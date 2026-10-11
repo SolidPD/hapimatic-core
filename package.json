@@ -1,0 +1,58 @@
+{
+  "name": "hapi",
+  "version": "1.0.1532",
+  "versionTimestamp": "2026-10-10T15:18:24.477Z",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "workspaces": [
+    "cli",
+    "shared",
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently \"bun run dev:server\" \"bun run dev:web\" --kill-others-on-exit",
+    "build": "bun run build:cli && bun run build:server && bun run build:web",
+    "build:cli": "cd cli && bun run build",
+    "build:single-exe": "bun run gen:worktree-constants && bun run gen:extensions && bun run gen:capabilities && bun run build:web && bun run server/scripts/generate-version-info.ts && (cd server && bun run generate:embedded-web-assets) && (cd cli && bun run build:exe:allinone)",
+    "build:single-exe:all": "bun run gen:worktree-constants && bun run gen:extensions && bun run gen:capabilities && bun run build:web && (cd server && bun run generate:embedded-web-assets) && (cd cli && bun run build:exe:allinone:all)",
+    "gen:worktree-constants": "bun run scripts/generate-worktree-constants.ts",
+    "gen:extensions": "bun run scripts/generate-extension-registry.ts",
+    "gen:capabilities": "bun run scripts/generate-capability-catalog.ts",
+    "build:server": "cd server && bun run build",
+    "build:web": "cd web && bun run build",
+    "dev:server": "cd server && bun run dev",
+    "dev:web": "cd web && bun run dev",
+    "typecheck:shared": "cd shared && bun run typecheck",
+    "typecheck:cli": "cd cli && bun run typecheck",
+    "typecheck:server": "cd server && bun run typecheck",
+    "typecheck:web": "cd web && bun run typecheck",
+    "test:shared": "cd shared && bun run test",
+    "test:cli": "cd cli && bun run test",
+    "test:server": "cd server && bun run test",
+    "test:web": "cd web && bun run test",
+    "test:web:changed": "cd web && bun run test --changed",
+    "clean-session": "bun run server/scripts/cleanup-sessions.ts",
+    "backfill-costs": "bun run server/scripts/backfill-costs.ts",
+    "backfill-turns": "bun run server/scripts/backfill-turns.ts",
+    "backfill-orphan-durations": "bun run server/scripts/backfill-orphan-durations.ts",
+    "release-all": "cd cli && bun run release-all",
+    "check:capabilities-gen-clean": "bun run scripts/generate-capability-catalog.ts --check"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.2",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.39.2",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "prettier": "^3.8.1",
+    "react-devtools-core": "^7.0.1",
+    "sharp": "^0.33.5",
+    "typescript": "^5",
+    "typescript-eslint": "^8.54.0",
+    "vite-plugin-pwa": "^1.2.0"
+  },
+  "patchedDependencies": {
+    "@assistant-ui/tap@0.3.5": "patches/@assistant-ui%2Ftap@0.3.5.patch"
+  }
+}

@@ -1,0 +1,58 @@
+diff --git a/dist/core/scheduler.js b/dist/core/scheduler.js
+index a61a05417fca038339e8e80c2dee5ee2ea4ef211..5fdd5b65daf62dce1ffd9a1ea2a29d094cc8213d 100644
+--- a/dist/core/scheduler.js
++++ b/dist/core/scheduler.js
+@@ -31,13 +31,20 @@ const scheduleFlush = () => {
+ const flushScheduled = () => {
+     try {
+         const errors = [];
+-        let flushDepth = 0;
++        // HAPImatic patch (hapimatic-private#1636): count flushes PER SCHEDULER
++        // instead of per flush cycle. The upstream counter conflates breadth
++        // (many distinct schedulers flushed once each — e.g. >50 per-message
++        // stores in a long chat thread invalidated by one render pass) with
++        // depth (the SAME scheduler re-entering repeatedly — a true
++        // setState-in-tapEffect loop). Only the latter is an error.
++        const flushCounts = new Map();
+         for (const scheduler of flushState.schedulers) {
+             flushState.schedulers.delete(scheduler);
+             if (!scheduler.isDirty)
+                 continue;
+-            flushDepth++;
+-            if (flushDepth > MAX_FLUSH_LIMIT) {
++            const flushCount = (flushCounts.get(scheduler) ?? 0) + 1;
++            flushCounts.set(scheduler, flushCount);
++            if (flushCount > MAX_FLUSH_LIMIT) {
+                 throw new Error(`Maximum update depth exceeded. This can happen when a resource ` +
+                     `repeatedly calls setState inside tapEffect.`);
+             }
+diff --git a/src/core/scheduler.ts b/src/core/scheduler.ts
+index 36ec0c9faaba264d51df5e5a32ef48728adc5193..9da7d83cb94a39af6e11ece4c8420bab7e3591ca 100644
+--- a/src/core/scheduler.ts
++++ b/src/core/scheduler.ts
+@@ -42,15 +42,22 @@ const scheduleFlush = () => {
+ const flushScheduled = () => {
+   try {
+     const errors = [];
+-    let flushDepth = 0;
++    // HAPImatic patch (hapimatic-private#1636): count flushes PER SCHEDULER
++    // instead of per flush cycle. The upstream counter conflates breadth
++    // (many distinct schedulers flushed once each — e.g. >50 per-message
++    // stores in a long chat thread invalidated by one render pass) with
++    // depth (the SAME scheduler re-entering repeatedly — a true
++    // setState-in-tapEffect loop). Only the latter is an error.
++    const flushCounts = new Map<unknown, number>();
+ 
+     for (const scheduler of flushState.schedulers) {
+       flushState.schedulers.delete(scheduler);
+       if (!scheduler.isDirty) continue;
+ 
+-      flushDepth++;
++      const flushCount = (flushCounts.get(scheduler) ?? 0) + 1;
++      flushCounts.set(scheduler, flushCount);
+ 
+-      if (flushDepth > MAX_FLUSH_LIMIT) {
++      if (flushCount > MAX_FLUSH_LIMIT) {
+         throw new Error(
+           `Maximum update depth exceeded. This can happen when a resource ` +
+             `repeatedly calls setState inside tapEffect.`,

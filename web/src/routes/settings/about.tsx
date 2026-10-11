@@ -1,0 +1,578 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+import { useState, type ReactElement } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useAppContext } from "@/lib/app-context";
+import { useDocumentTitle } from "@/hooks/useDocumentTitle";
+import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
+import { useVersion } from "@/hooks/useVersion";
+import { useAbout } from "@/hooks/queries/useAbout";
+import { useLauncherStatus } from "@/hooks/queries/useLauncherStatus";
+import { useDaemonCapacity } from "@/hooks/queries/useDaemonCapacity";
+import { useHealthStatus } from "@/hooks/queries/useHealthStatus";
+import { useAccounts } from "@/hooks/queries/useAccounts";
+import { useAccountUsage } from "@/hooks/queries/useAccountUsage";
+import { useNodeActiveAccount } from "@/hooks/queries/useNodeActiveAccount";
+import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
+import { useIsDevInstance } from "@/hooks/useIsDevInstance";
+import { queryKeys } from "@/lib/query-keys";
+import { Info } from "lucide-react";
+import {
+  SettingsSectionHeader,
+  TitleChip,
+} from "@/components/settings/SettingsSectionHeader";
+import { CollapsibleSection } from "@/components/ui/CollapsibleSection";
+import { DenseRow } from "@/components/ui/DenseRow";
+import { StatusDot, type StatusDotVariant } from "@/components/ui/StatusDot";
+import {
+  getUsageStatus,
+  getTemperatureStatus,
+  type HealthStatus,
+} from "@/lib/systemHealth";
+import {
+  PUBLIC_CORE_REPO_URL,
+  correspondingSourceHref,
+} from "@/lib/publicCoreSource";
+import { formatBytes } from "@/utils/formatBytes";
+import {
+  TerminalIcon,
+  BriefcaseIcon,
+  MonitorIcon,
+  GitHubIcon,
+} from "@/components/icons";
+
+/**
+ * AdminAboutPage — the `/settings/about` route (issue #1983 B2, epic #1981 Admin
+ * Drawer). The locked AB06 design: three `CollapsibleSection`s (Application,
+ * Account & Session, Machine & Node) of dense `DenseRow`s built ENTIRELY from the
+ * Epic A design-system primitives, modeled on the SM03 sibling
+ * (`session-metadata.tsx`).
+ *
+ * Field sources (research directive Field→Source Map):
+ *  - ~14 fields wire from existing app hooks (version, launcher, capacity, health,
+ *    accounts, usage, federation).
+ *  - The host-descriptor + harness fields wire from B3's `/api/about` via
+ *    `useAbout`.
+ *  - Live metrics (CPU temp, memory, disk, capacity) render a `StatusDot` mapped
+ *    from the existing 4-level health signal (K2).
+ *
+ * Two design decisions (approved by Matt, 2026-07-04):
+ *  - O1: the session-scoped `model` / `session + issue` fields are DROPPED for v1
+ *    (`/settings/about` is a session-less route — no session anchor exists here).
+ *  - O2: `auth + expiry` is derived by decoding the session JWT's `exp` client-side
+ *    (no backend change), plus the active account's `expired` status.
+ */
+
+const LICENSE_NAME = "AGPL-3.0";
+
+/**
+ * The value of the GitHub and Changelog rows (#4700). Both follow the public core repo, the same
+ * `PUBLIC_CORE_REPO_URL` as the Source row below, and never the private repo.
+ *
+ * Decision (#4700): every build shows the same thing. One web bundle ships to operator instances
+ * and public installs alike, with no signal that tells them apart, and the private repo 404s for
+ * everyone but its owner. So until the public repo is configured both rows show "—" (as the Source
+ * row does, and as the public site's repository links stay on "coming soon", #4820); after, GitHub
+ * links the repository and Changelog its releases page. No URL is written here. The URL is a prop
+ * so tests render both states without mocking a module.
+ */
+export function PublicCoreLinkValue({
+  repoUrl,
+  page,
+}: {
+  repoUrl: string;
+  page: "repository" | "releases";
+}): ReactElement {
+  if (repoUrl === "") return <>{cell(null)}</>;
+  return (
+    <a
+      href={page === "releases" ? `${repoUrl}/releases` : repoUrl}
+      target="_blank"
+      rel="noreferrer"
+      className="text-[var(--app-accent)] underline"
+    >
+      {page === "releases"
+        ? "View releases"
+        : repoUrl.replace(/^https:\/\/github\.com\//, "")}
+    </a>
+  );
+}
+
+/**
+ * The value of the "Source (AGPL §13)" row (#3869 R2, #4676). The public core repo URL and the
+ * link rules live in `@/lib/publicCoreSource`. Until that repo is configured the row shows "—"
+ * (no link that cannot resolve); after, a link anchored to the release tag when the running
+ * version has one. The URL is a prop so tests render both states without mocking a module.
+ */
+export function CorrespondingSourceValue({
+  repoUrl,
+  version,
+}: {
+  repoUrl: string;
+  version: string | undefined;
+}): ReactElement {
+  const href = correspondingSourceHref(repoUrl, version);
+  if (href === null) return <>{cell(null)}</>;
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      className="text-[var(--app-accent)] underline"
+    >
+      {href !== repoUrl
+        ? "Corresponding Source for this version"
+        : "Corresponding Source"}
+    </a>
+  );
+}
+
+// Friendly labels for the harness enumeration (B3 returns all four flavors,
+// each with `available` + `version`). Claude Code's own flavor is included (R3).
+const HARNESS_LABELS: Record<string, string> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  gemini: "Gemini",
+  opencode: "OpenCode",
+};
+
+// ── Display formatters (null/absent → "—") ──────────────────────────────
+
+function cell(value: unknown): string {
+  return value === null || value === undefined || value === ""
+    ? "—"
+    : String(value);
+}
+
+function fmtTimestamp(iso: string | undefined): string {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
+}
+
+function fmtBytes(bytes: number | null | undefined): string {
+  // Empty/zero/undefined → the about-page "—" sentinel; positive-finite bytes
+  // delegate to the shared IEC core (#3460). Output is byte-identical to the
+  // former inline copy (the shared core carries the same Math.min TiB clamp).
+  if (bytes == null || !Number.isFinite(bytes) || bytes <= 0) return "—";
+  return formatBytes(bytes);
+}
+
+function fmtUptime(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "—";
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const parts: string[] = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0 || parts.length === 0) parts.push(`${m}m`);
+  return parts.join(" ");
+}
+
+function fmtPercent(p: number | null | undefined): string {
+  return p == null || !Number.isFinite(p) ? "—" : `${Math.round(p)}%`;
+}
+
+// K2: map the existing 4-level HealthStatus → A3's 3-level StatusDot. `unknown`
+// (null metric / failed collector) renders NO dot (per the StatusDot contract).
+function healthDot(status: HealthStatus): StatusDotVariant | undefined {
+  switch (status) {
+    case "green":
+      return "ok";
+    case "yellow":
+    case "orange":
+      return "warn";
+    case "red":
+      return "hot";
+    default:
+      return undefined;
+  }
+}
+
+// Spawn-capacity dot: at/over the cap → hot, ≥80% → warn, else ok. Unknown → none.
+function capacityDot(
+  effective: number | null | undefined,
+  max: number | null | undefined
+): StatusDotVariant | undefined {
+  if (effective == null || max == null || max <= 0) return undefined;
+  const ratio = effective / max;
+  if (ratio >= 1) return "hot";
+  if (ratio >= 0.8) return "warn";
+  return "ok";
+}
+
+// O2: decode the session JWT's `exp` claim (Unix seconds → ms) with no backend
+// change. Returns null on any malformed token (safe fallback → "—").
+function decodeJwtExpMs(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const json = JSON.parse(atob(b64)) as { exp?: unknown };
+    return typeof json.exp === "number" ? json.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+// Render a StatusDot only when a variant is defined (unknown status → no dot).
+function dot(
+  variant: StatusDotVariant | undefined,
+  label: string
+): React.ReactNode {
+  return variant ? <StatusDot status={variant} label={label} /> : undefined;
+}
+
+export default function AdminAboutPage() {
+  useDocumentTitle("About - Hapimatic");
+  useEmojiFavicon(null);
+  const { api, token } = useAppContext();
+
+  const isDev = useIsDevInstance();
+  const { data: versionInfo, isLoading: versionLoading } = useVersion();
+  const { data: about } = useAbout(api);
+  const { data: launcher } = useLauncherStatus();
+  const { data: capacity } = useDaemonCapacity(api);
+  const { metrics } = useHealthStatus(api);
+  const { accounts } = useAccounts(api, true);
+  const { usage } = useAccountUsage(api, true);
+  const { localNode, remoteNodes } = useFederatedSessions(api);
+  const { account: activeAccount, status: accountStatus } =
+    useNodeActiveAccount(api, localNode?.nodeId ?? "", {
+      enabled: Boolean(localNode?.nodeId),
+    });
+
+  // Federation role — a direct nodes query. Shares the `federationNodes` cache
+  // key with useFederatedSessions (which discards `role`), so this dedupes.
+  const { data: fedNodes } = useQuery({
+    queryKey: queryKeys.federationNodes,
+    queryFn: () => (api ? api.getFederationNodes() : Promise.resolve(null)),
+    enabled: Boolean(api),
+    staleTime: 60_000,
+    retry: 1,
+  });
+
+  const [openKeys, setOpenKeys] = useState<Set<string>>(
+    new Set(["application", "account", "machine"])
+  );
+  const toggle = (key: string) => (next: boolean) =>
+    setOpenKeys(prev => {
+      const set = new Set(prev);
+      if (next) set.add(key);
+      else set.delete(key);
+      return set;
+    });
+
+  const versionText = versionLoading
+    ? "Loading…"
+    : `v${versionInfo?.version ?? "?.?.?"}`;
+
+  // Active-account usage entry (tier + today's usage), matched by accountUuid.
+  const activeUsage = activeAccount
+    ? usage.find(u => u.accountUuid === activeAccount.accountUuid)
+    : undefined;
+  const tierText =
+    activeUsage?.planLabel ?? cell(activeAccount?.subscriptionType);
+  const usageText = activeUsage?.score != null ? `${activeUsage.score}%` : "—";
+
+  // O2 — session-token expiry from the JWT, plus the account's re-login signal.
+  const expMs = decodeJwtExpMs(token);
+  const tokenExpired = expMs != null && expMs < Date.now();
+  const accountExpired = accountStatus === "expired";
+  const authText =
+    expMs == null
+      ? accountExpired
+        ? "Re-login required"
+        : "—"
+      : tokenExpired
+        ? "Expired"
+        : `Valid until ${new Date(expMs).toLocaleString()}`;
+  const authDot: StatusDotVariant | undefined =
+    tokenExpired || accountExpired ? "hot" : undefined;
+
+  // Live-metric StatusDots (K2 mapping from the existing per-field health logic).
+  const tempDot = healthDot(
+    getTemperatureStatus(metrics?.cpu.temperatureF ?? null)
+  );
+  const memDot = healthDot(
+    getUsageStatus(metrics?.memory.usagePercent ?? null)
+  );
+  const diskDot = healthDot(getUsageStatus(metrics?.disk.usagePercent ?? null));
+  const capDot = capacityDot(capacity?.effectiveCount, capacity?.maxConcurrent);
+
+  const capacityText =
+    capacity?.effectiveCount != null && capacity?.maxConcurrent != null
+      ? `${capacity.effectiveCount} / ${capacity.maxConcurrent}`
+      : "—";
+
+  const harnesses = about?.harnesses ?? [];
+  const tailscale = about?.tailscale ?? null;
+
+  return (
+    <div
+      data-testid="settings-about-root"
+      className="flex h-full flex-col overflow-y-auto"
+    >
+      <SettingsSectionHeader
+        icon={<TitleChip icon={Info} accent="var(--accent-amber-500)" />}
+        title="About"
+      />
+
+      <div className="mx-auto w-full max-w-content px-4 pb-6">
+        <div className="flex flex-col gap-2 py-2">
+          {/* ── Application ──────────────────────────────────────────── */}
+          <CollapsibleSection
+            data-testid="about-section-application"
+            title="Application"
+            icon={<TerminalIcon />}
+            summary={`${versionText} · ${cell(launcher?.kind)}`}
+            open={openKeys.has("application")}
+            onOpenChange={toggle("application")}
+          >
+            <DenseRow
+              testId="about-row-version"
+              label="Version"
+              value={versionText}
+            />
+            <DenseRow
+              testId="about-row-build"
+              label="Build"
+              value={fmtTimestamp(versionInfo?.timestamp)}
+            />
+            <DenseRow
+              testId="about-row-commit"
+              label="Commit"
+              value={cell(about?.commit)}
+            />
+            <DenseRow
+              testId="about-row-launcher"
+              label="Launcher"
+              value={cell(launcher?.kind)}
+            />
+            <DenseRow
+              testId="about-row-instance"
+              label="Instance"
+              value={isDev ? "Development" : "Production"}
+            />
+            <DenseRow
+              testId="about-row-uptime"
+              label="Uptime"
+              value={fmtUptime(about?.uptime.serverProcessSec)}
+            />
+            <DenseRow
+              testId="about-row-capacity"
+              label="Spawn capacity"
+              value={capacityText}
+              trailing={dot(capDot, "capacity")}
+            />
+
+            {/* Harness enumeration (R3) — all launchable harnesses + versions. */}
+            {harnesses.map(h => (
+              <DenseRow
+                key={h.flavor}
+                testId={`about-row-harness-${h.flavor}`}
+                label={HARNESS_LABELS[h.flavor] ?? h.flavor}
+                value={h.available ? cell(h.version) : "Not installed"}
+              />
+            ))}
+
+            <DenseRow
+              testId="about-row-github"
+              icon={<GitHubIcon />}
+              label="GitHub"
+              value={
+                <PublicCoreLinkValue
+                  repoUrl={PUBLIC_CORE_REPO_URL}
+                  page="repository"
+                />
+              }
+            />
+            <DenseRow
+              testId="about-row-changelog"
+              label="Changelog"
+              value={
+                <PublicCoreLinkValue
+                  repoUrl={PUBLIC_CORE_REPO_URL}
+                  page="releases"
+                />
+              }
+            />
+            <DenseRow
+              testId="about-row-license"
+              label="License"
+              value={LICENSE_NAME}
+            />
+            {/* §13 Corresponding-Source offer — see CorrespondingSourceValue above. */}
+            <DenseRow
+              testId="about-row-source"
+              icon={<GitHubIcon />}
+              label="Source (AGPL §13)"
+              value={
+                <CorrespondingSourceValue
+                  repoUrl={PUBLIC_CORE_REPO_URL}
+                  version={versionInfo?.version}
+                />
+              }
+            />
+          </CollapsibleSection>
+
+          {/* ── Account & Session ────────────────────────────────────── */}
+          <CollapsibleSection
+            data-testid="about-section-account"
+            title="Account & Session"
+            icon={<BriefcaseIcon />}
+            summary={`${cell(activeAccount?.emailAddress)} · ${tierText}`}
+            open={openKeys.has("account")}
+            onOpenChange={toggle("account")}
+          >
+            <DenseRow
+              testId="about-row-account"
+              label="Account"
+              value={cell(activeAccount?.emailAddress)}
+            />
+            <DenseRow testId="about-row-tier" label="Tier" value={tierText} />
+            <DenseRow
+              testId="about-row-accounts-count"
+              label="Accounts configured"
+              value={String(accounts.length)}
+            />
+            <DenseRow
+              testId="about-row-usage"
+              label="Today's usage"
+              value={usageText}
+            />
+            <DenseRow
+              testId="about-row-auth"
+              label="Auth"
+              value={authText}
+              trailing={dot(authDot, "auth expired")}
+            />
+          </CollapsibleSection>
+
+          {/* ── Machine & Node ───────────────────────────────────────── */}
+          <CollapsibleSection
+            data-testid="about-section-machine"
+            title="Machine & Node"
+            icon={<MonitorIcon />}
+            summary={`${cell(localNode?.nodeLabel)} · ${cell(about?.os.name)}`}
+            open={openKeys.has("machine")}
+            onOpenChange={toggle("machine")}
+          >
+            <DenseRow
+              testId="about-row-node"
+              label="Node"
+              value={cell(localNode?.nodeLabel)}
+            />
+            <DenseRow
+              testId="about-row-role"
+              label="Role"
+              value={cell(fedNodes?.role)}
+            />
+            <DenseRow
+              testId="about-row-peers"
+              label="Peers"
+              value={String(remoteNodes.length)}
+            />
+            <DenseRow
+              testId="about-row-os"
+              label="OS"
+              value={cell(about?.os.name)}
+            />
+            <DenseRow
+              testId="about-row-kernel"
+              label="Kernel"
+              value={cell(about?.os.kernel)}
+            />
+            <DenseRow
+              testId="about-row-arch"
+              label="Architecture"
+              value={cell(about?.os.arch)}
+            />
+            <DenseRow
+              testId="about-row-device"
+              label="Device"
+              value={cell(about?.hardware.deviceModel)}
+            />
+            <DenseRow
+              testId="about-row-cores"
+              label="CPU cores"
+              value={
+                about?.hardware.cpuCores != null
+                  ? String(about.hardware.cpuCores)
+                  : "—"
+              }
+            />
+            <DenseRow
+              testId="about-row-ram"
+              label="Memory (total)"
+              value={fmtBytes(
+                about?.hardware.totalRamBytes ?? metrics?.memory.total
+              )}
+            />
+            <DenseRow
+              testId="about-row-cpu-temp"
+              label="CPU temperature"
+              value={
+                metrics?.cpu.temperatureF != null
+                  ? `${Math.round(metrics.cpu.temperatureF)}°F`
+                  : "—"
+              }
+              trailing={dot(tempDot, "CPU temperature")}
+            />
+            <DenseRow
+              testId="about-row-memory"
+              label="Memory used"
+              value={fmtPercent(metrics?.memory.usagePercent)}
+              trailing={dot(memDot, "memory")}
+            />
+            <DenseRow
+              testId="about-row-disk"
+              label="Disk used"
+              value={fmtPercent(metrics?.disk.usagePercent)}
+              trailing={dot(diskDot, "disk")}
+            />
+            <DenseRow
+              testId="about-row-tailscale"
+              label="Tailscale"
+              value={cell(tailscale?.hostname)}
+            />
+            <DenseRow
+              testId="about-row-tailscale-ip"
+              label="Tailscale IP"
+              value={cell(tailscale?.ipv4)}
+            />
+
+            {/*
+              #3119 backup-key eligibility indicator. DETECT-and-HIDE (operator
+              round-3 ruling): the row renders ONLY on a gateway-managed cloud VM
+              (`backupKeyEligible === true`) and is entirely absent on a physical
+              node — no "not applicable" disclaimer. `=== true` also hides the row
+              when an older peer's About payload omits the field (undefined). The
+              scope is indicator + link-out only; the passphrase backend is
+              gateway-only + cookie-gated, so we never mirror its forms here.
+            */}
+            {about?.backupKeyEligible === true && (
+              <DenseRow
+                testId="about-row-backup-key"
+                label="Backup key"
+                value={
+                  <a
+                    href="https://hapimatic.com/backup-passphrase"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[var(--app-accent)] underline"
+                  >
+                    Manage backup passphrase
+                  </a>
+                }
+              />
+            )}
+          </CollapsibleSection>
+        </div>
+      </div>
+    </div>
+  );
+}

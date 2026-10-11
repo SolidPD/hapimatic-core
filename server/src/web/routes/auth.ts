@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+import { Hono } from "hono";
+import { SignJWT } from "jose";
+import { z } from "zod";
+import { configuration } from "../../configuration";
+import { constantTimeEquals } from "../../utils/crypto";
+import { parseAccessToken } from "../../utils/accessToken";
+import { validateTelegramInitData } from "../telegramInitData";
+import { getOrCreateOwnerId } from "../../config/ownerId";
+import { defineCapability } from "@hapi/protocol";
+import { cataloged } from "../../capabilities/cataloged";
+import type { WebAppEnv } from "../middleware/auth";
+import type { Store } from "../../store";
+import type { ErrorLogger } from "../../logging/errorLogger";
+
+const telegramAuthSchema = z.object({
+  initData: z.string(),
+});
+
+const accessTokenAuthSchema = z.object({
+  accessToken: z.string(),
+});
+
+const authBodySchema = z.union([telegramAuthSchema, accessTokenAuthSchema]);
+
+export function createAuthRoutes(
+  jwtSecret: Uint8Array,
+  store: Store,
+  errorLogger?: ErrorLogger | null
+): Hono<WebAppEnv> {
+  const app = new Hono<WebAppEnv>();
+
+  app.post(
+    "/auth",
+    cataloged(
+      defineCapability({
+        id: "accounts.auth",
+        domain: "accounts",
+        surface: "rest",
+        description:
+          "Exchange a CLI access token or Telegram init-data for a short-lived (15-minute) JWT for the web/API client.",
+        whenToUse:
+          "When a client obtains a session JWT to call authenticated endpoints.",
+        invocation: { kind: "rest", method: "POST", path: "/api/auth" },
+        auth: "none",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+        probe: "skip",
+      })
+    ),
+    async c => {
+      const json = await c.req.json().catch(() => null);
+      const parsed = authBodySchema.safeParse(json);
+      if (!parsed.success) {
+        return c.json({ error: "Invalid body" }, 400);
+      }
+
+      let userId: number;
+      let username: string | undefined;
+      let firstName: string | undefined;
+      let lastName: string | undefined;
+      let namespace: string;
+
+      // Access Token authentication (CLI_API_TOKEN)
+      if ("accessToken" in parsed.data) {
+        const parsedToken = parseAccessToken(parsed.data.accessToken);
+        if (
+          !parsedToken ||
+          !constantTimeEquals(parsedToken.baseToken, configuration.cliApiToken)
+        ) {
+          errorLogger?.warn(
+            `Access token validation failed - parsedToken exists: ${!!parsedToken}`,
+            { category: "auth" }
+          );
+          return c.json({ error: "Invalid access token" }, 401);
+        }
+        userId = await getOrCreateOwnerId();
+        firstName = "Web User";
+        namespace = parsedToken.namespace;
+        errorLogger?.info(
+          `Access token auth - namespace: "${namespace}", baseTokenLength: ${parsedToken.baseToken.length}`,
+          { category: "auth" }
+        );
+      } else {
+        if (!configuration.telegramEnabled || !configuration.telegramBotToken) {
+          return c.json(
+            {
+              error:
+                "Telegram authentication is disabled. Configure TELEGRAM_BOT_TOKEN.",
+            },
+            503
+          );
+        }
+
+        // Telegram initData authentication
+        const result = validateTelegramInitData(
+          parsed.data.initData,
+          configuration.telegramBotToken
+        );
+        if (!result.ok) {
+          return c.json({ error: result.error }, 401);
+        }
+
+        const telegramUserId = String(result.user.id);
+        const storedUser = store.users.getUser("telegram", telegramUserId);
+        if (!storedUser) {
+          return c.json({ error: "not_bound" }, 401);
+        }
+
+        userId = await getOrCreateOwnerId();
+        username = result.user.username;
+        firstName = result.user.first_name;
+        lastName = result.user.last_name;
+        namespace = storedUser.namespace;
+      }
+
+      const token = await new SignJWT({ uid: userId, ns: namespace })
+        .setProtectedHeader({ alg: "HS256" })
+        .setIssuedAt()
+        .setExpirationTime("15m")
+        .sign(jwtSecret);
+
+      errorLogger?.info(
+        `JWT created - userId: ${userId}, namespace: "${namespace}"`,
+        { category: "auth" }
+      );
+
+      return c.json({
+        token,
+        user: {
+          id: userId,
+          username,
+          firstName,
+          lastName,
+        },
+      });
+    }
+  );
+
+  return app;
+}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="t">
+<title id="t">Hapimatic</title>
+<!-- Hapimatic icon (issue #4725): H28, a constructed white block H in a thin mint outline run tight to the
+     edge of a flat deep purple tile (operator's choice, 2026-10-06, mockup round 8c). Source for icon-192.png /
+     icon-512.png; the app icon set is to derive from it (#4765). Brand tokens only. -->
+<rect width="512" height="512" rx="112" fill="#1e0a3e"/><rect x="26" y="26" width="460" height="460" rx="86" fill="none" stroke="#5ae6ab" stroke-width="16"/><path d="M130 126H200V226H312V126H382V386H312V286H200V386H130Z" fill="#ffffff"/>
+</svg>

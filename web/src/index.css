@@ -1,0 +1,779 @@
+@import "tailwindcss";
+@import "./design/tokens.css";
+@import "tw-animate-css";
+@config "../tailwind.config.ts";
+/* #3462 (ruling c1, R11): retarget Tailwind's built-in `disabled:` variant so every
+ * `disabled:*` utility also fires on an `aria-disabled="true"` element — the
+ * focusable-but-inert Button that HoverTooltip wraps. Declared AFTER the @import
+ * block because CSS ignores any @import that follows another rule (placing this
+ * between the imports silently dropped ./design/tokens.css → `border-border`
+ * became an unknown utility and the build failed). */
+@custom-variant disabled (&:disabled, &[aria-disabled="true"]);
+
+/* Design tokens (palette, surfaces, borders, status triad, shadows, spacing,
+ * radii, shadcn semantic tokens) + the Tailwind `@theme inline` mapping now
+ * live in ./design/tokens.css — the single source of truth every shared
+ * component reads from and the runtime-swap seam Epic C plugs into (#1977).
+ * Only app-shell-local vars (brand/safe-area, toast, icon grid, density) and
+ * layout/animation/markdown CSS remain here. */
+
+:root {
+  /* Hapimatic-Private brand colors - Indigo Spring: Deeper palette */
+  /* SWAPPED: App shell uses darker, title bar uses lighter for contrast */
+  --brand-primary: #1e0a3e; /* near-midnight - main app background */
+  --brand-primary-dark: #3b1578; /* deep indigo - title bar contrast */
+  --brand-accent: #4ade80; /* vivid spring green - accent for highlights */
+
+  /* Toast notification type colors */
+  --toast-error: #f87171;
+  --toast-warning: #fbbf24;
+
+  /* Bookmark colors (issue #983): single muted-yellow source, reuses the
+     toast-warning base (#fbbf24). --app-bookmark for the gutter icon + nav-button
+     border/icon; --app-bookmark-muted for reduced-opacity fills; --app-bookmark-bg
+     for the semi-transparent nav-button background. */
+  --app-bookmark: #fbbf24;
+  --app-bookmark-muted: rgba(251, 191, 36, 0.5);
+  --app-bookmark-bg: rgba(251, 191, 36, 0.18);
+
+  /* Spring green accent variants */
+  --brand-accent-light: rgba(74, 222, 128, 0.2);
+  --brand-accent-border: rgba(74, 222, 128, 0.4);
+  --brand-accent-glow: rgba(74, 222, 128, 0.6);
+
+  /* Icon column system — deterministic positioning from right edge */
+  --icon-btn-size: 32px;
+  --icon-btn-gap: 2px;
+  --icon-slot: calc(var(--icon-btn-size) + var(--icon-btn-gap)); /* 34px */
+
+  /* Density tokens — driven by useDensity hook; default matches 'normal' */
+  --row-padding-y: 6px;
+
+  /* Status-cluster alignment (#3484). The router.tsx toolbar accumulator
+     cluster is pinned to --status-cluster-w so its four flex-1 columns no longer
+     follow the timer text's width (a "1h 23m" timer made it 57.9px, "12h 34m"
+     wider — so nothing below could align with it by construction). Every
+     SubheadingBar's far-left cluster box is the SAME width minus the structural
+     inset the card pattern imposes on a subheading (its own 4px rail + the 1px
+     card hairline = 5px), so the RIGHTMOST column of every subheading bar lands
+     exactly under the toolbar's rightmost column, and all bars agree with each
+     other. 60px fits a two-digit count in every column ("9•9•9•99" measures
+     57.6px at 10px tabular). */
+  --status-cluster-w: 60px;
+  --subheading-rail-inset: 5px;
+  --subheading-cluster-w: calc(
+    var(--status-cluster-w) - var(--subheading-rail-inset)
+  );
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+}
+
+/* === iOS PWA Layout & Rubber-Band Prevention === */
+/* Source: https://pqina.nl/blog/how-to-prevent-scrolling-the-page-on-ios-safari */
+
+/* iOS PWA Safe Area Fix - Hybrid approach:
+ * Uses production layout (min-height extending into safe area) for smaller gap
+ * Combined with JS touch interception (usePreventRubberBand) for rubber-band prevention
+ */
+html {
+  /* Use min-height to allow expansion into safe areas on iOS */
+  min-height: 100vh;
+  min-height: 100dvh;
+  min-height: var(--tg-viewport-stable-height, 100dvh);
+  /* Extend to cover safe areas on iOS with viewport-fit=cover */
+  min-height: calc(100dvh + env(safe-area-inset-bottom, 0px));
+  -webkit-text-size-adjust: 100%;
+  /* Match the app's primary brand color so safe area gap is invisible */
+  background: var(--brand-primary) !important;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  height: 100dvh;
+  height: var(--tg-viewport-stable-height, 100dvh);
+  /* Extend body to cover bottom safe area (background only — no padding).
+   * The version footer in BrandedFrame handles safe-area-inset-bottom spacing
+   * for content. Body padding here was causing double safe-area compensation,
+   * shrinking the app-shell by ~34px on iPhone 16. */
+  min-height: calc(100dvh + env(safe-area-inset-bottom, 0px));
+  box-sizing: border-box;
+  overflow: hidden;
+  touch-action: pan-y;
+  overscroll-behavior: none;
+  background: var(--brand-primary);
+  color: var(--app-fg);
+}
+
+#root {
+  height: 100%;
+}
+
+/* App shell - uses flex layout instead of fixed positioning
+ * Fixed positioning creates a larger gap because bottom: 0 stops at safe area boundary
+ * Flex layout with min-height extension allows content to reach further down
+ */
+.app-shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* iOS PWA Keyboard Gap Fix
+ * When iOS keyboard appears in PWA standalone mode, the viewport is panned upward,
+ * revealing the area below the app content. Using :has() (CSS-only, zero render
+ * delay) we change ALL background colors to match the app content area.
+ * This fires BEFORE iOS captures the frame for panning. */
+/* Scoped to standalone-touch: only fire on iOS/Android PWA (touch + standalone).
+ * The standalone-touch class is set by BrandedFrame.tsx on mount.
+ * Desktop focus does NOT trigger these rules — fixes #739 (purple band disappears). */
+html.standalone-touch:has(
+    textarea:focus,
+    input:focus,
+    [contenteditable]:focus
+  ) {
+  background: var(--app-bg) !important;
+}
+html.standalone-touch:has(textarea:focus, input:focus, [contenteditable]:focus)
+  body {
+  background: var(--app-bg) !important;
+}
+html.standalone-touch:has(textarea:focus, input:focus, [contenteditable]:focus)
+  .app-shell {
+  background: var(--app-bg) !important;
+}
+html.standalone-touch:has(textarea:focus, input:focus, [contenteditable]:focus)
+  .content-wrapper {
+  background: var(--app-bg) !important;
+}
+html.standalone-touch:has(textarea:focus, input:focus, [contenteditable]:focus)
+  .content-area {
+  border-radius: 0 !important;
+}
+html.standalone-touch:has(textarea:focus, input:focus, [contenteditable]:focus)
+  .version-footer {
+  background: var(--app-bg) !important;
+  padding-top: 1px !important;
+  padding-bottom: 1px !important;
+  font-size: 0.625rem !important;
+  line-height: 1 !important;
+}
+
+/* Non-scrollable regions - header, footer, empty areas */
+.no-bounce {
+  touch-action: none;
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Scrollable content areas — overflow-x: hidden prevents CSS spec behavior
+ * where setting overflow-y to non-visible computes overflow-x to auto,
+ * which enables unwanted horizontal scrolling/dragging on iOS. */
+.overflow-y-auto,
+.overflow-y-scroll {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  overflow-x: hidden;
+  touch-action: pan-y;
+}
+
+/* Prevent iOS Safari scroll-into-view disruption when focusing inputs.
+ * iOS tries to scroll focused elements into visible viewport when keyboard appears,
+ * which can cause jarring viewport shifts. These rules minimize that behavior.
+ */
+input,
+textarea,
+[contenteditable="true"] {
+  /* Reduce scroll distance needed to bring element into view */
+  scroll-margin-bottom: 0;
+  scroll-margin-top: 0;
+  /* Ensure text selection works even if an ancestor sets user-select: none */
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Specifically target composer and notes textareas */
+textarea[placeholder*="message"],
+textarea[placeholder*="notes"] {
+  /* Prevent scroll padding from adding to the shift */
+  scroll-padding: 0;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .session-list-item:hover {
+    background-color: var(--item-hover-bg, var(--app-subtle-bg));
+  }
+  .session-list-new-button:hover {
+    background-color: var(--app-subtle-bg);
+  }
+}
+
+/* Markdown styles */
+.markdown-content a {
+  color: var(--app-link);
+  text-decoration: underline;
+}
+.markdown-content code {
+  background: var(--app-inline-code-bg);
+  padding: 0.1em 0.3em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+.markdown-content blockquote {
+  border-left: 3px solid var(--app-hint);
+  padding-left: 0.75rem;
+  margin: 0.5rem 0;
+  opacity: 0.85;
+}
+.markdown-content ul,
+.markdown-content ol {
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+.markdown-content table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.markdown-content th,
+.markdown-content td {
+  border: 1px solid var(--app-border);
+  padding: 0.25rem 0.5rem;
+}
+
+/* === Category visual identity (#2991, S4) ===
+ * Subtle per-category gutter + chevron tint for the four collapsible chat-section
+ * categories. Colors resolve from the runtime-swappable --cat-* tokens (defined
+ * in ./design/tokens.css, imported above). Ruling b3: styled via the stable
+ * [data-cat=…] hooks S2 (tools/reasoning) and S3 (response/user) emit, so no prop
+ * threading is needed. Gutter is a low-alpha border in the category hue — LEFT for
+ * the left-aligned rows, RIGHT for the right-aligned user affordance. Chevrons
+ * carry the full hue via .hapi-cat-chevron (SVG stroke=currentColor). Subtle
+ * accent only, never a filled background (KD4). Exact hues are the operator's
+ * approval-gate decision (KD3). */
+[data-cat="tools"] {
+  --cat: var(--cat-tools);
+}
+[data-cat="reasoning"] {
+  --cat: var(--cat-reasoning);
+}
+[data-cat="response"] {
+  --cat: var(--cat-response);
+}
+[data-cat="user"] {
+  --cat: var(--cat-user);
+}
+[data-cat="narration"] {
+  --cat: var(--cat-narration);
+}
+[data-cat="tools"],
+[data-cat="reasoning"],
+[data-cat="response"],
+[data-cat="narration"] {
+  border-left: 2px solid color-mix(in srgb, var(--cat) 60%, transparent);
+  padding-left: 0.5rem;
+}
+/* The user affordance row is right-aligned (ml-auto) → gutter on the right edge. */
+[data-cat="user"] {
+  border-right: 2px solid color-mix(in srgb, var(--cat) 60%, transparent);
+  padding-right: 0.5rem;
+}
+/* The collapse chevron picks up the category hue (currentColor drives the SVG
+ * stroke). Tool icons keep their neutral --app-hint color — only chevrons tint.
+ * Epic #3285 round 14: the chevron uses the SAME 60% mix as the gutter border
+ * above, so glyph and border render as one color (the full-hue chevron read
+ * visibly darker than its own border, most of all for the purple System rows). */
+[data-cat] .hapi-cat-chevron {
+  color: color-mix(in srgb, var(--cat) 60%, transparent);
+  /* Round 14 follow-up: SAME INK, not just the same color code. The glyph is a
+   * 12px SVG whose default stroke is 1 CSS px (stroke-width 2 in a 24 viewBox),
+   * while the gutter border is a solid 2px line. Measured on the deployed build
+   * (System row, gray 0-255): chevron peak 38 vs border 49 at 1x DPR, and only a
+   * single core pixel reaches 49 at 2x — a 1px anti-aliased diagonal in the
+   * darkest category hue vanishes where the 2px line still reads. A 2 CSS px
+   * stroke (4 in the 24 viewBox) measured an exact peak match (49/49) at both
+   * ratios, so the chevron renders the border's color at the border's weight. */
+  stroke-width: 4;
+}
+/* #3268: the System (response) chevron is too dark to read on the dark bg, so it
+ * gets its OWN lighter hue at full strength. Only the chevron changes: the border
+ * keeps its operator-tuned --cat-response mix (see tokens.css). Only `color` is
+ * set, so the 2px stroke above still applies.
+ * ORDER-DEPENDENT: this rule ties with the base [data-cat] .hapi-cat-chevron rule
+ * above at equal specificity (0,2,0) and wins on SOURCE ORDER only, so keep it
+ * AFTER that rule. */
+[data-cat="response"] .hapi-cat-chevron {
+  color: var(--cat-response-chevron);
+}
+/* A System section WRAPS its nested tool / reasoning / narration rows, so the
+ * descendant rule above also matches their chevrons. This rule restores each
+ * nested category's own tint; it mirrors the base rule's color exactly.
+ * Specificity (0,4,0) — :not() counts its argument — beats the override without
+ * depending on order. */
+[data-cat="response"] [data-cat]:not([data-cat="response"]) .hapi-cat-chevron {
+  color: color-mix(in srgb, var(--cat) 60%, transparent);
+}
+
+/* Epic #3285 round 14 (item 1, option B): hide the NATIVE scrollbar on the two
+ * primary scroll surfaces (session list, chat thread). A classic desktop
+ * scrollbar reserves ~15px of layout width, which pushed the session-row
+ * chevron column left of the app-bar gear column; with nothing reserved the
+ * columns line up at every width. Position feedback comes from the overlay
+ * `ScrollPositionRail` (ui/ScrollPositionRail.tsx), which takes no layout
+ * space. Native keyboard / wheel / touch scrolling is untouched. */
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* Epic #3285 round 16: ambient thread fade. The chat thread's scroll viewport
+ * (HappyThread.tsx, class `thread-fade`) fades its content where it slides
+ * behind the session-info bar above and the dock below — no divider line, no
+ * background color to match, theme-proof (the same alpha-mask technique
+ * FadeTruncate uses for the session name). The two soft edges are
+ * SCROLL-LINKED: lib/threadFade.ts writes --thread-fade-top and
+ * --thread-fade-bottom from min(scrollTop, 18px) and min(distanceFromBottom,
+ * 18px) on every scroll / resize, so the first line stays fully legible at the
+ * very top (top edge 0) and the newest line is never dimmed at the very bottom
+ * (bottom edge 0). A 0px edge collapses that side's two gradient stops to the
+ * same position — i.e. NO fade on that side — so one rule covers top-only,
+ * bottom-only, both, and neither. The mask sits on the clipping VIEWPORT, not
+ * the scrolled content, so the fade stays fixed while the content moves. */
+.thread-fade {
+  --thread-fade-top: 0px;
+  --thread-fade-bottom: 0px;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--thread-fade-top),
+    #000 calc(100% - var(--thread-fade-bottom)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--thread-fade-top),
+    #000 calc(100% - var(--thread-fade-bottom)),
+    transparent 100%
+  );
+}
+
+.aui-md-codeblock pre.shiki {
+  margin: 0;
+  padding: 0.5rem;
+  background-color: transparent !important;
+  font-size: 0.75em;
+}
+
+.aui-md-codeblock pre.shiki code {
+  display: block;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+}
+
+.aui-md-codeblock .shiki,
+.aui-md-codeblock .shiki span {
+  background-color: transparent !important;
+}
+
+/* Shiki syntax highlighting — always dark theme */
+.shiki,
+.shiki span {
+  color: var(--shiki-dark) !important;
+  font-style: var(--shiki-dark-font-style) !important;
+  font-weight: var(--shiki-dark-font-weight) !important;
+  text-decoration: var(--shiki-dark-text-decoration) !important;
+}
+
+/* Ultrathink rainbow sparkle effect - per-letter wave animation */
+@keyframes rainbow-wave {
+  0% {
+    color: #ff5555;
+  } /* red */
+  14% {
+    color: #ffaa00;
+  } /* orange */
+  28% {
+    color: #ffff55;
+  } /* yellow */
+  42% {
+    color: #55ff55;
+  } /* green */
+  57% {
+    color: #55ffff;
+  } /* cyan */
+  71% {
+    color: #5555ff;
+  } /* blue */
+  85% {
+    color: #ff55ff;
+  } /* magenta/pink */
+  100% {
+    color: #ff5555;
+  } /* red */
+}
+
+@keyframes sparkle-wave {
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(0.7);
+  }
+}
+
+.rainbow-letter {
+  display: inline-block;
+  animation:
+    rainbow-wave 2s linear infinite,
+    sparkle-wave 2s ease-in-out infinite;
+  font-weight: 600;
+}
+
+/* PWA install prompt animation */
+@keyframes slide-up {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s ease-out;
+}
+
+/* Syncing spinner animation */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Create-session ring pulse — draws the eye to the "+" button when the session
+   list is empty (sessions.length === 0, raw/unfiltered). ~0.5 Hz soft border-color
+   fade (2s period); applied conditionally by router.tsx's New Session button. */
+@keyframes create-ring-pulse {
+  0%,
+  100% {
+    border-color: var(--app-accent);
+  }
+  50% {
+    border-color: color-mix(in srgb, var(--app-accent) 25%, transparent);
+  }
+}
+
+.create-ring-pulse {
+  animation: create-ring-pulse 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .create-ring-pulse {
+    animation: none;
+  }
+}
+
+/* #3156 R5-3: active-reasoning "Knight Rider" sweep. While a reasoning block is
+ * streaming, the "Reasoning" heading label shows the teal reasoning-category accent
+ * (--cat-reasoning) wiping back and forth across the text — a visual "work in
+ * progress" indicator even when the thinking text itself is withheld. Uses
+ * background-clip:text so the teal sweeps ACROSS the glyphs; base color is
+ * --app-hint. -webkit-text-fill-color is required for the iOS PWA (WebKit). */
+@keyframes reasoning-sweep {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.reasoning-sweep-active {
+  background-image: linear-gradient(
+    90deg,
+    var(--app-hint) 0%,
+    var(--app-hint) 35%,
+    var(--cat-reasoning) 50%,
+    var(--app-hint) 65%,
+    var(--app-hint) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: reasoning-sweep 1.6s linear infinite alternate;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reasoning-sweep-active {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--app-hint);
+  }
+}
+
+/* Jump button bounce animation (centering handled by flexbox, not transform) */
+@keyframes bounce-in {
+  0% {
+    transform: scale(0.8);
+    opacity: 0;
+  }
+  50% {
+    transform: scale(1.05);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.animate-bounce-in {
+  animation: bounce-in 0.3s ease-out forwards;
+}
+
+@keyframes fade-in-up {
+  0% {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.2s ease-out forwards;
+}
+
+/* User message navigation highlight animation */
+@keyframes message-highlight {
+  0% {
+    box-shadow: 0 0 0 0 var(--brand-accent-glow);
+  }
+  50% {
+    box-shadow: 0 0 0 4px var(--brand-accent-glow);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.animate-message-highlight {
+  animation: message-highlight 0.8s ease-out;
+}
+
+/* #3146: the bookmark-navigation landing highlight (the muted-yellow box-shadow
+   glow flashed on jump) is REMOVED. The operator's binding spec is "no message
+   highlight of any kind, ever" — jump feedback now comes from the bookmark icon
+   sitting AT the restored spot, not a yellow flash. */
+
+/* Toast notification animations */
+@keyframes toast-slide-in {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes toast-slide-out {
+  from {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+}
+
+.toast-enter {
+  animation: toast-slide-in 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.toast-exit {
+  animation: toast-slide-out 0.25s ease-in forwards;
+  pointer-events: none;
+}
+
+.toast-item {
+  margin-top: 8px;
+}
+
+/* ─── Icon Column System ───
+   Deterministic icon positioning: each icon occupies a fixed slot
+   measured from the container's right edge. This guarantees vertical
+   alignment across rows regardless of container nesting or viewport width.
+
+   Usage:
+     <div class="icon-row">
+       <div class="icon-col-3"><button>…</button></div>  // leftmost slot
+       <div class="icon-col-2"><button>…</button></div>  // middle slot
+       <div class="icon-col-1"><button>…</button></div>  // rightmost slot
+     </div>
+
+   This rule set IS the slot registry, and it has TWO halves: the grouped
+   `position: absolute` rule below, and each slot's own `right:` offset.
+   A slot needs BOTH — with only one it overlaps a sibling and the icon
+   underneath becomes unclickable. scripts/check-icon-col-registry.ts (run
+   by `bun run lint`) parses this block, so ADDING or REMOVING a slot is
+   picked up automatically, and a slot declared in only one half is
+   reported as half-registered. See #2366.
+*/
+.icon-row {
+  position: relative;
+  min-height: var(--icon-btn-size);
+  /* Width of the icon area = number of slots you use. The row container
+     itself should be placed at the right edge of its parent via flex. */
+}
+
+.icon-col-1,
+.icon-col-2,
+.icon-col-3,
+.icon-col-4,
+.icon-col-5,
+.icon-col-6,
+.icon-col-7 {
+  position: absolute;
+  top: 0;
+  width: var(--icon-btn-size);
+  height: var(--icon-btn-size);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Slot positions from right edge */
+.icon-col-1 {
+  right: 0;
+}
+.icon-col-2 {
+  right: var(--icon-slot);
+} /* 36px */
+.icon-col-3 {
+  right: calc(var(--icon-slot) * 2);
+} /* 72px */
+.icon-col-4 {
+  right: calc(var(--icon-slot) * 3);
+} /* 108px */
+.icon-col-5 {
+  right: calc(var(--icon-slot) * 4);
+} /* 144px */
+.icon-col-6 {
+  right: calc(var(--icon-slot) * 5);
+} /* 180px */
+.icon-col-7 {
+  right: calc(var(--icon-slot) * 6);
+} /* 216px — issue #2149 Edit-session-params slot */
+
+/* Approve button flash animation — bright green burst fading to default */
+@keyframes approve-flash {
+  0% {
+    color: #4ade80;
+    filter: brightness(1.3);
+  }
+  100% {
+    color: currentColor;
+    filter: brightness(1);
+  }
+}
+
+.animate-approve-flash {
+  animation: approve-flash 0.6s ease-out;
+}
+
+/* Clean button flash animation — amber burst fading to default */
+@keyframes clean-flash {
+  0% {
+    color: #fbbf24;
+    filter: brightness(1.3);
+  }
+  100% {
+    color: currentColor;
+    filter: brightness(1);
+  }
+}
+
+.animate-clean-flash {
+  animation: clean-flash 0.6s ease-out;
+}
+
+/* Text scale cascade — convert rem-based Tailwind text utilities to em
+   within the chat thread so they scale with the container's font-size.
+   At 100% scale (14px base): 0.857em=12px, 1em=14px, 1.143em=16px —
+   identical to the original rem values, so no visual regression.
+   At other scales everything cascades proportionally. */
+.chat-thread-content .text-xs {
+  font-size: 0.857em;
+}
+.chat-thread-content .text-sm {
+  font-size: 1em;
+}
+.chat-thread-content .text-base {
+  font-size: 1.143em;
+}
+
+/* Document Picture-in-Picture window styles */
+@media (display-mode: picture-in-picture) {
+  body {
+    margin: 0;
+    background: var(--app-bg);
+    color: var(--app-fg);
+  }
+}
+
+/* Issue #2006 (Part A): paragraph gap for the chat thread. Both chat renderers
+   (markdown-text.tsx, MarkdownRenderer.tsx) share the `.aui-md` wrapper; notes
+   (SimpleMarkdown) already get this via the `[&>p+p]:mt-3` utility. Descendant
+   selector so paragraphs nested in blockquotes / list items also gain the gap. */
+.aui-md p + p {
+  margin-top: 0.75rem;
+}
+
+/* #N4: the settings drawer emerges from the app content-area's right edge (not the
+   window edge) on wide viewports. The drawer's right edge is already anchored to the
+   content column (SettingsDrawer.tsx `right: (100vw - CONTENT_MAX_WIDTH)/2`), so revealing it from
+   its right edge leftward makes it appear to pop out of that edge instead of sweeping in
+   from the far window edge through the brand-purple letterbox. clip-path is relative to
+   the drawer's own box, so this also works on mobile (edge = window) with no branching.
+   No animation-fill-mode: after the run, clip-path reverts to none so the drop shadow
+   (shadow-2xl) renders normally at rest. */
+@keyframes drawer-emerge-from-content-edge {
+  from {
+    clip-path: inset(0 0 0 100%);
+    opacity: 0;
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+    opacity: 1;
+  }
+}
+.settings-drawer-emerge {
+  animation: drawer-emerge-from-content-edge 220ms ease-out;
+}

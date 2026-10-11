@@ -1,0 +1,240 @@
+[
+  {
+    "name": "__meta__",
+    "spec_version": "1.0.0",
+    "spec": ".claude/skills/_shared/conflict-table-spec.md",
+    "helper": ".claude/hooks/lib/conflict_table.py",
+    "notes": [
+      "Canonical cross-repo conformance fixture for the conflict-table severity + recommended-action formula (issue #1081, epic #1074).",
+      "Every conforming implementation (rp1-home Python, hapimatic-private #1970/#1971 TS) must reproduce each vector's expected.severity and expected.recommended_action.",
+      "Cross-repo consumers VENDOR this file with a provenance comment recording the source path + commit sha (native cross-repo sharing is epic #1083).",
+      "Thresholds/weights are PROVISIONAL and tunable from observe-phase data (#1079); on any change, bump spec_version and update these vectors in lockstep.",
+      "Change-kind vocabulary is {edit, rename, move, delete}. #1077's planned 'create' kind is OUT of vocabulary here — resolve at #1077 augment time (add 'create' or map to an existing kind).",
+      "Elements without an 'inputs' key (i.e. this __meta__ entry) are not conformance vectors and are skipped by the test."
+    ]
+  },
+  {
+    "name": "shared-edit-2",
+    "description": "shared tier (3) x edit (1) x 2 = 6 -> medium; no predecessor -> sequence",
+    "inputs": {
+      "path": ".claude/hooks/lib/conflict_table.py",
+      "repo": "rp1-home",
+      "change_kind": "edit",
+      "concurrency": 2,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟡", "recommended_action": "sequence" }
+  },
+  {
+    "name": "core-move-3",
+    "description": "core tier (2) x move (2) x 3 = 12 -> high; no order -> hold-for-user",
+    "inputs": {
+      "path": "scripts/sweep-outside-repos.py",
+      "repo": "rp1-home",
+      "change_kind": "move",
+      "concurrency": 3,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🔴", "recommended_action": "hold-for-user" }
+  },
+  {
+    "name": "leaf-edit-2",
+    "description": "hapimatic-private leaf tier (1) x edit (1) x 2 = 2 -> low; sequence",
+    "inputs": {
+      "path": "web/src/components/Button.tsx",
+      "repo": "hapimatic-private",
+      "change_kind": "edit",
+      "concurrency": 2,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟢", "recommended_action": "sequence" }
+  },
+  {
+    "name": "trivial-doc-edit-3",
+    "description": "trivial tier (0) zeroes the product regardless of change-kind/concurrency -> low",
+    "inputs": {
+      "path": "claudedocs/notes.md",
+      "repo": "rp1-home",
+      "change_kind": "edit",
+      "concurrency": 3,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟢", "recommended_action": "sequence" }
+  },
+  {
+    "name": "core-rename-2",
+    "description": "core tier (2) x rename (2) x 2 = 8 -> medium; rename change-kind coverage",
+    "inputs": {
+      "path": ".claude/hooks/session-edit-logger.py",
+      "repo": "rp1-home",
+      "change_kind": "rename",
+      "concurrency": 2,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟡", "recommended_action": "sequence" }
+  },
+  {
+    "name": "shared-delete-2",
+    "description": "shared tier (3) x delete (2) x 2 = 12 -> high; delete change-kind coverage; hold-for-user",
+    "inputs": {
+      "path": ".claude/skills/_shared/conflict-table-spec.md",
+      "repo": "rp1-home",
+      "change_kind": "delete",
+      "concurrency": 2,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🔴", "recommended_action": "hold-for-user" }
+  },
+  {
+    "name": "boundary-green-top",
+    "description": "named band boundary (1, edit, 3) = 3 -> top of low (green)",
+    "inputs": {
+      "path": "web/src/pages/Home.tsx",
+      "repo": "hapimatic-private",
+      "change_kind": "edit",
+      "concurrency": 3,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟢", "recommended_action": "sequence" }
+  },
+  {
+    "name": "boundary-yellow-bottom",
+    "description": "named band boundary (1, rename, 2) = 4 -> bottom of medium (yellow)",
+    "inputs": {
+      "path": "web/src/pages/Login.tsx",
+      "repo": "hapimatic-private",
+      "change_kind": "rename",
+      "concurrency": 2,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟡", "recommended_action": "sequence" }
+  },
+  {
+    "name": "boundary-yellow-high",
+    "description": "named band boundary (3, edit, 3) = 9 -> near top of medium (yellow)",
+    "inputs": {
+      "path": ".claude/hooks/lib/edit_tracker.py",
+      "repo": "rp1-home",
+      "change_kind": "edit",
+      "concurrency": 3,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟡", "recommended_action": "sequence" }
+  },
+  {
+    "name": "boundary-red-bottom",
+    "description": "named band boundary (3, delete, 2) = 12 -> bottom of high (red)",
+    "inputs": {
+      "path": ".claude/CLAUDE.md",
+      "repo": "rp1-home",
+      "change_kind": "delete",
+      "concurrency": 2,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🔴", "recommended_action": "hold-for-user" }
+  },
+  {
+    "name": "overlap-glob-shared-test",
+    "description": "overlapping-glob precedence: shared/src/foo.test.ts matches BOTH shared/src/** (3) and **/*.test.* (trivial) -> trivial-first wins -> 0 -> green",
+    "inputs": {
+      "path": "shared/src/foo.test.ts",
+      "repo": "hapimatic-private",
+      "change_kind": "edit",
+      "concurrency": 3,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟢", "recommended_action": "sequence" }
+  },
+  {
+    "name": "action-proceed-ignored",
+    "description": "all overlapping paths churn-ignored (#1080) -> proceed (row 1 wins over severity)",
+    "inputs": {
+      "path": "claudedocs/scratch.md",
+      "repo": "rp1-home",
+      "change_kind": "edit",
+      "concurrency": 2,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": true
+    },
+    "expected": { "severity": "🟢", "recommended_action": "proceed" }
+  },
+  {
+    "name": "action-rebase-predecessor",
+    "description": "clear predecessor (ordering known + issue) -> rebase-after #N; hapimatic-private path",
+    "inputs": {
+      "path": "shared/src/index.ts",
+      "repo": "hapimatic-private",
+      "change_kind": "edit",
+      "concurrency": 2,
+      "ordering_known": true,
+      "predecessor_issue": 1075,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟡", "recommended_action": "rebase-after #1075" }
+  },
+  {
+    "name": "action-hold-core",
+    "description": "core tier (2) x delete (2) x 3 = 12 -> high; no order -> hold-for-user",
+    "inputs": {
+      "path": ".claude/hooks/mcp-enable-detector.py",
+      "repo": "rp1-home",
+      "change_kind": "delete",
+      "concurrency": 3,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🔴", "recommended_action": "hold-for-user" }
+  },
+  {
+    "name": "unknown-path-default",
+    "description": "path matching no tier -> conservative leaf default (1), never silently green; (1) x edit (1) x 2 = 2 -> low",
+    "inputs": {
+      "path": "some/unrecognized/path.txt",
+      "repo": "rp1-home",
+      "change_kind": "edit",
+      "concurrency": 2,
+      "ordering_known": false,
+      "predecessor_issue": null,
+      "all_ignored": false
+    },
+    "expected": { "severity": "🟢", "recommended_action": "sequence" }
+  },
+  {
+    "name": "action-rebase-over-red",
+    "description": "predecessor (row 2) wins over 🔴 severity: 3 x delete (2) x 2 = 12 -> red, but rebase-after #N",
+    "inputs": {
+      "path": ".claude/skills/_shared/conflict-table-spec.md",
+      "repo": "rp1-home",
+      "change_kind": "delete",
+      "concurrency": 2,
+      "ordering_known": true,
+      "predecessor_issue": "#1075",
+      "all_ignored": false
+    },
+    "expected": { "severity": "🔴", "recommended_action": "rebase-after #1075" }
+  }
+]

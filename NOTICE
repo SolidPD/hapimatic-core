@@ -1,0 +1,14 @@
+Hapimatic
+Copyright (C) 2026 Matt Starfield
+
+This is a modified version of the hapi project. The files in this repository
+have been changed from their upstream originals by Matt Starfield in 2026.
+
+Based on hapi, Copyright (C) 2024-2025 weishu, https://github.com/tiann/hapi,
+AGPL-3.0-only.
+
+The cli package contains MIT-licensed happy-cli code — see cli/NOTICE.
+
+gateway/ is a separate program outside the AGPL core and is not covered by
+LICENSE; see the open-core boundary statement (#3869) — wording to be confirmed
+by counsel (#4003).

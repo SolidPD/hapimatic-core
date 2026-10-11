@@ -1,0 +1,184 @@
+[
+  {
+    "name": "__meta__",
+    "issue": 2884,
+    "rule": "git-object-db-write-conflict",
+    "notes": [
+      "Table-driven conformance vectors for the INCIDENT_DERIVED git-object-db-write-conflict predicate.",
+      "One positive vector (a broken graph the predicate MUST flag) + four negative vectors (safe graphs it must pass).",
+      "Mirrors shared/src/graph/ir.vectors.json: the __meta__ element (no `graph` key) is skipped by the test.",
+      "Negatives isolate one region-boundary property each: different resource name, read-only mode, same-branch sequential writers (R-7 i), in-region-vs-post-join writers (R-7 ii).",
+      "Graphs are well-formed GraphIR (each parses via validateGraphIR) so they are realistic; the predicate itself is tolerant of dangling refs (validateGraphIR owns that error class)."
+    ]
+  },
+  {
+    "name": "conflict-git-object-db-parallel-siblings",
+    "description": "R4 worked example: two nodes on distinct sibling branches of one parallel fan-out both write git-object-db(hapimatic-private) → MUST flag.",
+    "expect_flagged": true,
+    "rule_id": "git-object-db-write-conflict",
+    "graph": {
+      "id": "conflict-positive",
+      "version": "0.1",
+      "nodes": [
+        { "id": "fanout", "kind": "parallel", "targets": ["w1", "w2"] },
+        {
+          "id": "w1",
+          "kind": "sequence",
+          "resources": [
+            { "name": "git-object-db(hapimatic-private)", "mode": "write" }
+          ]
+        },
+        {
+          "id": "w2",
+          "kind": "sequence",
+          "resources": [
+            { "name": "git-object-db(hapimatic-private)", "mode": "write" }
+          ]
+        },
+        { "id": "j", "kind": "join", "upstreams": ["w1", "w2"] }
+      ],
+      "edges": [
+        { "from": "fanout", "to": "w1" },
+        { "from": "fanout", "to": "w2" },
+        { "from": "w1", "to": "j" },
+        { "from": "w2", "to": "j" }
+      ]
+    }
+  },
+  {
+    "name": "no-conflict-different-repos",
+    "description": "Two parallel siblings write DIFFERENT git-object-db resources (different repos) → different conflict key → pass.",
+    "expect_flagged": false,
+    "rule_id": "git-object-db-write-conflict",
+    "graph": {
+      "id": "no-conflict-diff-repos",
+      "version": "0.1",
+      "nodes": [
+        { "id": "fanout", "kind": "parallel", "targets": ["w1", "w2"] },
+        {
+          "id": "w1",
+          "kind": "sequence",
+          "resources": [{ "name": "git-object-db(repo-a)", "mode": "write" }]
+        },
+        {
+          "id": "w2",
+          "kind": "sequence",
+          "resources": [{ "name": "git-object-db(repo-b)", "mode": "write" }]
+        },
+        { "id": "j", "kind": "join", "upstreams": ["w1", "w2"] }
+      ],
+      "edges": [
+        { "from": "w1", "to": "j" },
+        { "from": "w2", "to": "j" }
+      ]
+    }
+  },
+  {
+    "name": "no-conflict-both-read",
+    "description": "Two parallel siblings both READ the same git-object-db resource → read is not write-like → pass.",
+    "expect_flagged": false,
+    "rule_id": "git-object-db-write-conflict",
+    "graph": {
+      "id": "no-conflict-both-read",
+      "version": "0.1",
+      "nodes": [
+        { "id": "fanout", "kind": "parallel", "targets": ["r1", "r2"] },
+        {
+          "id": "r1",
+          "kind": "sequence",
+          "resources": [
+            { "name": "git-object-db(hapimatic-private)", "mode": "read" }
+          ]
+        },
+        {
+          "id": "r2",
+          "kind": "sequence",
+          "resources": [
+            { "name": "git-object-db(hapimatic-private)", "mode": "read" }
+          ]
+        },
+        { "id": "j", "kind": "join", "upstreams": ["r1", "r2"] }
+      ],
+      "edges": [
+        { "from": "r1", "to": "j" },
+        { "from": "r2", "to": "j" }
+      ]
+    }
+  },
+  {
+    "name": "no-conflict-sequential-same-branch",
+    "description": "R-7 (i): two SEQUENTIAL writers of the same resource inside the SAME fan-out branch (w1 -> w1b) → they share a branch-head → not concurrent → pass.",
+    "expect_flagged": false,
+    "rule_id": "git-object-db-write-conflict",
+    "graph": {
+      "id": "no-conflict-sequential-same-branch",
+      "version": "0.1",
+      "nodes": [
+        { "id": "fanout", "kind": "parallel", "targets": ["w1", "safe"] },
+        {
+          "id": "w1",
+          "kind": "sequence",
+          "resources": [
+            { "name": "git-object-db(hapimatic-private)", "mode": "write" }
+          ]
+        },
+        {
+          "id": "w1b",
+          "kind": "sequence",
+          "resources": [
+            { "name": "git-object-db(hapimatic-private)", "mode": "write" }
+          ]
+        },
+        {
+          "id": "safe",
+          "kind": "sequence",
+          "resources": [{ "name": "scratch", "mode": "read" }]
+        },
+        { "id": "j", "kind": "join", "upstreams": ["w1b", "safe"] }
+      ],
+      "edges": [
+        { "from": "w1", "to": "w1b" },
+        { "from": "w1b", "to": "j" },
+        { "from": "safe", "to": "j" }
+      ]
+    }
+  },
+  {
+    "name": "no-conflict-in-region-vs-post-join",
+    "description": "R-7 (ii): an in-region writer (w1) and a POST-JOIN writer (w3) both write git-object-db → w3 is only reachable through the join, so it has an empty branch-head set → not concurrent → pass.",
+    "expect_flagged": false,
+    "rule_id": "git-object-db-write-conflict",
+    "graph": {
+      "id": "no-conflict-in-region-vs-post-join",
+      "version": "0.1",
+      "nodes": [
+        { "id": "fanout", "kind": "parallel", "targets": ["w1", "safe"] },
+        {
+          "id": "w1",
+          "kind": "sequence",
+          "resources": [
+            { "name": "git-object-db(hapimatic-private)", "mode": "write" }
+          ]
+        },
+        {
+          "id": "safe",
+          "kind": "sequence",
+          "resources": [{ "name": "scratch", "mode": "read" }]
+        },
+        { "id": "j", "kind": "join", "upstreams": ["w1", "safe"] },
+        {
+          "id": "w3",
+          "kind": "sequence",
+          "resources": [
+            { "name": "git-object-db(hapimatic-private)", "mode": "write" }
+          ]
+        }
+      ],
+      "edges": [
+        { "from": "w1", "to": "j" },
+        { "from": "safe", "to": "j" },
+        { "from": "j", "to": "w3" }
+      ]
+    }
+  }
+]

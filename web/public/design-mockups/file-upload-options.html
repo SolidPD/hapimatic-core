@@ -1,0 +1,1702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hapimatic File Upload UI Options - Issue #197</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --app-bg: #0f1f1a;
+            --app-secondary-bg: #162822;
+            --app-tertiary-bg: #1d332b;
+            --app-fg: #e8f5f0;
+            --app-hint: #6b8a7f;
+            --app-link: #5ae6ab;
+            --app-link-hover: #7eecbe;
+            --app-divider: #2a4a3f;
+            --app-error: #f87171;
+            --app-warning: #fbbf24;
+            --font-display: 'Plus Jakarta Sans', system-ui, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            --phone-width: 402px;
+            --phone-height: 874px;
+            --safe-area-top: 62px;
+            --safe-area-bottom: 34px;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: var(--font-display);
+            background: linear-gradient(135deg, #0a1410 0%, #0f1f1a 50%, #0a1814 100%);
+            min-height: 100vh;
+            color: var(--app-fg);
+            padding: 2rem;
+        }
+
+        /* Page Header */
+        .page-header {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding-bottom: 2rem;
+            border-bottom: 1px solid var(--app-divider);
+        }
+
+        .page-header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--app-link) 0%, #a8f5d8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        .page-header .subtitle {
+            color: var(--app-hint);
+            font-size: 1.1rem;
+            font-weight: 500;
+        }
+
+        .page-header .issue-badge {
+            display: inline-block;
+            margin-top: 1rem;
+            padding: 0.5rem 1rem;
+            background: var(--app-tertiary-bg);
+            border: 1px solid var(--app-divider);
+            border-radius: 2rem;
+            font-family: var(--font-mono);
+            font-size: 0.875rem;
+            color: var(--app-link);
+        }
+
+        /* Instructions Panel */
+        .instructions {
+            max-width: 800px;
+            margin: 0 auto 3rem;
+            padding: 1.5rem;
+            background: var(--app-secondary-bg);
+            border: 1px solid var(--app-divider);
+            border-radius: 1rem;
+            border-left: 4px solid var(--app-link);
+        }
+
+        .instructions h3 {
+            color: var(--app-link);
+            margin-bottom: 0.75rem;
+            font-size: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .instructions p {
+            color: var(--app-hint);
+            line-height: 1.6;
+        }
+
+        .instructions ul {
+            margin-top: 0.75rem;
+            padding-left: 1.5rem;
+            color: var(--app-fg);
+        }
+
+        .instructions li {
+            margin-bottom: 0.5rem;
+        }
+
+        /* Options Grid */
+        .options-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 2rem;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        /* Option Card */
+        .option-card {
+            background: var(--app-secondary-bg);
+            border: 1px solid var(--app-divider);
+            border-radius: 1.5rem;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }
+
+        .option-card:hover {
+            border-color: var(--app-link);
+            box-shadow: 0 0 40px rgba(90, 230, 171, 0.1);
+        }
+
+        .option-header {
+            padding: 1.5rem;
+            border-bottom: 1px solid var(--app-divider);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .option-label {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .option-badge {
+            width: 2.5rem;
+            height: 2.5rem;
+            background: linear-gradient(135deg, var(--app-link) 0%, #3dd89a 100%);
+            border-radius: 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            color: var(--app-bg);
+            font-size: 1.25rem;
+        }
+
+        .option-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .option-subtitle {
+            font-size: 0.875rem;
+            color: var(--app-hint);
+        }
+
+        /* State Tabs */
+        .state-tabs {
+            display: flex;
+            gap: 0.25rem;
+            padding: 0.25rem;
+            background: var(--app-tertiary-bg);
+            border-radius: 0.5rem;
+        }
+
+        .state-tab {
+            padding: 0.5rem 0.75rem;
+            border: none;
+            background: transparent;
+            color: var(--app-hint);
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            border-radius: 0.375rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .state-tab:hover {
+            color: var(--app-fg);
+        }
+
+        .state-tab.active {
+            background: var(--app-link);
+            color: var(--app-bg);
+        }
+
+        /* Phone Frame */
+        .phone-container {
+            padding: 1.5rem;
+            display: flex;
+            justify-content: center;
+        }
+
+        .phone-frame {
+            width: var(--phone-width);
+            height: 320px;
+            background: var(--app-bg);
+            border-radius: 1rem;
+            overflow: hidden;
+            border: 2px solid var(--app-divider);
+            position: relative;
+        }
+
+        .phone-content {
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            padding: 1rem;
+        }
+
+        /* Composer Styles - Shared */
+        .composer-wrapper {
+            background: var(--app-secondary-bg);
+            border-radius: 0.75rem;
+            overflow: hidden;
+        }
+
+        .composer-input-area {
+            padding: 0.75rem 1rem;
+            display: flex;
+            align-items: center;
+        }
+
+        .composer-input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--app-fg);
+            font-size: 0.875rem;
+            outline: none;
+        }
+
+        .composer-input::placeholder {
+            color: var(--app-hint);
+        }
+
+        .composer-buttons {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            border-top: 1px solid var(--app-divider);
+        }
+
+        .composer-btn {
+            width: 44px;
+            height: 44px;
+            min-width: 44px;
+            border-radius: 0.5rem;
+            border: none;
+            background: transparent;
+            color: var(--app-hint);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+
+        .composer-btn:hover {
+            background: var(--app-tertiary-bg);
+            color: var(--app-fg);
+        }
+
+        .composer-btn.primary {
+            background: var(--app-link);
+            color: var(--app-bg);
+        }
+
+        .composer-btn.primary:hover {
+            background: var(--app-link-hover);
+        }
+
+        .composer-btn.attachment {
+            color: var(--app-link);
+        }
+
+        .composer-btn svg {
+            width: 20px;
+            height: 20px;
+        }
+
+        .spacer {
+            flex: 1;
+        }
+
+        /* Attachment Chips */
+        .attachment-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            padding: 0.75rem;
+            border-top: 1px solid var(--app-divider);
+        }
+
+        .attachment-chip {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.75rem;
+            background: var(--app-tertiary-bg);
+            border: 1px solid var(--app-divider);
+            border-radius: 2rem;
+            font-size: 0.75rem;
+            color: var(--app-fg);
+            max-width: 150px;
+        }
+
+        .attachment-chip .icon {
+            width: 16px;
+            height: 16px;
+            color: var(--app-link);
+            flex-shrink: 0;
+        }
+
+        .attachment-chip .name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .attachment-chip .remove {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: transparent;
+            border: none;
+            color: var(--app-hint);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            transition: all 0.2s ease;
+        }
+
+        .attachment-chip .remove:hover {
+            background: var(--app-error);
+            color: white;
+        }
+
+        .attachment-chip .remove svg {
+            width: 12px;
+            height: 12px;
+        }
+
+        /* Progress State */
+        .attachment-chip.uploading {
+            border-color: var(--app-link);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .attachment-chip.uploading::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            bottom: 0;
+            height: 2px;
+            width: 60%;
+            background: var(--app-link);
+            animation: progress 1.5s ease-in-out infinite;
+        }
+
+        @keyframes progress {
+            0% { width: 0; }
+            50% { width: 80%; }
+            100% { width: 100%; }
+        }
+
+        /* Rename Input */
+        .attachment-chip.renaming {
+            border-color: var(--app-link);
+            background: var(--app-secondary-bg);
+        }
+
+        .attachment-chip.renaming input {
+            background: transparent;
+            border: none;
+            color: var(--app-fg);
+            font-size: 0.75rem;
+            width: 80px;
+            outline: none;
+        }
+
+        /* Option A Specific - Inline Left */
+        .option-a .attachment-area {
+            display: none;
+        }
+
+        .option-a.has-attachments .attachment-area {
+            display: block;
+        }
+
+        /* Option B Specific - Attachment Row */
+        .option-b .attachment-row {
+            padding: 0.75rem;
+            border-top: 1px solid var(--app-divider);
+            min-height: 60px;
+        }
+
+        .option-b .drop-zone {
+            border: 2px dashed var(--app-divider);
+            border-radius: 0.5rem;
+            padding: 1rem;
+            text-align: center;
+            color: var(--app-hint);
+            font-size: 0.75rem;
+            transition: all 0.2s ease;
+        }
+
+        .option-b .drop-zone:hover {
+            border-color: var(--app-link);
+            color: var(--app-fg);
+        }
+
+        .option-b .drop-zone svg {
+            width: 24px;
+            height: 24px;
+            margin-bottom: 0.5rem;
+            opacity: 0.5;
+        }
+
+        .option-b.has-attachments .drop-zone {
+            display: none;
+        }
+
+        .option-b .attachment-chips {
+            border-top: none;
+            padding: 0;
+        }
+
+        /* Option C Specific - Expandable Panel */
+        .option-c .panel-wrapper {
+            position: relative;
+        }
+
+        .option-c .expandable-panel {
+            position: absolute;
+            bottom: 100%;
+            left: 0;
+            right: 0;
+            background: var(--app-secondary-bg);
+            border: 1px solid var(--app-divider);
+            border-bottom: none;
+            border-radius: 0.75rem 0.75rem 0 0;
+            padding: 1rem;
+            display: none;
+            animation: slideUp 0.2s ease;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .option-c.expanded .expandable-panel {
+            display: block;
+        }
+
+        .option-c .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }
+
+        .option-c .panel-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--app-fg);
+        }
+
+        .option-c .panel-close {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            border: none;
+            background: var(--app-tertiary-bg);
+            color: var(--app-hint);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .option-c .panel-close:hover {
+            color: var(--app-fg);
+        }
+
+        .option-c .mini-drop {
+            border: 2px dashed var(--app-divider);
+            border-radius: 0.5rem;
+            padding: 0.75rem;
+            text-align: center;
+            color: var(--app-hint);
+            font-size: 0.75rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .option-c .attachment-chips {
+            border-top: none;
+            padding: 0;
+        }
+
+        .option-c .composer-btn.attachment.active {
+            background: var(--app-link);
+            color: var(--app-bg);
+        }
+
+        .option-c .attachment-indicator {
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            width: 16px;
+            height: 16px;
+            background: var(--app-link);
+            border-radius: 50%;
+            font-size: 0.625rem;
+            color: var(--app-bg);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+        }
+
+        /* Option D Specific - Floating Action */
+        .option-d .floating-btn {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--app-link) 0%, #3dd89a 100%);
+            border: none;
+            color: var(--app-bg);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 20px rgba(90, 230, 171, 0.3);
+            transition: all 0.2s ease;
+        }
+
+        .option-d .floating-btn:hover {
+            transform: scale(1.1);
+            box-shadow: 0 6px 30px rgba(90, 230, 171, 0.4);
+        }
+
+        .option-d .floating-btn svg {
+            width: 24px;
+            height: 24px;
+        }
+
+        .option-d .floating-panel {
+            position: absolute;
+            top: 4.5rem;
+            right: 1rem;
+            left: 1rem;
+            background: var(--app-secondary-bg);
+            border: 1px solid var(--app-divider);
+            border-radius: 0.75rem;
+            padding: 1rem;
+            display: none;
+            animation: fadeIn 0.2s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: scale(0.95); }
+            to { opacity: 1; transform: scale(1); }
+        }
+
+        .option-d.expanded .floating-panel {
+            display: block;
+        }
+
+        .option-d .floating-indicator {
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            width: 20px;
+            height: 20px;
+            background: var(--app-error);
+            border-radius: 50%;
+            font-size: 0.75rem;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+        }
+
+        /* Pros/Cons Section */
+        .pros-cons {
+            padding: 1rem 1.5rem 1.5rem;
+            border-top: 1px solid var(--app-divider);
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        .pros h4, .cons h4 {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.375rem;
+        }
+
+        .pros h4 {
+            color: var(--app-link);
+        }
+
+        .cons h4 {
+            color: var(--app-warning);
+        }
+
+        .pros ul, .cons ul {
+            list-style: none;
+            font-size: 0.8rem;
+            color: var(--app-hint);
+            line-height: 1.5;
+        }
+
+        .pros li::before {
+            content: '✓ ';
+            color: var(--app-link);
+        }
+
+        .cons li::before {
+            content: '✗ ';
+            color: var(--app-warning);
+        }
+
+        /* Recommendation Badge */
+        .recommendation {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.375rem;
+            padding: 0.25rem 0.75rem;
+            background: linear-gradient(135deg, rgba(90, 230, 171, 0.2) 0%, rgba(90, 230, 171, 0.1) 100%);
+            border: 1px solid var(--app-link);
+            border-radius: 1rem;
+            font-size: 0.75rem;
+            color: var(--app-link);
+            font-weight: 600;
+        }
+
+        /* Hidden States */
+        .state-content {
+            display: none;
+        }
+
+        .state-content.active {
+            display: block;
+        }
+
+        /* Footer */
+        .page-footer {
+            text-align: center;
+            padding: 3rem 0;
+            margin-top: 3rem;
+            border-top: 1px solid var(--app-divider);
+            color: var(--app-hint);
+            font-size: 0.875rem;
+        }
+
+        .page-footer code {
+            font-family: var(--font-mono);
+            background: var(--app-tertiary-bg);
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 1100px) {
+            .options-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 600px) {
+            body {
+                padding: 1rem;
+            }
+
+            .page-header h1 {
+                font-size: 1.75rem;
+            }
+
+            .option-header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 1rem;
+            }
+
+            .pros-cons {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="page-header">
+        <h1>File Upload UI Options</h1>
+        <p class="subtitle">Hapimatic Composer Enhancement</p>
+        <span class="issue-badge">Issue #197</span>
+    </header>
+
+    <div class="instructions">
+        <h3>📋 Instructions</h3>
+        <p>Review each design option below. Click the state tabs to see different interaction states. Consider which approach best fits your workflow and iOS PWA usage patterns.</p>
+        <ul>
+            <li><strong>Default</strong> — How the composer looks with no attachments</li>
+            <li><strong>Attached</strong> — With 2-3 files attached, showing chips</li>
+            <li><strong>Rename</strong> — Inline editing of filename before upload</li>
+            <li><strong>Progress</strong> — Upload in progress with indicator</li>
+        </ul>
+    </div>
+
+    <div class="options-grid">
+        <!-- Option A: Inline Left -->
+        <div class="option-card" id="option-a">
+            <div class="option-header">
+                <div class="option-label">
+                    <span class="option-badge">A</span>
+                    <div>
+                        <div class="option-title">Inline Left</div>
+                        <div class="option-subtitle">Attachment button in existing row</div>
+                    </div>
+                </div>
+                <div class="state-tabs">
+                    <button class="state-tab active" data-state="default" onclick="switchState('a', 'default')">Default</button>
+                    <button class="state-tab" data-state="attached" onclick="switchState('a', 'attached')">Attached</button>
+                    <button class="state-tab" data-state="rename" onclick="switchState('a', 'rename')">Rename</button>
+                    <button class="state-tab" data-state="progress" onclick="switchState('a', 'progress')">Progress</button>
+                </div>
+            </div>
+
+            <div class="phone-container">
+                <div class="phone-frame">
+                    <div class="phone-content">
+                        <!-- Default State -->
+                        <div class="state-content active" data-state="default">
+                            <div class="composer-wrapper option-a">
+                                <div class="composer-input-area">
+                                    <input type="text" class="composer-input" placeholder="Type a message...">
+                                </div>
+                                <div class="composer-buttons">
+                                    <button class="composer-btn attachment" title="Attach file">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Settings">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Abort">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                        </svg>
+                                    </button>
+                                    <span class="spacer"></span>
+                                    <button class="composer-btn primary" title="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Attached State -->
+                        <div class="state-content" data-state="attached">
+                            <div class="composer-wrapper option-a has-attachments">
+                                <div class="composer-input-area">
+                                    <input type="text" class="composer-input" placeholder="Type a message...">
+                                </div>
+                                <div class="attachment-chips attachment-area">
+                                    <div class="attachment-chip">
+                                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                        <span class="name">screenshot.png</span>
+                                        <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                    </div>
+                                    <div class="attachment-chip">
+                                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                        <span class="name">report.pdf</span>
+                                        <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                    </div>
+                                </div>
+                                <div class="composer-buttons">
+                                    <button class="composer-btn attachment" title="Attach file">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Settings">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Abort">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                        </svg>
+                                    </button>
+                                    <span class="spacer"></span>
+                                    <button class="composer-btn primary" title="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Rename State -->
+                        <div class="state-content" data-state="rename">
+                            <div class="composer-wrapper option-a has-attachments">
+                                <div class="composer-input-area">
+                                    <input type="text" class="composer-input" placeholder="Type a message...">
+                                </div>
+                                <div class="attachment-chips attachment-area">
+                                    <div class="attachment-chip renaming">
+                                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                        <input type="text" value="error-log" autofocus>
+                                        <span style="color: var(--app-hint)">.png</span>
+                                    </div>
+                                    <div class="attachment-chip">
+                                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                        <span class="name">report.pdf</span>
+                                        <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                    </div>
+                                </div>
+                                <div class="composer-buttons">
+                                    <button class="composer-btn attachment" title="Attach file">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Settings">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Abort">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                        </svg>
+                                    </button>
+                                    <span class="spacer"></span>
+                                    <button class="composer-btn primary" title="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Progress State -->
+                        <div class="state-content" data-state="progress">
+                            <div class="composer-wrapper option-a has-attachments">
+                                <div class="composer-input-area">
+                                    <input type="text" class="composer-input" placeholder="Type a message...">
+                                </div>
+                                <div class="attachment-chips attachment-area">
+                                    <div class="attachment-chip uploading">
+                                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                        <span class="name">large-image.png</span>
+                                    </div>
+                                    <div class="attachment-chip">
+                                        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                        <span class="name">report.pdf</span>
+                                        <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                    </div>
+                                </div>
+                                <div class="composer-buttons">
+                                    <button class="composer-btn attachment" title="Attach file">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Settings">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Abort">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                        </svg>
+                                    </button>
+                                    <span class="spacer"></span>
+                                    <button class="composer-btn primary" title="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="pros-cons">
+                <div class="pros">
+                    <h4>✓ Pros</h4>
+                    <ul>
+                        <li>Minimal UI change</li>
+                        <li>Familiar pattern (Slack, Discord)</li>
+                        <li>Single tap to attach</li>
+                        <li>Chips appear naturally above buttons</li>
+                    </ul>
+                </div>
+                <div class="cons">
+                    <h4>✗ Cons</h4>
+                    <ul>
+                        <li>Button row gets crowded</li>
+                        <li>No drag-drop affordance</li>
+                        <li>Limited preview space</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Option B: Attachment Row -->
+        <div class="option-card" id="option-b">
+            <div class="option-header">
+                <div class="option-label">
+                    <span class="option-badge">B</span>
+                    <div>
+                        <div class="option-title">Attachment Row</div>
+                        <div class="option-subtitle">Dedicated drop zone above buttons</div>
+                    </div>
+                </div>
+                <div class="state-tabs">
+                    <button class="state-tab active" data-state="default" onclick="switchState('b', 'default')">Default</button>
+                    <button class="state-tab" data-state="attached" onclick="switchState('b', 'attached')">Attached</button>
+                    <button class="state-tab" data-state="rename" onclick="switchState('b', 'rename')">Rename</button>
+                    <button class="state-tab" data-state="progress" onclick="switchState('b', 'progress')">Progress</button>
+                </div>
+            </div>
+
+            <div class="phone-container">
+                <div class="phone-frame">
+                    <div class="phone-content">
+                        <!-- Default State -->
+                        <div class="state-content active" data-state="default">
+                            <div class="composer-wrapper option-b">
+                                <div class="composer-input-area">
+                                    <input type="text" class="composer-input" placeholder="Type a message...">
+                                </div>
+                                <div class="attachment-row">
+                                    <div class="drop-zone">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                        </svg>
+                                        <div>Tap to attach or drag files here</div>
+                                    </div>
+                                </div>
+                                <div class="composer-buttons">
+                                    <button class="composer-btn" title="Settings">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Abort">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                        </svg>
+                                    </button>
+                                    <span class="spacer"></span>
+                                    <button class="composer-btn primary" title="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Attached State -->
+                        <div class="state-content" data-state="attached">
+                            <div class="composer-wrapper option-b has-attachments">
+                                <div class="composer-input-area">
+                                    <input type="text" class="composer-input" placeholder="Type a message...">
+                                </div>
+                                <div class="attachment-row">
+                                    <div class="attachment-chips">
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                            <span class="name">screenshot.png</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                            <span class="name">report.pdf</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                                            <span class="name">utils.ts</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="composer-buttons">
+                                    <button class="composer-btn attachment" title="Add more">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Settings">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Abort">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                        </svg>
+                                    </button>
+                                    <span class="spacer"></span>
+                                    <button class="composer-btn primary" title="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Rename State -->
+                        <div class="state-content" data-state="rename">
+                            <div class="composer-wrapper option-b has-attachments">
+                                <div class="composer-input-area">
+                                    <input type="text" class="composer-input" placeholder="Type a message...">
+                                </div>
+                                <div class="attachment-row">
+                                    <div class="attachment-chips">
+                                        <div class="attachment-chip renaming">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                            <input type="text" value="debug-view" autofocus>
+                                            <span style="color: var(--app-hint)">.png</span>
+                                        </div>
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                            <span class="name">report.pdf</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="composer-buttons">
+                                    <button class="composer-btn attachment" title="Add more">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Settings">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Abort">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                        </svg>
+                                    </button>
+                                    <span class="spacer"></span>
+                                    <button class="composer-btn primary" title="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Progress State -->
+                        <div class="state-content" data-state="progress">
+                            <div class="composer-wrapper option-b has-attachments">
+                                <div class="composer-input-area">
+                                    <input type="text" class="composer-input" placeholder="Type a message...">
+                                </div>
+                                <div class="attachment-row">
+                                    <div class="attachment-chips">
+                                        <div class="attachment-chip uploading">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                            <span class="name">uploading...</span>
+                                        </div>
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                            <span class="name">report.pdf</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="composer-buttons">
+                                    <button class="composer-btn attachment" title="Add more">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Settings">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                        </svg>
+                                    </button>
+                                    <button class="composer-btn" title="Abort">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                        </svg>
+                                    </button>
+                                    <span class="spacer"></span>
+                                    <button class="composer-btn primary" title="Send">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="pros-cons">
+                <div class="pros">
+                    <h4>✓ Pros</h4>
+                    <ul>
+                        <li>Clear drop zone for desktop</li>
+                        <li>Ample space for chips</li>
+                        <li>Visual hierarchy is clear</li>
+                        <li>Supports many attachments</li>
+                    </ul>
+                </div>
+                <div class="cons">
+                    <h4>✗ Cons</h4>
+                    <ul>
+                        <li>Takes vertical space always</li>
+                        <li>Drop zone wasted on mobile</li>
+                        <li>May feel cluttered</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Option C: Expandable Panel -->
+        <div class="option-card" id="option-c">
+            <div class="option-header">
+                <div class="option-label">
+                    <span class="option-badge">C</span>
+                    <div>
+                        <div class="option-title">Expandable Panel <span class="recommendation">⭐ Recommended</span></div>
+                        <div class="option-subtitle">Tap icon to reveal attachment panel</div>
+                    </div>
+                </div>
+                <div class="state-tabs">
+                    <button class="state-tab active" data-state="default" onclick="switchState('c', 'default')">Default</button>
+                    <button class="state-tab" data-state="attached" onclick="switchState('c', 'attached')">Attached</button>
+                    <button class="state-tab" data-state="rename" onclick="switchState('c', 'rename')">Rename</button>
+                    <button class="state-tab" data-state="progress" onclick="switchState('c', 'progress')">Progress</button>
+                </div>
+            </div>
+
+            <div class="phone-container">
+                <div class="phone-frame">
+                    <div class="phone-content">
+                        <!-- Default State -->
+                        <div class="state-content active" data-state="default">
+                            <div class="composer-wrapper option-c">
+                                <div class="panel-wrapper">
+                                    <div class="composer-input-area">
+                                        <input type="text" class="composer-input" placeholder="Type a message...">
+                                    </div>
+                                    <div class="composer-buttons">
+                                        <button class="composer-btn attachment" title="Attach file">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                            </svg>
+                                        </button>
+                                        <button class="composer-btn" title="Settings">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                            </svg>
+                                        </button>
+                                        <button class="composer-btn" title="Abort">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                            </svg>
+                                        </button>
+                                        <span class="spacer"></span>
+                                        <button class="composer-btn primary" title="Send">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Attached State (Expanded) -->
+                        <div class="state-content" data-state="attached">
+                            <div class="composer-wrapper option-c expanded">
+                                <div class="panel-wrapper">
+                                    <div class="expandable-panel">
+                                        <div class="panel-header">
+                                            <span class="panel-title">Attachments</span>
+                                            <button class="panel-close">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                            </button>
+                                        </div>
+                                        <div class="mini-drop">+ Tap to add more files</div>
+                                        <div class="attachment-chips">
+                                            <div class="attachment-chip">
+                                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                                <span class="name">screenshot.png</span>
+                                                <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                            </div>
+                                            <div class="attachment-chip">
+                                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                                <span class="name">report.pdf</span>
+                                                <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="composer-input-area">
+                                        <input type="text" class="composer-input" placeholder="Type a message...">
+                                    </div>
+                                    <div class="composer-buttons">
+                                        <div style="position: relative;">
+                                            <button class="composer-btn attachment active" title="Attach file">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                                </svg>
+                                            </button>
+                                            <span class="attachment-indicator">2</span>
+                                        </div>
+                                        <button class="composer-btn" title="Settings">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                            </svg>
+                                        </button>
+                                        <button class="composer-btn" title="Abort">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                            </svg>
+                                        </button>
+                                        <span class="spacer"></span>
+                                        <button class="composer-btn primary" title="Send">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Rename State -->
+                        <div class="state-content" data-state="rename">
+                            <div class="composer-wrapper option-c expanded">
+                                <div class="panel-wrapper">
+                                    <div class="expandable-panel">
+                                        <div class="panel-header">
+                                            <span class="panel-title">Attachments</span>
+                                            <button class="panel-close">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                            </button>
+                                        </div>
+                                        <div class="mini-drop">+ Tap to add more files</div>
+                                        <div class="attachment-chips">
+                                            <div class="attachment-chip renaming">
+                                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                                <input type="text" value="api-error" autofocus>
+                                                <span style="color: var(--app-hint)">.png</span>
+                                            </div>
+                                            <div class="attachment-chip">
+                                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                                <span class="name">report.pdf</span>
+                                                <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="composer-input-area">
+                                        <input type="text" class="composer-input" placeholder="Type a message...">
+                                    </div>
+                                    <div class="composer-buttons">
+                                        <div style="position: relative;">
+                                            <button class="composer-btn attachment active" title="Attach file">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                                </svg>
+                                            </button>
+                                            <span class="attachment-indicator">2</span>
+                                        </div>
+                                        <button class="composer-btn" title="Settings">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                            </svg>
+                                        </button>
+                                        <button class="composer-btn" title="Abort">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                            </svg>
+                                        </button>
+                                        <span class="spacer"></span>
+                                        <button class="composer-btn primary" title="Send">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Progress State -->
+                        <div class="state-content" data-state="progress">
+                            <div class="composer-wrapper option-c expanded">
+                                <div class="panel-wrapper">
+                                    <div class="expandable-panel">
+                                        <div class="panel-header">
+                                            <span class="panel-title">Attachments</span>
+                                            <button class="panel-close">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                            </button>
+                                        </div>
+                                        <div class="mini-drop">+ Tap to add more files</div>
+                                        <div class="attachment-chips">
+                                            <div class="attachment-chip uploading">
+                                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                                <span class="name">uploading...</span>
+                                            </div>
+                                            <div class="attachment-chip">
+                                                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                                <span class="name">report.pdf</span>
+                                                <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="composer-input-area">
+                                        <input type="text" class="composer-input" placeholder="Type a message...">
+                                    </div>
+                                    <div class="composer-buttons">
+                                        <div style="position: relative;">
+                                            <button class="composer-btn attachment active" title="Attach file">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                                </svg>
+                                            </button>
+                                            <span class="attachment-indicator">2</span>
+                                        </div>
+                                        <button class="composer-btn" title="Settings">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                            </svg>
+                                        </button>
+                                        <button class="composer-btn" title="Abort">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                            </svg>
+                                        </button>
+                                        <span class="spacer"></span>
+                                        <button class="composer-btn primary" title="Send">
+                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="pros-cons">
+                <div class="pros">
+                    <h4>✓ Pros</h4>
+                    <ul>
+                        <li>Clean default state</li>
+                        <li>Badge shows attachment count</li>
+                        <li>Expandable panel = more space</li>
+                        <li>Works well on mobile</li>
+                        <li>Progressive disclosure pattern</li>
+                    </ul>
+                </div>
+                <div class="cons">
+                    <h4>✗ Cons</h4>
+                    <ul>
+                        <li>Extra tap to see attachments</li>
+                        <li>Panel overlays chat (minor)</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Option D: Floating Action -->
+        <div class="option-card" id="option-d">
+            <div class="option-header">
+                <div class="option-label">
+                    <span class="option-badge">D</span>
+                    <div>
+                        <div class="option-title">Floating Action</div>
+                        <div class="option-subtitle">Corner button opens attachment panel</div>
+                    </div>
+                </div>
+                <div class="state-tabs">
+                    <button class="state-tab active" data-state="default" onclick="switchState('d', 'default')">Default</button>
+                    <button class="state-tab" data-state="attached" onclick="switchState('d', 'attached')">Attached</button>
+                    <button class="state-tab" data-state="rename" onclick="switchState('d', 'rename')">Rename</button>
+                    <button class="state-tab" data-state="progress" onclick="switchState('d', 'progress')">Progress</button>
+                </div>
+            </div>
+
+            <div class="phone-container">
+                <div class="phone-frame">
+                    <div class="phone-content">
+                        <!-- Default State -->
+                        <div class="state-content active" data-state="default">
+                            <div class="option-d" style="height: 100%; position: relative;">
+                                <button class="floating-btn" title="Attach file">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                    </svg>
+                                </button>
+                                <div style="position: absolute; bottom: 0; left: 0; right: 0;">
+                                    <div class="composer-wrapper">
+                                        <div class="composer-input-area">
+                                            <input type="text" class="composer-input" placeholder="Type a message...">
+                                        </div>
+                                        <div class="composer-buttons">
+                                            <button class="composer-btn" title="Settings">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                                </svg>
+                                            </button>
+                                            <button class="composer-btn" title="Abort">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                                </svg>
+                                            </button>
+                                            <span class="spacer"></span>
+                                            <button class="composer-btn primary" title="Send">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                                </svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Attached State -->
+                        <div class="state-content" data-state="attached">
+                            <div class="option-d expanded" style="height: 100%; position: relative;">
+                                <div style="position: relative;">
+                                    <button class="floating-btn" title="Attach file">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                        </svg>
+                                    </button>
+                                    <span class="floating-indicator">2</span>
+                                </div>
+                                <div class="floating-panel">
+                                    <div class="panel-header" style="margin-bottom: 0.75rem;">
+                                        <span class="panel-title">Attachments</span>
+                                    </div>
+                                    <div class="attachment-chips" style="padding: 0;">
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                            <span class="name">screenshot.png</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                            <span class="name">report.pdf</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div style="position: absolute; bottom: 0; left: 0; right: 0;">
+                                    <div class="composer-wrapper">
+                                        <div class="composer-input-area">
+                                            <input type="text" class="composer-input" placeholder="Type a message...">
+                                        </div>
+                                        <div class="composer-buttons">
+                                            <button class="composer-btn" title="Settings">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                                </svg>
+                                            </button>
+                                            <button class="composer-btn" title="Abort">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                                </svg>
+                                            </button>
+                                            <span class="spacer"></span>
+                                            <button class="composer-btn primary" title="Send">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                                </svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Rename State -->
+                        <div class="state-content" data-state="rename">
+                            <div class="option-d expanded" style="height: 100%; position: relative;">
+                                <div style="position: relative;">
+                                    <button class="floating-btn" title="Attach file">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                        </svg>
+                                    </button>
+                                    <span class="floating-indicator">2</span>
+                                </div>
+                                <div class="floating-panel">
+                                    <div class="panel-header" style="margin-bottom: 0.75rem;">
+                                        <span class="panel-title">Attachments</span>
+                                    </div>
+                                    <div class="attachment-chips" style="padding: 0;">
+                                        <div class="attachment-chip renaming">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                            <input type="text" value="modal-bug" autofocus>
+                                            <span style="color: var(--app-hint)">.png</span>
+                                        </div>
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                            <span class="name">report.pdf</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div style="position: absolute; bottom: 0; left: 0; right: 0;">
+                                    <div class="composer-wrapper">
+                                        <div class="composer-input-area">
+                                            <input type="text" class="composer-input" placeholder="Type a message...">
+                                        </div>
+                                        <div class="composer-buttons">
+                                            <button class="composer-btn" title="Settings">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                                </svg>
+                                            </button>
+                                            <button class="composer-btn" title="Abort">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                                </svg>
+                                            </button>
+                                            <span class="spacer"></span>
+                                            <button class="composer-btn primary" title="Send">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                                </svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Progress State -->
+                        <div class="state-content" data-state="progress">
+                            <div class="option-d expanded" style="height: 100%; position: relative;">
+                                <div style="position: relative;">
+                                    <button class="floating-btn" title="Attach file">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                        </svg>
+                                    </button>
+                                    <span class="floating-indicator">2</span>
+                                </div>
+                                <div class="floating-panel">
+                                    <div class="panel-header" style="margin-bottom: 0.75rem;">
+                                        <span class="panel-title">Attachments</span>
+                                    </div>
+                                    <div class="attachment-chips" style="padding: 0;">
+                                        <div class="attachment-chip uploading">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                            <span class="name">uploading...</span>
+                                        </div>
+                                        <div class="attachment-chip">
+                                            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                                            <span class="name">report.pdf</span>
+                                            <button class="remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div style="position: absolute; bottom: 0; left: 0; right: 0;">
+                                    <div class="composer-wrapper">
+                                        <div class="composer-input-area">
+                                            <input type="text" class="composer-input" placeholder="Type a message...">
+                                        </div>
+                                        <div class="composer-buttons">
+                                            <button class="composer-btn" title="Settings">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                                                </svg>
+                                            </button>
+                                            <button class="composer-btn" title="Abort">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <rect x="3" y="3" width="18" height="18" rx="2"/>
+                                                </svg>
+                                            </button>
+                                            <span class="spacer"></span>
+                                            <button class="composer-btn primary" title="Send">
+                                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                                    <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                                </svg>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="pros-cons">
+                <div class="pros">
+                    <h4>✓ Pros</h4>
+                    <ul>
+                        <li>Eye-catching FAB design</li>
+                        <li>Doesn't clutter button row</li>
+                        <li>Always accessible</li>
+                        <li>Modern mobile pattern</li>
+                    </ul>
+                </div>
+                <div class="cons">
+                    <h4>✗ Cons</h4>
+                    <ul>
+                        <li>May overlap message content</li>
+                        <li>Inconsistent with existing UI</li>
+                        <li>Panel position awkward</li>
+                        <li>Safe area conflicts possible</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <footer class="page-footer">
+        <p>Issue #197 • Hapimatic File Upload System • <code>web/public/design-mockups/file-upload-options.html</code></p>
+        <p style="margin-top: 0.5rem;">Select your preferred option and let Claude know your choice to proceed with implementation.</p>
+    </footer>
+
+    <script>
+        function switchState(option, state) {
+            const card = document.getElementById(`option-${option}`);
+
+            // Update tabs
+            card.querySelectorAll('.state-tab').forEach(tab => {
+                tab.classList.toggle('active', tab.dataset.state === state);
+            });
+
+            // Update content
+            card.querySelectorAll('.state-content').forEach(content => {
+                content.classList.toggle('active', content.dataset.state === state);
+            });
+        }
+    </script>
+</body>
+</html>

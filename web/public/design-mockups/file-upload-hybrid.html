@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>File Upload UI: Hybrid Approach</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* =====================================================
+           Hapimatic Design System Variables
+           Extracted from actual codebase CSS custom properties
+           ===================================================== */
+        :root {
+            /* Core colors from Hapimatic theme */
+            --app-bg: #0f1f1a;
+            --app-surface: #162822;
+            --app-fg: #e8f5f0;
+            --app-hint: #6b8a7f;
+            --app-link: #5ae6ab;  /* Primary mint green */
+            --app-divider: #2a4a3f;
+            --app-error: #f87171;
+
+            /* Additional UI colors */
+            --amber-500: #f59e0b;
+            --amber-500-20: rgba(245, 158, 11, 0.2);
+            --amber-500-30: rgba(245, 158, 11, 0.3);
+
+            /* Typography */
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: var(--font-sans);
+            background: var(--app-bg);
+            min-height: 100vh;
+            color: var(--app-fg);
+            padding: 1rem;
+        }
+
+        /* =====================================================
+           Page Layout
+           ===================================================== */
+        .page-header {
+            text-align: center;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--app-divider);
+        }
+
+        .page-header h1 {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--app-link);
+            margin-bottom: 0.25rem;
+        }
+
+        .page-header p {
+            color: var(--app-hint);
+            font-size: 0.8125rem;
+        }
+
+        .description-box {
+            background: var(--app-surface);
+            border: 1px solid var(--app-link);
+            border-radius: 0.75rem;
+            padding: 1rem;
+            margin-bottom: 1.5rem;
+            font-size: 0.8125rem;
+            line-height: 1.6;
+        }
+
+        .description-box strong {
+            color: var(--app-link);
+        }
+
+        .description-box ul {
+            margin-top: 0.5rem;
+            margin-left: 1.25rem;
+            color: var(--app-hint);
+        }
+
+        .description-box li {
+            margin-bottom: 0.25rem;
+        }
+
+        /* =====================================================
+           Phone Mockup Container (iPhone 16 Pro dimensions)
+           ===================================================== */
+        .phone-container {
+            max-width: 402px;
+            margin: 0 auto 2rem;
+        }
+
+        .phone-frame {
+            background: var(--app-bg);
+            border: 2px solid var(--app-divider);
+            border-radius: 2rem;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .phone-notch {
+            width: 126px;
+            height: 36px;
+            background: #000;
+            border-radius: 0 0 1.25rem 1.25rem;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        .phone-notch::after {
+            content: '';
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            background: #1a1a1a;
+            border-radius: 50%;
+            right: 24px;
+            top: 10px;
+        }
+
+        /* Chat area simulation */
+        .chat-area {
+            height: 500px;
+            display: flex;
+            flex-direction: column;
+            padding: 0 0.5rem;
+        }
+
+        .chat-messages {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            padding: 1rem 0.5rem;
+            overflow: hidden;
+        }
+
+        .sample-message {
+            background: var(--app-surface);
+            padding: 0.75rem 1rem;
+            border-radius: 1rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.875rem;
+            max-width: 85%;
+        }
+
+        .sample-message.assistant {
+            align-self: flex-start;
+            border-bottom-left-radius: 0.25rem;
+        }
+
+        .sample-message.user {
+            align-self: flex-end;
+            background: var(--app-link);
+            color: var(--app-bg);
+            border-bottom-right-radius: 0.25rem;
+        }
+
+        /* =====================================================
+           Composer Area - Matching Hapimatic Exactly
+           ===================================================== */
+        .composer {
+            background: var(--app-surface);
+            border-top: 1px solid var(--app-divider);
+            padding: 0.5rem;
+        }
+
+        .composer-input {
+            background: var(--app-bg);
+            border: 1px solid var(--app-divider);
+            border-radius: 0.75rem;
+            padding: 0.75rem 1rem;
+            margin-bottom: 0.5rem;
+            color: var(--app-hint);
+            font-size: 0.875rem;
+        }
+
+        /* Button row - matches ComposerButtons.tsx exactly */
+        .button-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 0.5rem 0.25rem;
+        }
+
+        .button-group {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;  /* gap-1 = 0.25rem */
+        }
+
+        .button-group-right {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;  /* gap-2 = 0.5rem */
+        }
+
+        /* Standard icon button - matches h-8 w-8 rounded-full */
+        .icon-btn {
+            width: 32px;   /* h-8 w-8 = 2rem = 32px */
+            height: 32px;
+            min-width: 32px;
+            border-radius: 9999px;  /* rounded-full */
+            border: none;
+            background: transparent;
+            color: rgba(232, 245, 240, 0.6);  /* text-[var(--app-fg)]/60 */
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+            position: relative;
+        }
+
+        .icon-btn:hover {
+            background: var(--app-bg);
+            color: var(--app-fg);
+        }
+
+        .icon-btn:active {
+            transform: scale(0.95);
+        }
+
+        .icon-btn svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        /* Attachment button - mint green accent */
+        .icon-btn.attach {
+            color: var(--app-link);
+        }
+
+        .icon-btn.attach:hover {
+            background: rgba(90, 230, 171, 0.15);
+            color: var(--app-link);
+        }
+
+        .icon-btn.attach.has-files {
+            background: rgba(90, 230, 171, 0.2);
+        }
+
+        /* Queue button styling - matches actual implementation */
+        .icon-btn.queue {
+            color: rgba(232, 245, 240, 0.4);
+        }
+
+        .icon-btn.queue:hover {
+            background: var(--app-bg);
+            color: rgba(232, 245, 240, 0.6);
+        }
+
+        /* Send button - matches actual styles */
+        .send-btn {
+            width: 32px;
+            height: 32px;
+            min-width: 32px;
+            border-radius: 9999px;
+            border: none;
+            background: #C0C0C0;  /* Disabled state */
+            color: white;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+        }
+
+        .send-btn.active {
+            background: #000;
+        }
+
+        .send-btn svg {
+            width: 16px;
+            height: 16px;
+        }
+
+        /* Badge on button - matches absolute -right-1 -top-1 h-4 min-w-4 */
+        .badge {
+            position: absolute;
+            right: -4px;   /* -right-1 = -0.25rem = -4px */
+            top: -4px;     /* -top-1 = -0.25rem = -4px */
+            height: 16px;  /* h-4 = 1rem = 16px */
+            min-width: 16px;  /* min-w-4 = 1rem = 16px */
+            padding: 0 4px;
+            background: var(--app-link);
+            border-radius: 9999px;
+            font-size: 10px;  /* text-[10px] */
+            font-weight: 700;  /* font-bold */
+            color: var(--app-bg);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transform: scale(0);
+            transition: all 0.2s ease;
+        }
+
+        .badge.visible {
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        /* =====================================================
+           Modal - Matching QueueManagementModal.tsx Pattern
+           ===================================================== */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 50;
+            padding: 1rem;
+        }
+
+        .modal-overlay.visible {
+            display: flex;
+        }
+
+        /* Modal content - matches DialogContent styling */
+        .modal-content {
+            width: 100%;
+            max-width: 400px;
+            max-height: 80vh;
+            display: flex;
+            flex-direction: column;
+            background: var(--app-bg);
+            border: 2px solid rgba(90, 230, 171, 0.4);  /* border-2 border-[accent]/40 */
+            border-radius: 0.75rem;
+            overflow: hidden;
+        }
+
+        /* Modal header - matches DialogHeader */
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem;
+            border-bottom: 1px solid var(--app-divider);
+            flex-shrink: 0;
+        }
+
+        .modal-title {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--app-link);
+        }
+
+        .modal-title .count {
+            padding: 0.125rem 0.5rem;
+            border-radius: 9999px;
+            background: rgba(90, 230, 171, 0.2);
+            color: var(--app-link);
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .modal-close {
+            width: 28px;
+            height: 28px;
+            border-radius: 9999px;
+            border: none;
+            background: var(--app-surface);
+            color: var(--app-hint);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-close:hover {
+            color: var(--app-fg);
+        }
+
+        .modal-close svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        /* Modal body */
+        .modal-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            min-height: 0;
+        }
+
+        /* File item - similar to QueueMessageItem */
+        .file-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            padding: 0.75rem;
+            background: var(--app-surface);
+            border-radius: 0.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .file-icon {
+            width: 36px;
+            height: 36px;
+            flex-shrink: 0;
+            background: rgba(90, 230, 171, 0.15);
+            border-radius: 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--app-link);
+        }
+
+        .file-icon svg {
+            width: 20px;
+            height: 20px;
+        }
+
+        .file-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .file-name {
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--app-fg);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .file-meta {
+            font-size: 0.75rem;
+            color: var(--app-hint);
+            margin-top: 0.125rem;
+        }
+
+        .file-actions {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+            flex-shrink: 0;
+        }
+
+        .file-action-btn {
+            padding: 0.375rem;  /* p-1.5 */
+            border-radius: 0.25rem;
+            border: none;
+            background: transparent;
+            color: rgba(232, 245, 240, 0.5);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+        }
+
+        .file-action-btn:hover {
+            color: var(--app-link);
+            background: rgba(90, 230, 171, 0.1);
+        }
+
+        .file-action-btn.delete:hover {
+            color: var(--app-error);
+            background: rgba(248, 113, 113, 0.1);
+        }
+
+        .file-action-btn svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        /* Add file button - dashed border style */
+        .add-file-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            width: 100%;
+            padding: 0.75rem;
+            border: 2px dashed var(--app-divider);
+            border-radius: 0.5rem;
+            background: transparent;
+            color: var(--app-hint);
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            margin-top: 0.5rem;
+        }
+
+        .add-file-btn:hover {
+            border-color: var(--app-link);
+            color: var(--app-link);
+        }
+
+        .add-file-btn svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        /* Modal footer */
+        .modal-footer {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem;
+            border-top: 1px solid var(--app-divider);
+            flex-shrink: 0;
+        }
+
+        .clear-btn {
+            background: none;
+            border: none;
+            color: var(--app-error);
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .clear-btn:hover {
+            opacity: 0.8;
+        }
+
+        .done-btn {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            border: none;
+            background: var(--app-link);
+            color: var(--app-bg);
+            font-size: 0.875rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .done-btn:hover {
+            opacity: 0.9;
+        }
+
+        /* =====================================================
+           State Indicator
+           ===================================================== */
+        .state-indicator {
+            text-align: center;
+            padding: 0.75rem;
+            font-size: 0.75rem;
+            color: var(--app-hint);
+            font-family: 'SF Mono', 'Monaco', monospace;
+            background: var(--app-surface);
+            border-top: 1px solid var(--app-divider);
+        }
+
+        .state-indicator.active {
+            color: var(--app-link);
+        }
+
+        /* =====================================================
+           Interaction Guide
+           ===================================================== */
+        .guide {
+            max-width: 500px;
+            margin: 0 auto;
+            padding: 1rem;
+            background: var(--app-surface);
+            border-radius: 0.75rem;
+            font-size: 0.8125rem;
+        }
+
+        .guide h3 {
+            color: var(--app-link);
+            font-size: 0.875rem;
+            margin-bottom: 0.75rem;
+        }
+
+        .guide-step {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+            align-items: flex-start;
+        }
+
+        .guide-step:last-child {
+            margin-bottom: 0;
+        }
+
+        .step-num {
+            width: 24px;
+            height: 24px;
+            background: var(--app-link);
+            color: var(--app-bg);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            font-weight: 700;
+            flex-shrink: 0;
+        }
+
+        .step-text {
+            color: var(--app-fg);
+            line-height: 1.5;
+        }
+
+        .step-text code {
+            background: var(--app-bg);
+            padding: 0.125rem 0.375rem;
+            border-radius: 0.25rem;
+            font-size: 0.75rem;
+            color: var(--app-link);
+        }
+
+        /* Home indicator */
+        .home-indicator {
+            width: 134px;
+            height: 5px;
+            background: var(--app-fg);
+            border-radius: 3px;
+            margin: 0.5rem auto;
+            opacity: 0.3;
+        }
+    </style>
+</head>
+<body>
+    <header class="page-header">
+        <h1>📎 Hybrid File Upload UI</h1>
+        <p>Issue #197 • Badge on button + Modal for management</p>
+    </header>
+
+    <div class="description-box">
+        <strong>Hybrid Approach</strong> combines the best of both worlds:
+        <ul>
+            <li><strong>Compact button</strong> with badge count in the composer (saves space)</li>
+            <li><strong>Full modal</strong> for file management (rename, reorder, add more)</li>
+            <li>Matches existing <code>QueueManagementModal</code> pattern</li>
+            <li>Same interaction as the queue button (tap → modal opens)</li>
+        </ul>
+    </div>
+
+    <!-- Phone Mockup -->
+    <div class="phone-container">
+        <div class="phone-frame">
+            <div class="phone-notch"></div>
+
+            <div class="chat-area">
+                <div class="chat-messages">
+                    <div class="sample-message assistant">
+                        I've analyzed your codebase. What would you like me to help with?
+                    </div>
+                    <div class="sample-message user">
+                        Can you review this screenshot and PDF?
+                    </div>
+                </div>
+
+                <div class="composer">
+                    <div class="composer-input">Type a message...</div>
+
+                    <div class="button-row">
+                        <!-- Left button group: Session controls -->
+                        <div class="button-group">
+                            <!-- Settings button -->
+                            <button class="icon-btn" title="Settings">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="3"/>
+                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+                                </svg>
+                            </button>
+
+                            <!-- Terminal button -->
+                            <button class="icon-btn" title="Terminal">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <rect x="3" y="4" width="18" height="16" rx="2" ry="2"/>
+                                    <polyline points="7 9 10 12 7 15"/>
+                                    <line x1="12" y1="15" x2="17" y2="15"/>
+                                </svg>
+                            </button>
+
+                            <!-- Abort button -->
+                            <button class="icon-btn" title="Abort">
+                                <svg viewBox="0 0 16 16" fill="currentColor">
+                                    <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm4-2.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 .5.5v4a.5.5 0 0 1-.5.5h-4a.5.5 0 0 1-.5-.5v-4Z"/>
+                                </svg>
+                            </button>
+                        </div>
+
+                        <!-- Right button group: Message composition actions -->
+                        <div class="button-group-right">
+                            <!-- Attachment button with badge -->
+                            <button class="icon-btn attach" id="attach-btn" onclick="toggleModal()" title="Attachments">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                                </svg>
+                                <span class="badge visible" id="badge">2</span>
+                            </button>
+
+                            <!-- Queue button -->
+                            <button class="icon-btn queue" title="Message queue">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                                    <path d="M2 17l10 5 10-5"/>
+                                    <path d="M2 12l10 5 10-5"/>
+                                </svg>
+                            </button>
+
+                            <!-- Send button -->
+                            <button class="send-btn active" title="Send">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                    <line x1="12" y1="19" x2="12" y2="5"/>
+                                    <polyline points="5 12 12 5 19 12"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="home-indicator"></div>
+            </div>
+
+            <div class="state-indicator active" id="state">
+                2 files attached • Tap paperclip to manage
+            </div>
+        </div>
+    </div>
+
+    <!-- Attachment Management Modal -->
+    <div class="modal-overlay" id="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">
+                    <span>Attachments</span>
+                    <span class="count">2</span>
+                </div>
+                <button class="modal-close" onclick="toggleModal()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+
+            <div class="modal-body">
+                <!-- File 1 -->
+                <div class="file-item">
+                    <div class="file-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="3" width="18" height="18" rx="2"/>
+                            <circle cx="8.5" cy="8.5" r="1.5"/>
+                            <polyline points="21 15 16 10 5 21"/>
+                        </svg>
+                    </div>
+                    <div class="file-info">
+                        <div class="file-name">screenshot-2024-01-15.png</div>
+                        <div class="file-meta">PNG • 1.2 MB</div>
+                    </div>
+                    <div class="file-actions">
+                        <button class="file-action-btn" title="Rename">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                            </svg>
+                        </button>
+                        <button class="file-action-btn delete" title="Remove">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="18" y1="6" x2="6" y2="18"/>
+                                <line x1="6" y1="6" x2="18" y2="18"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- File 2 -->
+                <div class="file-item">
+                    <div class="file-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                            <line x1="16" y1="13" x2="8" y2="13"/>
+                            <line x1="16" y1="17" x2="8" y2="17"/>
+                        </svg>
+                    </div>
+                    <div class="file-info">
+                        <div class="file-name">architecture-review.pdf</div>
+                        <div class="file-meta">PDF • 342 KB</div>
+                    </div>
+                    <div class="file-actions">
+                        <button class="file-action-btn" title="Rename">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                            </svg>
+                        </button>
+                        <button class="file-action-btn delete" title="Remove">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="18" y1="6" x2="6" y2="18"/>
+                                <line x1="6" y1="6" x2="18" y2="18"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Add more files button -->
+                <button class="add-file-btn">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"/>
+                        <line x1="5" y1="12" x2="19" y2="12"/>
+                    </svg>
+                    Add more files
+                </button>
+            </div>
+
+            <div class="modal-footer">
+                <button class="clear-btn">Clear All</button>
+                <button class="done-btn" onclick="toggleModal()">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                    Done
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Interaction Guide -->
+    <div class="guide">
+        <h3>How It Works</h3>
+        <div class="guide-step">
+            <span class="step-num">1</span>
+            <span class="step-text">
+                <strong>Tap the paperclip</strong> button (right side, next to queue) to open the attachment modal.
+            </span>
+        </div>
+        <div class="guide-step">
+            <span class="step-num">2</span>
+            <span class="step-text">
+                <strong>Badge shows count</strong> of attached files. Visible when files are attached, hidden when empty.
+            </span>
+        </div>
+        <div class="guide-step">
+            <span class="step-num">3</span>
+            <span class="step-text">
+                In the modal, you can <strong>rename</strong> files (tap pencil icon), <strong>remove</strong> files (tap X), or <strong>add more</strong>.
+            </span>
+        </div>
+        <div class="guide-step">
+            <span class="step-num">4</span>
+            <span class="step-text">
+                Tap <strong>Done</strong> or outside the modal to close. Files stay attached until you send or remove them.
+            </span>
+        </div>
+    </div>
+
+    <script>
+        let modalOpen = false;
+
+        function toggleModal() {
+            modalOpen = !modalOpen;
+            const modal = document.getElementById('modal');
+            const attachBtn = document.getElementById('attach-btn');
+
+            if (modalOpen) {
+                modal.classList.add('visible');
+                attachBtn.classList.add('has-files');
+            } else {
+                modal.classList.remove('visible');
+                // Keep has-files class if there are files
+            }
+        }
+
+        // Close modal on backdrop click
+        document.getElementById('modal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                toggleModal();
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,74 @@
+# Hapimatic public core — release workflow.
+#
+# This repository is a generated export. Each v<VERSION> tag pushed by the release publisher triggers
+# this workflow, which builds the binaries from THIS public tree and creates the GitHub Release, so
+# every published binary is built from the public source tagged alongside it (AGPL-3.0 §13).
+#
+# Actions are pinned to immutable commit SHAs.
+# Injection-safe: the only ${{ }} is secrets.GITHUB_TOKEN; the tag is read via the trusted
+# $GITHUB_REF env var with quoted expansion (no github.event.* untrusted input).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # Frozen install proves the build reproduces from the committed lock with no re-resolution.
+      - run: bun install --frozen-lockfile
+      - run: bun run build:single-exe:all
+      - name: Package release artifacts
+        run: |
+          cd cli/dist-exe
+          mkdir -p ../release-artifacts
+
+          for dir in bun-*/; do
+              target="${dir%/}"
+              # bun-darwin-arm64 -> hapi-darwin-arm64
+              name="hapi-${target#bun-}"
+              name="${name/windows/win32}"
+
+              if [[ "$target" == *"windows"* ]]; then
+                  zip -j "../release-artifacts/${name}.zip" "$target"/hapi.exe
+              else
+                  tar -czvf "../release-artifacts/${name}.tar.gz" -C "$target" hapi
+              fi
+          done
+
+          # Ship the one-command installer as `install.sh` when the installer is part of this tree.
+          # When it is not, say so in the run: a ::warning:: annotation on this Actions run (the Release
+          # page itself does not show it), so a Release without install.sh is never silent.
+          if [ -f ../../scripts/install-hapimatic-v1.sh ]; then
+              cp ../../scripts/install-hapimatic-v1.sh ../release-artifacts/install.sh
+          else
+              echo "::warning title=install.sh not shipped::scripts/install-hapimatic-v1.sh is not in this source tree, so this Release carries the binaries and checksums.txt but no install.sh."
+          fi
+
+          cd ../release-artifacts
+          # `--` ends options (SC2035) while keeping bare filenames, so consumers can match
+          # lines by asset name (e.g. grep " hapi-linux-arm64.tar.gz$" checksums.txt).
+          sha256sum -- * > checksums.txt
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if gh release view "$TAG" &>/dev/null; then
+            # A re-run for the same tag: refresh the assets on the existing Release.
+            echo "Release $TAG already exists — uploading artifacts to it"
+            gh release upload "$TAG" --clobber cli/release-artifacts/*
+            exit 0
+          fi
+          gh release create "$TAG" \
+              --title "Release $TAG" \
+              --generate-notes \
+              cli/release-artifacts/*

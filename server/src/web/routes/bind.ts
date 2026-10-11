@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+import { Hono } from "hono";
+import { SignJWT } from "jose";
+import { z } from "zod";
+import { configuration } from "../../configuration";
+import { constantTimeEquals } from "../../utils/crypto";
+import { parseAccessToken } from "../../utils/accessToken";
+import { validateTelegramInitData } from "../telegramInitData";
+import { getOrCreateOwnerId } from "../../config/ownerId";
+import { defineCapability } from "@hapi/protocol";
+import { cataloged } from "../../capabilities/cataloged";
+import type { WebAppEnv } from "../middleware/auth";
+import type { Store } from "../../store";
+
+const bindBodySchema = z.object({
+  initData: z.string(),
+  accessToken: z.string(),
+});
+
+export function createBindRoutes(
+  jwtSecret: Uint8Array,
+  store: Store
+): Hono<WebAppEnv> {
+  const app = new Hono<WebAppEnv>();
+
+  app.post(
+    "/bind",
+    cataloged(
+      defineCapability({
+        id: "accounts.bind",
+        domain: "accounts",
+        surface: "rest",
+        description:
+          "Bind a Telegram user to a namespace (validated via init-data plus access token) and return a JWT; 409 when already bound elsewhere.",
+        whenToUse: "When a Telegram Mini App user first links their account.",
+        invocation: { kind: "rest", method: "POST", path: "/api/bind" },
+        auth: "none",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+        probe: "skip",
+      })
+    ),
+    async c => {
+      const json = await c.req.json().catch(() => null);
+      const parsed = bindBodySchema.safeParse(json);
+      if (!parsed.success) {
+        return c.json({ error: "Invalid body" }, 400);
+      }
+
+      const parsedToken = parseAccessToken(parsed.data.accessToken);
+      if (
+        !parsedToken ||
+        !constantTimeEquals(parsedToken.baseToken, configuration.cliApiToken)
+      ) {
+        return c.json({ error: "Invalid access token" }, 401);
+      }
+      const namespace = parsedToken.namespace;
+
+      if (!configuration.telegramEnabled || !configuration.telegramBotToken) {
+        return c.json(
+          {
+            error:
+              "Telegram authentication is disabled. Configure TELEGRAM_BOT_TOKEN.",
+          },
+          503
+        );
+      }
+
+      const result = validateTelegramInitData(
+        parsed.data.initData,
+        configuration.telegramBotToken
+      );
+      if (!result.ok) {
+        return c.json({ error: result.error }, 401);
+      }
+
+      const telegramUserId = String(result.user.id);
+      const existingUser = store.users.getUser("telegram", telegramUserId);
+      if (existingUser && existingUser.namespace !== namespace) {
+        return c.json({ error: "already_bound" }, 409);
+      }
+      store.users.addUser("telegram", telegramUserId, namespace);
+
+      const userId = await getOrCreateOwnerId();
+
+      const token = await new SignJWT({ uid: userId, ns: namespace })
+        .setProtectedHeader({ alg: "HS256" })
+        .setIssuedAt()
+        .setExpirationTime("15m")
+        .sign(jwtSecret);
+
+      return c.json({
+        token,
+        user: {
+          id: userId,
+          username: result.user.username,
+          firstName: result.user.first_name,
+          lastName: result.user.last_name,
+        },
+      });
+    }
+  );
+
+  return app;
+}

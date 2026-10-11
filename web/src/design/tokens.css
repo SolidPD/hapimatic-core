@@ -1,0 +1,626 @@
+/**
+ * Hapimatic Design Tokens — the single source of truth for the app's
+ * color / surface / border / shadow / status / spacing / radii vocabulary.
+ *
+ * ── The one load-bearing mechanism (read first) ───────────────────────────
+ * Runtime accent/palette swapping (the Epic C contract, #1985/#1986) works
+ * ONLY because Tailwind utilities reference a CSS variable *by reference*
+ * (via `@theme inline`) rather than baking the resolved hex at build time:
+ *
+ *   @theme inline { --color-accent: var(--accent) }
+ *     → `.bg-accent { background: var(--accent) }`  (live reference ✅ swappable)
+ *
+ *   @theme { --color-accent: #5ae6ab }   (or tailwind.config.ts theme.extend)
+ *     → `.bg-accent { background: #5ae6ab }`        (frozen hex ❌ NOT swappable)
+ *
+ * Override `--palette-accent` at runtime (see web/src/design/tokens.ts
+ * `applyAccent`) and every accent-consuming Tailwind utility AND every
+ * TS-consumed `tokens.accent` re-resolves instantly — no per-usage-site edit.
+ *
+ * 🔴 NEVER put swappable tokens in `tailwind.config.ts` (theme.extend bakes hex).
+ * See web/src/design/README.md for the full catalog + usage guide.
+ * Parent epic: #1976 (Design System). Foundation sub-issue: #1977 (A1).
+ */
+
+:root {
+  /* ── Palette (swap source) ──────────────────────────────────────────────
+     The single source var for the mint accent. Override this at runtime and
+     every accent-consuming utility / TS color re-colors at once (R2). */
+  --palette-accent: #5ae6ab; /* mint accent */
+  --palette-accent-fg: #0f1f1a; /* dark ink/text on mint surfaces */
+
+  /* ── Surfaces ───────────────────────────────────────────────────────── */
+  --app-bg: #1c1c1e; /* app background */
+  --app-fg: #ffffff; /* primary text */
+  --app-hint: #8e8e93; /* muted/secondary text */
+  --app-button: #ffffff;
+  --app-button-text: #111827;
+  --app-banner-bg: #3a3a3c;
+  --app-banner-text: #ffffff;
+  /* Project-header icon discs (#4538): the solid gray circle behind the chain /
+     trash / chevron glyphs so the row-2 node band never slices through them.
+     Rest = the banner surface; hover = one step lighter, derived (no new hex). */
+  --header-icon-disc: var(--app-banner-bg);
+  --header-icon-disc-hover: color-mix(
+    in srgb,
+    var(--app-fg) 6%,
+    var(--app-banner-bg)
+  );
+  --app-secondary-bg: #2c2c2e; /* panel/surface bg */
+
+  /* Interactive states */
+  /* subtle elevated bg for hover + static "muted gray" surfaces */
+  --app-hover: rgba(255, 255, 255, 0.08);
+  --app-bg-hover: var(--app-hover); /* alias — same intent as --app-hover */
+
+  /* ── Accent (all point at the single swap source) ────────────────────────
+     Mint was historically declared 3× (here, --accent, --ring); unified under
+     --palette-accent so one applyAccent() flip propagates everywhere (R2). */
+  --app-link: var(--palette-accent);
+  --app-accent: var(--app-link); /* mint accent (second vocabulary) */
+
+  /* ── Session-relationship accents (#2479) ────────────────────────────────
+     Per-relationship accent for the session-list grouping. `branch` reuses the
+     mint swap source; `spawn` is the managed-peer muted gold; `schedule` is the
+     scheduler blue. Downstream literals (SessionItem, Scheduler*) reference
+     THESE tokens instead of inlining hex/rgba (R8). Final palette is locked by
+     Epic #2478 — do NOT re-open the hue here. */
+  --session-rel-branch: var(
+    --palette-accent
+  ); /* mint — forked/branch children */
+  --session-rel-spawn: #bfa869; /* muted gold — PM-spawned managed peers */
+  --session-rel-schedule: #60a5fa; /* blue — scheduler group */
+  /* Managed-peer (spawn) surface tints, derived from --session-rel-spawn
+     (HSL 44°/40%/58% = rgb 191,168,105). Kept as explicit rgba so the alpha is
+     unambiguous; update alongside --session-rel-spawn if the hue changes.
+     The row fill MUST be a DARK shade of the hue, mirroring the scheduled
+     tint's construction (blue-900/20): a light color at low alpha lightens the
+     dark surface and reads as a yellow film over the row's text/icons, while a
+     dark shade deepens the background only. Fill = HSL(44°/64%/33%) @ 0.2 —
+     the scheduled tint's S/L/alpha with the hue rotated to the managed gold. */
+  --session-rel-spawn-fill: rgba(138, 109, 30, 0.08); /* row bg tint (dark) */
+  /* Round 14 follow-up: 0.2 → 0.08. Equal ALPHA is not equal VISIBILITY — the
+     eye weights green ≈ 72 %, red ≈ 21 %, blue ≈ 7 %. Over --app-bg the
+     scheduled blue-900/20 lifts luminance by ≈ 5.9 (Δ 0,+6,+22); the old gold
+     @0.2 lifted it by ≈ 16 (Δ +22,+16,0) — 2.7× louder for the "same" 20 %.
+     Gold @0.08 lifts ≈ 6.5 (Δ +9,+6,0): perceptual parity with the blue. */
+  /* --session-rel-spawn-pill-bg (managed-pill bg) is declared in the
+     "Chip surfaces" rule after this block — see there for why (#4553). */
+  --session-rel-spawn-text: #cdb984; /* managed pill + breadcrumb text */
+  /* Darker gold — a NEW role for the PM managed-PARENT chrome (#3264): the
+     parent row's left border + the parent→subheading bottom separator. Distinct
+     from --session-rel-spawn (#bfa869, the inner managed-PEER border) so the two
+     roles stay independently tunable (R7). ~HSL 42°/39%/48% reads clearly darker
+     than #bfa869 (HSL 44°/40%/58%) at border weight. Palette family locked by
+     Epic #2478 — a new role, NOT a hue re-open; do NOT alias --session-rel-spawn. */
+  --session-rel-spawn-parent: #a8894e;
+  /* Darker mint — the branch-cluster PARENT chrome (#3484): the branch-root row's
+     left rail + the root→subheading top separator — the exact role
+     --session-rel-spawn-parent plays for the gold managed cluster, so all three
+     group types (blue-800/400, gold #a8894e/#bfa869, mint dark/light) share ONE
+     two-tone rail structure and differ only in hue. Derived from
+     --session-rel-branch (var(--palette-accent)) via color-mix rather than a
+     literal hex so a runtime accent swap re-colors BOTH mint rails together (a
+     literal would leave the outer rail stuck mint-dark under a swapped accent).
+     70% toward black takes #5ae6ab (L*≈83) to ≈#3fa178 (L*≈60): a clearly-darker
+     step at 4px border weight, between the gold pair's ≈11 L* and the blue pair's
+     ≈36 L*. */
+  --session-rel-branch-parent: color-mix(
+    in srgb,
+    var(--session-rel-branch) 70%,
+    black
+  );
+
+  /* Semantic aliases of existing canonical tokens (a second naming vocabulary
+     used by some components) */
+  --app-muted: var(--app-hint); /* #8e8e93 muted/secondary text */
+  --app-text: var(--app-fg); /* #ffffff primary text */
+  --app-surface: var(--app-secondary-bg); /* #2c2c2e panel/surface bg */
+  /* #4ade80 success green (--brand-accent lives in index.css) */
+  --app-success: var(--brand-accent);
+
+  /* ── Borders / dividers ─────────────────────────────────────────────── */
+  --app-border: rgba(255, 255, 255, 0.1);
+  --app-divider: rgba(255, 255, 255, 0.08);
+  /* ── Chip surface base (epic #3285 round 14 follow-up) ────────────────
+     A translucent chip composites against whatever is BEHIND it. On a plain row
+     that is the app background; on a tinted row (managed-peer gold, scheduled
+     blue) the tint bleeds THROUGH a 5–8 %-alpha chip — measured on the deployed
+     build: 92–95 % of the row tint reaches the eye through the idle pill, node
+     badge and counters — so the tint reads as a film laid OVER the chips rather
+     than a background beneath them. --chip-base is the compositing base for
+     every chip surface that mixes against it: `transparent` (the default) keeps
+     the translucent look everywhere else; the session list's `.chip-scope`
+     wrapper (router.tsx) sets it to var(--app-bg) so its chips are OPAQUE —
+     pixel-identical on a plain row, tint-free on a tinted one. The chip TOKENS
+     that mix against it live in the "Chip surfaces" rule after this block. */
+  --chip-base: transparent;
+  --app-code-bg: #282c34;
+  --app-inline-code-bg: rgba(255, 255, 255, 0.1);
+
+  /* Diff colors */
+  --app-diff-added-bg: #0d2e1f;
+  --app-diff-added-text: #c9d1d9;
+  --app-diff-removed-bg: #3f1b23;
+  --app-diff-removed-text: #c9d1d9;
+
+  /* Git status colors */
+  --app-git-staged-color: #4ade80;
+  --app-git-unstaged-color: #f59e0b;
+  --app-git-deleted-color: #f87171;
+  --app-git-renamed-color: #60a5fa;
+  --app-git-untracked-color: #9ca3af;
+
+  /* Badge colors */
+  --app-badge-warning-bg: rgba(251, 191, 36, 0.2);
+  --app-badge-warning-text: #fbbf24;
+  --app-badge-warning-border: rgba(251, 191, 36, 0.3);
+  --app-badge-success-bg: rgba(74, 222, 128, 0.2);
+  --app-badge-success-text: #4ade80;
+  --app-badge-success-border: rgba(74, 222, 128, 0.3);
+  --app-badge-error-bg: rgba(248, 113, 113, 0.2);
+  --app-badge-error-text: #fca5a5;
+  --app-badge-error-border: rgba(248, 113, 113, 0.35);
+
+  /* ── Status triad (canonical ok / warn / hot) ────────────────────────────
+     Values chosen to match the existing badge tokens → zero visual change.
+     A1 DEFINES the triad; Batch C2 (#3356) migrated the one exact-value match
+     onto it (SystemHealthModal's #f87171 -> --status-hot); the remaining
+     no-token status literals stay as documented exceptions (token-gap
+     follow-up #3393), and RecoveryStatusBadge maps onto the session-status
+     category quad below, NOT this triad.
+     NOTE: --status-hot is the error-family BASE (#f87171 = --toast-error);
+     the badge error TEXT (#fca5a5) is intentionally NOT equal to --status-hot. */
+  --status-ok: #4ade80; /* = --app-badge-success-text */
+  --status-warn: #fbbf24; /* = --app-badge-warning-text / --toast-warning */
+  --status-hot: #f87171; /* = --toast-error (error-family base) */
+
+  /* ── Session-status category quad (#3334 · epic #3028 Sub B) ───────────────
+     The four-way SESSION-ACTIVITY category — needs-attention / working / active /
+     inactive — rendered by the toolbar status cluster (router.tsx) and the mirrored
+     SessionCountBadge. A DISTINCT vocabulary from the --status-ok/warn/hot health
+     triad above (instrument/system health, NOT session activity) and from the
+     --cat-* chat-section accents below. attention/working name previously-unnamed
+     hexes (the #3038 gap); active/inactive ALIAS the existing badge-success / hint
+     tokens so the whole quad reads as ONE named family (zero value duplication).
+     Consumed via arbitrary values (text-[var(--status-cat-attention)]); :root-only,
+     no @theme inline — matching the --accent-cyan (#3030) precedent and the
+     existing consumer sites. */
+  --status-cat-attention: #ff9500; /* needs attention (was text-[#FF9500]) */
+  --status-cat-working: #007aff; /* working (was text-[#007AFF]) */
+  --status-cat-active: var(
+    --app-badge-success-text
+  ); /* active (idle-active) — reuses #4ade80 */
+  --status-cat-inactive: var(--app-hint); /* inactive — reuses #8e8e93 */
+  --status-cat-rate-limited: #af52de; /* 429 session limit (RecoveryStatusBadge rate-limited violet) — extends the #3334 quad; NOT in the landed attention/working/active/inactive set (#3393) */
+
+  /* ── Health-severity family + neutral (#3393 · epic #3354 token-gap follow-up) ──
+     The 4-tier SYSTEM-HEALTH SEVERITY palette rendered by SystemHealthModal's
+     statusColors / HealthStatus seam (nominal/elevated/high/critical) + the no-data
+     `unknown` gray. A DISTINCT vocabulary from the --status-ok/warn/hot health triad
+     above (a 3-state triad, NOT a 4-tier severity), the --status-cat-* session-activity
+     quad above (session lifecycle, NOT instrument severity), and #3432's --status-mcp-*
+     (mcp-list; its --status-mcp-unknown #9ca3af is a DIFFERENT gray on purpose). Consumed
+     via inline var() strings / arbitrary values (text-[var(--status-sev-high)]); :root-only,
+     no @theme inline — per this file's :143-145 rule and the --accent-cyan (#3030) precedent.
+     LITERAL values (ruling D2a — no aliasing): the value coincidences noted below are
+     DELIBERATELY not aliased, so a re-tint of a coinciding token never silently moves a
+     health signal. */
+  --status-sev-nominal: #22c55e; /* all good */
+  --status-sev-elevated: #eab308; /* one param ≥80% */
+  --status-sev-high: #f97316; /* one param >90% */
+  --status-sev-critical: #ef4444; /* 3+ params >90% — LITERAL; value coincides with --accent-red-500 (Sign-Out tile); do NOT alias */
+  --status-sev-unknown: #6b7280; /* disabled / no-data gray — net-new value; distinct ON PURPOSE from #3432's --status-mcp-unknown (#9ca3af, mcp-list) */
+  /* Metric-icon blue is NOT a severity (not in HealthStatus, never returned by
+     getStatusColor) — a separate non-severity token. LITERAL; value coincides with
+     --accent-blue-400 (Analytics) AND --app-git-renamed-color (:108) — three unrelated
+     holders; do NOT alias. */
+  --health-metric-icon: #60a5fa; /* SystemHealthModal metric-icon neutral blue */
+
+  /* ── MCP-server status pair (#3432 · #3409 OR1 · epic #3354) ───────────────
+     The two porter MCP-list status colors that have NO exact existing token —
+     `unknown` (an mcp-list line the parser could not classify; drift-visible,
+     never dropped) and `pending-approval` (a ⏸ project-scoped server awaiting
+     approval) — rendered by InstalledConfigTabs' MCP_STATUS_META (the MCP Servers
+     tab status dot + label text). A DISTINCT vocabulary from the --status-ok/warn/hot
+     health triad, the --status-cat-* session-activity quad, and #3393's --status-sev-*
+     health-severity family above; --status-mcp-unknown (#9ca3af) is a DIFFERENT gray
+     ON PURPOSE from --status-sev-unknown (#6b7280, health no-data). Consumed via inline
+     var() strings; :root-only, no @theme inline — per this file's :143-145 rule and the
+     --accent-cyan (#3030) precedent (the only consumer is inline-style, so text-mcp-*
+     would have zero users). LITERAL values (ruling D2a — no aliasing). */
+  --status-mcp-unknown: #9ca3af; /* unclassified mcp-list line — #3432 · #3409 OR1; value coincides with --app-git-untracked-color (:109) — LITERAL, do NOT alias */
+  --status-mcp-pending-approval: #facc15; /* ⏸ pending-approval — #3432 · #3409 OR1; net-new value; coincides with the suppressed text-[#facc15] at SessionRightMetaRow.tsx:69 (#3404) — do NOT converge that site here */
+
+  /* ── Category accents (#2991, S4 — per chat-section visual identity) ───────
+     Subtle per-category gutter/chevron tints for the four collapsible
+     chat-section categories (tools / reasoning / response / user). Sourced
+     through a `--palette-cat-*` seam (mirroring `--accent: var(--palette-accent)`
+     at :161) so a theme CAN re-tint them via `applyPalette` — but no theme sets
+     `--palette-cat-*` today, so they resolve to these `:root` defaults and
+     survive accent swaps as independent vars (R1/R6). Consumed ONLY via
+     `var(--cat-*)` (typed as `tokens.cat.*`) — never a raw hex at a usage site.
+
+     Palette pass (R3) — a v1 proposal; the exact HUES are the operator's
+     approval-gate decision (KD3). Chosen to avoid the SAME hue as the four theme
+     accents (mint #5ae6ab ~155°, sky #38bdf8 ~199°, violet #a78bfa ~255°, pink
+     #f472b6 ~329°), the status triad (--status-ok/warn/hot), the session-rel
+     gold/blue, and #983's reserved bookmark yellow (~50°). Subtle gutter + chevron
+     tint, NOT a filled background (KD4). Residual notes (retunable at the gate):
+     tools-orange sits ~18° from the amber/gold family; response-cyan sits ~12°
+     from the (alternate) sky theme accent. */
+  /* #3147 palette (operator round-4 spec — hues tunable at the approval gate):
+     System(response)=muted purple, User=muted mint, Tool Calls=muted yellow,
+     Reasoning=muted teal (adopts the FORMER System/response cyan-teal — "the
+     current System-chevron color"), Narration(new)=muted slate gray-blue. */
+  --palette-cat-tools: #d9b74f; /* muted yellow — tool calls (#3147; was orange) */
+  --palette-cat-reasoning: #22d3ee; /* muted teal — thinking/reasoning (#3147; the former System/response chevron color) */
+  /* System-message border hue. History: #3147 shipped the Violet ACCENT #a78bfa
+     (operator: too light); #3156 rebound it to --brand-primary #1e0a3e (operator:
+     too dark — it IS the chat background, so at the 60% color-mix below it renders
+     invisible). Round-7: the operator picked from RENDERED (post-mix) swatches. The
+     chosen on-screen border is #392464; inverting the mix
+     (raw = (rendered − 0.4·#1e0a3e) / 0.6) gives this concrete raw hue #4c357d.
+     It is now a plain approval-gate-tuned hex like the other four categories (no
+     longer a --brand-primary var). Actual border = color-mix(in srgb, --cat 60%,
+     transparent) over #1e0a3e — see index.css [data-cat] rules. */
+  --palette-cat-response: #4c357d;
+  /* #3268: the System (response) CHEVRON's own hue. The chevron used to share
+     --palette-cat-response (at the same 60% mix as the border) and read too dark
+     to spot as collapsible on the dark background. A separate seam lets the
+     chevron go lighter while the operator-tuned border above stays put. The
+     exact hue is the operator's approval-gate decision (KD3). Consumed only by
+     the [data-cat="response"] chevron override in index.css, at full strength. */
+  --palette-cat-response-chevron: #7c5cbf; /* operator pick K1 (#3268 gate, 2026-09-23) */
+  --palette-cat-user: #5ac2a0; /* muted mint green — human (#3147; was pink) */
+  --palette-cat-narration: #8493b5; /* muted slate gray-blue — narration / interstitial commentary (#3147, new) */
+  --cat-tools: var(--palette-cat-tools);
+  --cat-reasoning: var(--palette-cat-reasoning);
+  --cat-response: var(--palette-cat-response);
+  --cat-response-chevron: var(--palette-cat-response-chevron);
+  --cat-user: var(--palette-cat-user);
+  --cat-narration: var(--palette-cat-narration);
+
+  /* ── Per-view accents (#3286 · epic #3028 Sub A) ───────────────────────────
+     The View Picker's four folder-tab per-view accents — Chat / Terminal /
+     Desktop / Files — routed through a `--palette-view-*` swap seam →
+     `--view-accent-*` semantic layer, mirroring the `--palette-cat-*` → `--cat-*`
+     structure above so one runtime applyPalette() flip re-colors the tabs. Chat
+     reuses the mint accent swap source; Terminal/Desktop/Files name the E6
+     operator-approved hues (blue/purple/amber). Consumed in JS via the
+     `tokens.view.*` accessor (ViewPicker inline style + color-mix tint) — never a
+     raw hex at a usage site. :root-only (no @theme inline), matching the
+     --accent-cyan (#3030) / --status-cat-* precedent. */
+  --palette-view-chat: var(
+    --palette-accent
+  ); /* mint — reuses the accent swap source */
+  --palette-view-terminal: #60a5fa; /* blue */
+  --palette-view-desktop: #a78bfa; /* purple */
+  --palette-view-files: #fbbf24; /* amber */
+  --view-accent-chat: var(--palette-view-chat);
+  --view-accent-terminal: var(--palette-view-terminal);
+  --view-accent-desktop: var(--palette-view-desktop);
+  --view-accent-files: var(--palette-view-files);
+
+  /* ── Named cyan accent (#3030 · OOS-2 convergence vocabulary) ─────────────
+     ONE name for the audited #22d3ee decorative cyan that 5 sites inline today:
+     account-usage TitleChip accent, settings/preferences accent (bg + text),
+     settings/index accent, and the porter InstalledConfigTabs "Hosted" label.
+     Named --accent-cyan (NOT --status-info): every consumer is a DECORATIVE
+     section/chip/label accent, not a health signal in the --status-ok/warn/hot
+     family. This token only DEFINES the vocabulary; migrating the 5 sites onto
+     it is Sub K's sweep (#3039 item 23) — B adds NO consumer edits here (R7).
+     🔴 DISTINCT from --palette-cat-reasoning (:147, same #22d3ee hue) — that is
+     the chat-reasoning chevron (a DIFFERENT semantic, governed by #3147) and is
+     deliberately left byte-identical. */
+  --accent-cyan: #22d3ee;
+
+  /* ── Decorative section-hue accents (#3335 · epic #3028 Sub B) ─────────────
+     One name per audited DECORATIVE per-section accent hue that settings
+     surfaces inline as raw hex today — the same class of value --accent-cyan
+     (above) was created for ("decorative section/chip/label accent, not a health
+     signal"). Census: the settings/index.tsx ADMIN_SECTIONS registry (each
+     section's TitleChip accent), the per-page TitleChip literals that duplicate
+     those values, the Preferences Notifications tile (amber), the project-group
+     header rail (violet), and the Sign-Out tile (red). Named by hue + Tailwind
+     shade so a value maps unambiguously (the set has two teals, three ambers,
+     etc.); every value is an EXISTING audited literal with a real consumer (R7).
+     :root-only, consumed via arbitrary values / tokens.section.* — NOT
+     @theme inline, NOT routed through a --palette-* swap seam (decorative section
+     branding is stable, not theme-swappable) — matching the --accent-cyan
+     precedent. ADDITIVE ONLY: no consumer site is migrated here (that is Sub K,
+     #3039) → zero visual diff at rest (R4/R6).
+
+     🔴 Five values are byte-identical to an existing NAMED token but kept DISTINCT
+     on purpose: decorative section branding is a SEPARATE vocabulary from the
+     health / accent / session-rel palettes, so reusing (e.g.) --status-warn for a
+     section tile would couple branding to the health signal. This generalizes the
+     issue's amber-vs-warn guidance and mirrors --accent-cyan ≡ --palette-cat-reasoning
+     (same #22d3ee, deliberately distinct). Collisions annotated inline below.
+     🔴 --accent-violet-600 (#7c3aed) is the frozen v3 hex; it is intentionally
+     DISTINCT from Tailwind v4's oklch violet-600 (a different color), so a named
+     token is required — a border-violet-600 utility swap would change the hue. */
+  --accent-teal-400: #2dd4bf; /* Preferences TitleChip; settings/index nav */
+  --accent-teal-200: #5eead4; /* Configuration */
+  --accent-purple-400: #c084fc; /* Time Log */
+  --accent-amber-300: #fcd34d; /* Keys */
+  --accent-amber-400: #fbbf24; /* Notifications tile — ≡ --status-warn (decorative; do NOT reuse warn) */
+  --accent-amber-500: #f59e0b; /* About — ≡ --app-git-unstaged-color */
+  --accent-emerald-400: #34d399; /* Federation */
+  --accent-sky-400: #38bdf8; /* VMs, Session Metadata */
+  --accent-indigo-400: #818cf8; /* Extensions */
+  --accent-violet-400: #a78bfa; /* System Jobs */
+  --accent-violet-600: #7c3aed; /* project-group header rail (className-only; frozen v3 hex, NOT v4 oklch) */
+  --accent-green-400: #4ade80; /* Harness Updates, Keys backup — ≡ --status-ok */
+  --accent-blue-400: #60a5fa; /* Analytics — ≡ --session-rel-schedule */
+  --accent-mint: #5ae6ab; /* Harness Scorecard — ≡ --palette-accent (frozen; do NOT alias — must not swap) */
+  --accent-orange-400: #fb923c; /* File Conflicts */
+  --accent-rose-400: #fb7185; /* Error Log */
+  --accent-pink-400: #f472b6; /* Feedback */
+  --accent-red-500: #ef4444; /* Sign-Out tile (destructive-action; KD5 — ≠ --destructive #dc2626) */
+
+  /* ── Chart data-series accents (#3434 · epic #3354 · L8/#3410) ────────────
+     A reusable ORDINAL data-viz series vocabulary (the shadcn `--chart-N`
+     convention) — NOT widget-private constants. First consumer:
+     TokenUsageWidget's token-usage StackedBar + legend (series 1 = cache-read,
+     2 = cache-write, 3 = output), read through the `tokens.chart[1..3]` accessor
+     (a JS / inline-`style` value). Candidate later consumers: the
+     extensions/analytics/ charts (TypeDistribution / UsageBarChart /
+     TimeSeriesChart), currently outside the design-token checker's SCAN_ROOTS.
+     :root-only, consumed via inline `style` / arbitrary values — NOT
+     @theme inline (matching the --accent-cyan #3030 / --status-cat-* precedent,
+     this file's :143-145 rule).
+     🔴 --chart-3 (#f59e0b) coincides by VALUE ONLY with --accent-amber-500 (the
+     "About" section accent) and --app-git-unstaged-color — a DIFFERENT semantic
+     (a data-series color, not a section/git accent), kept a LITERAL DISTINCT on
+     purpose, never an alias (the "separate vocabulary / literal-not-alias" rule,
+     README.md). */
+  --chart-1: #3b82f6; /* series 1 — cache-read (TokenUsageWidget) */
+  --chart-2: #8b5cf6; /* series 2 — cache-write (TokenUsageWidget) */
+  --chart-3: #f59e0b; /* series 3 — output — ≡ --accent-amber-500 / --app-git-unstaged-color by hex only, LITERAL not alias */
+
+  /* ── Cost display — equivalent-cost accent (#3353 · epic #3345) ────────────
+     The real-vs-EQUIVALENT API-cost display keys on `metadata.authBinding.kind`
+     (#3351): api-key/gateway-key = REAL cost → mint (--app-accent); a
+     subscription-account has no marginal API charge → the cost shown is the
+     EQUIVALENT at API rates, tinted with this token + an "EQ." marker;
+     inherited/absent → neutral (--app-hint "—"). Consumers: the per-turn footer
+     (AssistantMessage) + the cumulative row (TokenUsageWidget), via
+     `text-[var(--cost-equivalent)]` — never a raw hex at a usage site (R5).
+     Operator-approved hue (mockup gate 2026-09-21): periwinkle #818cf8, chosen to
+     read as a DISTINCT family from the reserved blues rendered near cost —
+     especially the hardcoded cache-read #3b82f6 in the SAME widget, plus
+     --status-cat-working #007aff, --accent-sky-400 #38bdf8, and
+     --accent-blue-400/--session-rel-schedule #60a5fa.
+     🔴 The value coincides with --accent-indigo-400 (#818cf8, the "Extensions"
+     decorative section accent) — a SEPARATE vocabulary (cost-semantic, not
+     decorative branding) that never co-renders with cost. LITERAL, do NOT alias
+     to --accent-indigo-400 (the same "distinct-semantic value-coincidence"
+     convention as --chart-3 ≡ --accent-amber-500). */
+  --cost-equivalent: #818cf8;
+
+  /* ── Shadows (semantic dark-theme scale — minimal, YAGNI) ────────────────
+     Additive semantic tokens for surfaces wanting app-consistent elevation.
+     Deliberately NOT named --shadow-sm/md/lg (those would shadow Tailwind's
+     built-in shadow utilities); Tailwind default shadow-* stay unchanged. */
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+  /* ── Spacing scale ───────────────────────────────────────────────────────
+     Tailwind 4's default spacing scale (base --spacing: 0.25rem) remains the
+     canonical spacing source; use `p-2`, `gap-4`, etc. These named tokens
+     mirror the common steps 1:1 (no divergence) for the rare arbitrary-value
+     or JS case where a semantic name reads clearer than a magic number. */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+
+  /* ── Radii ──────────────────────────────────────────────────────────── */
+  --radius: 0.5rem;
+
+  /* ══ #3030 — Token vocabulary completion (epic #3028 Sub B) ══════════════
+     The families below name Sub A's (#3029) Matt-approved decision records + the
+     audited census values, so consumers reference a name instead of a scattered
+     literal. All are :root-only vars consumed via arbitrary values
+     (`text-[length:var(--text-body)]`, `z-[var(--z-overlay)]`) — NOT @theme inline
+     utilities (following the --space-* precedent above; A's records name semantic
+     roles, not Tailwind utility names). ADDITIVE ONLY: each token names an
+     EXISTING audited value with a real consumer (R6); no consumer site is
+     migrated here (that is later subs, e.g. Sub K) → zero visual diff at rest
+     (R4). None is theme-swappable (not colors), so :root residence + no
+     @theme inline keeps the swap contract untouched. */
+
+  /* ── Type scale — dense 10–14px family (Sub A #3029 typography record) ─────
+     Names the approved dense type styles (499 arbitrary `text-[Npx]` uses
+     audited). Each size pairs with a bundled line-height token — A's line-height
+     decision: the arbitrary `text-[Npx]` utilities set font-size ONLY and leak
+     vertical-rhythm drift, so a consumer should set both
+     (`text-[length:var(--text-body)] leading-[var(--leading-body)]`). The weight axis
+     defaults to --weight-medium (500) — Hapimatic's default UI weight (264 uses
+     vs 5 for regular). */
+  --text-caption-xs: 10px; /* smallest metadata — badge counts, micro-labels (103 uses) */
+  --text-caption: 11px; /* dense captions, uppercase section labels (147 — most common) */
+  --text-body-dense: 12px; /* dense body + list-row secondary content (100) */
+  --text-body: 13px; /* primary dense body + control labels — the workhorse (117) */
+  --text-label-strong: 14px; /* row titles, emphasized labels, small headers (32) */
+  --leading-caption-xs: 1; /* leading-none — micro-labels where every px counts */
+  --leading-caption: 1; /* leading-none */
+  --leading-body-dense: 1.25; /* leading-tight — dense but readable multi-line */
+  --leading-body: 1.25; /* leading-tight */
+  --leading-label-strong: 1.25; /* leading-tight */
+  --weight-regular: 400; /* font-normal — rare, long-form prose only (5 uses) */
+  --weight-medium: 500; /* font-medium — the DEFAULT UI weight (264 uses) */
+  --weight-semibold: 600; /* font-semibold — emphasis, headers, active states (93) */
+  --weight-bold: 700; /* font-bold — strong emphasis, rare (24) */
+
+  /* ── Control sizes (Sub A #3029 density record) ───────────────────────────
+     The audited control-height ladder (button.tsx cva sizes) + the chip and
+     touch-action sizes. NOTE: the icon-button vars (--icon-btn-size 32 /
+     --icon-slot 34) and row-density (--row-padding-y 6/3/1) already live in
+     web/src/index.css + useDensity and are REFERENCED there, not duplicated
+     here (see README). Consumed via `h-[var(--control-sm)]`. */
+  --control-sm: 32px; /* button size="sm" (h-8) — dense toolbars, inline actions */
+  --control-md: 36px; /* button size="default" (h-9) — the standard button height */
+  --control-lg: 40px; /* button size="lg" (h-10) — prominent / primary actions */
+  --control-chip: 24px; /* Filter/Sort segmented chip (desktop) — SC 2.5.8 floor.
+                           ⚠️ collapses to 22px at width 393; holding it at ≥24 is
+                           a Sub B/K component change, NOT this vocabulary task. */
+  --control-touch: 44px; /* composer actions (+Prompt/+Notes/+Usage) */
+  --nav-circle: 36px; /* message-nav circles (bookmark · jump · user-msg) — split from --control-touch 2026-10-05 so the circles shrink without touching the composer's 44px tap targets */
+
+  /* ── Z-index scale ────────────────────────────────────────────────────────
+     Names the audited stacking layers so consumers reference a layer, not a bare
+     `z-N`. Every value names a real audited literal with a real consumer; the
+     ad-hoc middle layers (20/30/40) are tokened for the exact sites that use
+     them. Consumed via `z-[var(--z-overlay)]`. */
+  --z-sticky: 10; /* sticky / pinned headers (13 uses) */
+  --z-raised: 20; /* locally-raised controls above sticky (session-metadata, account-usage) */
+  --z-dropdown: 30; /* anchored floating panels / dropdowns (router overlay, LinkIssueField) */
+  --z-drawer: 40; /* side drawer (SettingsDrawer) */
+  --z-overlay: 50; /* modals / dialogs / popovers / overlays — the dominant float layer (38 uses) */
+  --z-toast: 9999; /* toast stack — always on top (Toast.tsx) */
+
+  /* ── Motion (duration + easing) ───────────────────────────────────────────
+     Audited transition durations + easing curves (transition-colors is the
+     default transition, 129 files). Durations honor prefers-reduced-motion via
+     the @media guard AFTER this :root block (zeroes them for reduced-motion).
+     Easing values are Tailwind's default curves (the audited ease-* utilities).
+     Consumed via `duration-[var(--duration-base)] ease-[var(--ease-out)]`. */
+  --duration-fast: 150ms; /* quick feedback (9 uses) */
+  --duration-base: 200ms; /* the default transition duration (17 — dominant) */
+  --duration-slow: 300ms; /* deliberate transitions (2) */
+  --duration-slower: 500ms; /* slow reveals / long fades (9) */
+  --ease-out: cubic-bezier(0, 0, 0.2, 1); /* decelerate — enter (17 uses) */
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1); /* both ends — move (12) */
+  --ease-in: cubic-bezier(0.4, 0, 1, 1); /* accelerate — exit (1) */
+
+  /* ── Icon glyph sizes — DISTINCT from icon-BUTTON size ─────────────────────
+     The lucide icon px scale (square h-N w-N). This is the GLYPH size, NOT the
+     icon-button container (--icon-btn-size 32 / --icon-slot 34 in index.css).
+     Consumed via `h-[var(--icon-sm)] w-[var(--icon-sm)]`. */
+  --icon-2xs: 8px; /* h-2 w-2 (33 uses) */
+  --icon-xs: 12px; /* h-3 w-3 (67) */
+  --icon-sm: 16px; /* h-4 w-4 — the DEFAULT icon size (155) */
+  --icon-md: 20px; /* h-5 w-5 (57) */
+  --icon-lg: 24px; /* h-6 w-6 (9) */
+  --icon-xl: 32px; /* h-8 w-8 (58) */
+
+  /* ── Content width (Sub A #3029 layout record) ────────────────────────────
+     Mirrors tailwind.config.ts maxWidth.content (1024px, widened from 720px by
+     #3455), consumed as the
+     `max-w-content` utility (router, SplitPaneContentView). The Tailwind config
+     stays AUTHORITATIVE for the utility; this var exposes the same audited value
+     as a :root token for the rare JS / arbitrary-value case. Content width is
+     not theme-swappable, so config residence does not violate the swap contract. */
+  --content-width: 1024px;
+
+  /* ── shadcn/ui semantic tokens — mapped to Hapimatic --app-* values ──── */
+  --background: #1c1c1e;
+  --foreground: #ffffff;
+  --card: #2c2c2e;
+  --card-foreground: #ffffff;
+  --popover: #2c2c2e;
+  --popover-foreground: #ffffff;
+  --primary: #ffffff;
+  --primary-foreground: #111827;
+  --secondary: rgba(255, 255, 255, 0.05);
+  --secondary-foreground: #ffffff;
+  --muted: rgba(255, 255, 255, 0.05);
+  --muted-foreground: #8e8e93;
+  /* was #5ae6ab — now points at the shared swap source */
+  --accent: var(--palette-accent);
+  --accent-foreground: #111827; /* UNCHANGED — menu/select/command consumers (R3, D1) */
+  --destructive: #dc2626;
+  --border: rgba(255, 255, 255, 0.1);
+  --input: rgba(255, 255, 255, 0.15);
+  /* was #5ae6ab — joins the swap seam so focus rings follow the accent (D3) */
+  --ring: var(--palette-accent);
+}
+
+/* ── Chip surfaces (#4553) ────────────────────────────────────────────────
+   These fills mix against --chip-base. A custom property's var() resolves
+   where the property is DECLARED, and descendants inherit the already-resolved
+   value — so while these lived only on :root they resolved --chip-base THERE
+   (transparent), and the session list's opaque override never reached them:
+   inside the list they measured alpha 0.08 and a tinted row bled through the
+   managed pill, status pill, loop-cron badge and account chip, defeating the
+   epic #3285 round-14 intent. Declaring them on BOTH :root and `.chip-scope`
+   makes each scope resolve against its own --chip-base: opaque inside the
+   session list, translucent (unchanged) everywhere else. One declaration per
+   token, two scopes. */
+:root,
+.chip-scope {
+  --app-subtle-bg: color-mix(in srgb, #fff 5%, var(--chip-base));
+  --app-badge-bg: color-mix(in srgb, #fff 8%, var(--chip-base));
+  /* managed-pill bg (epic #2479 X1) */
+  --session-rel-spawn-pill-bg: color-mix(
+    in srgb,
+    #bfa869 16%,
+    var(--chip-base)
+  );
+}
+
+/* The session-list wrapper (router.tsx): the opaque compositing base. */
+.chip-scope {
+  --chip-base: var(--app-bg);
+}
+
+/* ── Reduced-motion guard (#3030) ─────────────────────────────────────────
+   Honor prefers-reduced-motion for every consumer of the motion duration
+   tokens: zero them so a token-referencing transition becomes instant. Dormant
+   until sites migrate onto the --duration-* tokens (B is additive — no site
+   references them yet, so this changes nothing at rest, R4). Easing is left
+   untouched (a 0ms transition has no perceptible curve). */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-base: 0ms;
+    --duration-slow: 0ms;
+    --duration-slower: 0ms;
+  }
+}
+
+/* ── Tailwind 4 theme mapping (semantic name → var reference) ──────────────
+   `@theme inline` emits utilities that reference the CSS variable rather than
+   baking its value — this is what makes the tokens runtime-swappable. Every
+   existing --color-* mapping is preserved byte-for-byte; the additions are the
+   status triad (bg-ok / text-warn / border-hot …) and two semantic shadows
+   (shadow-card / shadow-overlay). */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Status triad utilities: bg-ok / text-warn / border-hot, etc. */
+  --color-ok: var(--status-ok);
+  --color-warn: var(--status-warn);
+  --color-hot: var(--status-hot);
+
+  /* Semantic shadow utilities: shadow-card / shadow-overlay (additive; the
+     built-in shadow-sm/md/lg/xl utilities are untouched). */
+  --shadow-card: var(--shadow-card);
+  --shadow-overlay: var(--shadow-overlay);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+}

@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+import { Hono } from "hono";
+import { defineCapability } from "@hapi/protocol";
+import {
+  FeedbackRequestSchema,
+  FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES,
+} from "@hapi/protocol/schemas";
+import type {
+  FeedbackAttachment,
+  FeedbackMetadata,
+} from "@hapi/protocol/types";
+import type { Store } from "../../store";
+import type { WebAppEnv } from "../middleware/auth";
+import { createRateLimiter } from "../middleware/rateLimit";
+import { cataloged } from "../../capabilities/cataloged";
+import { scrubString } from "../../sentry";
+import { isFileTypeAllowed } from "./upload";
+import {
+  buildFeedbackEmail,
+  sendFeedbackEmail,
+  type FeedbackEmailInput,
+  type FeedbackSenderConfig,
+} from "../../feedback/feedbackSender";
+
+/**
+ * Deep-scrub every string leaf of the composed metadata (R4 defense-in-depth).
+ * The client already composes by whitelist, but the server re-scrubs so a token
+ * that somehow rode along in a metadata value is redacted before it is persisted
+ * or emailed. Structure-preserving: the object shape is untouched.
+ */
+function scrubDeep(value: unknown): unknown {
+  if (typeof value === "string") return scrubString(value);
+  if (Array.isArray(value)) return value.map(scrubDeep);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[k] = scrubDeep(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+function scrubMetadata(metadata: FeedbackMetadata): FeedbackMetadata {
+  return scrubDeep(metadata) as FeedbackMetadata;
+}
+
+/**
+ * `POST /api/feedback` (issue #2664, epic #2663). Zod-validated + rate-limited
+ * with parity to `POST /api/error-reports` (10/60s). The invariants:
+ *
+ *  - R4: `scrubString` is applied to BOTH the description AND every metadata
+ *    string; the payload schema is `.strict()` so un-whitelisted keys 400.
+ *  - R7: the row is persisted BEFORE the email is attempted — the SQLite row is
+ *    the durable record (read by the #2666 admin viewer).
+ *  - R10: an unconfigured / failed email still returns 201 with the row
+ *    persisted; the outcome is recorded via `updateEmailStatus`.
+ *
+ * Issue #2665 extends this with optional `attachments` (base64-in-payload):
+ * each is re-validated server-side against the `upload.ts` MIME allowlist +
+ * a 10 MB total cap and rejected 400 on violation (never trust the client);
+ * valid attachment refs persist in the row's `attachments_json` and the bytes
+ * are delivered as native AgentMail attachments. A failed send still 201s.
+ */
+export function createFeedbackRoutes(
+  store: Store,
+  senderConfig: FeedbackSenderConfig
+): Hono<WebAppEnv> {
+  const app = new Hono<WebAppEnv>();
+
+  const limiter = createRateLimiter({ name: "feedback", limit: 10 });
+
+  app.post(
+    "/feedback",
+    cataloged(
+      defineCapability({
+        id: "harness-admin.submit-feedback",
+        domain: "harness-admin",
+        surface: "rest",
+        description:
+          "Submit in-app user feedback (category, description, optional attachments); the entry is persisted first, then emailed best-effort.",
+        whenToUse: "When the user sends product feedback from the app.",
+        invocation: { kind: "rest", method: "POST", path: "/api/feedback" },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    limiter,
+    async c => {
+      const namespace = c.get("namespace");
+
+      const json = await c.req.json().catch(() => null);
+      const parsed = FeedbackRequestSchema.safeParse(json);
+      if (!parsed.success) {
+        return c.json(
+          { error: "Invalid body", details: parsed.error.issues },
+          400
+        );
+      }
+
+      const data = parsed.data;
+      const description = scrubString(data.description);
+      const metadata = scrubMetadata(data.metadata);
+
+      // Issue #2665 — validate + associate attachments (Path A: base64-in-payload).
+      // MIME allowlist + byte size are RE-VALIDATED server-side (never trust the
+      // client): a disallowed / empty / oversize attachment is rejected 400, at
+      // parity with POST /sessions/:id/upload (V1). This is distinct from the R4
+      // graceful-degradation path below — a failed EMAIL send still 201s with the
+      // row (and its attachment refs) persisted. The bytes ride the email; the row
+      // persists only the refs (filename/mimeType/size), not the file bytes.
+      const emailAttachments: FeedbackAttachment[] = [];
+      const attachmentRefs: Array<{
+        filename: string;
+        mimeType: string;
+        size: number;
+      }> = [];
+      let attachmentBytes = 0;
+      for (const att of data.attachments ?? []) {
+        const bytes = Buffer.from(att.data, "base64").length;
+        if (bytes === 0) {
+          return c.json({ error: "Attachment is empty or malformed" }, 400);
+        }
+        if (!isFileTypeAllowed(att.mimeType, att.filename)) {
+          return c.json(
+            { error: `Attachment type not allowed: ${att.mimeType}` },
+            400
+          );
+        }
+        attachmentBytes += bytes;
+        if (attachmentBytes > FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES) {
+          return c.json(
+            {
+              error: `Attachments too large. Maximum total size is ${
+                FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024
+              }MB`,
+            },
+            400
+          );
+        }
+        // Scrub the free-text filename (defense-in-depth, same discipline as the
+        // description/metadata); the file bytes are consented content — never scrubbed.
+        const filename = scrubString(att.filename);
+        emailAttachments.push({
+          filename,
+          mimeType: att.mimeType,
+          data: att.data,
+        });
+        attachmentRefs.push({ filename, mimeType: att.mimeType, size: bytes });
+      }
+      const attachmentsJson =
+        attachmentRefs.length > 0 ? JSON.stringify(attachmentRefs) : null;
+
+      // R7 — persist FIRST. The row is the durable record; email is best-effort.
+      const entry = store.feedback.createEntry({
+        namespace,
+        category: data.category,
+        description,
+        submitterEmail: data.submitterEmail ?? null,
+        metadataJson: JSON.stringify(metadata),
+        attachmentsJson,
+      });
+
+      // R10 — best-effort email. A skip/failure never loses the persisted row.
+      // The SAME structured input both renders the direct-AgentMail email and is
+      // the relay's request payload (#2667): the relay rebuilds the email from these
+      // fields rather than trusting a caller-rendered body. Kept fork-free (R3) — the
+      // route always builds `emailInput`; `sendFeedbackEmail` selects the transport.
+      const emailInput: FeedbackEmailInput = {
+        category: data.category,
+        description,
+        submitterEmail: data.submitterEmail ?? null,
+        metadata,
+        attachments: emailAttachments.length > 0 ? emailAttachments : undefined,
+      };
+      const email = buildFeedbackEmail(emailInput);
+      const result = await sendFeedbackEmail(senderConfig, email, emailInput);
+      if (result.status === "sent") {
+        store.feedback.updateEmailStatus(entry.id, true, null);
+      } else if (result.status === "error") {
+        console.error(
+          `[feedback] email send failed for ${entry.id}: ${result.error}`
+        );
+        store.feedback.updateEmailStatus(entry.id, false, result.error);
+      } else {
+        console.log(
+          `[feedback] email skipped for ${entry.id}: ${result.reason}`
+        );
+      }
+
+      return c.json({ id: entry.id }, 201);
+    }
+  );
+
+  // ── Admin viewer list endpoint (issue #2666, epic #2663 Sub C) ─────────────
+  // Kept in a DISTINCT region from the POST above so the parallel #2665
+  // (attachments) edits to this file rebase cleanly. `GET /api/feedback` is a
+  // read-only admin surface: it inherits its auth from mount position — the
+  // factory mounts at `/api` AFTER the global JWT middleware
+  // (`app.use("/api/*", createAuthMiddleware(...))`, server.ts), exactly like
+  // `sessionMetadata` / `errorLogs`, so an unauthenticated request is rejected
+  // (401) before it reaches this handler. The list is node-global (no namespace
+  // filter) — the documented permissive bulk-read tier (server/CLAUDE.md:213):
+  // any authenticated user of the node reads all rows; role-gated reads are a
+  // future hardening (cf. epic #2494). Rows carry `emailed`/`email_error`, so a
+  // persist-only (`emailed=0`) row is visibly the durable safety net (R3).
+  app.get(
+    "/feedback",
+    cataloged(
+      defineCapability({
+        id: "harness-admin.list-feedback",
+        domain: "harness-admin",
+        surface: "rest",
+        description:
+          "List submitted user-feedback entries (node-global) with their email-delivery status, for the admin feedback viewer.",
+        whenToUse: "When reviewing submitted feedback in the admin viewer.",
+        invocation: { kind: "rest", method: "GET", path: "/api/feedback" },
+        auth: "jwt",
+        riskTier: "readonly",
+        availability: { scope: "user" },
+      })
+    ),
+    c => {
+      const url = new URL(c.req.url);
+
+      // Clamp `limit` per the real precedent (errorLogs.ts): default 100, max 500.
+      let limit = 100;
+      const rawLimit = url.searchParams.get("limit");
+      if (rawLimit) {
+        const parsed = Number(rawLimit);
+        if (!Number.isNaN(parsed) && parsed > 0) {
+          limit = Math.min(parsed, 500);
+        }
+      }
+
+      let offset = 0;
+      const rawOffset = url.searchParams.get("offset");
+      if (rawOffset) {
+        const parsed = Number(rawOffset);
+        if (!Number.isNaN(parsed) && parsed >= 0) {
+          offset = parsed;
+        }
+      }
+
+      const items = store.feedback.getEntries({ limit, offset });
+      const total = store.feedback.countEntries();
+      return c.json({ items, total });
+    }
+  );
+
+  return app;
+}

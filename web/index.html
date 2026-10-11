@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+
+    <!-- PWA Meta Tags -->
+    <meta name="theme-color" content="#1E0A3E" />
+    <meta
+      name="description"
+      content="Matt's AI-powered development assistant"
+    />
+
+    <!-- iOS PWA Meta Tags -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta
+      name="apple-mobile-web-app-status-bar-style"
+      content="black-translucent"
+    />
+    <meta name="apple-mobile-web-app-title" content="Hapimatic" />
+    <!-- Apple touch icon - dynamically set based on instance type -->
+    <link
+      rel="apple-touch-icon"
+      id="apple-touch-icon"
+      href="/apple-touch-icon-180x180.png"
+    />
+
+    <!-- Google Fonts - Varela Round (rounded letterforms) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Varela+Round&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Favicon - dynamically set based on instance type (port 3009 = dev) -->
+    <link rel="icon" id="favicon-ico" href="/favicon.ico" sizes="48x48" />
+    <link
+      rel="icon"
+      id="favicon-svg"
+      href="/icon.svg"
+      sizes="any"
+      type="image/svg+xml"
+    />
+
+    <!-- Safari Pinned Tab -->
+    <link rel="mask-icon" href="/mask-icon.svg" color="#1E0A3E" />
+
+    <!-- Dev/Prod icon switching based on hostname or port -->
+    <!-- Dev: hostname contains 'hapi-dev' (Tailscale Services) OR port 3009/8443 -->
+    <script>
+      (function () {
+        var hostname = window.location.hostname;
+        var port = window.location.port;
+        var isDev =
+          hostname.indexOf("hapi-dev") !== -1 ||
+          port === "3009" ||
+          port === "8443";
+        var iconPath = isDev ? "/icons/" : "/icons-production/";
+
+        // Update favicon
+        var faviconIco = document.getElementById("favicon-ico");
+        var faviconSvg = document.getElementById("favicon-svg");
+        var appleTouchIcon = document.getElementById("apple-touch-icon");
+
+        if (faviconIco) faviconIco.href = iconPath + "favicon-32x32.png";
+        if (faviconSvg) faviconSvg.href = iconPath + "icon-source.svg";
+        if (appleTouchIcon)
+          appleTouchIcon.href = iconPath + "apple-touch-icon-180x180.png";
+
+        // Update page title for dev instance
+        if (isDev) {
+          document.title = "Hapimatic DEV";
+        }
+      })();
+    </script>
+
+    <!-- Always dark — prevent flash of white on load -->
+    <style>
+      html {
+        background: #1e0a3e;
+        color-scheme: dark;
+      }
+    </style>
+    <script>
+      document.documentElement.setAttribute("data-theme", "dark");
+    </script>
+
+    <!-- Issue #1793: bootstrap-independent "React failed to mount" detector.
+         Runs even if the module graph (main.tsx / its chunks) fails to load — it
+         is the LAST line of defense for the blank #1E0A3E shell, where React
+         never mounts (a different failure family than a crash-to-error-boundary).
+         ~10s after DOMContentLoaded, if #root is still empty AND main.tsx never
+         set window.__hapiReactMounted, it beacons a `react-mount-failure` row to
+         the server error_logs (R5c) and self-heals with ONE visibility-guarded,
+         sessionStorage-one-shot reload. -->
+    <script>
+      (function () {
+        var MOUNT_TIMEOUT_MS = 10000;
+        var SELF_HEAL_FLAG = "hapi:mount-reload-once";
+
+        // Mirror getInstancePort() + getStorageKey("hapi_server_url") so the
+        // token lookup key matches what the app writes (R11). Bare
+        // location.origin would miss when the API server differs from the shell.
+        function serverBaseUrl() {
+          var port =
+            window.location.port ||
+            (window.location.protocol === "https:" ? "443" : "80");
+          var stored = null;
+          try {
+            stored = localStorage.getItem("hapi_server_url:" + port);
+          } catch (e) {
+            /* storage unavailable */
+          }
+          return stored || window.location.origin;
+        }
+
+        function reactMounted() {
+          if (window.__hapiReactMounted) return true;
+          var root = document.getElementById("root");
+          return !!(root && root.childElementCount > 0);
+        }
+
+        function selfHealReload() {
+          if (reactMounted()) return;
+          var alreadyReloaded = false;
+          try {
+            alreadyReloaded = sessionStorage.getItem(SELF_HEAL_FLAG) !== null;
+          } catch (e) {
+            /* storage unavailable */
+          }
+          if (alreadyReloaded) return;
+
+          function fire() {
+            try {
+              sessionStorage.setItem(SELF_HEAL_FLAG, "1");
+            } catch (e) {
+              /* best-effort */
+            }
+            window.location.reload();
+          }
+
+          // Reloading a HIDDEN tab would re-land on the blank shell (the exact
+          // bug). Defer to the next foreground, mirroring reloadWhenVisible().
+          if (document.visibilityState === "visible") {
+            fire();
+          } else {
+            var onVis = function () {
+              if (document.visibilityState !== "visible") return;
+              document.removeEventListener("visibilitychange", onVis);
+              if (!reactMounted()) fire();
+            };
+            document.addEventListener("visibilitychange", onVis);
+          }
+        }
+
+        function onMountTimeout() {
+          if (reactMounted()) return;
+
+          var baseUrl = serverBaseUrl();
+          var token = null;
+          try {
+            token = localStorage.getItem("hapi_access_token::" + baseUrl);
+          } catch (e) {
+            /* storage unavailable */
+          }
+
+          // R11 / OR-2: /api/error-reports is auth-gated. A never-logged-in or
+          // token-expired client cannot beacon — that blank shell goes
+          // unrecorded (accepted for v1). fetch(keepalive), NOT sendBeacon,
+          // because sendBeacon cannot set an Authorization header.
+          if (token) {
+            try {
+              fetch(baseUrl + "/api/error-reports", {
+                method: "POST",
+                keepalive: true,
+                headers: {
+                  "content-type": "application/json",
+                  authorization: "Bearer " + token,
+                },
+                body: JSON.stringify({
+                  message:
+                    "React failed to mount within " +
+                    MOUNT_TIMEOUT_MS +
+                    "ms of DOMContentLoaded",
+                  category: "react-mount-failure",
+                  source: "client",
+                  severity: "error",
+                  context: "index.html mount-detector",
+                  userAgent: navigator.userAgent,
+                }),
+              }).catch(function () {
+                /* beacon is best-effort */
+              });
+            } catch (e) {
+              /* beacon is best-effort */
+            }
+          }
+
+          selfHealReload();
+        }
+
+        function arm() {
+          window.setTimeout(onMountTimeout, MOUNT_TIMEOUT_MS);
+        }
+
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", arm);
+        } else {
+          arm();
+        }
+      })();
+    </script>
+
+    <title>Hapimatic</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

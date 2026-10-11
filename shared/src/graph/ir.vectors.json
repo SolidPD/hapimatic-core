@@ -1,0 +1,153 @@
+[
+  {
+    "name": "__meta__",
+    "issue": 2883,
+    "notes": [
+      "Table-driven conformance vectors for the v0.1 Graph IR validator (validateGraphIR).",
+      "One positive vector exercising every construct kind + one negative vector per IRError.code.",
+      "Mirrors the shared/src/conflictSeverity.vectors.json convention: the __meta__ element (no `graph` key) is skipped by the test.",
+      "Negative vectors are each minimal so exactly ONE IRError.code fires — do not add unrelated defects to a negative vector."
+    ]
+  },
+  {
+    "name": "positive-all-constructs",
+    "description": "A well-formed graph exercising all 8 construct kinds, both effect-field variants (enum + object), resources, capabilities (declared + enforced(<mech>)), a typed contract, retry, and terminal.",
+    "expect_ok": true,
+    "graph": {
+      "id": "sample-v01",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "start",
+          "kind": "sequence",
+          "terminal": false,
+          "contract": {
+            "inputs": { "x": "string" },
+            "outputs": { "y": "number" }
+          },
+          "resources": [{ "name": "db", "mode": "write" }],
+          "effects": [
+            {
+              "access": "write",
+              "idempotency": "natural",
+              "reversibility": "reversible",
+              "authority": "none",
+              "reconciliation": "none",
+              "risk_tier": "mutating"
+            }
+          ],
+          "capabilities": [
+            { "name": "fs.write", "enforcement": "declared" },
+            { "name": "net.fetch", "enforcement": "enforced(gha-oidc)" }
+          ],
+          "retry": { "max": 3 }
+        },
+        {
+          "id": "sw",
+          "kind": "branch",
+          "branches": [{ "when": "cond_a", "to": "par" }],
+          "default": "gate"
+        },
+        { "id": "par", "kind": "parallel", "targets": ["mapper", "loop1"] },
+        { "id": "mapper", "kind": "map", "item_key": "item.id" },
+        {
+          "id": "loop1",
+          "kind": "loop",
+          "max_iterations": 5,
+          "on_exhaustion": "join1"
+        },
+        { "id": "join1", "kind": "join", "upstreams": ["mapper", "loop1"] },
+        {
+          "id": "gate",
+          "kind": "human_gate",
+          "gate_id": "approve_release",
+          "approver": "release-team"
+        },
+        { "id": "sub", "kind": "subgraph", "ref": "start" },
+        {
+          "id": "done",
+          "kind": "sequence",
+          "terminal": true,
+          "effects": [
+            {
+              "access": "read",
+              "idempotency": { "keyed": "order-id" },
+              "reversibility": { "compensatable": "refund" },
+              "authority": { "witness": ["witness-svc"] },
+              "reconciliation": { "queryable": "ledger-query" },
+              "risk_tier": "destructive"
+            }
+          ]
+        }
+      ],
+      "edges": [
+        { "from": "start", "to": "sw" },
+        { "from": "gate", "to": "done" },
+        { "from": "join1", "to": "done" }
+      ]
+    }
+  },
+  {
+    "name": "unknown-construct",
+    "description": "A node whose kind is outside the frozen 8-construct set.",
+    "expect_ok": false,
+    "expect_code": "unknown_construct",
+    "graph": {
+      "id": "g",
+      "version": "0.1",
+      "nodes": [{ "id": "u", "kind": "teleport" }],
+      "edges": []
+    }
+  },
+  {
+    "name": "dangling-ref",
+    "description": "An edge whose target does not resolve to any node id.",
+    "expect_ok": false,
+    "expect_code": "dangling_ref",
+    "graph": {
+      "id": "g",
+      "version": "0.1",
+      "nodes": [{ "id": "a", "kind": "sequence" }],
+      "edges": [{ "from": "a", "to": "ghost" }]
+    }
+  },
+  {
+    "name": "duplicate-id",
+    "description": "Two nodes sharing the same id.",
+    "expect_ok": false,
+    "expect_code": "duplicate_id",
+    "graph": {
+      "id": "g",
+      "version": "0.1",
+      "nodes": [
+        { "id": "dup", "kind": "sequence" },
+        { "id": "dup", "kind": "sequence" }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "loop-unbounded",
+    "description": "A loop node missing max_iterations (on_exhaustion resolves, so only loop_unbounded fires).",
+    "expect_ok": false,
+    "expect_code": "loop_unbounded",
+    "graph": {
+      "id": "g",
+      "version": "0.1",
+      "nodes": [{ "id": "L", "kind": "loop", "on_exhaustion": "L" }],
+      "edges": []
+    }
+  },
+  {
+    "name": "map-no-identity",
+    "description": "A map node missing its stable item-identity key.",
+    "expect_ok": false,
+    "expect_code": "map_no_identity",
+    "graph": {
+      "id": "g",
+      "version": "0.1",
+      "nodes": [{ "id": "M", "kind": "map" }],
+      "edges": []
+    }
+  }
+]

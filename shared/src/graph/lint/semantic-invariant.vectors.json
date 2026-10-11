@@ -1,0 +1,448 @@
+[
+  {
+    "name": "__meta__",
+    "issue": 2885,
+    "rules": "SEMANTIC_INVARIANT (linter engine + rules)",
+    "notes": [
+      "Table-driven conformance vectors for the R2 structural conditions, one positive + one negative per condition (12 conditions x 2 = 24).",
+      "Every vector is run THROUGH runLinter(graph, SEMANTIC_INVARIANT_RULES) so validator-channel conditions (surfaced via #2883's validateGraphIR reuse) and named-rule conditions test uniformly; the assertion filters findings by `invariant_id`.",
+      "Two conditions assert `schema`-class findings (invariant_id INV-schema-valid) rather than a named rule (S7): the illegal-resource-access ENUM-MODE facet (a `mode` not in {read,write,exclusive} is pure shape, S6a) and a residual GraphIRSchema safeParse failure.",
+      "Mirrors incident-derived.vectors.json / ir.vectors.json: the __meta__ element (no `graph` key) is skipped by the test.",
+      "Positive graphs are deliberately minimal so the target invariant is the primary finding; a positive assertion only requires the target invariant_id to be present (extra findings are permitted). Negatives assert the target invariant_id is ABSENT."
+    ]
+  },
+
+  {
+    "name": "duplicate-node-ids-positive",
+    "condition": "duplicate node ids",
+    "invariant_id": "INV-unique-node-ids",
+    "expect_flagged": true,
+    "description": "Two nodes share id 'a' -> validateGraphIR duplicate_id.",
+    "graph": {
+      "id": "dup-pos",
+      "version": "0.1",
+      "nodes": [
+        { "id": "a", "kind": "sequence", "terminal": true },
+        { "id": "a", "kind": "sequence" }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "duplicate-node-ids-negative",
+    "condition": "duplicate node ids",
+    "invariant_id": "INV-unique-node-ids",
+    "expect_flagged": false,
+    "description": "Distinct ids -> no duplicate_id.",
+    "graph": {
+      "id": "dup-neg",
+      "version": "0.1",
+      "nodes": [
+        { "id": "a", "kind": "sequence" },
+        { "id": "b", "kind": "sequence", "terminal": true }
+      ],
+      "edges": [{ "from": "a", "to": "b" }]
+    }
+  },
+
+  {
+    "name": "dangling-ref-positive",
+    "condition": "dangling node/edge reference",
+    "invariant_id": "INV-no-dangling-refs",
+    "expect_flagged": true,
+    "description": "An edge targets a non-existent node id -> validateGraphIR dangling_ref.",
+    "graph": {
+      "id": "dang-pos",
+      "version": "0.1",
+      "nodes": [{ "id": "a", "kind": "sequence", "terminal": true }],
+      "edges": [{ "from": "a", "to": "ghost" }]
+    }
+  },
+  {
+    "name": "dangling-ref-negative",
+    "condition": "dangling node/edge reference",
+    "invariant_id": "INV-no-dangling-refs",
+    "expect_flagged": false,
+    "description": "Every ref resolves.",
+    "graph": {
+      "id": "dang-neg",
+      "version": "0.1",
+      "nodes": [
+        { "id": "a", "kind": "sequence" },
+        { "id": "b", "kind": "sequence", "terminal": true }
+      ],
+      "edges": [{ "from": "a", "to": "b" }]
+    }
+  },
+
+  {
+    "name": "map-no-identity-positive",
+    "condition": "map without stable item identity",
+    "invariant_id": "INV-stable-map-identity",
+    "expect_flagged": true,
+    "description": "A map node missing item_key -> validateGraphIR map_no_identity.",
+    "graph": {
+      "id": "map-pos",
+      "version": "0.1",
+      "nodes": [{ "id": "m", "kind": "map", "terminal": true }],
+      "edges": []
+    }
+  },
+  {
+    "name": "map-no-identity-negative",
+    "condition": "map without stable item identity",
+    "invariant_id": "INV-stable-map-identity",
+    "expect_flagged": false,
+    "description": "A keyed map with item_key.",
+    "graph": {
+      "id": "map-neg",
+      "version": "0.1",
+      "nodes": [
+        { "id": "m", "kind": "map", "item_key": "id", "terminal": true }
+      ],
+      "edges": []
+    }
+  },
+
+  {
+    "name": "loop-without-max-iterations-positive",
+    "condition": "loop without max_iterations",
+    "invariant_id": "INV-bounded-loops",
+    "expect_flagged": true,
+    "description": "A loop missing max_iterations -> validateGraphIR loop_unbounded.",
+    "graph": {
+      "id": "loopmax-pos",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "lp",
+          "kind": "loop",
+          "on_exhaustion": "done",
+          "terminal": true
+        },
+        { "id": "done", "kind": "sequence" }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "loop-without-max-iterations-negative",
+    "condition": "loop without max_iterations",
+    "invariant_id": "INV-bounded-loops",
+    "expect_flagged": false,
+    "description": "A bounded loop with max_iterations + on_exhaustion.",
+    "graph": {
+      "id": "loopmax-neg",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "lp",
+          "kind": "loop",
+          "max_iterations": 3,
+          "on_exhaustion": "done",
+          "terminal": true
+        },
+        { "id": "done", "kind": "sequence" }
+      ],
+      "edges": []
+    }
+  },
+
+  {
+    "name": "loop-without-exhaustion-route-positive",
+    "condition": "loop without exhaustion route",
+    "invariant_id": "INV-bounded-loops",
+    "expect_flagged": true,
+    "description": "A loop missing on_exhaustion -> validateGraphIR loop_unbounded.",
+    "graph": {
+      "id": "loopexh-pos",
+      "version": "0.1",
+      "nodes": [
+        { "id": "lp", "kind": "loop", "max_iterations": 3, "terminal": true }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "loop-without-exhaustion-route-negative",
+    "condition": "loop without exhaustion route",
+    "invariant_id": "INV-bounded-loops",
+    "expect_flagged": false,
+    "description": "A bounded loop with an exhaustion route.",
+    "graph": {
+      "id": "loopexh-neg",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "lp",
+          "kind": "loop",
+          "max_iterations": 5,
+          "on_exhaustion": "done",
+          "terminal": true
+        },
+        { "id": "done", "kind": "sequence" }
+      ],
+      "edges": []
+    }
+  },
+
+  {
+    "name": "human-gate-without-continuation-positive",
+    "condition": "human_gate without continuation",
+    "invariant_id": "INV-human-gate-has-continuation",
+    "expect_flagged": true,
+    "description": "A human_gate with no outgoing edge -> approval leads nowhere.",
+    "graph": {
+      "id": "gate-pos",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "hg",
+          "kind": "human_gate",
+          "gate_id": "g1",
+          "approver": "matt"
+        },
+        { "id": "t", "kind": "sequence", "terminal": true }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "human-gate-without-continuation-negative",
+    "condition": "human_gate without continuation",
+    "invariant_id": "INV-human-gate-has-continuation",
+    "expect_flagged": false,
+    "description": "A human_gate with a downstream continuation.",
+    "graph": {
+      "id": "gate-neg",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "hg",
+          "kind": "human_gate",
+          "gate_id": "g1",
+          "approver": "matt"
+        },
+        { "id": "nxt", "kind": "sequence", "terminal": true }
+      ],
+      "edges": [{ "from": "hg", "to": "nxt" }]
+    }
+  },
+
+  {
+    "name": "unreachable-branch-predicate-positive",
+    "condition": "impossible/unreachable branch predicate (shadowed identical arm)",
+    "invariant_id": "INV-reachable-branch-arms",
+    "expect_flagged": true,
+    "description": "Two branch arms share an IDENTICAL `when` -> the later arm is unreachable.",
+    "graph": {
+      "id": "branch-pos",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "br",
+          "kind": "branch",
+          "terminal": true,
+          "branches": [
+            { "when": "ready", "to": "end" },
+            { "when": "ready", "to": "end" }
+          ],
+          "default": "end"
+        },
+        { "id": "end", "kind": "sequence" }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "unreachable-branch-predicate-negative",
+    "condition": "impossible/unreachable branch predicate (shadowed identical arm)",
+    "invariant_id": "INV-reachable-branch-arms",
+    "expect_flagged": false,
+    "description": "Distinct branch predicates -> every arm reachable.",
+    "graph": {
+      "id": "branch-neg",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "br",
+          "kind": "branch",
+          "terminal": true,
+          "branches": [
+            { "when": "a", "to": "end" },
+            { "when": "b", "to": "end" }
+          ],
+          "default": "end"
+        },
+        { "id": "end", "kind": "sequence" }
+      ],
+      "edges": []
+    }
+  },
+
+  {
+    "name": "unknown-construct-positive",
+    "condition": "unknown IR construct",
+    "invariant_id": "INV-known-constructs",
+    "expect_flagged": true,
+    "description": "A node with a kind outside the frozen 8-kind set -> validateGraphIR unknown_construct.",
+    "graph": {
+      "id": "unk-pos",
+      "version": "0.1",
+      "nodes": [
+        { "id": "x", "kind": "franistan" },
+        { "id": "t", "kind": "sequence", "terminal": true }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "unknown-construct-negative",
+    "condition": "unknown IR construct",
+    "invariant_id": "INV-known-constructs",
+    "expect_flagged": false,
+    "description": "All kinds are within the frozen construct set.",
+    "graph": {
+      "id": "unk-neg",
+      "version": "0.1",
+      "nodes": [{ "id": "a", "kind": "sequence", "terminal": true }],
+      "edges": []
+    }
+  },
+
+  {
+    "name": "illegal-resource-access-enum-mode-positive",
+    "condition": "illegal resource-access declaration (enum-mode facet, S6a -> schema-class)",
+    "invariant_id": "INV-schema-valid",
+    "expect_flagged": true,
+    "description": "A resource mode outside {read,write,exclusive} is pure shape -> validateGraphIR schema.",
+    "graph": {
+      "id": "resmode-pos",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "a",
+          "kind": "sequence",
+          "resources": [{ "name": "db", "mode": "delete" }],
+          "terminal": true
+        }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "illegal-resource-access-enum-mode-negative",
+    "condition": "illegal resource-access declaration (enum-mode facet, S6a -> schema-class)",
+    "invariant_id": "INV-schema-valid",
+    "expect_flagged": false,
+    "description": "A valid resource mode.",
+    "graph": {
+      "id": "resmode-neg",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "a",
+          "kind": "sequence",
+          "resources": [{ "name": "db", "mode": "read" }],
+          "terminal": true
+        }
+      ],
+      "edges": []
+    }
+  },
+
+  {
+    "name": "negative-retry-positive",
+    "condition": "retry count < 0",
+    "invariant_id": "INV-non-negative-retry",
+    "expect_flagged": true,
+    "description": "retry.max < 0.",
+    "graph": {
+      "id": "retry-pos",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "a",
+          "kind": "sequence",
+          "retry": { "max": -1 },
+          "terminal": true
+        }
+      ],
+      "edges": []
+    }
+  },
+  {
+    "name": "negative-retry-negative",
+    "condition": "retry count < 0",
+    "invariant_id": "INV-non-negative-retry",
+    "expect_flagged": false,
+    "description": "A non-negative retry count.",
+    "graph": {
+      "id": "retry-neg",
+      "version": "0.1",
+      "nodes": [
+        {
+          "id": "a",
+          "kind": "sequence",
+          "retry": { "max": 3 },
+          "terminal": true
+        }
+      ],
+      "edges": []
+    }
+  },
+
+  {
+    "name": "missing-terminal-condition-positive",
+    "condition": "missing terminal condition",
+    "invariant_id": "INV-reachable-terminal",
+    "expect_flagged": true,
+    "description": "No node with terminal:true reachable from an entry.",
+    "graph": {
+      "id": "term-pos",
+      "version": "0.1",
+      "nodes": [{ "id": "a", "kind": "sequence" }],
+      "edges": []
+    }
+  },
+  {
+    "name": "missing-terminal-condition-negative",
+    "condition": "missing terminal condition",
+    "invariant_id": "INV-reachable-terminal",
+    "expect_flagged": false,
+    "description": "A reachable terminal node exists.",
+    "graph": {
+      "id": "term-neg",
+      "version": "0.1",
+      "nodes": [{ "id": "a", "kind": "sequence", "terminal": true }],
+      "edges": []
+    }
+  },
+
+  {
+    "name": "invalid-schema-relationship-positive",
+    "condition": "invalid schema relationship (residual safeParse failure)",
+    "invariant_id": "INV-schema-valid",
+    "expect_flagged": true,
+    "description": "A residual GraphIRSchema violation (wrong version literal) -> validateGraphIR schema.",
+    "graph": {
+      "id": "schema-pos",
+      "version": "0.2",
+      "nodes": [{ "id": "a", "kind": "sequence", "terminal": true }],
+      "edges": []
+    }
+  },
+  {
+    "name": "invalid-schema-relationship-negative",
+    "condition": "invalid schema relationship (residual safeParse failure)",
+    "invariant_id": "INV-schema-valid",
+    "expect_flagged": false,
+    "description": "A fully valid v0.1 document.",
+    "graph": {
+      "id": "schema-neg",
+      "version": "0.1",
+      "nodes": [{ "id": "a", "kind": "sequence", "terminal": true }],
+      "edges": []
+    }
+  }
+]
