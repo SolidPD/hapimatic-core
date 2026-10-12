@@ -5,11 +5,21 @@
  *
  * Every Hapimatic instance on a machine (prod, dev, every worktree) and every
  * session wrapper they spawn shares ONE credentials file per account:
- * `<accountConfigsDir>/<uuid>/.credentials.json` (#1643). Refresh tokens are
- * single-use, so two writers that each rotate the token they last read race
- * each other: the loser presents a consumed token, gets `invalid_grant`, and the
- * account is flagged `unrefreshable` until a manual re-login. That is the
- * mechanism behind #4423's RP1 deaths.
+ * `<accountConfigsDir>/<uuid>/.credentials.json` (#1643). Native Claude Code is
+ * a writer of that file too: every bound session refreshes the account in-session
+ * and saves the rotated pair back (#5020). Refresh tokens are single-use, so two
+ * writers that each rotate the token they last read race each other: the loser
+ * presents a consumed token, gets `invalid_grant`, and the account is flagged
+ * `unrefreshable` until a manual re-login. That is the mechanism behind #4423's
+ * RP1 deaths.
+ *
+ * Issue #5020: native already coordinates its own refreshes (it re-reads the
+ * file under its refresh lock and saves by compare-and-swap), so a Hapimatic
+ * rotation joins that protocol (`nativeCredentialLock.ts`) instead of only
+ * excluding other Hapimatic writers. Per-account lock order, never taken in
+ * another order: `.recovery.lock` → `.rotate.lock` → native
+ * `.oauth_refresh.lock` (+ legacy `<realpath(dir)>.lock`) → native
+ * `.storage-write.lock` → the account store's own file lock.
  *
  * This module holds the pieces that keep those writers from destroying each
  * other's work:
@@ -39,6 +49,11 @@ import {
   type IsolatedClaudeAiOauth,
 } from "@/accounts/accountConfigDir";
 import { UUID_REGEX } from "@/accounts/accountStore";
+import {
+  NATIVE_LOCK_BUDGETS,
+  withNativeRefreshLock,
+  type NativeLockBudgetSet,
+} from "@/accounts/nativeCredentialLock";
 import { normalizeHapiHome } from "@/daemon/orphanMcpReaper";
 import { withFileLock } from "@/utils/fileLock";
 import { logger } from "@/ui/logger";
@@ -51,7 +66,9 @@ export const ROTATE_LOCK_NAME = ".rotate.lock";
  * Lock taken around spawn-time recovery. A DISTINCT file from
  * {@link ROTATE_LOCK_NAME}: recovery holds it while it calls the rotation path,
  * and `withFileLock` is not re-entrant. Lock order is always
- * `.recovery.lock` → `.rotate.lock` → the account store's own file lock.
+ * `.recovery.lock` → `.rotate.lock` → native `.oauth_refresh.lock` (+ legacy)
+ * → native `.storage-write.lock` → the account store's own file lock (#5020;
+ * the native locks live in `nativeCredentialLock.ts`).
  */
 export const RECOVERY_LOCK_NAME = ".recovery.lock";
 
@@ -359,11 +376,15 @@ export function refreshTokenFingerprint(refreshToken: string): string {
   return createHash("sha256").update(refreshToken).digest("hex");
 }
 
-/** A copy of `account` without the failed-token fingerprint. */
+/** A copy of `account` without the failed-token fingerprint and its reason. */
 export function withoutFailedTokenFingerprint(
   account: StoredAccount
 ): StoredAccount {
-  const { unrefreshableTokenFingerprint: _dropped, ...rest } = account;
+  const {
+    unrefreshableTokenFingerprint: _dropped,
+    unrefreshableReason: _reason,
+    ...rest
+  } = account;
   return rest as StoredAccount;
 }
 
@@ -384,6 +405,50 @@ export function fingerprintedFlagIsStale(
     typeof failed === "string" &&
     failed.length > 0 &&
     failed !== refreshTokenFingerprint(onDiskRefreshToken)
+  );
+}
+
+/**
+ * `current` with its isolated-file lineage (`isolatedHeadExpiresAt`, #5020)
+ * advanced to `expiresAt` — never moved back.
+ */
+export function withIsolatedLineage(
+  current: StoredAccount,
+  expiresAt: number
+): StoredAccount {
+  return {
+    ...current,
+    isolatedHeadExpiresAt: Math.max(
+      current.isolatedHeadExpiresAt ?? 0,
+      expiresAt
+    ),
+  };
+}
+
+/**
+ * The store merge for a pair taken from the isolated file (an adoption here, or
+ * the #5020 daemon mirror): the token triple, the lineage, and Task 6's flag
+ * rule — the `unrefreshable` flag clears only when it records a different
+ * failed token, never outright.
+ */
+export function adoptPairIntoStore(
+  current: StoredAccount,
+  onDisk: Pick<
+    IsolatedClaudeAiOauth,
+    "accessToken" | "refreshToken" | "expiresAt"
+  >
+): StoredAccount {
+  const base = fingerprintedFlagIsStale(current, onDisk.refreshToken)
+    ? { ...withoutFailedTokenFingerprint(current), unrefreshable: false }
+    : current;
+  return withIsolatedLineage(
+    {
+      ...base,
+      accessToken: onDisk.accessToken,
+      refreshToken: onDisk.refreshToken,
+      expiresAt: onDisk.expiresAt,
+    },
+    onDisk.expiresAt
   );
 }
 
@@ -486,6 +551,8 @@ export interface IsolatedRotationDeps {
   expiryBufferMs: number;
   /** Test seam; production uses {@link CREDENTIAL_LOCK_BUDGETS}. */
   budgets?: CredentialLockBudgets;
+  /** Test seam; production uses `NATIVE_LOCK_BUDGETS` (#5020). */
+  nativeLockBudgets?: NativeLockBudgetSet;
   /** Test seams; production uses the real file helpers. */
   readCredentials?: (
     accountUuid: string
@@ -498,7 +565,11 @@ export interface IsolatedRotationDeps {
 
 /**
  * One rotation of an account's shared credentials file, compare-and-swap under
- * {@link ROTATE_LOCK_NAME} (R4). Never throws: a lock timeout, a credentials
+ * {@link ROTATE_LOCK_NAME} (R4) and, inside it, native Claude Code's refresh lock
+ * (#5020 R1): the read → decide → refresh → re-read → write body runs while no
+ * native session of the account can refresh, so the two never present the same
+ * refresh token, and a head native saved before the lock is adopted, not
+ * rotated again. Never throws: a lock timeout (ours or native's), a credentials
  * write failure or a store-mirror failure maps to `transient` (the last two are
  * pre-existing hazards, unchanged here).
  */
@@ -510,7 +581,12 @@ export async function rotateIsolatedCredentials(
     return await withAccountCredentialLock(
       uuid,
       ROTATE_LOCK_NAME,
-      () => rotateLocked(deps),
+      () =>
+        withNativeRefreshLock(
+          accountConfigDirFor(uuid),
+          () => rotateLocked(deps),
+          (deps.nativeLockBudgets ?? NATIVE_LOCK_BUDGETS).refresh
+        ),
       deps.budgets
     );
   } catch (err) {
@@ -527,7 +603,13 @@ async function rotateLocked(
 ): Promise<IsolatedRotationOutcome> {
   const uuid = deps.accountUuid;
   const read = deps.readCredentials ?? readIsolatedCredentials;
-  const write = deps.writeCredentials ?? writeIsolatedCredentials;
+  const write =
+    deps.writeCredentials ??
+    ((accountUuid: string, oauth: IsolatedClaudeAiOauth) =>
+      writeIsolatedCredentials(accountUuid, oauth, {
+        writer: "rotation",
+        nativeLockBudgets: deps.nativeLockBudgets,
+      }));
 
   const onDisk = await read(uuid);
   const decision = decideRotation(
@@ -596,14 +678,19 @@ async function rotateLocked(
     expiresAt: rotated.expiresAt,
   });
   // Mirror into the store and clear the flag (this token demonstrably works).
-  await deps.mergeStore(current => ({
-    ...withoutFailedTokenFingerprint(current),
-    accessToken: rotated.accessToken,
-    refreshToken: rotated.refreshToken,
-    expiresAt: rotated.expiresAt,
-    lastRefreshedAt: deps.now(),
-    unrefreshable: false,
-  }));
+  await deps.mergeStore(current =>
+    withIsolatedLineage(
+      {
+        ...withoutFailedTokenFingerprint(current),
+        accessToken: rotated.accessToken,
+        refreshToken: rotated.refreshToken,
+        expiresAt: rotated.expiresAt,
+        lastRefreshedAt: deps.now(),
+        unrefreshable: false,
+      },
+      rotated.expiresAt
+    )
+  );
   // Byte-stable: this line means a real OAuth rotation — the #4423 soak
   // attributes every one of them.
   logger.info(
@@ -622,17 +709,7 @@ async function adoptOnDisk(
   deps: IsolatedRotationDeps,
   onDisk: IsolatedClaudeAiOauth
 ): Promise<IsolatedRotationOutcome> {
-  await deps.mergeStore(current => {
-    const base = fingerprintedFlagIsStale(current, onDisk.refreshToken)
-      ? { ...withoutFailedTokenFingerprint(current), unrefreshable: false }
-      : current;
-    return {
-      ...base,
-      accessToken: onDisk.accessToken,
-      refreshToken: onDisk.refreshToken,
-      expiresAt: onDisk.expiresAt,
-    };
-  });
+  await deps.mergeStore(current => adoptPairIntoStore(current, onDisk));
   logger.info(
     `[TOKEN_REFRESH] forceRefreshIsolated: adopted the on-disk credentials for ${deps.accountUuid} — another writer already rotated (no OAuth call)`
   );

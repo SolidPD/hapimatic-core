@@ -80,6 +80,19 @@ export function resolveTmuxRemoteSessionName(opts: {
   return opts.envOverride || `${opts.localSessionName}-remote`;
 }
 
+/**
+ * Issue #4679: parse a millisecond env knob that accepts `0`. A finite value
+ * ≥ 0 wins; unset, non-numeric, or negative keeps `fallback`.
+ */
+export function parseNonNegativeMsEnv(
+  raw: string | undefined,
+  fallback: number
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 class Configuration {
   public readonly serverUrl: string;
   private _cliApiToken: string;
@@ -112,6 +125,18 @@ class Configuration {
    * byte-equivalent to #1635 (R6).
    */
   public readonly rotationLeaseEnabled: boolean;
+
+  /**
+   * Issue #5021: release the rotation lease when each lease-gated rotation
+   * completes (HAPI_ROTATION_LEASE_RELEASE_AFTER_ROTATION), so the lease covers
+   * only the rotation critical section and another node's idle backstop can
+   * rotate its own copy of the account; an account whose chain #3784 has proven
+   * independent skips the lease entirely. Default ON (inverted parse, mirroring
+   * {@link idleRotateAnywayEnabled}). Set to a falsy value ({0,false,no,off},
+   * case-insensitive) to restore the #1644 standing lease (KD-D) exactly, with
+   * no redeploy. Has no effect while {@link rotationLeaseEnabled} is off.
+   */
+  public readonly rotationLeaseReleaseAfterRotation: boolean;
 
   /**
    * Issue #1806: idle non-host token-refresh backstop gate (HAPI_IDLE_REFRESH).
@@ -158,6 +183,29 @@ class Configuration {
    * to the pre-#3784 skip. Forwarded into the tmux worker like the sibling flags.
    */
   public readonly idleRotateWhenRemoteIndependentEnabled: boolean;
+
+  /**
+   * Issue #4679: rotation lead for LOCALLY-bound accounts, in ms
+   * (HAPI_BOUND_ROTATION_LEAD_MS, default 1_800_000 = 30 min). From this long
+   * before access-token expiry, the token-refresh service rotates a
+   * locally-bound account at the first maintenance pass where none of its local
+   * sessions is busy, instead of waiting for the 5-minute buffer, where a busy
+   * session's in-flight work is cut off. `0` (or any value at or below the
+   * buffer) restores the pre-#4679 buffer-only timing with no redeploy; a
+   * non-numeric or negative value falls back to the default.
+   */
+  public readonly boundRotationLeadMs: number;
+
+  /**
+   * Issue #4679: how long a post-rotation restart may stay deferred by a busy
+   * session before the daemon forces it, in ms
+   * (HAPI_TOKEN_RESTART_FORCE_AFTER_MS, default 600_000 = 10 min). After a
+   * rotation the session's token is revoked, so its turn cannot complete; the
+   * ceiling also covers a frozen `thinking:true` session or a stuck background
+   * count. `0` disables forcing (the restart then waits for idle indefinitely);
+   * a non-numeric or negative value falls back to the default.
+   */
+  public readonly tokenRestartForceAfterMs: number;
 
   /**
    * Issue #1734: OmniBox sandbox kill-switch (HAPI_OMNIBOX_SANDBOX). Default
@@ -272,6 +320,20 @@ class Configuration {
       process.env.HAPI_ROTATION_LEASE?.toLowerCase() || ""
     );
 
+    // Issue #5021: release-after-rotation lease lifetime (default ON). Inverted
+    // parse mirroring idleRotateAnywayEnabled: enabled UNLESS explicitly falsy,
+    // so HAPI_ROTATION_LEASE_RELEASE_AFTER_ROTATION={0,false,no,off} restores
+    // the #1644 standing lease with no redeploy.
+    this.rotationLeaseReleaseAfterRotation = ![
+      "false",
+      "0",
+      "no",
+      "off",
+    ].includes(
+      process.env.HAPI_ROTATION_LEASE_RELEASE_AFTER_ROTATION?.toLowerCase() ||
+        ""
+    );
+
     // Issue #1806: idle-refresh backstop gate (default ON — it is the fix).
     // Inverted parse vs rotationLeaseEnabled: enabled UNLESS explicitly set to a
     // falsy value, so a bare/unset env keeps the backstop running (instant
@@ -300,6 +362,16 @@ class Configuration {
       "on",
     ].includes(
       process.env.HAPI_IDLE_ROTATE_REMOTE_INDEPENDENT?.toLowerCase() || ""
+    );
+
+    // Issue #4679: busy-session-safe rotation knobs (read once, here).
+    this.boundRotationLeadMs = parseNonNegativeMsEnv(
+      process.env.HAPI_BOUND_ROTATION_LEAD_MS,
+      30 * 60 * 1000
+    );
+    this.tokenRestartForceAfterMs = parseNonNegativeMsEnv(
+      process.env.HAPI_TOKEN_RESTART_FORCE_AFTER_MS,
+      10 * 60 * 1000
     );
 
     // Issue #1734: OmniBox sandbox kill-switch (default OFF — KD-5). Ship gated;

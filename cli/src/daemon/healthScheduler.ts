@@ -704,8 +704,11 @@ export function createHealthScheduler(
       }
 
       // Issue #1644: heartbeat every cross-machine rotation lease this node
-      // holds so it stays the stable family owner (KD-D/R4). Never throws (the
-      // client fail-opens); a no-op when the gate is off or nothing is held.
+      // holds (R4). Since #5021 the rotation sites release their lease when the
+      // rotation finishes, so this only extends a lease held across a loop
+      // iteration; with HAPI_ROTATION_LEASE_RELEASE_AFTER_ROTATION=off it keeps
+      // this node the standing family owner (KD-D). Never throws (the client
+      // fail-opens); a no-op when the gate is off or nothing is held.
       try {
         await rotationLeaseManager.heartbeatHeld();
       } catch (err) {
@@ -742,6 +745,20 @@ export function createHealthScheduler(
       } catch (err) {
         logger.warn(
           `[DAEMON RUN] stale-flag clear failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+
+      // Issue #5020 (R3, R4): mirror each isolated credentials file into this
+      // instance's store — a pair native Claude Code saved, the file lineage
+      // spawn-time recovery checks, and a native wipe (flagged + error_logs).
+      // On EVERY daemon (each instance has its own store), after the flag clear
+      // so a just-cleared account is mirrored this tick. Never writes the file,
+      // never calls OAuth, never throws.
+      try {
+        await tokenRefreshService.mirrorIsolatedCredentials();
+      } catch (err) {
+        logger.warn(
+          `[DAEMON RUN] isolated-credentials mirror failed: ${err instanceof Error ? err.message : String(err)}`
         );
       }
     } finally {

@@ -58,6 +58,10 @@ const updateParentSchema = z.object({
 // Issue #1507: body for the daemon-triggered token-refresh restart endpoint.
 const tokenRefreshSchema = z.object({
   accountUuid: z.string().uuid(),
+  // Issue #4679: the daemon forces the restart of a session still busy past its
+  // ceiling after a rotation (skips only the busy guard). Optional, so an older
+  // daemon's body parses unchanged.
+  force: z.boolean().optional(),
 });
 
 const cliErrorReportSchema = z.object({
@@ -505,13 +509,15 @@ export function createCliRoutes(
         // Use resolved.session.id (UUID), not sessionId which may be a tag.
         const result = await engine.tokenRefreshRestart(
           resolved.session.id,
-          parsed.data.accountUuid
+          parsed.data.accountUuid,
+          { force: parsed.data.force }
         );
         if (result.type === "success") {
           return c.json({ ok: true });
         }
         if (result.type === "deferred") {
-          // 202 Accepted: session is mid-inference; the daemon retries.
+          // 202 Accepted: session is busy (or the instance is at capacity);
+          // the daemon retries.
           return c.json(
             { ok: false, deferred: true, reason: result.reason },
             202

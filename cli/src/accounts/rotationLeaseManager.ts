@@ -10,10 +10,20 @@ import { RotationLeaseClient } from "@/accounts/rotationLeaseClient";
  * (`TokenRefreshService.tick`) and the spawn-time recovery
  * (`isolatedSnapshotRecovery` tier-b, reached via the resolver in
  * `accountTokenInjection.ts`) — acquire through this ONE manager so they share a
- * single held-families set. The daemon's 60s maintenance loop heartbeats that set
- * to keep this node a STABLE owner (KD-D standing lease): once a node owns a
- * family, peers keep deferring instead of re-rotating, which is what converts the
- * cross-machine ping-pong into a one-time re-login on the non-owner (KD-E).
+ * single held-families set.
+ *
+ * Lease lifetime (issue #5021): the lease covers only the rotation critical
+ * section. The daemon's rotation sites acquire, rotate, then {@link release} in
+ * `finally`, so between rotations this node holds no row and another node's idle
+ * backstop can rotate its own copy of the account. The 60s maintenance loop still
+ * heartbeats whatever is held, which now only matters for a lease held across a
+ * loop iteration. With `HAPI_ROTATION_LEASE_RELEASE_AFTER_ROTATION` off, nothing
+ * releases and the heartbeat keeps this node the family's standing owner
+ * (#1644 KD-D/KD-E), exactly as before #5021.
+ *
+ * The hub row is keyed by node, not process: a daemon release also frees a lease
+ * a session wrapper on the same node took for spawn recovery. That matters only
+ * for a copied chain, which the #4423 copy guard prevents (#5021 OR-1).
  *
  * A crashed holder stops heartbeating, so its lease expires via the hub TTL and
  * another node can acquire it (R4). All operations are **fail-open / never-throw**
@@ -61,6 +71,18 @@ export class RotationLeaseManager {
       const stillHeld = await this.client.heartbeat(uuid);
       if (!stillHeld) this.held.delete(uuid);
     }
+  }
+
+  /**
+   * Release one family's lease after a rotation completes (issue #5021).
+   * Fail-open and never throws. The held set is updated before the HTTP call so
+   * a concurrent {@link heartbeatHeld} cannot re-extend the lease being dropped.
+   */
+  async release(accountUuid: string): Promise<void> {
+    // Gate off ⇒ zero HTTP and nothing tracked (#1635 byte-equivalence).
+    if (!this.enabled) return;
+    this.held.delete(accountUuid);
+    await this.client.release(accountUuid);
   }
 
   /** Best-effort release of all held families (daemon shutdown). */

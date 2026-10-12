@@ -24,6 +24,7 @@
  */
 
 import { claudeAccountInfoFromStored } from "@hapi/protocol";
+import { sessionBusyReason } from "@hapi/protocol/sessionBusy";
 import { buildRespawnBase } from "./respawnBase";
 import { gracefulTurnInterruptBeforeKill } from "./gracefulTurnInterrupt";
 import type {
@@ -983,14 +984,22 @@ export class AccountRestart {
    *    killing the process, so a revoked account surfaces a re-login state
    *    rather than spawn-failing opaquely.
    *
-   * R6: a mid-inference session (thinking=true) is NOT interrupted — returns
-   * {type:"deferred"} so the daemon can retry within the proactive buffer window.
+   * R6: a busy session is NOT interrupted — returns {type:"deferred"} so the
+   * daemon retries. Issue #4679: "busy" is the shared `sessionBusyReason`
+   * predicate (`@hapi/protocol/sessionBusy`) — mid-inference, OR background
+   * agents running, OR background shells running — the same predicate the
+   * daemon's rotation defer uses, so the two never disagree. The daemon retries
+   * a deferred restart until the session is idle (no longer abandoned after
+   * 90s) and, past its ceiling, sends `force` — which skips ONLY this busy
+   * guard; every other guard below (API-key refusal, unrefreshable re-check,
+   * capacity probe, graceful turn interrupt) still applies.
    * R4 (no restart storms) is enforced at the daemon layer via the per-account
    * in-flight guard in restartBoundSessions().
    */
   async tokenRefreshRestart(
     sessionId: string,
-    accountUuid: string
+    accountUuid: string,
+    opts?: { force?: boolean }
   ): Promise<
     | { type: "success" }
     | { type: "deferred"; reason: string }
@@ -1028,9 +1037,12 @@ export class AccountRestart {
         code: "api_key_session",
       };
     }
-    // R6: never interrupt a mid-inference session. The daemon retries.
-    if (session.thinking) {
-      return { type: "deferred", reason: "session is mid-inference" };
+    // R6 (+ #4679): never interrupt a busy session unless the daemon forces it
+    // (its token is already rotated, so the turn cannot complete). The daemon
+    // retries a deferral until the session is idle.
+    const busy = sessionBusyReason(session);
+    if (busy !== null && !opts?.force) {
+      return { type: "deferred", reason: `session is ${busy}` };
     }
 
     // R3: re-check the account is still refreshable before killing the process.
@@ -1115,7 +1127,7 @@ export class AccountRestart {
     // The fail-safe is probe-once -> DEFER, NOT switchAccount's bounded wait: this
     // path is automatic and already returns {type:"deferred"} for a mid-inference
     // session (above), and the daemon's TokenRefreshService retries a deferred
-    // within its proactive-buffer window. So if the respawn is not admittable, do
+    // until the restart succeeds (#4679). So if the respawn is not admittable, do
     // NOT kill — return deferred and let the daemon retry; never block on a slot loop.
     //
     // probe === null (RPC error / daemon offline / uncertain) OR wouldAdmit ⇒ proceed
@@ -1130,7 +1142,7 @@ export class AccountRestart {
     );
     if (capacityProbe !== null && !capacityProbe.wouldAdmit) {
       this.errorLogger?.info(
-        `tokenRefreshRestart ${sessionTag}: instance at capacity and own slot not creditable — deferring the refresh restart (session left running); the daemon retries within its proactive-buffer window`,
+        `tokenRefreshRestart ${sessionTag}: instance at capacity and own slot not creditable — deferring the refresh restart (session left running); the daemon retries until the restart succeeds (#4679)`,
         { category: "sync" }
       );
       return {

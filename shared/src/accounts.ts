@@ -90,6 +90,17 @@ export const StoredAccountSchema = z
     // the token now on disk: a different token means the flag no longer applies.
     // Read only while the flag is set; never part of a web-facing view model.
     unrefreshableTokenFingerprint: z.string().optional(),
+    // Issue #5020: why `unrefreshable` was set when the cause is not a rejected
+    // Hapimatic rotation — `native-cleared` (native Claude Code emptied the
+    // isolated file after its own refresh failed) or `store-lineage-stale` (the
+    // store holds a pair older than the file's lineage). Diagnostic only;
+    // dropped with the fingerprint when the flag clears.
+    unrefreshableReason: z.string().optional(),
+    // Issue #5020: the newest `expiresAt` this instance has observed on the
+    // account's isolated `.credentials.json` (mirrored by the daemon each tick
+    // and written by every Hapimatic rotation). Spawn-time recovery never seeds
+    // a store pair older than this: a pair the file has moved past was consumed.
+    isolatedHeadExpiresAt: z.number().optional(),
   })
   .passthrough()
   // Issue #2268: every account EXCEPT the "env-token" kind MUST carry a non-empty

@@ -72,12 +72,17 @@ const VM_TIER_MARKER = join(homedir(), ".config", "hapimatic", "vm-tier");
  * ~/.config/hapimatic/vm-tier). Env `HAPI_VM_TIER` overrides (tests / dev). A
  * missing marker → undefined (treated as not-eligible: dev/worktree instances and
  * non-cloud hosts have no VM tier, so the desktop toggle stays hidden there).
+ * `markerPath` is a test seam (#4954): production callers pass nothing and read
+ * the real marker; tests point it at a temp file so the result never depends on
+ * whether the host carries a marker (operator VMs do).
  */
-export function readVmTier(): string | undefined {
+export function readVmTier(
+  markerPath: string = VM_TIER_MARKER
+): string | undefined {
   const env = process.env.HAPI_VM_TIER?.trim().toLowerCase();
   if (env) return env;
   try {
-    const t = readFileSync(VM_TIER_MARKER, "utf8").trim().toLowerCase();
+    const t = readFileSync(markerPath, "utf8").trim().toLowerCase();
     return t || undefined;
   } catch {
     return undefined;

@@ -14,7 +14,7 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { StoredAccount } from "@hapi/protocol/accounts";
 import {
   REPAIRABLE_FILE_DIMS,
@@ -23,6 +23,12 @@ import {
 import { configuration } from "@/configuration";
 import { logger } from "@/ui/logger";
 import { InvalidAccountUuidError, UUID_REGEX } from "@/accounts/accountStore";
+import {
+  NATIVE_LOCK_BUDGETS,
+  withNativeRefreshLock,
+  withNativeStorageWriteLock,
+  type NativeLockBudgetSet,
+} from "@/accounts/nativeCredentialLock";
 
 /**
  * Per-account isolated config dirs (issue #1551 — the #1546 Path A true-fix).
@@ -225,6 +231,31 @@ async function atomicWrite600(path: string, body: string): Promise<void> {
   await writeFile(tmpPath, body, { mode: 0o600 });
   await chmod(tmpPath, 0o600).catch(() => {});
   await rename(tmpPath, path);
+}
+
+/**
+ * Issue #5020 (R7): one line per Hapimatic write of an isolated credentials
+ * file, so a soak can attribute every chain change. Carries the writer, the
+ * account, the first 8 hex of the refresh token's SHA-256 (the
+ * `refreshTokenFingerprint` digest) and the expiry — never a token value.
+ */
+function logIsolatedWrite(
+  writer: string,
+  accountUuid: string,
+  refreshToken: string,
+  expiresAt: number
+): void {
+  const fp = createHash("sha256")
+    .update(refreshToken)
+    .digest("hex")
+    .slice(0, 8);
+  const exp =
+    Number.isFinite(expiresAt) && expiresAt > 0
+      ? new Date(expiresAt).toISOString()
+      : String(expiresAt);
+  logger.info(
+    `[ISOLATED_WRITE] writer=${writer} uuid=${accountUuid} refresh=${fp} expiresAt=${exp}`
+  );
 }
 
 /**
@@ -508,9 +539,19 @@ async function buildIsolatedClaudeJson(
  *    it, so there is no live owner to race). Keeps the dir warm for the moment
  *    the account later loses host status.
  *
- * Returns `true` when it wrote, `false` when it skipped (already seeded,
- * `overwrite:false`). Throws on a missing token (a record cannot be seeded
- * without an access+refresh token).
+ * Issue #5020: the `.credentials.json` write joins native Claude Code's lock
+ * protocol (`nativeCredentialLock.ts`) — always under native's storage-write
+ * lock, and an `overwrite: true` seed also under native's refresh lock, so it
+ * can never replace a pair a native refresh is about to save (or present). The
+ * `overwrite: false` check is repeated under the lock: native may have written
+ * the file since the first check. `skipIfOnDiskNewer` (the host-capture
+ * re-seed) leaves a file whose `expiresAt` is newer than the seed's pair alone —
+ * native already rotated past it.
+ *
+ * Returns `true` when it wrote, `false` when it skipped (already seeded with
+ * `overwrite:false`, or a newer pair on disk under `skipIfOnDiskNewer`). Throws
+ * on a missing token (a record cannot be seeded without an access+refresh
+ * token) and on a native-lock timeout (`FileLockTimeoutError`).
  */
 export async function seedAccountConfigDir(
   account: StoredAccount,
@@ -518,6 +559,12 @@ export async function seedAccountConfigDir(
     overwrite: boolean;
     hostClaudeConfigPath?: string;
     hostClaudeDir?: string;
+    /** Writer tag for the #5020 R7 write log. */
+    writer?: string;
+    /** Skip when the file on disk holds a newer pair than `account` (#5020). */
+    skipIfOnDiskNewer?: boolean;
+    /** Test seam; production uses {@link NATIVE_LOCK_BUDGETS}. */
+    nativeLockBudgets?: NativeLockBudgetSet;
   }
 ): Promise<boolean> {
   if (!account.accessToken || !account.refreshToken) {
@@ -557,12 +604,48 @@ export async function seedAccountConfigDir(
     opts.hostClaudeConfigPath ?? join(homedir(), ".claude.json")
   );
 
+  const uuid = account.accountUuid;
+  const refreshToken = account.refreshToken;
+  const budgets = opts.nativeLockBudgets ?? NATIVE_LOCK_BUDGETS;
+  const writer =
+    opts.writer ?? (opts.overwrite ? "seed-overwrite" : "seed-bootstrap");
+  const writeCredentials = () =>
+    withNativeStorageWriteLock(
+      dir,
+      async (): Promise<"written" | "owned" | "newer"> => {
+        if (!opts.overwrite && (await hasIsolatedConfigDir(uuid))) {
+          return "owned";
+        }
+        if (opts.skipIfOnDiskNewer) {
+          const onDisk = await readIsolatedCredentials(uuid);
+          if (onDisk && onDisk.expiresAt > account.expiresAt) return "newer";
+        }
+        await atomicWrite600(
+          isolatedCredentialsPath(uuid),
+          JSON.stringify(credentials, null, 2)
+        );
+        logIsolatedWrite(writer, uuid, refreshToken, account.expiresAt);
+        return "written";
+      },
+      budgets.storageWrite
+    );
+  const written = opts.overwrite
+    ? await withNativeRefreshLock(dir, writeCredentials, budgets.refresh)
+    : await writeCredentials();
+  if (written === "owned") {
+    logger.debug(
+      `[ACCOUNT_CONFIG_DIR] seed skipped for ${uuid} (native wrote the credentials first; overwrite=false)`
+    );
+    return false;
+  }
+  if (written === "newer") {
+    logger.info(
+      `[ACCOUNT_CONFIG_DIR] seed skipped for ${uuid}: the isolated credentials on disk are newer than the seed's pair (native already rotated past it)`
+    );
+    return false;
+  }
   await atomicWrite600(
-    isolatedCredentialsPath(account.accountUuid),
-    JSON.stringify(credentials, null, 2)
-  );
-  await atomicWrite600(
-    isolatedConfigPath(account.accountUuid),
+    isolatedConfigPath(uuid),
     JSON.stringify(config, null, 2)
   );
 
@@ -609,23 +692,99 @@ export async function readIsolatedCredentials(
 }
 
 /**
+ * The state of an account's isolated `.credentials.json`, as the #5020 mirror
+ * needs it — {@link readIsolatedCredentials} collapses every failure to `null`.
+ *  - `absent` — no file (the account is not isolated here).
+ *  - `readable` — both tokens present.
+ *  - `cleared` — the file parses but both tokens are empty: native Claude Code
+ *    emptied it after its own refresh failed (`invalid_grant` on the head that
+ *    was on disk). Observed on ms1, 2026-10-10: a 271-byte file with empty
+ *    tokens and `expiresAt: 0`.
+ *  - `malformed` — anything else (unparseable, one token missing, unreadable).
+ * Never throws; token values never leave the returned object.
+ */
+export type IsolatedCredentialsState =
+  | { kind: "absent" }
+  | { kind: "readable"; oauth: IsolatedClaudeAiOauth; mtimeMs: number }
+  | { kind: "cleared"; mtimeMs: number }
+  | { kind: "malformed"; mtimeMs: number; detail: string };
+
+export async function readIsolatedCredentialsState(
+  accountUuid: string
+): Promise<IsolatedCredentialsState> {
+  const path = isolatedCredentialsPath(accountUuid);
+  let raw: string;
+  let mtimeMs: number;
+  try {
+    mtimeMs = (await stat(path)).mtimeMs;
+    raw = await readFile(path, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { kind: "absent" };
+    }
+    return {
+      kind: "malformed",
+      mtimeMs: 0,
+      detail: `unreadable: ${(err as NodeJS.ErrnoException).code ?? "error"}`,
+    };
+  }
+  let oauth: Partial<IsolatedClaudeAiOauth> | undefined;
+  try {
+    oauth = (JSON.parse(raw) as IsolatedCredentialsFile).claudeAiOauth;
+  } catch {
+    return { kind: "malformed", mtimeMs, detail: "not valid JSON" };
+  }
+  if (!oauth || typeof oauth !== "object") {
+    return { kind: "malformed", mtimeMs, detail: "no claudeAiOauth" };
+  }
+  const access = oauth.accessToken;
+  const refresh = oauth.refreshToken;
+  if (!access && !refresh) return { kind: "cleared", mtimeMs };
+  if (
+    typeof access !== "string" ||
+    typeof refresh !== "string" ||
+    !access ||
+    !refresh
+  ) {
+    return { kind: "malformed", mtimeMs, detail: "one token missing" };
+  }
+  return { kind: "readable", oauth: oauth as IsolatedClaudeAiOauth, mtimeMs };
+}
+
+/**
  * Write back an account's isolated `claudeAiOauth` (atomic 0600). Used by the
- * force-refresh harness (Option A) to persist the rotated token native will pick
- * up on its next read — keeping the isolated dir the single source of truth and
- * preventing the harness's rotation from diverging from native's view.
+ * Hapimatic rotation (force-refresh harness, idle backstop, spawn-time
+ * recovery) to persist the rotated token native will pick up on its next read —
+ * keeping the isolated dir the single source of truth and preventing the
+ * rotation from diverging from native's view.
+ *
+ * Issue #5020 (R2, R7): the write holds native's storage-write lock, so it never
+ * interleaves with native's read-modify-write save, and logs its writer. A
+ * caller that rotates must ALSO hold native's refresh lock around its whole
+ * read → refresh → write (`rotateIsolatedCredentials` does). Throws
+ * `FileLockTimeoutError` when the lock cannot be taken.
  */
 export async function writeIsolatedCredentials(
   accountUuid: string,
-  oauth: IsolatedClaudeAiOauth
+  oauth: IsolatedClaudeAiOauth,
+  opts: { writer?: string; nativeLockBudgets?: NativeLockBudgetSet } = {}
 ): Promise<void> {
   const dir = accountConfigDirFor(accountUuid);
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const credentials: IsolatedCredentialsFile = { claudeAiOauth: oauth };
-  await atomicWrite600(
-    isolatedCredentialsPath(accountUuid),
-    JSON.stringify(credentials, null, 2)
+  await withNativeStorageWriteLock(
+    dir,
+    () =>
+      atomicWrite600(
+        isolatedCredentialsPath(accountUuid),
+        JSON.stringify(credentials, null, 2)
+      ),
+    (opts.nativeLockBudgets ?? NATIVE_LOCK_BUDGETS).storageWrite
   );
-  logger.debug(
-    `[ACCOUNT_CONFIG_DIR] wrote rotated credentials for ${accountUuid}`
+  logIsolatedWrite(
+    opts.writer ?? "rotation",
+    accountUuid,
+    oauth.refreshToken,
+    oauth.expiresAt
   );
 }

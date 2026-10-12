@@ -105,6 +105,7 @@ import {
   type RelaunchResult,
 } from "./sessionRelaunch";
 import type { LoopCronLifecycleCoupler } from "./loopCronLifecycle";
+import { RespawnMarks } from "./respawnMarks";
 import {
   RpcGateway,
   type DirectoryEntry,
@@ -443,6 +444,13 @@ export class SyncEngine {
   private loopCronCoupler: LoopCronLifecycleCoupler | null = null;
 
   /**
+   * Issue #3478: pre-kill marks set by respawn archives, so the dying CLI's own
+   * unflagged `session-end` is treated as part of the respawn in
+   * `handleSessionEnd` (consumed once, 60 s TTL — see respawnMarks.ts).
+   */
+  private readonly respawnMarks = new RespawnMarks();
+
+  /**
    * Issue #1664 (epic #1662, Sub B): turn-lifecycle orchestrator, used here for
    * the orphan sweep (R5). Injected post-construction via setTurnLifecycle() —
    * TurnLifecycle is built after SyncEngine in index.ts (it needs the resolved
@@ -587,6 +595,11 @@ export class SyncEngine {
                   { category: "sync", sessionId }
                 );
                 this.sessionCache.reactivate(sessionId);
+                // #3478: like the reconnect re-attach path, a session found
+                // alive gets back any loops the coupler paused for it
+                // (ledger-driven; a no-op when none were). reactivate() is not
+                // a heartbeat, so the rising-edge resume never sees it.
+                void this.loopCronCoupler?.onReconnect(sessionId);
                 return;
               }
             }
@@ -787,6 +800,7 @@ export class SyncEngine {
       errorLogger,
       handleSessionEnd: payload => this.handleSessionEnd(payload),
       spawnSession: opts => this.spawnSession(opts),
+      markRespawning: sid => this.respawnMarks.mark(sid),
     });
     // Issue #2149: session-relaunch delegate (launcher / safeMode teardown +
     // respawn). archiveSession + spawnSession stay facade callbacks (test spies on
@@ -1229,6 +1243,17 @@ export class SyncEngine {
     backgroundAgents?: BackgroundAgentsSnapshot | null;
   }): void {
     const aliveResult = this.sessionCache.handleSessionAlive(payload);
+    // #3478: the session came back active, by any driver (reconnect, a daemon
+    // reconnect-respawn, RecoveryService, a revival through an account switch).
+    // Resume ONLY the loops the coupler paused for it — ledger-driven, so a
+    // no-op when nothing was auto-paused. Fire-and-forget. A respawn mark still
+    // standing now is stale (the respawned process is alive, so the kill's own
+    // end has come and gone, or the old CLI was already gone): drop it, so the
+    // new process's genuine death pauses as usual.
+    if (aliveResult.activatedRisingEdge) {
+      this.respawnMarks.consume(payload.sid);
+      void this.loopCronCoupler?.onReconnect(payload.sid);
+    }
     this.checkModelDowngrade(payload.sid);
     // #3563: on the `rateLimited` rising edge (a genuinely new session-limit 429),
     // check for a grant minted in the aborting turn and post a proactive notice.
@@ -1970,15 +1995,29 @@ export class SyncEngine {
     time: number;
     archived?: boolean;
     /**
-     * Issue #2453 (Task 7): true when this end is part of a RESPAWN
-     * (switchAccount / tokenRefreshRestart / heartbeat-rotation /
-     * modelModeRestart), which respawns under the same uuid and never reaches
-     * reconnectSession. Terminal ends (default, incl. an unexpected death that
-     * reaches here WITHOUT archiveSession) auto-pause the session's loops;
-     * respawns must NOT (else the loops pause permanently).
+     * Issue #2453 (Task 7): true when this end is the respawn archive's own end
+     * (switchAccount / tokenRefreshRestart / config or model-mode restart /
+     * relaunchSession / heartbeat rotation). Terminal ends (default, incl. an
+     * unexpected death that reaches here WITHOUT archiveSession) auto-pause the
+     * session's loops; respawns must not.
+     *
+     * #3478: a respawn produces a SECOND end — the dying CLI's own
+     * `session-end`, which carries no flag and usually arrives first. The
+     * respawn archive marks the session before its kill, and the first
+     * unflagged, non-archive end consumes that mark and is treated as part of
+     * the respawn (the respawned process's first heartbeat drops a mark no end
+     * consumed). A respawn that never comes back — and heartbeat rotation, whose
+     * old id never returns — is paused by the 30 s CLI-disconnect grace archive;
+     * any loop paused anyway (a driver that sets no mark) is resumed by the
+     * inactive→active edge in `handleSessionAlive`.
      */
     respawn?: boolean;
   }): void {
+    // #3478: resolve the respawn decision once, for every consumer below. An
+    // archive end never consumes a mark — only the dying CLI's own end does.
+    const respawn =
+      payload.respawn === true ||
+      (!payload.archived && this.respawnMarks.consume(payload.sid));
     const endingAgents = this.runningBackgroundAgents(payload.sid);
     this.sessionCache.handleSessionEnd(payload);
     this.recordAgentsOfEndedSession(payload.sid, endingAgents);
@@ -2019,10 +2058,7 @@ export class SyncEngine {
     // #2453 (Task 7): auto-pause this session's bound loops on a TERMINAL end.
     // Fire-and-forget best-effort — the coupler absorbs its own failures and a
     // slow loop-cron.sh pause must never block session teardown.
-    void this.loopCronCoupler?.onSessionEnd(
-      payload.sid,
-      payload.respawn ?? false
-    );
+    void this.loopCronCoupler?.onSessionEnd(payload.sid, respawn);
     // #3839: re-index this session's transcript for the transcript browser.
     // Fire-and-forget; a no-op until the indexer has started.
     notifyTranscriptSessionEnded(
@@ -3378,13 +3414,18 @@ export class SyncEngine {
    */
   async tokenRefreshRestart(
     sessionId: string,
-    accountUuid: string
+    accountUuid: string,
+    opts?: { force?: boolean }
   ): Promise<
     | { type: "success" }
     | { type: "deferred"; reason: string }
     | { type: "error"; message: string; code?: string }
   > {
-    return this.accountRestart.tokenRefreshRestart(sessionId, accountUuid);
+    return this.accountRestart.tokenRefreshRestart(
+      sessionId,
+      accountUuid,
+      opts
+    );
   }
   /**
    * Branch a session via Claude's --fork-session flag: create a NEW HAPI

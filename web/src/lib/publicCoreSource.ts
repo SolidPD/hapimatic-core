@@ -15,7 +15,7 @@
  * INVARIANT: this module has NO imports. That test reads the constant from bash
  * (`bun -e 'import(...)'`), and an import would pull the app's module graph into it.
  */
-export const PUBLIC_CORE_REPO_URL = "";
+export const PUBLIC_CORE_REPO_URL = "https://github.com/SolidPD/hapimatic-core";
 
 const RELEASE_VERSION_RE = /^\d+\.\d+\.\d+$/;
 

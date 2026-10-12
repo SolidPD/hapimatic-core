@@ -57,6 +57,12 @@ export interface SessionLifecycleOpsDeps {
   handleSessionEnd: HandleSessionEndFn;
   /** The SyncEngine facade's spawnSession (universal spawn choke point). */
   spawnSession: SpawnSessionFn;
+  /**
+   * #3478: mark a session whose CLI a respawn archive is about to kill, so the
+   * dying CLI's own unflagged `session-end` is not taken for a terminal end
+   * (see `respawnMarks.ts`). Optional — harnesses that omit it still archive.
+   */
+  markRespawning?: (sessionId: string) => void;
 }
 
 export class SessionLifecycleOps {
@@ -65,6 +71,7 @@ export class SessionLifecycleOps {
   private readonly errorLogger?: ErrorLogger | null;
   private readonly handleSessionEnd: HandleSessionEndFn;
   private readonly spawnSession: SpawnSessionFn;
+  private readonly markRespawning?: (sessionId: string) => void;
 
   constructor(deps: SessionLifecycleOpsDeps) {
     this.sessionCache = deps.sessionCache;
@@ -72,6 +79,7 @@ export class SessionLifecycleOps {
     this.errorLogger = deps.errorLogger ?? null;
     this.handleSessionEnd = deps.handleSessionEnd;
     this.spawnSession = deps.spawnSession;
+    this.markRespawning = deps.markRespawning;
   }
 
   /**
@@ -79,9 +87,10 @@ export class SessionLifecycleOps {
    * churn the common failure is `RPC handler not registered` / `RPC socket
    * disconnected` (the dying-pane race) — the session is ALREADY gone and the
    * kill is a no-op success, so those log at INFO with no retry (was WARN — the
-   * reported journal noise). An ack-TIMEOUT is different: the handler acks
-   * {success:true} optimistically BEFORE `void killThisHappy()`
-   * (registerKillSessionHandler.ts), so a lost ack is safe to retry ONCE (a retry
+   * reported journal noise). An ack-TIMEOUT is different: the handler starts
+   * `void killThisHappy()` and acks {success:true} optimistically without
+   * awaiting it (registerKillSessionHandler.ts), so a lost ack is safe to retry
+   * ONCE (a retry
    * either resolves fast to the already-gone case or confirms a genuine hang). A
    * persistent post-retry failure is surfaced at WARN, not swallowed. Never
    * throws — archiveSession always proceeds to handleSessionEnd.
@@ -230,6 +239,12 @@ export class SessionLifecycleOps {
         }
       }
     }
+
+    // #3478: mark a respawn BEFORE the kill. The Claude CLI emits its unflagged
+    // `session-end` before it acks killSession, so a mark set after the kill
+    // would arrive too late to keep that end from pausing the session's loops.
+    // Not in the CWD-gone branch above: there is no kill there.
+    if (opts?.isRespawn) this.markRespawning?.(sessionId);
 
     // #2683: error-SHAPE handling + bounded retry (was a bare try/catch that
     // logged EVERY killSession failure at WARN — the churn journal noise).

@@ -35,6 +35,11 @@
 // stays cli-scoped and governs ONLY this guard — never the server projection.
 import { LIVE_SESSION_FRESHNESS_WINDOW_MS } from "@hapi/protocol";
 export { LIVE_SESSION_FRESHNESS_WINDOW_MS };
+import {
+  sessionBusyReason,
+  type SessionBusyReason,
+  type SessionBusySignal,
+} from "@hapi/protocol/sessionBusy";
 
 /**
  * The subset of a session summary the liveness predicate reads. Deliberately
@@ -142,4 +147,52 @@ export function resolveLiveFreshnessWindowMs(): number {
   return Number.isFinite(parsed) && parsed > 0
     ? parsed
     : LIVE_SESSION_FRESHNESS_WINDOW_MS;
+}
+
+/**
+ * Issue #4679: one LOCAL session as read from `/cli/sessions` (a full `Session`)
+ * for the rotation guards — the liveness fields, the shared busy signal, and the
+ * bound account.
+ */
+export type LocalBindingInput = LivenessInput &
+  SessionBusySignal & { metadata?: { accountUuid?: string } };
+
+/** Issue #4679: which accounts have a live local session, and which are busy. */
+export interface LocalBindings {
+  /** Accounts with a live (fresh-heartbeat) local session. */
+  uuids: Set<string>;
+  /** The subset of `uuids` with at least one BUSY live session. */
+  busyUuids: Set<string>;
+  /** Why each busy account is busy (the first busy session's axis), for logs. */
+  busyReasons: Map<string, SessionBusyReason>;
+}
+
+/**
+ * Issue #4679: the ONE local-leg collector for the rotation guards, shared by the
+ * daemon's `getLiveAccountKeys` (once per pass) and its `getLocalBusyAccounts`
+ * re-check (right before a rotation). A session counts only when it is live for
+ * the guard ({@link isSessionLiveForGuard}); busy is the shared
+ * `isSessionBusyForRotation` predicate — `thinking`, OR background agents
+ * running, OR background shells running — so a session whose turn has ended
+ * while background work still runs on its token is never treated as idle.
+ */
+export function collectLocalBindings(
+  sessions: readonly LocalBindingInput[],
+  now: number,
+  windowMs: number = LIVE_SESSION_FRESHNESS_WINDOW_MS
+): LocalBindings {
+  const uuids = new Set<string>();
+  const busyUuids = new Set<string>();
+  const busyReasons = new Map<string, SessionBusyReason>();
+  for (const s of sessions) {
+    const uuid = s.metadata?.accountUuid;
+    if (!uuid || !isSessionLiveForGuard(s, now, windowMs)) continue;
+    uuids.add(uuid);
+    const reason = sessionBusyReason(s);
+    if (reason !== null) {
+      busyUuids.add(uuid);
+      if (!busyReasons.has(uuid)) busyReasons.set(uuid, reason);
+    }
+  }
+  return { uuids, busyUuids, busyReasons };
 }

@@ -13,6 +13,7 @@
     "./deterministicJson": "./src/deterministicJson.ts",
     "./adminVms": "./src/adminVms.ts",
     "./apiErrorClasses": "./src/apiErrorClasses.ts",
+    "./sessionBusy": "./src/sessionBusy.ts",
     "./effort": "./src/effort.ts",
     "./modelCatalog": "./src/modelCatalog.ts",
     "./geminiModelCatalog": "./src/geminiModelCatalog.ts",

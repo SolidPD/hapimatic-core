@@ -743,6 +743,9 @@ export function registerSessionHandlers(
       emitAccessError("session", data.sid, sessionAccess.reason);
       return;
     }
-    onSessionEnd?.(data);
+    // #3478: forward only the typed fields. `respawn` / `archived` are
+    // server-side facts (set by archiveSession); a CLI socket that sent them
+    // could otherwise skip a real loop-cron pause or arm the #678 archive guard.
+    onSessionEnd?.({ sid: data.sid, time: data.time });
   });
 }

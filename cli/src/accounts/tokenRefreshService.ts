@@ -15,6 +15,7 @@ import {
   withoutFailedTokenFingerprint,
   type SiblingBindingScan,
 } from "@/accounts/machineRotator";
+import { runIsolatedCredentialsMirror } from "@/accounts/isolatedCredentialsMirror";
 import {
   decideMixedBindingRotation,
   type ChainIndependence,
@@ -289,6 +290,21 @@ export interface TokenRefreshServiceOptions {
    */
   acquireRotationLease?: (accountUuid: string) => Promise<boolean>;
   /**
+   * Issue #5021: release the lease taken by {@link acquireRotationLease} once a
+   * lease-gated rotation completes, success or failure, so the lease covers only
+   * the rotation critical section. Called after the rotation is awaited (the new
+   * token is already written), never on a defer. Errors are swallowed. Default
+   * no-op ⇒ the lease stays held, byte-equivalent to the #1644 standing lease.
+   */
+  releaseRotationLease?: (accountUuid: string) => Promise<void>;
+  /**
+   * Issue #5021: `true` ⇒ when the idle backstop's #3784 mixed-binding check has
+   * PROVEN this node's chain independent of every remote holder's, rotate
+   * without the lease, because no other node can be rotating the same chain.
+   * Default false ⇒ the proven-independent case still takes the lease.
+   */
+  bypassLeaseWhenIndependent?: boolean;
+  /**
    * Issue #1806: returns the accounts that currently have a live session bound
    * anywhere (local + every federation node), so {@link
    * TokenRefreshService.refreshIdleIsolatedAccounts} can skip them (the
@@ -362,6 +378,28 @@ export interface TokenRefreshServiceOptions {
    * `configuration.idleRotateAnywayEnabled` (default ON).
    */
   rotateBoundAtExpiry?: boolean;
+  /**
+   * Issue #4679: how long before access-token expiry a LOCALLY-bound account
+   * starts looking for an idle moment to rotate at (ms). Inside this lead window
+   * but outside the {@link expiryBufferMs} buffer, the idle backstop rotates a
+   * locally-bound isolated account (and `tick()` a locally-bound non-isolated
+   * one) only when none of its local sessions is busy, so the rotation lands at
+   * a turn boundary instead of under an in-flight request. Unbound accounts keep
+   * the buffer. Default (and any value below the buffer) is `expiryBufferMs`,
+   * which is byte-identical to pre-#4679; the daemon passes
+   * `configuration.boundRotationLeadMs` (`HAPI_BOUND_ROTATION_LEAD_MS`).
+   */
+  boundRotationLeadMs?: number;
+  /**
+   * Issue #4679 (R4): a cheap, local-only re-read of which accounts have a busy
+   * local session RIGHT NOW (the daemon GETs `/cli/sessions` only, no federation
+   * JWT). Called once per account immediately before a pre-expiry rotation of a
+   * locally-bound account, so the idle snapshot taken at the start of the pass
+   * (up to ~60s old) cannot rotate under a turn that has just started. Returns
+   * `null` when the read failed; the caller then defers (fail safe). Absent
+   * (tests / no daemon) ⇒ no re-check, which is pre-#4679 behaviour.
+   */
+  getLocalBusyAccounts?: () => Promise<Set<string> | null>;
   /**
    * Issue #3023: optional per-tick utilization sampler for the un-pinned spawn veto.
    * When provided, `tick()` invokes it at the LOOP-TOP with the full account list —
@@ -498,17 +536,25 @@ export interface LiveAccountKeys {
   localDegraded?: boolean;
   /**
    * Issue #3541: the subset of `uuids`/`emails` whose bound live session is
-   * mid-inference (`Session.thinking === true`). `inferring ⊆ live` by
-   * construction (populated only inside the daemon's `isSessionLiveForGuard`
-   * gate). The rotate-anyway backstop DEFERS a locally-bound (`inferring.uuids`)
-   * mid-turn session — rotating would revoke its in-memory access token mid-turn
-   * (#1653/#1647). Optional so the pre-#3541 construction sites and test literals
-   * stay byte-compatible; absent ⇒ treated as "nothing inferring" (safe: the
-   * rotate-anyway path additionally requires the switch ON + a local binding, so
-   * an absent `inferring` can never rotate an account the switch-off default
-   * would have skipped).
+   * BUSY. `inferring ⊆ live` by construction (populated only inside the daemon's
+   * `isSessionLiveForGuard` gate). The rotate-anyway backstop DEFERS a
+   * locally-bound (`inferring.uuids`) busy session — rotating would revoke the
+   * access token its in-flight work is using (#1653/#1647). Optional so the
+   * pre-#3541 construction sites and test literals stay byte-compatible; absent ⇒
+   * treated as "nothing busy" (safe: the rotate-anyway path additionally requires
+   * the switch ON + a local binding, so an absent `inferring` can never rotate an
+   * account the switch-off default would have skipped).
+   *
+   * Issue #4679: "busy" is the shared `isSessionBusyForRotation` predicate
+   * (`@hapi/protocol/sessionBusy`) — `thinking`, OR background agents running,
+   * OR background shells running — not `thinking` alone (the field keeps its
+   * #3541 name). `reasons` optionally names the axis per local uuid, for logs.
    */
-  inferring?: { uuids: Set<string>; emails: Set<string> };
+  inferring?: {
+    uuids: Set<string>;
+    emails: Set<string>;
+    reasons?: Map<string, string>;
+  };
 }
 
 export class TokenRefreshService {
@@ -521,6 +567,10 @@ export class TokenRefreshService {
   private readonly acquireRotationLease: (
     accountUuid: string
   ) => Promise<boolean>;
+  /** #5021: post-rotation lease release (default no-op ⇒ standing lease). */
+  private readonly releaseRotationLease: (accountUuid: string) => Promise<void>;
+  /** #5021: skip the lease for a #3784-proven independent chain. */
+  private readonly bypassLeaseWhenIndependent: boolean;
   private readonly getLiveAccountKeys: () => Promise<LiveAccountKeys>;
   private readonly getSiblingBoundAccounts: NonNullable<
     TokenRefreshServiceOptions["getSiblingBoundAccounts"]
@@ -542,10 +592,19 @@ export class TokenRefreshService {
    */
   private readonly unrefreshableProbeAt = new Map<string, number>();
   /**
+   * Issue #4679: the expiry each account's lead-window "awaiting a turn
+   * boundary" defer was last logged for, so it logs once per token lifetime.
+   */
+  private readonly leadDeferLogged = new Map<string, number>();
+  /**
    * Issue #3541: rotate-anyway gate (see the option doc). `false` ⇒ a
    * locally-bound near-expiry account keeps the pre-#3541 P-REVOKE skip.
    */
   private readonly rotateBoundAtExpiry: boolean;
+  /** #4679: idle-moment rotation lead for locally-bound accounts (≥ expiryBufferMs). */
+  private readonly boundRotationLeadMs: number;
+  /** #4679 (R4): pre-rotation local busy re-read; undefined ⇒ no re-check. */
+  private readonly getLocalBusyAccounts?: () => Promise<Set<string> | null>;
   /** #3784: mixed-case rotate-when-independent gate (default false ⇒ pre-#3784 skip). */
   private readonly rotateWhenRemoteIndependent: boolean;
   /** #3784: composed cross-node independence verdict seam (default ⇒ "unknown"). */
@@ -602,6 +661,11 @@ export class TokenRefreshService {
     // #1644: default no-op grant ⇒ byte-equivalent #1635 when no lease client is injected.
     this.acquireRotationLease =
       options.acquireRotationLease ?? (async () => true);
+    // #5021: default no-op release + no bypass ⇒ the #1644 standing lease.
+    this.releaseRotationLease =
+      options.releaseRotationLease ?? (async () => {});
+    this.bypassLeaseWhenIndependent =
+      options.bypassLeaseWhenIndependent ?? false;
     // #1806: idle-refresh backstop seams. Defaults are no-op safe: empty live
     // sets (so the backstop only acts on genuinely-idle accounts once the daemon
     // wires the real query) and a direct isolated-dir expiry read.
@@ -629,6 +693,13 @@ export class TokenRefreshService {
     // default ⇒ no sampling (tests / no daemon are byte-equivalent to pre-#3023).
     this.sampleUtilization = options.sampleUtilization;
     this.expiryBufferMs = options.expiryBufferMs ?? DEFAULT_EXPIRY_BUFFER_MS;
+    // #4679: a lead below the buffer (incl. 0 / absent) collapses to the buffer,
+    // which is byte-identical to pre-#4679 timing.
+    this.boundRotationLeadMs = Math.max(
+      this.expiryBufferMs,
+      options.boundRotationLeadMs ?? 0
+    );
+    this.getLocalBusyAccounts = options.getLocalBusyAccounts;
     this.maxScheduledAttempts = options.maxScheduledAttempts ?? 3;
     this.backoffMinMs = options.backoffMinMs ?? 1_000;
     this.backoffMaxMs = options.backoffMaxMs ?? 30_000;
@@ -891,7 +962,8 @@ export class TokenRefreshService {
    * the isolated ones `tick()` defers). NEVER throws into the daemon loop (R7).
    *
    * Guard order (cheapest first): host-default → not-isolated → unrefreshable →
-   * not-near-expiry → remote-bound-skip → local-bound-switch-off-skip →
+   * not-near-expiry (#4679: `boundRotationLeadMs` for a locally-bound account,
+   * the buffer otherwise) → remote-bound-skip → local-bound-switch-off-skip →
    * federation-degraded-skip → [#3541 rotate-anyway gate: local ∧ ¬inferring ∧
    * file-authoritative near-expiry] → lease. Only an account that clears all
    * guards is rotated via {@link forceRefresh} (which routes isolated accounts to
@@ -971,7 +1043,14 @@ export class TokenRefreshService {
           () => null
         );
         const expiresAt = isolatedExpiresAt ?? account.expiresAt;
-        if (expiresAt - this.now() > this.expiryBufferMs) continue;
+        const remaining = expiresAt - this.now();
+        // Issue #4679: a locally-bound account starts looking for an idle moment
+        // `boundRotationLeadMs` before expiry; everything else keeps the buffer.
+        if (remaining > this.boundRotationLeadMs) continue;
+        const inLeadOnly = remaining > this.expiryBufferMs;
+        if (inLeadOnly && !(live.uuids.has(uuid) && this.rotateBoundAtExpiry)) {
+          continue;
+        }
         // Issue #3541: SPLIT the #1645 P-REVOKE guard (was a single skip on ANY
         // live binding). It is a two-key OR whose keys are NOT interchangeable —
         // `uuids` = a LOCAL binding this node CAN restart (`restartBoundSessions`
@@ -994,6 +1073,9 @@ export class TokenRefreshService {
         // to the #3541 path below) — the remote holder's independent chain is
         // untouched. Any doubt (gate off, shared copy, degraded view) fails SAFE
         // to the pre-#3784 skip.
+        // Issue #5021: set only when the mixed-binding check below proves this
+        // node's chain independent; the lease gate reads it.
+        let provenIndependent = false;
         if (boundRemotely) {
           if (!boundLocally) {
             logger.info(
@@ -1008,9 +1090,12 @@ export class TokenRefreshService {
             assess: u => this.assessChainIndependence(u),
           });
           if (decision.action === "skip") {
-            if (decision.level === "warn") logger.warn(decision.message);
+            // #4679: a lead-window skip repeats every pass for up to the whole
+            // lead; keep it out of the journal (the buffer pass logs it as before).
+            if (inLeadOnly) logger.debug(decision.message);
+            else if (decision.level === "warn") logger.warn(decision.message);
             else logger.info(decision.message);
-            if (decision.jobError) {
+            if (decision.jobError && !inLeadOnly) {
               this.jobRegistry?.update(TOKEN_REFRESH_JOB_NAME, {
                 lastError: decision.jobError,
               });
@@ -1020,7 +1105,9 @@ export class TokenRefreshService {
           // decision.action === "rotate": independent chain proven — fall through
           // to the sibling / rotate-anyway path, which rotates this node's chain
           // and restarts this node's local session (#3541).
-          logger.info(decision.message);
+          if (inLeadOnly) logger.debug(decision.message);
+          else logger.info(decision.message);
+          provenIndependent = true;
         }
         // Issue #4423 (R5): a live session of a SIBLING instance on this machine
         // ALWAYS skips — this daemon cannot restart another instance's session,
@@ -1031,6 +1118,8 @@ export class TokenRefreshService {
           const msg = `[IDLE_REFRESH] skip ${uuid} (${account.emailAddress}) — live session bound on a sibling instance on this machine (no cross-instance restart)`;
           if (isolatedExpiresAt !== null && isolatedExpiresAt <= this.now()) {
             logger.warn(`${msg}; the credentials file is past expiry`);
+          } else if (inLeadOnly) {
+            logger.debug(msg); // #4679: the buffer pass logs it as before
           } else {
             logger.info(msg);
           }
@@ -1099,24 +1188,41 @@ export class TokenRefreshService {
         // above) and the pass is NOT federation-degraded (so an invisible remote
         // binding is ruled out). Two remaining conditions gate the rotation:
         if (boundLocally) {
-          const inferring = live.inferring ?? {
-            uuids: new Set<string>(),
-            emails: new Set<string>(),
-          };
+          const inferring: NonNullable<LiveAccountKeys["inferring"]> =
+            live.inferring ?? {
+              uuids: new Set<string>(),
+              emails: new Set<string>(),
+            };
           const postExpiry = expiresAt - this.now() <= 0;
           // R8: NEVER restart a mid-turn session — rotating revokes its in-memory
-          // access token mid-inference (and `restartBoundSessions` would then hit
-          // the 202-deferral → 3×30s retry → give-up, stranding it on a dead
-          // token). The ONLY exception is a POST-expiry token (nothing live is
+          // access token mid-inference (and `restartBoundSessions` would then
+          // wait out the 202-deferral with the session on a dead token). The
+          // ONLY exception is a POST-expiry token (nothing live is
           // left to revoke): the bounded backstop for a frozen `thinking:true`
           // tmux/pty session (#1653/#1647). No pre-expiry "last resort" — that
           // races native Claude Code's in-memory refresh token into the #1520
           // family lockout, and native self-heals a genuinely-inferring isolated
           // session today (#1551).
+          //
+          // #4679: "busy" is the shared predicate (thinking OR background agents
+          // OR background shells), and inside the lead window the same defer
+          // waits for a turn boundary instead of the last five minutes.
           if (inferring.uuids.has(uuid) && !postExpiry) {
-            logger.info(
-              `[IDLE_REFRESH] defer ${uuid} (${account.emailAddress}) — bound session mid-inference`
-            );
+            const reason = inferring.reasons?.get(uuid) ?? "mid-inference";
+            if (inLeadOnly) {
+              // Logged once per token lifetime: a busy lead window can last
+              // the whole lead (~30 passes).
+              if (this.leadDeferLogged.get(uuid) !== expiresAt) {
+                this.leadDeferLogged.set(uuid, expiresAt);
+                logger.info(
+                  `[IDLE_REFRESH] defer ${uuid} (${account.emailAddress}) — bound session busy (${reason}); awaiting a turn boundary before expiry`
+                );
+              }
+            } else {
+              logger.info(
+                `[IDLE_REFRESH] defer ${uuid} (${account.emailAddress}) — bound session ${reason === "mid-inference" ? "mid-inference" : `busy (${reason})`}`
+              );
+            }
             continue;
           }
           // R3: rotate-anyway requires the near-expiry judgement to come from the
@@ -1131,18 +1237,48 @@ export class TokenRefreshService {
             );
             continue;
           }
-          // All four conditions hold (local ∧ ¬inferring ∧ file-authoritative ∧
+          // R4 (#4679): the busy snapshot above was taken at the start of the
+          // pass (up to ~60s ago). Re-read local sessions right before the
+          // destructive step so a turn that has just started is not rotated
+          // under. A failed read defers (fail safe). Done BEFORE the lease so a
+          // deferral never holds the family lease without rotating. Post-expiry
+          // has nothing left to protect, so it skips the re-check.
+          if (!postExpiry && this.getLocalBusyAccounts) {
+            const busyNow = await this.getLocalBusyAccounts().catch(() => null);
+            if (busyNow === null || busyNow.has(uuid)) {
+              logger.info(
+                `[IDLE_REFRESH] defer ${uuid} (${account.emailAddress}) — ${busyNow === null ? "local session re-check failed (fail-safe)" : "session became busy before rotation"}`
+              );
+              continue;
+            }
+          }
+          // All four conditions hold (local ∧ ¬busy ∧ file-authoritative ∧
           // switch-on) → fall through to the lease + rotate + bound-session restart.
         }
         // R5: acquire the cross-machine family lease before the destructive
         // rotation (single owner). A non-holder defers — mirrors tick()'s gate.
-        if (!(await this.acquireRotationLease(uuid))) {
+        // Issue #5021: a chain the #3784 check proved independent skips the
+        // lease (no other node can be rotating it), and a taken lease is
+        // released once the rotation finishes, so it never outlives it.
+        let outcome: ForceRefreshOutcome;
+        if (provenIndependent && this.bypassLeaseWhenIndependent) {
           logger.info(
-            `[IDLE_REFRESH] defer ${uuid} (${account.emailAddress}) — family lease held by another node`
+            `[IDLE_REFRESH] ${uuid} (${account.emailAddress}) — independent chain proven; lease not required (#5021)`
           );
-          continue;
+          outcome = await this.forceRefresh(uuid);
+        } else {
+          if (!(await this.acquireRotationLease(uuid))) {
+            logger.info(
+              `[IDLE_REFRESH] defer ${uuid} (${account.emailAddress}) — family lease held by another node`
+            );
+            continue;
+          }
+          try {
+            outcome = await this.forceRefresh(uuid);
+          } finally {
+            await this.releaseLeaseQuietly(uuid);
+          }
         }
-        const outcome = await this.forceRefresh(uuid);
         // Issue #3541 (Task 3): restart the LOCALLY-bound session whose access
         // token we just revoked, via the SAME injected hook the tick() path uses
         // (run.ts wires `onSuccessfulRefresh` → `restartBoundSessions`). Fire it
@@ -1235,6 +1371,28 @@ export class TokenRefreshService {
     }
   }
 
+  /**
+   * Issue #5020 (R3, R4): mirror every isolated account's credentials file into
+   * this instance's store — a fresher pair native saved, the file's lineage, and
+   * a native wipe (flagged `unrefreshable`, reason `native-cleared`, one
+   * `error_logs` entry). Runs on EVERY daemon, every maintenance tick (each
+   * instance has its own store). Never writes the file, never calls OAuth,
+   * never throws. See `isolatedCredentialsMirror.ts`.
+   */
+  async mirrorIsolatedCredentials(): Promise<void> {
+    await runIsolatedCredentialsMirror({
+      listAccountUuids: async () =>
+        (await this.listAnthropicEntries()).map(e => e.accountUuid),
+      getAccount: async uuid => {
+        const res = await this.store.get(uuid);
+        return res && res.ok ? res.account : null;
+      },
+      mergeStore: (uuid, mergeFn) => this.persistMerge(uuid, mergeFn),
+      hostDefaultUuid: () => this.getHostDefaultAccountUuid(),
+      now: this.now,
+    });
+  }
+
   // --- internals ----------------------------------------------------------------
 
   /**
@@ -1279,6 +1437,20 @@ export class TokenRefreshService {
       const hostDefaultUuid = await this.getHostDefaultAccountUuid().catch(
         () => null
       );
+      // Issue #4679: lazily read live bindings at most once per tick, and only
+      // when an account is inside the lead window. A failed read or a degraded
+      // local view counts as "not idle", so the account waits for the buffer.
+      let liveForLead: LiveAccountKeys | null | undefined;
+      const isLocallyBoundAndIdle = async (uuid: string): Promise<boolean> => {
+        if (liveForLead === undefined) {
+          liveForLead = await this.getLiveAccountKeys().catch(() => null);
+        }
+        if (!liveForLead || liveForLead.localDegraded) return false;
+        return (
+          liveForLead.uuids.has(uuid) &&
+          !(liveForLead.inferring?.uuids.has(uuid) ?? false)
+        );
+      };
       for (const entry of entries) {
         if (this.stopped) return;
         const res = await this.store.get(entry.accountUuid);
@@ -1319,7 +1491,36 @@ export class TokenRefreshService {
           continue;
         }
         if (account.unrefreshable) continue;
-        if (account.expiresAt - this.now() <= this.expiryBufferMs) {
+        const remaining = account.expiresAt - this.now();
+        // Issue #4679 (R8): inside the lead window but outside the buffer,
+        // rotate a LOCALLY-bound account at an idle moment (a turn boundary)
+        // rather than at the buffer, where its session may be mid-request.
+        // Unbound, busy, or degraded-view accounts wait for the buffer below,
+        // whose behaviour is unchanged. Unreachable when the lead equals the
+        // buffer (the default), so the default is byte-identical.
+        if (
+          remaining > this.expiryBufferMs &&
+          remaining <= this.boundRotationLeadMs &&
+          (await isLocallyBoundAndIdle(account.accountUuid))
+        ) {
+          if (!(await this.acquireRotationLease(account.accountUuid))) {
+            logger.info(
+              `[TOKEN_REFRESH] deferred rotation for ${account.accountUuid} (${account.emailAddress}) — family lease held by another node`
+            );
+            continue;
+          }
+          logger.info(
+            `[TOKEN_REFRESH] rotating ${account.accountUuid} (${account.emailAddress}) at an idle moment before expiry (bound session idle)`
+          );
+          try {
+            await this.refreshScheduled(account);
+          } finally {
+            // #5021: the lease covers only the rotation.
+            await this.releaseLeaseQuietly(account.accountUuid);
+          }
+          continue;
+        }
+        if (remaining <= this.expiryBufferMs) {
           // Issue #1644: acquire the cross-machine family lease before
           // proactively rotating. A non-holder defers — mirrors the
           // isolated-account `continue` above. Only non-deferred accounts reach
@@ -1331,7 +1532,12 @@ export class TokenRefreshService {
             );
             continue;
           }
-          await this.refreshScheduled(account);
+          try {
+            await this.refreshScheduled(account);
+          } finally {
+            // #5021: the lease covers only the rotation.
+            await this.releaseLeaseQuietly(account.accountUuid);
+          }
         } else if (
           soonestExpiresAt === undefined ||
           account.expiresAt < soonestExpiresAt
@@ -1376,6 +1582,18 @@ export class TokenRefreshService {
         : soonestExpiresAt - this.expiryBufferMs - this.now();
     const delayMs = Math.min(this.maxTickMs, Math.max(this.minTickMs, raw));
     this.timer = setTimeout(() => void this.tick(), delayMs);
+  }
+
+  /**
+   * Issue #5021: release a lease taken for a rotation that has now finished.
+   * Never throws — a failed release lapses at the hub TTL.
+   */
+  private async releaseLeaseQuietly(accountUuid: string): Promise<void> {
+    try {
+      await this.releaseRotationLease(accountUuid);
+    } catch {
+      // Fail-open, like every lease surface.
+    }
   }
 
   /** Scheduled refresh with bounded backoff on transient failure (R5). */

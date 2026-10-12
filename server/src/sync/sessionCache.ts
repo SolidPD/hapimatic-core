@@ -29,6 +29,8 @@ import { extractTodoWriteTodosFromMessageContent, TodosSchema } from "./todos";
 export interface SessionAliveResult {
   /** Issue #3563: the `rateLimited.since` null→set rising edge. */
   rateLimitedRisingEdge: boolean;
+  /** Issue #3478: the session's inactive→active rising edge (any driver). */
+  activatedRisingEdge: boolean;
   /** Issue #4385: background agents that completed on this tick — the SCRUBBED
    *  cache entries, so the recorder copies `description`/`agentType` from the
    *  one scrub site, never from the raw meta file (T11). */
@@ -45,8 +47,10 @@ export type SessionBindingSnapshot = Pick<
   "accountUuid" | "claudeAccount" | "authBinding" | "apiKeyId" | "apiKeyMasked"
 >;
 
+/** A heartbeat the cache ignores (bad time, archive guard, unknown session). */
 const NO_ALIVE_EDGES: SessionAliveResult = {
   rateLimitedRisingEdge: false,
+  activatedRisingEdge: false,
   completedBackgroundAgents: [],
 };
 
@@ -738,6 +742,8 @@ export class SessionCache {
     }
     return {
       rateLimitedRisingEdge: rateLimitedRose,
+      // `session.active` was set true above, so the edge is exactly `!wasActive`.
+      activatedRisingEdge: !wasActive,
       completedBackgroundAgents: completedBackgroundAgents(
         previousBackgroundAgents,
         session.backgroundAgents

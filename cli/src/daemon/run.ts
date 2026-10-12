@@ -17,9 +17,16 @@ import {
 import { buildDaemonBootRecord } from "./daemonBootRecord";
 import { TrackedSession } from "./types";
 import {
+  collectLocalBindings,
   isSessionLiveForGuard,
   resolveLiveFreshnessWindowMs,
+  type LocalBindingInput,
 } from "./sessionLiveness";
+import {
+  isSessionBusyForRotation,
+  type SessionBusySignal,
+} from "@hapi/protocol/sessionBusy";
+import { createBoundSessionRestarter } from "./boundSessionRestart";
 import { DaemonState, type Machine, Metadata } from "@/api/types";
 import {
   SpawnSessionOptions,
@@ -862,148 +869,22 @@ export async function startDaemon(
     // active sessions bound to that account so the running `claude` process picks
     // up the fresh token (its CLAUDE_CODE_OAUTH_TOKEN env is frozen at spawn).
     // R4 (no restart storms): per-account in-flight guard prevents concurrent
-    // restart passes for the same account.
-    const refreshingAccounts = new Set<string>();
-    // Returns a RestartSummary (issue #1547) so the force-refresh harness can
-    // assert step 3/4 (restartBoundSessions fired → bound-session respawn). The
-    // existing fire-and-forget caller (`void restartBoundSessions(...)` below)
-    // ignores the return — backward compatible.
-    const restartBoundSessions = async (
+    // restart passes for the same account. Returns a RestartSummary (issue #1547)
+    // so the force-refresh harness can assert step 3/4; the fire-and-forget
+    // caller (`void restartBoundSessions(...)` below) ignores it.
+    // Issue #4679: extracted to `boundSessionRestart.ts`. A session the server
+    // defers (busy) is retried until it restarts, ends, or errors — never
+    // abandoned after 90s — and is forced after `tokenRestartForceAfterMs`.
+    const boundSessionRestarter = createBoundSessionRestarter({
+      serverUrl: configuration.serverUrl,
+      cliApiToken: configuration.cliApiToken,
+      forceAfterMs: configuration.tokenRestartForceAfterMs,
+      logger,
+    });
+    const restartBoundSessions = (
       accountUuid: string
-    ): Promise<RestartSummary> => {
-      if (refreshingAccounts.has(accountUuid)) {
-        logger.debug(
-          `[TOKEN_REFRESH] already restarting sessions for account ${accountUuid}, skipping`
-        );
-        return {
-          skipped: true,
-          boundCount: 0,
-          restarted: 0,
-          busy: 0,
-          failed: 0,
-          errors: [],
-        };
-      }
-      refreshingAccounts.add(accountUuid);
-      const summary: RestartSummary = {
-        skipped: false,
-        boundCount: 0,
-        restarted: 0,
-        busy: 0,
-        failed: 0,
-        errors: [],
-      };
-      try {
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-        };
-        if (configuration.cliApiToken) {
-          headers["Authorization"] = `Bearer ${configuration.cliApiToken}`;
-        }
-        const resp = await fetch(`${configuration.serverUrl}/cli/sessions`, {
-          headers,
-        });
-        if (!resp.ok) {
-          logger.warn(
-            `[TOKEN_REFRESH] failed to list sessions for restart: ${resp.status}`
-          );
-          summary.errors.push(`list sessions failed: HTTP ${resp.status}`);
-          return summary;
-        }
-        const { sessions } = (await resp.json()) as {
-          sessions: Array<{
-            id: string;
-            active?: boolean;
-            metadata?: { accountUuid?: string };
-          }>;
-        };
-        const bound = sessions.filter(
-          s => s.active && s.metadata?.accountUuid === accountUuid
-        );
-        summary.boundCount = bound.length;
-        logger.info(
-          `[TOKEN_REFRESH] restarting ${bound.length} session(s) bound to account ${accountUuid}`
-        );
-        for (const session of bound) {
-          // R6: the server returns 202 when a session is mid-inference; retry up
-          // to 3 times with 30s gaps (within the proactive 5-min buffer window)
-          // rather than interrupting the turn. The summary tallies the FIRST
-          // attempt per session (issue #1547 — harness needs an immediate
-          // classification); a 202 is reported as `busy` and retries in the
-          // background, `counted` ensures each session is tallied exactly once.
-          let retries = 0;
-          let counted = false;
-          const tryRestart = async (): Promise<void> => {
-            let r: Response;
-            try {
-              r = await fetch(
-                `${configuration.serverUrl}/cli/sessions/${session.id}/token-refresh`,
-                {
-                  method: "POST",
-                  headers,
-                  body: JSON.stringify({ accountUuid }),
-                }
-              );
-            } catch (e) {
-              if (!counted) {
-                counted = true;
-                summary.failed++;
-                summary.errors.push(
-                  `session ${session.id}: ${e instanceof Error ? e.message : String(e)}`
-                );
-              }
-              return;
-            }
-            if (r.status === 202) {
-              if (!counted) {
-                counted = true;
-                summary.busy++;
-              }
-              if (retries < 3) {
-                retries++;
-                logger.debug(
-                  `[TOKEN_REFRESH] session ${session.id} busy, retrying in 30s (attempt ${retries})`
-                );
-                setTimeout(() => void tryRestart(), 30_000);
-              } else {
-                logger.warn(
-                  `[TOKEN_REFRESH] session ${session.id} still busy after 3 retries — skipping restart`
-                );
-              }
-            } else if (!r.ok) {
-              const body = await r.text().catch(() => "");
-              if (!counted) {
-                counted = true;
-                summary.failed++;
-                summary.errors.push(
-                  `session ${session.id}: HTTP ${r.status} ${body}`.trim()
-                );
-              }
-              logger.warn(
-                `[TOKEN_REFRESH] failed to restart session ${session.id}: ${r.status} ${body}`
-              );
-            } else {
-              if (!counted) {
-                counted = true;
-                summary.restarted++;
-              }
-              logger.info(
-                `[TOKEN_REFRESH] session ${session.id} restarted with fresh token`
-              );
-            }
-          };
-          await tryRestart();
-        }
-      } catch (err) {
-        logger.warn(
-          `[TOKEN_REFRESH] error in restartBoundSessions: ${err instanceof Error ? err.message : String(err)}`
-        );
-        summary.errors.push(err instanceof Error ? err.message : String(err));
-      } finally {
-        refreshingAccounts.delete(accountUuid);
-      }
-      return summary;
-    };
+    ): Promise<RestartSummary> =>
+      boundSessionRestarter.restartBoundSessions(accountUuid);
 
     // Start the OAuth token-refresh service (issue #1448) — keeps every stored
     // account's access token fresh ahead of expiry, since Hapimatic's env-var
@@ -1040,6 +921,8 @@ export async function startDaemon(
       // symmetry with `live`; only `inferring.uuids` is consumed today.
       const inferringUuids = new Set<string>();
       const inferringEmails = new Set<string>();
+      // #4679: why each local busy account is busy, for the backstop's log line.
+      const inferringReasons = new Map<string, string>();
       // Issue #1834: track whether the FEDERATION query failed this pass. The
       // per-block try/catch structure stays intact — this flag is set only in
       // the federation `catch` below, so the success path leaves it false. The
@@ -1065,36 +948,30 @@ export async function startDaemon(
           headers,
         });
         if (resp.ok) {
+          // `/cli/sessions` returns full `Session` objects; this narrows to the
+          // liveness (#1852 `activeAt`), busy (#3541 `thinking`, #4679
+          // `backgroundAgents`) and binding fields the guards read.
           const { sessions } = (await resp.json()) as {
-            sessions: Array<{
-              active?: boolean;
-              // #1852: carry the freshness signal — the previous cast stripped it.
-              activeAt?: number;
-              // #3541: carry the inference signal — the previous cast stripped it
-              // too, even though `/cli/sessions` returns full `Session` objects
-              // (`thinking: z.boolean()`). This is a narrowing, not the wire.
-              thinking?: boolean;
-              metadata?: { accountUuid?: string };
-            }>;
+            sessions: LocalBindingInput[];
           };
-          for (const s of sessions) {
-            // #1852: gate on a fresh `activeAt` heartbeat, not the raw `active`
-            // flag. Local sessions carry no `nodeStatus` (so the predicate's
-            // offline handling is a no-op); the 120s window is >= this node's
-            // local reaper tolerance (TMUX_PTY_INACTIVE_TOLERANCE_MS, 30s), so a
-            // just-ended live tmux/pty session is never falsely NOT-live here.
-            if (
-              isSessionLiveForGuard(s, now, liveFreshnessWindowMs) &&
-              s.metadata?.accountUuid
-            ) {
-              uuids.add(s.metadata.accountUuid);
-              // #3541: a live LOCAL session that is mid-inference joins the
-              // `inferring` set so the rotate-anyway backstop defers it (never
-              // rotates its in-memory access token out from under an active turn).
-              if (s.thinking === true) {
-                inferringUuids.add(s.metadata.accountUuid);
-              }
-            }
+          // #1852: gate on a fresh `activeAt` heartbeat, not the raw `active`
+          // flag. Local sessions carry no `nodeStatus` (so the predicate's
+          // offline handling is a no-op); the 120s window is >= this node's
+          // local reaper tolerance (TMUX_PTY_INACTIVE_TOLERANCE_MS, 30s), so a
+          // just-ended live tmux/pty session is never falsely NOT-live here.
+          // #3541 + #4679: a live LOCAL session that is BUSY (thinking, or
+          // background agents / shells still running) joins the `inferring`
+          // set so the backstop defers it rather than rotating the token its
+          // in-flight work is using.
+          const local = collectLocalBindings(
+            sessions,
+            now,
+            liveFreshnessWindowMs
+          );
+          for (const uuid of local.uuids) uuids.add(uuid);
+          for (const uuid of local.busyUuids) inferringUuids.add(uuid);
+          for (const [uuid, reason] of local.busyReasons) {
+            inferringReasons.set(uuid, reason);
           }
         } else {
           // Issue #3640: local visibility degraded (non-OK response — incl. the
@@ -1144,6 +1021,9 @@ export async function startDaemon(
             // `inferring.emails` for symmetry; the rotate-anyway path is
             // local-only, so this key-space is not consumed by the gate today.
             thinking?: boolean;
+            // #4679: background-work counts (the summary's counts-only
+            // projection carries `running` and `shells.running`).
+            backgroundAgents?: SessionBusySignal["backgroundAgents"];
             metadata?: { claudeAccount?: { email?: string } };
           }>;
         };
@@ -1156,9 +1036,10 @@ export async function startDaemon(
           // left untouched.
           if (email && isSessionLiveForGuard(s, now, liveFreshnessWindowMs)) {
             emails.add(email);
-            // #3541: a live REMOTE inferring session (symmetry with the local
-            // leg). Unused by the local-only rotate-anyway gate today.
-            if (s.thinking === true) {
+            // #3541: a live REMOTE busy session (symmetry with the local leg;
+            // #4679: the same shared busy predicate). Unused by the local-only
+            // rotate-anyway gate today.
+            if (isSessionBusyForRotation(s)) {
               inferringEmails.add(email);
             }
           }
@@ -1184,8 +1065,37 @@ export async function startDaemon(
         emails,
         federationDegraded,
         localDegraded,
-        inferring: { uuids: inferringUuids, emails: inferringEmails },
+        inferring: {
+          uuids: inferringUuids,
+          emails: inferringEmails,
+          reasons: inferringReasons,
+        },
       };
+    };
+
+    // Issue #4679 (R4): the cheap pre-rotation re-read — local `/cli/sessions`
+    // only (no federation JWT), same collector as the local leg above. `null`
+    // on any failure so the backstop defers (fail safe).
+    const getLocalBusyAccounts = async (): Promise<Set<string> | null> => {
+      try {
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+        };
+        if (configuration.cliApiToken) {
+          headers["Authorization"] = `Bearer ${configuration.cliApiToken}`;
+        }
+        const resp = await fetch(`${configuration.serverUrl}/cli/sessions`, {
+          headers,
+        });
+        if (!resp.ok) return null;
+        const { sessions } = (await resp.json()) as {
+          sessions: LocalBindingInput[];
+        };
+        return collectLocalBindings(sessions, Date.now(), liveFreshnessWindowMs)
+          .busyUuids;
+      } catch {
+        return null;
+      }
     };
 
     // Issue #3784: cross-node chain-independence probe (fetcher in
@@ -1209,9 +1119,17 @@ export async function startDaemon(
           accountConfigsDir: configuration.accountConfigsDir,
         }),
       // Issue #1644: gate proactive rotation on the cross-machine family lease,
-      // acquired through the shared manager so the daemon's 60s loop heartbeats
-      // held families into a stable owner. Default-off feature gate ⇒ no-op true.
+      // acquired through the shared manager. Default-off feature gate ⇒ no-op true.
       acquireRotationLease: uuid => rotationLeaseManager.acquire(uuid),
+      // Issue #5021: release the lease when each rotation finishes, and skip it
+      // for a chain #3784 proved independent, so every node's backstop can
+      // rotate its own copy. HAPI_ROTATION_LEASE_RELEASE_AFTER_ROTATION=off
+      // restores the #1644 standing lease (no release, no bypass).
+      releaseRotationLease: configuration.rotationLeaseReleaseAfterRotation
+        ? uuid => rotationLeaseManager.release(uuid)
+        : undefined,
+      bypassLeaseWhenIndependent:
+        configuration.rotationLeaseReleaseAfterRotation,
       // Issue #1806: the live-session-anywhere guard for the idle-refresh backstop.
       getLiveAccountKeys,
       // Issue #3544: probe an isolated account's machine-global token before the
@@ -1225,6 +1143,11 @@ export async function startDaemon(
       // account with a LOCALLY-bound, non-inferring session (then restart it)
       // instead of decaying it to expiry behind the P-REVOKE guard.
       rotateBoundAtExpiry: configuration.idleRotateAnywayEnabled,
+      // Issue #4679: rotate a locally-bound account at an idle moment inside
+      // this lead (HAPI_BOUND_ROTATION_LEAD_MS; 0 ⇒ pre-#4679 buffer timing),
+      // re-reading local busy state right before the rotation (R4).
+      boundRotationLeadMs: configuration.boundRotationLeadMs,
+      getLocalBusyAccounts,
       // Issue #3784: mixed (local+remote) rotate-when-independent gate (default
       // OFF; HAPI_IDLE_ROTATE_REMOTE_INDEPENDENT=1 enables post-validation). The
       // verdict composes this node's own fingerprint with the remote probe above.
@@ -1406,6 +1329,8 @@ export async function startDaemon(
       // and awaits any in-flight refresh within a bounded timeout so daemon
       // shutdown can't hang.
       await tokenRefreshService.stop();
+      // Issue #4679: cancel scheduled post-rotation restart retries.
+      boundSessionRestarter.stop();
 
       // Issue #1644: best-effort release of every held rotation lease so peers
       // can take over promptly (the hub TTL covers a hard crash that skips this).

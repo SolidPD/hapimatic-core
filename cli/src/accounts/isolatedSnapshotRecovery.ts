@@ -125,6 +125,15 @@ export interface SnapshotRecoveryDeps {
   acquireRotationLease?: (accountUuid: string) => Promise<boolean>;
   /** Seed seam. Defaults to the real {@link seedAccountConfigDir}. */
   seedFn?: typeof seedAccountConfigDir;
+  /**
+   * Issue #5020 (R5): flag the account `unrefreshable` with a reason and the
+   * failed head's fingerprint. Defaults to a merge into this instance's store.
+   */
+  markUnrefreshable?: (
+    accountUuid: string,
+    reason: string,
+    fingerprint: string | undefined
+  ) => Promise<void>;
   /** Probe timeout override (tests). */
   probeTimeoutMs?: number;
 }
@@ -251,6 +260,7 @@ export async function validateAndRecoverIsolatedSnapshot(
               deps.refreshService ?? new TokenRefreshService({ accountStore })),
           seed: deps.seedFn ?? seedAccountConfigDir,
           acquireRotationLease: deps.acquireRotationLease ?? (async () => true),
+          markUnrefreshable: deps.markUnrefreshable ?? markUnrefreshableInStore,
         };
         const verdict = fresh
           ? await recoverReadableFile(ctx, fresh.refreshToken)
@@ -280,6 +290,7 @@ interface RecoveryContext {
   refreshService: () => Pick<TokenRefreshService, "forceRefresh">;
   seed: typeof seedAccountConfigDir;
   acquireRotationLease: (accountUuid: string) => Promise<boolean>;
+  markUnrefreshable: NonNullable<SnapshotRecoveryDeps["markUnrefreshable"]>;
 }
 
 /** True when the store record carries both tokens and a refresh token other than `onDisk`. */
@@ -294,30 +305,92 @@ function storeHeadDiffers(
   );
 }
 
+/** Why the store head may or may not be seeded over the file. */
+export type StoreHeadSeedability =
+  | "seedable"
+  /** The store head is missing or is the token on disk. */
+  | "same-or-missing"
+  /** The store head is the token recorded as failed (#4423 Task 6). */
+  | "failed-token"
+  /** The store pair is older than the file's lineage (#5020 R5). */
+  | "older-lineage";
+
 /**
  * The last-resort seed condition: the store head differs from the token on
- * disk AND is not itself the token recorded as failed (#4423 Task 6 — a flagged
- * record whose fingerprint matches its own refresh token is a known-dead head).
+ * disk, is not itself the token recorded as failed (#4423 Task 6 — a flagged
+ * record whose fingerprint matches its own refresh token is a known-dead head),
+ * and (#5020 R5) is not older than the file's lineage: the newest `expiresAt`
+ * known for the file — the one on disk, or the `isolatedHeadExpiresAt` the
+ * daemon mirror and every Hapimatic rotation record. A store pair the file has
+ * moved past was consumed by a native refresh; presenting it again only buys an
+ * `invalid_grant` (ms1, 2026-10-10 16:10:40Z: the seeded 2026-10-09 capture pair).
  */
-function storeHeadSeedable(
+export function storeHeadSeedability(
   account: StoredAccount,
-  onDiskRefreshToken: string | null
-): boolean {
-  if (!storeHeadDiffers(account, onDiskRefreshToken)) return false;
-  return !(
+  onDiskRefreshToken: string | null,
+  onDiskExpiresAt: number | null
+): StoreHeadSeedability {
+  if (!storeHeadDiffers(account, onDiskRefreshToken)) return "same-or-missing";
+  if (
     account.unrefreshable === true &&
     !!account.refreshToken &&
     account.unrefreshableTokenFingerprint ===
       refreshTokenFingerprint(account.refreshToken)
+  ) {
+    return "failed-token";
+  }
+  const lineage = Math.max(
+    account.isolatedHeadExpiresAt ?? 0,
+    onDiskExpiresAt ?? 0
   );
+  if (lineage > 0 && account.expiresAt < lineage) return "older-lineage";
+  return "seedable";
 }
 
 /** Seed the store head over the file, with `overwrite: true`, and log it. */
 async function lastResortSeed(ctx: RecoveryContext): Promise<void> {
-  await ctx.seed(ctx.account, { overwrite: true });
+  await ctx.seed(ctx.account, {
+    overwrite: true,
+    writer: "recovery-last-resort",
+  });
   logger.info(
     `[SNAPSHOT_RECOVERY] last-resort seed for ${ctx.account.accountUuid}`
   );
+}
+
+/**
+ * #5020 R5: the store pair is older than the file's lineage, so it is never
+ * presented. Mark the account `unrefreshable` (reason `store-lineage-stale`,
+ * fingerprint of the store head) — the env-token path then throws the precise
+ * re-login error — rather than seed a consumed pair and burn an OAuth call.
+ */
+async function refuseOlderLineage(ctx: RecoveryContext): Promise<"fallback"> {
+  const uuid = ctx.account.accountUuid;
+  const fp = ctx.account.refreshToken
+    ? refreshTokenFingerprint(ctx.account.refreshToken)
+    : undefined;
+  await ctx.markUnrefreshable(uuid, STORE_LINEAGE_STALE_REASON, fp);
+  logger.warn(
+    `[SNAPSHOT_RECOVERY] recovery exhausted for ${uuid}: store pair older than the isolated head — re-login required (store head ${fp ? fp.slice(0, 8) : "none"} not presented)`
+  );
+  return "fallback";
+}
+
+/** `unrefreshableReason` when the store pair is older than the file lineage. */
+export const STORE_LINEAGE_STALE_REASON = "store-lineage-stale";
+
+/** Production {@link SnapshotRecoveryDeps.markUnrefreshable}: merge into this instance's store. */
+async function markUnrefreshableInStore(
+  accountUuid: string,
+  reason: string,
+  fingerprint: string | undefined
+): Promise<void> {
+  await accountStore.update(accountUuid, current => ({
+    ...current,
+    unrefreshable: true,
+    unrefreshableReason: reason,
+    ...(fingerprint ? { unrefreshableTokenFingerprint: fingerprint } : {}),
+  }));
 }
 
 /**
@@ -396,7 +469,7 @@ async function recoverReadableFile(
   const step = await withAccountCredentialLock(
     uuid,
     ROTATE_LOCK_NAME,
-    async (): Promise<"changed" | "seeded" | "none"> => {
+    async (): Promise<"changed" | "seeded" | "none" | "older-lineage"> => {
       const onDisk = await readIsolatedCredentials(uuid);
       // R3: a readable file holding a token OTHER than the rejected one was
       // written after the rejection (a native refresh, a re-login write-through)
@@ -407,9 +480,13 @@ async function recoverReadableFile(
       ) {
         return "changed";
       }
-      if (!storeHeadSeedable(ctx.account, onDisk?.refreshToken ?? null)) {
-        return "none";
-      }
+      const seedability = storeHeadSeedability(
+        ctx.account,
+        onDisk?.refreshToken ?? null,
+        onDisk?.expiresAt ?? null
+      );
+      if (seedability === "older-lineage") return "older-lineage";
+      if (seedability !== "seedable") return "none";
       await lastResortSeed(ctx);
       return "seeded";
     }
@@ -421,6 +498,7 @@ async function recoverReadableFile(
     );
     return "ok";
   }
+  if (step === "older-lineage") return refuseOlderLineage(ctx);
   if (step === "none") return exhausted(ctx, first);
   const second = await rotateOnce(ctx);
   return second.kind === "success" ? "ok" : exhausted(ctx, second);
@@ -443,12 +521,15 @@ async function recoverUnreadableFile(
     uuid,
     ROTATE_LOCK_NAME,
     async (): Promise<
-      { kind: "readable"; refreshToken: string } | { kind: "seeded" | "none" }
+      | { kind: "readable"; refreshToken: string }
+      | { kind: "seeded" | "none" | "older-lineage" }
     > => {
       const onDisk = await readIsolatedCredentials(uuid);
       if (onDisk)
         return { kind: "readable", refreshToken: onDisk.refreshToken };
-      if (!storeHeadSeedable(ctx.account, null)) return { kind: "none" };
+      const seedability = storeHeadSeedability(ctx.account, null, null);
+      if (seedability === "older-lineage") return { kind: "older-lineage" };
+      if (seedability !== "seedable") return { kind: "none" };
       await lastResortSeed(ctx);
       return { kind: "seeded" };
     }
@@ -456,6 +537,9 @@ async function recoverUnreadableFile(
   if (step.kind === "readable") {
     return recoverReadableFile(ctx, step.refreshToken);
   }
+  // #5020 R5: never present a consumed pair, and skip the rotation below —
+  // it would only find no readable file to rotate.
+  if (step.kind === "older-lineage") return refuseOlderLineage(ctx);
   if (step.kind === "seeded") {
     const storeTokenLive =
       ctx.account.expiresAt - ctx.now() > EXPIRY_BUFFER_MS &&

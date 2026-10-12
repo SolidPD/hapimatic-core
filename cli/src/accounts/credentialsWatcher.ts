@@ -215,10 +215,17 @@ export class CredentialsWatcher {
     this.profileFetch = opts.profileFetch;
     this.now = opts.now ?? Date.now;
     this.enabled = opts.enabled ?? true;
+    // Issue #5020: the re-seed writes under native Claude Code's refresh and
+    // storage-write locks (inside `seedAccountConfigDir`), and leaves a file
+    // whose pair is newer than the capture alone — native rotated past it.
     this.seedConfigDir =
       opts.seedConfigDir ??
       (account =>
-        seedAccountConfigDir(account, { overwrite: true }).then(() => {}));
+        seedAccountConfigDir(account, {
+          overwrite: true,
+          writer: "credentials-watcher",
+          skipIfOnDiskNewer: true,
+        }).then(() => {}));
     this.jobRegistry = opts.jobRegistry ?? null;
     this.jobNode = opts.jobNode ?? "standalone";
   }
