@@ -1,0 +1,961 @@
+#!/usr/bin/env bash
+# install-hapimatic-v1.sh — one-command open-core (free-tier) installer for Hapimatic.
+#
+# Installs the L0 single-exe binary (a GitHub release asset) and the L1 toolkit core tier
+# (the dispatcher + registries + core hooks + guidance + templates), and puts `hapi` on PATH
+# as an installer-owned FILE (never a shell function). A built-in doctor reports what is present
+# and what is missing, one line per check.
+#
+# Issue #3984 (E2 Sub A). Core tier only (G5): the premium plugins (L2) and the operator overlay
+# (L3) are never installed here. Every behavioral change bumps INSTALLER_VERSION below, which the
+# script prints in its banner. The filename stays `-v1` because it is part of the public one-liner
+# URL, https://github.com/SolidPD/hapimatic-core/releases/latest/download/install-hapimatic-v1.sh
+# (#5069). Renaming the file changes that URL: the overlay release workflow, the allowlist line,
+# README.md, the two install-guide pages, docs/internal/open-core-release-runbook.md, gate G3 in
+# docs/public-site/launch-runbook.md, GATEWAY_PUBLIC_INSTALLER_URL and the tests that pin the name
+# must move together, and every already-published copy of the old command stops working.
+#
+# Zero operator context (R4): this script and everything it installs contain no absolute operator
+# home path, no secret, no account, and no federation token — every path is derived from $HOME /
+# $SHELL at runtime.
+#
+# ── Modes ────────────────────────────────────────────────────────────────────
+#   install-hapimatic-v1.sh [install]                 full install (L0 + L1 + PATH) — the stranger path
+#   install-hapimatic-v1.sh fetch --out <dir>         download+verify the binary (+ clone toolkit if
+#                                                     --toolkit-source) into <dir>; NO install.
+#                                                     The shared fetch/verify path provision.sh runs on RP1.
+#   install-hapimatic-v1.sh --toolkit-dir <tree>      offline L1-only apply from an already-fetched tree
+#                                                     (no clone, no network, no L0) — the host-side apply
+#                                                     path provision.sh runs on a hosted VM (#1004 boundary).
+#   install-hapimatic-v1.sh doctor                    run the install-readiness doctor only.
+#   install-hapimatic-v1.sh uninstall [--purge]       remove what install wrote.
+#
+# ── Flags ────────────────────────────────────────────────────────────────────
+#   --release-source <owner/repo|url>  release channel for the L0 binary (default:
+#                                      SolidPD/hapimatic-core, the public open-core release; no
+#                                      credentials needed). For the private channel pass
+#                                      --release-source MattStarfield/hapimatic-private with `gh`
+#                                      auth or $GH_TOKEN.
+#   --release-tag <tag>                release tag (default: latest)
+#   --asset <name>                     override the auto-detected asset name (used by provision.sh)
+#   --toolkit-source <git URL>         L1 core-tier source (install mode default:
+#                                      https://github.com/SolidPD/hapimatic-toolkit). `fetch` clones a
+#                                      toolkit only when this flag is passed; --toolkit-dir ignores it.
+#   --toolkit-tag <tag>                toolkit tag to pin (default: v1.0.0)
+#   --toolkit-dir <local tree>         apply L1 from this already-fetched tree (offline; implies L1-only)
+#   --name <binary-name>               installed binary name (default: hapi; provision.sh passes
+#                                      hapimatic-private)
+#   --prefix <dir>                     bin prefix (default: ~/.local/bin)
+#   --out <dir>                        staging dir for `fetch` mode
+#   --purge                            uninstall also removes the Hapimatic home dir (token + DB)
+#   --dry-run                          print the plan; change nothing
+#   -h | --help                        this help
+set -uo pipefail
+
+INSTALLER_VERSION="1.4.0"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+MODE="install"                         # install | fetch | doctor | uninstall
+RELEASE_SOURCE="SolidPD/hapimatic-core"
+RELEASE_TAG=""                         # empty = latest
+ASSET_OVERRIDE=""
+TOOLKIT_SOURCE=""                      # empty = not passed (see DEFAULT_TOOLKIT_SOURCE)
+DEFAULT_TOOLKIT_SOURCE="https://github.com/SolidPD/hapimatic-toolkit"   # install mode only (#5069): fetch and --toolkit-dir never use it
+TOOLKIT_TAG="v1.0.0"
+TOOLKIT_DIR=""
+BIN_NAME="hapi"
+PREFIX="$HOME/.local/bin"
+OUT_DIR=""
+PURGE=0
+DRY_RUN=0
+
+HAPI_HOME_DIR="${HAPI_HOME:-$HOME/.hapi}"        # happyHomeDir: $HAPI_HOME else ~/.hapi (cli/src/configuration.ts)
+TOOLKIT_TARGET="$HOME/.claude"                    # toolkit install.sh default --target
+MANIFEST_PATH="$HAPI_HOME_DIR/install-hapimatic.json"
+PATH_MARKER="# >>> install-hapimatic (hapi on PATH) >>>"
+PATH_MARKER_END="# <<< install-hapimatic (hapi on PATH) <<<"
+
+# ── Logging (all to stderr so `fetch`/machine use keeps stdout clean) ──────────
+log()  { printf '%s\n' "$*" >&2; }
+info() { printf '  %s\n' "$*" >&2; }
+ok()   { printf '  [ OK ] %s\n' "$*" >&2; }
+warn() { printf '  [WARN] %s\n' "$*" >&2; }
+err()  { printf '  [FAIL] %s\n' "$*" >&2; }
+die()  { printf 'install-hapimatic: ERROR: %s\n' "$*" >&2; exit 1; }
+plan() { printf '  [DRY-RUN] %s\n' "$*" >&2; }
+
+# The comment header only: line 1 is the shebang and the first non-comment line ends the help.
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
+
+# ── OS / arch resolution ──────────────────────────────────────────────────────
+detect_os() {
+    case "$(uname -s)" in
+        Linux)  echo linux ;;
+        Darwin) echo darwin ;;
+        *) die "unsupported OS: $(uname -s) (Linux and macOS only; Windows is out of scope for v1)" ;;
+    esac
+}
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo x64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *) die "unsupported arch: $(uname -m) (x64 and arm64 only)" ;;
+    esac
+}
+resolve_asset() {
+    if [ -n "$ASSET_OVERRIDE" ]; then printf '%s' "$ASSET_OVERRIDE"; return; fi
+    printf 'hapi-%s-%s.tar.gz' "$(detect_os)" "$(detect_arch)"
+}
+
+# ── L0 download + checksum verification ───────────────────────────────────────
+# Downloads <asset> + checksums.txt into $1 (work dir). Primary: gh; fallback: curl via the
+# releases API (public-only, honors $GH_TOKEN). Verifies the ONE matching checksum line.
+download_and_verify() {
+    local work="$1" asset tagarg
+    asset="$(resolve_asset)"
+    tagarg="${RELEASE_TAG:-latest}"
+    if [ "$DRY_RUN" = 1 ]; then
+        plan "download $asset + checksums.txt from $RELEASE_SOURCE @ $tagarg into $work; verify sha256"
+        return 0
+    fi
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        gh release download ${RELEASE_TAG:+"$RELEASE_TAG"} --repo "$RELEASE_SOURCE" \
+            --pattern "$asset" --pattern 'checksums.txt' --dir "$work" 2>/dev/null \
+            || die "gh release download failed for $RELEASE_SOURCE @ $tagarg ($asset): check the network and that the release and asset exist; a private source needs 'gh auth login' with access to it."
+    else
+        # curl fallback — resolves the asset URL from the releases API. Anonymous for a public
+        # source; honors $GH_TOKEN for a private one. curl_auth is EMPTY on the anonymous path, so
+        # it is always expanded as ${curl_auth[@]+"${curl_auth[@]}"}: bash before 4.4 (macOS
+        # /bin/bash is 3.2) treats a bare "${curl_auth[@]}" on an empty array as unbound under
+        # set -u, which killed the default one-liner here (#5069).
+        command -v curl >/dev/null 2>&1 || die "neither 'gh' (authenticated) nor 'curl' is available to download the binary"
+        command -v jq   >/dev/null 2>&1 || die "'jq' is required for the curl download fallback"
+        local api json url curl_auth=()
+        [ -n "${GH_TOKEN:-}" ] && curl_auth=(-H "Authorization: Bearer $GH_TOKEN")
+        if [ -n "$RELEASE_TAG" ]; then api="releases/tags/$RELEASE_TAG"; else api="releases/latest"; fi
+        json="$(curl -fsSL ${curl_auth[@]+"${curl_auth[@]}"} "https://api.github.com/repos/$RELEASE_SOURCE/$api" 2>/dev/null)" \
+            || die "could not reach the releases API for $RELEASE_SOURCE (network, GitHub rate limit, or a private source without 'gh' auth / \$GH_TOKEN)"
+        for want in "$asset" "checksums.txt"; do
+            url="$(printf '%s' "$json" | jq -r --arg n "$want" '.assets[]? | select(.name==$n) | .browser_download_url')"
+            [ -n "$url" ] && [ "$url" != "null" ] || die "release asset not found: $want (source $RELEASE_SOURCE @ $tagarg)"
+            curl -fsSL ${curl_auth[@]+"${curl_auth[@]}"} -o "$work/$want" "$url" || die "download failed: $want"
+        done
+    fi
+    [ -f "$work/$asset" ] || die "asset not downloaded: $asset"
+    [ -f "$work/checksums.txt" ] || die "checksums.txt not downloaded"
+    # Verify: extract the ONE matching line and pipe it to the platform checker. checksums.txt is
+    # `sha256sum *` over ALL assets, so never --ignore-missing (macOS shasum lacks it).
+    local line checker
+    line="$(grep -F "  $asset" "$work/checksums.txt" || true)"
+    [ -n "$line" ] || die "no checksum line for $asset in checksums.txt"
+    if [ "$(detect_os)" = darwin ]; then checker=(shasum -a 256 -c -); else checker=(sha256sum -c -); fi
+    ( cd "$work" && printf '%s\n' "$line" | "${checker[@]}" ) >/dev/null 2>&1 \
+        || die "checksum verification FAILED for $asset (truncated or tampered download)"
+    log "verified $asset against checksums.txt"
+}
+
+# Extracts the single `hapi` file from the downloaded tarball in $1 into $1/hapi.
+extract_binary() {
+    local work="$1" asset; asset="$(resolve_asset)"
+    if [ "$DRY_RUN" = 1 ]; then plan "extract hapi from $asset"; return 0; fi
+    tar -xzf "$work/$asset" -C "$work" || die "failed to extract $asset"
+    [ -f "$work/hapi" ] || die "extracted tarball did not contain 'hapi'"
+}
+
+# ── PATH management (idempotent, guarded, login + non-login) ───────────────────
+# Appends a guarded block exporting $PREFIX onto PATH to the rc/profile pair of the user's $SHELL.
+ensure_on_path() {
+    local shellname rcfiles=() f block
+    shellname="$(basename "${SHELL:-/bin/bash}")"
+    case "$shellname" in
+        zsh)  rcfiles=("$HOME/.zprofile" "$HOME/.zshrc") ;;
+        bash) rcfiles=("$HOME/.profile" "$HOME/.bashrc") ;;
+        *)    log "NOTE: unknown shell '$shellname' — add this to your shell startup file to put hapi on PATH:"
+              log "      export PATH=\"$PREFIX:\$PATH\""
+              rcfiles=("$HOME/.profile") ;;   # best-effort for POSIX login shells
+    esac
+    block=$(printf '%s\ncase ":$PATH:" in *":%s:"*) ;; *) export PATH="%s:$PATH" ;; esac\n%s' \
+        "$PATH_MARKER" "$PREFIX" "$PREFIX" "$PATH_MARKER_END")
+    for f in "${rcfiles[@]}"; do
+        if [ -f "$f" ] && grep -qF "$PATH_MARKER" "$f" 2>/dev/null; then
+            info "PATH block already present in $f (idempotent, no change)"
+            continue
+        fi
+        if [ "$DRY_RUN" = 1 ]; then plan "append PATH block for $PREFIX to $f"; continue; fi
+        printf '\n%s\n' "$block" >> "$f" || die "could not write PATH block to $f"
+        ok "added $PREFIX to PATH in $f"
+    done
+}
+
+# ── L0 install ────────────────────────────────────────────────────────────────
+install_binary() {
+    local work src dst newver
+    dst="$PREFIX/$BIN_NAME"
+    work="$(mktemp -d)"
+    download_and_verify "$work"
+    extract_binary "$work"
+    src="$work/hapi"
+    if [ "$DRY_RUN" = 1 ]; then
+        plan "install binary -> $dst (chmod +x)"
+        rm -rf "$work"; return 0
+    fi
+    mkdir -p "$PREFIX" || die "could not create prefix $PREFIX"
+    # Idempotency: skip replace when the installed binary is byte-identical.
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+        ok "binary already current at $dst (idempotent, no change)"
+    else
+        chmod +x "$src"
+        mv -f "$src" "$dst" || die "could not install binary to $dst"
+        ok "installed binary -> $dst"
+    fi
+    rm -rf "$work"
+    ensure_on_path
+    newver="$("$dst" --version 2>/dev/null | head -1 || echo unknown)"
+    info "binary version: $newver"
+}
+
+# ── L1 toolkit core tier ──────────────────────────────────────────────────────
+# Resolves the toolkit tree (clone from --toolkit-source, or use --toolkit-dir), then runs its
+# install.sh --minimal. The clone target is PERSISTENT so the deployed symlinks never dangle.
+install_toolkit() {
+    local tree
+    if [ -n "$TOOLKIT_DIR" ]; then
+        tree="$TOOLKIT_DIR"
+        [ -d "$tree" ] || die "--toolkit-dir does not exist: $tree"
+    else
+        [ -n "$TOOLKIT_SOURCE" ] || die "no toolkit source — pass --toolkit-source <git URL> --toolkit-tag <tag> (install mode defaults to $DEFAULT_TOOLKIT_SOURCE)"
+        tree="$HAPI_HOME_DIR/claude-toolkit"
+        if [ "$DRY_RUN" = 1 ]; then
+            plan "git clone --depth 1 -b $TOOLKIT_TAG $TOOLKIT_SOURCE $tree"
+        else
+            mkdir -p "$HAPI_HOME_DIR"
+            if [ -d "$tree/.git" ]; then
+                ( cd "$tree" && git fetch --depth 1 origin "$TOOLKIT_TAG" >/dev/null 2>&1 \
+                    && git checkout -q FETCH_HEAD ) || warn "could not update existing toolkit tree at $tree; using as-is"
+                ok "toolkit tree already present at $tree (idempotent fetch)"
+            else
+                git clone --depth 1 -b "$TOOLKIT_TAG" "$TOOLKIT_SOURCE" "$tree" \
+                    || die "toolkit clone failed: $TOOLKIT_SOURCE @ $TOOLKIT_TAG"
+                ok "cloned toolkit -> $tree"
+            fi
+        fi
+    fi
+    [ -f "$tree/install.sh" ] || { [ "$DRY_RUN" = 1 ] && plan "run $tree/install.sh --minimal" && return 0; die "toolkit tree has no install.sh: $tree"; }
+    if [ "$DRY_RUN" = 1 ]; then
+        plan "run $tree/install.sh --minimal (core tier symlink deploy into $TOOLKIT_TARGET)"
+        return 0
+    fi
+    ( cd "$tree" && ./install.sh --minimal ) || die "toolkit install.sh --minimal failed"
+    ok "toolkit core tier applied (install.sh --minimal) from $tree"
+    TOOLKIT_ROOT_RESOLVED="$tree"
+}
+
+# ── Installer manifest (doctor reads this; source-agnostic, survives the repo swap) ──
+write_manifest() {
+    [ "$DRY_RUN" = 1 ] && { plan "write installer manifest -> $MANIFEST_PATH"; return 0; }
+    command -v jq >/dev/null 2>&1 || { warn "jq absent — skipping installer manifest write"; return 0; }
+    mkdir -p "$HAPI_HOME_DIR"
+    local binver newman rs rt ts
+    binver="$("$PREFIX/$BIN_NAME" --version 2>/dev/null | head -1 || echo unknown)"
+    rs="$RELEASE_SOURCE"; rt="${RELEASE_TAG:-latest}"; ts="$TOOLKIT_SOURCE"
+    # --toolkit-dir: the caller manages the binary, so this run installed no release, and the toolkit
+    # came from the local tree, whatever --toolkit-source says (#5069).
+    if [ -n "$TOOLKIT_DIR" ]; then rs=""; rt=""; ts="$TOOLKIT_DIR"; fi
+    newman="$(jq -n \
+        --arg iv "$INSTALLER_VERSION" --arg bn "$BIN_NAME" --arg bv "$binver" \
+        --arg rs "$rs" --arg rt "$rt" \
+        --arg ts "$ts" --arg tt "$TOOLKIT_TAG" \
+        --arg tr "${TOOLKIT_ROOT_RESOLVED:-}" --arg px "$PREFIX" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{installer_version:$iv, binary_name:$bn, binary_version:$bv, release_source:$rs,
+          release_tag:$rt, toolkit_source:$ts, toolkit_tag:$tt, toolkit_root:$tr,
+          prefix:$px, installed_at:$at}')"
+    # Idempotency (R2): if an existing manifest matches modulo the timestamp, leave it untouched so a
+    # re-run makes no filesystem change.
+    if [ -f "$MANIFEST_PATH" ] \
+       && [ "$(jq -S 'del(.installed_at)' "$MANIFEST_PATH" 2>/dev/null)" = "$(printf '%s' "$newman" | jq -S 'del(.installed_at)' 2>/dev/null)" ]; then
+        ok "installer manifest unchanged ($MANIFEST_PATH)"
+        return 0
+    fi
+    printf '%s\n' "$newman" > "$MANIFEST_PATH" && ok "wrote installer manifest -> $MANIFEST_PATH"
+}
+
+# ── Doctor — the UNIFIED install-readiness list (published ONCE here, #3984) ──────
+# One line per check with an explicit state. Missing REQUIRED prerequisites exit non-zero and are
+# named. #3985 added its four lines (git identity, secrets file, git hooks, gh auth); #4417 added the
+# machine-spec line after them, last in the list. Keep this ADDITIVE.
+doctor_fatal=0
+dr_ok()   { printf '  [ OK ] %-24s : %s\n' "$1" "$2"; }
+dr_miss() { printf '  [MISS] %-24s : %s\n' "$1" "$2"; doctor_fatal=1; }
+dr_warn() { printf '  [WARN] %-24s : %s\n' "$1" "$2"; }
+dr_info() { printf '  [info] %-24s : %s\n' "$1" "$2"; }
+
+# ── machine spec (#4417, R6): CPUs / memory / disk vs the published minimum ──────────────────
+# The minimum is `machine_minimum` in scripts/lib/vm-tiers.json: the Standard VM shape, measured by
+# #4417's load test. This script runs standalone (curl | bash), so the values are copied here, and
+# scripts/test-install-hapimatic.sh fails if they drift from the JSON. Everything between the
+# MACHINE-SPEC markers is self-contained (it calls no other installer function), so the test suite
+# loads that block alone and feeds it fixture files. Bash 3.2-safe (macOS), and every read degrades to
+# "unknown" instead of failing: the doctor must still render with an empty PATH.
+# --- MACHINE-SPEC-BEGIN (#4417) ---
+MACHINE_MIN_CPUS=2
+MACHINE_MIN_MEMORY_GB=8
+MACHINE_MIN_DISK_GB=40
+
+# ms_os — linux | darwin | other, from bash's own $OSTYPE (no uname: PATH may be empty).
+ms_os() {
+    case "${OSTYPE:-}" in
+        linux*)  printf 'linux' ;;
+        darwin*) printf 'darwin' ;;
+        *)       printf 'other' ;;
+    esac
+}
+
+# ms_cg_files <cgroup-root> <proc-self-cgroup> <v2-file> <v1-controller> <v1-file>
+# Prints every readable limit file on this process's cgroup path, from its own cgroup up to the root,
+# because a limit set on an ancestor binds this process too. cgroup v2 uses the `0::<path>` line; v1 uses
+# the line whose controller list holds <v1-controller>, under <cgroup-root>/<controller-list>. Inside a
+# container the host-side path may not exist under the container's mount, and the walk still ends at
+# the mount root, which is where the container's own limit is.
+ms_cg_files() {
+    local root="$1" pcg="$2" v2f="$3" v1c="$4" v1f="$5" line rest ctrls rel base dir f
+    [ -r "$pcg" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        rest="${line#*:}"; ctrls="${rest%%:*}"; rel="${rest#*:}"
+        case "$line" in
+            0::*) base="$root"; f="$v2f" ;;
+            *)
+                case ",$ctrls," in
+                    *",$v1c,"*) base="$root/$ctrls"; f="$v1f" ;;
+                    *) continue ;;
+                esac
+                ;;
+        esac
+        rel="${rel%/}"; dir="$base$rel"
+        while :; do
+            [ -r "$dir/$f" ] && printf '%s\n' "$dir/$f"
+            [ "$dir" = "$base" ] && break
+            dir="${dir%/*}"
+            [ "${#dir}" -lt "${#base}" ] && dir="$base"
+        done
+    done < "$pcg"
+}
+
+# ms_cg_mem_kib <cgroup-root> <proc-self-cgroup> — the tightest cgroup memory limit in KiB
+# (`memory.max` on v2, `memory.limit_in_bytes` on v1), or nothing when no limit is set. v2
+# writes `max` for no limit; v1 writes a huge number instead (9223372036854771712, LLONG_MAX
+# rounded down to a page), so any value at or above 2^62 bytes is also no limit.
+ms_cg_mem_kib() {
+    local f v best=""
+    while IFS= read -r f; do
+        v=""; IFS= read -r v 2>/dev/null < "$f"
+        case "$v" in ''|max|*[!0-9]*) continue ;; esac
+        [ "$v" -ge 4611686018427387904 ] && continue
+        v=$(( v / 1024 ))
+        if [ -z "$best" ] || [ "$v" -lt "$best" ]; then best="$v"; fi
+    done < <(ms_cg_files "$1" "$2" memory.max memory memory.limit_in_bytes)
+    printf '%s' "$best"
+}
+
+# ms_cg_cpu_tenths <cgroup-root> <proc-self-cgroup> — the tightest CPU quota in tenths of a CPU,
+# rounded down (`cpu.max` on v2; `cpu.cfs_quota_us` / `cpu.cfs_period_us` on v1): 150000/100000
+# is 15. Nothing when no quota is set. Rounding down keeps the check exact: a quota meets a
+# whole-CPU minimum m with the 90% allowance exactly when its tenths reach 9m, i.e. when
+# quota * 10 >= m * period * 9, so the one-decimal value shown and the decision always agree
+# (#4754, PM ruling R-CPU).
+ms_cg_cpu_tenths() {
+    local f v q p best=""
+    while IFS= read -r f; do
+        v=""; q=""; p=""
+        IFS= read -r v 2>/dev/null < "$f"
+        case "$f" in
+            */cpu.max) q="${v%% *}"; p="${v#* }" ;;
+            *)         q="$v"; [ -r "${f%/*}/cpu.cfs_period_us" ] && IFS= read -r p 2>/dev/null < "${f%/*}/cpu.cfs_period_us" ;;
+        esac
+        case "$q" in ''|max|-*|*[!0-9]*) continue ;; esac
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        [ "$p" -gt 0 ] || continue
+        v=$(( q * 10 / p ))
+        if [ -z "$best" ] || [ "$v" -lt "$best" ]; then best="$v"; fi
+    done < <(ms_cg_files "$1" "$2" cpu.max cpu cpu.cfs_quota_us)
+    printf '%s' "$best"
+}
+
+# ms_meminfo_kib <meminfo> — MemTotal in KiB, or nothing.
+ms_meminfo_kib() {
+    local k v
+    [ -r "$1" ] || return 0
+    while read -r k v _; do
+        if [ "$k" = "MemTotal:" ]; then
+            case "$v" in ''|*[!0-9]*) ;; *) printf '%s' "$v" ;; esac
+            return 0
+        fi
+    done < "$1"
+}
+
+# ms_allowed_cpus <status> — how many CPUs the `Cpus_allowed_list` field of <status> (/proc/self/status)
+# names: the CPUs this process may run on after CPU affinity (taskset) and cpuset limits, which is what
+# nproc reads through sched_getaffinity. Nothing when the file or the field is missing or malformed. IFS is
+# local because this block is sourced into the installer's own shell.
+ms_allowed_cpus() {
+    local k v n=0 part a b IFS
+    [ -r "$1" ] || return 0
+    while IFS=$'\t ' read -r k v; do
+        [ "$k" = "Cpus_allowed_list:" ] || continue
+        IFS=,
+        for part in $v; do
+            case "$part" in
+                *-*)
+                    a="${part%-*}"; b="${part#*-}"
+                    case "$a" in ''|*[!0-9]*) return 0 ;; esac
+                    case "$b" in ''|*[!0-9]*) return 0 ;; esac
+                    n=$(( n + b - a + 1 ))
+                    ;;
+                ''|*[!0-9]*) return 0 ;;
+                *) n=$(( n + 1 )) ;;
+            esac
+        done
+        break
+    done < "$1"
+    [ "$n" -gt 0 ] && printf '%s' "$n"
+    return 0
+}
+
+# ms_online_cpus <cpuinfo> [<status>] — the CPUs this process may run on: nproc (honours CPU affinity),
+# else the `Cpus_allowed_list` of <status> (the same affinity and cpuset answer, #4754), else getconf,
+# else the processor lines of <cpuinfo>; nothing when none of them answers. getconf and <cpuinfo> are last
+# resorts that count every online CPU and ignore affinity. GNU nproc also caps its answer at
+# $OMP_NUM_THREADS / $OMP_THREAD_LIMIT (often 1 in ML containers), which says nothing about the machine,
+# so both are cleared for that one call.
+ms_online_cpus() {
+    local n="" line
+    n="$(OMP_NUM_THREADS='' OMP_THREAD_LIMIT='' nproc 2>/dev/null)" || n=""
+    case "$n" in ''|*[!0-9]*) n="$(ms_allowed_cpus "${2:-}")" ;; esac
+    case "$n" in ''|*[!0-9]*) n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" || n="" ;; esac
+    case "$n" in
+        ''|*[!0-9]*)
+            n=0
+            if [ -r "$1" ]; then
+                while IFS= read -r line; do
+                    case "$line" in processor*:*) n=$(( n + 1 )) ;; esac
+                done < "$1"
+            fi
+            [ "$n" -gt 0 ] || n=""
+            ;;
+    esac
+    printf '%s' "$n"
+}
+
+# ms_disk_kib <dir> — the total size of the filesystem holding <dir> in KiB (`df -Pk`), or nothing.
+# The size is trusted only when the 5th column is the capacity percentage: a filesystem name with a
+# space in it (a CIFS source such as `//nas/backup 2`) shifts every column, and that misread is
+# reported as unknown rather than as a wrong size (#4754).
+ms_disk_kib() {
+    local size="" cap=""
+    { read -r _; read -r _ size _ _ cap _; } < <(df -Pk "$1" 2>/dev/null) || true
+    case "$cap" in *%) ;; *) size="" ;; esac
+    case "$size" in ''|*[!0-9]*) ;; *) printf '%s' "$size" ;; esac
+}
+
+# machine_spec_probe <os> <cgroup-root> <proc-root> <disk-dir>
+# Sets MS_CPUS / MS_CPU_NOTE / MS_MEM_KIB / MS_MEM_NOTE / MS_DISK_KIB (empty = unknown). On Linux a
+# memory- or CPU-limited container sees the HOST in /proc/meminfo and nproc, so each value is the
+# smaller of the machine figure and the cgroup limit, and the note says when the limit won.
+machine_spec_probe() {
+    local os="$1" cgroot="$2" proc="$3" ddir="$4" lim sc v
+    MS_CPUS=""; MS_CPU_NOTE=""; MS_MEM_KIB=""; MS_MEM_NOTE=""; MS_DISK_KIB=""
+    case "$os" in
+        linux)
+            MS_MEM_KIB="$(ms_meminfo_kib "$proc/meminfo")"
+            lim="$(ms_cg_mem_kib "$cgroot" "$proc/self/cgroup")"
+            if [ -n "$lim" ] && { [ -z "$MS_MEM_KIB" ] || [ "$lim" -lt "$MS_MEM_KIB" ]; }; then
+                MS_MEM_KIB="$lim"; MS_MEM_NOTE="cgroup limit"
+            fi
+            MS_CPUS="$(ms_online_cpus "$proc/cpuinfo" "$proc/self/status")"
+            # The quota is in tenths and stays exact; when it is the tighter value it is shown
+            # with one decimal ("1.5"), so the line can tell a quota from a whole CPU count.
+            lim="$(ms_cg_cpu_tenths "$cgroot" "$proc/self/cgroup")"
+            if [ -n "$lim" ] && { [ -z "$MS_CPUS" ] || [ "$lim" -lt $(( MS_CPUS * 10 )) ]; }; then
+                MS_CPUS="$(( lim / 10 )).$(( lim % 10 ))"; MS_CPU_NOTE="CPU quota"
+            fi
+            ;;
+        darwin)
+            sc="$(command -v sysctl 2>/dev/null || printf '/usr/sbin/sysctl')"
+            v="$("$sc" -n hw.memsize 2>/dev/null)" || v=""
+            case "$v" in ''|*[!0-9]*) ;; *) MS_MEM_KIB=$(( v / 1024 )) ;; esac
+            v="$("$sc" -n hw.ncpu 2>/dev/null)" || v=""
+            case "$v" in ''|*[!0-9]*) ;; *) MS_CPUS="$v" ;; esac
+            ;;
+        *) return 0 ;;
+    esac
+    MS_DISK_KIB="$(ms_disk_kib "$ddir")"
+}
+
+# ms_fmt_gib <kib> — GiB with one decimal.
+ms_fmt_gib() {
+    local t=$(( ($1 * 10 + 524288) / 1048576 ))
+    printf '%d.%d' $(( t / 10 )) $(( t % 10 ))
+}
+
+# ms_meets <kib> <minimum-gb> — true when <kib> is at least 90% of the minimum. A machine reports less
+# than its nominal size (the kernel and firmware reserve memory; a filesystem keeps its own metadata):
+# the 8 GB Standard VM that defines the minimum reports MemTotal 7.73 GiB (#4417 phase 2 raw data).
+ms_meets() { [ $(( $1 * 10 )) -ge $(( $2 * 1048576 * 9 )) ]; }
+
+# ms_cpus_meet <cpus> <minimum> — <cpus> is a whole count ("4") or a quota with one decimal
+# ("1.5"); true when it is at least 90% of the minimum, the allowance memory and disk get
+# (#4754, PM ruling R-CPU): a 1.8-CPU quota meets a 2-CPU minimum, 1.5 does not. For a whole
+# count this equals ">= minimum" whenever the minimum is below 10 (the drift check pins it at 2).
+ms_cpus_meet() {
+    local t
+    case "$1" in
+        *.*) t=$(( ${1%.*} * 10 + ${1#*.} )) ;;
+        *)   t=$(( $1 * 10 )) ;;
+    esac
+    [ "$t" -ge $(( $2 * 9 )) ]
+}
+
+# machine_spec_line <cpus> <cpu-note> <mem-kib> <mem-note> <disk-kib>
+# Prints "<state><TAB><text>"; state is ok | warn | na (#3984's vocabulary: ok | WARN below minimum
+# (non-fatal) | n/a). Any value below the minimum warns; otherwise an unreadable value makes it n/a.
+machine_spec_line() {
+    local cpus="$1" cpun="$2" mem="$3" memn="$4" disk="$5" s low="" fine="" unknown="" minimum
+    minimum="the minimum is ${MACHINE_MIN_CPUS} CPUs, ${MACHINE_MIN_MEMORY_GB} GB memory, ${MACHINE_MIN_DISK_GB} GB disk"
+    if [ -n "$cpus" ]; then
+        s="$cpus CPU"; [ "$cpus" = 1 ] || s="${s}s"; s="$s${cpun:+ ($cpun)}"
+        if ms_cpus_meet "$cpus" "$MACHINE_MIN_CPUS"; then fine="${fine:+$fine, }$s"; else low="${low:+$low, }$s"; fi
+    else
+        unknown="${unknown:+$unknown, }CPUs"
+    fi
+    if [ -n "$mem" ]; then
+        s="$(ms_fmt_gib "$mem") GiB memory${memn:+ ($memn)}"
+        if ms_meets "$mem" "$MACHINE_MIN_MEMORY_GB"; then fine="${fine:+$fine, }$s"; else low="${low:+$low, }$s"; fi
+    else
+        unknown="${unknown:+$unknown, }memory"
+    fi
+    if [ -n "$disk" ]; then
+        s="$(ms_fmt_gib "$disk") GiB disk"
+        if ms_meets "$disk" "$MACHINE_MIN_DISK_GB"; then fine="${fine:+$fine, }$s"; else low="${low:+$low, }$s"; fi
+    else
+        unknown="${unknown:+$unknown, }disk"
+    fi
+    if [ -n "$low" ]; then
+        printf 'warn\tbelow minimum (non-fatal) — %s; %s. Hapimatic still installs and runs, but fewer sessions run reliably' "$low" "$minimum"
+    elif [ -n "$unknown" ]; then
+        printf 'na\tn/a — could not read %s%s; %s' "$unknown" "${fine:+ ($fine meet it)}" "$minimum"
+    else
+        printf 'ok\t%s; %s' "$fine" "$minimum"
+    fi
+}
+# --- MACHINE-SPEC-END (#4417) ---
+
+cmd_doctor() {
+    local dst="$PREFIX/$BIN_NAME" v
+    log "hapi install doctor (install-hapimatic v$INSTALLER_VERSION)"
+
+    # binary version (#3984)
+    if [ -x "$dst" ] && v="$("$dst" --version 2>/dev/null | head -1)"; then
+        dr_ok "binary version" "$v ($dst)"
+    elif command -v "$BIN_NAME" >/dev/null 2>&1; then
+        local p; p="$(command -v "$BIN_NAME")"
+        if [ -f "$p" ] && [ ! -L "$p" ] && v="$("$p" --version 2>/dev/null | head -1)"; then
+            dr_ok "binary version" "$v ($p)"
+        else
+            dr_warn "binary version" "'$BIN_NAME' on PATH is not an installer-owned file at $dst"
+        fi
+    else
+        dr_miss "binary version" "'$BIN_NAME' not installed at $dst (run the installer)"
+    fi
+
+    # toolkit core tier present + tag (#3984) — source-agnostic: prefer the ACTUAL deployed toolkit's
+    # identity (git tag of the tree, then its VERSION file — survives the eventual repo swap), and only
+    # fall back to the tag the installer recorded at install time.
+    local tk_manifest="$TOOLKIT_TARGET/.toolkit-state/manifest.json" tag="" troot=""
+    if [ -f "$tk_manifest" ]; then
+        command -v jq >/dev/null 2>&1 && troot="$(jq -r '.toolkit_root // empty' "$tk_manifest" 2>/dev/null)"
+        if [ -n "$troot" ] && [ -d "$troot/.git" ]; then tag="$(git -C "$troot" describe --tags --always 2>/dev/null || true)"; fi
+        [ -z "$tag" ] && [ -n "$troot" ] && [ -f "$troot/VERSION" ] && tag="$(head -1 "$troot/VERSION" 2>/dev/null)"
+        if [ -z "$tag" ] && command -v jq >/dev/null 2>&1 && [ -f "$MANIFEST_PATH" ]; then
+            tag="$(jq -r '.toolkit_tag // empty' "$MANIFEST_PATH" 2>/dev/null)"
+        fi
+        dr_ok "toolkit core tier" "present, tag ${tag:-unknown} ($tk_manifest)"
+    else
+        dr_warn "toolkit core tier" "not applied yet (no $tk_manifest) — the install step applies it; if it is still missing after an install, re-run the installer"
+    fi
+
+    # ── git identity, secrets file, git hooks (#3985; gh auth is the 4th, below) — all NON-FATAL ──
+    # These four are readiness conventions for the issue workflow, NOT install prerequisites: a fresh
+    # machine spawns sessions without any of them, so each is reported with a fix and never sets
+    # doctor_fatal (that stays reserved for the REQUIRED prereqs below — #3984's semantic, extended).
+
+    # Read git's config ONCE before the identity and hooks lines. A SYNTAX error in a system, global or
+    # repo config makes `git config --list` exit 128 ("fatal: bad config line N in file …"), and every
+    # per-key read below with it, which would otherwise surface as a false "unset". It exits 0 with no
+    # config at all. A warning it prints while still succeeding is kept too, and since git SILENTLY
+    # ignores an unreadable ~/.gitconfig (EACCES is tolerated by design) the doctor checks that itself.
+    # Value-level errors (a bad core boolean, an unknown repository extension) pass this probe; the hooks
+    # line names those from `git rev-parse` below.
+    local gcfg_err="" gcfg_warn="" gcfg_out
+    if ! command -v git >/dev/null 2>&1; then
+        gcfg_err="git not installed (see the git prerequisite below)"
+    elif gcfg_out="$(git config --list 2>&1 >/dev/null)"; then
+        gcfg_warn="${gcfg_out%%$'\n'*}"
+        if [ -z "$gcfg_warn" ] && [ -e "$HOME/.gitconfig" ] && [ ! -r "$HOME/.gitconfig" ]; then
+            gcfg_warn="$HOME/.gitconfig is not readable, so git silently ignores it"
+        fi
+    else
+        gcfg_err="git config --list failed: ${gcfg_out%%$'\n'*} — git commands fail until this is fixed"
+    fi
+
+    # git identity (G1/R1) — read from `git config` at ANY scope, printed with --show-origin so an
+    # inherited identity is visible; NEVER source ~/.config/hapimatic/env (that is the #1004 Anthropic
+    # credential store, not an identity source).
+    local gi_name gi_email gi_origin
+    if [ -n "$gcfg_err" ]; then
+        dr_warn "git identity" "unknown — $gcfg_err"
+    else
+        gi_name="$(git config --get user.name 2>/dev/null || true)"
+        gi_email="$(git config --get user.email 2>/dev/null || true)"
+        if [ -n "$gi_name" ] && [ -n "$gi_email" ]; then
+            gi_origin="$(git config --show-origin --get user.email 2>/dev/null | cut -f1 || true)"
+            dr_ok "git identity" "$gi_name <$gi_email>${gi_origin:+ (${gi_origin})}"
+        elif [ -n "$gcfg_warn" ]; then
+            dr_warn "git identity" "unset, and git warned: $gcfg_warn — fix that first, then: git config --global user.name \"Your Name\" && git config --global user.email \"you@example.com\""
+        else
+            dr_warn "git identity" "unset — fix: git config --global user.name \"Your Name\" && git config --global user.email \"you@example.com\" (nothing commits as an unknown identity)"
+        fi
+    fi
+
+    # secrets file (G4/R2) — TIERED per ER D3 (D-3985-1 (b)). Consumers that use the one rp1-home
+    # resolver (~/.claude/scripts/lib/resolve-hapimatic-secrets-v1.sh, rp1-home#2607) source the FIRST
+    # readable file of $HAPIMATIC_SECRETS_FILE → ~/.config/hapimatic/secrets.env →
+    # ~/.bashrc.d/99-api-secrets.sh, warning on a candidate that exists but cannot be used. This
+    # installer only reports the state. Tiers:
+    #   * no consumer installed (the free tier): informational — `n/a on the free tier`, or the file found;
+    #   * the resolver installed: a missing file is a WARN naming every candidate, an earlier candidate
+    #     that exists but is unusable is a WARN (consumers skip it), and a present file is OK;
+    #   * a consumer installed WITHOUT the resolver (notify-pm.sh / check-pm-inbox.sh from before
+    #     rp1-home#2607) reads only ~/.bashrc.d/99-api-secrets.sh, so only that file counts;
+    #   * an explicit $HAPIMATIC_SECRETS_FILE that is not a readable file is always a WARN, because the
+    #     resolver falls through to the defaults and the typo would otherwise go unnoticed.
+    # The planned P-B plugin (rp1-home#2214) keeps notify-pm.sh / check-pm-inbox.sh in core, so these
+    # checks cover it once it lands. Never [MISS]: the four convention lines stay non-fatal (PM ruling (a)).
+    local sec_resolver="$HOME/.claude/scripts/lib/resolve-hapimatic-secrets-v1.sh"
+    local sec_legacy_file="$HOME/.bashrc.d/99-api-secrets.sh"
+    local sec_found="" sec_unusable="" sec_consumer="" sec_legacy="" sf
+    local sec_tried="\$HAPIMATIC_SECRETS_FILE${HAPIMATIC_SECRETS_FILE:+=$HAPIMATIC_SECRETS_FILE}, ~/.config/hapimatic/secrets.env, ~/.bashrc.d/99-api-secrets.sh"
+    if [ -f "$sec_resolver" ]; then
+        sec_consumer="$sec_resolver"
+    else
+        for sf in "$HOME/.claude/scripts/notify-pm.sh" "$HOME/.claude/scripts/check-pm-inbox.sh"; do
+            [ -f "$sf" ] && { sec_legacy="$sf"; break; }
+        done
+    fi
+    for sf in "${HAPIMATIC_SECRETS_FILE:-}" "$HOME/.config/hapimatic/secrets.env" "$sec_legacy_file"; do
+        [ -n "$sf" ] || continue
+        if [ -f "$sf" ] && [ -r "$sf" ]; then sec_found="$sf"; break; fi
+        { [ -e "$sf" ] || [ -L "$sf" ]; } && [ -z "$sec_unusable" ] && sec_unusable="$sf"
+    done
+    if [ -n "${HAPIMATIC_SECRETS_FILE:-}" ] && [ "$sec_found" != "$HAPIMATIC_SECRETS_FILE" ]; then
+        dr_warn "secrets file" "\$HAPIMATIC_SECRETS_FILE=$HAPIMATIC_SECRETS_FILE is not a readable file — consumers fall through to ${sec_found:-nothing (no candidate exists)}; fix: correct the path or unset it"
+    elif [ -n "$sec_legacy" ]; then
+        if [ -f "$sec_legacy_file" ] && [ -r "$sec_legacy_file" ]; then
+            dr_ok "secrets file" "present (~/.bashrc.d/99-api-secrets.sh) — read by $sec_legacy, which predates the shared resolver"
+        else
+            dr_warn "secrets file" "missing — $sec_legacy predates the shared resolver (rp1-home#2607) and reads only ~/.bashrc.d/99-api-secrets.sh; fix: create that file, or update the rp1-home tier to get the resolver"
+        fi
+    elif [ -n "$sec_consumer" ] && [ -n "$sec_unusable" ]; then
+        dr_warn "secrets file" "$sec_unusable exists but is not a readable file — consumers skip it and load ${sec_found:-nothing}; fix: make it a readable file, or remove it"
+    elif [ -n "$sec_found" ] && [ -n "$sec_consumer" ]; then
+        dr_ok "secrets file" "present ($sec_found)"
+    elif [ -n "$sec_found" ]; then
+        dr_info "secrets file" "present ($sec_found) — no consumer installed yet"
+    elif [ -n "$sec_consumer" ]; then
+        dr_warn "secrets file" "missing — a consumer is installed ($sec_consumer) but no candidate is a readable file (tried: $sec_tried); fix: create ~/.config/hapimatic/secrets.env"
+    else
+        dr_info "secrets file" "n/a on the free tier (no consumer installed; the escalation/issue-workflow plugins read \$HAPIMATIC_SECRETS_FILE, ~/.config/hapimatic/secrets.env or ~/.bashrc.d/99-api-secrets.sh)"
+    fi
+
+    # git hooks (G6/R3) — the EFFECTIVE core.hooksPath must resolve to an existing dir. `git config
+    # --get` prints the stored value literally (e.g. ~/.githooks), so tilde-expand it here; git itself
+    # expands it at hook-run time. A value that resolves to a missing dir silently disables all hooks.
+    local hp_line hp hp_origin hp_expanded hp_global hp_top hooks_dir rp_out
+    if [ -n "$gcfg_err" ]; then
+        dr_warn "git hooks" "unknown — $gcfg_err"
+    elif hp_line="$(git config --show-origin --get core.hooksPath 2>/dev/null)" && [ -n "$hp_line" ]; then
+        hp_origin="${hp_line%%$'\t'*}"
+        hp="${hp_line#*$'\t'}"
+        if [ -z "$hp" ]; then
+            # An empty value is not "the default": git runs no hooks at all with it.
+            dr_warn "git hooks" "core.hooksPath is set but empty — git runs no hooks; fix: git config --unset core.hooksPath, or point it at a hooks dir (${hp_origin})"
+        else
+            # Expand `~` / `~/…` by prefix-strip, not `${hp/#\~/$HOME}`: bash 5.2's patsub_replacement
+            # turns an `&` in $HOME into the matched `~`, and quoting the replacement is not portable to
+            # bash 3.2.
+            case "$hp" in
+                "~")   hp_expanded="$HOME" ;;
+                "~/"*) hp_expanded="$HOME/${hp#\~/}" ;;
+                *)     hp_expanded="$hp" ;;
+            esac
+            # git runs hooks from the work-tree root, so a relative value resolves against the top level,
+            # not $PWD. Outside a work tree a relative value cannot be resolved (it depends on the
+            # repository), and git's `~user/` form is left unexpanded; both are reported as not checked.
+            case "$hp_expanded" in
+                /*) : ;;
+                "~"*) hp_expanded="" ;;
+                *)
+                    if hp_top="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -n "$hp_top" ]; then
+                        hp_expanded="$hp_top/$hp_expanded"
+                    else
+                        hp_expanded=""
+                    fi
+                    ;;
+            esac
+            if [ -z "$hp_expanded" ]; then
+                dr_info "git hooks" "core.hooksPath=$hp not checked here — a relative value resolves per repository (run the doctor inside one) and git's ~user/ form is not expanded by the doctor (${hp_origin})"
+            elif [ -d "$hp_expanded" ]; then
+                dr_ok "git hooks" "core.hooksPath=$hp → $hp_expanded (${hp_origin})"
+            else
+                dr_warn "git hooks" "core.hooksPath=$hp resolves to a missing dir ($hp_expanded) — hooks silently disabled; fix: point core.hooksPath at an existing dir or unset it (${hp_origin})"
+            fi
+        fi
+        # When the value is repo-local it shadows the global dispatcher — surface the shadowed global.
+        case "$hp_origin" in
+            *".git/config")
+                hp_global="$(git config --global --get core.hooksPath 2>/dev/null || true)"
+                [ -n "$hp_global" ] && dr_info "git hooks" "repo-local value shadows global core.hooksPath=$hp_global"
+                ;;
+        esac
+    elif rp_out="$(git rev-parse --is-inside-work-tree 2>&1)"; then
+        # --git-path hooks resolves to the dir git actually consults for hooks (the shared common dir,
+        # even from a linked worktree), not the per-worktree gitdir.
+        hooks_dir="$(git rev-parse --git-path hooks 2>/dev/null || echo .git/hooks)"
+        if [ -f "$hooks_dir/pre-commit" ] && [ -x "$hooks_dir/pre-commit" ]; then
+            dr_ok "git hooks" "no core.hooksPath override; $hooks_dir/pre-commit present"
+        elif [ -f "$hooks_dir/pre-commit" ]; then
+            # git skips a hook that is not executable (it only prints a hint), so the gate is off.
+            dr_warn "git hooks" "$hooks_dir/pre-commit is not executable — git skips it, so the repo's pre-commit gates do not run; fix: chmod +x $hooks_dir/pre-commit"
+        else
+            dr_warn "git hooks" "no core.hooksPath and $hooks_dir/pre-commit absent — repo pre-commit gates not wired (run the repo's hook installer)"
+        fi
+    else
+        case "$rp_out" in
+            *"not a git repository"*) dr_info "git hooks" "n/a (not inside a git repo)" ;;
+            *) dr_warn "git hooks" "unknown — git rev-parse failed: ${rp_out%%$'\n'*} (git refuses to run here)" ;;
+        esac
+    fi
+
+    # uv + pytest (G3; #3984) — informational test tooling, non-fatal. READ-ONLY probes only:
+    # `uv run`/`uv tool list` materialize state under $HOME, so use find_spec (locates, never imports).
+    if command -v uv >/dev/null 2>&1; then
+        local uvv; uvv="$(uv --version 2>/dev/null | head -1)"
+        if command -v pytest >/dev/null 2>&1 \
+           || python3 -c 'import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("pytest") else 1)' >/dev/null 2>&1; then
+            dr_ok "uv + pytest" "$uvv (pytest available)"
+        else
+            dr_warn "uv + pytest" "$uvv present; pytest not found (needed only for the hook test suite)"
+        fi
+    else
+        dr_warn "uv + pytest" "uv not found (needed only for the hook test suite — https://astral.sh/uv)"
+    fi
+
+    # ── gh auth (#3985, G7/R4) — NON-FATAL; the issue workflow only. The free tier runs sessions with
+    # `gh` absent or unauthenticated; only the issue-workflow features need it. ──
+    if command -v gh >/dev/null 2>&1; then
+        if gh auth status >/dev/null 2>&1; then
+            dr_ok "gh auth" "authenticated ($(command -v gh))"
+        else
+            dr_warn "gh auth" "not authenticated — needed for the issue workflow only (run: gh auth login)"
+        fi
+    else
+        dr_warn "gh auth" "'gh' not installed — needed for the issue workflow only (install GitHub CLI, then: gh auth login)"
+    fi
+
+    # prerequisites (#3984): git, python3, jq, claude are REQUIRED; a downloader (gh|curl) is REQUIRED
+    local pre
+    for pre in git python3 jq claude; do
+        if command -v "$pre" >/dev/null 2>&1; then
+            dr_ok "prereq: $pre" "$(command -v "$pre")"
+        else
+            case "$pre" in
+                claude) dr_miss "prereq: $pre" "agent CLI 'claude' not found — needed to spawn Claude Code sessions" ;;
+                *)      dr_miss "prereq: $pre" "'$pre' not found — install it" ;;
+            esac
+        fi
+    done
+    if command -v gh >/dev/null 2>&1 || command -v curl >/dev/null 2>&1; then
+        dr_ok "prereq: downloader" "$(command -v gh 2>/dev/null || command -v curl)"
+    else
+        dr_miss "prereq: downloader" "neither 'gh' nor 'curl' found — needed to fetch the binary"
+    fi
+    # tmux (informational: needed for the tmux launcher and for tmux session persistence; the default launcher is sdk)
+    if command -v tmux >/dev/null 2>&1; then dr_ok "tmux" "$(command -v tmux) (tmux launcher, tmux session persistence)"
+    else dr_warn "tmux" "not found — needed for the tmux launcher and for tmux session persistence (HAPI_TMUX_PERSISTENCE)"; fi
+
+    # build-only / maintainer-only (informational, never fatal)
+    if command -v bun >/dev/null 2>&1; then dr_info "bun" "$(command -v bun) — BUILD-only (the binary embeds its runtime)"
+    else dr_info "bun" "absent — BUILD-only, not required at runtime"; fi
+    dr_info "gitleaks" "maintainer-only, not an install prerequisite"
+
+    # auth mode per harness (#3984; report only — never read or print values)
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        dr_info "auth mode (Claude)" "API key present (ANTHROPIC_API_KEY set) — Claude Code bills it ahead of a subscription in any process that inherits it; run sessions on a key from Settings → Keys instead (workspace-scoped, sdk launcher only)"
+    elif [ -f "$HOME/.claude/.credentials.json" ] || [ -f "$HAPI_HOME_DIR/credentials.json" ]; then
+        dr_info "auth mode (Claude)" "subscription (OAuth credentials present) → sdk launcher by default; pty/tmux also run on a subscription"
+    else
+        dr_warn "auth mode (Claude)" "no Claude auth detected — run 'claude' once to sign in, or add a workspace-scoped API key in Settings → Keys (a key stored there is not detected by this check)"
+    fi
+    if [ -n "${GEMINI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then
+        dr_info "auth mode (Gemini)" "API key present (API-key only per policy)"
+    fi
+
+    # ── machine spec (#4417, R6) — CPUs / memory / disk vs the published minimum, after #3985's four
+    # lines. NON-FATAL, the same class as tmux / gh auth: it never sets doctor_fatal. cmd_install runs
+    # this doctor as its preflight, so an under-spec machine is warned BEFORE the install (#4417 D2).
+    local ms_out
+    machine_spec_probe "$(ms_os)" /sys/fs/cgroup /proc "$HOME"
+    ms_out="$(machine_spec_line "$MS_CPUS" "$MS_CPU_NOTE" "$MS_MEM_KIB" "$MS_MEM_NOTE" "$MS_DISK_KIB")"
+    case "${ms_out%%$'\t'*}" in
+        ok)   dr_ok   "machine spec" "${ms_out#*$'\t'}" ;;
+        warn) dr_warn "machine spec" "${ms_out#*$'\t'}" ;;
+        *)    dr_info "machine spec" "${ms_out#*$'\t'}" ;;
+    esac
+
+    if [ "$doctor_fatal" = 1 ]; then
+        log ""
+        log "doctor: one or more REQUIRED prerequisites are missing (see [MISS] lines above)."
+        return 1
+    fi
+    log ""
+    log "doctor: all required checks passed."
+    return 0
+}
+
+# ── uninstall ─────────────────────────────────────────────────────────────────
+cmd_uninstall() {
+    local dst="$PREFIX/$BIN_NAME" f
+    if [ "$DRY_RUN" = 1 ]; then
+        plan "remove $dst"
+        plan "remove the install-hapimatic PATH block from shell rc/profile files"
+        plan "remove $HAPI_HOME_DIR/runtime/ and $MANIFEST_PATH"
+        plan "run the toolkit uninstall.sh (L1) if present"
+        [ "$PURGE" = 1 ] && plan "PURGE: remove $HAPI_HOME_DIR (token + DB)"
+        return 0
+    fi
+    [ -f "$dst" ] && { rm -f "$dst" && ok "removed $dst"; } || info "no binary at $dst"
+    # Strip the guarded PATH block from any rc/profile file that carries the marker.
+    for f in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zprofile" "$HOME/.zshrc"; do
+        [ -f "$f" ] && grep -qF "$PATH_MARKER" "$f" 2>/dev/null || continue
+        local tmp; tmp="$(mktemp)"
+        sed "/$(printf '%s' "$PATH_MARKER" | sed 's/[.[\*^$/]/\\&/g')/,/$(printf '%s' "$PATH_MARKER_END" | sed 's/[.[\*^$/]/\\&/g')/d" "$f" > "$tmp" && mv "$tmp" "$f" \
+            && ok "removed PATH block from $f"
+    done
+    [ -d "$HAPI_HOME_DIR/runtime" ] && { rm -rf "$HAPI_HOME_DIR/runtime" && ok "removed $HAPI_HOME_DIR/runtime"; }
+    [ -f "$MANIFEST_PATH" ] && { rm -f "$MANIFEST_PATH" && ok "removed $MANIFEST_PATH"; }
+    # L1: run the toolkit's own uninstall if we can find its tree.
+    local troot="$HAPI_HOME_DIR/claude-toolkit"
+    if command -v jq >/dev/null 2>&1 && [ -f "$TOOLKIT_TARGET/.toolkit-state/manifest.json" ]; then
+        troot="$(jq -r '.toolkit_root // empty' "$TOOLKIT_TARGET/.toolkit-state/manifest.json" 2>/dev/null)"
+    fi
+    if [ -n "$troot" ] && [ -x "$troot/uninstall.sh" ]; then
+        ( cd "$troot" && ./uninstall.sh ) && ok "ran toolkit uninstall.sh (L1)" || warn "toolkit uninstall.sh failed"
+    else
+        info "no toolkit uninstall.sh found (L1 not removed)"
+    fi
+    if [ "$PURGE" = 1 ]; then
+        warn "PURGE: removing $HAPI_HOME_DIR (contains the auth token + session DB)"
+        rm -rf "$HAPI_HOME_DIR" && ok "removed $HAPI_HOME_DIR"
+    else
+        info "left $HAPI_HOME_DIR in place (use --purge to remove the token + DB)"
+    fi
+}
+
+# ── fetch (RP1-side shared fetch/verify path consumed by provision.sh) ─────────
+cmd_fetch() {
+    [ -n "$OUT_DIR" ] || die "fetch requires --out <dir>"
+    if [ "$DRY_RUN" = 1 ]; then
+        plan "fetch binary ($(resolve_asset)) from $RELEASE_SOURCE into $OUT_DIR"
+        [ -n "$TOOLKIT_SOURCE" ] && plan "clone toolkit $TOOLKIT_SOURCE @ $TOOLKIT_TAG into $OUT_DIR/claude-toolkit"
+        return 0
+    fi
+    mkdir -p "$OUT_DIR" || die "could not create --out dir $OUT_DIR"
+    download_and_verify "$OUT_DIR"
+    extract_binary "$OUT_DIR"
+    ok "fetched + verified binary -> $OUT_DIR/hapi"
+    if [ -n "$TOOLKIT_SOURCE" ]; then
+        local tdir="$OUT_DIR/claude-toolkit"
+        rm -rf "$tdir"
+        git clone --depth 1 -b "$TOOLKIT_TAG" "$TOOLKIT_SOURCE" "$tdir" \
+            || die "toolkit clone failed: $TOOLKIT_SOURCE @ $TOOLKIT_TAG"
+        ok "cloned toolkit -> $tdir"
+    fi
+}
+
+# ── install (default full path; --toolkit-dir = offline L1-only apply) ─────────
+cmd_install() {
+    TOOLKIT_ROOT_RESOLVED=""
+    if [ -n "$TOOLKIT_DIR" ]; then
+        # Offline L1-only apply (the host-side path provision.sh runs on a VM). No L0, no PATH,
+        # no network — the binary is managed separately (#1004 boundary).
+        log "install-hapimatic v$INSTALLER_VERSION — offline L1 apply from $TOOLKIT_DIR (binary: $BIN_NAME, managed externally)"
+        install_toolkit
+        write_manifest
+        log ""
+        log "L1 core tier applied. (L0 binary '$BIN_NAME' is managed by the caller in --toolkit-dir mode.)"
+        return 0
+    fi
+    # The public toolkit is the default for the full install only (#5069): fetch mode (provision.sh)
+    # clones a toolkit only when --toolkit-source is passed, and --toolkit-dir returned above.
+    TOOLKIT_SOURCE="${TOOLKIT_SOURCE:-$DEFAULT_TOOLKIT_SOURCE}"
+    log "install-hapimatic v$INSTALLER_VERSION — installing the free tier (L0 binary + L1 core tier)"
+    # Preflight reuses the doctor (R3). Skip it in --dry-run so the "writes nothing" guarantee never
+    # depends on a probe's read-only-ness; run `doctor` separately to preview prerequisites.
+    if [ "$DRY_RUN" = 1 ]; then
+        log "preflight: skipped in --dry-run (run '$0 doctor' to preview prerequisites)"
+    else
+        log "preflight:"
+        cmd_doctor || true   # advisory here (we install anyway); missing items are surfaced
+    fi
+    log ""
+    log "L0 binary:"; install_binary
+    log "L1 toolkit core tier:"; install_toolkit
+    write_manifest
+    log ""
+    log "install complete. Verify with: $0 doctor"
+    log "  'hapi' is on PATH after you open a new shell (or: export PATH=\"$PREFIX:\$PATH\")."
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+# First positional (if it is a known subcommand) selects the mode.
+case "${1:-}" in
+    install|fetch|doctor|uninstall) MODE="$1"; shift ;;
+    -h|--help) usage; exit 0 ;;
+esac
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --release-source) RELEASE_SOURCE="$2"; shift 2 ;;
+        --release-tag)    RELEASE_TAG="$2"; shift 2 ;;
+        --asset)          ASSET_OVERRIDE="$2"; shift 2 ;;
+        --toolkit-source) TOOLKIT_SOURCE="$2"; shift 2 ;;
+        --toolkit-tag)    TOOLKIT_TAG="$2"; shift 2 ;;
+        --toolkit-dir)    TOOLKIT_DIR="$2"; shift 2 ;;
+        --name)           BIN_NAME="$2"; shift 2 ;;
+        --prefix)         PREFIX="$2"; shift 2 ;;
+        --out)            OUT_DIR="$2"; shift 2 ;;
+        --purge)          PURGE=1; shift ;;
+        --dry-run)        DRY_RUN=1; shift ;;
+        -h|--help)        usage; exit 0 ;;
+        *) die "unknown argument: $1 (see --help)" ;;
+    esac
+done
+
+# Recompute derived paths in case --prefix changed HAPI_HOME inputs (HAPI_HOME env still wins).
+MANIFEST_PATH="$HAPI_HOME_DIR/install-hapimatic.json"
+
+case "$MODE" in
+    install)   cmd_install ;;
+    fetch)     cmd_fetch ;;
+    doctor)    cmd_doctor ;;
+    uninstall) cmd_uninstall ;;
+    *) die "unknown mode: $MODE" ;;
+esac
