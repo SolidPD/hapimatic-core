@@ -38,7 +38,7 @@ import { runForceRefreshHarness } from "@/accounts/forceRefreshHarness";
 import { probeAccessToken } from "@/accounts/isolatedSnapshotRecovery";
 import { logger } from "@/ui/logger";
 import { authAndSetupMachineIfNeeded } from "@/ui/auth";
-import packageJson from "../../package.json";
+import { CLI_VERSION } from "@/version";
 import { getEnvironmentInfo } from "@/ui/doctor";
 import {
   writeDaemonState,
@@ -59,8 +59,7 @@ import {} from "@/utils/processTree";
 import {
   cleanupDaemonState,
   getInstalledCliMtimeMs,
-  isDaemonRunningCurrentlyInstalledHappyVersion,
-  stopDaemon,
+  readDaemonBuildSkew,
 } from "./controlClient";
 import { startDaemonControlServer } from "./controlServer";
 import {
@@ -285,27 +284,29 @@ export async function startDaemon(
   logger.debug("[DAEMON RUN] Starting daemon process...");
   logger.debugLargeJson("[DAEMON RUN] Environment", getEnvironmentInfo());
 
-  // Check if already running
-  // Check if running daemon version matches current CLI version
-  const runningDaemonVersionMatches =
-    await isDaemonRunningCurrentlyInstalledHappyVersion();
-  if (!runningDaemonVersionMatches) {
+  // Issue #4594 (D-4594-1 A): a live daemon for this HAPI_HOME is never stopped or
+  // replaced here, whatever build it runs. With a real build version the old
+  // "versions differ → stopDaemon()" branch would fire for every session an old
+  // daemon spawns after a binary swap: it would stop the systemd daemon and start
+  // a detached one outside the unit, whose start-sync then exits here until
+  // systemd gives up (start-limit-hit). The difference is reported; the deploy
+  // flows restart the daemon's unit, and that is the only upgrade path.
+  const existingDaemon = await readDaemonBuildSkew();
+  if (existingDaemon.running) {
     logger.debug(
-      "[DAEMON RUN] Daemon version mismatch detected, restarting daemon with current CLI version"
+      `[DAEMON RUN] Daemon already running (pid ${existingDaemon.pid}, build ${existingDaemon.daemonVersion}), keeping it`
     );
-    await stopDaemon();
-  } else {
-    logger.debug(
-      "[DAEMON RUN] Daemon version matches, keeping existing daemon"
-    );
-    console.log("Daemon already running with matching version");
+    console.log("Daemon already running");
+    if (existingDaemon.skew) {
+      logger.info(`Build skew: ${existingDaemon.skew}`);
+    }
     process.exit(0);
   }
 
   // Validate systemd unit invariants required for tmux session survival
   // (hapimatic-private#418, hapimatic-private#1132). Default behavior is
   // log-only; set HAPI_DAEMON_ENFORCE_SYSTEMD_INVARIANTS=1 to escalate
-  // to refusal-to-start. Placed AFTER the version-mismatch check (so we
+  // to refusal-to-start. Placed AFTER the already-running check (so we
   // don't fire on the legitimate exit(0) "already running" fast path) and
   // BEFORE acquireDaemonLock (so a refusal-to-start doesn't orphan the
   // lock file).
@@ -516,7 +517,7 @@ export async function startDaemon(
       // DaemonState below — see initialDaemonState).
       controlToken,
       startTime: new Date().toLocaleString(),
-      startedWithCliVersion: packageJson.version,
+      startedWithCliVersion: CLI_VERSION,
       startedWithCliMtimeMs,
       daemonLogPath: logger.logFilePath,
       // #3731 (F2) + #4153: the daemon's OWN socket, accounts dir and token state.

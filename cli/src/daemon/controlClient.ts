@@ -7,7 +7,7 @@
 import { logger } from "@/ui/logger";
 import { clearDaemonState, readDaemonState } from "@/persistence";
 import { Metadata } from "@/api/types";
-import packageJson from "../../package.json";
+import { CLI_VERSION, describeDaemonBuildSkew } from "@/version";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { isBunCompiled, projectPath } from "@/projectPath";
@@ -152,31 +152,12 @@ export async function getDaemonEffectiveCount(): Promise<
 }
 
 /**
- * The version check is still quite naive.
- * For instance we are not handling the case where we upgraded hapi,
- * the daemon is still running, and it recieves a new message to spawn a new session.
- * This is a tough case - we need to somehow figure out to restart ourselves,
- * yet still handle the original request.
+ * Whether a daemon process for this HAPI_HOME is alive. A state file whose pid is
+ * dead is deleted on the way; the daemon-start paths rely on that cleanup, and
+ * `hapi doctor` deliberately does not call this (#4155 R12: a read-only probe).
  *
- * Options:
- * 1. Periodically check during the health checks whether our version is the same as CLIs version. If not - restart.
- * 2. Wait for a command from the machine session, or any other signal to
- * check for version & restart.
- *   a. Handle the request first
- *   b. Let the request fail, restart and rely on the client retrying the request
- *
- * I like option 1 a little better.
- * Maybe we can ... wait for it ... have another daemon to make sure
- * our daemon is always alive and running the latest version.
- *
- * That seems like an overkill and yet another process to manage - lets not do this :D
- *
- * TODO: This function should return a state object with
- * clear state - if it is running / or errored out or something else.
- * Not just a boolean.
- *
- * We can destructure the response on the caller for richer output.
- * For instance when running `hapi daemon status` we can show more information.
+ * Upgrades never go through here. Since #4594 (D-4594-1 A) a running daemon of
+ * any build is left in place, and the deploy flows restart the daemon's unit.
  */
 export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolean> {
   const state = await readDaemonState();
@@ -195,74 +176,46 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
 }
 
 /**
- * Check if the running daemon version matches the current CLI version.
- * This should work from both the daemon itself & a new CLI process.
- * Works via the daemon.state.json file.
- *
- * @returns true if versions match, false if versions differ or no daemon running
+ * What `daemon start`, `daemon start-sync` and `hapi claude` learn about this
+ * HAPI_HOME's daemon.
  */
-export async function isDaemonRunningCurrentlyInstalledHappyVersion(): Promise<boolean> {
-  logger.debug("[DAEMON CONTROL] Checking if daemon is running same version");
-  const runningDaemon = await checkIfDaemonRunningAndCleanupStaleState();
-  if (!runningDaemon) {
-    logger.debug("[DAEMON CONTROL] No daemon running, returning false");
-    return false;
-  }
+export interface DaemonBuildSkew {
+  /** A daemon process for this HAPI_HOME is alive. */
+  running: boolean;
+  /** The live daemon's pid. */
+  pid?: number;
+  /** The build the live daemon recorded at boot (`startedWithCliVersion`). */
+  daemonVersion?: string;
+  /** This CLI's build. */
+  cliVersion: string;
+  /** describeDaemonBuildSkew() for a live daemon whose build differs, else null. */
+  skew: string | null;
+}
 
+/**
+ * Issue #4594 (D-4594-1 A): whether a daemon is live for this HAPI_HOME and which
+ * build it recorded. Callers never stop or replace a live daemon because its
+ * build differs; they report the skew. A state file with a dead pid is cleaned
+ * up, as every daemon-start path did before.
+ */
+export async function readDaemonBuildSkew(): Promise<DaemonBuildSkew> {
+  const cliVersion = CLI_VERSION;
+  if (!(await checkIfDaemonRunningAndCleanupStaleState())) {
+    return { running: false, cliVersion, skew: null };
+  }
   const state = await readDaemonState();
   if (!state) {
-    logger.debug("[DAEMON CONTROL] No daemon state found, returning false");
-    return false;
+    // The daemon removed its record between the two reads (it is shutting down).
+    // A start path then contends for the daemon lock, which still decides.
+    return { running: false, cliVersion, skew: null };
   }
-
-  try {
-    // Primary check: version string comparison (stable across rebuilds/copies)
-    const currentCliVersion = packageJson.version;
-    if (currentCliVersion && state.startedWithCliVersion) {
-      logger.debug(
-        `[DAEMON CONTROL] Current CLI version: ${currentCliVersion}, Daemon started with version: ${state.startedWithCliVersion}`
-      );
-      return currentCliVersion === state.startedWithCliVersion;
-    }
-
-    // Fallback: mtime comparison (when version string is unavailable)
-    const currentCliMtimeMs = getInstalledCliMtimeMs();
-    if (
-      typeof currentCliMtimeMs === "number" &&
-      typeof state.startedWithCliMtimeMs === "number"
-    ) {
-      logger.debug(
-        `[DAEMON CONTROL] Falling back to mtime check: current=${currentCliMtimeMs}, daemon=${state.startedWithCliMtimeMs}`
-      );
-      return currentCliMtimeMs === state.startedWithCliMtimeMs;
-    }
-
-    // Neither version string nor mtime available — can't determine, assume mismatch
-    logger.debug(
-      "[DAEMON CONTROL] No version or mtime data available for comparison"
-    );
-    return false;
-
-    // PREVIOUS IMPLEMENTATION - Keeping this commented in case we need it
-    // Kirill does not understand how the upgrade of npm packages happen and whether
-    // we will get a new path or not when hapi is upgraded globally.
-    // If reading package.json doesn't work correctly after npm upgrades,
-    // we can revert to spawning a process (but should add timeout and cleanup!)
-    /*
-    const { spawnHappyCLI } = await import('@/utils/spawnHappyCLI');
-    const happyProcess = spawnHappyCLI(['--version'], { stdio: 'pipe' });
-    let version: string | null = null;
-    happyProcess.stdout?.on('data', (data) => {
-      version = data.toString().trim();
-    });
-    await new Promise(resolve => happyProcess.stdout?.on('close', resolve));
-    logger.debug(`[DAEMON CONTROL] Current CLI version: ${version}, Daemon started with version: ${state.startedWithCliVersion}`);
-    return version === state.startedWithCliVersion;
-    */
-  } catch (error) {
-    logger.debug("[DAEMON CONTROL] Error checking daemon version", error);
-    return false;
-  }
+  return {
+    running: true,
+    pid: state.pid,
+    daemonVersion: state.startedWithCliVersion,
+    cliVersion,
+    skew: describeDaemonBuildSkew(state.startedWithCliVersion, cliVersion),
+  };
 }
 
 export async function cleanupDaemonState(): Promise<void> {

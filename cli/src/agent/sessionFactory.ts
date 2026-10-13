@@ -30,6 +30,7 @@ import {
 } from "@/claude/accountTokenInjection";
 import { detectAgentCapabilities } from "@/utils/agentCapabilities";
 import packageJson from "../../package.json";
+import { CLI_VERSION } from "@/version";
 
 export type SessionStartedBy = "daemon" | "terminal";
 
@@ -186,7 +187,7 @@ export function buildMachineMetadata(): MachineMetadata {
   return {
     host: os.hostname(),
     platform: os.platform(),
-    happyCliVersion: packageJson.version,
+    happyCliVersion: CLI_VERSION,
     homeDir: os.homedir(),
     happyHomeDir: configuration.happyHomeDir,
     happyLibDir: runtimePath(),
@@ -292,7 +293,7 @@ export async function buildSessionMetadata(options: {
   return {
     path: options.workingDirectory,
     host: os.hostname(),
-    version: packageJson.version,
+    version: CLI_VERSION,
     name: defaultName,
     os: os.platform(),
     machineId: options.machineId,
@@ -400,8 +401,9 @@ export async function bootstrapSession(
   const sessionTag = options.tag ?? process.env.HAPI_SESSION_ID ?? randomUUID();
   const isSessionReuse = !!process.env.HAPI_SESSION_ID && !options.tag;
   // Ensure HAPI_SESSION_ID is available in process.env for hooks (e.g., issue auto-linker).
-  // CLI-launched sessions generate a sessionTag above but never wrote it back — only
-  // the web UI path (tmuxSpawnAdapter) injected it. Safe: daemon strips this on startup.
+  // Both daemon spawn paths (tmuxSpawnAdapter and the direct spawn, #5083) inject the
+  // spawn's tag; a session started with none generates one above and writes it back here.
+  // Safe: the daemon strips any inherited value on startup and before every spawn (#283).
   if (!process.env.HAPI_SESSION_ID) {
     process.env.HAPI_SESSION_ID = sessionTag;
   }

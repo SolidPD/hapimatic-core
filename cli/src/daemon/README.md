@@ -1,6 +1,6 @@
 # HAPI CLI Daemon: Control Flow and Lifecycle
 
-The daemon is a persistent background process that manages HAPI sessions, enables remote control from the mobile app, and handles auto-updates when the CLI version changes.
+The daemon is a persistent background process that manages HAPI sessions and enables remote control from the mobile app. Upgrades come from the deploy flows restarting its unit (see "Build Version & Upgrades").
 
 ## 1. Daemon Lifecycle
 
@@ -15,16 +15,14 @@ Control Flow:
 3. New process calls `startDaemon()` from `src/daemon/run.ts`
 4. `startDaemon()` performs startup:
    - Sets up shutdown promise and handlers (SIGINT, SIGTERM, uncaughtException, unhandledRejection)
-   - Version check: `isDaemonRunningCurrentlyInstalledHappyVersion()` compares CLI binary mtime
-   - If version mismatch: calls `stopDaemon()` to kill old daemon before proceeding
-   - If same version running: exits with "Daemon already running"
+   - Already-running check: `readDaemonBuildSkew()` (`controlClient.ts`). A live daemon for this `HAPI_HOME` is never stopped or replaced, whatever build it recorded (#4594, D-4594-1 A): `start-sync` exits 0 with "Daemon already running" and logs a build skew if there is one. `hapi daemon start` from a terminal prints the same and does not spawn `start-sync`.
    - Lock acquisition: `acquireDaemonLock()` creates exclusive lock file to prevent multiple daemons
    - Direct-connect setup: `authAndSetupMachineIfNeeded()` ensures `CLI_API_TOKEN` is set and `machineId` exists
    - State persistence: writes PID, version, HTTP port, mtime to daemon.state.json
    - HTTP server: starts Fastify on random port for local CLI control (list, stop, spawn)
    - WebSocket: establishes persistent connection to backend via `ApiMachineClient`
    - RPC registration: exposes `spawn-happy-session`, `stop-session`, `stop-daemon` handlers
-   - Heartbeat loop: every 60s (or `HAPI_DAEMON_HEARTBEAT_INTERVAL`) checks for version updates, prunes dead sessions, verifies PID ownership
+   - Heartbeat loop: every 60s (or `HAPI_DAEMON_HEARTBEAT_INTERVAL`) prunes dead sessions and verifies PID ownership (its version check never fires; see "Build Version & Upgrades")
 5. Awaits shutdown promise which resolves when:
    - OS signal received (SIGINT/SIGTERM) - source: `os-signal`
    - HTTP `/stop` endpoint called - source: `hapi-cli`
@@ -41,7 +39,7 @@ Control Flow:
 
 ### Systemd Invariants Self-Check
 
-After the version-mismatch check and before `acquireDaemonLock()`, the daemon
+After the already-running check and before `acquireDaemonLock()`, the daemon
 validates its own systemd unit against four invariants required to keep
 tmux/Claude sessions alive across daemon restarts (see [hapimatic-private#418]):
 
@@ -75,19 +73,16 @@ drift on the live system.
 [hapimatic-private#418]: https://github.com/MattStarfield/hapimatic-private/issues/418
 [rp1-home#472]: https://github.com/MattStarfield/rp1-home/issues/472
 
-### Version Detection & Auto-Update
+### Build Version & Upgrades (#4594)
 
-The daemon detects when CLI binary changes (e.g., after `npm upgrade hapi`):
+The CLI's version is the build's root `package.json` version, read from `server/src/version.generated.ts` through `cli/src/version.ts` (`CLI_VERSION`); `cli/package.json`'s `0.6.0` is never read. The daemon records it at boot as `startedWithCliVersion` (plus `startedWithCliMtimeMs`).
 
-1. At startup, records `startedWithCliMtimeMs` (file modification time of CLI binary)
-2. Heartbeat compares current CLI mtime with recorded mtime via `getInstalledCliMtimeMs()`
-3. If mtime changed:
-   - Clears heartbeat interval
-   - Spawns new daemon via `spawnHappyCLI(['daemon', 'start'])`
-   - Waits 10 seconds to be killed by new daemon
-4. New daemon starts, sees old daemon running with different mtime
-5. New daemon calls `stopDaemon()` which tries HTTP `/stop`, falls back to SIGKILL
-6. New daemon takes over
+Upgrades are the deploy flows' job: they replace the binary and restart the daemon's systemd unit (prod deploy script, `deploy-local.sh` + the closer's daemon restart, `worktree-build.sh --restart`, `deploy-node.sh`). No CLI command replaces a running daemon because its build differs (D-4594-1 A):
+
+1. `daemon start` / `daemon start-sync` see a live daemon of another build, leave it running and report the skew; `hapi claude` (including a daemon-spawned session) only skips starting a second daemon.
+2. `hapi doctor` / `hapi daemon status` print the daemon's recorded build and, when it differs from the CLI's, a "Build skew" line naming the older side.
+
+The heartbeat's own version compare (`healthScheduler.ts`) compares the daemon's in-memory build with the record it wrote itself, so it never fires (#4590 tracks its removal).
 
 ### Heartbeat System
 
@@ -95,7 +90,7 @@ Every 60 seconds (configurable via `HAPI_DAEMON_HEARTBEAT_INTERVAL`):
 
 1. **Guard**: Skips if previous heartbeat still running (prevents concurrent heartbeats)
 2. **Session Pruning**: Checks each tracked PID with `isProcessAlive(pid)`, removes dead sessions
-3. **Version Check**: Compares CLI binary mtime, triggers self-restart if changed
+3. **Version Check**: compares the daemon's build with its own record, so it never fires (see "Build Version & Upgrades"; #4590)
 4. **PID Ownership**: Verifies daemon still owns state file, self-terminates if another daemon took over
 5. **State Update**: Writes `lastHeartbeat` timestamp to daemon.state.json
 
@@ -373,7 +368,7 @@ All data is plain JSON over TLS; authentication is `CLI_API_TOKEN` (no end-to-en
 - External session webhook tracking
 - Graceful SIGTERM/SIGKILL shutdown
 - Multiple daemon prevention
-- Version mismatch detection
+- A live daemon of another build is kept and the skew is reported
 - Directory creation approval flow
 - Concurrent session stress tests
 

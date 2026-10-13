@@ -14,6 +14,17 @@ on:
     tags:
       - "v*"
 
+# One release run at a time, in order (#5072). LATEST-SELECT reads the release list and then marks
+# the highest tag Latest; two overlapping runs could interleave those two calls and leave an older
+# tag Latest. The group serializes whole runs. queue: max keeps up to 100 waiting runs, first in,
+# first out, and GitHub cancels any run past that. GitHub's default queue holds one pending run and
+# cancels the older one, so the middle of three overlapping tag pushes would get no Release at all.
+# cancel-in-progress: false never cancels the running one.
+concurrency:
+  group: public-release
+  cancel-in-progress: false
+  queue: max
+
 permissions:
   contents: write
 
@@ -44,16 +55,20 @@ jobs:
               fi
           done
 
+          # --- INSTALLER-SHIP-BEGIN (#5069, #5072) ---
           # Ship the one-command installer under its own versioned name, install-hapimatic-v1.sh: the
           # public one-liner downloads releases/latest/download/install-hapimatic-v1.sh. Copied before
-          # checksums.txt is written, so checksums.txt covers it. When the tree lacks it, say so in the
-          # run: a ::warning:: annotation on this Actions run (the Release page itself does not show it),
-          # so a Release without the installer is never silent.
-          if [ -f ../../scripts/install-hapimatic-v1.sh ]; then
-              cp ../../scripts/install-hapimatic-v1.sh ../release-artifacts/install-hapimatic-v1.sh
-          else
-              echo "::warning title=install-hapimatic-v1.sh not shipped::scripts/install-hapimatic-v1.sh is not in this source tree, so this Release carries the binaries and checksums.txt but no install-hapimatic-v1.sh."
+          # checksums.txt is written, so checksums.txt covers it. A tree without it fails this step, so no
+          # Release is created (#5072): a green Release without the installer could become Latest and turn
+          # the one-liner into a 404. One variable names the source, so a rename cannot update the copy and
+          # miss the check.
+          INSTALLER=../../scripts/install-hapimatic-v1.sh
+          if [ ! -f "$INSTALLER" ]; then
+              echo "::error title=install-hapimatic-v1.sh missing::scripts/install-hapimatic-v1.sh is not in this source tree, so no Release is created (the public one-liner downloads releases/latest/download/install-hapimatic-v1.sh)."
+              exit 1
           fi
+          cp "$INSTALLER" ../release-artifacts/install-hapimatic-v1.sh
+          # --- INSTALLER-SHIP-END ---
 
           cd ../release-artifacts
           # `--` ends options (SC2035) while keeping bare filenames, so consumers can match
@@ -76,22 +91,41 @@ jobs:
                 --latest=false \
                 cli/release-artifacts/*
           fi
-          # --- LATEST-SELECT-BEGIN (#5069) ---
+          # --- LATEST-SELECT-BEGIN (#5069, #5072) ---
           # Latest = the highest vMAJOR.MINOR.PATCH among published releases. Both the installer's default
           # source and the public one-liner read releases/latest, so a re-published older tag
           # (docs/internal/open-core-release-runbook.md "Re-publishing a tag") must never take it. This
-          # runs on both paths, after this run's own Release exists, so overlapping runs and re-runs
-          # converge on the highest tag whichever finishes last. A failed list read or edit fails the
-          # step; the Release keeps the previous Latest, and a re-run recovers.
+          # runs on both paths, after this run's own Release exists. On its own it cannot see a Release
+          # another run publishes after its list read; the workflow's concurrency group serializes the runs
+          # (#5072), so each read sees every earlier run's Release and Latest ends on the highest tag once
+          # the last queued run finishes. A failed list read, tag filter, sort or edit fails the step; the
+          # Release keeps the previous Latest, and a re-run recovers.
           if ! PUBLISHED="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName -q '.[].tagName')"; then
               echo "::error title=release list failed::could not read this repository's releases, so Latest cannot be decided"
               exit 1
           fi
-          # `|| true`: with no vMAJOR.MINOR.PATCH tag at all the pipeline is empty under pipefail; Latest
-          # is then left as it is, not a failed step. This run's own tag is a candidate even before the
-          # list shows it.
-          HIGHEST="$({ printf '%s\n' "$TAG"; printf '%s\n' "$PUBLISHED"; } | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+          # This run's own tag is a candidate even before the list shows it. grep exits 1 when no line is a
+          # vMAJOR.MINOR.PATCH tag (Latest is then left as it is); any other grep exit fails the step. The
+          # default run shell is bash -e without pipefail, so neither failure may hide behind a later command.
+          GREP_RC=0
+          CANDIDATES="$({ printf '%s\n' "$TAG"; printf '%s\n' "$PUBLISHED"; } | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$')" || GREP_RC=$?
+          if [ "$GREP_RC" -gt 1 ]; then
+              echo "::error title=tag filter failed::grep exited $GREP_RC while filtering the release tags"
+              exit 1
+          fi
+          HIGHEST=""
+          if [ -n "$CANDIDATES" ]; then
+              # sort is the last command of its pipeline, so a sort failure fails this assignment under bash -e.
+              SORTED="$(printf '%s\n' "$CANDIDATES" | sort -V)"
+              HIGHEST="${SORTED##*$'\n'}"
+          fi
           if [ -n "$HIGHEST" ]; then
+              # A second pin for the Package step's installer check (#5072): this run's own tag never
+              # becomes Latest without the installer the one-liner downloads.
+              if [ "$HIGHEST" = "$TAG" ] && [ ! -f cli/release-artifacts/install-hapimatic-v1.sh ]; then
+                  echo "::error title=install-hapimatic-v1.sh missing::this run's release artifacts have no install-hapimatic-v1.sh, so $TAG is not made Latest"
+                  exit 1
+              fi
               gh release edit "$HIGHEST" --latest
               echo "Latest: $HIGHEST"
           fi

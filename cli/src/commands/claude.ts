@@ -5,7 +5,7 @@ import { z } from "zod";
 import { SessionRoleSchema } from "@hapi/protocol/schemas";
 import type { StartOptions } from "@/claude/runClaude";
 import { configuration } from "@/configuration";
-import { isDaemonRunningCurrentlyInstalledHappyVersion } from "@/daemon/controlClient";
+import { readDaemonBuildSkew } from "@/daemon/controlClient";
 import { authAndSetupMachineIfNeeded } from "@/ui/auth";
 import { logger } from "@/ui/logger";
 import { initializeToken } from "@/ui/tokenInit";
@@ -192,11 +192,12 @@ ${chalk.bold.cyan("Claude Code Options (from `claude --help`):")}
     await maybeAutoStartServer();
     await authAndSetupMachineIfNeeded();
 
-    logger.debug(
-      "Ensuring hapi background service is running & matches our version..."
-    );
+    logger.debug("Ensuring hapi background service is running...");
 
-    if (!(await isDaemonRunningCurrentlyInstalledHappyVersion())) {
+    // Issue #4594 (D-4594-1 A): start a daemon only when none is live. A live
+    // daemon of another build is left alone — that includes the daemon that
+    // spawned this very session (`--started-by daemon`) after a binary swap.
+    if (!(await readDaemonBuildSkew()).running) {
       logger.debug("Starting hapi background service...");
 
       const daemonProcess = spawnHappyCLI(["daemon", "start-sync"], {

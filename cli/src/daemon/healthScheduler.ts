@@ -19,7 +19,7 @@
  */
 import { logger } from "@/ui/logger";
 import { configuration } from "@/configuration";
-import packageJson from "../../package.json";
+import { CLI_VERSION } from "@/version";
 import { type DaemonLocallyPersistedState } from "@/persistence";
 import { SupervisedLoop } from "@hapi/protocol";
 import { isProcessAlive } from "@/utils/process";
@@ -447,11 +447,12 @@ export function createHealthScheduler(
         });
       }
 
-      // Check if daemon binary has been updated (e.g., during deployment)
-      // Under systemd supervision, we exit with code 1 so systemd restarts us
-      // with the new binary automatically. No need to self-spawn a replacement.
-      // Primary: version string comparison (stable across rebuilds/copies)
-      const currentVersion = packageJson.version;
+      // Intended to exit (code 1, so systemd restarts us) when the binary was
+      // updated, but it never fires: CLI_VERSION is this daemon's own build and
+      // fileState is the record this daemon wrote with the same constant, and
+      // the mtime branch below needs an empty CLI_VERSION. Deploys restart the
+      // unit instead; #4590 tracks removing this check.
+      const currentVersion = CLI_VERSION;
       if (
         currentVersion &&
         fileState.startedWithCliVersion &&
@@ -492,7 +493,7 @@ export function createHealthScheduler(
           pid: process.pid,
           httpPort: controlPort,
           controlToken,
-          startedWithCliVersion: packageJson.version,
+          startedWithCliVersion: CLI_VERSION,
           startedWithCliMtimeMs,
           lastHeartbeat: new Date().toLocaleString(),
           lastHeartbeatAt: Date.now(),

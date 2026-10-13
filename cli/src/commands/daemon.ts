@@ -5,6 +5,7 @@ import { startDaemon } from "@/daemon/run";
 import {
   checkIfDaemonRunningAndCleanupStaleState,
   listDaemonSessions,
+  readDaemonBuildSkew,
   stopDaemon,
   stopDaemonSession,
 } from "@/daemon/controlClient";
@@ -56,6 +57,18 @@ export const daemonCommand: CommandDefinition = {
     }
 
     if (daemonSubcommand === "start") {
+      // Issue #4594 (D-4594-1 A): a live daemon of any build is left running.
+      // Say so (and name a build skew) instead of spawning a start-sync that
+      // exits 0 and then reporting "started successfully".
+      const existing = await readDaemonBuildSkew();
+      if (existing.running) {
+        console.log(`Daemon already running (pid ${existing.pid})`);
+        if (existing.skew) {
+          console.log(chalk.yellow(`Build skew: ${existing.skew}`));
+        }
+        process.exit(0);
+      }
+
       const child = spawnHappyCLI(["daemon", "start-sync"], {
         detached: true,
         stdio: "ignore",

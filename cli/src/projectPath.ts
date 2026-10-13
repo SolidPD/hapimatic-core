@@ -2,7 +2,7 @@
 import { dirname, resolve, join } from "path";
 import { fileURLToPath } from "url";
 import { configuration } from "@/configuration";
-import packageJson from "../package.json";
+import { runtimeAssetsKey } from "@/runtime/assetsKey";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -14,12 +14,22 @@ export function projectPath(): string {
   return resolve(__dirname, "..");
 }
 
+/** `<HAPI_HOME>/runtime` — the parent of every runtime-asset directory. */
+export function runtimeAssetsBasePath(): string {
+  return join(configuration.happyHomeDir, "runtime");
+}
+
+/**
+ * Where the compiled binary's embedded tools are extracted:
+ * `<HAPI_HOME>/runtime/<digest of the embedded assets>` (#4594, D-4594-2 A).
+ * A source run uses the checkout's own cli/ directory.
+ */
 export function runtimePath(): string {
   if (!isCompiled) {
     return projectPath();
   }
 
-  return join(configuration.happyHomeDir, "runtime", packageJson.version);
+  return join(runtimeAssetsBasePath(), runtimeAssetsKey());
 }
 
 export function isBunCompiled(): boolean {

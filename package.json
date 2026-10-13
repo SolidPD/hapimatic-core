@@ -1,7 +1,7 @@
 {
   "name": "hapi",
-  "version": "1.0.1553",
-  "versionTimestamp": "2026-10-12T17:47:00.462Z",
+  "version": "1.0.1565",
+  "versionTimestamp": "2026-10-13T12:56:49.082Z",
   "private": true,
   "license": "AGPL-3.0-only",
   "workspaces": [

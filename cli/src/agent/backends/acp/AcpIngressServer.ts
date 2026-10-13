@@ -46,7 +46,7 @@ import {
   ACP_STOP_REASONS,
   type AcpStopReason,
 } from "./sdkMessageToAcp";
-import packageJson from "../../../../package.json";
+import { CLI_VERSION } from "@/version";
 
 /**
  * Grace after a `session/cancel` interrupt within which the turn's own `result`
@@ -176,7 +176,7 @@ export class AcpIngressServer {
       agentInfo: {
         name: "hapi",
         title: "Hapimatic",
-        version: packageJson.version,
+        version: CLI_VERSION,
       },
       authMethods: [],
     };

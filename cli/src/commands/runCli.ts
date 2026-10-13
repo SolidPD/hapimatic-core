@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 import { join } from "node:path";
 
-import packageJson from "../../package.json";
+import { CLI_VERSION } from "@/version";
 import { ensureRuntimeAssets } from "@/runtime/assets";
 import { isBunCompiled } from "@/projectPath";
 import { logger } from "@/ui/logger";
@@ -32,7 +32,7 @@ export async function runCli(): Promise<void> {
   const args = getCliArgs();
 
   if (args.includes("-v") || args.includes("--version")) {
-    console.log(`hapi version: ${packageJson.version}`);
+    console.log(`hapi version: ${CLI_VERSION}`);
     process.exit(0);
   }
 

@@ -1,6 +1,10 @@
 import { dirname, isAbsolute, join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import {
+  computeRuntimeAssetsKey,
+  runtimeAssetPaths,
+} from "../src/runtime/assetsKey";
 
 const DEFAULT_TARGETS = [
   "bun-darwin-x64",
@@ -122,6 +126,25 @@ function assertArchivesExist(
   }
 }
 
+/**
+ * #4594 (D-4594-2 A): the digest of exactly the files embeddedAssets.bun.ts embeds
+ * for this target. It keys the binary's `<HAPI_HOME>/runtime/<key>` directory, so a
+ * release with unchanged tools reuses it and changed tools extract a fresh one.
+ */
+function runtimeAssetsKeyFor(
+  projectRoot: string,
+  platform: string,
+  arch: string
+): string {
+  const platformDir = getPlatformDir(platform, arch);
+  return computeRuntimeAssetsKey(
+    runtimeAssetPaths(platformDir).map(relativePath => ({
+      relativePath,
+      content: readFileSync(join(projectRoot, relativePath)),
+    }))
+  );
+}
+
 function resolveOutdir(projectRoot: string, outdir: string): string {
   if (isAbsolute(outdir)) {
     return outdir;
@@ -232,6 +255,7 @@ async function buildTarget(
   const outfile = join(outdir, target, outputName);
   mkdirSync(dirname(outfile), { recursive: true });
   const featureFlag = getFeatureFlag(platform, arch);
+  const runtimeAssetsKey = runtimeAssetsKeyFor(projectRoot, platform, arch);
 
   const cmd = [
     process.execPath,
@@ -239,6 +263,7 @@ async function buildTarget(
     "--compile",
     "--no-compile-autoload-dotenv",
     `--feature=${featureFlag}`,
+    `--define=HAPI_RUNTIME_ASSETS_KEY=${JSON.stringify(runtimeAssetsKey)}`,
     `--target=${target}`,
     `--outfile=${outfile}`,
     join(projectRoot, "src", "bootstrap.ts"),

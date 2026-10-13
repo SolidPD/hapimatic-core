@@ -9,7 +9,6 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import packageJson from "../package.json";
 import { getCliArgs } from "@/utils/cliArgs";
 
 /**
@@ -116,7 +115,6 @@ class Configuration {
   public readonly privateKeyFile: string;
   public readonly daemonStateFile: string;
   public readonly daemonLockFile: string;
-  public readonly currentCliVersion: string;
 
   /**
    * Issue #1644: cross-machine rotation-lease feature gate (HAPI_ROTATION_LEASE).
@@ -399,8 +397,6 @@ class Configuration {
       localSessionName: this.tmuxSessionName,
       envOverride: process.env.HAPI_TMUX_REMOTE_SESSION_NAME,
     });
-
-    this.currentCliVersion = packageJson.version;
 
     if (!existsSync(this.happyHomeDir)) {
       mkdirSync(this.happyHomeDir, { recursive: true });

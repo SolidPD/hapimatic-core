@@ -31,6 +31,11 @@ import { TmuxManager } from "@/tmux";
 import { describeTmuxFailure, type GlobalEnvRead } from "@/tmux/TmuxManager";
 import { UUID_REGEX } from "@/accounts/accountStore";
 import packageJson from "../../package.json";
+import {
+  CLI_VERSION,
+  CLI_VERSION_TIMESTAMP,
+  describeDaemonBuildSkew,
+} from "@/version";
 
 /**
  * Get relevant environment information for debugging
@@ -617,7 +622,10 @@ export async function runDoctorCommand(
   if (filter === "all") {
     // Version and basic info
     console.log(chalk.bold("📋 Basic Information"));
-    console.log(`hapi CLI Version: ${chalk.green(packageJson.version)}`);
+    // #4594: the build's real version, never cli/package.json's frozen 0.6.0.
+    console.log(
+      `hapi CLI Version: ${chalk.green(CLI_VERSION)} (built ${CLI_VERSION_TIMESTAMP})`
+    );
     console.log(`Platform: ${chalk.green(process.platform)} ${process.arch}`);
     console.log(`Node.js Version: ${chalk.green(process.version)}`);
     console.log("");
@@ -729,6 +737,12 @@ export async function runDoctorCommand(
       console.log(`  PID: ${state.pid}`);
       console.log(`  Started: ${new Date(state.startTime).toLocaleString()}`);
       console.log(`  CLI Version: ${state.startedWithCliVersion}`);
+      // #4594 (D-4594-1 A): a build difference is reported here, never acted on.
+      // Judged from the record read above, so this probe stays read-only (R12).
+      const buildSkew = describeDaemonBuildSkew(state.startedWithCliVersion);
+      if (buildSkew) {
+        console.log(chalk.yellow(`  ⚠️  Build skew: ${buildSkew}`));
+      }
       if (state.httpPort) {
         console.log(`  HTTP Port: ${state.httpPort}`);
       }

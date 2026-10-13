@@ -15,7 +15,7 @@ import { acpUsageFromPromptResponse } from "./acpUsageDetector";
 // `manifestDriver.ts` imports DEFAULT_ACP_CLIENT_CAPABILITIES from this file.
 import type { AcpQuirkId } from "./manifestDriver";
 import { logger } from "@/ui/logger";
-import packageJson from "../../../../package.json";
+import { CLI_VERSION } from "@/version";
 
 /**
  * Issue #3347: bound the ACP boot handshakes (`initialize`, `session/new`) so a
@@ -146,7 +146,7 @@ export class AcpSdkBackend implements AgentBackend {
         this.options.clientCapabilities ?? DEFAULT_ACP_CLIENT_CAPABILITIES,
       clientInfo: {
         name: "hapi",
-        version: packageJson.version,
+        version: CLI_VERSION,
       },
     });
 

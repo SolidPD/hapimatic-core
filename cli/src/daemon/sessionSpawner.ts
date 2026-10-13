@@ -2451,9 +2451,9 @@ export function createSessionSpawner(
 
       // Defense #2: Build child env without session-specific vars.
       // Even if defense #1 missed (e.g., env var set after startup),
-      // ensure children never inherit a stale HAPI_SESSION_ID.
-      // The tmux path (tmuxSpawnAdapter.ts) already handles this correctly
-      // by building a clean env. See issue #283.
+      // ensure children never inherit a stale HAPI_SESSION_ID. See issue #283.
+      // Both inherited vars are stripped below; HAPI_SESSION_ID is then set to
+      // THIS spawn's own hapiSessionId, as the tmux path does (#5083).
       //
       // Issue #3731 (R3 parity on the direct path): for a claude spawn, the
       // wrapper's account-binding env is EXACTLY what the daemon delivers
@@ -2475,6 +2475,14 @@ export function createSessionSpawner(
           : { ...process.env, ...extraEnv };
       delete childEnv.HAPI_SESSION_ID;
       delete childEnv.HAPI_TMUX_WINDOW;
+      // Issue #5083: hand the child THIS spawn's own tag, as the tmux path does
+      // (tmuxSpawnAdapter.ts HAPI_SESSION_ID: hapiSessionId). The wrapper takes
+      // its session tag from this var (sessionFactory.ts bootstrapSession), and
+      // the server placeholder reconcile, the web Create-page swap and the
+      // respawn re-attach all match on that tag. The value comes from the spawn
+      // options or generateSessionId() — never from the environment — so #283's
+      // guard above still holds: an inherited id is always stripped first.
+      childEnv.HAPI_SESSION_ID = hapiSessionId;
       // Issue #4065: carry this instance's HAPI_HOME explicitly, mirroring the
       // tmux path (tmuxSpawnAdapter.ts envVars). The orphan-MCP reaper attributes
       // a process to this instance by the HAPI_HOME in its /proc environ, so every
