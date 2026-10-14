@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { io, type Socket } from "socket.io-client";

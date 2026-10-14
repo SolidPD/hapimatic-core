@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { randomUUID } from "node:crypto";
 import { configuration } from "@/configuration";
 import { updateSettings } from "@/persistence";

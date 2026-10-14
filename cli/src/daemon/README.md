@@ -22,7 +22,7 @@ Control Flow:
    - HTTP server: starts Fastify on random port for local CLI control (list, stop, spawn)
    - WebSocket: establishes persistent connection to backend via `ApiMachineClient`
    - RPC registration: exposes `spawn-happy-session`, `stop-session`, `stop-daemon` handlers
-   - Heartbeat loop: every 60s (or `HAPI_DAEMON_HEARTBEAT_INTERVAL`) prunes dead sessions and verifies PID ownership (its version check never fires; see "Build Version & Upgrades")
+   - Heartbeat loop: every 60s (or `HAPI_DAEMON_HEARTBEAT_INTERVAL`) prunes dead sessions and verifies PID ownership (no build check; see "Build Version & Upgrades")
 5. Awaits shutdown promise which resolves when:
    - OS signal received (SIGINT/SIGTERM) - source: `os-signal`
    - HTTP `/stop` endpoint called - source: `hapi-cli`
@@ -75,14 +75,14 @@ drift on the live system.
 
 ### Build Version & Upgrades (#4594)
 
-The CLI's version is the build's root `package.json` version, read from `server/src/version.generated.ts` through `cli/src/version.ts` (`CLI_VERSION`); `cli/package.json`'s `0.6.0` is never read. The daemon records it at boot as `startedWithCliVersion` (plus `startedWithCliMtimeMs`).
+The CLI's version is the build's root `package.json` version, read from `server/src/version.generated.ts` through `cli/src/version.ts` (`CLI_VERSION`); `cli/package.json`'s `0.6.0` is never read. The daemon records it at boot as `startedWithCliVersion` (plus `startedWithCliMtimeMs`, which no code acts on since #4590; `hapi doctor` still prints it with the record).
 
 Upgrades are the deploy flows' job: they replace the binary and restart the daemon's systemd unit (prod deploy script, `deploy-local.sh` + the closer's daemon restart, `worktree-build.sh --restart`, `deploy-node.sh`). No CLI command replaces a running daemon because its build differs (D-4594-1 A):
 
 1. `daemon start` / `daemon start-sync` see a live daemon of another build, leave it running and report the skew; `hapi claude` (including a daemon-spawned session) only skips starting a second daemon.
 2. `hapi doctor` / `hapi daemon status` print the daemon's recorded build and, when it differs from the CLI's, a "Build skew" line naming the older side.
 
-The heartbeat's own version compare (`healthScheduler.ts`) compares the daemon's in-memory build with the record it wrote itself, so it never fires (#4590 tracks its removal).
+The heartbeat has no build check (#4590): a running daemon keeps its build until its unit restarts, whatever binary is installed meanwhile.
 
 ### Heartbeat System
 
@@ -90,9 +90,8 @@ Every 60 seconds (configurable via `HAPI_DAEMON_HEARTBEAT_INTERVAL`):
 
 1. **Guard**: Skips if previous heartbeat still running (prevents concurrent heartbeats)
 2. **Session Pruning**: Checks each tracked PID with `isProcessAlive(pid)`, removes dead sessions
-3. **Version Check**: compares the daemon's build with its own record, so it never fires (see "Build Version & Upgrades"; #4590)
-4. **PID Ownership**: Verifies daemon still owns state file, self-terminates if another daemon took over
-5. **State Update**: Writes `lastHeartbeat` timestamp to daemon.state.json
+3. **PID Ownership**: Verifies daemon still owns state file, self-terminates if another daemon took over
+4. **State Update**: Writes `lastHeartbeat` timestamp to daemon.state.json
 
 ### Stopping the Daemon
 

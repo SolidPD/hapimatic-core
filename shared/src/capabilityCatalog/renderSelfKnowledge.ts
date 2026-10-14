@@ -69,7 +69,11 @@ export const SELF_KNOWLEDGE_CEILING: Record<SelfKnowledgeScope, number> = {
   // the agent-facing catalog for no benefit; the doc stays far below the ~64–80 KB
   // REST-inclusion runaway R3 exists to catch. Raise again — in review — if a later
   // sub-issue's user-scope surface legitimately outgrows this (do NOT re-admit REST).
-  user: 10500,
+  // RAISED to 11,000 B on 2026-10-13 (SBOM work): the preamble gains a 365 B
+  // "Third-party software (SBOM)" section pointing every session — customer VMs
+  // included — at the published bill of materials, so license and dependency
+  // questions are answered from it, not from memory (render: ~10,700 B).
+  user: 11000,
   // Greenfield: no replaced-doc anchor. Fits the current full user∪operator
   // render (~16 KB) with headroom for the catalog to fill as #3745 lands more
   // RPC entries, and catches the ~64–80 KB REST-inclusion runaway (R3). A

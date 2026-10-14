@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * `claudeTmuxRemote` — backup remote launcher that spawns `claude` inside a
  * dedicated tmux window and streams its terminal output over a FIFO to the

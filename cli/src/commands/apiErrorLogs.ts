@@ -1,7 +1,8 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import axios from "axios";
 import chalk from "chalk";
 import { configuration } from "@/configuration";
+import { authenticateCli, cliApiTokenSourcesNote } from "./cliAuth";
 
 // Local mirror of the server's StoredErrorLog shape (server/src/store/types.ts).
 // The cli package cannot import server types across the package boundary, so the
@@ -214,20 +215,6 @@ export function formatStats(bySeverity: Record<string, number>): string {
 
 // ── Network plumbing (mirrors handleSessions in api.ts) ──────────────────────
 
-async function authenticate(): Promise<string> {
-  const token = configuration.cliApiToken;
-  if (!token) {
-    console.error("CLI_API_TOKEN is required. Set it in env or settings.json.");
-    process.exit(1);
-  }
-  const resp = await axios.post(
-    `${configuration.serverUrl}/api/auth`,
-    { accessToken: token },
-    { timeout: 10_000 }
-  );
-  return resp.data.token as string;
-}
-
 function authHeaders(jwt: string): Record<string, string> {
   return {
     Authorization: `Bearer ${jwt}`,
@@ -281,7 +268,7 @@ ${chalk.bold("Default behavior (no filter flags):")}
 ${chalk.bold("Notes:")}
   - Queries the LOCAL instance only (${configuration.serverUrl}). error_logs is
     per-instance SQLite; federated/cross-node querying is not supported in this version.
-  - Authentication uses CLI_API_TOKEN from env or settings.json.
+  - ${cliApiTokenSourcesNote()}
 `);
 }
 
@@ -300,7 +287,7 @@ export async function handleErrorLogs(args: string[]): Promise<void> {
 
   // --stats mode (R3)
   if (args.includes("--stats")) {
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     const resp = await axios.get(
       `${configuration.serverUrl}/api/error-logs/stats`,
       {
@@ -335,7 +322,7 @@ export async function handleErrorLogs(args: string[]): Promise<void> {
     : DEFAULT_LIMIT;
 
   const hasExplicitFilter = Boolean(severity || category || source || session);
-  const jwt = await authenticate();
+  const jwt = await authenticateCli();
   let entries: ErrorLogEntry[];
 
   if (hasExplicitFilter) {

@@ -1,7 +1,7 @@
 {
   "name": "hapi",
-  "version": "1.0.1565",
-  "versionTimestamp": "2026-10-13T12:56:49.082Z",
+  "version": "1.0.1573",
+  "versionTimestamp": "2026-10-13T23:22:29.183Z",
   "private": true,
   "license": "AGPL-3.0-only",
   "workspaces": [
@@ -36,7 +36,6 @@
     "backfill-costs": "bun run server/scripts/backfill-costs.ts",
     "backfill-turns": "bun run server/scripts/backfill-turns.ts",
     "backfill-orphan-durations": "bun run server/scripts/backfill-orphan-durations.ts",
-    "release-all": "cd cli && bun run release-all",
     "check:capabilities-gen-clean": "bun run scripts/generate-capability-catalog.ts --check"
   },
   "devDependencies": {

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Pure helpers for the `hapi api sessions spawn` client-side error path (#1559).
  *

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * sessionCapacity — the pure RAM/CPU → session-count capacity module (#4417, Task 3).
  *

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import React from "react";
 import { Session } from "./session";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { mkdirSync } from "node:fs";
 import { logger } from "@/ui/logger";
 import { restoreTerminalState } from "@/ui/terminalState";

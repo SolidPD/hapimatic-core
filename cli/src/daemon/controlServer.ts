@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * HTTP control server for daemon management
  * Provides endpoints for listing sessions, stopping sessions, and daemon shutdown

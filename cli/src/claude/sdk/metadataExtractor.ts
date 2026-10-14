@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * SDK Metadata Extractor
  * Captures available tools and slash commands from Claude SDK initialization

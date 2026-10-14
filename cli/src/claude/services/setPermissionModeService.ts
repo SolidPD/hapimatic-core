@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * set-permission-mode service (issue #2346) — the CLI-side RPC handler factories
  * for the `set-permission-mode` control route.

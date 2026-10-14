@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Utilities for building Codex CLI config arguments (-c) for MCP servers
  * and developer instructions.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import chalk from "chalk";
 import { execFileSync } from "node:child_process";
 import { z } from "zod";

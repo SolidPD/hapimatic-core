@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 export class AsyncLock {
   private permits: number = 1;
   private promiseResolverQueue: Array<(v: boolean) => void> = [];

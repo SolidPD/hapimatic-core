@@ -1,24 +1,9 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import axios from "axios";
 import chalk from "chalk";
 import { configuration } from "@/configuration";
 import type { CommandContext, CommandDefinition } from "./types";
-
-async function authenticate(): Promise<string> {
-  const token = configuration.cliApiToken;
-  if (!token) {
-    console.error("CLI_API_TOKEN is required. Set it in env or settings.json.");
-    process.exit(1);
-  }
-
-  const resp = await axios.post(
-    `${configuration.serverUrl}/api/auth`,
-    { accessToken: token },
-    { timeout: 10_000 }
-  );
-
-  return resp.data.token as string;
-}
+import { authenticateCli } from "./cliAuth";
 
 function authHeaders(jwt: string): Record<string, string> {
   return {
@@ -76,7 +61,7 @@ ${chalk.bold("Examples:")}
 }
 
 async function statusCommand(): Promise<void> {
-  const jwt = await authenticate();
+  const jwt = await authenticateCli();
   const url = configuration.serverUrl;
 
   try {
@@ -146,7 +131,7 @@ async function statusCommand(): Promise<void> {
 }
 
 async function drainNodeCommand(nodeId: string): Promise<void> {
-  const jwt = await authenticate();
+  const jwt = await authenticateCli();
   const url = configuration.serverUrl;
 
   try {

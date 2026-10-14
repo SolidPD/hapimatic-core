@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Design decisions:
  * - Logging should be done only through file for debugging, otherwise we might disturb the claude session when in interactive mode

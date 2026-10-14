@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Diff Processor - Handles turn_diff messages and tracks unified_diff changes
  *

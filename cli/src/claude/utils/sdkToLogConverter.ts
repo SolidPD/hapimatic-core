@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Converter from SDK message types to log format (RawJSONLines)
  * Transforms Claude SDK messages into the format expected by session logs

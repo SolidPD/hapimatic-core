@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * HTTP client helpers for daemon communication
  * Used by CLI commands to interact with running daemon

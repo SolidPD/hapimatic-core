@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { ApiClient } from "@/api/api";
 import { accountStore } from "@/accounts/accountStore";
 import { createUtilizationSampler } from "@/accounts/utilizationSampler";

@@ -9,6 +9,11 @@ AGPL-3.0-only.
 
 The cli package contains MIT-licensed happy-cli code — see cli/NOTICE.
 
+The program also includes third-party open-source software, including the
+embedded Bun runtime. THIRD-PARTY-NOTICES.md reproduces each component's
+license, and sbom/hapimatic-core.cdx.json lists every component, version and
+license as a CycloneDX software bill of materials.
+
 gateway/ is a separate program outside the AGPL core and is not covered by
 LICENSE; see the open-core boundary statement (#3869) — wording to be confirmed
 by counsel (#4003).

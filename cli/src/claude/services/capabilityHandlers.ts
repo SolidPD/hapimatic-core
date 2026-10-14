@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Testable factories for the readonly control capabilities migrated through the
  * capability registry in issue #2421 (epic #2416, Sub-Issue E).

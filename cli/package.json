@@ -1,5 +1,5 @@
 {
-  "name": "@twsxtd/hapi",
+  "name": "hapi-cli",
   "version": "0.6.0",
   "description": "App for agentic coding - access coding agent anywhere",
   "author": "Kirill Dubovitskiy & weishu",
@@ -12,25 +12,11 @@
     "url": "git+https://github.com/SolidPD/hapimatic-core.git",
     "directory": "cli"
   },
-  "bin": {
-    "hapi": "bin/hapi.cjs"
-  },
-  "files": [
-    "bin/hapi.cjs",
-    "NOTICE"
-  ],
   "imports": {
     "#embedded-assets": {
       "bun": "./src/runtime/embeddedAssets.bun.ts",
       "default": "./src/runtime/embeddedAssets.stub.ts"
     }
-  },
-  "optionalDependencies": {
-    "@twsxtd/hapi-darwin-arm64": "0.6.0",
-    "@twsxtd/hapi-darwin-x64": "0.6.0",
-    "@twsxtd/hapi-linux-arm64": "0.6.0",
-    "@twsxtd/hapi-linux-x64": "0.6.0",
-    "@twsxtd/hapi-win32-x64": "0.6.0"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -38,15 +24,12 @@
     "build:exe:all": "bun run scripts/build-executable.ts --all",
     "build:exe:allinone": "bun run scripts/build-executable.ts --with-web-assets",
     "build:exe:allinone:all": "bun run scripts/build-executable.ts --with-web-assets --all",
-    "prepare-npm-packages": "bun run scripts/prepare-npm-packages.ts",
-    "prepack": "bun run prepare-npm-packages",
     "tools:unpack": "bun run scripts/unpack-tools.ts",
     "test": "bun run tools:unpack && vitest run",
     "test:win": "vitest run",
     "dev": "bun src/index.ts",
     "dev:local-server": "bun --env-file .env.dev-local-server src/index.ts",
-    "dev:integration-test-env": "bun --env-file .env.integration-test src/index.ts",
-    "release-all": "bun run scripts/release-all.ts"
+    "dev:integration-test-env": "bun --env-file .env.integration-test src/index.ts"
   },
   "dependencies": {
     "@hapi/protocol": "workspace:*",
@@ -82,5 +65,6 @@
     "parse-path": "7.0.3",
     "@types/parse-path": "7.0.3"
   },
-  "packageManager": "bun@1.4.0"
+  "packageManager": "bun@1.4.0",
+  "private": true
 }

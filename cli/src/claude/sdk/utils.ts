@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Utility functions for Claude Code SDK integration
  * Provides helper functions for path resolution and logging

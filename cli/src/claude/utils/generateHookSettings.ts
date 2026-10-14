@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Generate temporary settings file with Claude hooks for session tracking.
  *
@@ -34,6 +34,20 @@ export interface ApiKeyHelperBinding {
   /** The mask recorded at spawn; the helper refuses a key that no longer matches. */
   masked?: string;
 }
+
+/**
+ * Issue #5118: the prompt-cache TTL an API-key session's main conversation uses.
+ * Claude Code 2.1.280 defaults an API-key credential to the 5-minute TTL (a
+ * subscription within its limits gets 1 hour), so every idle gap of 5–60 min
+ * re-wrote the whole cached context at the 1.25× write rate. The setting outranks
+ * that default; env `CLAUDE_CODE_PROMPT_CACHE_TTL` still outranks the setting,
+ * which is the operator's escape hatch. Requests outside the main conversation
+ * (subagents, workflows, background and helper requests) keep Claude Code's own
+ * default: 5 minutes unless `subagentPromptCacheTtl`,
+ * `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` or `ENABLE_PROMPT_CACHING_1H` says
+ * otherwise.
+ */
+export const API_KEY_SESSION_PROMPT_CACHE_TTL = "1h";
 
 /**
  * Issue #4568 (F1): the `apiKeyHelper` command string for an API-key session.
@@ -125,6 +139,7 @@ export function generateHookSettingsFile(
     claudeMdExcludes?: string[];
     outputStyle?: string;
     apiKeyHelper?: string;
+    promptCacheTtl?: string;
   } = {
     hooks: {
       SessionStart: hookEntry,
@@ -155,9 +170,12 @@ export function generateHookSettingsFile(
   // measured on 2.1.280, the helper outranks `CLAUDE_CODE_OAUTH_TOKEN` and the
   // `/login` credentials, and a failing helper yields an empty credential (a
   // 401), never a login fallback. Only added for a key session — every other
-  // session's file stays byte-identical.
+  // session's file stays byte-identical. Issue #5118: the same gate sets the
+  // 1-hour cache TTL, so the two keys cannot drift apart (measured on 2.1.280: a
+  // `--settings` `promptCacheTtl` is honoured in normal and `--safe-mode`).
   if (apiKeyBinding) {
     settings.apiKeyHelper = buildApiKeyHelperCommand(apiKeyBinding);
+    settings.promptCacheTtl = API_KEY_SESSION_PROMPT_CACHE_TTL;
   }
 
   writeFileSync(filepath, JSON.stringify(settings, null, 4));
@@ -175,6 +193,8 @@ export function generateHookSettingsFile(
  * credential, and measured on Claude Code 2.1.280 `--safe-mode` still honours a
  * `--settings` `apiKeyHelper` while hooks stay disabled. Without this file a
  * safe-mode key session would have no key and fall through to the host login.
+ * Issue #5118: it also carries the 1-hour cache TTL, which `--safe-mode` honours
+ * from `--settings` too (measured on 2.1.280).
  */
 export function generateApiKeyHelperSettingsFile(
   binding: ApiKeyHelperBinding
@@ -184,7 +204,14 @@ export function generateApiKeyHelperSettingsFile(
   const filepath = join(hooksDir, `api-key-helper-${process.pid}.json`);
   writeFileSync(
     filepath,
-    JSON.stringify({ apiKeyHelper: buildApiKeyHelperCommand(binding) }, null, 4)
+    JSON.stringify(
+      {
+        apiKeyHelper: buildApiKeyHelperCommand(binding),
+        promptCacheTtl: API_KEY_SESSION_PROMPT_CACHE_TTL,
+      },
+      null,
+      4
+    )
   );
   logger.debug(
     `[generateHookSettings] Created API-key helper settings file: ${filepath}`

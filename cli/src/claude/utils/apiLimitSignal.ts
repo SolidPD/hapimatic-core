@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Launcher-agnostic extraction of an API-limit signal from one session message
  * (#4936). Feeds the single classification point

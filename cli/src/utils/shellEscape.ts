@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Shell single-quote escaping + the tmux spawn-command length ceiling.
  *

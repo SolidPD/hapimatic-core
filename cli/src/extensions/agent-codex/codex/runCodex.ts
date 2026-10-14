@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { logger } from "@/ui/logger";
 import { loop, type EnhancedMode, type PermissionMode } from "./loop";
 import { MessageQueue2 } from "@/utils/MessageQueue2";

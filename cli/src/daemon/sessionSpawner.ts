@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /* eslint-disable max-lines -- Grandfathered god-file: extracted VERBATIM from run.ts (Epic 0, #2081/#2077) already at ~1498/1500 by construction; decomposition verdict tracked in claudedocs/architecture-hotspot-review.md. #1082 adds the codex tmux-persistence gate/wiring. */
 /**
  * `sessionSpawner` — the daemon's session-spawning core, extracted from
@@ -105,6 +105,25 @@ import { getSpawnPaused } from "./spawnPauseState";
  * webhook-timeout) find the install already settled and return immediately.
  */
 const DEPS_TEARDOWN_SETTLE_MS = 30_000;
+
+/**
+ * #5086: true when `directory`'s repo HEAD resolves to a commit. A `git init`
+ * folder with no commits (unborn branch) returns false. Mirrors the #2270
+ * `--show-toplevel` probe (same execFileSync, same inherited env) so the two
+ * probes in the worktree gate always see the same environment. Neither probe
+ * applies worktree.ts's #1435 GIT_* scrub (pre-existing; noted on #5086).
+ */
+function directoryHasHeadCommit(directory: string): boolean {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "--quiet", "HEAD"], {
+      cwd: directory,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Build the session spawner bound to `ctx` (shared maps) and `tracker` (the
@@ -731,6 +750,33 @@ export function createSessionSpawner(
             type: "error",
             errorMessage:
               "Selected directory is not a git repository — choose 'Basic' (simple) or a git directory.",
+          };
+        }
+      } else if (
+        !options.existingBranch &&
+        !directoryHasHeadCommit(directory)
+      ) {
+        // Issue #5086: a `git init` folder with no commits passes the
+        // --show-toplevel probe above, so it used to fail late in createWorktree
+        // ("Source repo HEAD not resolvable", worktree.ts) AFTER creating
+        // `.worktrees/` and appending to `.git/info/exclude` in the user's fresh
+        // project. Same split as the non-git branch: a defaulted type runs as a
+        // simple session; an explicit worktree gets a plain-words fix before any
+        // side effect. An existing-branch spawn needs no HEAD (it opens the named
+        // branch), so it is exempt and keeps its path.
+        if (!options.sessionType) {
+          logger.debug(
+            `[DAEMON RUN] sessionType defaulted to 'worktree' but '${directory}' has no commits yet — downgrading to 'simple'`
+          );
+          sessionType = "simple";
+        } else {
+          logger.debug(
+            `[DAEMON RUN] Explicit worktree spawn rejected: '${directory}' has no commits yet`
+          );
+          return {
+            type: "error",
+            errorMessage:
+              "The current branch in this Git repository has no commits yet, so there is nothing to branch a worktree from — make a first commit that includes your files (for example: git add . && git commit -m \"Initial commit\"), or choose 'Basic' (simple) to start the session in this folder.",
           };
         }
       } else if (

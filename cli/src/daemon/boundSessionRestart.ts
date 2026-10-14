@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Issue #1507 / #4679: restart the sessions bound to an account after its OAuth
  * token was rotated, so each running `claude` process picks up the fresh token

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Issue #4153 (A1/A2/A3/A5): the daemon-side facts `hapi doctor` judges, put in
  * the daemon's BOOT `daemon.state.json` write.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 export function getToolDescriptor(toolName: string): {
   edit: boolean;
   exitPlan: boolean;

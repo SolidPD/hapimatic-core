@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 export type CodexCliOverrides = {
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   approvalPolicy?: "untrusted" | "on-request" | "never";

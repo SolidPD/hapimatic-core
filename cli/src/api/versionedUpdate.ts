@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 export type AckResult = "success" | "version-mismatch";
 
 export type VersionedAckResult<ValueKey extends string> =

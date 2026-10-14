@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Who owns `daemon.state.json`, as seen by a running daemon (issue #4155).
  *

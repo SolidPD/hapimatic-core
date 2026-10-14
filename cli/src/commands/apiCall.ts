@@ -1,7 +1,8 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import axios from "axios";
 import { configuration } from "@/configuration";
 import { writeStdout } from "@/utils/stdout";
+import { authenticateCli } from "./cliAuth";
 
 /**
  * `hapi api call <METHOD> <path> [--json <body>] [--node <id>]` (issue #3751,
@@ -73,20 +74,6 @@ export const NODE_UNSUPPORTED = {
   code: "node_unsupported" as const,
 };
 
-async function authenticate(): Promise<string> {
-  const token = configuration.cliApiToken;
-  if (!token) {
-    console.error("CLI_API_TOKEN is required. Set it in env or settings.json.");
-    process.exit(1);
-  }
-  const resp = await axios.post(
-    `${configuration.serverUrl}/api/auth`,
-    { accessToken: token },
-    { timeout: 10_000 }
-  );
-  return resp.data.token as string;
-}
-
 /** Execute `hapi api call`. Prints the `{ok, data|error, code}` envelope to stdout;
  *  sets a non-zero exit code on any `ok:false` / non-2xx outcome. */
 export async function handleApiCall(args: string[]): Promise<void> {
@@ -104,7 +91,7 @@ export async function handleApiCall(args: string[]): Promise<void> {
     return;
   }
 
-  const jwt = await authenticate();
+  const jwt = await authenticateCli();
   const resp = await axios.post(
     `${configuration.serverUrl}/api/capabilities/call`,
     { method: resolved.method, path: resolved.path, body: resolved.body },

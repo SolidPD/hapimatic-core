@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Detects UserPromptSubmit hook block messages in the session's JSONL
  * transcript and reports them to the server's error log system via

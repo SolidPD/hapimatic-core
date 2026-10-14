@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * `DaemonContext` — the dependency-injection struct that replaces the implicit
  * closure capture inside `startDaemon` (issue #2081, Epic #2077 Sub-Issue D).
@@ -98,7 +98,7 @@ export interface DaemonContext {
   controlToken: string;
   /** The daemon control server's bound port. */
   controlPort: number;
-  /** The installed-CLI mtime captured at daemon start (version-change probe). */
+  /** The installed-CLI mtime captured at daemon start; recorded in daemon.state.json, acted on by no code since #4590. */
   startedWithCliMtimeMs: number | undefined;
   /** The daemon's locally-persisted state record. */
   fileState: DaemonLocallyPersistedState;

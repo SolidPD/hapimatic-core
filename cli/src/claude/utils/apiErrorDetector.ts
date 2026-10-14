@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Detects Anthropic API errors in the Claude Code JSONL message stream and
  * reports them to the server's error log system via logger.reportError()

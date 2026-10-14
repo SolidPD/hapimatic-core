@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { RpcHandlerManager } from "@/api/rpc/RpcHandlerManager";
 import { logger } from "@/lib";
 import { KILL_SESSION_META } from "@/api/rpc/capabilityMeta";

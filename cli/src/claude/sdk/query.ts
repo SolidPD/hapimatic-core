@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Main query implementation for Claude Code SDK
  * Handles spawning Claude process and managing message streams

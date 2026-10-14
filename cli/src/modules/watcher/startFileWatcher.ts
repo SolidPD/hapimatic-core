@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { logger } from "@/ui/logger";
 import { delay } from "@/utils/time";
 import { watch } from "fs/promises";

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * `hapi ext <install|enable|disable|uninstall|list|update>` — extension lifecycle
  * CLI commands (issue #1290, epic #1264 Phase 5).

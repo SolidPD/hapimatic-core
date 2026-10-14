@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * HAPI MCP server
  * Provides HAPI CLI specific tools including chat session title management
@@ -165,7 +165,7 @@ async function fetchImageAsBase64(url: string): Promise<
 // Auth [expert-review 1B-21]: the `/api` surface is JWT-gated
 // (server/src/web/middleware/auth.ts), so a raw `Bearer <cliApiToken>` 401s.
 // The tools exchange the token for a short-lived (15-min) JWT via `POST
-// /api/auth` — the house `authenticate()` pattern (cli/src/commands/api.ts) —
+// /api/auth` — the house `authenticateCli()` pattern (cli/src/commands/cliAuth.ts) —
 // cached per factory instance and refreshed on 401 or soft-expiry.
 //
 

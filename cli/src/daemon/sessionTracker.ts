@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * `sessionTracker` — the daemon's tracked-session bookkeeping, extracted from
  * `run.ts`'s `startDaemon` closure (issue #2081, Epic #2077 Sub-Issue D).

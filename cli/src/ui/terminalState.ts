@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 export function restoreTerminalState(): void {
   if (process.stdout.isTTY) {
     // Disable kitty keyboard protocol / CSI u key release reporting if enabled.

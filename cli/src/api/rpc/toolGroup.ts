@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * The session "tool group" — the set of RPC methods `registerCommonHandlers`
  * registers on BOTH the session and machine `RpcHandlerManager`s

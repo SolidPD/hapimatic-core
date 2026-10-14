@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * `healthScheduler` — the daemon's heartbeat / maintenance loop, extracted from
  * `run.ts`'s `startDaemon` closure (issue #2081, Epic #2077 Sub-Issue D).
  *
  * Owns the `maintenanceTick` body (stale-session prune, dead-pane/orphan-MCP
  * reaping, stale-socket cleanup, MCP status poll, rotation-lease heartbeat,
- * idle-refresh backstop, version check) + its MCP-poll failure/backoff state,
+ * idle-refresh backstop) + its MCP-poll failure/backoff state,
  * and builds + starts the `daemon-maintenance` `SupervisedLoop`.
  * `createHealthScheduler(ctx, clockSeams)` reads the shared state it needs from
  * the injected {@link DaemonContext}, threads the #2079 {@link ClockSeams} into
@@ -23,7 +23,6 @@ import { CLI_VERSION } from "@/version";
 import { type DaemonLocallyPersistedState } from "@/persistence";
 import { SupervisedLoop } from "@hapi/protocol";
 import { isProcessAlive } from "@/utils/process";
-import { getInstalledCliMtimeMs } from "./controlClient";
 import { pollMcpStatus } from "./mcpStatusPoller";
 import { dirsNeedingProjectPoll } from "./mcpPollStrategy";
 import {
@@ -447,37 +446,12 @@ export function createHealthScheduler(
         });
       }
 
-      // Intended to exit (code 1, so systemd restarts us) when the binary was
-      // updated, but it never fires: CLI_VERSION is this daemon's own build and
-      // fileState is the record this daemon wrote with the same constant, and
-      // the mtime branch below needs an empty CLI_VERSION. Deploys restart the
-      // unit instead; #4590 tracks removing this check.
-      const currentVersion = CLI_VERSION;
-      if (
-        currentVersion &&
-        fileState.startedWithCliVersion &&
-        currentVersion !== fileState.startedWithCliVersion
-      ) {
-        logger.debug(
-          `[DAEMON RUN] CLI version changed (${fileState.startedWithCliVersion} → ${currentVersion}), exiting so systemd restarts daemon`
-        );
-        maintenanceLoop.stop();
-        process.exit(1);
-      }
-      // Fallback: mtime comparison (when version string is unavailable)
-      const installedCliMtimeMs = getInstalledCliMtimeMs();
-      if (
-        !currentVersion &&
-        typeof installedCliMtimeMs === "number" &&
-        typeof startedWithCliMtimeMs === "number" &&
-        installedCliMtimeMs !== startedWithCliMtimeMs
-      ) {
-        logger.debug(
-          "[DAEMON RUN] Binary mtime changed (version unavailable), exiting so systemd restarts daemon"
-        );
-        maintenanceLoop.stop();
-        process.exit(1);
-      }
+      // No build check here (#4590): a daemon never restarts itself on a new
+      // binary. The deploy flow restarts its unit (prod deploy script, closer dev
+      // deploy — rp1-home#813, worktree-build.sh --restart, deploy-node.sh).
+      // `daemon start`, `daemon start-sync` and `hapi doctor` only report a
+      // build skew from the recorded startedWithCliVersion; `hapi claude` leaves
+      // a live daemon of any build running (#4594).
 
       // Heartbeat
       try {

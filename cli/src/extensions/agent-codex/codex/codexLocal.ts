@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { logger } from "@/ui/logger";
 import { restoreTerminalState } from "@/ui/terminalState";
 import { spawnWithAbort } from "@/utils/spawnWithAbort";

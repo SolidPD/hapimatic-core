@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Detects in-session cron / loop-wakeup usage (CronCreate, ScheduleWakeup tool
  * calls) in the JSONL session message stream and surfaces a non-silent

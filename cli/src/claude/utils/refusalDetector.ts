@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Detects model content-policy refusals so they surface visibly in the chat
  * thread instead of leaving a dead-looking session (issue #1633).

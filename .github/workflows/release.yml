@@ -42,18 +42,49 @@ jobs:
           cd cli/dist-exe
           mkdir -p ../release-artifacts
 
+          # --- NOTICES-SHIP-BEGIN (#5128 R2) ---
+          # Every binary carries the license notices it owes: the AGPL LICENSE, NOTICE, and
+          # THIRD-PARTY-NOTICES.md (the license text of each bundled third-party component, the MPL
+          # source pointers and the embedded Bun runtime's LGPL notice). They go INSIDE each archive,
+          # beside the binary, because the one-command installer downloads only the archive; the
+          # Release also carries THIRD-PARTY-NOTICES.md and a CycloneDX SBOM stamped with this version.
+          # A tree missing any of them fails this step, so no Release ships without them.
+          NOTICES=../../THIRD-PARTY-NOTICES.md
+          SBOM=../../sbom/hapimatic-core.cdx.json
+          for f in ../../LICENSE ../../NOTICE "$NOTICES" "$SBOM"; do
+              if [ ! -f "$f" ]; then
+                  echo "::error title=${f##*/} missing::${f#../../} is not in this source tree, so no Release is created (every binary ships with its license and third-party notices)."
+                  exit 1
+              fi
+          done
+          # --- NOTICES-SHIP-END ---
+
           for dir in bun-*/; do
               target="${dir%/}"
               # bun-darwin-arm64 -> hapi-darwin-arm64
               name="hapi-${target#bun-}"
               name="${name/windows/win32}"
+              cp ../../LICENSE ../../NOTICE "$NOTICES" "$target"/
 
               if [[ "$target" == *"windows"* ]]; then
-                  zip -j "../release-artifacts/${name}.zip" "$target"/hapi.exe
+                  zip -j "../release-artifacts/${name}.zip" "$target"/hapi.exe \
+                      "$target"/LICENSE "$target"/NOTICE "$target"/THIRD-PARTY-NOTICES.md
               else
-                  tar -czvf "../release-artifacts/${name}.tar.gz" -C "$target" hapi
+                  tar -czvf "../release-artifacts/${name}.tar.gz" -C "$target" \
+                      hapi LICENSE NOTICE THIRD-PARTY-NOTICES.md
               fi
           done
+
+          # The Release copies (#5128 R2): the notices, and the SBOM with its version set to this tag's.
+          # The committed SBOM carries no version on purpose, so a version bump never stales it.
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error title=unexpected tag::$GITHUB_REF is not a v<MAJOR>.<MINOR>.<PATCH> tag, so the SBOM cannot be stamped."
+              exit 1
+          fi
+          cp "$NOTICES" ../release-artifacts/THIRD-PARTY-NOTICES.md
+          jq --arg v "$VERSION" '.metadata.component.version = $v' "$SBOM" \
+              > "../release-artifacts/hapimatic-core-${VERSION}.cdx.json"
 
           # --- INSTALLER-SHIP-BEGIN (#5069, #5072) ---
           # Ship the one-command installer under its own versioned name, install-hapimatic-v1.sh: the

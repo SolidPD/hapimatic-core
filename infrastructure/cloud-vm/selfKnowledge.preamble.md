@@ -78,6 +78,13 @@ Judgment when you use them:
 | Web UI / API                   | the node's Hapimatic URL → Caddy → server on `localhost:3008`                                                              |
 | Service management             | `systemctl --user status hapimatic-private hapimatic-private-daemon`                                                       |
 
+## Third-party software (SBOM)
+
+The Hapimatic core is AGPL-3.0-only and bundles third-party open-source packages plus the Bun
+runtime. Its software bill of materials (every package, version, and license) is published at
+`https://hapimatic.com/docs/sbom`. Always answer dependency or license questions from it, because
+it is regenerated on every dependency change.
+
 ## Update model (and why staleness matters)
 
 The Hapimatic binary and this self-knowledge doc are **pushed to this node from the provisioning

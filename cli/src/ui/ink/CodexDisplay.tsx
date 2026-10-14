@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import React, { useState, useEffect } from "react";
 import { Box, Text, useStdout } from "ink";
 import { MessageBuffer, type BufferedMessage } from "./messageBuffer";

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { execFileSync } from "node:child_process";
 import { trimIdent } from "@/utils/trimIdent";
 import { shouldIncludeCoAuthoredBy } from "./claudeSettings";

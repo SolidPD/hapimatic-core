@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * PushableAsyncIterable - A generic async iterable that allows external pushing
  * Provides a clean API for creating async iterables that can be pushed to from external sources

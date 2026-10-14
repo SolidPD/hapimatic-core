@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { readFileSync, existsSync } from "node:fs";
 import { logger } from "@/ui/logger";
 import { configuration } from "@/configuration";

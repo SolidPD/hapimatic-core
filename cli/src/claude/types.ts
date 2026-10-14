@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Simplified schema that only validates fields actually used in the codebase
  * while preserving all other fields through passthrough()

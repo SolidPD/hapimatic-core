@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Stale tmux-socket sweep (issue #4204, PR-1 / Task 1 — the urgent fix for the
  * root cause of #4204).

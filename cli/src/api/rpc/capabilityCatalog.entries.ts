@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Capability catalog — `rpc` surface entries (issue #3745, epic #3740, Sub-Issue E).
  *

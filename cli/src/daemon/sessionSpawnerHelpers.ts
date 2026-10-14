@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * `sessionSpawnerHelpers` — module-scope helpers lifted out of
  * `sessionSpawner.ts` (issue #2081, Epic #2077 Sub-Issue D) so `sessionSpawner`

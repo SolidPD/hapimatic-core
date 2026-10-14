@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Codex tmux launcher helpers (issue #1082 — Multi-LLM Tier 2)
  *

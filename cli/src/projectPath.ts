@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { dirname, resolve, join } from "path";
 import { fileURLToPath } from "url";
 import { configuration } from "@/configuration";

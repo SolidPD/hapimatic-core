@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Detects the Anthropic subscription SESSION-LIMIT rate-limit (HTTP 429) in the
  * session message stream so launchers can surface a "rate-limited — resets

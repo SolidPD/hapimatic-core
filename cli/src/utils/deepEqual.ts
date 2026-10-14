@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 // Deep equality helper for comparing tool arguments
 export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;

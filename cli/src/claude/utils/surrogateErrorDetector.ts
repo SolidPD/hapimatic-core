@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Detects the unrecoverable UTF-16 surrogate-truncation death-loop (issue #1604).
  *

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import type { RpcHandlerManager } from "@/api/rpc/RpcHandlerManager";
 import { registerBashHandlers } from "./handlers/bash";
 import { registerDirectoryHandlers } from "./handlers/directories";

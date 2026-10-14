@@ -51,3 +51,20 @@ The following files/directories are derived from happy-cli:
 - src/projectPath.ts
 - src/lib.ts
 - src/index.ts
+
+---
+
+How the source files are labeled (the SPDX-License-Identifier line at the top
+of each file):
+
+- "MIT AND AGPL-3.0-only": the file derives from happy-cli. It contains
+  MIT-licensed code from happy-cli, under the notice above, together with
+  modifications licensed under AGPL-3.0-only.
+- "AGPL-3.0-only": every other file, including files written later for
+  tiann/hapi or for Hapimatic inside the directories listed above. Where such a
+  file incorporates code moved out of a happy-cli file, that code remains
+  available under the MIT License above.
+
+A file is labeled as derived from happy-cli when any path it has had in this
+repository's history (renames included) also appears in the history of
+slopus/happy-cli.

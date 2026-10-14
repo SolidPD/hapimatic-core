@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * `worktreeCollector` — the daily 05:00-local expired-worktree trash collector
  * (issue #3451). Before this, `purgeExpiredWorktrees` ran ONLY at worktree-spawn

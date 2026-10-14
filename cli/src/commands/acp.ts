@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import chalk from "chalk";
 import { Writable } from "node:stream";
 import { authAndSetupMachineIfNeeded } from "@/ui/auth";

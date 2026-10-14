@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { execFileSync } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";

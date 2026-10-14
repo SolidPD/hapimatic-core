@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { basename, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Clears the web "thinking" status dot on a clean turn-end under the tmux/pty
  * launchers (issue #1742).

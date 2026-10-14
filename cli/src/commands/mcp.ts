@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { runHappyMcpStdioBridge } from "@/extensions/agent-codex/codex/happyMcpStdioBridge";
 import type { CommandDefinition } from "./types";
 

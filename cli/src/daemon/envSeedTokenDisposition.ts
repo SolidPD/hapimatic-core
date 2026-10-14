@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Issue #3731 (R0/R0b, F1, F8): the daemon's handling of the onboarding
  * `CLAUDE_CODE_OAUTH_TOKEN` it finds in its service env.

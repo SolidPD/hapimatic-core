@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Issue #1488 (Gap 2): surfaces a first-order model-name + context-window indicator
  * for the PTY/tmux launchers, which cannot use the SDK `get_context_usage`

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Daemon-global spawn-quiesce flag (issue #1774, Sub E of epic #1769, Task 10 /
  * R9 / KD-2).

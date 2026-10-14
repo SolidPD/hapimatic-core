@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import type { Query } from "./sdk/query";
 import { SdkRequestError } from "./sdk/types";
 

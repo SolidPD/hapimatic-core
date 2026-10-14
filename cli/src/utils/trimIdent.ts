@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 export function trimIdent(text: string): string {
   // Split the text into an array of lines
   const lines = text.split("\n");

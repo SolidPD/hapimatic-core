@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import chalk from "chalk";
 import os from "node:os";
 import * as readline from "node:readline/promises";

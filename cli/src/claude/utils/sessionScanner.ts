@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { RawJSONLines, RawJSONLinesSchema } from "../types";
 import { basename, join } from "node:path";
 import { existsSync } from "node:fs";

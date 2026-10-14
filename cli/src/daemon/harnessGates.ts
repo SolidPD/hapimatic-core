@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Manifest-driven harness capability gates (issue #3126, epic #3117 Sub-Issue K).
  *

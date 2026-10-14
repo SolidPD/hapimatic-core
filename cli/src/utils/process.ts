@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import type { ChildProcess } from "node:child_process";
 import spawn from "cross-spawn";
 

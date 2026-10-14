@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import type { Session } from "@/claude/session";
 import type { SessionModelMode } from "@/api/types";
 import type { ClaudeAccountInfo } from "@hapi/protocol/schemas";

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Cross-layer observability for process-hygiene cleanup (issue #1031).
  *

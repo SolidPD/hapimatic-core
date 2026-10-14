@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Orphan-MCP reaper (issue #849), scoped to this instance and anchored to the
  * MCP server's own identity (issue #4065).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { logger } from "@/ui/logger";
 import { runLocalRemoteSession } from "@/agent/loopBase";

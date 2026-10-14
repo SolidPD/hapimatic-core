@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Detects auth-class API failures (HTTP 401/403 `authentication_error`) in the
  * message stream so launchers can fail FAST instead of burning their burst-load

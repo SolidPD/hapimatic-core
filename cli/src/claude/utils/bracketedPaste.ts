@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 

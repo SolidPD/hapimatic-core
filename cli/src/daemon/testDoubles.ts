@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Test doubles for the `startDaemon` characterization tests (issue #2079,
  * Epic #2077 Sub-Issue B). These are fake adapters + fixture builders + process

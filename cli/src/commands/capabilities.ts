@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * `hapi capabilities audit [--json] [--node <id>]` — the runtime self-audit CLI
  * verb (issue #3744, Sub-Issue D / R6, Task 5 + Task 7).
@@ -25,6 +25,7 @@ import { writeStdout } from "@/utils/stdout";
 import { capabilityCatalogIndex } from "@hapi/protocol";
 import type { CatalogEntry } from "@hapi/protocol";
 import type { CommandDefinition } from "./types";
+import { authenticateCli } from "./cliAuth";
 import { listCommands } from "./registry";
 import { API_RESOURCE_ACTIONS } from "./api";
 import { HAPY_MCP_TOOL_NAMES } from "@/claude/utils/startHappyServer";
@@ -63,20 +64,6 @@ const REMOTE_COLLECTORS = {
   cli: "unobserved",
   ui: "unobserved",
 } as const;
-
-async function authenticate(): Promise<string> {
-  const token = configuration.cliApiToken;
-  if (!token) {
-    console.error("CLI_API_TOKEN is required. Set it in env or settings.json.");
-    process.exit(2);
-  }
-  const resp = await axios.post(
-    `${configuration.serverUrl}/api/auth`,
-    { accessToken: token },
-    { timeout: 10_000 }
-  );
-  return resp.data.token as string;
-}
 
 function authHeaders(jwt: string): Record<string, string> {
   return { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" };
@@ -197,7 +184,7 @@ function emitReport(
 async function runLocalAudit(jsonMode: boolean): Promise<void> {
   let result: ServerAuditResult;
   try {
-    const jwt = await authenticate();
+    const jwt = await authenticateCli(2);
     const resp = await axios.get(
       `${configuration.serverUrl}/api/capabilities/audit?format=full`,
       { headers: authHeaders(jwt), timeout: 10_000 }
@@ -229,7 +216,7 @@ async function runProbeAudit(jsonMode: boolean): Promise<void> {
     rest?: (CatalogEntry & { available?: boolean; reason?: string })[];
   };
   try {
-    headers = authHeaders(await authenticate());
+    headers = authHeaders(await authenticateCli(2));
     const resp = await axios.get(
       `${configuration.serverUrl}/api/capabilities/catalog`,
       { headers, timeout: 10_000 }
@@ -311,7 +298,7 @@ async function runRemoteAudit(
     peerVersion?: string | null;
   };
   try {
-    const jwt = await authenticate();
+    const jwt = await authenticateCli(2);
     const resp = await axios.get(
       `${configuration.serverUrl}/api/capabilities/audit?nodeId=${encodeURIComponent(
         nodeId

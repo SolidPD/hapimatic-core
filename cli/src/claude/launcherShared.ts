@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Shared launcher constants and helpers used by both `claudePty.ts` (PTY-attach
  * launcher) and `claudeTmuxRemote.ts` (tmux backup launcher). Extracted from

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import axios from "axios";
 import chalk from "chalk";
 import { PmSpawnReconciliationStatusSchema } from "@hapi/protocol";
@@ -13,28 +13,13 @@ import { readSettings } from "@/persistence";
 import { writeStdout } from "@/utils/stdout";
 import { handleErrorLogs } from "./apiErrorLogs";
 import { handleApiCall } from "./apiCall";
+import { authenticateCli, cliApiTokenSourcesNote } from "./cliAuth";
 import {
   SPAWN_CLIENT_TIMEOUT_MS,
   isAxiosTimeout,
   spawnTimeoutMessage,
 } from "./apiSpawnError";
 import type { CommandDefinition } from "./types";
-
-async function authenticate(): Promise<string> {
-  const token = configuration.cliApiToken;
-  if (!token) {
-    console.error("CLI_API_TOKEN is required. Set it in env or settings.json.");
-    process.exit(1);
-  }
-
-  const resp = await axios.post(
-    `${configuration.serverUrl}/api/auth`,
-    { accessToken: token },
-    { timeout: 10_000 }
-  );
-
-  return resp.data.token as string;
-}
 
 function authHeaders(jwt: string): Record<string, string> {
   return {
@@ -357,7 +342,7 @@ async function handleSessions(args: string[]): Promise<void> {
   const action = args[0];
 
   if (action === "list") {
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     const headers = authHeaders(jwt);
     const url = configuration.serverUrl;
 
@@ -393,7 +378,7 @@ async function handleSessions(args: string[]): Promise<void> {
     const { dir, machineId, name, sessionRole, modelMode, parentSessionId } =
       resolved;
 
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     // Issue #1565: request the early-return spawn path (Option B). A new server
     // acks {type:"accepted", sessionId} immediately and we poll /api/sessions for
     // the session's lifecycleState (spawning → running/failed), surfacing a
@@ -509,7 +494,7 @@ async function handleSessions(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     // #3331 (Task 5, ruling D6(a)): attach the CLI's own session id so the server
     // classes this send `cli-api` (the origin discriminator) and runs the R3
     // self-send check. Unset HAPI_SESSION_ID → no header → the send degrades to
@@ -535,7 +520,7 @@ async function handleSessions(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     const resp = await axios.get(
       `${configuration.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/messages`,
       { headers: authHeaders(jwt), timeout: 10_000, params: { limit: 50 } }
@@ -554,7 +539,7 @@ async function handleSessions(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     const resp = await axios.get(`${configuration.serverUrl}${resolved.path}`, {
       headers: authHeaders(jwt),
       timeout: 10_000,
@@ -570,7 +555,7 @@ async function handleSessions(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     const resp = await axios.delete(
       `${configuration.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}`,
       { headers: authHeaders(jwt), timeout: 10_000 }
@@ -586,7 +571,7 @@ async function handleSessions(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     const resp = await axios.post(
       `${configuration.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/branch`,
       {},
@@ -603,7 +588,7 @@ async function handleSessions(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     const resp = await axios.post(
       `${configuration.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/abort`,
       {},
@@ -620,7 +605,7 @@ async function handleSessions(args: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const jwt = await authenticate();
+    const jwt = await authenticateCli();
     const resp = await axios.post(
       `${configuration.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/archive`,
       {},
@@ -655,7 +640,7 @@ ${chalk.bold("Notes:")}
   - 'abort' interrupts the current Claude query but the session stays active
   - 'archive' kills the session process, marking it inactive (required before delete)
   - All commands output JSON to stdout
-  - Authentication uses CLI_API_TOKEN from env or settings.json
+  - ${cliApiTokenSourcesNote()}
 `);
 }
 
@@ -671,7 +656,7 @@ async function handleSessionMetadata(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const jwt = await authenticate();
+  const jwt = await authenticateCli();
   const headers = authHeaders(jwt);
   const url = `${configuration.serverUrl}${req.path}`;
 
@@ -709,14 +694,14 @@ ${chalk.bold("Status values:")} spawned | complete | re-driving
 
 ${chalk.bold("Notes:")}
   - All commands output JSON to stdout
-  - Authentication uses CLI_API_TOKEN from env or settings.json
+  - ${cliApiTokenSourcesNote()}
   - --all-nodes queries the hub federation aggregate across all nodes
 `);
 }
 
 /**
  * `hapi api initiatives <action>` — CRUD + roster/phase/reconcile over the
- * initiative object (issue #2156). One handler + `authenticate()`/`authHeaders()`
+ * initiative object (issue #2156). One handler + `authenticateCli()`/`authHeaders()`
  * + `axios` against `/api/initiatives…`, mirroring handleSessionMetadata.
  */
 async function handleInitiatives(args: string[]): Promise<void> {
@@ -726,7 +711,7 @@ async function handleInitiatives(args: string[]): Promise<void> {
     return;
   }
 
-  const jwt = await authenticate();
+  const jwt = await authenticateCli();
   const headers = authHeaders(jwt);
   const base = `${configuration.serverUrl}/api/initiatives`;
   const jlog = (data: unknown): void =>
@@ -905,7 +890,7 @@ ${chalk.bold("Notes:")}
   - The initiative is a CACHE over GitHub label truth — reconcile-on-read, GitHub wins on conflict
   - The event log is append-only: there is no update/delete of a recorded event
   - All commands output JSON to stdout
-  - Authentication uses CLI_API_TOKEN from env or settings.json
+  - ${cliApiTokenSourcesNote()}
 `);
 }
 
@@ -1092,7 +1077,7 @@ export const apiCommand: CommandDefinition = {
 
     if (resource === "auth") {
       try {
-        const jwt = await authenticate();
+        const jwt = await authenticateCli();
         writeStdout(jwt);
       } catch (error) {
         if (axios.isAxiosError(error)) {

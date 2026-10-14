@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { dirname, relative, resolve, sep } from "path";
 import { existsSync, realpathSync } from "fs";
 import { homedir } from "os";

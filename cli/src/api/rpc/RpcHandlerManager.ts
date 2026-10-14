@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Generic RPC handler manager for session and machine clients
  * Manages RPC method registration and handler execution (no encryption).

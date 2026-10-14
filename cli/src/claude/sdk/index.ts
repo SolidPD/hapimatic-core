@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Claude Code SDK integration for HAPI CLI
  * Provides clean TypeScript implementation without Bun support

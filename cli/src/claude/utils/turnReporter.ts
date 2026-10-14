@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * CLI-side per-turn telemetry reporter (issue #1664, epic #1662 — Sub B).
  *

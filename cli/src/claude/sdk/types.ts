@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 /**
  * Type definitions for Claude Code SDK integration
  * Provides type-safe interfaces for all SDK communication

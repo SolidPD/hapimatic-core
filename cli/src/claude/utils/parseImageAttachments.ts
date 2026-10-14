@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Parse image attachments from user messages and convert them to
  * base64 content blocks for direct injection into the Claude API.

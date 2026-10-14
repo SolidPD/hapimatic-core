@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Sub D (#1666, epic #1662): local working-tree git probe for per-turn telemetry.
  *

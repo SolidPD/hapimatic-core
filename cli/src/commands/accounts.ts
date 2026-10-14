@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { forceRefreshDaemonAccount } from "@/daemon/controlClient";
 import type { ForceRefreshReport } from "@/modules/common/rpcTypes";
 import {

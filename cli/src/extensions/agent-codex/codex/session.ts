@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { ApiClient, ApiSessionClient } from "@/lib";
 import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { AgentSessionBase } from "@/agent/sessionBase";

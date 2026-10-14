@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 import { accountsCommand } from "./accounts";
 import { acpCommand } from "./acp";
 import { apiCommand } from "./api";

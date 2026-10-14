@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-only
 /**
  * Issue #4383: `BackgroundAgentTracker` — the single component that sees every
  * launcher's background-Agent START and END.

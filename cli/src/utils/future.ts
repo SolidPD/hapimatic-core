@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT AND AGPL-3.0-only
 export class Future<T> {
   private _resolve!: (value: T) => void;
   private _reject!: (reason?: unknown) => void;
