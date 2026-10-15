@@ -16,7 +16,7 @@ import {
   SetModelRequestSchema,
   SetPermissionModeRequestSchema,
 } from "@hapi/protocol/schemas";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import type { SyncEngine, Session } from "../../sync/syncEngine";
 import { reconcile, listForNamespace } from "../../sync/pendingSpawns";
@@ -27,6 +27,16 @@ import { cataloged } from "../../capabilities/cataloged";
 import { logAndJson } from "./routeErrorHelper";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { SessionService } from "../../services/sessionService";
+import {
+  BULK_SESSION_MAX_IDS,
+  BulkSessionResultSchema,
+  type BulkSessionResult,
+} from "@hapi/protocol/bulkSessionResult";
+import {
+  runBulkDelete,
+  runBulkSessionAction,
+  type BulkSessionAction,
+} from "./bulkSessionActions";
 import type { PaymentMethodTarget } from "../../sync/accountRestart";
 import {
   EMOJI_MUTATION,
@@ -1948,7 +1958,7 @@ export function createSessionsRoutes(
         domain: "session-lifecycle",
         surface: "rest",
         description:
-          "Delete up to 100 sessions by id in one request, partitioning local and remote nodes and skipping active sessions.",
+          "Delete up to 100 sessions by id in one request, partitioning local and remote nodes and skipping active sessions; returns one result per session.",
         whenToUse: "When the user clears out several sessions at once.",
         invocation: {
           kind: "rest",
@@ -1979,92 +1989,134 @@ export function createSessionsRoutes(
       }
 
       const namespace = c.get("namespace");
-      const registry = options?.getNodeRegistry?.();
+      const registry = options?.getNodeRegistry?.() ?? null;
 
-      // Partition IDs into local vs. remote
-      const localIds: string[] = [];
-      const remoteByNode = new Map<string, string[]>();
-
-      for (const id of parsed.data.ids) {
-        // Check if session exists locally
-        const session = engine.getSession(id);
-        if (session) {
-          localIds.push(id);
-          continue;
-        }
-
-        // Check if session is on a remote node
-        if (registry) {
-          const node = registry.findNodeForSession(id);
-          if (node) {
-            const existing = remoteByNode.get(node.nodeId) ?? [];
-            existing.push(id);
-            remoteByNode.set(node.nodeId, existing);
-            continue;
-          }
-        }
-
-        // Not found anywhere — treat as local (SyncEngine will skip it)
-        localIds.push(id);
+      // #3815 Task 1b: one result per session (`results`, additive). Local ids
+      // are namespace-checked before the engine sees them; remote ids are
+      // deleted per SESSION (registry.deleteOnNode) so each has an outcome.
+      let results: BulkSessionResult;
+      try {
+        results = await runBulkDelete({
+          ids: parsed.data.ids,
+          engine,
+          namespace,
+          registry,
+        });
+      } catch (error) {
+        return logAndJson(c, error, 500, {
+          errorLogger,
+          category: "sessions-bulk-delete",
+          fallbackMessage: "Failed to delete sessions",
+        });
       }
 
-      let localDeleted = 0;
-      let localSkipped = 0;
-      let remoteDeleted = 0;
-      let remoteSkipped = 0;
-      const remoteErrors: string[] = [];
-
-      // Delete local sessions
-      if (localIds.length > 0) {
-        try {
-          const result = await engine.deleteSessions(localIds, namespace);
-          localDeleted = result.deleted.length;
-          localSkipped = result.skipped.length;
-        } catch (error) {
-          return logAndJson(c, error, 500, {
-            errorLogger,
-            category: "sessions-bulk-delete",
-            fallbackMessage: "Failed to delete sessions",
-          });
-        }
-      }
-
-      // Proxy delete to remote nodes in parallel
-      if (registry && remoteByNode.size > 0) {
-        const remoteResults = await Promise.allSettled(
-          Array.from(remoteByNode.entries()).map(async ([nodeId, ids]) => {
-            const result = await registry.bulkDeleteOnNode(nodeId, ids);
-            if ("ok" in result) {
-              return { deleted: result.deleted, skipped: result.skipped };
-            }
-            return {
-              deleted: 0,
-              skipped: ids.length,
-              error: result.message,
-            };
-          })
-        );
-
-        for (const r of remoteResults) {
-          if (r.status === "fulfilled") {
-            remoteDeleted += r.value.deleted;
-            remoteSkipped += r.value.skipped;
-            if ("error" in r.value && r.value.error) {
-              remoteErrors.push(r.value.error);
-            }
-          } else {
-            remoteErrors.push(r.reason?.message ?? "Remote delete failed");
-          }
-        }
-      }
-
+      // The numeric fields keep their pre-#3815 meaning for peers and scripts
+      // that read them: `deleted` = sessions removed, `skipped` = every
+      // requested session that was NOT removed. `remoteErrors` keeps the
+      // messages of remote failures that are not a refusal.
+      const deleted = results.filter(r => r.ok).length;
+      const remoteErrors = results
+        .filter(r => !r.ok && !r.skipped && r.error !== undefined)
+        .map(r => r.error as string);
       return c.json({
         ok: true,
-        deleted: localDeleted + remoteDeleted,
-        skipped: localSkipped + remoteSkipped,
+        deleted,
+        skipped: results.length - deleted,
         ...(remoteErrors.length > 0 ? { remoteErrors } : {}),
+        results,
       });
     }
+  );
+
+  // #3815: Stop turn and Disconnect over a selection — one route and one
+  // honest risk tier each (a capability carries a single `riskTier`, so one
+  // `/sessions/bulk` route could not describe three grades). Delete stays on
+  // `/sessions/bulk-delete` (destructive). Body and 100-id cap match it.
+  const bulkActionBodySchema = z.object({
+    ids: z.array(z.string().uuid()).min(1).max(BULK_SESSION_MAX_IDS),
+  });
+
+  const handleBulkAction =
+    (action: BulkSessionAction) =>
+    async (c: Context<WebAppEnv>): Promise<Response> => {
+      const engine = requireSyncEngine(c, getSyncEngine);
+      if (engine instanceof Response) {
+        return engine;
+      }
+
+      const body = await c.req.json().catch(() => null);
+      const parsed = bulkActionBodySchema.safeParse(body);
+      if (!parsed.success) {
+        return c.json(
+          { error: "Invalid request body", details: parsed.error.issues },
+          400
+        );
+      }
+
+      const results = await runBulkSessionAction({
+        action,
+        ids: parsed.data.ids,
+        engine,
+        namespace: c.get("namespace"),
+        registry: options?.getNodeRegistry?.() ?? null,
+      });
+      const checked = BulkSessionResultSchema.safeParse(results);
+      if (!checked.success) {
+        return logAndJson(c, checked.error, 500, {
+          errorLogger,
+          category: `sessions-bulk-${action}`,
+          fallbackMessage: "Bulk action produced an invalid result",
+        });
+      }
+      return c.json({ ok: true, results: checked.data });
+    };
+
+  app.post(
+    "/sessions/bulk-abort",
+    cataloged(
+      defineCapability({
+        id: "session-lifecycle.bulk-abort",
+        domain: "session-lifecycle",
+        surface: "rest",
+        description:
+          "Stop the running turn of up to 100 sessions by id, each on its owning federation node, leaving every session connected; returns one result per session.",
+        whenToUse:
+          "When the user stops the work of several sessions at once (select mode Stop turn, or a fleet-wide stop).",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/sessions/bulk-abort",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    handleBulkAction("abort")
+  );
+
+  app.post(
+    "/sessions/bulk-archive",
+    cataloged(
+      defineCapability({
+        id: "session-lifecycle.bulk-archive",
+        domain: "session-lifecycle",
+        surface: "rest",
+        description:
+          "Disconnect (archive for reconnect) up to 100 sessions by id, each on its owning federation node; returns one result per session.",
+        whenToUse:
+          "When the user disconnects several sessions at once from select mode.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/sessions/bulk-archive",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    handleBulkAction("archive")
   );
 
   app.delete(

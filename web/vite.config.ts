@@ -28,6 +28,10 @@ if (process.env.SENTRY_AUTH_TOKEN && !isDev) {
     );
   }
 }
+// The built manifest is the production identity: one web build is embedded in
+// the binary that every instance runs, and nothing sets VITE_INSTANCE_TYPE. The
+// server rewrites the manifest per request for the dev instance
+// (server/src/web/instanceManifest.ts, #4797).
 const iconsPath = isDev ? "icons" : "icons-production";
 const appName = isDev ? "Hapimatic DEV" : "Hapimatic";
 

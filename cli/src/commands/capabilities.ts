@@ -202,12 +202,102 @@ async function runLocalAudit(jsonMode: boolean): Promise<void> {
 }
 
 /**
+ * #4655: the Porter exposure gate's refusal code (`PORTER_WITHHELD_CODE` in
+ * `@hapi/protocol/porter`). Spelled here because the command registry loads
+ * this module on every `hapi` start, and importing the Porter barrel would add
+ * its schemas to that path; `capabilities.test.ts` pins the two equal.
+ */
+export const PROBE_PORTER_WITHHELD_CODE = "porter_withheld";
+
+/** #4655: one readonly probe response, classified for the comparator. */
+export type ProbeClassification =
+  | { kind: "outcome"; outcome: ProbeOutcome }
+  | { kind: "withheld" };
+
+/**
+ * #4655: classify one readonly probe response. A 2xx is an `ok` outcome; any
+ * other status is a failed outcome whose rejection is the body's `code`, then
+ * its `error`, then `http_<status>`. The one exception is a Porter capability
+ * answering the exposure gate's 404 `porter_withheld`: that is the instance's
+ * deliberate withheld state (`HAPI_PORTER_EXPOSED`, #4533) — discovery is not
+ * exposure — so it is reported as withheld, never as drift. The domain check
+ * keeps a `porter_withheld` from any non-Porter route counted as drift. PURE:
+ * exported so the verb's test classifies responses without a server.
+ */
+export function classifyProbeResponse(
+  entry: { id: string; domain: string },
+  status: number,
+  body: unknown
+): ProbeClassification {
+  if (status >= 200 && status < 300) {
+    return { kind: "outcome", outcome: { id: entry.id, ok: true } };
+  }
+  // axios hands back a string, "", null or undefined for a non-JSON body.
+  const fields =
+    typeof body === "object" && body !== null && !Array.isArray(body)
+      ? (body as { code?: unknown; error?: unknown })
+      : undefined;
+  const code = typeof fields?.code === "string" ? fields.code : undefined;
+  const error = typeof fields?.error === "string" ? fields.error : undefined;
+  if (
+    entry.domain === "porter" &&
+    status === 404 &&
+    code === PROBE_PORTER_WITHHELD_CODE
+  ) {
+    return { kind: "withheld" };
+  }
+  return {
+    kind: "outcome",
+    outcome: {
+      id: entry.id,
+      ok: false,
+      rejection: code ?? error ?? `http_${status}`,
+    },
+  };
+}
+
+/** #4655: one probed capability — what was advertised, and the GET's class. */
+export interface ProbeResult {
+  capability: AdvertisedCapability;
+  classification: ProbeClassification;
+}
+
+/**
+ * #4655: fold probe results into the comparator's two inputs plus the withheld
+ * ids. A withheld entry leaves BOTH lists, because `advertisedVsActual` reads an
+ * advertised entry with no outcome as advertised-but-dead. PURE: exported so
+ * the verb's test exercises the same partition the probe uses.
+ */
+export function partitionProbeResults(results: readonly ProbeResult[]): {
+  advertised: AdvertisedCapability[];
+  outcomes: ProbeOutcome[];
+  withheld: string[];
+} {
+  const advertised: AdvertisedCapability[] = [];
+  const outcomes: ProbeOutcome[] = [];
+  const withheld: string[] = [];
+  for (const { capability, classification } of results) {
+    if (classification.kind === "withheld") {
+      withheld.push(capability.id);
+      continue;
+    }
+    advertised.push(capability);
+    outcomes.push(classification.outcome);
+  }
+  return { advertised, outcomes, withheld };
+}
+
+/**
  * #3749 (Sub-Issue I / R6): opt-in readonly ADVERTISED-VS-ACTUAL probe. Fetches
- * the session-aware catalog, probes each `available`, readonly, PARAMETER-FREE
+ * the user-scope catalog (no `sessionId` is sent), probes each `available`, readonly, PARAMETER-FREE
  * REST GET entry (a GET with no `:param` is safe to hit), and reconciles the
  * advertised availability against the live outcomes via the PURE `audit.ts`
  * `advertisedVsActual` comparator. Opt-in behind `--probe` (NOT `--deep`, which
- * D6 cut from #3744); reports mismatches and mutates NOTHING. Exit 0 clean /
+ * D6 cut from #3744); reports mismatches and issues only readonly GETs — but on
+ * an instance that exposes Configuration Porter, the first
+ * `GET /api/porter/recipient/public` creates its age keypair (#5170). #4655: a
+ * Porter entry answering 404 `porter_withheld` is listed as withheld and kept
+ * out of the comparator, so it never counts as a mismatch. Exit 0 clean /
  * 1 mismatches / 2 tool error — recorded in the PR, NOT gated in CI (V5).
  */
 async function runProbeAudit(jsonMode: boolean): Promise<void> {
@@ -227,8 +317,7 @@ async function runProbeAudit(jsonMode: boolean): Promise<void> {
     process.exit(2);
   }
 
-  const advertised: AdvertisedCapability[] = [];
-  const outcomes: ProbeOutcome[] = [];
+  const results: ProbeResult[] = [];
   for (const e of catalog.rest ?? []) {
     if (e.probe === "skip") continue;
     if (e.riskTier !== "readonly") continue;
@@ -236,43 +325,48 @@ async function runProbeAudit(jsonMode: boolean): Promise<void> {
     // A parameterized path (`:id`) cannot be probed without a real value —
     // skip rather than emit a false "advertised-but-dead" for a 404.
     if (e.invocation.path.includes(":")) continue;
-    advertised.push({
-      id: e.id,
-      available: e.available ?? true,
-      reason: e.reason,
-    });
     const path = e.invocation.path;
     const url = path.startsWith("http")
       ? path
       : `${configuration.serverUrl}${path.startsWith("/") ? "" : "/"}${path}`;
+    let classification: ProbeClassification;
     try {
       const r = await axios.get(url, {
         headers,
         timeout: 8_000,
         validateStatus: () => true,
       });
-      if (r.status >= 200 && r.status < 300) {
-        outcomes.push({ id: e.id, ok: true });
-      } else {
-        const body = r.data as { error?: string; code?: string } | undefined;
-        outcomes.push({
-          id: e.id,
-          ok: false,
-          rejection: body?.code ?? body?.error ?? `http_${r.status}`,
-        });
-      }
+      classification = classifyProbeResponse(e, r.status, r.data);
     } catch (error) {
-      outcomes.push({ id: e.id, ok: false, rejection: describeError(error) });
+      classification = {
+        kind: "outcome",
+        outcome: { id: e.id, ok: false, rejection: describeError(error) },
+      };
     }
+    results.push({
+      capability: {
+        id: e.id,
+        available: e.available ?? true,
+        reason: e.reason,
+      },
+      classification,
+    });
   }
 
+  const { advertised, outcomes, withheld } = partitionProbeResults(results);
   const mismatches = advertisedVsActual(advertised, outcomes);
+  // Every GET issued, compared or withheld.
+  const probed = advertised.length + withheld.length;
   if (jsonMode) {
-    writeStdout(
-      JSON.stringify({ probed: advertised.length, mismatches }, null, 2)
-    );
+    writeStdout(JSON.stringify({ probed, withheld, mismatches }, null, 2));
   } else {
-    const lines = [`Probed ${advertised.length} readonly GET capabilities.`];
+    const lines = [`Probed ${probed} readonly GET capabilities.`];
+    if (withheld.length > 0) {
+      lines.push(
+        `${withheld.length} withheld (Configuration Porter is withheld on this ` +
+          `instance by HAPI_PORTER_EXPOSED; not a mismatch): ${withheld.join(", ")}`
+      );
+    }
     if (mismatches.length === 0) {
       lines.push("No advertised-vs-actual mismatches.");
     } else {
@@ -339,8 +433,12 @@ Options:
   --json         Machine-readable report (validates against the documented schema)
   --node <id>    Audit a remote federation node's rest+rpc surface (proxied)
   --probe        #3749: opt-in readonly advertised-vs-actual probe of the
-                 session-aware catalog (parameter-free GET readonly entries).
-                 Reports mismatches; mutates nothing. NOT --deep (cut by D6).
+                 user-scope catalog (parameter-free GET readonly entries).
+                 Reports mismatches and issues only readonly GETs; on an
+                 instance that exposes Configuration Porter, the first
+                 recipient/public GET creates its age keypair. A Porter entry
+                 answering 404 porter_withheld is listed as withheld, not as a
+                 mismatch. NOT --deep (cut by D6).
 
 Exit codes:
   0  clean (no drift / no mismatches)

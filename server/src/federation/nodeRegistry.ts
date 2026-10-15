@@ -62,6 +62,19 @@ import type {
 } from "../services/codexLoginService";
 
 const FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * #3815: failure of a per-session action proxied to a peer. `status` is the
+ * peer's HTTP status (absent on a transport fault or timeout); `offline` marks
+ * a node the registry already knows is down (no request was sent).
+ */
+export type RemoteSessionActionError = {
+  type: "error";
+  message: string;
+  status?: number;
+  offline?: true;
+};
+
 /** Longer timeout for spawn/reconnect: daemon must spawn CLI + wait for Socket.IO. */
 const SPAWN_TIMEOUT_MS = 30_000;
 const OFFLINE_THRESHOLD = 3;
@@ -711,6 +724,32 @@ export class NodeRegistry {
           return { nodeId: cached.nodeId, url: state.config.url };
         }
         return null; // Node exists but is offline
+      }
+    }
+    return null;
+  }
+
+  /**
+   * #3815: find the node that owns a remote session REGARDLESS of its status.
+   * `findNodeForSession` returns null for an offline owner — the same as for an
+   * unknown id — while `getAllRemoteSessions` keeps listing that node's
+   * sessions; a bulk action must tell "node_offline" from "not_found". Also
+   * returns the hub's cached summary (the remote Stop turn reads `thinking`).
+   */
+  locateSession(sessionId: string): {
+    nodeId: string;
+    status: "online" | "degraded" | "offline";
+    session: SessionSummary;
+  } | null {
+    for (const cached of this.sessionCache.values()) {
+      const match = cached.sessions.find(s => s.id === sessionId);
+      if (match) {
+        const state = this.nodeStates.get(cached.nodeId);
+        return {
+          nodeId: cached.nodeId,
+          status: state?.status ?? "offline",
+          session: match,
+        };
       }
     }
     return null;
@@ -2261,14 +2300,22 @@ export class NodeRegistry {
     }
   }
 
-  /** Delete a session on a remote node via its federation API. */
+  /**
+   * Delete a session on a remote node via its federation API.
+   *
+   * #3815: the error result carries the peer's HTTP `status` (a 409 means the
+   * session is still active) and `offline` when the node is down, so a bulk
+   * caller can attribute each outcome. `deferPoll` skips the per-call re-poll
+   * so a bulk caller can coalesce to ONE `pollNodeById` per touched node.
+   */
   async deleteOnNode(
     nodeId: string,
-    sessionId: string
-  ): Promise<{ ok: true } | { type: "error"; message: string }> {
+    sessionId: string,
+    options?: { deferPoll?: boolean }
+  ): Promise<{ ok: true } | RemoteSessionActionError> {
     const state = this.nodeStates.get(nodeId);
     if (!state || state.status === "offline") {
-      return { type: "error", message: "Node is offline" };
+      return { type: "error", message: "Node is offline", offline: true };
     }
 
     const url = `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}`;
@@ -2281,10 +2328,14 @@ export class NodeRegistry {
           message:
             (body as Record<string, string>).error ??
             `Node returned ${res.status}`,
+          status: res.status,
         };
       }
       // Immediately remove from cache so client queries reflect the deletion
       this.evictSessionFromCache(sessionId);
+      if (options?.deferPoll) {
+        return { ok: true };
+      }
       // Fire-and-forget re-poll — don't block the response
       void this.pollNode(state.config).catch(err => {
         console.warn(
@@ -2301,22 +2352,90 @@ export class NodeRegistry {
     }
   }
 
-  /** Bulk-delete sessions on a remote node via its federation API. */
-  async bulkDeleteOnNode(
+  /**
+   * #3815: stop the running turn of one session on its owning node through the
+   * EXISTING peer receiver `POST /api/federation/sessions/:id/abort`. Unlike the
+   * single-session route's bare-`fetch` fallback this carries the registry's
+   * timeout, so one half-dead node cannot hold a bulk fan-out open.
+   */
+  async abortOnNode(
     nodeId: string,
-    sessionIds: string[]
-  ): Promise<
-    | { ok: true; deleted: number; skipped: number }
-    | { type: "error"; message: string }
-  > {
+    sessionId: string,
+    namespace: string
+  ): Promise<{ ok: true } | RemoteSessionActionError> {
+    return this.postSessionActionOnNode(nodeId, sessionId, "abort", namespace);
+  }
+
+  /**
+   * #3815: disconnect (archive) one session on its owning node through the
+   * EXISTING peer receiver `POST /api/federation/sessions/:id/archive`, marking
+   * the cached copy inactive on success (as the single-session route does).
+   * NOTE: the receiver answers `{ ok: true }` even when its kill RPC failed, so
+   * an `ok` here cannot prove the process died.
+   */
+  async archiveOnNode(
+    nodeId: string,
+    sessionId: string,
+    namespace: string
+  ): Promise<{ ok: true } | RemoteSessionActionError> {
+    const result = await this.postSessionActionOnNode(
+      nodeId,
+      sessionId,
+      "archive",
+      namespace
+    );
+    if ("ok" in result) {
+      this.markSessionInactive(sessionId);
+    }
+    return result;
+  }
+
+  /**
+   * #3815 (ruling D2): how many prompts are still queued on a remote session,
+   * via the EXISTING `GET /api/federation/sessions/:id/queue`. That receiver
+   * re-asserts the caller's namespace, so the header is forwarded. Returns
+   * null when the count cannot be read — never throws.
+   */
+  async getQueuedCountOnNode(
+    nodeId: string,
+    sessionId: string,
+    namespace: string
+  ): Promise<number | null> {
+    const state = this.nodeStates.get(nodeId);
+    if (!state || state.status === "offline") return null;
+    const url = `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/queue`;
+    try {
+      const res = await this.fetchWithAuth(url, "GET", undefined, undefined, {
+        "X-Hapi-Caller-Namespace": namespace,
+      });
+      if (!res.ok) return null;
+      const body = (await res.json().catch(() => null)) as {
+        messages?: unknown;
+      } | null;
+      return Array.isArray(body?.messages) ? body.messages.length : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async postSessionActionOnNode(
+    nodeId: string,
+    sessionId: string,
+    action: "abort" | "archive",
+    namespace: string
+  ): Promise<{ ok: true } | RemoteSessionActionError> {
     const state = this.nodeStates.get(nodeId);
     if (!state || state.status === "offline") {
-      return { type: "error", message: "Node is offline" };
+      return { type: "error", message: "Node is offline", offline: true };
     }
-
-    const url = `${state.config.url}/api/federation/sessions/bulk-delete`;
+    const url = `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/${action}`;
     try {
-      const res = await this.fetchWithAuth(url, "POST", { ids: sessionIds });
+      // The abort/archive receivers do not check the caller namespace today;
+      // the header is forwarded anyway (#1097 convention) so a receiver that
+      // starts checking it keeps working.
+      const res = await this.fetchWithAuth(url, "POST", {}, undefined, {
+        "X-Hapi-Caller-Namespace": namespace,
+      });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         return {
@@ -2324,29 +2443,17 @@ export class NodeRegistry {
           message:
             (body as Record<string, string>).error ??
             `Node returned ${res.status}`,
+          status: res.status,
         };
       }
-      const result = (await res.json()) as {
-        ok: true;
-        deleted: number;
-        skipped: number;
-      };
-      // Immediately remove deleted sessions from cache
-      for (const id of sessionIds) {
-        this.evictSessionFromCache(id);
-      }
-      // Fire-and-forget re-poll — don't block the response
-      void this.pollNode(state.config).catch(err => {
-        console.warn(
-          `[Federation] Background poll failed after bulk-delete on ${state.config.id}:`,
-          err
-        );
-      });
-      return result;
+      return { ok: true };
     } catch (err) {
       return {
         type: "error",
-        message: err instanceof Error ? err.message : "Delete request failed",
+        message:
+          err instanceof Error
+            ? err.message
+            : `Remote ${action} request failed`,
       };
     }
   }
@@ -2356,9 +2463,10 @@ export class NodeRegistry {
     url: string,
     method: "GET" | "POST" | "DELETE" = "GET",
     body?: unknown,
-    timeoutMs: number = FETCH_TIMEOUT_MS
+    timeoutMs: number = FETCH_TIMEOUT_MS,
+    extraHeaders?: Record<string, string>
   ): Promise<Response> {
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { ...extraHeaders };
     if (this.apiToken) {
       headers["Authorization"] = `Bearer ${this.apiToken}`;
     }

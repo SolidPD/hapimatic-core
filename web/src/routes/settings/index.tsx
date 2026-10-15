@@ -370,10 +370,13 @@ export default function SettingsLandingPage() {
   // again as defense-in-depth).
   const vmEnabled = useVmPreflight(api).data?.enabled === true;
 
-  // #4533: the Configuration (Porter) row is gated FAIL-CLOSED on the Porter
-  // exposure probe — Porter is withheld by default, so the row appears only when
-  // the server answers 200 `{ exposed: true }` (product-map decision 6).
-  const porterExposed = isPorterExposed(usePorterStatus(api).data);
+  // #4533 / #5165: the Configuration (Porter) row is gated FAIL-CLOSED on the
+  // Porter exposure probe — Porter is exposed by default, but a node withheld by
+  // `HAPI_PORTER_EXPOSED=0` answers 404, so the row appears only when the server
+  // answers 200 `{ exposed: true }` (product-map decisions 6 and 47). #4655: the
+  // verdict reads the query's status first, so a tab that cached `exposed` hides
+  // the row once a refetch fails.
+  const porterExposed = isPorterExposed(usePorterStatus(api));
 
   // #3059 round-4: the sidebar mirrors the keys page — a node that was never
   // backup-provisioned (every physical node) hides the Backup Key sub-row,

@@ -61,8 +61,8 @@ export interface FixtureInventory {
    * script that does not exist, and a `$HOME/...` reference outside `~/.claude`
    * that the exporter cannot resolve (both exporters expand `$HOME` only in
    * `~/.claude` paths). Neither is R6's outside-root case: an existing script
-   * outside `~/.claude` written as an absolute path is carried today (#4331),
-   * which PR-1 does not cover.
+   * outside `~/.claude` written as an absolute path is carried (#4331);
+   * `seedGateItemsHome` seeds that case.
    */
   droppedHookCommands: { missing: string; unresolvable: string };
   /** The `$HOME/.claude/<rel>` scripts that hooks/statusLine/apiKeyHelper run and the export carries. */
@@ -398,5 +398,126 @@ export function seedThreeSourceHome(
     droppedEnvKey: "FOO",
     plugin,
     outside,
+  };
+}
+
+/** What {@link seedGateItemsHome} seeds (#5165 Task 9). */
+export interface GateItemsInventory {
+  /** The seeded source HOME. */
+  home: string;
+  /** `CLAUDE.md` as seeded, and as it must land once its nested includes move (#4156). */
+  claudeMd: { source: string; landed: string };
+  /** Each include: its seeded path and its landed path, both relative to `.claude` (#4156). */
+  includes: { sourceRel: string; destRel: string; sha256: string }[];
+  /** Registered hooks inside `hooks/` subfolders, each landing at its own path (#4331). */
+  folderHooks: FixtureFile[];
+  /** A hook registered by an absolute path outside `~/.claude` (#4331, R6's outside-root leg). */
+  outsideHook: {
+    scriptPath: string;
+    command: string;
+    carriedRel: string;
+    sha256: string;
+  };
+  /** A skills folder with no file: the export lists it, the plan reports it (#4185). */
+  emptySkill: string;
+}
+
+/**
+ * Seed a Claude Code source HOME for the exposure gate items (#5165 Task 9):
+ * nested `CLAUDE.md` includes (#4156), registered hooks in `hooks/` subfolders
+ * including two with the same file name, a hook registered by an absolute path
+ * outside `~/.claude` (#4331), and an empty skills folder (#4185). It holds no
+ * MCP server, secret, or credential decoy; `seedThreeSourceHome` covers those.
+ */
+export function seedGateItemsHome(home: string): GateItemsInventory {
+  const claude = join(home, ".claude");
+  const includes = [
+    { sourceRel: "TOP.md", destRel: "TOP.md", content: "# top include\n" },
+    {
+      sourceRel: "docs/guide.md",
+      destRel: "claude-includes/docs/guide.md",
+      content: "# nested guide (#4156)\n",
+    },
+    {
+      sourceRel: "a/RULES.md",
+      destRel: "claude-includes/a/RULES.md",
+      content: "# a rules (#4156)\n",
+    },
+    {
+      sourceRel: "b/RULES.md",
+      destRel: "claude-includes/b/RULES.md",
+      content: "# b rules, same file name (#4156)\n",
+    },
+  ];
+  const title = "# gate items (#5165)\n\n";
+  const claudeMd = {
+    source: title + includes.map(i => `@${i.sourceRel}\n`).join(""),
+    landed: title + includes.map(i => `@${i.destRel}\n`).join(""),
+  };
+  put(join(claude, "CLAUDE.md"), claudeMd.source);
+  for (const i of includes) put(join(claude, i.sourceRel), i.content);
+
+  const folderHooks = [
+    {
+      rel: "hooks/sub/run.sh",
+      content: "#!/bin/sh\necho INERT-5165-sub-run\n",
+    },
+    { rel: "hooks/a/same.sh", content: "#!/bin/sh\necho INERT-5165-a-same\n" },
+    { rel: "hooks/b/same.sh", content: "#!/bin/sh\necho INERT-5165-b-same\n" },
+  ];
+  for (const h of folderHooks) put(join(claude, h.rel), h.content, 0o755);
+
+  const outsidePath = join(home, "tools/outside-hook.sh");
+  const outsideContent = "#!/bin/sh\necho INERT-5165-outside-hook\n";
+  put(outsidePath, outsideContent, 0o755);
+  const outsideCommand = `bash ${outsidePath}`;
+
+  put(
+    join(claude, "settings.json"),
+    JSON.stringify(
+      {
+        hooks: {
+          PreToolUse: [
+            ...folderHooks.map((h, n) => ({
+              matcher: `Tool${n}`,
+              hooks: [
+                { type: "command", command: `bash $HOME/.claude/${h.rel}` },
+              ],
+            })),
+            {
+              matcher: "Grep",
+              hooks: [{ type: "command", command: outsideCommand }],
+            },
+          ],
+        },
+      },
+      null,
+      2
+    )
+  );
+
+  const emptySkill = "skills/empty";
+  mkdirSync(join(claude, emptySkill), { recursive: true });
+
+  return {
+    home,
+    claudeMd,
+    includes: includes.map(i => ({
+      sourceRel: i.sourceRel,
+      destRel: i.destRel,
+      sha256: sha256(i.content),
+    })),
+    folderHooks: folderHooks.map(h => ({
+      rel: h.rel,
+      sha256: sha256(h.content),
+      executable: true,
+    })),
+    outsideHook: {
+      scriptPath: outsidePath,
+      command: outsideCommand,
+      carriedRel: "hooks/outside-hook.sh",
+      sha256: sha256(outsideContent),
+    },
+    emptySkill,
   };
 }

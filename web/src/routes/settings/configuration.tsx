@@ -8,9 +8,10 @@ import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
 import { InstalledConfigTabs } from "@/components/porter/InstalledConfigTabs";
 import { SettingsPage } from "@/components/layouts/SettingsPage";
+import { Button } from "@/components/ui/button";
 import { useAppContext } from "@/lib/app-context";
 import {
-  isPorterExposed,
+  porterExposure,
   usePorterStatus,
 } from "@/hooks/queries/usePorterStatus";
 
@@ -37,17 +38,33 @@ import {
  * Full-width inside the drawer; does NOT attach its own `useSwipeBack`
  * (SettingsDrawer owns the single swipe-back handler).
  *
- * #4533: gated FAIL-CLOSED on the Porter exposure probe (the `vms.tsx` shape).
- * Porter is withheld by default, so a direct visit — or the legacy
- * `/admin/configuration` redirect — renders a not-available notice and mounts
- * no Porter component (no Porter endpoint is called besides the probe) until
- * the server answers 200 `{ exposed: true }`.
+ * #4533 / #5165: gated FAIL-CLOSED on the Porter exposure probe (the `vms.tsx`
+ * shape). No Porter component mounts, and no Porter endpoint besides the probe
+ * is called, until the server answers 200 `{ exposed: true }`. Porter is
+ * exposed by default, so while the first probe is in flight the page shows
+ * only its header; a node withheld by `HAPI_PORTER_EXPOSED=0` (the probe's 404)
+ * — reached by a direct visit or the legacy `/admin/configuration` redirect —
+ * then shows the not-available notice.
+ *
+ * #4655: the probe's verdict has four states. Loading renders the header only
+ * (plus a screen-reader status line), so an exposed instance never flashes a
+ * notice; a 404 `porter_withheld` renders the not-available notice; any other
+ * probe failure renders "couldn't check" with Retry — it is not proof that the
+ * instance withholds Porter; and only `exposed` renders the full page. The
+ * verdict reads the query status before its data, so a tab that cached
+ * `exposed` falls back to the notice when a refetch answers `porter_withheld`.
  */
 export default function ConfigurationAdminPage() {
   useDocumentTitle("Configuration - Hapimatic");
   useEmojiFavicon(null);
   const { api } = useAppContext();
-  const exposed = isPorterExposed(usePorterStatus(api).data);
+  const status = usePorterStatus(api);
+  const exposure = porterExposure(status);
+  // A Retry after a failed first probe sends the query back to `pending` (no
+  // data is cached), which would swap the couldn't-check block — and the
+  // focused Retry button — for the loading line. Keep the block mounted while
+  // that retry is in flight.
+  const retrying = exposure === "loading" && status.errorUpdateCount > 0;
 
   const header = (
     <SettingsSectionHeader
@@ -56,16 +73,51 @@ export default function ConfigurationAdminPage() {
     />
   );
 
-  if (!exposed) {
+  if (exposure !== "exposed") {
     return (
       <SettingsPage data-testid="settings-configuration-root" header={header}>
-        <div className="mx-auto w-full max-w-content px-4 pb-6">
-          <p
-            className="py-6 text-[length:var(--text-body)] text-[var(--app-hint)]"
-            data-testid="configuration-withheld"
-          >
-            Configuration import is not available on this instance.
-          </p>
+        {/* One polite live region that persists across the states, so the
+            notice or the couldn't-check text is announced when it replaces
+            the loading line. */}
+        <div
+          className="mx-auto w-full max-w-content px-4 pb-6"
+          aria-live="polite"
+        >
+          {exposure === "unknown" || retrying ? (
+            <div
+              className="flex flex-col items-start gap-3 py-6"
+              data-testid="configuration-check-failed"
+            >
+              <p className="text-[length:var(--text-body)] text-[var(--app-hint)]">
+                Couldn&apos;t check whether configuration import is available.
+              </p>
+              {/* aria-disabled, not disabled: a disabled button drops focus,
+                  and this one keeps it through the retry. */}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                aria-disabled={status.isFetching}
+                onClick={() => {
+                  if (!status.isFetching) void status.refetch();
+                }}
+                data-testid="configuration-check-retry"
+              >
+                {status.isFetching ? "Checking…" : "Retry"}
+              </Button>
+            </div>
+          ) : exposure === "loading" ? (
+            <p className="sr-only" data-testid="configuration-checking">
+              Checking availability…
+            </p>
+          ) : (
+            <p
+              className="py-6 text-[length:var(--text-body)] text-[var(--app-hint)]"
+              data-testid="configuration-withheld"
+            >
+              Configuration import is not available on this instance.
+            </p>
+          )}
         </div>
       </SettingsPage>
     );

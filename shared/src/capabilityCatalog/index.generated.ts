@@ -8884,6 +8884,63 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Stop the current turn of many sessions at once, each on its owning node; sessions stay connected. Prints one result per session.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-sessions-bulk-abort",
+    "invocation": {
+      "command": "api sessions bulk-abort",
+      "kind": "cli"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "cli",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To stop several sessions' work via `hapi api sessions bulk-abort` with a list of session ids (a fleet-wide stop from a script or the PM role)."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Disconnect many sessions at once, each on its owning node, leaving them for reconnect. Prints one result per session.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-sessions-bulk-archive",
+    "invocation": {
+      "command": "api sessions bulk-archive",
+      "kind": "cli"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "cli",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To disconnect several sessions via `hapi api sessions bulk-archive` with a list of session ids."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Delete many disconnected sessions at once. Irreversible: the session records, message history and queued prompts are removed. Prints one result per session.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-sessions-bulk-delete",
+    "invocation": {
+      "command": "api sessions bulk-delete",
+      "kind": "cli"
+    },
+    "probe": "safe",
+    "riskTier": "destructive",
+    "surface": "cli",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To delete several disconnected sessions via `hapi api sessions bulk-delete` with a list of session ids (run bulk-archive first)."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Delete a session. Irreversible.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.api-sessions-delete",
@@ -9022,7 +9079,47 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Delete up to 100 sessions by id in one request, partitioning local and remote nodes and skipping active sessions.",
+    "description": "Stop the running turn of up to 100 sessions by id, each on its owning federation node, leaving every session connected; returns one result per session.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.bulk-abort",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/sessions/bulk-abort"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user stops the work of several sessions at once (select mode Stop turn, or a fleet-wide stop)."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Disconnect (archive for reconnect) up to 100 sessions by id, each on its owning federation node; returns one result per session.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.bulk-archive",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/sessions/bulk-archive"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user disconnects several sessions at once from select mode."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Delete up to 100 sessions by id in one request, partitioning local and remote nodes and skipping active sessions; returns one result per session.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.bulk-delete",
     "invocation": {

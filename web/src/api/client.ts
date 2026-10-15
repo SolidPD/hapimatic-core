@@ -32,6 +32,10 @@ import type {
 import type { QueuedMessage, SessionView } from "@hapi/protocol/types";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type {
+  BulkSessionActionResponse,
+  BulkSessionResult,
+} from "@hapi/protocol/bulkSessionResult";
+import type {
   AboutInfo,
   FeedbackRequest,
   FeedbackResponse,
@@ -269,6 +273,19 @@ export class ApiError extends Error {
  * sourced; only this small wrapper is local (per #2587 directive — no new cross-package
  * schema for the enable feature).
  */
+/**
+ * `POST /api/sessions/bulk-delete` (#3815 Task 1b). The numeric fields keep
+ * their meaning for older readers: `deleted` = sessions removed, `skipped` =
+ * every requested session that was not removed. `results` is per session.
+ */
+export interface BulkDeleteSessionsResponse {
+  ok: true;
+  deleted: number;
+  skipped: number;
+  remoteErrors?: string[];
+  results: BulkSessionResult;
+}
+
 export interface WatermarkStatus {
   enabled: boolean;
   watermarkPercent: number;
@@ -404,6 +421,12 @@ export class ApiClient {
   // run.ts) below that — so this outermost layer must be the largest to avoid
   // pre-empting a slow-but-valid spawn. Only the spawn calls opt into it.
   private static readonly SPAWN_TIMEOUT_MS = 90_000;
+
+  // #3815: a bulk route answers every session within its 25 s per-session
+  // deadline (server/src/web/routes/bulkSessionActions.ts), and Bun's
+  // `idleTimeout` (≥ 30 s) bounds it from above — so the client waits longer
+  // than the deadline and never reports a finished batch as failed.
+  private static readonly BULK_TIMEOUT_MS = 45_000;
 
   private async request<T>(
     path: string,
@@ -2050,15 +2073,49 @@ export class ApiClient {
     });
   }
 
-  async bulkDeleteSessions(
-    ids: string[]
-  ): Promise<{ deleted: string[]; skipped: string[] }> {
-    return await this.request<{ deleted: string[]; skipped: string[] }>(
+  /**
+   * Delete up to 100 sessions. #3815: `deleted` / `skipped` are COUNTS (the
+   * server never sent arrays — the former `string[]` type was wrong); the
+   * per-session outcome is `results`.
+   */
+  async bulkDeleteSessions(ids: string[]): Promise<BulkDeleteSessionsResponse> {
+    return await this.request<BulkDeleteSessionsResponse>(
       "/api/sessions/bulk-delete",
       {
         method: "POST",
         body: JSON.stringify({ ids }),
-      }
+      },
+      0,
+      undefined,
+      ApiClient.BULK_TIMEOUT_MS
+    );
+  }
+
+  /** #3815: Stop turn on up to 100 sessions — one result per session. */
+  async bulkAbortSessions(ids: string[]): Promise<BulkSessionActionResponse> {
+    return await this.request<BulkSessionActionResponse>(
+      "/api/sessions/bulk-abort",
+      {
+        method: "POST",
+        body: JSON.stringify({ ids }),
+      },
+      0,
+      undefined,
+      ApiClient.BULK_TIMEOUT_MS
+    );
+  }
+
+  /** #3815: Disconnect up to 100 sessions — one result per session. */
+  async bulkArchiveSessions(ids: string[]): Promise<BulkSessionActionResponse> {
+    return await this.request<BulkSessionActionResponse>(
+      "/api/sessions/bulk-archive",
+      {
+        method: "POST",
+        body: JSON.stringify({ ids }),
+      },
+      0,
+      undefined,
+      ApiClient.BULK_TIMEOUT_MS
     );
   }
 
@@ -3529,10 +3586,11 @@ export class ApiClient {
   }
 
   /**
-   * Configuration Porter exposure probe (issue #4533). `GET /api/porter/status`
-   * answers 200 `{ exposed: true }` only when Porter is exposed; a withheld
-   * instance (the default) answers 404 `porter_withheld`, a DESIGNED steady
-   * state — so 404 is an expected status and is never reported (#2362).
+   * Configuration Porter exposure probe (issues #4533 and #5165).
+   * `GET /api/porter/status` answers 200 `{ exposed: true }` when Porter is
+   * exposed (the default); an instance withheld by `HAPI_PORTER_EXPOSED=0`
+   * answers 404 `porter_withheld`, a DESIGNED steady state — so 404 is an
+   * expected status and is never reported (#2362).
    */
   async getPorterStatus(): Promise<PorterStatusResponse> {
     return await this.request<PorterStatusResponse>(

@@ -71,9 +71,13 @@
         if (appleTouchIcon)
           appleTouchIcon.href = iconPath + "apple-touch-icon-180x180.png";
 
-        // Update page title for dev instance
+        // Update page title and iOS home-screen name for dev instance (#4797)
         if (isDev) {
           document.title = "Hapimatic DEV";
+          var appleTitle = document.querySelector(
+            'meta[name="apple-mobile-web-app-title"]'
+          );
+          if (appleTitle) appleTitle.setAttribute("content", "Hapimatic DEV");
         }
       })();
     </script>

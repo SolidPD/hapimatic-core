@@ -3,6 +3,11 @@ import axios from "axios";
 import chalk from "chalk";
 import { PmSpawnReconciliationStatusSchema } from "@hapi/protocol";
 import {
+  BULK_SESSION_MAX_IDS,
+  BulkSessionResultSchema,
+  type BulkSessionResult,
+} from "@hapi/protocol/bulkSessionResult";
+import {
   ModelModeSchema,
   SessionRoleSchema,
   SESSION_ROLES,
@@ -619,7 +624,118 @@ async function handleSessions(args: string[]): Promise<void> {
     return;
   }
 
+  if (isBulkSessionSubcommand(action)) {
+    const ids = args.slice(1);
+    if (ids.length === 0) {
+      console.error(`Usage: hapi api sessions ${action} <id> [<id>...]`);
+      process.exit(1);
+    }
+
+    const jwt = await authenticateCli();
+    const results = await runBulkSessionsRequest(
+      action,
+      ids,
+      async (path, body) =>
+        (
+          await axios.post(`${configuration.serverUrl}${path}`, body, {
+            headers: authHeaders(jwt),
+            timeout: BULK_SESSIONS_TIMEOUT_MS,
+          })
+        ).data
+    );
+    writeStdout(JSON.stringify(results, null, 2));
+    // Scripts read the exit status: 1 when any session FAILED (a skipped
+    // session — idle, already disconnected, still connected — is not a failure).
+    if (bulkResultsHaveFailure(results)) {
+      process.exit(1);
+    }
+    return;
+  }
+
   printSessionsHelp();
+}
+
+/**
+ * #3815 (operator ruling D1, 2026-10-01): three bulk subcommands, one route and
+ * one risk tier each — Stop turn, Disconnect, Delete. There is deliberately no
+ * compound disconnect-and-delete: a script runs `bulk-archive` and then
+ * `bulk-delete`, two deliberate commands (the CLI analogue of the UI's two
+ * dialogs; the delete route refuses sessions that are still connected).
+ */
+export const BULK_SESSION_SUBCOMMANDS = {
+  "bulk-abort": "/api/sessions/bulk-abort",
+  "bulk-archive": "/api/sessions/bulk-archive",
+  "bulk-delete": "/api/sessions/bulk-delete",
+} as const;
+
+export type BulkSessionSubcommand = keyof typeof BULK_SESSION_SUBCOMMANDS;
+
+/**
+ * A session RPC may take 30 s (server `rpcGateway`) and each bulk route waits
+ * for its whole fan-out, so this is wider than the single `abort`'s 10 s.
+ */
+const BULK_SESSIONS_TIMEOUT_MS = 60_000;
+
+export function isBulkSessionSubcommand(
+  action: string | undefined
+): action is BulkSessionSubcommand {
+  return (
+    action !== undefined && Object.hasOwn(BULK_SESSION_SUBCOMMANDS, action)
+  );
+}
+
+/** True when any session failed outright (skips are not failures). */
+export function bulkResultsHaveFailure(results: BulkSessionResult): boolean {
+  return results.some(r => !r.ok && r.skipped !== true);
+}
+
+function describeRequestError(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    const status = error.response?.status;
+    const body = error.response?.data as { error?: string } | undefined;
+    return `${status ?? "network error"} — ${body?.error ?? error.message}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * POST `ids` to the subcommand's bulk route in chunks of the server's 100-id
+ * cap and merge each chunk's per-session `results` in request order — the
+ * same `BulkSessionResult` the web UI reports. A chunk whose request fails as a
+ * whole yields one `{ id, ok: false, error }` per id and later chunks still
+ * run. `post` is injected (cli/CLAUDE.md no-module-mock convention).
+ */
+export async function runBulkSessionsRequest(
+  action: BulkSessionSubcommand,
+  ids: readonly string[],
+  post: (path: string, body: { ids: string[] }) => Promise<unknown>
+): Promise<BulkSessionResult> {
+  const path = BULK_SESSION_SUBCOMMANDS[action];
+  const unique = Array.from(new Set(ids));
+  const results: BulkSessionResult = [];
+  for (let i = 0; i < unique.length; i += BULK_SESSION_MAX_IDS) {
+    const chunk = unique.slice(i, i + BULK_SESSION_MAX_IDS);
+    let data: unknown;
+    try {
+      data = await post(path, { ids: chunk });
+    } catch (error) {
+      const message = describeRequestError(error);
+      results.push(...chunk.map(id => ({ id, ok: false, error: message })));
+      continue;
+    }
+    const parsed = BulkSessionResultSchema.safeParse(
+      (data as { results?: unknown } | null)?.results
+    );
+    if (!parsed.success) {
+      // An older server answers bulk-delete with counts only: the request may
+      // well have run, so say "unknown" rather than imply nothing happened.
+      const message = `Outcome unknown: ${path} answered without per-session results (older server?)`;
+      results.push(...chunk.map(id => ({ id, ok: false, error: message })));
+      continue;
+    }
+    results.push(...parsed.data);
+  }
+  return results;
 }
 
 function printSessionsHelp(): void {
@@ -639,10 +755,18 @@ ${chalk.bold("Usage:")}
   hapi api sessions branch <id>                        Branch a session's conversation
   hapi api sessions abort <id>                         Interrupt the active query (session stays active)
   hapi api sessions archive <id>                       Kill an active session (required before delete)
+  hapi api sessions bulk-abort <id> [<id>...]          Stop the turn of every listed session (sessions stay active)
+  hapi api sessions bulk-archive <id> [<id>...]        Disconnect every listed session
+  hapi api sessions bulk-delete <id> [<id>...]         Delete every listed session — disconnect first (bulk-archive)
 
 ${chalk.bold("Notes:")}
   - 'abort' interrupts the current Claude query but the session stays active
   - 'archive' kills the session process, marking it inactive (required before delete)
+  - 'bulk-*' run on each session's owning node and print one result per session
+    ({ id, ok, skipped?, code?, error?, queued? }); a session that is not mid-turn
+    is skipped by bulk-abort, and bulk-delete refuses a session that is still
+    connected — run bulk-archive first. Delete is permanent. Exit status 1 when
+    any session failed (skipped sessions do not count).
   - All commands output JSON to stdout
   - ${cliApiTokenSourcesNote()}
 `);
@@ -939,6 +1063,9 @@ export const API_RESOURCE_ACTIONS: Record<string, readonly string[]> = {
     "branch",
     "abort",
     "archive",
+    "bulk-abort",
+    "bulk-archive",
+    "bulk-delete",
   ],
   "session-metadata": ["spawn-roster"],
   "error-logs": [],

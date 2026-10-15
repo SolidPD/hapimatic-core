@@ -13,6 +13,9 @@ import {
 import { ClockIcon, ProjectTimer } from "@/components/SessionTimer";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { useToast } from "@/components/Toast";
+import { summarizeBulkSessionResult } from "@/lib/bulkSessionToast";
+import { executeBulkSessionAction } from "@/hooks/mutations/useBulkSessionAction";
 import { SESSION_NAME_MAX_LENGTH, validateSessionName } from "@hapi/protocol";
 import { useEffect, useRef, useState } from "react";
 import { NodeBadge, useNodeTone } from "@/components/NodeBadge";
@@ -90,6 +93,7 @@ export function ProjectHeader(props: {
   const [disconnectAllOpen, setDisconnectAllOpen] = useState(false);
   const [deleteDisconnectedOpen, setDeleteDisconnectedOpen] = useState(false);
   const [isPending, setIsPending] = useState(false);
+  const { showToast } = useToast();
 
   // Inline project name editing
   const [isEditingName, setIsEditingName] = useState(false);
@@ -207,8 +211,16 @@ export function ProjectHeader(props: {
     if (!api || disconnectedSessions.length === 0) return;
     setIsPending(true);
     try {
-      await api.bulkDeleteSessions(disconnectedSessions.map(s => s.id));
+      // #3815: chunked by the 100-id server cap, and reported per session — a
+      // skipped session is no longer silent.
+      const results = await executeBulkSessionAction(
+        api,
+        "delete",
+        disconnectedSessions.map(s => s.id)
+      );
       onRefresh();
+      const { message, type } = summarizeBulkSessionResult("delete", results);
+      showToast(message, { type });
     } finally {
       setIsPending(false);
       setDeleteDisconnectedOpen(false);

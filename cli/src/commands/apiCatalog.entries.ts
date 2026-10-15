@@ -365,6 +365,45 @@ export const cliCatalogEntries = [
     availability: { scope: "operator" },
   }),
   defineCapability({
+    id: "session-lifecycle.api-sessions-bulk-abort",
+    domain: "session-lifecycle",
+    surface: "cli",
+    description:
+      "Stop the current turn of many sessions at once, each on its owning node; sessions stay connected. Prints one result per session.",
+    whenToUse:
+      "To stop several sessions' work via `hapi api sessions bulk-abort` with a list of session ids (a fleet-wide stop from a script or the PM role).",
+    invocation: { kind: "cli", command: "api sessions bulk-abort" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "operator" },
+  }),
+  defineCapability({
+    id: "session-lifecycle.api-sessions-bulk-archive",
+    domain: "session-lifecycle",
+    surface: "cli",
+    description:
+      "Disconnect many sessions at once, each on its owning node, leaving them for reconnect. Prints one result per session.",
+    whenToUse:
+      "To disconnect several sessions via `hapi api sessions bulk-archive` with a list of session ids.",
+    invocation: { kind: "cli", command: "api sessions bulk-archive" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "operator" },
+  }),
+  defineCapability({
+    id: "session-lifecycle.api-sessions-bulk-delete",
+    domain: "session-lifecycle",
+    surface: "cli",
+    description:
+      "Delete many disconnected sessions at once. Irreversible: the session records, message history and queued prompts are removed. Prints one result per session.",
+    whenToUse:
+      "To delete several disconnected sessions via `hapi api sessions bulk-delete` with a list of session ids (run bulk-archive first).",
+    invocation: { kind: "cli", command: "api sessions bulk-delete" },
+    auth: "cli-token",
+    riskTier: "destructive",
+    availability: { scope: "operator" },
+  }),
+  defineCapability({
     id: "session-introspection.api-session-metadata-spawn-roster",
     domain: "session-introspection",
     surface: "cli",

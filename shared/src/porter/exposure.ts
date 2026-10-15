@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * Configuration Porter — exposure-gate wire contract (issue #4533, epic #4290).
+ * Configuration Porter — exposure-gate wire contract (issues #4533 and #5165,
+ * epic #4290).
  *
- * The server withholds Porter by default (`HAPI_PORTER_EXPOSED` unset). While
- * withheld, every `/api/porter/*` and `/p/*` request answers 404 with
+ * The server exposes Porter by default (#5165) and withholds it under the kill
+ * switch `HAPI_PORTER_EXPOSED=0`. While withheld, every `/api/porter/*` and `/p/*` request answers 404 with
  * {@link PorterWithheldBody}; while exposed, `GET /api/porter/status` answers
  * 200 {@link PorterStatusResponse}. The server emits these shapes and the web
  * reads them, so the code string lives here once and cannot drift.

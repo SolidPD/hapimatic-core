@@ -6,6 +6,7 @@ import { CacheFirst, NetworkFirst } from "workbox-strategies";
 import { ExpirationPlugin } from "workbox-expiration";
 import { getCacheNameForServiceWorker } from "@/lib/storage-keys";
 import { decidePushAction } from "@/lib/pushDisplayGate";
+import { withoutWebManifest } from "@/lib/precacheEntries";
 // Type-only (erased at build): the app module itself is window-bound and must
 // never be bundled into the service worker — see pushDisplayGate.ts.
 import type { NotificationPreferences } from "@/lib/notificationPreferences";
@@ -81,7 +82,9 @@ async function getNotificationPreferences(): Promise<NotificationPreferences> {
   }
 }
 
-precacheAndRoute(self.__WB_MANIFEST);
+// #4797: the manifest always goes to the network — the server picks its identity
+// per instance, and a precached copy would pin an existing client to production.
+precacheAndRoute(withoutWebManifest(self.__WB_MANIFEST));
 
 registerRoute(
   ({ url }) => url.pathname === "/api/sessions",
@@ -219,7 +222,12 @@ self.addEventListener("push", event => {
       const title = payload.title || defaultTitle;
       const body = payload.body ?? "";
       const icon = payload.icon ?? `${iconsPath}/pwa-192x192.png`;
-      const badge = payload.badge ?? `${iconsPath}/pwa-64x64.png`;
+      // Issue #4798: Android draws the badge (the status-bar icon) from the
+      // image's alpha channel alone, so it is the white H on a transparent
+      // square, not the tile, which showed as a filled square. One file
+      // serves both instances: the DEV badge cannot be read at 24 dp. Safari
+      // ignores the badge option. The file comes from scripts/generate-icons.js.
+      const badge = payload.badge ?? "/notification-badge-96x96.png";
       const data = payload.data;
       const tag = payload.tag;
 

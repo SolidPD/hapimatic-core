@@ -983,7 +983,10 @@ export function useSessionActions(
       }
       for (let i = 0; i < ids.length; i += 100) {
         const res = await api.bulkDeleteSessions(ids.slice(i, i + 100));
-        skipped.push(...res.skipped);
+        // #3815: `skipped` is a COUNT on the wire — spreading it threw after the
+        // server had already deleted the rows, so every cascade toasted a false
+        // failure. The per-session `results` name the ids that were kept.
+        skipped.push(...res.results.filter(r => !r.ok).map(r => r.id));
       }
       const skippedSet = new Set(skipped);
       // Drop the per-session caches only for the ids the server actually deleted.

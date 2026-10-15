@@ -184,6 +184,7 @@ import type { Store } from "../store";
 import type { ErrorLogger } from "../logging/errorLogger";
 import { HTTPException } from "hono/http-exception";
 import { scrubString } from "../sentry";
+import { devManifestResponse, MANIFEST_PATH } from "./instanceManifest";
 
 function findWebappDistDir(): { distDir: string; indexHtmlPath: string } {
   const candidates = [
@@ -1294,9 +1295,10 @@ export function buildWebApp(options: {
     );
   }
   app.route("/api", createApiKeysRoutes(configuration.settingsFile));
-  // Issue #4533: the Porter exposure gate — withheld by default, 404
-  // `porter_withheld` on BOTH Porter prefixes. Registered BEFORE every Porter
-  // mount below (Hono runs handlers in registration order); see the middleware.
+  // Issues #4533 and #5165: the Porter exposure gate — exposed by default;
+  // `HAPI_PORTER_EXPOSED=0` makes it answer 404 `porter_withheld` on BOTH Porter
+  // prefixes. Registered BEFORE every Porter mount below (Hono runs handlers in
+  // registration order); see the middleware.
   const porterExposureGate = createPorterExposureGate();
   app.use("/api/porter/*", porterExposureGate);
   app.use("/p/*", porterExposureGate);
@@ -1534,6 +1536,22 @@ export function buildWebApp(options: {
         return await next();
       }
 
+      // #4797: the dev instance serves the manifest with its own identity.
+      const devManifest = await devManifestResponse(
+        c.req.path,
+        c.req.url,
+        configuration.webappPort,
+        async () => {
+          const manifestAsset = embeddedAssetMap.get(MANIFEST_PATH);
+          return manifestAsset
+            ? await Bun.file(manifestAsset.sourcePath).text()
+            : null;
+        }
+      );
+      if (devManifest) {
+        return devManifest;
+      }
+
       const asset = embeddedAssetMap.get(c.req.path);
       if (asset) {
         return serveEmbeddedAsset(asset);
@@ -1572,6 +1590,24 @@ export function buildWebApp(options: {
     if (c.req.path.startsWith("/api")) {
       await next();
       return;
+    }
+
+    // #4797: the dev instance serves the manifest with its own identity.
+    if (c.req.method === "GET" || c.req.method === "HEAD") {
+      const devManifest = await devManifestResponse(
+        c.req.path,
+        c.req.url,
+        configuration.webappPort,
+        async () => {
+          const manifestFile = join(distDir, "manifest.webmanifest");
+          return existsSync(manifestFile)
+            ? readFileSync(manifestFile, "utf8")
+            : null;
+        }
+      );
+      if (devManifest) {
+        return devManifest;
+      }
     }
 
     return await serveStatic({ root: distDir })(c, next);

@@ -9,12 +9,13 @@ import type { WebAppEnv } from "./auth";
 import { porterExposed } from "../../config/porterExposureConfig";
 
 /**
- * Configuration Porter exposure gate (issue #4533, epic #4290).
+ * Configuration Porter exposure gate (issues #4533 and #5165, epic #4290).
  *
- * While Porter is withheld (`HAPI_PORTER_EXPOSED` unset — the default), this
- * middleware answers 404 `porter_withheld` and never calls `next()`, so no
- * Porter handler, TTL sweep, staging-dir write, age-keypair generation, token
- * mint or settings write runs. While exposed it is a pass-through.
+ * Porter is exposed by default (#5165), and this middleware is then a
+ * pass-through. While Porter is withheld (`HAPI_PORTER_EXPOSED=0`, or any value
+ * other than empty / `1` / `true` / `yes`), it answers 404 `porter_withheld`
+ * and never calls `next()`, so no Porter handler, TTL sweep, staging-dir write,
+ * age-keypair generation, token mint or settings write runs.
  *
  * 🔴 Mounted at the COMPOSITION ROOT (`buildWebApp.ts`) on exactly the two
  * prefixes every Porter capability lives under — `/api/porter/*` and the

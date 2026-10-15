@@ -660,9 +660,12 @@ function SessionsPage() {
 
   // Select-Mode Chip Row (#3292) — ephemeral bulk-action bar rendered below the
   // Control Bar in every pane while Select Mode is active (`false` renders nothing).
+  // #3815 (D-4406-2 = (i)): the FILTERED list, so "All" and every chip act only on
+  // what the filter matches — a hidden session is never stopped or deleted. With
+  // no filter active the two lists are equal.
   const chipRow = selectMode ? (
     <SelectModeChipRow
-      sessions={sessions}
+      sessions={filteredSessions}
       selectedIds={selectedIds}
       api={api}
       onSelectAll={selectAll}
