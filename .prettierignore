@@ -59,3 +59,8 @@ THIRD-PARTY-NOTICES.md
 # docs/public-site/design/assets/ (ignored above via docs/); reformatting the copies would break
 # the byte parity that gateway/src/routes/publicSite.test.ts asserts.
 gateway/public/site/assets/*.css
+# Dev tools size manifest (issue #5125) — written on one line by `bun run tools:unpack`
+# (cli/scripts/unpack-tools.ts → cli/src/runtime/toolExtraction.ts) and git-ignored in
+# cli/.gitignore. Prettier reads only the root .gitignore, so without this entry every
+# local `format:check` after a cli test run would fail on the generated file.
+cli/.runtime-manifest.json

@@ -60,12 +60,15 @@ export type SpawnArgsError = { error: string };
 
 /**
  * Resolve `sessions spawn` flags, defaulting `--machine` to the local machine
- * ID from `~/.hapimatic-<instance>/settings.json` when omitted (issue #994). An
- * explicit `--machine` always wins and short-circuits the settings read (R2).
- * Returns a `{ error }` shape — never throws — so the caller controls exit.
+ * ID from `<HAPI_HOME>/settings.json` (`configuration.settingsFile`) when
+ * omitted (issue #994). An explicit `--machine` always wins and short-circuits
+ * the settings read (R2). Returns a `{ error }` shape — never throws — so the
+ * caller controls exit.
  *
  * `readSettingsFn` is injectable for unit tests, matching the codebase's
  * no-mocking test style (the test passes a plain stub, not a module mock).
+ * `settingsPath` is injectable the same way, and names the file in the
+ * missing-machine-id error (#5098).
  */
 export async function resolveSpawnArgs(
   args: string[],
@@ -73,7 +76,8 @@ export async function resolveSpawnArgs(
   // #2479: injectable so the function stays pure/testable (like readSettingsFn).
   // Production callers get the caller's HAPI_SESSION_ID; tests pass an explicit
   // value (or undefined) to avoid depending on the runner's environment.
-  parentSessionIdEnv: string | undefined = process.env.HAPI_SESSION_ID
+  parentSessionIdEnv: string | undefined = process.env.HAPI_SESSION_ID,
+  settingsPath: string = configuration.settingsFile
 ): Promise<ResolvedSpawnArgs | SpawnArgsError> {
   const dir = parseFlag(args, "--dir");
   if (!dir) {
@@ -122,8 +126,8 @@ export async function resolveSpawnArgs(
   if (!machineId) {
     return {
       error:
-        "Local machineId not found in ~/.hapimatic-private/settings.json. " +
-        "Run 'hapi auth' to register this machine, or pass --machine <id> explicitly.",
+        `No machine id found in ${settingsPath}. ` +
+        "Start the daemon with 'hapi daemon start' (if it is already running, run 'hapi daemon stop' first) to register this machine, or pass --machine <id> explicitly.",
     };
   }
 

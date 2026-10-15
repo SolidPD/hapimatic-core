@@ -14,6 +14,7 @@ import { spawnHappyCLI } from "@/utils/spawnHappyCLI";
 import { writeStdout } from "@/utils/stdout";
 import { runDoctorCommand } from "@/ui/doctor";
 import { initializeToken } from "@/ui/tokenInit";
+import { formatDaemonBuildSkew } from "@/version";
 import type { CommandDefinition } from "./types";
 
 export const daemonCommand: CommandDefinition = {
@@ -63,8 +64,9 @@ export const daemonCommand: CommandDefinition = {
       const existing = await readDaemonBuildSkew();
       if (existing.running) {
         console.log(`Daemon already running (pid ${existing.pid})`);
-        if (existing.skew) {
-          console.log(chalk.yellow(`Build skew: ${existing.skew}`));
+        const skewLine = formatDaemonBuildSkew(existing);
+        if (skewLine) {
+          console.log(chalk.yellow(skewLine));
         }
         process.exit(0);
       }

@@ -240,6 +240,72 @@ export function parseWindowsWithIdentityOutput(
 }
 
 /**
+ * The field separator in `listWindows()`'s `list-windows -F` row: the ASCII
+ * Unit Separator (0x1f) instead of `|`, because a window name may contain `|`.
+ */
+export const LIST_WINDOWS_SEP = "\x1f";
+
+/**
+ * Issue #1841: parse `listWindows()`'s 8-field `list-windows -F` output —
+ * index, name, active, panes, pane_dead, pane_pid, `@hapi_archive`, and
+ * `pane_start_command` LAST (free text; any separator-split remainder is
+ * rejoined, #2683).
+ *
+ * tmux 3.3a prints the 0x1f separator as a raw byte. tmux 3.4 vis-escapes
+ * control bytes below 0x20 in `-F` output, so the same row arrives with the
+ * literal four characters `\037` between fields: a plain `split("\x1f")` saw
+ * one field per line and every row was dropped, so `listWindows()` returned
+ * `[]` on every tmux-3.4 host. Option C′: a line that carries the raw byte is
+ * split as is (3.3a output parses byte-identically), and only a line without
+ * it has `\037` decoded back to the separator. tmux 3.4 does not double a
+ * literal backslash, so a window name holding the literal text `\037` is
+ * split there — an accepted edge.
+ *
+ * Rows that still do not parse (no separator → undefined name / NaN index)
+ * are dropped (#1609). Pure + exported for a CI unit test.
+ */
+export function parseWindowListOutput(output: string): TmuxWindow[] {
+  const SEP = LIST_WINDOWS_SEP;
+  return (
+    output
+      .trim()
+      .split("\n")
+      .filter(line => line.trim())
+      .map(line => {
+        const normalized = line.includes(SEP)
+          ? line
+          : line.replace(/\\037/g, SEP);
+        const parts = normalized.split(SEP);
+        const [index, name, active, panes, paneDead, panePidStr, archiveTag] =
+          parts;
+        const parsedPid = parseInt(panePidStr, 10);
+        return {
+          index: parseInt(index, 10),
+          name,
+          active: active === "1",
+          paneCount: parseInt(panes, 10),
+          paneDead: paneDead === "1",
+          panePid: isNaN(parsedPid) ? undefined : parsedPid,
+          // #2683: unset ("") on death-orphans, "1" on deliberate
+          // archive-for-reconnect windows.
+          archiveTag: archiveTag === "1",
+          // #2683: pane_start_command is the final field; rejoin any
+          // SEP-split remainder defensively.
+          paneStartCommand: parts.slice(7).join(SEP) || undefined,
+        };
+      })
+      // #1609: drop rows that did not parse (missing separator → undefined
+      // name / NaN index). On SL7 (tmux 3.4, daemon process context) a
+      // malformed row crashed the #1600 remote-window reaper with
+      // `undefined is not an object (window.name.startsWith)`, aborting the
+      // whole reap and orphaning live claude processes. A dropped row only
+      // degrades name-based lookup for that window — consumers holding the
+      // captured index are unaffected.
+      .filter(w => typeof w.name === "string" && !isNaN(w.index))
+  );
+}
+
+/**
  * Issue #4218: parse the exact-name pane-pid probe
  * (`display-message -p '#{pane_pid} #{window_name}'`). The pid is space-free,
  * so it is the first token and the name is the rejoined remainder. Returns the
@@ -652,8 +718,9 @@ export class TmuxManager {
    *
    * Returns `{ created, index }` — surfacing the window index captured race-free
    * from `new-window -P -F #{window_index}` (#945) lets callers use index-based
-   * targeting for follow-up operations, bypassing `list-windows -F` which returns
-   * stale data on tmux 3.4+ (#1315). `index` may be null on parse failure even
+   * targeting for follow-up operations, bypassing `list-windows -F`, which read
+   * as stale/empty on tmux 3.4 (#1315; the mechanism was the escaped `\x1f`
+   * separator, fixed by #1841). `index` may be null on parse failure even
    * when `created` is true; callers should fall back to name-based lookup in
    * that case.
    */
@@ -1040,7 +1107,8 @@ export class TmuxManager {
 
   /**
    * Check if a window exists by name.
-   * Retries to handle tmux 3.4+ stale list-windows data. (#959, #1315)
+   * Retries to handle tmux 3.4+ stale list-windows data. (#959, #1315; on 3.4
+   * the empty listing was the escaped separator, fixed by #1841.)
    */
   async windowExists(name: string): Promise<boolean> {
     // #3734: an `@N` window-id target is resolved server-globally by tmux and
@@ -1073,7 +1141,9 @@ export class TmuxManager {
     // list-windows is index-based targeting (see getWindowPidByIndex); this
     // wider retry is the fallback for reconnect/recovery paths where the
     // index isn't available. #1018 confirmed retries alone don't fully solve
-    // tmux 3.4, but a wider budget still helps marginal cases. (#1315)
+    // tmux 3.4, but a wider budget still helps marginal cases. (#1315) #1841
+    // found why retries never helped on 3.4: list-windows printed the `\x1f`
+    // separator as the literal `\037`, so every row was dropped.
     for (let attempt = 0; attempt < 10; attempt++) {
       const windows = await this.listWindows();
       if (windows.some(w => w.name === name)) return true;
@@ -1091,8 +1161,9 @@ export class TmuxManager {
    * `new-window -P -F '#{window_index}'` (#945/#1315) — are addressed
    * directly as `<session>:<index>`, bypassing the name-based
    * `resolveWindowTarget()` → `listWindows()` path entirely. That path
-   * returns stale data on tmux 3.4+ (the #1315 root cause, recurring in the
-   * remote launcher as #1609 on SL7/WSL2). String targets keep the existing
+   * returned stale/empty data on tmux 3.4 (the #1315 symptom, recurring in the
+   * remote launcher as #1609 on SL7/WSL2; mechanism and fix: #1841, the
+   * escaped `\x1f` separator). String targets keep the existing
    * name-based lookup — the fallback surface for callers without an index
    * (Fallback Preservation Rule).
    */
@@ -1155,18 +1226,19 @@ export class TmuxManager {
    * as `[]`. With `strict` (#4218), only an absent tmux session/server reads as
    * `[]` ({@link isAbsentTmuxSessionError}); any other tmux fault THROWS, so a
    * caller guarding a destructive or resurrecting action can tell "no windows"
-   * from "could not list them".
+   * from "could not list them". Rows are parsed by
+   * {@link parseWindowListOutput}, which handles tmux 3.4's `\037`-escaped
+   * separator (#1841).
    */
   async listWindows(strict = false): Promise<TmuxWindow[]> {
     if (!strict && !(await this.sessionExists())) {
       return [];
     }
 
+    const SEP = LIST_WINDOWS_SEP;
+    let output: string;
     try {
-      // Use ASCII Unit Separator (\x1f) as delimiter instead of pipe (|)
-      // because window names may contain | which would corrupt parsing.
-      const SEP = "\x1f";
-      const output = await this.runTmux([
+      output = await this.runTmux([
         "list-windows",
         "-t",
         this.sessionName,
@@ -1177,53 +1249,28 @@ export class TmuxManager {
         // is free text; the parser rejoins any SEP-split remainder.
         `#{window_index}${SEP}#{window_name}${SEP}#{window_active}${SEP}#{window_panes}${SEP}#{pane_dead}${SEP}#{pane_pid}${SEP}#{${TMUX_ARCHIVE_USER_OPTION}}${SEP}#{pane_start_command}`,
       ]);
-
-      return (
-        output
-          .trim()
-          .split("\n")
-          .filter(line => line.trim())
-          .map(line => {
-            const parts = line.split(SEP);
-            const [
-              index,
-              name,
-              active,
-              panes,
-              paneDead,
-              panePidStr,
-              archiveTag,
-            ] = parts;
-            const parsedPid = parseInt(panePidStr, 10);
-            return {
-              index: parseInt(index, 10),
-              name,
-              active: active === "1",
-              paneCount: parseInt(panes, 10),
-              paneDead: paneDead === "1",
-              panePid: isNaN(parsedPid) ? undefined : parsedPid,
-              // #2683: unset ("") on death-orphans, "1" on deliberate
-              // archive-for-reconnect windows.
-              archiveTag: archiveTag === "1",
-              // #2683: pane_start_command is the final field; rejoin any
-              // SEP-split remainder defensively.
-              paneStartCommand: parts.slice(7).join(SEP) || undefined,
-            };
-          })
-          // #1609: drop rows that did not parse (missing separator → undefined
-          // name / NaN index). On SL7 (tmux 3.4, daemon process context) a
-          // malformed row crashed the #1600 remote-window reaper with
-          // `undefined is not an object (window.name.startsWith)`, aborting the
-          // whole reap and orphaning live claude processes. A dropped row only
-          // degrades name-based lookup for that window — consumers holding the
-          // captured index are unaffected.
-          .filter(w => typeof w.name === "string" && !isNaN(w.index))
-      );
     } catch (error) {
       if (strict && !isAbsentTmuxSessionError(error)) throw error;
       logger.warn(`[TmuxManager] Failed to list windows: ${error}`);
       return [];
     }
+
+    const windows = parseWindowListOutput(output);
+    // #1841 / #4443: tmux exited 0 and printed rows, yet none parsed — an
+    // output format this parser does not understand. A strict caller must not
+    // read that as "no windows" (the dedup would hand out a name a live window
+    // holds), so it throws. Raised outside the try above so the message text
+    // can never be mistaken for an absent-session error.
+    if (strict && windows.length === 0 && output.trim()) {
+      const lines = output
+        .trim()
+        .split("\n")
+        .filter(line => line.trim());
+      throw new Error(
+        `[TmuxManager] list-windows printed ${lines.length} line(s) but none parsed: ${JSON.stringify((lines[0] ?? "").slice(0, 80))}`
+      );
+    }
+    return windows;
   }
 
   /**
@@ -1694,8 +1741,9 @@ export class TmuxManager {
   /**
    * Get the PID of the process running in a window, addressed by index.
    *
-   * Bypasses `list-windows -F` (broken on tmux 3.4+ — returns stale data even
-   * seconds after a fresh new-window). Uses `display-message -t <session>:<index>`
+   * Bypasses `list-windows -F` (it read as empty on tmux 3.4 even seconds after
+   * a fresh new-window, because the `\x1f` separator arrived as the literal
+   * `\037` — #1841). Uses `display-message -t <session>:<index>`
    * directly with the index captured race-free from `new-window -P -F` (#945).
    * Callers MUST pair this with a name-based fallback via `getWindowPid` for
    * reconnect/recovery paths where the index isn't available. See issue #1315.
@@ -1726,8 +1774,9 @@ export class TmuxManager {
    * Uses tmux's `=` target prefix — `<session>:=<name>` — which forces
    * exact-match window-name resolution INSIDE the tmux server, bypassing both
    * fnmatch pattern matching and the client-side `list-windows` path that
-   * returns stale data on tmux 3.4+ in the daemon process context (#1628 —
-   * the reaper-blindness recurrence of the #1315/#1609 corruption class).
+   * returned stale/empty data on tmux 3.4 in the daemon process context (#1628 —
+   * the reaper-blindness recurrence of the #1315/#1609 corruption class, whose
+   * mechanism #1841 traced to the escaped `\x1f` separator).
    * Absent windows are the expected common case (the #1628 reaper probes
    * retry-suffix candidate names), so failures log at debug, not warn.
    *

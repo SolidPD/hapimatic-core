@@ -61,10 +61,12 @@ ${chalk.bold("Examples:")}
 }
 
 async function statusCommand(): Promise<void> {
-  const jwt = await authenticateCli();
   const url = configuration.serverUrl;
 
   try {
+    // Inside the try so a failed login ends in one "failed" line, not the error
+    // object (#5098). A 401 for a settings.json token prints #5080's hint first.
+    const jwt = await authenticateCli();
     const resp = await axios.get(`${url}/api/federation/nodes`, {
       headers: authHeaders(jwt),
       timeout: 10_000,
@@ -131,10 +133,12 @@ async function statusCommand(): Promise<void> {
 }
 
 async function drainNodeCommand(nodeId: string): Promise<void> {
-  const jwt = await authenticateCli();
   const url = configuration.serverUrl;
 
   try {
+    // Inside the try so a failed login ends in one "failed" line, not the error
+    // object (#5098). A 401 for a settings.json token prints #5080's hint first.
+    const jwt = await authenticateCli();
     const resp = await axios.post(
       `${url}/api/federation/nodes/${encodeURIComponent(nodeId)}/drain`,
       {},

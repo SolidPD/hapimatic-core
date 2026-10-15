@@ -13,22 +13,24 @@
  * no log sink: the summary is API-returned to the authenticated operator only.
  * #4173: the same holds for each carried script's sha256 and content preview
  * (`settings.executableScripts`), the file an executable value runs.
+ * #5172: and for each MCP server's command, args, and url as the commit writes
+ * them (`mcpServers[].definition`); a secret slot is shown by name, never value.
  */
 import {
   EXECUTABLE_SETTINGS_KEYS,
   type Omission,
   type PorterManifest,
 } from "@hapi/protocol/porter";
-import type {
-  ImportPlan,
-  PlannedItemKind,
-  PlannedMcpServer,
-} from "./importArchive";
+import type { ImportPlan, PlannedItemKind } from "./importArchive";
 import { computeGroups, type ImportGroups } from "./commitSelection";
 import type { Conflict } from "./conflictDetection";
 import type { ModeReconcilePreview } from "./modeReconcile";
 import type { SettingsLinkState } from "./commitFs";
 import type { ExecutableScriptReview } from "./planSettingsScripts";
+import {
+  reviewMcpServers,
+  type PlannedMcpServerReview,
+} from "./mcpReviewDefinition";
 
 /**
  * Client-facing plan summary. Ships resolved destination paths
@@ -36,8 +38,10 @@ import type { ExecutableScriptReview } from "./planSettingsScripts";
  * already carries absolute dest paths (#2620 / F6).
  *
  * #2600: imported VALUES (hook command strings, `env` values, `permissions`
- * values) are surfaced DELIBERATELY for review scrutiny — potentially including
- * secrets from a hostile archive. That visibility IS the control, so this
+ * values, and — #5172 — each MCP server's command, args, and url) are surfaced
+ * DELIBERATELY for review scrutiny — potentially including plain-text
+ * credentials from a hostile archive; a declared secret slot stays a slot name.
+ * That visibility IS the control, so this
  * summary is intentionally NOT value-free. Moved here from `importArchive.ts`
  * (#3590, #2077 max-lines) to sit beside its {@link toPlanSummary} projection;
  * `importArchive.ts` re-exports it for public-API parity.
@@ -101,13 +105,21 @@ export interface ImportPlanSummary {
     /** #3590 (K4/D9): registry-referenced hook names absent from archive + dest. */
     registryMissing: string[];
   };
-  mcpServers: PlannedMcpServer[];
+  /** #5172: each server with the definition the commit writes (slots by name). */
+  mcpServers: PlannedMcpServerReview[];
   plugins: { descriptorPresent: boolean; remediation: string[] };
+  /** The exporter's omissions plus any importer notice that is not a policy refusal. */
   omissions: Omission[];
+  /** #4156: the importer's policy refusals ("Refused by import policy"). */
+  policySkips: Omission[];
   expiresAt: number;
 }
 
 export function toPlanSummary(plan: ImportPlan): ImportPlanSummary {
+  // #4156 (K-A): split by identity — `policySkips` holds the same objects as
+  // `omissions`. Never derive this from `manifest.omissions`: an importer
+  // notice that is not a refusal must stay in `omissions`.
+  const policy = new Set(plan.policySkips);
   return {
     stagingHandle: plan.stagingHandle,
     claudeDir: plan.claudeDir,
@@ -162,12 +174,13 @@ export function toPlanSummary(plan: ImportPlan): ImportPlanSummary {
       // #3590 (K4/D9): the plan-time fail-loud registry list the review surfaces.
       registryMissing: plan.registryMissing,
     },
-    mcpServers: plan.mcpServers,
+    mcpServers: reviewMcpServers(plan),
     plugins: {
       descriptorPresent: plan.pluginDescriptorPresent,
       remediation: plan.pluginRemediation,
     },
-    omissions: plan.omissions,
+    omissions: plan.omissions.filter(o => !policy.has(o)),
+    policySkips: plan.policySkips,
     expiresAt: plan.createdAt + plan.ttlMs,
   };
 }

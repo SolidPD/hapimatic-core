@@ -1,6 +1,6 @@
 {
   "$comment": "VM tier menu — SINGLE SOURCE OF TRUTH for the shorthand VM sizes (operator spec, 2026-07-31). Consumed by resolve_vm_tier() in scripts/lib/provision-helpers.sh (bash/jq, drives --tier in oci-create-vm.sh + provision.sh) and by the #2467 Admin → VMs panel tier selector, which should display est_monthly_usd next to each tier at provisioning time. est_monthly_usd is a BALLPARK: raw PAYG marginal cost per month at the pricing_basis rates. The OCI always-free allowance (4 OCPU + 24 GB A1 compute, 200 GB total block storage) absorbs roughly one VM's worth (~$60/mo of value), so the FIRST VM in the tenancy runs ~free; every additional VM costs about its est_monthly_usd.",
-  "$comment_sessions": "Per-tier open-session counts and the machine block (issue #4417) come from a load test on 2026-10-06: one scratch VM per tier (lite, standard, pro; Ubuntu 24.04 arm64, the shipped daemon unit), each session a worktree spawn plus one real model turn. max_sessions = the open sessions the tier held before a spawn failed or the 50-session ceiling stopped it. recommended_sessions = the open sessions that stayed healthy when a third of them ran builds (typecheck, web tests, single-binary build) and a third ran repo tool work. Ultra was not measured: its counts are derived from the measured coefficients. machine_minimum / machine_recommended are the standard and pro shapes with their measured counts; disk is the measured base install plus about 0.75 GiB per open session of the test repository, at the tier maximum, rounded up to 10 GB. The disk figures count open sessions only. An archived session keeps its worktree on disk (0.75 GiB each in this test, the same as an open one), and only deleting the session frees it, after a 10-day recovery window. Retention has no upper bound, so no fixed figure covers it (PM ruling R-DISK, #4754). In the test, standard reached 40.5 GiB with 8 sessions open because its idle leg had left 33 archived worktrees on disk. Counts are per Hapimatic instance. docs/guide/installation.md § Machine requirements repeats machine_minimum / machine_recommended, the lite, standard and pro counts, lite's ocpus and memory_gb, and the 0.75 GiB per working copy: update it when they change.",
+  "$comment_sessions": "Per-tier open-session counts (issue #4785, operator ruling G2 of 2026-10-15) are what the capacity formula gives with the coefficients measured on 2026-10-15, except lite's recommended_sessions, which is 2 by operator ruling G2-6 (the formula gives 3; lite's #4785 mix stopped at the 2nd session on 1 OCPU, and the runtime guard takes the lower of the tier and the formula): one scratch VM per tier (lite, standard, pro; Ubuntu 24.04 arm64, the sessions slice at 10G / 12G, zram at half of RAM), each session a worktree spawn plus one real model turn, every session running the Playwright and sequential-thinking MCP servers and no LSP server (ruling G2-1 = A: the profile the fleet's sessions run; an LSP server such as tsserver adds about 1.1 GiB per session on a large TypeScript project). max_sessions = open sessions, idle (ruling G2-4 = R8-b: an open session holds its memory whether or not it is working, so max is the idle memory ceiling). recommended_sessions = the working count: open sessions that stay healthy when a third of them run builds (typecheck, web tests, single-binary build) and a third run repo tool work. Pro, pilot and ultra read the 10 GiB sessions slice on a provisioned VM (ruling D2 = A), so they share 12 / 19 until per-tier limits land (#4471). machine_minimum / machine_recommended are the standard and pro shapes with their recommended counts; their disk figures stay at #4417's values (ruling G2-5): #4417 computed disk as the measured base install plus about 0.75 GiB per open session of the test repository at the tier maximum, rounded up to 10 GB, so at the #4785 maxima they leave headroom. The disk figures count open sessions only. An archived session keeps its worktree on disk (0.75 GiB each in #4417's test, the same as an open one), and only deleting the session frees it, after a 10-day recovery window. Retention has no upper bound, so no fixed figure covers it (PM ruling R-DISK, #4754). Counts are per Hapimatic instance. docs/guide/installation.md § Machine requirements repeats machine_minimum / machine_recommended, the lite, standard and pro counts, lite's ocpus and memory_gb, and the 0.75 GiB per working copy: update it when they change.",
   "pricing_basis": {
     "as_of": "2026-07-31",
     "currency": "USD",
@@ -22,7 +22,7 @@
       "boot_volume_gb": 256,
       "est_monthly_usd": 66,
       "recommended_sessions": 12,
-      "max_sessions": 50
+      "max_sessions": 19
     },
     "pro": {
       "label": "Pro",
@@ -31,7 +31,7 @@
       "boot_volume_gb": 160,
       "est_monthly_usd": 54,
       "recommended_sessions": 12,
-      "max_sessions": 50
+      "max_sessions": 19
     },
     "pilot": {
       "label": "Pilot",
@@ -40,7 +40,7 @@
       "boot_volume_gb": 256,
       "est_monthly_usd": 58,
       "recommended_sessions": 12,
-      "max_sessions": 50
+      "max_sessions": 19
     },
     "standard": {
       "label": "Standard",
@@ -49,7 +49,7 @@
       "boot_volume_gb": 60,
       "est_monthly_usd": 26,
       "recommended_sessions": 6,
-      "max_sessions": 33
+      "max_sessions": 12
     },
     "lite": {
       "label": "Lite",
@@ -57,8 +57,8 @@
       "memory_gb": 4,
       "boot_volume_gb": 50,
       "est_monthly_usd": 14,
-      "recommended_sessions": 3,
-      "max_sessions": 12
+      "recommended_sessions": 2,
+      "max_sessions": 4
     }
   },
   "machine_minimum": {

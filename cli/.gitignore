@@ -9,6 +9,8 @@ oclif.manifest.json
 
 # Unpacked binaries (keep archives)
 /tools/unpacked/
+# The size manifest `bun run tools:unpack` writes beside tools/ (#5125)
+/.runtime-manifest.json
 
 # Build outputs
 /dist-exe/

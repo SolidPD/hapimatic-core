@@ -5,6 +5,7 @@ import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { configuration } from "@/configuration";
 import { readSettings, clearMachineId, updateSettings } from "@/persistence";
+import { serverSettingsHint } from "@/ui/tokenInit";
 import type { CommandDefinition } from "./types";
 
 export async function handleAuthCommand(args: string[]): Promise<void> {
@@ -45,9 +46,7 @@ export async function handleAuthCommand(args: string[]): Promise<void> {
           "    1. Check the server startup logs (first run shows generated token)"
         )
       );
-      console.log(
-        chalk.gray("    2. Read ~/.hapi/settings.json on the server")
-      );
+      console.log(chalk.gray(`    2. ${serverSettingsHint()}`));
       console.log(
         chalk.gray(
           "    3. Ask your server administrator (if token is set via env var)"
@@ -127,7 +126,7 @@ ${chalk.bold("Usage:")}
 
 ${chalk.bold("Token priority (highest to lowest):")}
   1. CLI_API_TOKEN environment variable
-  2. ~/.hapi/settings.json
+  2. cliApiToken in ${configuration.settingsFile}
   3. Interactive prompt (on first run)
 `);
 }

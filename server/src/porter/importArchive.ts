@@ -19,14 +19,16 @@ import {
 } from "@hapi/protocol/porter";
 import { decryptPorterArchive } from "../config/porterAgeKeys";
 import { parseTarGz } from "./tarArchive";
-import { planClaudeMd } from "./planClaudeMd";
+import { claudeMdCommitBytes, planClaudeMd } from "./planClaudeMd";
 import {
   buildExecutableScriptReview,
   differingSettingsKeys,
   heldSettingsScripts,
+  holdUncarriedSettings,
   planSettingsScripts,
   referencedScriptRels,
   settingsKeyLands,
+  SETTINGS_SCRIPT_IMPORT_REASONS,
   stageSettingsScripts,
   type ExecutableScriptReview,
 } from "./planSettingsScripts";
@@ -305,7 +307,12 @@ export interface ImportPlan {
   mcpServers: PlannedMcpServer[];
   /** Present only when the archive carried an encrypted secrets member. */
   encryptedSecretsStagedPath: string | null;
+  /** Every omission: the exporter's, then the importer's (`commitHooks` reads all). */
   omissions: Omission[];
+  /** #4156 (K-A): the importer's policy refusals, the SAME objects as in `omissions`. */
+  policySkips: Omission[];
+  /** #4156: lets the commit keep an excluded include's original CLAUDE.md reference. */
+  claudeMdRewrite?: ReturnType<typeof planClaudeMd>["rewrite"];
   pluginRemediation: string[];
   pluginDescriptorPresent: boolean;
   createdAt: number;
@@ -728,20 +735,22 @@ export async function planImport(
       // #2639 (F9) / #3590: hook-support subtrees AND the whole-tree per-file
       // `hookSupport` entries land here — same `planDimension` prefix-matcher, so
       // each `hooks/**` tar member (lib/_shared subtrees + every other file, minus
-      // registered hooks) stages PATH-PRESERVED (NOT basename-flattened like hook
-      // FILES) and flows through `detectFileConflicts` + the overwrite-none default
+      // registered hooks) stages PATH-PRESERVED (as hook FILES do since #4331)
+      // and flows through `detectFileConflicts` + the overwrite-none default
       // for free (R4 conflict policy — no bespoke landing block needed).
       ["hookSupport", manifest.hookSupport],
     ];
-    // #3590 (K3): archive paths already claimed by a registered `hooks[]` entry
-    // are planned by the hook-FILE loop below — skip them in the hookSupport
+    // #3590 (K3): destinations a registered `hooks[]` entry stages (#4331) are
+    // planned by the hook-FILE loop below — skip them in the hookSupport
     // dimension so a non-conforming archive is corrected, not double-planned.
-    const claimed = claimedHookPaths(manifest.hooks);
+    const claimed = claimedHookPaths(entries, manifest.hooks, claudeDir);
     // #4160: a section entry writes only inside its own folder; the rest is
-    // skipped (./planSections) and reported in `omissions`.
+    // skipped (./planSections) and reported in `omissions`. #4185: an entry
+    // that matches no file is reported too, in its own (non-policy) array.
     const sectionOmissions: Omission[] = [];
+    const sectionUnmatched: Omission[] = [];
     for (const [dimKey, ces] of dims) {
-      const { plans, skipped } = planDimension(
+      const { plans, skipped, unmatched } = planDimension(
         entries,
         ces,
         dimKey,
@@ -750,6 +759,7 @@ export async function planImport(
         dimKey === "hookSupport" ? claimed : undefined
       );
       sectionOmissions.push(...skipped);
+      sectionUnmatched.push(...unmatched);
       for (const { item, content } of plans) {
         await mkdir(dirname(item.stagedPath), { recursive: true });
         await writeFile(item.stagedPath, content);
@@ -761,21 +771,24 @@ export async function planImport(
     // CLAUDE.md member + its @-includes. A skipped include (#4143) is never
     // staged — only the returned items are — and is reported in `omissions`.
     const claudeMdOmissions: Omission[] = [];
+    let claudeMdPlan: ReturnType<typeof planClaudeMd> | undefined;
     if (manifest.claudeMd) {
-      const { items: claudeMdItems, skipped } = planClaudeMd(
+      claudeMdPlan = planClaudeMd(
         entries,
         manifest.claudeMd,
         claudeDir,
         stagingDir
       );
-      claudeMdOmissions.push(...skipped);
-      for (const item of claudeMdItems) {
+      claudeMdOmissions.push(...claudeMdPlan.skipped);
+      for (const item of claudeMdPlan.items) {
         const entry = findEntry(entries, item.archivePath);
         if (!entry || entry.kind !== "file") continue;
+        // #4156: CLAUDE.md with its nested include references rewritten.
+        const content = item.content ?? entry.data;
         await mkdir(dirname(item.file.stagedPath), { recursive: true });
-        await writeFile(item.file.stagedPath, entry.data);
+        await writeFile(item.file.stagedPath, content);
         files.push(item.file);
-        stagedItems.push({ destPath: item.file.destPath, content: entry.data });
+        stagedItems.push({ destPath: item.file.destPath, content });
       }
     }
 
@@ -794,7 +807,7 @@ export async function planImport(
       const v = (manifest.settings as Record<string, unknown>)[key];
       if (v !== undefined) settingsToMerge[key] = v;
     }
-    // #4173: the scripts the imported executable values run (./planSettingsScripts).
+    // #4173: the scripts the values run; #5178 holds a value whose file is unwritten.
     const homeDir = opts.homeDir ?? homedir();
     const scriptPlan = planSettingsScripts(
       entries,
@@ -804,7 +817,12 @@ export async function planImport(
       homeDir,
       stagingDir
     );
-    await stageSettingsScripts(scriptPlan.plans, files, stagedItems);
+    const scriptPlans = holdUncarriedSettings(settingsToMerge, scriptPlan, {
+      claudeDir,
+      homeDir,
+      files,
+    });
+    await stageSettingsScripts(scriptPlans, files, stagedItems);
     // #4160 backstop: every producer's destination, checked once (fail-closed).
     // #4173 (R7): the referenced-script set is recomputed here, not taken from the planner.
     assertPlannedDestinations(claudeDir, files, {
@@ -829,8 +847,16 @@ export async function planImport(
     // 9. Hooks → denormalised registrations + advisory command lint + unknown events.
     //    (`destHome` is hoisted above the MCP plan loop — #2640.) Extracted to
     //    ./planHooks (#3590, #2077 max-lines).
-    const { hookEntries, hookCommandWarnings, unknownHookEvents } =
-      buildHookEntries(manifest.hooks, destHome, claudeDir);
+    // #4331: every producer has planned by now, so a registration whose file
+    // this plan does not write is held, and one whose script is neither planned
+    // nor at the destination is reported (R5).
+    const { hookEntries, hookHolds, hookCommandWarnings, unknownHookEvents } =
+      buildHookEntries(
+        manifest.hooks,
+        destHome,
+        claudeDir,
+        new Set(files.map(f => f.destPath))
+      );
 
     // #3590 (K4/D9): plan-time fail-loud belt — registry-referenced hook names
     // absent from BOTH the archive and the destination.
@@ -901,9 +927,22 @@ export async function planImport(
       omissions: [
         ...manifest.omissions,
         ...sectionOmissions,
+        ...sectionUnmatched,
         ...claudeMdOmissions,
+        ...(claudeMdPlan?.notices ?? []),
         ...scriptPlan.skipped,
+        ...hookHolds,
       ],
+      // A missing carried script is a notice; a #5178 / #4331 hold is a refusal.
+      policySkips: [
+        ...sectionOmissions,
+        ...claudeMdOmissions,
+        ...scriptPlan.skipped.filter(
+          o => o.reason !== SETTINGS_SCRIPT_IMPORT_REASONS.missing
+        ),
+        ...hookHolds,
+      ],
+      claudeMdRewrite: claudeMdPlan?.rewrite,
       pluginRemediation,
       pluginDescriptorPresent: Boolean(manifest.plugins),
       createdAt: now,
@@ -1104,7 +1143,9 @@ async function runCommit(
 
     // a. Write file-tree items (dest-dir tmp + atomic rename).
     for (const item of writable) {
-      const content = await readFile(item.stagedPath);
+      const content =
+        claudeMdCommitBytes(plan.claudeMdRewrite, item, sel.isItemExcluded) ??
+        (await readFile(item.stagedPath));
       markTouched(backups, [item.destPath]);
       await atomicWriteFile(item.destPath, content, importFileMode(item.mode));
       filesWritten.push(item.destPath);

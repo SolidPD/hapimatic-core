@@ -71,3 +71,14 @@ export function describeDaemonBuildSkew(
   }
   return `the daemon's build (${daemonVersion}) differs from this CLI's (${cliVersion}) — restart its unit to run this build`;
 }
+
+/**
+ * #5103: the "Build skew: …" line `daemon start`, `daemon start-sync` and
+ * `hapi claude` report for a live daemon whose build differs, or null.
+ */
+export function formatDaemonBuildSkew(daemon: {
+  running: boolean;
+  skew: string | null;
+}): string | null {
+  return daemon.running && daemon.skew ? `Build skew: ${daemon.skew}` : null;
+}

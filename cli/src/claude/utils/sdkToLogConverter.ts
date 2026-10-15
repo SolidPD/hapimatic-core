@@ -15,6 +15,7 @@ import type {
 } from "@/claude/sdk";
 import type { RawJSONLines } from "@/claude/types";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
+import { CLI_VERSION } from "@/version";
 
 /**
  * Extended log message type that includes extra fields added during SDK→log conversion.
@@ -91,7 +92,7 @@ export class SDKToLogConverter {
     this.context = {
       ...context,
       gitBranch: context.gitBranch ?? getGitBranch(context.cwd),
-      version: context.version ?? process.env.npm_package_version ?? "0.0.0",
+      version: context.version ?? CLI_VERSION,
       parentUuid: null,
     };
     this.responses = responses;

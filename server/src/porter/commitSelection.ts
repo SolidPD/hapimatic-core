@@ -6,6 +6,8 @@
  * commit-side write (`runCommit` in `importArchive.ts`, via
  * {@link resolveCommitExclusions}), so the hierarchical grouping the UI renders
  * and the exclusion the commit applies CANNOT drift — they are the same code.
+ * The commit route's up-front `excluded` check ({@link unknownExclusions},
+ * #4237) reads the same groups, so it accepts every key the UI can send.
  *
  * Split into its own module (not grown into `importArchive.ts`) because that file
  * sits at 1488/1500 under a hard eslint `max-lines` error (`eslint.config.mjs:106`,
@@ -21,7 +23,6 @@
  * `ImportGroups` STRUCTURE — the server computes it once here and ships it in the
  * summary; the client renders + cascades from that same shipped data.
  */
-import { basename, join } from "node:path";
 import type { HookEntry } from "@hapi/protocol/porter";
 // #3448 (Sub C): the source-id set for the per-source `bySource` grouping the
 // review cards cascade over.
@@ -32,6 +33,7 @@ import type {
   PlannedFileItem,
   PlannedItemKind,
 } from "./importArchive";
+import { hookFileDest } from "./planHooks";
 
 /** One skill and its EXACT membership (files) + the hooks that serve it. */
 export interface SkillGroup {
@@ -92,16 +94,13 @@ type PlanForSelection = Pick<
  * A hook's exclusion key = its hook-file item's destPath, so excluding the hook
  * drops BOTH the registration (via {@link CommitExclusions.selectedHookEntries})
  * AND the file (via {@link CommitExclusions.isItemExcluded} on the `hook-file`
- * item, which shares this destPath). Falls back to the canonical `hooks/<base>`
- * path if the archive omitted the file (registration-only edge case).
+ * item, which shares this destPath). #4331: the path-preserved destination
+ * (./planHooks `hookFileDest`), never the basename, so two same-named hooks in
+ * different folders are two selection units. The same key covers a
+ * registration whose file the archive omitted.
  */
-function hookFileId(
-  h: HookEntry,
-  hookFileByName: ReadonlyMap<string, string>,
-  claudeDir: string
-): string {
-  const base = basename(h.file.path);
-  return hookFileByName.get(base) ?? join(claudeDir, "hooks", base);
+function hookFileId(h: HookEntry, claudeDir: string): string {
+  return hookFileDest(claudeDir, h.file.path);
 }
 
 /**
@@ -121,13 +120,6 @@ function servingSkillOf(
   return null;
 }
 
-/** Build a basename→destPath map of the plan's hook-file items. */
-function hookFileMap(files: readonly PlannedFileItem[]): Map<string, string> {
-  const m = new Map<string, string>();
-  for (const f of files) if (f.kind === "hook-file") m.set(f.name, f.destPath);
-  return m;
-}
-
 /** Append `value` to the array stored at `key`, creating it on first use. */
 function pushInto(
   map: Map<string, string[]>,
@@ -145,7 +137,6 @@ function pushInto(
  */
 export function computeGroups(plan: PlanForSelection): ImportGroups {
   const { files, hookEntries, mcpServers, claudeDir, manifest } = plan;
-  const hookFileByName = hookFileMap(files);
 
   // Skills: group skill-kind file items by owning skill name (EXACT membership).
   const skillFiles = new Map<string, string[]>();
@@ -159,7 +150,7 @@ export function computeGroups(plan: PlanForSelection): ImportGroups {
   const servingBySkill = new Map<string, string[]>();
   const independentHooks: IndependentHook[] = [];
   for (const h of hookEntries) {
-    const id = hookFileId(h, hookFileByName, claudeDir);
+    const id = hookFileId(h, claudeDir);
     const served = servingSkillOf(h.registration.command, skillNames);
     if (served) {
       pushInto(servingBySkill, served, id);
@@ -267,8 +258,9 @@ export interface CommitExclusions {
  * MCP quality exclusions. Default (empty set) = today's write-all behaviour.
  * #4173: `held` names the `settings-script` destPaths the commit holds back
  * (D4); a settings script ignores `excluded`, because its destPath is never a
- * valid exclusion key: the script follows its setting. The route still accepts
- * such a key as a silent no-op until #4237 refuses unknown keys.
+ * valid exclusion key: the script follows its setting. The commit route refuses
+ * such a key up front ({@link unknownExclusions}, #4237); only a library caller
+ * can still pass one, and it is ignored here.
  */
 export function resolveCommitExclusions(
   plan: PlanForSelection,
@@ -288,9 +280,8 @@ export function resolveCommitExclusions(
   }
 
   // Surviving hooks: keyed by hook-file destPath (registration + file as a unit).
-  const hookFileByName = hookFileMap(plan.files);
   const selectedHookEntries = plan.hookEntries.filter(
-    h => !expanded.has(hookFileId(h, hookFileByName, plan.claudeDir))
+    h => !expanded.has(hookFileId(h, plan.claudeDir))
   );
   const allHooksExcluded =
     plan.hookEntries.length > 0 && selectedHookEntries.length === 0;
@@ -335,4 +326,44 @@ export function resolveCommitExclusions(
     excludedMcpNames,
     mcpExclusions,
   };
+}
+
+/**
+ * #4237: the `excluded` keys a commit must refuse — every key that is not a
+ * selectable item of this plan. `excluded` is an opt-OUT list, so an unmatched
+ * key would write the item the caller meant to deselect (for a hook, its
+ * registration is merged into settings.json and runs next session).
+ *
+ * The valid set (K-EXCL) comes from the SAME {@link computeGroups} the plan
+ * summary ships, so every key the review can send is valid by construction:
+ * every skill's files and serving hooks, every independent hook id, agents,
+ * commands, rules, output styles, CLAUDE.md files, MCP server names, every
+ * `bySource[*].keys`, and `skill:<name>`. Exact string match, no normalization:
+ * a relative or `~`-prefixed path is unknown. `hook-lib` and `settings-script`
+ * destPaths are in no group, so they are refused too — excluding either would
+ * do nothing.
+ *
+ * Returns the unknown keys deduped, in input order; empty means all are valid.
+ */
+export function unknownExclusions(
+  plan: PlanForSelection,
+  excluded: readonly string[]
+): string[] {
+  const groups = computeGroups(plan);
+  const valid = new Set<string>([
+    ...groups.skills.flatMap(s => [
+      ...s.files,
+      ...s.servingHooks,
+      `skill:${s.skill}`,
+    ]),
+    ...groups.independentHooks.map(h => h.id),
+    ...groups.agents,
+    ...groups.commands,
+    ...groups.rules,
+    ...groups.outputStyles,
+    ...groups.claudeMd,
+    ...groups.mcpServers,
+    ...Object.values(groups.bySource).flatMap(s => s.keys),
+  ]);
+  return [...new Set(excluded)].filter(k => !valid.has(k));
 }

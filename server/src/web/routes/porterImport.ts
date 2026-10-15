@@ -29,6 +29,7 @@ import { PathEscapeError } from "../../porter/archiveContainment";
 import { ArchiveLimitError, TarParseError } from "../../porter/tarArchive";
 import { SecretInjectionError } from "../../porter/mcpImport";
 import { unknownKeepModes } from "../../porter/modeReconcile";
+import { unknownExclusions } from "../../porter/commitSelection";
 import {
   validateSecretOverlay,
   type SecretOverlay,
@@ -99,9 +100,10 @@ const CommitBodySchema = z.object({
   /**
    * #3247: keys the operator DESELECTED in the pre-import confirmation screen —
    * file destPaths, hook-file destPaths, MCP server names, or `skill:<name>`.
-   * Unknown names are a silent no-op at commit. Known gap (#4177 D1): `excluded`
-   * is an opt-OUT, so an unmatched key writes the item anyway — unlike
-   * `overwrite`, an opt-in, where ignoring an unknown key is the safe default.
+   * #4237: `excluded` is strict. It is an opt-OUT, so an unmatched key would
+   * write the item anyway; every key must be a selectable item of this plan, and
+   * an unknown key is refused with 400 (`excludedUnknown`). `overwrite` stays a
+   * no-op for unknown keys: it is an opt-in, so an unmatched key replaces nothing.
    */
   excluded: z.array(z.string()).optional(),
   /**
@@ -202,6 +204,20 @@ export function statusForError(err: unknown): 400 | 409 | 410 | 413 | 500 {
  */
 export function commitFailureOf(err: unknown): unknown {
   return err instanceof CommitRollbackError && !err.partial ? err.cause : err;
+}
+
+/** #4237: at most this many names go into a refusal's human-readable text. */
+const ERROR_NAME_LIMIT = 20;
+
+/**
+ * #4237: the names a refusal's `error` text lists — the first
+ * {@link ERROR_NAME_LIMIT}, then a count of the rest — because `excluded` has
+ * no length cap. The response's array field still carries every name.
+ */
+function namesForError(names: readonly string[]): string {
+  const shown = names.slice(0, ERROR_NAME_LIMIT).join(", ");
+  const rest = names.length - ERROR_NAME_LIMIT;
+  return rest > 0 ? `${shown}, and ${rest} more` : shown;
 }
 
 /**
@@ -575,6 +591,25 @@ export function createPorterImportRoutes(opts: {
           {
             error: `keepModes names ${keepUnknown.length} path(s) that are not File modes rows in this plan: ${keepUnknown.join(", ")}`,
             keepModesUnknown: keepUnknown,
+          },
+          400
+        );
+      }
+
+      // #4237: `excluded` is an opt-OUT list too — an unmatched key would write
+      // the item the caller meant to deselect (a hook's registration would run
+      // next session). Every key must be a selectable item of this plan, the same
+      // groups the summary shipped; refuse the rest up front, naming each, and keep
+      // the plan in the store for a corrected re-submit.
+      const excludedUnknown = unknownExclusions(
+        plan,
+        parsed.data.excluded ?? []
+      );
+      if (excludedUnknown.length > 0) {
+        return c.json(
+          {
+            error: `excluded names ${excludedUnknown.length} key(s) that are not selectable items in this plan: ${namesForError(excludedUnknown)}`,
+            excludedUnknown,
           },
           400
         );

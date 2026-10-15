@@ -79,7 +79,7 @@ The CLI's version is the build's root `package.json` version, read from `server/
 
 Upgrades are the deploy flows' job: they replace the binary and restart the daemon's systemd unit (prod deploy script, `deploy-local.sh` + the closer's daemon restart, `worktree-build.sh --restart`, `deploy-node.sh`). No CLI command replaces a running daemon because its build differs (D-4594-1 A):
 
-1. `daemon start` / `daemon start-sync` see a live daemon of another build, leave it running and report the skew; `hapi claude` (including a daemon-spawned session) only skips starting a second daemon.
+1. `daemon start` / `daemon start-sync` see a live daemon of another build, leave it running and report the skew; `hapi claude` (including a daemon-spawned session) only skips starting a second daemon, and reports the skew: always in its debug log, and on the console when it was started from a terminal (#5103).
 2. `hapi doctor` / `hapi daemon status` print the daemon's recorded build and, when it differs from the CLI's, a "Build skew" line naming the older side.
 
 The heartbeat has no build check (#4590): a running daemon keeps its build until its unit restarts, whatever binary is installed meanwhile.

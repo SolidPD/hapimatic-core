@@ -8,7 +8,11 @@ import {
   ArrowLeft,
   ArrowRight,
 } from "lucide-react";
-import { PORTER_SOURCE_IDS, PORTER_SOURCE_LABELS } from "@hapi/protocol/porter";
+import {
+  CLAUDE_INCLUDES_DIR,
+  PORTER_SOURCE_IDS,
+  PORTER_SOURCE_LABELS,
+} from "@hapi/protocol/porter";
 import { useAppContext } from "@/lib/app-context";
 import { usePorterImport } from "@/hooks/mutations/usePorterImport";
 import type {
@@ -32,12 +36,15 @@ import {
   ExecutableSettingsReview,
   SettingsScriptsHeldList,
 } from "./ExecutableSettingsReview";
+import { ImportOmissions } from "./ImportOmissions";
 import { conflictExcludedBy, resolvableConflicts } from "./importConflicts";
+import { hookRowLabels } from "./hookRowLabels";
 import {
   ImportDestination,
   SymlinkedSettingsGate,
   useSettingsLinkAck,
 } from "./ImportSettingsLink";
+import { McpServerDefinition } from "./McpServerDefinition";
 
 /**
  * PorterImportPanel — the upload → review → commit surface of the Admin →
@@ -310,6 +317,15 @@ function leafLabel(key: string): string {
   return seg && seg.length > 0 ? seg : key;
 }
 
+/**
+ * #4156: a nested CLAUDE.md include keeps its path from `claude-includes/` on,
+ * so `a/RULES.md` and `b/RULES.md` are two distinct rows, not two "RULES.md".
+ */
+function includeLabel(key: string): string {
+  const at = key.lastIndexOf(`/${CLAUDE_INCLUDES_DIR}/`);
+  return at >= 0 ? key.slice(at + 1) : leafLabel(key);
+}
+
 /** Tri-state of a skill's parent checkbox, derived from its leaves' exclusion. */
 function skillCheckState(
   leaves: readonly string[],
@@ -370,11 +386,13 @@ function DimGroup({
   keys,
   excluded,
   onToggle,
+  labelOf = leafLabel,
 }: {
   title: string;
   keys: string[];
   excluded: Set<string>;
   onToggle: (k: string) => void;
+  labelOf?: (k: string) => string;
 }) {
   if (keys.length === 0) return null;
   return (
@@ -386,7 +404,7 @@ function DimGroup({
         <LeafRow
           key={k}
           keyId={k}
-          label={leafLabel(k)}
+          label={labelOf(k)}
           excluded={excluded}
           onToggle={onToggle}
         />
@@ -509,15 +527,25 @@ function SourceCards({
  */
 function SelectionTree({
   groups,
+  claudeDir,
   excluded,
   onToggleLeaf,
   onToggleSkill,
 }: {
   groups: ImportGroups;
+  claudeDir: string;
   excluded: Set<string>;
   onToggleLeaf: (k: string) => void;
   onToggleSkill: (leaves: string[]) => void;
 }) {
+  // #4331: two same-named hooks in different folders get distinct labels.
+  const hookLabels = hookRowLabels(
+    [
+      ...groups.skills.flatMap(s => s.servingHooks),
+      ...groups.independentHooks.map(h => h.id),
+    ],
+    claudeDir
+  );
   const isEmpty =
     groups.skills.length === 0 &&
     groups.independentHooks.length === 0 &&
@@ -583,7 +611,7 @@ function SelectionTree({
                       <LeafRow
                         key={h}
                         keyId={h}
-                        label={leafLabel(h)}
+                        label={hookLabels.get(h) ?? leafLabel(h)}
                         hint="hook"
                         excluded={excluded}
                         onToggle={onToggleLeaf}
@@ -604,7 +632,7 @@ function SelectionTree({
                 <LeafRow
                   key={h.id}
                   keyId={h.id}
-                  label={leafLabel(h.id)}
+                  label={hookLabels.get(h.id) ?? leafLabel(h.id)}
                   hint="hook"
                   excluded={excluded}
                   onToggle={onToggleLeaf}
@@ -647,6 +675,7 @@ function SelectionTree({
             keys={groups.claudeMd}
             excluded={excluded}
             onToggle={onToggleLeaf}
+            labelOf={includeLabel}
           />
         </div>
       )}
@@ -1100,6 +1129,7 @@ export function PorterImportPanel({
                   />
                   <SelectionTree
                     groups={summary.groups}
+                    claudeDir={summary.claudeDir}
                     excluded={excluded}
                     onToggleLeaf={toggleExcludedLeaf}
                     onToggleSkill={toggleSkill}
@@ -1342,35 +1372,23 @@ export function PorterImportPanel({
                           </span>
                         )}
                         {s.commandTranslation && (
-                          <span className="truncate text-[length:var(--text-caption)] text-[var(--app-hint)]">
+                          <span className="font-mono break-all text-[length:var(--text-caption)] text-[var(--app-hint)]">
                             {s.commandTranslation.from} →{" "}
                             {s.commandTranslation.to}
                           </span>
                         )}
+                        <McpServerDefinition server={s} />
                       </li>
                     ))}
                   </ul>
                 </section>
               )}
 
-              {/* Omissions */}
-              {summary.omissions.length > 0 && (
-                <section>
-                  <h3 className="pb-1 text-[length:var(--text-caption)] font-semibold uppercase tracking-wide text-[var(--app-hint)]">
-                    Deliberately omitted
-                  </h3>
-                  <ul className="flex flex-col gap-0.5 text-[length:var(--text-body-dense)] text-[var(--app-hint)]">
-                    {summary.omissions.map(o => (
-                      <li key={o.surface}>
-                        <span className="font-medium text-[var(--app-fg)]">
-                          {o.surface}
-                        </span>{" "}
-                        — {o.reason}
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              )}
+              {/* #4156: policy refusals, then the other omissions. */}
+              <ImportOmissions
+                omissions={summary.omissions}
+                policySkips={summary.policySkips ?? []}
+              />
             </div>
           )}
 

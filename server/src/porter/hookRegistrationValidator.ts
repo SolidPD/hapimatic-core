@@ -207,8 +207,12 @@ function toDestPath(token: string, claudeDir: string): string {
  * (F3-expanded). A "path-like" token contains a `/` and either is absolute,
  * begins with a home/`~`/`$HOME` marker, or references `.claude/`. Interpreter
  * names (`python3`, `bash`) and flags are ignored.
+ *
+ * Exported for #4331: the plan-time dangling-registration warning
+ * (`buildHookEntries` in ./planHooks) uses this same token rule, so the plan
+ * and the post-commit orphan check below agree on what a command runs.
  */
-function referencedPaths(command: string, claudeDir: string): string[] {
+export function referencedPaths(command: string, claudeDir: string): string[] {
   // Apply the canonical `$HOME/.claude` / `~/.claude` denormaliser first, then
   // token-level rewriting handles foreign-home and bare-home forms.
   const destHome = dirname(claudeDir);

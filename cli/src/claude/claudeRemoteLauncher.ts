@@ -52,6 +52,7 @@ import {
   logExitDiagnostics,
   captureProcessTree,
   buildSessionExitReport,
+  createExitDiagnosticEntry,
 } from "./utils/exitDiagnostics";
 import { PLAN_FAKE_REJECT } from "./sdk/prompts";
 import { EnhancedMode } from "./loop";
@@ -71,6 +72,7 @@ import {
   type RemoteLauncherExitReason,
 } from "@/modules/common/remote/RemoteLauncherBase";
 import { NO_META_TEARDOWN } from "@/api/rpc/types";
+import { CLI_VERSION } from "@/version";
 
 interface PermissionsField {
   date: number;
@@ -372,7 +374,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
       {
         sessionId: session.sessionId || "unknown",
         cwd: session.path,
-        version: process.env.npm_package_version,
+        version: CLI_VERSION,
       },
       permissionHandler.getResponses()
     );
@@ -874,8 +876,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             // claudeRemote() returned cleanly, so the child's stderr is
             // uninteresting (no error preamble to capture). The crash-branch
             // path below populates stderr_tail when the close handler raised.
-            const rapidExitEntry = {
-              timestamp: new Date().toISOString(),
+            const rapidExitEntry = createExitDiagnosticEntry({
               exitType: "rapid-exit" as const,
               exitCode: null,
               signal: null,
@@ -888,8 +889,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
               processTree: null,
               stderr_tail: null,
               errorDetail: `Rapid exit in ${launchDurationMs}ms`,
-              version: process.env.npm_package_version ?? "unknown",
-            };
+            });
             logExitDiagnostics(rapidExitEntry);
             // Issue #1239: also persist to error_logs SQLite for admin visibility.
             logger.reportError(
@@ -967,8 +967,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             // SQLite context omits a no-op "".
             const stderrTail = typedErr?.stderrTail ?? null;
 
-            const exitEntry = {
-              timestamp: new Date().toISOString(),
+            const exitEntry = createExitDiagnosticEntry({
               exitType: isSignalExit ? ("signal" as const) : ("crash" as const),
               exitCode,
               signal,
@@ -981,8 +980,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
               processTree: childPid ? captureProcessTree(childPid) : null,
               stderr_tail: stderrTail,
               errorDetail,
-              version: process.env.npm_package_version ?? "unknown",
-            };
+            });
             logExitDiagnostics(exitEntry);
 
             // Send structured event to web UI

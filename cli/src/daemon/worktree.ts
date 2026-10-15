@@ -12,6 +12,7 @@ import {
   readlink,
   realpath,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -546,6 +547,192 @@ export async function resolveRepoRoot(basePath: string): Promise<string> {
   }
 
   return root;
+}
+
+// Issue #5106: the outcome of a git call that must tell its failure modes
+// apart. `runGit` rethrows `new Error(message)` and drops the exit status, so
+// the spawn-gate probes below use this never-throwing variant. Same exec
+// options as `runGit` (the #1435 GIT_* scrub, the HAPI_GIT_TIMEOUT_MS bound,
+// SIGKILL on timeout), plus LC_ALL=C: the probes classify git's stderr, and git
+// translates those messages under other locales.
+type GitStatusResult =
+  | { kind: "exit"; status: number; stdout: string; stderr: string }
+  | { kind: "spawn-error"; code: string }
+  | { kind: "signal"; signal: string }
+  | { kind: "timeout"; timeoutMs: number };
+
+async function runGitStatus(
+  args: string[],
+  cwd: string
+): Promise<GitStatusResult> {
+  const timeoutMs = getGitTimeoutMs();
+  try {
+    const result = await execFileAsync("git", args, {
+      cwd,
+      timeout: timeoutMs,
+      killSignal: "SIGKILL",
+      env: { ...buildScrubbedGitEnv(), LC_ALL: "C" },
+    });
+    return {
+      kind: "exit",
+      status: 0,
+      stdout: result.stdout ? result.stdout.toString() : "",
+      stderr: result.stderr ? result.stderr.toString() : "",
+    };
+  } catch (error) {
+    const execError = error as {
+      code?: number | string | null;
+      killed?: boolean;
+      signal?: string | null;
+      stdout?: string | Buffer;
+      stderr?: string | Buffer;
+    };
+    // A child SIGKILLed on timeout has `code === null`, so test `killed` first.
+    if (execError.killed || execError.code === "ETIMEDOUT") {
+      return { kind: "timeout", timeoutMs };
+    }
+    // A non-zero exit carries the numeric status in `code` (Node and Bun alike);
+    // a failure to start git at all carries a string code such as "ENOENT".
+    if (typeof execError.code === "number") {
+      return {
+        kind: "exit",
+        status: execError.code,
+        stdout: execError.stdout ? execError.stdout.toString() : "",
+        stderr: execError.stderr ? execError.stderr.toString() : "",
+      };
+    }
+    // git started but died on a signal other than the timeout kill.
+    if (typeof execError.signal === "string" && execError.signal.length > 0) {
+      return { kind: "signal", signal: execError.signal };
+    }
+    return {
+      kind: "spawn-error",
+      code: typeof execError.code === "string" ? execError.code : "UNKNOWN",
+    };
+  }
+}
+
+/** First meaningful line of a git failure, without git's `fatal: ` prefix. */
+function firstGitErrorLine(text: string): string | null {
+  const line = text
+    .split("\n")
+    .map(part => part.trim())
+    .find(part => part.length > 0);
+  return line ? line.replace(/^fatal:\s*/, "") : null;
+}
+
+function describeGitFailure(args: string[], result: GitStatusResult): string {
+  const command = `git ${args.join(" ")}`;
+  switch (result.kind) {
+    case "timeout":
+      return `${command} timed out after ${result.timeoutMs}ms (HAPI_GIT_TIMEOUT_MS to override)`;
+    case "spawn-error":
+      return `could not run git (${result.code})`;
+    case "signal":
+      return `${command} was terminated by ${result.signal}`;
+    case "exit":
+      return firstGitErrorLine(result.stderr) ?? `git exited ${result.status}`;
+  }
+}
+
+/** Issue #5106 (R6): what the worktree-spawn gate's git-ness probe found. */
+export type GitRepoProbe =
+  | { state: "repo"; toplevel: string }
+  | { state: "not-a-repo" }
+  | { state: "git-unavailable" }
+  | { state: "probe-failed"; detail: string };
+
+/**
+ * Issue #5106 (R5/R6): the worktree-spawn gate's git-ness probe (the #2270
+ * `--show-toplevel` check), classified instead of reading every failure as
+ * "not a git repository". Never throws.
+ *
+ * The directory is checked FIRST: a missing cwd fails the spawn with the same
+ * `ENOENT` / `spawn git` error as a missing git binary (Node and Bun alike), so
+ * without the check a nonexistent folder would read as "git not installed".
+ * A missing directory stays `not-a-repo`, which keeps the pre-#5106 flow (a
+ * defaulted spawn becomes a simple session, which offers to create the folder).
+ */
+export async function probeGitRepo(directory: string): Promise<GitRepoProbe> {
+  try {
+    const info = await stat(directory);
+    if (!info.isDirectory()) {
+      return { state: "not-a-repo" };
+    }
+  } catch {
+    return { state: "not-a-repo" };
+  }
+
+  const args = ["rev-parse", "--show-toplevel"];
+  const result = await runGitStatus(args, directory);
+  if (result.kind === "exit" && result.status === 0) {
+    const toplevel = result.stdout.trim();
+    return toplevel
+      ? { state: "repo", toplevel }
+      : {
+          state: "probe-failed",
+          detail: `git ${args.join(" ")} printed no path`,
+        };
+  }
+  if (
+    result.kind === "exit" &&
+    result.status === 128 &&
+    /not a git repository/i.test(result.stderr)
+  ) {
+    return { state: "not-a-repo" };
+  }
+  if (result.kind === "spawn-error" && result.code === "ENOENT") {
+    return { state: "git-unavailable" };
+  }
+  return { state: "probe-failed", detail: describeGitFailure(args, result) };
+}
+
+/** Issue #5106 (R1/R4): whether the HEAD a new worktree branches from has a commit. */
+export type SourceHeadProbe =
+  | { state: "present"; repoRoot: string }
+  | { state: "unborn"; repoRoot: string }
+  | { state: "unknown"; detail: string };
+
+/**
+ * Issue #5106 (R1/R4): does the HEAD that {@link createWorktree} branches from
+ * have a commit? Never throws.
+ *
+ * MIRRORS createWorktree's base: `git rev-parse --verify HEAD` at
+ * `resolveRepoRoot(basePath)` (the #1435 block; the root is the MAIN checkout,
+ * via `--git-common-dir`, #1219), not the HEAD of `basePath` itself, which for a
+ * linked worktree is a different branch. If createWorktree's base resolution
+ * changes (#4370 Task 3 replaces it with a base-ref resolution), update this
+ * probe in the same change. The agreement test in worktree.test.ts fails until
+ * it does.
+ *
+ * Only exit status 1 (`--quiet` on an unborn HEAD) reads as `unborn`. Any other
+ * failure (exit 128, a spawn error, a timeout, or a root that does not resolve,
+ * e.g. inside a submodule) is `unknown`, and the caller continues to
+ * createWorktree, whose own HEAD check reports a real failure.
+ */
+export async function probeSourceRepoHead(
+  basePath: string
+): Promise<SourceHeadProbe> {
+  let repoRoot: string;
+  try {
+    repoRoot = await resolveRepoRoot(basePath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      state: "unknown",
+      detail: firstGitErrorLine(message) ?? "repository root did not resolve",
+    };
+  }
+
+  const args = ["rev-parse", "--verify", "--quiet", "HEAD"];
+  const result = await runGitStatus(args, repoRoot);
+  if (result.kind === "exit" && result.status === 0) {
+    return { state: "present", repoRoot };
+  }
+  if (result.kind === "exit" && result.status === 1) {
+    return { state: "unborn", repoRoot };
+  }
+  return { state: "unknown", detail: describeGitFailure(args, result) };
 }
 
 function toSlug(value: string): string {
@@ -1512,9 +1699,19 @@ export type SyncConfigResult =
  *     against whatever `origin/<source_branch>` is currently at locally.
  *   - Sync failure: return `{ ok: false, error }` and the session starts with
  *     whatever `.claude/` the worktree already has (preserves existing *     behavior as fallback).
+ *
+ * Issue #5117: the fetch step is caller-supplied through `options.fetch`, never
+ * inferred here. Without it, `fetchSourceBranch` runs the same
+ * `git fetch origin <source_branch>` as before #5117, so the spawn caller is
+ * unchanged. The
+ * resume caller passes a per-recovery-pass coalescer
+ * (`createSourceBranchFetchCoalescer`) so the worktrees of one clone share one
+ * fetch per source branch. A throw from `options.fetch` is a failed fetch: it
+ * sets `fetchSucceeded=false` and the overlay runs against the local ref.
  */
 export async function syncConfigFromMain(options: {
   worktreePath: string;
+  fetch?: SourceBranchFetch;
 }): Promise<SyncConfigResult> {
   const { worktreePath } = options;
   let fetchSucceeded = true;
@@ -1571,20 +1768,11 @@ export async function syncConfigFromMain(options: {
   // local ref we happened to have" — closing the silent-failure hole flagged
   // by the silent-failure-hunter agent during PR #1324 review.
   try {
-    // Issue #1557: the non-fatal config fetch gets its OWN short timeout
-    // (HAPI_GIT_FETCH_TIMEOUT_MS, default 8s) so a slow/hung fetch fails fast to
-    // the local-ref fallback below WITHOUT consuming the fatal 30s worktree-op
-    // budget (HAPI_GIT_TIMEOUT_MS). `git worktree add` keeps the generous default.
-    // [perf] issue #2147 stage (d1): time syncConfigFromMain's config fetch —
-    // the SECOND per-spawn fetch #2852 R5 deferred measuring. grep `[perf][spawn]`.
-    const perfCfgFetchT0 = Date.now();
-    await runGit(["fetch", "origin", resolvedSourceBranch], worktreePath, {
-      timeoutMs: getGitFetchTimeoutMs(),
-      timeoutEnvHint: "HAPI_GIT_FETCH_TIMEOUT_MS",
+    // Issue #5117: the fetch step is injectable; the default is fetchSourceBranch.
+    await (options.fetch ?? fetchSourceBranch)({
+      worktreePath,
+      sourceBranch: resolvedSourceBranch,
     });
-    logger.debug(
-      `[perf][spawn] stage=worktree-fetch which=syncConfigFromMain branch=${resolvedSourceBranch} ms=${Date.now() - perfCfgFetchT0}`
-    );
   } catch (fetchError) {
     fetchSucceeded = false;
     const message =
@@ -1629,6 +1817,141 @@ export async function syncConfigFromMain(options: {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, error: message };
   }
+}
+
+/**
+ * The fetch step of `syncConfigFromMain` (issue #5117). Resolving means the
+ * fetch ran; throwing means it failed, which the caller treats as non-fatal.
+ */
+export type SourceBranchFetch = (args: {
+  worktreePath: string;
+  sourceBranch: string;
+}) => Promise<void>;
+
+/**
+ * The default fetch step: `git fetch origin <sourceBranch>` from the worktree.
+ */
+export async function fetchSourceBranch(args: {
+  worktreePath: string;
+  sourceBranch: string;
+}): Promise<void> {
+  // Issue #1557: the non-fatal config fetch gets its OWN short timeout
+  // (HAPI_GIT_FETCH_TIMEOUT_MS, default 8s) so a slow/hung fetch fails fast to
+  // the local-ref fallback WITHOUT consuming the fatal 30s worktree-op
+  // budget (HAPI_GIT_TIMEOUT_MS). `git worktree add` keeps the generous default.
+  // [perf] issue #2147 stage (d1): time syncConfigFromMain's config fetch —
+  // the SECOND per-spawn fetch #2852 R5 deferred measuring. grep `[perf][spawn]`.
+  const perfCfgFetchT0 = Date.now();
+  await runGit(["fetch", "origin", args.sourceBranch], args.worktreePath, {
+    timeoutMs: getGitFetchTimeoutMs(),
+    timeoutEnvHint: "HAPI_GIT_FETCH_TIMEOUT_MS",
+  });
+  logger.debug(
+    `[perf][spawn] stage=worktree-fetch which=syncConfigFromMain branch=${args.sourceBranch} ms=${Date.now() - perfCfgFetchT0}`
+  );
+}
+
+/**
+ * The shared git directory of `worktreePath` (every linked worktree of one
+ * clone resolves to the same path), or `null` when it cannot be read. Unlike
+ * `resolveRepoRoot` it never throws: a missing key means "fetch on your own".
+ */
+export async function resolveGitCommonDir(
+  worktreePath: string
+): Promise<string | null> {
+  try {
+    const result = await runGit(
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      worktreePath
+    );
+    const commonDir = result.stdout.trim();
+    return commonDir || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch attempts per (clone, source branch) key within one recovery pass. */
+export const RESUME_FETCH_ATTEMPTS_PER_KEY = 2;
+
+/**
+ * Issue #5117: a fetch step for one recovery pass that fetches each
+ * (git common dir, source branch) key once. All linked worktrees of a clone
+ * share `refs/remotes/origin/<branch>`, so one fetch refreshes the ref every
+ * sibling's overlay reads, and concurrent same-ref fetches lose the ref lock
+ * (`cannot lock ref`). Callers sharing a key join the in-flight fetch; after a
+ * success the key is never fetched again in this pass; a failure is retried by
+ * a later caller until `maxAttemptsPerKey`, after which the last error is
+ * rethrown so each record still reports `fetchSucceeded: false`. A worktree
+ * whose key cannot be resolved always runs its own fetch.
+ *
+ * The memo is deliberately NOT cleared on settle (unlike
+ * `kickExpiredWorktreePurge`): "already fetched in this pass" must hold for the
+ * records processed after the fetch completed. Create one per pass.
+ */
+export function createSourceBranchFetchCoalescer(
+  options: {
+    fetch?: SourceBranchFetch;
+    resolveKey?: (worktreePath: string) => Promise<string | null>;
+    maxAttemptsPerKey?: number;
+  } = {}
+): SourceBranchFetch {
+  const fetch = options.fetch ?? fetchSourceBranch;
+  const resolveKey = options.resolveKey ?? resolveGitCommonDir;
+  const maxAttempts =
+    options.maxAttemptsPerKey ?? RESUME_FETCH_ATTEMPTS_PER_KEY;
+  type Entry = {
+    inFlight: Promise<void> | null;
+    succeeded: boolean;
+    attempts: number;
+    lastError: unknown;
+  };
+  const entries = new Map<string, Entry>();
+
+  return async (args): Promise<void> => {
+    const commonDir = await resolveKey(args.worktreePath);
+    if (commonDir === null) {
+      return fetch(args);
+    }
+    // No await between the get and the set below, so claiming a key is atomic
+    // in single-threaded JS.
+    const key = `${commonDir}\0${args.sourceBranch}`;
+    let entry = entries.get(key);
+    if (!entry) {
+      entry = {
+        inFlight: null,
+        succeeded: false,
+        attempts: 0,
+        lastError: undefined,
+      };
+      entries.set(key, entry);
+    }
+    if (entry.succeeded) {
+      return;
+    }
+    if (entry.inFlight) {
+      return entry.inFlight;
+    }
+    if (entry.attempts >= maxAttempts) {
+      throw entry.lastError;
+    }
+    entry.attempts++;
+    const current = entry;
+    current.inFlight = fetch(args)
+      .then(
+        () => {
+          current.succeeded = true;
+        },
+        (error: unknown) => {
+          current.lastError = error;
+          throw error;
+        }
+      )
+      .finally(() => {
+        current.inFlight = null;
+      });
+    return current.inFlight;
+  };
 }
 
 // Issue #1646: the daemon's worktree-spawn path (sessionSpawner.ts) writes a

@@ -15,7 +15,8 @@
  * The rule is an ALLOWLIST keyed by the planned item's kind, not a denylist of
  * reserved names: a section item may only write strictly inside its section's
  * folder, CLAUDE.md only to `CLAUDE.md`, and a CLAUDE.md include only to a
- * top-level `*.md` sibling (#4143's rule, reused). Every reserved config file
+ * top-level `*.md` sibling or a `*.md` under `claude-includes/` (#4143's rule,
+ * extended by #4156, reused). Every reserved config file
  * (`settings.json`, `settings.local.json`, `.claude.json`, `.config.json`,
  * `.credentials.json`) is top-level and non-markdown, so none is reachable — and
  * a name denylist could not be applied at depth anyway, because an honest skill
@@ -228,7 +229,8 @@ export function assertPlannedDestinations(
 
 /**
  * The `omissions` surface a skipped section entry is reported under. The one
- * spelling shared by {@link sectionSkipOmission} (which emits it) and the
+ * spelling shared by the emitters ({@link sectionSkipOmission},
+ * {@link sectionEntryOmission}, {@link sectionUnmatchedOmission}) and the
  * parity report (./commitHooks), which skips an entry only when the plan
  * actually carries this omission for it.
  */
@@ -237,6 +239,42 @@ export function sectionSkipSurface(
   entryPath: string
 ): string {
   return `${field} entry ${entryPath}`;
+}
+
+/**
+ * A path with its leading `./` and trailing `/` stripped (each repeated): the
+ * spelling a tar MEMBER is matched by (#4185), so `./skills/foo/x` and
+ * `skills/foo/x/` match the entry `skills/foo`. A member is never rejected
+ * here, so a hostile `./skills/foo/../x` still matches `skills/foo` and is
+ * refused by `assertSafeEntry`, which runs on the RAW member path.
+ *
+ * Matching only. Never `path.posix.normalize`, which would fold
+ * `rules/../skills/x` into `skills/x`.
+ */
+export function stripEntrySpelling(p: string): string {
+  let s = p;
+  while (s.startsWith("./")) s = s.slice(2);
+  while (s.endsWith("/")) s = s.slice(0, -1);
+  return s;
+}
+
+/**
+ * The spelling a section ENTRY path is matched by (#4185):
+ * {@link stripEntrySpelling}, so `skills/foo/`, `./skills/foo` and `skills/foo`
+ * plan the same members. `null` when nothing is left, or the path has an empty
+ * (`//`, a leading `/`), `.` or `..` part: such an entry is reported as an
+ * invalid entry path and never used as a prefix. An omission still names the
+ * RAW entry spelling. Parts are split on `/` only, the tar separator, so a `\`
+ * path is matched as it is, and `assertSafeEntry` (which also splits on `\`)
+ * still refuses a member with a `..` part.
+ */
+export function normalizeEntryPath(p: string): string | null {
+  const s = stripEntrySpelling(p);
+  if (s === "") return null;
+  const parts = s.split("/");
+  if (parts.some(part => part === "" || part === "." || part === ".."))
+    return null;
+  return s;
 }
 
 /**
@@ -313,5 +351,28 @@ export function sectionEntryOmission(
   return {
     surface: sectionSkipSurface(field, entryPath),
     reason: reasons.join("; also "),
+  };
+}
+
+/**
+ * The plan warning for a section entry that planned nothing because it matched
+ * no FILE member (#4185), or because its path is not a valid entry path
+ * ({@link normalizeEntryPath} returned `null`). It carries the same surface as
+ * {@link sectionEntryOmission}, so an entry still gets ONE omission, and the
+ * post-commit parity (./commitHooks) drops a "missing" result for an entry
+ * already reported here. At most one of the two fires per entry: a member
+ * skipped for either #4160 or #4172 reason counts as a match.
+ */
+export function sectionUnmatchedOmission(
+  field: SectionField,
+  entryPath: string,
+  cause: "no-file" | "invalid-path" = "no-file"
+): Omission {
+  return {
+    surface: sectionSkipSurface(field, entryPath),
+    reason:
+      cause === "invalid-path"
+        ? `not imported: this is not a valid entry path (it has an empty, "." or ".." part)`
+        : "not imported: no file in the archive matches this entry",
   };
 }

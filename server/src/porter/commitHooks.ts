@@ -7,14 +7,15 @@
  * commit-time logic — the same decomposition that produced `importPlanSummary.ts`
  * (#2565) and `commitSelection.ts` (#3247).
  */
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { HOOK_SUPPORT_DIRS } from "@hapi/protocol/porter";
 import {
   validateHookRegistration,
   type HookRegistrationValidationResult,
 } from "./hookRegistrationValidator";
 import { RegistryDriftError } from "./importArchiveErrors";
-import { sectionSkipSurface } from "./plannedDestinations";
+import { hookFileDest } from "./planHooks";
+import { normalizeEntryPath, sectionSkipSurface } from "./plannedDestinations";
 import type { Conflict } from "./conflictDetection";
 import type { ImportPlan, PlannedItemKind } from "./importArchive";
 import type { CommitExclusions } from "./commitSelection";
@@ -32,7 +33,9 @@ export interface DimensionParity {
   /**
    * The non-tautological gap: for `hooks`, registry-referenced modules absent at
    * the destination post-commit (Task 4); for `hookSupport`, per-file entries
-   * whose tar member was absent (a truncated/partial archive). Empty otherwise.
+   * that did not land at their own path and carry no plan-time omission (#4185
+   * reports an entry whose tar member is absent at plan time instead). Empty
+   * otherwise.
    */
   missing: string[];
 }
@@ -59,8 +62,9 @@ const KIND_TO_DIM: Record<PlannedItemKind, string> = {
  * finalized commit. `runCommit` is all-or-nothing (rollback on any error), so for
  * file dimensions `written`/`alreadyPresent`/`skippedConflicts` are a function of
  * the selected plan — the two `missing` sources are the only non-tautological
- * signals (a registry that points at an absent hook; a truncated hookSupport
- * entry). Deselected items (#3247) are excluded from every count.
+ * signals (a registry that points at an absent hook; a hookSupport entry that
+ * did not land at its path). Deselected items (#3247) are excluded from every
+ * count.
  */
 export function computeParity(
   plan: ImportPlan,
@@ -97,24 +101,40 @@ export function computeParity(
     ensure("hooks").missing = [...hookValidation.registryMissing];
   }
 
-  // hookSupport: a per-file entry whose tar member was absent at plan time (a
-  // truncated/partial archive) — the directory entries (lib/_shared) are excluded.
+  // hookSupport: a per-file entry that did not land at its own path and has no
+  // plan-time omission — the directory entries (lib/_shared) are excluded.
   const isDirEntry = (path: string): boolean =>
     HOOK_SUPPORT_DIRS.some(d => path === join("hooks", d));
-  const plannedLibPaths = new Set(
-    plan.files.filter(f => f.kind === "hook-lib").map(f => f.destPath)
+  // #4185: a hookSupport file a registered hook claims lands as a `hook-file`
+  // (./planSections leaves it to the hook-file loop), so it counts as landed.
+  const plannedHookPaths = new Set(
+    plan.files
+      .filter(f => f.kind === "hook-lib" || f.kind === "hook-file")
+      .map(f => f.destPath)
   );
-  // #4160: skip an entry only when the plan actually reports it as policy-skipped
-  // (./planSections emits one omission per skipped entry). An entry with no such
-  // omission — e.g. outside hooks/ and absent from the archive — is still missing.
+  // #4160: skip an entry only when the plan actually reports it under its
+  // section surface (./planSections emits one omission per entry). #4185: that
+  // includes an entry that matched no file or has an invalid path, so one
+  // already reported at plan time is not ALSO reported here as missing.
+  // 🔴 #4185 / #4156: this dedupe RELIES on reading EVERY `plan.omissions`
+  // surface (policy skips ∪ unmatched). If #4156 adds a policy-only list
+  // (`plan.policySkips`) and narrows this set to it, the unmatched notices must
+  // stay in the set, or V7/V7b report an entry twice (plan-time notice and
+  // post-commit missing).
   const policySkipped = new Set(plan.omissions.map(o => o.surface));
   const missingSupport = plan.manifest.hookSupport
-    .filter(
-      e =>
-        !isDirEntry(e.path) &&
+    .filter(e => {
+      // The planner's spelling: `hooks/x.sh/` planned `<claudeDir>/hooks/x.sh`,
+      // and `hooks/lib/` is the `hooks/lib` directory entry. `null` was
+      // reported at plan time as an invalid entry path.
+      const path = normalizeEntryPath(e.path);
+      return (
+        path !== null &&
+        !isDirEntry(path) &&
         !policySkipped.has(sectionSkipSurface("hookSupport", e.path)) &&
-        !plannedLibPaths.has(join(plan.claudeDir, e.path))
-    )
+        !plannedHookPaths.has(join(plan.claudeDir, path))
+      );
+    })
     .map(e => e.path);
   if (missingSupport.length > 0) {
     ensure("hookSupport").missing = missingSupport;
@@ -149,13 +169,15 @@ export function assertRegistryAcknowledged(
  * back.
  *
  * The validator walks the ENTIRE destination `hooks/` tree — including
- * pre-existing native hooks that were never in this archive — so its findings are
- * intersected with this plan's SELECTED hook entries by BASENAME (the validator
- * returns dest file paths; `plan.hookEntries` carry archive paths) before
- * excluding from the count. A pre-existing hook's unresolved import stays LOUD (it
- * remains in `hookValidation.unresolvedImports`) but must NOT decrement the
- * imported count. A deselected hook (#3247) was neither written nor merged, so it
- * must not appear in the imported count either.
+ * pre-existing native hooks that were never in this archive, at any folder depth
+ * — so its findings are intersected with this plan's SELECTED hook entries by
+ * DESTINATION (#4331: ./planHooks `hookFileDest`, never the basename, so a
+ * pre-existing `hooks/b/run.py` is not counted against an imported
+ * `hooks/a/run.py`) before excluding from the count. A pre-existing hook's
+ * unresolved import stays LOUD (it remains in `hookValidation.unresolvedImports`)
+ * but must NOT decrement the imported count. A deselected hook (#3247) was
+ * neither written nor merged, so it must not appear in the imported count
+ * either.
  */
 export async function attributeHookValidation(
   plan: ImportPlan,
@@ -166,18 +188,19 @@ export async function attributeHookValidation(
 }> {
   const hookValidation = await validateHookRegistration(plan.claudeDir);
 
-  const importedHookBasenames = new Set(
-    sel.selectedHookEntries.map(h => basename(h.file.path))
+  const importedHookDests = new Set(
+    sel.selectedHookEntries.map(h => hookFileDest(plan.claudeDir, h.file.path))
   );
   const hookExcluded: { hook: string; module: string }[] = [];
-  const excludedHookNames = new Set<string>();
+  const excludedHookDests = new Set<string>();
   for (const u of hookValidation.unresolvedImports) {
-    const name = basename(u.hook);
-    if (!importedHookBasenames.has(name)) continue; // pre-existing dest hook
-    hookExcluded.push({ hook: name, module: u.module });
-    excludedHookNames.add(name);
+    const dest = resolve(u.hook);
+    if (!importedHookDests.has(dest)) continue; // pre-existing dest hook
+    // The displayed value stays the basename, so the wire strings do not change.
+    hookExcluded.push({ hook: basename(u.hook), module: u.module });
+    excludedHookDests.add(dest);
   }
-  const hooksImported = sel.selectedHookEntries.length - excludedHookNames.size;
+  const hooksImported = sel.selectedHookEntries.length - excludedHookDests.size;
 
   return {
     hookValidation,

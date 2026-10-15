@@ -562,7 +562,11 @@ empty-matcher registrations are exactly the ones a careless filter drops.
    truthy, so it would emit a schema-invalid \`matcher: ""\` / \`matcher: null\`
    (the manifest requires a non-empty \`matcher\` string, or none at all).
 2. For each row, resolve its \`command\` to the script file it runs (commonly under
-   \`~/.claude/hooks/\`) and copy that FILE into \`hooks/\` in the archive.
+   \`~/.claude/hooks/\`) and copy that FILE into \`hooks/\` in the archive. A script
+   under \`~/.claude/hooks/\` keeps its path relative to \`~/.claude/\`, subfolders
+   included (\`~/.claude/hooks/a/run.py\` is archived as \`hooks/a/run.py\`); any
+   other script goes into \`hooks/\` under its own name. Set the entry's
+   \`file.path\` (sub-step 4) to that archive path.
 3. Normalize each \`command\` path to the portable form: rewrite the source home
    prefix (\`/home/<user>/.claude\` or \`~/.claude\`) to
    \`${PORTABLE_HOME_TOKEN}/.claude\` so the command is not dead-on-arrival where

@@ -275,12 +275,13 @@ export const PORTER_STAGING_MARKER = ".hapi-porter-staging";
  * (`manifest.json`'s `claudeMd.path` and `claudeMd.includes` name the other
  * two), so the guarantee holds against a tar that misplaces, adds, duplicates
  * or rewrites any of them, as that tar lists and extracts the archive. The
- * scope is exactly that: the importer parses the archive with its OWN tar
- * parser, which is not byte-exact and can name a member differently from the
- * local tar (a global pax `path`, a GNU-format header's ustar prefix bytes, a
- * pax `size` record, a char-vs-byte pax length, and other header forms) — a
- * tar that writes such a header can pass this check yet be read differently on
- * import. Closing that class is the importer's job (#4285), not this block's.
+ * importer parses the archive with its own parser, which names every member
+ * as GNU tar and BusyBox do or refuses the archive (#4285: a global pax
+ * `path`, a non-POSIX header's prefix bytes, a pax `size`, a base-256 size, a
+ * sized directory, a char-vs-byte pax length, a repeated name and the rest of
+ * that class — the list is in docs/internal/architecture/config-porter-archive.md,
+ * "The importer's tar rules"); for a header form outside that list the
+ * guarantee is how that tar lists the archive.
  * Every other listed folder carries what was staged, unchecked. `TAR_*` and
  * `GZIP` are cleared first. (5) prints
  * one summary line for the includes and one for the settings scripts. Any
@@ -503,8 +504,8 @@ export function buildIncludeCheckShellFragment(
     "# member to decide what it installs as CLAUDE.md or an include: manifest.json",
     "# (its claudeMd.path and claudeMd.includes name the members), and the members",
     "# they name. So the check requires: every listed name is canonical (relative, no",
-    "# // and no . or .. segment) and appears once (the importer reads a repeated",
-    "# name's first copy, extraction keeps its last), and listing it drew no tar",
+    "# // and no . or .. segment) and appears once (the importer refuses a repeated",
+    "# name, extraction keeps its last copy), and listing it drew no tar",
     "# member-name warning (BusyBox strips a leading / or ../ from what it lists,",
     "# and says 'removing leading ... from member names' — so a name the case rules",
     "# below can no longer see is still caught by that warning; other stderr noise,",

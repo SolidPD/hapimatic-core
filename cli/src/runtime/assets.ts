@@ -13,15 +13,25 @@ import {
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
-import { arch, platform } from "node:os";
-import * as tar from "tar";
 import type { EmbeddedAsset } from "#embedded-assets";
 import { isBunCompiled, runtimeAssetsBasePath } from "@/projectPath";
 import { runtimeAssetsKey } from "@/runtime/assetsKey";
+import {
+  TOOL_EXTRACT_OPTIONS,
+  runtimeDirProblem,
+  unpackTools,
+} from "@/runtime/toolExtraction";
 import { logger } from "@/ui/logger";
 
 /** Names the key a runtime directory was extracted for; written last, before publishing. */
 const RUNTIME_MARKER = ".runtime-version";
+/** #5103: private to this user — every session executes the binaries in it. */
+const RUNTIME_DIR_MODE = 0o700;
+
+// #5125: the tool extraction and its size manifest live in toolExtraction.ts,
+// shared with the source checkout's `bun run tools:unpack`.
+export { TOOL_EXTRACT_OPTIONS, runtimeDirProblem, unpackTools };
+
 /** A private extraction in progress: `.tmp-<key>-<pid>-<random>`. */
 const TEMP_PREFIX = ".tmp-";
 /** A torn final directory moved aside before publishing over it. */
@@ -76,93 +86,15 @@ async function copyAssetFile(
   }
 }
 
-function getPlatformDir(): string {
-  const platformName = platform();
-  const archName = arch();
-
-  if (platformName === "darwin") {
-    if (archName === "arm64") return "arm64-darwin";
-    if (archName === "x64") return "x64-darwin";
-  } else if (platformName === "linux") {
-    if (archName === "arm64") return "arm64-linux";
-    if (archName === "x64") return "x64-linux";
-  } else if (platformName === "win32") {
-    if (archName === "x64") return "x64-win32";
-  }
-
-  throw new Error(`Unsupported platform: ${archName}-${platformName}`);
-}
-
-function areToolsUnpacked(unpackedPath: string): boolean {
-  if (!existsSync(unpackedPath)) {
-    return false;
-  }
-
-  const isWin = platform() === "win32";
-  const difftBinary = isWin ? "difft.exe" : "difft";
-  const rgBinary = isWin ? "rg.exe" : "rg";
-
-  const expectedFiles = [
-    join(unpackedPath, difftBinary),
-    join(unpackedPath, rgBinary),
-  ];
-
-  return expectedFiles.every(file => existsSync(file));
-}
-
 /**
- * Extracts the platform's tool archives into `<runtimeRoot>/tools/unpacked`.
- * Always a full extract: it only ever runs on a fresh private directory, so
- * existing binaries can never shadow the archives' contents (#4594 fixture S2).
+ * A published runtime directory: its marker names `key`, and its manifest lists
+ * the tools with every file at its declared size (#5103).
  */
-export function unpackTools(runtimeRoot: string): void {
-  const platformDir = getPlatformDir();
-  const toolsDir = join(runtimeRoot, "tools");
-  const archivesDir = join(toolsDir, "archives");
-  const unpackedPath = join(toolsDir, "unpacked");
-
-  rmSync(unpackedPath, { recursive: true, force: true });
-  ensureDirectory(unpackedPath);
-
-  const archives = [
-    `difftastic-${platformDir}.tar.gz`,
-    `ripgrep-${platformDir}.tar.gz`,
-  ];
-
-  for (const archiveName of archives) {
-    const archivePath = join(archivesDir, archiveName);
-    if (!existsSync(archivePath)) {
-      throw new Error(`Archive not found: ${archivePath}`);
-    }
-    tar.extract({
-      file: archivePath,
-      cwd: unpackedPath,
-      sync: true,
-      preserveOwner: false,
-    });
-  }
-
-  if (platform() !== "win32") {
-    const files = readdirSync(unpackedPath);
-    for (const file of files) {
-      if (file.endsWith(".node")) {
-        continue;
-      }
-      const filePath = join(unpackedPath, file);
-      const stats = statSync(filePath);
-      if (stats.isFile()) {
-        chmodSync(filePath, 0o755);
-      }
-    }
-  }
-}
-
-/** A published runtime directory: its marker names `key` and both tools are unpacked. */
 export function isRuntimeDirReady(dir: string, key: string): boolean {
   try {
     return (
       readFileSync(join(dir, RUNTIME_MARKER), "utf-8").trim() === key &&
-      areToolsUnpacked(join(dir, "tools", "unpacked"))
+      runtimeDirProblem(dir) === null
     );
   } catch {
     return false;
@@ -180,8 +112,8 @@ function isMissing(error: unknown): boolean {
 /**
  * Renames a complete private extraction to its final name (R5). A final
  * directory that is already published wins and the private copy is discarded;
- * a torn one (no marker, or tools missing) is moved aside first, never
- * rewritten in place.
+ * a torn one (wrong or missing marker, or a tool missing, truncated or absent
+ * from its manifest) is moved aside first, never rewritten in place.
  */
 function publishRuntimeDir(
   tempDir: string,
@@ -196,9 +128,12 @@ function publishRuntimeDir(
       return;
     }
     const aside = join(baseDir, `${STALE_PREFIX}${key}-${uniqueSuffix()}`);
+    const reason = runtimeDirProblem(finalDir) ?? "wrong or missing marker";
     try {
       renameSync(finalDir, aside);
-      log(`[RUNTIME] moved a torn runtime directory aside: ${aside}`);
+      log(
+        `[RUNTIME] moved a torn runtime directory aside (${reason}): ${aside}`
+      );
     } catch (error) {
       // A concurrent extractor moved it first.
       if (!isMissing(error)) {
@@ -307,11 +242,13 @@ export interface EnsureRuntimeDirOptions {
 
 /**
  * Returns `<baseDir>/<key>`, ready to use (#4594 R4-R6). When it is already
- * published this is a marker read and a few stats. Otherwise the assets are
- * extracted into a private `.tmp-*` directory, the marker is written last (only
- * once the tools are there), the directory is published with an atomic rename,
- * and older directories are pruned. A failed extraction, including one that
- * left the tools missing, removes its private directory and throws.
+ * published this is a marker read, a manifest read and a few stats. Otherwise
+ * the assets are extracted into a private `.tmp-*` directory, the marker is
+ * written last (only once the manifest check passes, #5103), the directory is
+ * published with an atomic rename, and older directories are pruned. A failed
+ * extraction, including one that left a tool missing or truncated, removes its
+ * private directory and throws. A published directory whose files no longer
+ * match its manifest is not ready, so it is moved aside and extracted again.
  */
 export async function ensureRuntimeDir(
   options: EnsureRuntimeDirOptions
@@ -323,16 +260,21 @@ export async function ensureRuntimeDir(
     return finalDir;
   }
 
-  ensureDirectory(baseDir);
+  mkdirSync(baseDir, { recursive: true, mode: RUNTIME_DIR_MODE });
   const tempDir = join(baseDir, `${TEMP_PREFIX}${key}-${uniqueSuffix()}`);
-  mkdirSync(tempDir);
+  // Created private and renamed into place, so the published <key> directory
+  // holding the tools is private too (#5103).
+  mkdirSync(tempDir, { mode: RUNTIME_DIR_MODE });
   try {
     await populate(tempDir);
-    // The marker promises the tools are there, so check them first: a
-    // non-strict tar extract can return without having written its files.
-    if (!areToolsUnpacked(join(tempDir, "tools", "unpacked"))) {
+    // The marker promises a complete directory, so check the manifest first:
+    // every tool present at the size its archive entry declared (#5103). Strict
+    // extraction already throws on a failed write; this also catches a populate
+    // that returned without its files.
+    const problem = runtimeDirProblem(tempDir);
+    if (problem) {
       throw new Error(
-        `Runtime assets for ${key} were extracted without the difft and rg tools`
+        `Runtime assets for ${key} failed the manifest check: ${problem}`
       );
     }
     writeFileSync(join(tempDir, RUNTIME_MARKER), key, "utf-8");

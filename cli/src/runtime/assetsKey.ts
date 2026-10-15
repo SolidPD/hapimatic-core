@@ -19,8 +19,11 @@ declare const HAPI_RUNTIME_ASSETS_KEY: string | undefined;
 /**
  * Hashed ahead of the files. Change it when the extracted layout changes, so a
  * build with a new layout never reuses a directory extracted by an older one.
+ *
+ * v2 (#5103): strict extraction plus `.runtime-manifest.json` (the declared tool
+ * sizes). A v1 directory has no manifest, so a v2 build never reuses one.
  */
-export const RUNTIME_ASSETS_LAYOUT = "hapi-runtime-assets-v1";
+export const RUNTIME_ASSETS_LAYOUT = "hapi-runtime-assets-v2";
 
 /** A build-time key: the first 12 hex digits of the digest. */
 export const RUNTIME_ASSETS_KEY_PATTERN = /^[0-9a-f]{12}$/;

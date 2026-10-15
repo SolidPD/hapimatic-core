@@ -12,6 +12,7 @@ import { initializeToken } from "@/ui/tokenInit";
 import { spawnHappyCLI } from "@/utils/spawnHappyCLI";
 import { maybeAutoStartServer } from "@/utils/autoStartServer";
 import { withBunRuntimeEnv } from "@/utils/bunRuntime";
+import { formatDaemonBuildSkew } from "@/version";
 import type { CommandDefinition } from "./types";
 
 function extractErrorInfo(error: unknown): {
@@ -197,7 +198,17 @@ ${chalk.bold.cyan("Claude Code Options (from `claude --help`):")}
     // Issue #4594 (D-4594-1 A): start a daemon only when none is live. A live
     // daemon of another build is left alone — that includes the daemon that
     // spawned this very session (`--started-by daemon`) after a binary swap.
-    if (!(await readDaemonBuildSkew()).running) {
+    // #5103: its build skew is reported, as `daemon start` reports it.
+    const daemon = await readDaemonBuildSkew();
+    const skewLine = formatDaemonBuildSkew(daemon);
+    if (skewLine) {
+      logger.debug(`[CLAUDE] ${skewLine}`);
+      // A daemon-spawned session's console is a tmux pane nobody reads.
+      if (options.startedBy !== "daemon") {
+        console.log(chalk.yellow(skewLine));
+      }
+    }
+    if (!daemon.running) {
       logger.debug("Starting hapi background service...");
 
       const daemonProcess = spawnHappyCLI(["daemon", "start-sync"], {

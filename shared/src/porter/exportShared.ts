@@ -50,6 +50,17 @@ export const DIMENSION_DIRS = PORTABLE_DIMENSIONS.filter(
 );
 
 /**
+ * The archive folder every exporter stages CLAUDE.md's `@`-includes under: an
+ * include `docs/guide.md` ships as the member `claude-includes/docs/guide.md`.
+ * #4156: the importer lands a NESTED include at
+ * `<config root>/claude-includes/<include>` and rewrites its CLAUDE.md
+ * reference to match, so the folder is also the one place under the config
+ * root an include may write below top level. A test pins every exporter's
+ * member paths to this spelling.
+ */
+export const CLAUDE_INCLUDES_DIR = "claude-includes";
+
+/**
  * The tar members a definitions-only archive can carry — NEVER a secrets one.
  * Both exporters tar these; the extraction prompt's Step 11 tars these plus
  * the encrypted secrets member (#4164 `PROMPT_ARCHIVE_MEMBERS`).
@@ -60,7 +71,7 @@ export const DEFINITIONS_ARCHIVE_MEMBERS: readonly string[] = [
   "manifest.json",
   ...DIMENSION_DIRS,
   "CLAUDE.md",
-  "claude-includes",
+  CLAUDE_INCLUDES_DIR,
   "hooks",
   "settings-scripts",
 ];

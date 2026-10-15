@@ -14,14 +14,20 @@
  * now resolves from its tier marker (capped at the formula on its real inputs, #4754) or,
  * without one, from the formula below.
  *
- * This module does only cheap process-stable reads (os.totalmem / constrainedMemory /
- * availableParallelism, cached) plus a tiny marker file read; it holds no daemon state.
+ * This module does only cheap reads (os.totalmem / constrainedMemory /
+ * availableParallelism, the cgroupfs limits of this instance's child sessions slice —
+ * cached once that slice is seen) plus a tiny marker file read; it holds no daemon state.
  */
 import * as os from "node:os";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { MAX_CONCURRENCY_DEFAULT } from "@hapi/protocol/schemas";
+import {
+  instanceSliceFor,
+  resolveSessionSliceConfig,
+  sliceCgroupSegment,
+} from "@/tmux/sessionSlice";
 // Build-time import of the tier menu (cli tsconfig `rootDir: ".."` + resolveJsonModule).
 // `shared/` cannot import it (rootDir), which is why this lives in cli/daemon.
 import vmTiersJson from "../../../scripts/lib/vm-tiers.json";
@@ -51,11 +57,15 @@ export interface SessionCounts {
 }
 
 /**
- * The fitted formula coefficients. Two `R0` constants because
- * `process.constrainedMemory()` returns the cgroup limit on a limited host:
- * - `r0CgroupBytes` — when the memory input IS the daemon's cgroup limit, only the
- *   daemon + its MCP servers + the tmux server share that budget (the Hapimatic server
- *   is a separate unit and is NOT in it).
+ * The fitted formula coefficients. Two `R0` constants because the memory input is a
+ * cgroup limit on a limited host:
+ * - `r0CgroupBytes` — when the memory input IS a cgroup limit. Since #4743 that is the
+ *   sessions slice's limit wherever the slice exists (#4785, ruling D2 = A): the slice
+ *   holds each instance's tmux server and every tmux-persisted session, not the daemon or
+ *   the Hapimatic server. On a node without the slice it is the daemon's own cgroup
+ *   (`process.constrainedMemory()`), whose budget the daemon, its direct-spawn agents
+ *   and the tmux server share. #4785 refit this value to the slice (64 MiB, ruling G2-3); a
+ *   node without the slice whose daemon unit is limited now uses the same 64 MiB.
  * - `r0MachineBytes` — when the input is whole-machine memory, `R0` covers the server,
  *   the daemon, MCP servers and the OS baseline.
  */
@@ -75,26 +85,32 @@ export interface CapacityCoefficients {
 const MiB = 1024 * 1024;
 
 /**
- * The measured coefficients (#4417 phase 2; the record is
- * docs/internal/research/issue-4417-machine-spec-load-test.md). This is the SINGLE place a
- * coefficient lives; nothing else hardcodes one.
+ * The measured coefficients (#4785, operator ruling G2 of 2026-10-15; #4417 phase 2 before
+ * it; the record is docs/internal/research/issue-4417-machine-spec-load-test.md §11). This is
+ * the SINGLE place a coefficient lives; nothing else hardcodes one.
  *
- * - `pOpenBytes` 190 MiB: memory (MemTotal - MemAvailable) per open idle session — 180 MiB on
- *   the standard VM, 187 MiB on the pro VM (least-squares slopes, R² ≥ 0.995), rounded up.
- *   A bare session (no MCP or LSP children); a real session measured about 556 MiB (research
- *   record §10, #4754).
- * - `pMixBytes` 432 MiB: the same slope when sessions rotate idle / tool work / builds.
- * - `r0MachineBytes` 1.5 GiB: the fixed cost before any session (OS, server, daemon). With it
- *   the formula reproduces the measured maxima (lite 12, standard 33).
- * - `r0CgroupBytes` 512 MiB: the daemon and its tmux server inside the daemon unit's limit.
- * - `kRec` 3: the pro VM held 12 sessions on 4 CPUs under that mix before step latency doubled.
- * - `kMax` 17: no idle ramp was CPU-bound (standard held 33 idle sessions on 2 CPUs).
+ * They describe the MCP-only session (G2-1 = A): Playwright and sequential-thinking MCP
+ * servers, no LSP server — the profile the fleet's sessions run. An LSP server adds to this:
+ * tsserver held about 1.1 GiB per session on the Hapimatic repository (#4785 §11).
+ *
+ * - `pOpenBytes` 512 MiB: memory (MemTotal - MemAvailable) per open idle session — 366 MiB on
+ *   the pro VM, 394 MiB on the standard VM (least-squares slopes before swap, R² ≥ 0.993),
+ *   457 MiB on pro's aged leg; rounded up past the aged slope.
+ * - `pMixBytes` 768 MiB: the same slope when sessions rotate idle / tool work / builds
+ *   (631 MiB pro, 733 MiB standard).
+ * - `r0MachineBytes` 1.5 GiB: the fixed cost before any session (OS, server, daemon).
+ * - `r0CgroupBytes` 64 MiB (G2-3; D2 = A): the sessions slice's own fixed cost — it holds
+ *   only the tmux server at 0 sessions (8–58 MiB in the observe legs of both runs), not the
+ *   daemon or the server.
+ * - `kRec` 3: the #4417 pro VM held 12 sessions on 4 CPUs under the mix before step latency
+ *   doubled; #4785's pro mix held 13 (unchanged).
+ * - `kMax` 17: no idle ramp was CPU-bound (unchanged).
  */
 export const CAPACITY_COEFFICIENTS: CapacityCoefficients | null = {
-  r0CgroupBytes: 512 * MiB,
+  r0CgroupBytes: 64 * MiB,
   r0MachineBytes: 1536 * MiB,
-  pOpenBytes: 190 * MiB,
-  pMixBytes: 432 * MiB,
+  pOpenBytes: 512 * MiB,
+  pMixBytes: 768 * MiB,
   kRec: 3,
   kMax: 17,
 };
@@ -149,41 +165,207 @@ export function resolveCpus(): number {
   return n >= 1 ? n : 1;
 }
 
+/** Where the formula's memory input came from (#4785). */
+export type MemInputSource = "session-slice" | "process-cgroup" | "machine";
+
 /** Machine inputs for the formula — process-stable, so computed once and cached. */
 export interface MachineInputs {
-  /** The memory the formula keys on: `min(totalmem, constrainedMemory || ∞)`. */
+  /**
+   * The memory the formula keys on: the sessions slice's limit when the slice exists
+   * (capped at `totalmem`), else `min(totalmem, constrainedMemory || ∞)`.
+   */
   memBytes: number;
   /** `os.availableParallelism()`. */
   cpus: number;
   /** `os.totalmem()` — used by the marker-sanity check (NOT the cgroup-limited value). */
   machineMemBytes: number;
-  /** True when `memBytes` is a cgroup limit (`constrainedMemory < totalmem`). */
+  /** True when `memBytes` is a cgroup limit below `totalmem`. */
   memInputIsCgroupLimited: boolean;
+  /** Which source decided `memBytes`. */
+  memInputSource: MemInputSource;
+}
+
+/** The sessions slice as seen from this instance (#4785). */
+export interface SessionSliceLimit {
+  /**
+   * True when THIS instance's child sessions slice exists as a cgroup (its tmux server or
+   * pane scopes run there). The node slice alone does not count (#5155).
+   */
+  present: boolean;
+  /** Its effective limit — the smallest `memory.high` / `memory.max` on it or an ancestor — or `null` for none. */
+  limitBytes: number | null;
+}
+
+/** Injectable reads for {@link resolveSessionSliceLimit} (tests pass fixtures). */
+export interface SessionSliceLimitDeps {
+  env?: NodeJS.ProcessEnv;
+  /** The user id whose systemd user manager holds the slice; `null` = unknown. */
+  uid?: number | null;
+  cgroupRoot?: string;
+  readText?: (path: string) => string | null;
+}
+
+const DEFAULT_CGROUP_ROOT = "/sys/fs/cgroup";
+const NO_SESSION_SLICE: SessionSliceLimit = {
+  present: false,
+  limitBytes: null,
+};
+
+function readTextOrNull(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** Parse a cgroup v2 `memory.high` / `memory.max` value: bytes, or `null` for `max` or anything unreadable. */
+export function parseCgroupMemoryLimit(text: string | null): number | null {
+  if (text === null) return null;
+  const value = text.trim();
+  if (!/^\d+$/.test(value)) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * The slice that bounds this instance's tmux-persisted sessions, and its effective limit
+ * (#4785, ruling D2 = A). Since #4743 every such session runs in the node's sessions
+ * slice (`hapimatic-sessions.slice`, which carries the limits) under a per-instance child
+ * slice — not in the daemon unit, whose limit `process.constrainedMemory()` reports.
+ *
+ * Only this instance's child slice counts (#5155). Both the scoped server start
+ * (`--slice=<instance slice>`) and the adoption (`Slice=<instance slice>`) in
+ * `cli/src/tmux/sessionSlice.ts` put the server there, so a node slice without this
+ * instance's child slice means another instance created it while this instance's sessions
+ * run elsewhere — in the daemon unit, before the first spawn or after `ensureTmuxServerContained`
+ * returned `failed` / `unprovisioned`. The walk from the child slice still reaches the node
+ * slice's limits as an ancestor.
+ *
+ * Absent (`present: false`) when containment is off (`HAPI_SESSION_SLICE`), this instance's
+ * child slice has no cgroup (RP1 until rp1-home#1477; SL7; before this instance's tmux server
+ * is in the slice), or the user id is unknown — the caller then keeps the
+ * `constrainedMemory()` path. Sync and cheap: a few small cgroupfs reads. Never throws.
+ */
+export function resolveSessionSliceLimit(
+  deps: SessionSliceLimitDeps = {}
+): SessionSliceLimit {
+  const env = deps.env ?? process.env;
+  const config = resolveSessionSliceConfig(env);
+  if (!config.enabled) return NO_SESSION_SLICE;
+  const uid =
+    deps.uid !== undefined
+      ? deps.uid
+      : typeof process.getuid === "function"
+        ? process.getuid()
+        : null;
+  if (uid === null) return NO_SESSION_SLICE;
+  const root = (deps.cgroupRoot ?? DEFAULT_CGROUP_ROOT).replace(/\/+$/, "");
+  const read = deps.readText ?? readTextOrNull;
+  // The daemon's tmux socket — the same default as `configuration.tmuxSessionName`
+  // (cli/src/configuration.ts); importing configuration here would drag the daemon's
+  // whole config singleton into this pure module.
+  const socketName = env.HAPI_TMUX_SESSION_NAME || "hapimatic";
+  const userManager = `${root}/user.slice/user-${uid}.slice/user@${uid}.service`;
+  const start = `${userManager}/${sliceCgroupSegment(instanceSliceFor(socketName, config.slice))}`;
+  if (read(`${start}/memory.max`) === null) return NO_SESSION_SLICE;
+  let limitBytes: number | null = null;
+  // Walk to (not including) the cgroup root, which has no memory.high / memory.max.
+  // The `dirname(dir) !== dir` guard ends the walk at `/` whatever root a caller passes.
+  for (
+    let dir = start;
+    dir.startsWith(`${root}/`) && dirname(dir) !== dir;
+    dir = dirname(dir)
+  ) {
+    for (const key of ["memory.high", "memory.max"]) {
+      const v = parseCgroupMemoryLimit(read(`${dir}/${key}`));
+      if (v !== null && (limitBytes === null || v < limitBytes)) limitBytes = v;
+    }
+  }
+  return { present: true, limitBytes };
+}
+
+/**
+ * Choose the formula's memory input (#4785, ruling D2 = A). Where the sessions slice
+ * exists it decides — capped at `totalmem`, because a slice limit above the machine's
+ * memory does not bind — and the daemon's own cgroup is ignored, since it no longer holds
+ * the sessions. Otherwise the pre-#4785 rule: `min(totalmem, constrainedMemory || ∞)`.
+ */
+export function selectMemoryInput(
+  totalmem: number,
+  constrained: number,
+  slice: SessionSliceLimit
+): Pick<
+  MachineInputs,
+  "memBytes" | "memInputIsCgroupLimited" | "memInputSource"
+> {
+  if (slice.present) {
+    if (slice.limitBytes !== null && slice.limitBytes < totalmem) {
+      return {
+        memBytes: slice.limitBytes,
+        memInputIsCgroupLimited: true,
+        memInputSource: "session-slice",
+      };
+    }
+    return {
+      memBytes: totalmem,
+      memInputIsCgroupLimited: false,
+      memInputSource: "machine",
+    };
+  }
+  if (constrained > 0 && constrained < totalmem) {
+    return {
+      memBytes: constrained,
+      memInputIsCgroupLimited: true,
+      memInputSource: "process-cgroup",
+    };
+  }
+  return {
+    memBytes: totalmem,
+    memInputIsCgroupLimited: false,
+    memInputSource: "machine",
+  };
 }
 
 let machineInputsCache: MachineInputs | null = null;
 
+/** Injectable reads for {@link computeMachineInputs} (tests pass fixtures). */
+export interface MachineInputDeps {
+  /** `os.totalmem()` override. */
+  totalmem?: number;
+  /** `process.constrainedMemory()` override. */
+  constrained?: number;
+  /** Reads for {@link resolveSessionSliceLimit}. */
+  slice?: SessionSliceLimitDeps;
+}
+
 /**
- * Read + cache the machine's formula inputs. `process.constrainedMemory()` returns
- * `min(memory.high, memory.max)` under a systemd scope on Bun (verified 1.4.0), or
- * `os.totalmem()` with no limit — so `memBytes = min(totalmem, constrainedMemory || ∞)`
- * and the input is cgroup-limited exactly when it comes in below `totalmem`.
+ * Read the machine's formula inputs. `process.constrainedMemory()` returns
+ * `min(memory.high, memory.max)` of the daemon's own cgroup on Bun (verified 1.4.0), or
+ * `os.totalmem()` with no limit; this instance's sessions slice, where it exists, replaces
+ * it ({@link selectMemoryInput}). Cached once this instance's slice has been seen; while it
+ * is absent (a node slice alone does not count, #5155) the inputs are re-read on each call,
+ * so an instance slice whose cgroup appears after the daemon started (its tmux server starts
+ * or is adopted there on the first spawn) is picked up. A cache hit ignores `deps`.
  */
-export function computeMachineInputs(): MachineInputs {
+export function computeMachineInputs(
+  deps: MachineInputDeps = {}
+): MachineInputs {
   if (machineInputsCache) return machineInputsCache;
-  const totalmem = os.totalmem();
+  const totalmem = deps.totalmem ?? os.totalmem();
   const constrainedFn = (process as { constrainedMemory?: () => number })
     .constrainedMemory;
-  const constrained = typeof constrainedFn === "function" ? constrainedFn() : 0;
-  const memInputIsCgroupLimited = constrained > 0 && constrained < totalmem;
-  const memBytes = memInputIsCgroupLimited ? constrained : totalmem;
-  machineInputsCache = {
-    memBytes,
+  const constrained =
+    deps.constrained ??
+    (typeof constrainedFn === "function" ? constrainedFn() : 0);
+  const slice = resolveSessionSliceLimit(deps.slice);
+  const inputs: MachineInputs = {
+    ...selectMemoryInput(totalmem, constrained, slice),
     cpus: resolveCpus(),
     machineMemBytes: totalmem,
-    memInputIsCgroupLimited,
   };
-  return machineInputsCache;
+  if (slice.present) machineInputsCache = inputs;
+  return inputs;
 }
 
 /** Test-only: drop the cached machine inputs so a test can re-stub `os`/`process`. */
@@ -417,10 +599,11 @@ export function parseSystemdBytes(value: string): number | null {
   return n * (mult[unit] ?? 1);
 }
 
-/** Read the shipped daemon unit's `MemoryHigh` (bytes) from a systemd unit file; `null`
- *  when the file or key is absent. The drift test clamps a tier's `max` against
- *  `formula(min(tier memory, this))` because a provisioned Pro/Ultra VM's daemon reads
- *  this limit via `constrainedMemory()`, not its 16/24 GB shape. */
+/** Read `MemoryHigh` (bytes) from a systemd unit or slice file — the daemon unit, or the
+ *  sessions slice (`hapimatic-sessions.slice.example`); `null` when the file or key is
+ *  absent. The drift test clamps a tier's `max` against `formula(min(tier memory, this))`
+ *  because a provisioned Pro/Ultra VM's formula input is the sessions slice's limit
+ *  (#4785; the daemon unit's via `constrainedMemory()` before it), not its 16/24 GB shape. */
 export function readDaemonUnitMemoryHigh(unitFilePath: string): number | null {
   try {
     const text = readFileSync(unitFilePath, "utf8");

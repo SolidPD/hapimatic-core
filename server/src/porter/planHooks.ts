@@ -9,26 +9,33 @@
  *
  * The whole-tree hooks change (#3590) archives every `~/.claude/hooks/**` file,
  * so registry-referenced AND dynamically-loaded hooks travel with the archive.
- * The registered hook FILES land here (basename-flattened into `hooks/`); every
- * other hooks-tree file rides the manifest `hookSupport` dimension path-preserved
- * (planned by `planDimension` in `./planSections`).
+ * The registered hook FILES land here, each at its archive path under `hooks/`
+ * (folders kept, #4331); every other hooks-tree file rides the manifest
+ * `hookSupport` dimension, also path-preserved (planned by `planDimension` in
+ * `./planSections`).
  */
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   credentialPathPart,
   denormalizeHookCommand,
   collectUnknownHookEvents,
   type PorterManifest,
   type HookEntry,
+  type Omission,
 } from "@hapi/protocol/porter";
 import {
   assertSafeEntry,
   lintHookCommandContainment,
 } from "./archiveContainment";
 import { hashContent, type StagedFileItem } from "./conflictDetection";
-import { parseRegistryNames, hookNameOf } from "./hookRegistrationValidator";
+import {
+  parseRegistryNames,
+  hookNameOf,
+  referencedPaths,
+} from "./hookRegistrationValidator";
+import { ManifestValidationError } from "./importArchiveErrors";
 import {
   classifyPlannedDestination,
   CredentialNameError,
@@ -60,36 +67,71 @@ export function findEntry(
 }
 
 /**
- * The set of archive paths carried by the manifest's registered `hooks[]`
- * entries (#3590 K3). The whole-tree exporter emits at most ONE manifest
- * reference per staged `hooks/**` file — registered scripts via `hooks[]`, every
- * other file via a `hookSupport` entry — so a conforming archive never lists a
- * registered path under `hookSupport`. This claimed set lets the import belt SKIP
- * any `hookSupport` tar entry whose archive path is already claimed by a
- * registration, so a hand-built or extraction-prompt archive that violates the
- * one-reference rule is corrected (planned once) instead of double-planned.
+ * Where a registered hook's script lands: `<claudeDir>/<archive path>`, the
+ * path-preserved destination (#4331). The ONE definition planning, selection
+ * (./commitSelection) and commit attribution (./commitHooks) key a hook on, so
+ * two same-named hooks in different folders never share a key.
+ *
+ * A comparison key only: every write still goes through `assertSafeEntry`,
+ * whose `resolve(resolve(root), path)` this matches, so a key equals the
+ * planned hook-file item's `destPath`.
  */
-export function claimedHookPaths(
-  hooks: PorterManifest["hooks"]
-): ReadonlySet<string> {
-  return new Set(hooks.map(h => h.file.path));
+export function hookFileDest(claudeDir: string, archivePath: string): string {
+  return resolve(claudeDir, archivePath);
 }
 
 /**
- * Plan + stage the registered hook FILES. Each registration's resolved script
- * file is basename-flattened into `hooks/<basename>` (registrations are merged
- * into `settings.json` separately). Mirrors the `dims` staging loop shape:
- * returns the planned items + their staged-content records for the caller to
- * concat, doing its own staging I/O so the import core stays a thin call site.
+ * The destinations the registered `hooks[]` entries stage, each mapped to the
+ * archive path whose bytes it stages (#3590 K3, keyed on the destination by
+ * #4331). The whole-tree exporter emits at most ONE manifest reference per
+ * staged `hooks/**` file — registered scripts via `hooks[]`, every other file
+ * via a `hookSupport` entry — so a conforming archive never lists a registered
+ * path under `hookSupport`. This map lets the import belt SKIP any `hookSupport`
+ * member that writes a destination a registration already stages, however that
+ * member is spelled, so a hand-built or extraction-prompt archive that violates
+ * the one-reference rule is corrected (planned once) instead of double-planned.
+ *
+ * The owner is the first registration whose tar member is a regular file, the
+ * same one {@link planHookFiles} stages; a registration with no such member
+ * claims nothing, so its destination is left to `hookSupport`.
+ */
+export function claimedHookPaths(
+  entries: TarEntry[],
+  hooks: PorterManifest["hooks"],
+  claudeDir: string
+): ReadonlyMap<string, string> {
+  const claimed = new Map<string, string>();
+  for (const h of hooks) {
+    if (findEntry(entries, h.file.path)?.kind !== "file") continue;
+    const dest = hookFileDest(claudeDir, h.file.path);
+    if (!claimed.has(dest)) claimed.set(dest, h.file.path);
+  }
+  return claimed;
+}
+
+/**
+ * Plan + stage the registered hook FILES. Each registration's script is staged
+ * at its archive path, which must lie under `hooks/` (folders kept, #4331), so
+ * a merged registration names a file that lands; registrations are merged into
+ * `settings.json` separately. Mirrors the `dims` staging loop shape: returns the
+ * planned items + their staged-content records for the caller to concat, doing
+ * its own staging I/O so the import core stays a thin call site.
  *
  * #4160 (F3): a hook whose resolved destination is not a file under `hooks/`
- * (`file.path` "." → `hooks` itself, ".." → the config root) refuses the
- * archive with a typed `PlannedDestinationError` BEFORE staging — never an
- * untyped `EISDIR` from writing onto a staging directory.
+ * (`file.path` "." → `hooks` itself; since #4331 also any path outside
+ * `hooks/`, such as `skills/fmt/check.py`, which was once flattened onto a real
+ * `hooks/check.py`) refuses the archive with a typed `PlannedDestinationError`
+ * BEFORE staging. A `..` part is refused by containment first, as the base
+ * `PathEscapeError`.
  *
- * #4172: a hook whose flattened destination is credential-named
- * (`hooks/.npmrc`) likewise refuses with a typed `CredentialNameError` BEFORE
+ * #4172: a hook whose destination has a credential-named part (`hooks/.npmrc`,
+ * `hooks/.ssh/x.py`) likewise refuses with a typed `CredentialNameError` BEFORE
  * staging, so a secret from an archive is never written to disk here.
+ *
+ * #4331: two registrations whose archive paths resolve to ONE destination
+ * (`hooks/a/run.py`, `hooks/./a/run.py`) with different bytes refuse the
+ * archive with a `ManifestValidationError`, so a merged registration never runs
+ * a script other than the one it names and no script is silently dropped.
  */
 export async function planHookFiles(
   entries: TarEntry[],
@@ -104,14 +146,15 @@ export async function planHookFiles(
   // entries that resolve to the SAME destPath — stage that file ONCE, so
   // filesWritten carries no duplicate (R4). The registrations themselves are
   // all preserved separately by buildHookEntries → the settings.json merge.
-  const seen = new Set<string>();
+  // #4331: keyed on the resolved destination, with the bytes it was staged from.
+  const seen = new Map<string, { archivePath: string; hash: string }>();
   for (const hook of hooks) {
-    const destRel = join("hooks", basename(hook.file.path));
+    // 🔴 #4331: the archive path IS the destination (folders kept), so
+    // containment checks it as written: `..`, absolute and NUL refuse here.
     const destPath = assertSafeEntry(claudeDir, {
-      path: destRel,
+      path: hook.file.path,
       kind: "file",
     });
-    if (seen.has(destPath)) continue;
     const entry = findEntry(entries, hook.file.path);
     if (!entry || entry.kind !== "file") continue;
     // 🔴 #4160 (F3): typed refusal before any staging write (./plannedDestinations).
@@ -124,8 +167,22 @@ export async function planHookFiles(
     const part = credentialPathPart(v.destRel);
     if (part !== null)
       throw new CredentialNameError(claudeDir, v.destRel, part);
-    seen.add(destPath);
-    const stagedPath = join(stagingDir, "tree", destRel);
+    const hash = hashContent(entry.data);
+    const first = seen.get(destPath);
+    if (first) {
+      if (first.archivePath === hook.file.path || first.hash === hash) continue;
+      // 🔴 #4331: never keep the first script silently (zero bytes written:
+      // planImport removes the staging dir on any throw).
+      throw new ManifestValidationError(
+        "invalid",
+        `hooks[] entries ${JSON.stringify(first.archivePath)} and ` +
+          `${JSON.stringify(hook.file.path)} both import to ` +
+          `${JSON.stringify(v.destRel)} with different content`
+      );
+    }
+    seen.set(destPath, { archivePath: hook.file.path, hash });
+    // Stage by the NORMALIZED destination (#4143 precedent in ./planSections).
+    const stagedPath = join(stagingDir, "tree", v.destRel);
     await mkdir(dirname(stagedPath), { recursive: true });
     await writeFile(stagedPath, entry.data);
     const item: PlannedFileItem = {
@@ -133,7 +190,7 @@ export async function planHookFiles(
       name: basename(hook.file.path),
       destPath,
       stagedPath,
-      incomingHash: hashContent(entry.data),
+      incomingHash: hash,
       mode: entry.mode,
     };
     files.push(item);
@@ -147,28 +204,88 @@ export async function planHookFiles(
  * the advisory command-containment lint and the unknown-event list. Each
  * incoming registration command is expanded to the destination home so a
  * `$HOME`-form command resolves on this host.
+ *
+ * #4331 (PM scope addition, 2026-10-15): a registration whose hook file this
+ * plan does not write — its tar member is missing or not a regular file, and no
+ * other producer plans its destination — is HELD: it leaves `hookEntries`, so
+ * it is neither merged nor offered for selection, and `hookHolds` carries one
+ * omission naming the registration and its missing file. Merged, it would run
+ * whatever the destination already holds at that path. The hold keys on what
+ * the plan writes (`plannedDests`, every producer's destination), the shape of
+ * #5178's settings hold. Honest exporters never emit such a registration.
+ *
+ * #4331 (R5): a merged registration whose command names scripts of which none
+ * is planned by this import and none exists at the destination is reported
+ * once per distinct command. It would land as a dangling command: for example
+ * an exported script from outside `hooks/` (carried as `hooks/<name>` with its
+ * command unchanged). The token rule is the post-commit validator's
+ * `referencedPaths`, so plan time and commit time agree. Advisory, never a
+ * refusal; it proves only that some named script exists, not that it holds the
+ * imported bytes.
  */
 export function buildHookEntries(
   hooks: PorterManifest["hooks"],
   destHome: string,
-  claudeDir: string
+  claudeDir: string,
+  plannedDests: ReadonlySet<string>
 ): {
   hookEntries: HookEntry[];
+  hookHolds: Omission[];
   hookCommandWarnings: string[];
   unknownHookEvents: string[];
 } {
-  const hookEntries: HookEntry[] = hooks.map(h => ({
-    file: h.file,
-    registration: {
-      ...h.registration,
-      command: denormalizeHookCommand(h.registration.command, destHome),
-    },
-  }));
+  const hookHolds: Omission[] = [];
+  const hookEntries: HookEntry[] = [];
+  for (const h of hooks) {
+    const entry: HookEntry = {
+      file: h.file,
+      registration: {
+        ...h.registration,
+        command: denormalizeHookCommand(h.registration.command, destHome),
+      },
+    };
+    const dest = hookFileDest(claudeDir, h.file.path);
+    if (plannedDests.has(dest)) {
+      hookEntries.push(entry);
+      continue;
+    }
+    const surface = heldHookSurface(entry);
+    if (!hookHolds.some(o => o.surface === surface)) {
+      hookHolds.push({
+        surface,
+        reason:
+          `not merged: its hook file ${h.file.path} is not a file in this ` +
+          `archive and this import writes nothing at ` +
+          `${relative(claudeDir, dest)}, so it would run whatever the ` +
+          `destination holds there`,
+      });
+    }
+  }
   const hookCommandWarnings = hookEntries.flatMap(h =>
     lintHookCommandContainment(claudeDir, h.registration.command)
   );
+  for (const cmd of new Set(hookEntries.map(h => h.registration.command))) {
+    const paths = referencedPaths(cmd, claudeDir);
+    const resolves = paths.some(
+      p => plannedDests.has(resolve(p)) || existsSync(p)
+    );
+    if (paths.length > 0 && !resolves) {
+      hookCommandWarnings.push(
+        `hook command runs a script this import does not write and the destination lacks: ${cmd}`
+      );
+    }
+  }
   const unknownHookEvents = collectUnknownHookEvents(hookEntries);
-  return { hookEntries, hookCommandWarnings, unknownHookEvents };
+  return { hookEntries, hookHolds, hookCommandWarnings, unknownHookEvents };
+}
+
+/**
+ * The omission surface of a held hook registration (#4331): its events and its
+ * command, so two held registrations never share a key in the review's
+ * surface-keyed "Deliberately omitted" list.
+ */
+export function heldHookSurface(h: HookEntry): string {
+  return `hook registration ${h.registration.events.join(",")} runs ${h.registration.command}`;
 }
 
 /**

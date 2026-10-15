@@ -19,7 +19,6 @@
  */
 import fs from "fs/promises";
 import os from "os";
-import { execFileSync } from "child_process";
 import { join } from "path";
 import { logger } from "@/ui/logger";
 import { configuration } from "@/configuration";
@@ -41,8 +40,11 @@ import {
   isExistingLinkedWorktree,
   kickExpiredWorktreePurge,
   kickOrphanedUnitSweep,
+  probeGitRepo,
+  probeSourceRepoHead,
   resolveRepoRoot,
   syncConfigFromMain,
+  type GitRepoProbe,
   type WorktreeInfo,
 } from "./worktree";
 import {
@@ -106,23 +108,67 @@ import { getSpawnPaused } from "./spawnPauseState";
  */
 const DEPS_TEARDOWN_SETTLE_MS = 30_000;
 
-/**
- * #5086: true when `directory`'s repo HEAD resolves to a commit. A `git init`
- * folder with no commits (unborn branch) returns false. Mirrors the #2270
- * `--show-toplevel` probe (same execFileSync, same inherited env) so the two
- * probes in the worktree gate always see the same environment. Neither probe
- * applies worktree.ts's #1435 GIT_* scrub (pre-existing; noted on #5086).
- */
-function directoryHasHeadCommit(directory: string): boolean {
-  try {
-    execFileSync("git", ["rev-parse", "--verify", "--quiet", "HEAD"], {
-      cwd: directory,
-      stdio: "ignore",
-    });
-    return true;
-  } catch {
-    return false;
+type GitRepoProbeFailure = Exclude<GitRepoProbe, { state: "repo" }>;
+
+/** Issue #5106 (R6): the cause of a failed git-ness probe, for the daemon log. */
+function describeGitRepoProbeFailure(probe: GitRepoProbeFailure): string {
+  switch (probe.state) {
+    case "not-a-repo":
+      return "not a git repository";
+    case "git-unavailable":
+      return "git is not installed or not on the daemon's PATH";
+    case "probe-failed":
+      return probe.detail;
   }
+}
+
+/**
+ * Issue #2270 / #5106 (R6): the refusal for an EXPLICIT worktree spawn whose
+ * git-ness probe failed. The not-a-repo text is #2270's, verbatim; the other
+ * two name the actual cause instead of claiming the folder is not a repository.
+ */
+function explicitWorktreeGitProbeMessage(probe: GitRepoProbeFailure): string {
+  switch (probe.state) {
+    case "not-a-repo":
+      return "Selected directory is not a git repository — choose 'Basic' (simple) or a git directory.";
+    case "git-unavailable":
+      return "Git is not installed or not on the Hapimatic daemon's PATH, so a worktree cannot be created — install Git, or choose 'Basic' (simple) to start the session in this folder.";
+    case "probe-failed": {
+      const ownedPath = /dubious ownership in repository at '([^']+)'/.exec(
+        probe.detail
+      )?.[1];
+      if (ownedPath) {
+        return `Git refuses to read this repository because a different user owns it — as the user that runs Hapimatic, run: git config --global --add safe.directory '${ownedPath}' — or choose 'Basic' (simple) to start the session in this folder.`;
+      }
+      return `Git reported a problem with the selected directory: ${probe.detail} — fix that, or choose 'Basic' (simple) to start the session in this folder.`;
+    }
+  }
+}
+
+/** True when two paths name the same directory (raw compare if realpath fails). */
+async function isSameDirectory(a: string, b: string): Promise<boolean> {
+  try {
+    return (await fs.realpath(a)) === (await fs.realpath(b));
+  } catch {
+    return a === b;
+  }
+}
+
+/**
+ * Issue #5086 / #5106 (R3): the refusal for an EXPLICIT worktree spawn whose
+ * branch-from HEAD (the main checkout's) has no commits. From the main checkout
+ * itself this is #5086's message, verbatim. From a linked worktree the user's
+ * own branch may have commits, so the message names the main checkout instead
+ * of advising a first commit in the spawn folder, which would not help.
+ */
+async function noCommitRefusalMessage(
+  toplevel: string,
+  repoRoot: string
+): Promise<string> {
+  if (await isSameDirectory(toplevel, repoRoot)) {
+    return "The current branch in this Git repository has no commits yet, so there is nothing to branch a worktree from — make a first commit that includes your files (for example: git add . && git commit -m \"Initial commit\"), or choose 'Basic' (simple) to start the session in this folder.";
+  }
+  return `The main checkout of this Git repository (${repoRoot}) is on a branch with no commits yet, and a new worktree branches from it — switch the main checkout to a branch that has commits, or choose 'Basic' (simple) to start the session in this folder.`;
 }
 
 /**
@@ -724,38 +770,36 @@ export function createSessionSpawner(
     //     users to 'simple' first; this is the backstop for an explicit override
     //     or any non-web caller. `errorMessage` → `message` via rpcGateway, so
     //     the sync (web) path renders it in-band (machines.ts) exactly like today.
+    // Issue #5106 (R5/R6): both gate probes live in worktree.ts — async, with
+    // the #1435 GIT_* scrub and the HAPI_GIT_TIMEOUT_MS bound, so they see the
+    // same environment as createWorktree — and the git-ness probe names its
+    // failure (not a repo / git missing / git refused the folder) instead of
+    // reading every failure as "not a git repository".
     if (sessionType === "worktree") {
-      let directoryIsGitRepo = false;
-      try {
-        execFileSync("git", ["rev-parse", "--show-toplevel"], {
-          cwd: directory,
-          stdio: "ignore",
-        });
-        directoryIsGitRepo = true;
-      } catch {
-        directoryIsGitRepo = false;
-      }
-      if (!directoryIsGitRepo) {
+      const repoProbe = await probeGitRepo(directory);
+      if (repoProbe.state !== "repo") {
         // #4481: an existing-branch spawn is an explicit worktree request.
         if (!options.sessionType && !options.existingBranch) {
-          logger.debug(
-            `[DAEMON RUN] sessionType defaulted to 'worktree' but '${directory}' is not a Git repo — downgrading to 'simple'`
-          );
+          if (repoProbe.state === "not-a-repo") {
+            logger.debug(
+              `[DAEMON RUN] sessionType defaulted to 'worktree' but '${directory}' is not a Git repo — downgrading to 'simple'`
+            );
+          } else {
+            logger.warn(
+              `[DAEMON RUN] Issue #5106: sessionType defaulted to 'worktree' but git could not read '${directory}' (${describeGitRepoProbeFailure(repoProbe)}) — downgrading to 'simple'`
+            );
+          }
           sessionType = "simple";
         } else {
           logger.debug(
-            `[DAEMON RUN] Explicit worktree spawn rejected: '${directory}' is not a Git repository`
+            `[DAEMON RUN] Explicit worktree spawn rejected: '${directory}' (${describeGitRepoProbeFailure(repoProbe)})`
           );
           return {
             type: "error",
-            errorMessage:
-              "Selected directory is not a git repository — choose 'Basic' (simple) or a git directory.",
+            errorMessage: explicitWorktreeGitProbeMessage(repoProbe),
           };
         }
-      } else if (
-        !options.existingBranch &&
-        !directoryHasHeadCommit(directory)
-      ) {
+      } else if (!options.existingBranch) {
         // Issue #5086: a `git init` folder with no commits passes the
         // --show-toplevel probe above, so it used to fail late in createWorktree
         // ("Source repo HEAD not resolvable", worktree.ts) AFTER creating
@@ -764,22 +808,41 @@ export function createSessionSpawner(
         // simple session; an explicit worktree gets a plain-words fix before any
         // side effect. An existing-branch spawn needs no HEAD (it opens the named
         // branch), so it is exempt and keeps its path.
-        if (!options.sessionType) {
-          logger.debug(
-            `[DAEMON RUN] sessionType defaulted to 'worktree' but '${directory}' has no commits yet — downgrading to 'simple'`
+        // Issue #5106 (R1/R4): the probe reads the HEAD createWorktree branches
+        // from (the main checkout's, via resolveRepoRoot), not the spawn folder's
+        // own HEAD, so an orphan linked worktree is no longer refused. Only an
+        // unborn HEAD refuses or downgrades; a probe that cannot tell warns and
+        // continues to createWorktree, whose own HEAD check is the backstop.
+        const head = await probeSourceRepoHead(directory);
+        if (head.state === "unborn") {
+          if (!options.sessionType) {
+            logger.debug(
+              `[DAEMON RUN] sessionType defaulted to 'worktree' but the branch-from HEAD at '${head.repoRoot}' has no commits yet — downgrading to 'simple'`
+            );
+            sessionType = "simple";
+          } else {
+            logger.debug(
+              `[DAEMON RUN] Explicit worktree spawn rejected: the branch-from HEAD at '${head.repoRoot}' has no commits yet`
+            );
+            return {
+              type: "error",
+              errorMessage: await noCommitRefusalMessage(
+                repoProbe.toplevel,
+                head.repoRoot
+              ),
+            };
+          }
+        } else if (head.state === "unknown") {
+          logger.warn(
+            `[DAEMON RUN] Issue #5106: could not tell whether '${directory}' has a commit to branch from (${head.detail}) — continuing to createWorktree, which reports its own error if HEAD does not resolve`
           );
-          sessionType = "simple";
-        } else {
-          logger.debug(
-            `[DAEMON RUN] Explicit worktree spawn rejected: '${directory}' has no commits yet`
-          );
-          return {
-            type: "error",
-            errorMessage:
-              "The current branch in this Git repository has no commits yet, so there is nothing to branch a worktree from — make a first commit that includes your files (for example: git add . && git commit -m \"Initial commit\"), or choose 'Basic' (simple) to start the session in this folder.",
-          };
         }
-      } else if (
+      }
+      // Runs only when the arms above neither refused nor downgraded: its other
+      // guards read `options`, so without the `sessionType` term it would also
+      // fire after a #5086 downgrade (#5106 R7).
+      if (
+        sessionType === "worktree" &&
         !options.sessionType &&
         !options.worktreeName &&
         !options.existingBranch

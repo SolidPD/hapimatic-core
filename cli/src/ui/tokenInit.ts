@@ -4,7 +4,7 @@
  *
  * Handles CLI_API_TOKEN initialization with priority:
  * 1. Environment variable (highest - allows temporary override)
- * 2. Settings file (~/.hapi/settings.json)
+ * 2. Settings file (`<HAPI_HOME>/settings.json`, `configuration.settingsFile`)
  * 3. Interactive prompt (only when both above are missing)
  */
 
@@ -13,6 +13,11 @@ import { stdin as input, stdout as output } from "node:process";
 import chalk from "chalk";
 import { configuration } from "@/configuration";
 import { readSettings, updateSettings } from "@/persistence";
+
+/** Where to find the server's token: its settings.json, named for this machine. */
+export function serverSettingsHint(): string {
+  return `Read cliApiToken in settings.json under the server's HAPI_HOME (${configuration.settingsFile} on this machine)`;
+}
 
 /**
  * Initialize CLI API token
@@ -59,7 +64,7 @@ async function promptForToken(): Promise<string> {
       "  1. Check the server startup logs (first run shows generated token)"
     )
   );
-  console.log(chalk.gray("  2. Read ~/.hapi/settings.json on the server"));
+  console.log(chalk.gray(`  2. ${serverSettingsHint()}`));
   console.log(
     chalk.gray(
       "  3. Ask your server administrator (if token is set via env var)\n"

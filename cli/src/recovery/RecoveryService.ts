@@ -8,8 +8,6 @@
  */
 
 import fs from "fs/promises";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { join } from "node:path";
 
 import { logger } from "@/ui/logger";
@@ -20,8 +18,11 @@ import {
 } from "@/tmux/windowOwnership";
 import { createSessionStore } from "@/sessionPersistence";
 import type { PersistedSession, SessionStatus } from "@/sessionPersistence";
-import { syncConfigFromMain } from "@/daemon/worktree";
-import { readClaimedPort } from "@/daemon/worktreeMeta";
+import {
+  createSourceBranchFetchCoalescer,
+  type SourceBranchFetch,
+} from "@/daemon/worktree";
+import { ResumeConfigResyncQueue } from "./resumeConfigResync";
 import type {
   RecoveryStatus,
   RecoveryResult,
@@ -29,46 +30,15 @@ import type {
   RecoveryServiceOptions,
 } from "./types";
 
-const execFileAsync = promisify(execFile);
-
-/**
- * Issue #1328: Determine whether a session's cwd is a hapimatic-private
- * working tree. Used to scope the resume-time `.claude/` re-sync gate so the
- * daemon does NOT issue `git fetch` against unrelated repos' origins (rp1-home,
- * rp1-home worktrees, etc.) on every recovery cycle.
- *
- * Cheap path: Hapimatic-spawned worktrees carry `.worktree-meta.json`. The
- * presence of a parseable meta-file with a claimed_port implies the worktree
- * was created by Hapimatic, which by current construction only spawns
- * hapimatic-private worktrees.
- *
- * Fallback path: query the cwd's `origin` remote URL. Covers manual
- * `git worktree add` worktrees AND the base clones (which lack a meta-file
- * but have the right origin).
- *
- * Fail-closed: any error returns false. The caller logs at debug level and
- * skips the re-sync.
- */
-export async function isHapimaticPrivateCwd(cwd: string): Promise<boolean> {
-  if ((await readClaimedPort(cwd)) !== null) {
-    return true;
-  }
-  try {
-    const { stdout } = await execFileAsync(
-      "git",
-      ["remote", "get-url", "origin"],
-      { cwd, timeout: 5000 }
-    );
-    return stdout.includes("MattStarfield/hapimatic-private");
-  } catch {
-    return false;
-  }
-}
+// Issue #5117: moved beside the re-sync queue; re-exported for existing importers.
+export { isHapimaticPrivateCwd } from "./resumeConfigResync";
 
 export class RecoveryService {
   private readonly hapiHome: string;
   private readonly tmuxSessionName: string;
   private readonly autoRecover: boolean;
+  // Issue #5117: bounds the resume-time .claude/ re-sync fan-out.
+  private readonly resumeResync = new ResumeConfigResyncQueue();
 
   private status: RecoveryStatus = {
     totalPersisted: 0,
@@ -204,9 +174,11 @@ export class RecoveryService {
     );
 
     const results: RecoveryResult[] = [];
+    // Issue #5117: one fetch per (clone, source branch) for this pass.
+    const passFetch = createSourceBranchFetchCoalescer();
 
     for (const session of sessions) {
-      const result = await this.recoverSession(session, tmux, store);
+      const result = await this.recoverSession(session, tmux, store, passFetch);
       results.push(result);
 
       this.status.inProgress--;
@@ -241,7 +213,8 @@ export class RecoveryService {
   private async recoverSession(
     session: PersistedSession,
     tmux: TmuxManager,
-    store: ReturnType<typeof createSessionStore>
+    store: ReturnType<typeof createSessionStore>,
+    resyncFetch?: SourceBranchFetch
   ): Promise<RecoveryResult> {
     logger.debug(
       `[RecoveryService] Recovering session: ${session.hapiSessionId}`
@@ -438,53 +411,18 @@ export class RecoveryService {
       // start — the SessionStart settings validator hook is the fail-fast
       // surface.
       //
+      // #5117: the job goes through a bounded queue (at most
+      // HAPI_SYNC_CONFIG_ON_RESUME_CONCURRENCY at once, default 2) with the
+      // pass's coalesced fetch, so one restart fetches each (clone, source
+      // branch) once instead of once per record. Scheduling never waits.
+      //
       // Disable by setting HAPI_SYNC_CONFIG_ON_RESUME=0 (default ON).
-      if (session.cwd && process.env.HAPI_SYNC_CONFIG_ON_RESUME !== "0") {
-        const worktreePath = session.cwd;
-        const recoverySessionId = session.hapiSessionId;
-        void (async () => {
-          try {
-            // Issue #1328: scope to hapimatic-private worktrees. Skip the
-            // sync for sessions whose cwd belongs to a different repo
-            // (rp1-home, rp1-home worktrees, other projects) so we don't
-            // issue `git fetch` against unrelated origins on every daemon
-            // recovery.
-            if (!(await isHapimaticPrivateCwd(worktreePath))) {
-              logger.debug(
-                `[RecoveryService] Resume-time .claude/ re-sync: skipping non-hapimatic-private cwd ${worktreePath} (${recoverySessionId})`
-              );
-              return;
-            }
-
-            const syncResult = await syncConfigFromMain({ worktreePath });
-            if (syncResult.ok) {
-              // Issue #1327: surface fetch failure even when sync overall
-              // succeeded — without this, a hung/failed fetch followed by a
-              // successful diff/checkout against the (potentially stale) local
-              // origin/<source-branch> ref would log nothing, recreating the
-              // silent-failure mode that #1320 was meant to close.
-              if (!syncResult.fetchSucceeded) {
-                logger.warn(
-                  `[RecoveryService] Resume-time .claude/ re-sync: fetch failed, used local origin/<source-branch> ref (${syncResult.filesUpdated} files updated) (${recoverySessionId})`
-                );
-              } else if (syncResult.filesUpdated > 0) {
-                logger.info(
-                  `[RecoveryService] Resume-time .claude/ re-sync: ${syncResult.filesUpdated} files updated (${recoverySessionId})`
-                );
-              }
-            } else {
-              logger.warn(
-                `[RecoveryService] Resume-time .claude/ re-sync failed (non-fatal): ${syncResult.error} (${recoverySessionId})`
-              );
-            }
-          } catch (error) {
-            const message =
-              error instanceof Error ? error.message : String(error);
-            logger.warn(
-              `[RecoveryService] Resume-time .claude/ re-sync threw (non-fatal): ${message} (${recoverySessionId})`
-            );
-          }
-        })();
+      if (session.cwd) {
+        this.resumeResync.schedule({
+          worktreePath: session.cwd,
+          sessionId: session.hapiSessionId,
+          fetch: resyncFetch,
+        });
       }
 
       // Verify the alive process is actually a HAPI session, not a zombie

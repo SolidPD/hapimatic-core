@@ -12,6 +12,7 @@
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { getAllDescendantPids } from "@/utils/processTree";
+import { CLI_VERSION } from "@/version";
 
 export interface ExitDiagnosticEntry {
   timestamp: string;
@@ -39,6 +40,19 @@ export interface ExitDiagnosticEntry {
   stderr_tail: string | null;
   errorDetail: string;
   version: string;
+}
+
+/**
+ * Issue #5103: every exit diagnostic names the build that wrote it. The version
+ * is CLI_VERSION (#4594), never read from the environment: daemon-spawned
+ * sessions run with no package-manager variables, so the old read was always
+ * "unknown".
+ */
+export function createExitDiagnosticEntry(
+  fields: Omit<ExitDiagnosticEntry, "timestamp" | "version">,
+  now: Date = new Date()
+): ExitDiagnosticEntry {
+  return { timestamp: now.toISOString(), ...fields, version: CLI_VERSION };
 }
 
 /**

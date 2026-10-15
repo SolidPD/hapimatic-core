@@ -38,7 +38,7 @@ import { runForceRefreshHarness } from "@/accounts/forceRefreshHarness";
 import { probeAccessToken } from "@/accounts/isolatedSnapshotRecovery";
 import { logger } from "@/ui/logger";
 import { authAndSetupMachineIfNeeded } from "@/ui/auth";
-import { CLI_VERSION } from "@/version";
+import { CLI_VERSION, formatDaemonBuildSkew } from "@/version";
 import { getEnvironmentInfo } from "@/ui/doctor";
 import {
   writeDaemonState,
@@ -297,8 +297,9 @@ export async function startDaemon(
       `[DAEMON RUN] Daemon already running (pid ${existingDaemon.pid}, build ${existingDaemon.daemonVersion}), keeping it`
     );
     console.log("Daemon already running");
-    if (existingDaemon.skew) {
-      logger.info(`Build skew: ${existingDaemon.skew}`);
+    const skewLine = formatDaemonBuildSkew(existingDaemon);
+    if (skewLine) {
+      logger.info(skewLine);
     }
     process.exit(0);
   }

@@ -48,3 +48,5 @@ export * from "./exportScriptPowerShell";
 export * from "./token";
 // #4533: the exposure-gate wire contract (`porter_withheld` code + status shape).
 export * from "./exposure";
+// #5172: the import review's view of an MCP server definition + field roles.
+export * from "./mcpReview";

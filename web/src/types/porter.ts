@@ -11,8 +11,12 @@
  * MUST change in lockstep. Source-of-truth anchors:
  *
  *   - `InstalledConfigResponse` → `server/src/web/routes/porterInstalled.ts`
- *   - `ImportPlanSummary`, `ImportResult`, `PlannedMcpServer`, `PlannedItemKind`
+ *   - `ImportResult`, `PlannedMcpServer`, `PlannedItemKind`
  *       → `server/src/porter/importArchive.ts`
+ *   - `ImportPlanSummary` → `server/src/porter/importPlanSummary.ts`
+ *   - `PlannedMcpServer.definition` (the summary's `PlannedMcpServerReview`)
+ *       → `server/src/porter/mcpReviewDefinition.ts` (#5172); its
+ *       `McpReviewDefinition` type is shared, imported from `@hapi/protocol/porter`
  *   - `ImportGroups`, `SkillGroup`, `IndependentHook`
  *       → `server/src/porter/commitSelection.ts`
  *   - `Conflict` → `server/src/porter/conflictDetection.ts`
@@ -30,6 +34,7 @@
  */
 import type {
   ExecutableSettingsKey,
+  McpReviewDefinition,
   Omission,
   PorterTokenResponse,
   PorterTokenState,
@@ -297,6 +302,12 @@ export interface PlannedMcpServer {
   commandTranslation?: { from: string; to: string };
   /** A `/home/<srcuser>/…` command with no destination-home equivalent (F14). */
   nonPortable?: boolean;
+  /**
+   * #5172: the definition the commit writes — transport, command (after the
+   * translation above), args, url, and `disabled` — with a credential-bearing
+   * element shown by its secret slot name, never its value.
+   */
+  definition: McpReviewDefinition;
 }
 
 /**
@@ -425,7 +436,14 @@ export interface ImportPlanSummary {
   };
   mcpServers: PlannedMcpServer[];
   plugins: { descriptorPresent: boolean; remediation: string[] };
+  /** The exporter's omissions plus any importer notice that is not a policy refusal. */
   omissions: Omission[];
+  /**
+   * #4156: the importer's policy refusals (a skipped CLAUDE.md include, section
+   * entry, or carried script), rendered as "Refused by import policy". Absent
+   * from a server that predates #4156.
+   */
+  policySkips?: Omission[];
   expiresAt: number;
 }
 
