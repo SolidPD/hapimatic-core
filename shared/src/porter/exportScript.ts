@@ -69,7 +69,9 @@ import {
   SECRET_URL_QUERYFRAG_PATTERN,
   SECRET_URL_USERINFO_PATTERN,
   SETTINGS_KEYS_NO_ENV,
+  headerCommentLabel,
   toJqRegex,
+  validUploadUrl,
 } from "./exportShared";
 // #4164: the Step 3 include loop, shared with the extraction prompt's check block.
 import { claudeMdIncludeLoopLines } from "./claudeMdIncludeShell";
@@ -108,7 +110,8 @@ export interface ExportScriptInput {
   /**
    * Optional human label for the destination instance, shown in the script
    * header comment so the user can confirm they are packaging for the right
-   * target. Header-only; the script embeds nothing destination-specific.
+   * target. Header-only; the script embeds nothing destination-specific. A CR
+   * or LF in it becomes a space, so it cannot end the comment line (#5239).
    */
   instanceLabel?: string;
   /**
@@ -140,7 +143,8 @@ export interface ExportScriptInput {
    * the manual Download/Upload path on failure. When ABSENT the script is the
    * legacy Download/Copy export — its output stays BYTE-IDENTICAL to before this
    * field existed (no upload step, `TOTAL_STEPS=11`). Passed IN (server-derived
-   * from the token + instance origin) to keep this builder PURE.
+   * from the token + instance origin) to keep this builder PURE. A value that is
+   * not an http(s) URL is treated as absent (#5239, `validUploadUrl`).
    */
   uploadUrl?: string;
 }
@@ -383,6 +387,11 @@ function pluginExtractionJq(): string {
   ].join("\n");
 }
 
+/** A bash single-quoted string literal for `s` (each `'` becomes `'\''`). */
+function bashSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 /**
  * Build the script-driven, secrets-free export script (R1). Pure — no I/O.
  *
@@ -399,8 +408,9 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     instanceLabel,
     generatedAt,
     generatorVersion,
-    uploadUrl,
   } = input;
+  // #5239: only an http(s) URL gets the self-upload leg.
+  const uploadUrl = validUploadUrl(input.uploadUrl);
 
   // The export-dir move/rename/collision fragment (#3239), single-sourced. It
   // moves `config-port.<fmt>` from the CWD — the script `cd`s into $STAGING
@@ -413,7 +423,7 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     : '"$(date -u +%Y-%m-%dT%H:%M:%SZ)"';
 
   const headerTarget = instanceLabel
-    ? `# Target instance: ${instanceLabel}`
+    ? `# Target instance: ${headerCommentLabel(instanceLabel)}`
     : "# Target: another Hapimatic instance";
   const headerWhen = generatedAt ? [`# Generated at: ${generatedAt}`] : [];
   const headerVersion = generatorVersion
@@ -1099,7 +1109,7 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
           "# keeps the server's JSON response off stdout. `curl -f` fails non-zero on",
           "# an HTTP error, handled by the `if` (set -e safe); on failure we print the",
           "# manual Download/Upload fallback and exit non-zero.",
-          `UPLOAD_URL='${uploadUrl}'`,
+          `UPLOAD_URL=${bashSingleQuote(uploadUrl)}`,
           'step "Uploading the archive to the destination instance"',
           'if curl -fsS -o /dev/null -F "file=@$DEST/$FINAL" "$UPLOAD_URL" </dev/null >&2; then',
           "  printf 'Uploaded. Return to the page to review the plan.\\n' >&2",

@@ -451,6 +451,8 @@ export function createSessionsRoutes(
         if (node) {
           const headers: Record<string, string> = {
             "Content-Type": "application/json",
+            // #5240: the peer re-asserts the caller's namespace (#1097).
+            "X-Hapi-Caller-Namespace": c.get("namespace"),
           };
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
@@ -529,6 +531,8 @@ export function createSessionsRoutes(
         if (node) {
           const headers: Record<string, string> = {
             "Content-Type": "application/json",
+            // #5240: the peer re-asserts the caller's namespace (#1097).
+            "X-Hapi-Caller-Namespace": c.get("namespace"),
           };
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
@@ -2181,7 +2185,10 @@ export function createSessionsRoutes(
         const sessionId = c.req.param("id");
         const node = registry.findNodeForSession(sessionId);
         if (node) {
-          const headers: Record<string, string> = {};
+          const headers: Record<string, string> = {
+            // #5240: the peer re-asserts the caller's namespace (#1097).
+            "X-Hapi-Caller-Namespace": c.get("namespace"),
+          };
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }

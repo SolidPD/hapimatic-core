@@ -73,6 +73,8 @@ import {
   ARCHIVE_HOOK_SLOT_UNLISTABLE_OMISSION_REASON,
   ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
   ARCHIVE_BACKSLASH_PATH_OMISSION_REASON,
+  headerCommentLabel,
+  validUploadUrl,
 } from "./exportShared";
 // #3448 (Sub C, K7): the multi-source discovery table — the same candidate
 // config paths + source-id set the bash twin cites, rendered here in PS dialect.
@@ -129,8 +131,9 @@ export function buildExportScriptPowerShell(
     instanceLabel,
     generatedAt,
     generatorVersion,
-    uploadUrl,
   } = input;
+  // #5239: only an http(s) URL gets the self-upload leg (the bash twin's gate).
+  const uploadUrl = validUploadUrl(input.uploadUrl);
 
   const TOTAL_STEPS = uploadUrl ? 12 : 11;
 
@@ -167,7 +170,7 @@ export function buildExportScriptPowerShell(
   );
 
   const headerTarget = instanceLabel
-    ? `# Target instance: ${instanceLabel}`
+    ? `# Target instance: ${headerCommentLabel(instanceLabel)}`
     : "# Target: another Hapimatic instance";
   const headerWhen = generatedAt ? [`# Generated at: ${generatedAt}`] : [];
   const headerVersion = generatorVersion

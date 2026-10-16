@@ -4,7 +4,11 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
-import { checkFederationToken, notifyOriginatingHub } from "./shared";
+import {
+  checkCallerNamespace,
+  checkFederationToken,
+  notifyOriginatingHub,
+} from "./shared";
 import { logAndJson } from "../routeErrorHelper";
 import { isSafeMachinePath } from "../../../utils/pathSecurity";
 import { expandTilde } from "../../../utils/expandTilde";
@@ -84,6 +88,11 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5240: re-assert the caller's namespace before the active
+      // check, so another namespace's session reads as not found, never as
+      // inactive.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
       if (!session.active) {
         return c.json({ error: "Session is inactive" }, 409);
       }
@@ -154,6 +163,9 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5240: namespace before the active check, as in archive.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
       if (!session.active) {
         return c.json({ error: "Session is inactive" }, 409);
       }
@@ -509,6 +521,9 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5240: namespace before the active check, as in archive.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
       // #1443: orphaned sessions (CWD gone) bypass the active-check — federation
       // parity with the hub DELETE route. The peer received this proxied delete
       // for a local session it owns; orphan state is local to its SyncEngine.

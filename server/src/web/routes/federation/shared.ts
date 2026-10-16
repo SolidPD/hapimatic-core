@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { Context } from "hono";
 import type { FederationConfig } from "@hapi/protocol";
 import type { SyncEngine } from "../../../sync/syncEngine";
 import type { SSEManager } from "../../../sse/sseManager";
@@ -23,6 +24,7 @@ import type {
   SessionLike,
 } from "../../../capabilities/availabilityContext";
 import { constantTimeEquals } from "../../../utils/crypto";
+import type { WebAppEnv } from "../../middleware/auth";
 
 export type FederationDeps = {
   getSyncEngine: () => SyncEngine | null;
@@ -106,6 +108,32 @@ export function checkFederationToken(
   if (!authHeader?.startsWith("Bearer ")) return false;
   const token = authHeader.slice("Bearer ".length);
   return constantTimeEquals(token, deps.apiToken);
+}
+
+/**
+ * Issue #1097: validate the caller's namespace against the resolved
+ * session. The federation token authenticates the peer node only —
+ * namespace ownership is a separate authorization layer that must be
+ * re-asserted at the receiver. Returns 404 (not 403) on mismatch to
+ * avoid leaking session existence across namespaces. A missing
+ * `X-Hapi-Caller-Namespace` header fails closed the same way.
+ */
+export function checkCallerNamespace(
+  c: Context<WebAppEnv>,
+  session: { namespace: string },
+  envelopeShape = false
+): Response | null {
+  const callerNamespace = c.req.header("x-hapi-caller-namespace");
+  if (!callerNamespace || session.namespace !== callerNamespace) {
+    if (envelopeShape) {
+      return c.json(
+        { ok: false, error: "Session not found", code: "session_not_found" },
+        404
+      );
+    }
+    return c.json({ error: "Session not found" }, 404);
+  }
+  return null;
 }
 
 export async function notifyOriginatingHub(params: {

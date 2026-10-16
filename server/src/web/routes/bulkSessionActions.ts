@@ -334,7 +334,7 @@ export async function runBulkDelete(params: {
   if (registry && remote.length > 0) {
     const settled = await Promise.allSettled(
       remote.map(({ id, nodeId }) =>
-        registry.deleteOnNode(nodeId, id, { deferPoll: true })
+        registry.deleteOnNode(nodeId, id, namespace, { deferPoll: true })
       )
     );
     const touched = new Set<string>();

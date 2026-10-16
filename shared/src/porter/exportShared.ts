@@ -372,3 +372,45 @@ export function classifyClaudeMdIncludeName(
   if (base.toLowerCase() === "claude.md") return "shadowsClaudeMd";
   return "ok";
 }
+
+/**
+ * #5239: the instance label as it may appear in a script's `#` header comment.
+ *
+ * The label comes from the operator's `federation.nodeLabel`. A CR or LF in it
+ * would end the comment line, so the rest of the label would run as a command
+ * when the script is piped into `bash` or `iex`. Bash ends a comment only at LF
+ * and PowerShell at CR or LF, so replacing every run of CR/LF with one space
+ * keeps the label on its comment line in both dialects.
+ */
+export function headerCommentLabel(label: string): string {
+  return label.replace(/[\r\n]+/g, " ");
+}
+
+/**
+ * #5239: the self-upload URL both emitters embed, or `undefined` when the
+ * input is not an http(s) URL.
+ *
+ * The URL is built from `webappUrl` / `federation.selfUrl`, or, when neither is
+ * set, from the requesting client's own `X-Forwarded-Host` / `X-Forwarded-Proto`
+ * (`porterKey.ts` `deriveInstanceProvenance`). Anything that does not parse, or
+ * whose scheme is not http/https, gets the legacy Download/Copy script with no
+ * upload step — the same fallback the serving route uses when it has no origin.
+ * The parsed `href` is returned, so the script carries the URL that was checked.
+ *
+ * Parsing is a gate, not an escape: a WHATWG URL host may still contain `'`,
+ * `$`, `(` and `)`, so each emitter quotes the result for its own dialect.
+ */
+export function validUploadUrl(
+  uploadUrl: string | undefined
+): string | undefined {
+  if (!uploadUrl) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(uploadUrl);
+  } catch {
+    return undefined;
+  }
+  return parsed.protocol === "http:" || parsed.protocol === "https:"
+    ? parsed.href
+    : undefined;
+}

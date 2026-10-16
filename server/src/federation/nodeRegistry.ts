@@ -2403,10 +2403,14 @@ export class NodeRegistry {
    * session is still active) and `offline` when the node is down, so a bulk
    * caller can attribute each outcome. `deferPoll` skips the per-call re-poll
    * so a bulk caller can coalesce to ONE `pollNodeById` per touched node.
+   *
+   * #5240: the caller's namespace is forwarded; the receiver answers 404 for
+   * a session another namespace owns (#1097).
    */
   async deleteOnNode(
     nodeId: string,
     sessionId: string,
+    namespace: string,
     options?: { deferPoll?: boolean }
   ): Promise<{ ok: true } | RemoteSessionActionError> {
     const state = this.nodeStates.get(nodeId);
@@ -2416,7 +2420,15 @@ export class NodeRegistry {
 
     const url = `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}`;
     try {
-      const res = await this.fetchWithAuth(url, "DELETE");
+      const res = await this.fetchWithAuth(
+        url,
+        "DELETE",
+        undefined,
+        undefined,
+        {
+          "X-Hapi-Caller-Namespace": namespace,
+        }
+      );
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         return {
@@ -2526,9 +2538,8 @@ export class NodeRegistry {
     }
     const url = `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/${action}`;
     try {
-      // The abort/archive receivers do not check the caller namespace today;
-      // the header is forwarded anyway (#1097 convention) so a receiver that
-      // starts checking it keeps working.
+      // The receivers re-assert this namespace and answer 404 for a session
+      // another namespace owns (#1097, #5240).
       const res = await this.fetchWithAuth(url, "POST", {}, undefined, {
         "X-Hapi-Caller-Namespace": namespace,
       });
