@@ -28,9 +28,13 @@ import { logProcessHygieneEvent } from "@/utils/processHygieneEvents";
 import { probeLinkedWorktree } from "@/utils/worktreeEnv";
 
 import {
+  buildScrubbedGitEnv,
   collectOwnedWorktreePorts,
   detectSourceBranch,
+  getGitFetchTimeoutMs,
+  getGitTimeoutMs,
   getListeningPorts,
+  getWorktreeAddTimeoutMs,
   readClaimedPort,
   writeWorktreeMeta,
 } from "./worktreeMeta";
@@ -270,77 +274,43 @@ export class RepoRootResolutionError extends Error {
   override name = "RepoRootResolutionError";
 }
 
-// Issue #1327: default 30s ceiling for git operations under runGit.
-// Env-overridable via HAPI_GIT_TIMEOUT_MS. Covers the network fetch added by
-// #1320 + protects all runGit callers (local ops normally complete in ms, so
-// 30s is generous defense-in-depth). Pattern matches the precedent at
-// cli/src/modules/common/handlers/git.ts:64-99 (the user-facing git RPC handler
-// uses 10s; runGit's 30s allows headroom for the network fetch).
-const DEFAULT_GIT_TIMEOUT_MS = 30_000;
-function getGitTimeoutMs(): number {
-  const raw = process.env.HAPI_GIT_TIMEOUT_MS;
-  if (!raw) return DEFAULT_GIT_TIMEOUT_MS;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0
-    ? parsed
-    : DEFAULT_GIT_TIMEOUT_MS;
-}
-
-// Issue #1557: the non-fatal spawn-time config fetch gets a SHORTER, independent
-// budget than the fatal worktree-op timeout. A slow/hung fetch fails fast to the
-// local-ref fallback (in syncConfigFromMain and createWorktree's fetch-first
-// base) WITHOUT starving `git worktree add` (which keeps the 30s default above).
-// Default 8s is under the 30s worktree budget yet above a typical incremental
-// fetch; env-overridable via HAPI_GIT_FETCH_TIMEOUT_MS.
-const DEFAULT_GIT_FETCH_TIMEOUT_MS = 8_000;
-function getGitFetchTimeoutMs(): number {
-  const raw = process.env.HAPI_GIT_FETCH_TIMEOUT_MS;
-  if (!raw) return DEFAULT_GIT_FETCH_TIMEOUT_MS;
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) && parsed > 0
-    ? parsed
-    : DEFAULT_GIT_FETCH_TIMEOUT_MS;
-}
-
-// Issue #1435: defense-in-depth scrub of inherited GIT_* env vars before
-// invoking git. Mirrors the issue #283 SESSION_ENV_VARS_TO_STRIP pattern at
-// run.ts:230-240. If any GIT_* var leaks into the daemon's process.env (from
-// a parent shell, a systemd drop-in, or a future caller that sets one for a
-// local operation), it would override git's normal repo discovery — producing
-// symptoms like `fatal: not a valid object name: 'HEAD'` against a target
-// repo whose HEAD demonstrably resolves from a shell.
-//
-// Allow-list extension: if a future workflow legitimately needs to pass a
-// GIT_* var through (e.g. GIT_SSH_COMMAND for federation node SSH keys), add
-// it to the allow-list below — do NOT widen by removing entries from the
-// strip list, as that would re-open the bug class.
-const GIT_ENV_VARS_TO_STRIP = [
-  "GIT_DIR",
-  "GIT_WORK_TREE",
-  "GIT_INDEX_FILE",
-  "GIT_COMMON_DIR",
-  "GIT_OBJECT_DIRECTORY",
-  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-  "GIT_CEILING_DIRECTORIES",
-  "GIT_NAMESPACE",
-  "GIT_CONFIG",
-  "GIT_CONFIG_PARAMETERS",
-] as const;
-
-function buildScrubbedGitEnv(): NodeJS.ProcessEnv {
-  const scrubbed: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of GIT_ENV_VARS_TO_STRIP) {
-    delete scrubbed[key];
-  }
-  return scrubbed;
-}
+// The git timeout getters (getGitTimeoutMs, getGitFetchTimeoutMs,
+// getWorktreeAddTimeoutMs) and the #1435 GIT_* env scrub (buildScrubbedGitEnv)
+// live in ./worktreeMeta (#4058, decision D1 = B); they are imported above.
 
 export async function runGit(
   args: string[],
   cwd: string,
-  options?: { timeoutMs?: number; timeoutEnvHint?: string }
+  options?: {
+    timeoutMs?: number;
+    timeoutEnvHint?: string;
+    /**
+     * Run git under `LC_ALL=C` (and without `LANGUAGE`), so its messages are
+     * git's English source text. The two `git worktree add` calls set it,
+     * because their refusals are classified: under another locale git
+     * translates them (#4058). The older `branch -D` callers that match
+     * stderr predate it and do not set it.
+     */
+    cLocale?: boolean;
+    /**
+     * Name the repository explicitly as `GIT_DIR` + `GIT_WORK_TREE`, set
+     * after the GIT_* scrub, so git never discovers one by walking up from
+     * `cwd`. Phase 2 of a worktree add needs this: the same form git's own
+     * `worktree add` uses for its checkout child (#4058, CR-R1).
+     */
+    repo?: { gitDir: string; workTree: string };
+  }
 ): Promise<{ stdout: string; stderr: string }> {
   const timeoutMs = options?.timeoutMs ?? getGitTimeoutMs();
+  const env = buildScrubbedGitEnv();
+  if (options?.cLocale) {
+    env.LC_ALL = "C";
+    delete env.LANGUAGE;
+  }
+  if (options?.repo) {
+    env.GIT_DIR = options.repo.gitDir;
+    env.GIT_WORK_TREE = options.repo.workTree;
+  }
   try {
     const result = await execFileAsync("git", args, {
       cwd,
@@ -354,7 +324,7 @@ export async function runGit(
       // the kill matters more than graceful shutdown.
       killSignal: "SIGKILL",
       // Issue #1435: scrub inherited GIT_* env vars before spawning git.
-      env: buildScrubbedGitEnv(),
+      env,
     });
     return {
       stdout: result.stdout ? result.stdout.toString() : "",
@@ -1149,6 +1119,415 @@ export function classifyWorktreeAddFailure(
   return "rethrow";
 }
 
+/**
+ * Issue #4058 (contract K-1 with #4508): the worktree paths a `createWorktree`
+ * in THIS daemon is creating right now, keyed by `resolve(worktreePath)`.
+ *
+ * The failed-add rollback below may force-remove whatever is registered at the
+ * attempt's path and delete the attempt's branch. That is only safe while no
+ * other creator works the same path, and nothing else guarantees it:
+ * `createWorktree` is serialized only for `claimPort:true` spawns, and a
+ * re-spawn after the server's 75s RPC give-up can run the same name again. Each
+ * add path claims its path here (check and add in one synchronous step, before
+ * any await) and releases it in a `finally`; a claimed path reads as taken, so a
+ * concurrent same-name call moves on to a suffixed name. A creator outside the
+ * daemon (a hand-run `git worktree add` of the same path) is not covered.
+ * Exported so #4508's existing-branch work reuses this one set.
+ */
+export const inFlightWorktreePaths = new Set<string>();
+
+/** git's "branch is held by another worktree" refusal (wording varies by version). */
+const BRANCH_HELD_PATTERN =
+  /is already (?:checked out|used by worktree) at '([^']+)'/;
+const BRANCH_EXISTS_PATTERN = /a branch named '[^']*' already exists/;
+const PATH_TAKEN_PATTERN =
+  /'[^']*' already exists|is a missing but (?:locked|already registered) worktree/;
+
+/**
+ * Issue #4058: what a refused `git worktree add` says about who owns the
+ * conflicting object. Measured on git 2.39.5:
+ *  - "branch": `a branch named 'B' already exists` (with `-b`) or the branch is
+ *    checked out elsewhere (no `-b`). git refused before creating anything.
+ *  - "path": `'<path>' already exists` or the path is a missing-but-registered
+ *    worktree. With `-b`, git's `git branch` step has ALREADY created the branch
+ *    by then (it runs before the path check), so the branch is this call's own
+ *    and the path or registration belongs to someone else.
+ *  - null: anything else (a timeout, a signal, disk full, …).
+ */
+export type WorktreeAddConflict = "branch" | "path" | null;
+
+export function classifyWorktreeAddConflict(
+  errMsg: string
+): WorktreeAddConflict {
+  if (BRANCH_EXISTS_PATTERN.test(errMsg) || BRANCH_HELD_PATTERN.test(errMsg)) {
+    return "branch";
+  }
+  if (PATH_TAKEN_PATTERN.test(errMsg)) {
+    return "path";
+  }
+  return null;
+}
+
+/** The state {@link planWorktreeAddRollback} decides from. */
+export type WorktreeAddRollbackFacts = {
+  /** The failure's error message. */
+  errMsg: string;
+  /**
+   * "add" = `git worktree add` itself failed; "after-add" = it succeeded and a
+   * later step failed (the checkout, the meta write), so the worktree is this
+   * call's own and no conflict reading applies. The branch is this call's own
+   * only when `baseCommit` is set: an existing local branch has a null
+   * `baseCommit` and is always kept.
+   */
+  stage: "add" | "after-add";
+  /** How many times `git worktree add` ran for THIS name (the inner retry counter). */
+  addAttempts: number;
+  /** `git worktree list` registers exactly this attempt's path. */
+  registered: boolean;
+  /** The attempt's directory exists on disk. */
+  pathExists: boolean;
+  /** The path passes `isWithinWorktreeBase` for the repo's worktree host base. */
+  pathInsideBase: boolean;
+  /** The branch's tip, or null when the branch does not exist. */
+  branchTip: string | null;
+  /**
+   * The commit this attempt creates its branch at, or null when the attempt
+   * never creates a branch (it opens an existing local branch), which keeps the
+   * branch unconditionally.
+   */
+  baseCommit: string | null;
+  /** A worktree other than this attempt's path has the branch checked out. */
+  branchCheckedOutElsewhere: boolean;
+  /** The branch carries a pre-existing-branch record (#4481 `isPreservedBranch`). */
+  branchPreserved: boolean;
+};
+
+export type WorktreeAddRollbackPlan = {
+  worktree: "keep" | "remove-registered" | "remove-unregistered-dir";
+  branch: "keep" | "delete";
+  /** Why something this attempt may have created is left in place (empty when nothing is). */
+  residual: string[];
+};
+
+/**
+ * Issue #4058: decide what a failed worktree add rolls back. Pure, so the
+ * scoping rules are unit-tested without git. Before the add, the caller proves
+ * that the path did not exist and that no other add in this daemon works it
+ * ({@link inFlightWorktreePaths}). On the new-branch and remote-tracking paths
+ * it also proves the branch did not exist; on the existing-local path the
+ * branch exists by definition, and its null `baseCommit` keeps it. These rules
+ * keep the rollback to what THIS attempt created:
+ *
+ *  (a) A "branch" conflict on the FIRST add attempt: git refused before
+ *      creating anything, so nothing is touched. On attempt 2 or later (the
+ *      `fresh-name` exit) the branch is this call's own residue from attempt 1,
+ *      so the rules below apply.
+ *  (a') A "path" conflict on the first attempt: the path or registration
+ *      belongs to someone else and is never touched; the branch is this call's
+ *      own (git creates it before the path check) and goes through rule (c).
+ *  (b) The worktree is removed only when it is registered at exactly this path,
+ *      or is an unregistered directory at this path inside the worktree base.
+ *  (c) The branch is deleted only when its tip is still `baseCommit`, no other
+ *      worktree has it checked out, and it carries no pre-existing record.
+ */
+export function planWorktreeAddRollback(
+  facts: WorktreeAddRollbackFacts
+): WorktreeAddRollbackPlan {
+  const conflict =
+    facts.stage === "add" && facts.addAttempts === 1
+      ? classifyWorktreeAddConflict(facts.errMsg)
+      : null;
+  if (conflict === "branch") {
+    return { worktree: "keep", branch: "keep", residual: [] };
+  }
+
+  const residual: string[] = [];
+  let worktree: WorktreeAddRollbackPlan["worktree"] = "keep";
+  if (conflict !== "path") {
+    if (facts.registered) {
+      worktree = "remove-registered";
+    } else if (facts.pathExists) {
+      if (facts.pathInsideBase) {
+        worktree = "remove-unregistered-dir";
+      } else {
+        residual.push("directory outside the worktree base");
+      }
+    }
+  }
+
+  let branch: WorktreeAddRollbackPlan["branch"] = "keep";
+  if (
+    facts.branchTip !== null &&
+    facts.baseCommit !== null &&
+    !facts.branchPreserved
+  ) {
+    if (facts.branchTip !== facts.baseCommit) {
+      residual.push(
+        `branch tip ${facts.branchTip} is not the base ${facts.baseCommit}`
+      );
+    } else if (facts.branchCheckedOutElsewhere) {
+      residual.push("branch is checked out by another worktree");
+    } else {
+      branch = "delete";
+    }
+  }
+  return { worktree, branch, residual };
+}
+
+type WorktreeListEntry = { path: string; branch: string | null };
+
+function parseWorktreeListPorcelain(stdout: string): WorktreeListEntry[] {
+  const entries: WorktreeListEntry[] = [];
+  let current: WorktreeListEntry | null = null;
+  for (const line of stdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      current = { path: line.slice("worktree ".length), branch: null };
+      entries.push(current);
+    } else if (current && line.startsWith("branch ")) {
+      current.branch = line.slice("branch ".length);
+    }
+  }
+  return entries;
+}
+
+/**
+ * The spellings git may have recorded for `worktreePath`: as given, resolved,
+ * and real (git records the real path, and the directory may be gone, so the
+ * parent's real path is tried too).
+ */
+async function worktreePathSpellings(
+  worktreePath: string
+): Promise<Set<string>> {
+  const spellings = new Set([worktreePath, resolve(worktreePath)]);
+  try {
+    spellings.add(await realpath(worktreePath));
+  } catch {
+    // The directory does not exist (a killed add may not have created it).
+  }
+  try {
+    spellings.add(
+      join(await realpath(dirname(worktreePath)), basename(worktreePath))
+    );
+  } catch {
+    // The parent does not exist either.
+  }
+  return spellings;
+}
+
+async function listWorktrees(repoRoot: string): Promise<WorktreeListEntry[]> {
+  const listed = await runGit(["worktree", "list", "--porcelain"], repoRoot);
+  return parseWorktreeListPorcelain(listed.stdout);
+}
+
+async function isRegisteredWorktree(
+  repoRoot: string,
+  spellings: Set<string>
+): Promise<boolean> {
+  return (await listWorktrees(repoRoot)).some(entry =>
+    spellings.has(entry.path)
+  );
+}
+
+/**
+ * Issue #4058: phase 2 of the two-phase add — the checkout, with git's own
+ * command, run by this process so the timeout kills the writer. It writes
+ * every tracked file, so it gets the checkout budget, not the generic one.
+ * Both add paths call this, so the command and its budget cannot drift apart.
+ *
+ * The repository is named explicitly (GIT_DIR = the worktree's admin dir,
+ * GIT_WORK_TREE = the worktree), as git does for its own checkout child. With
+ * the cwd alone, a `.git` file removed after phase 1 makes git walk up to the
+ * enclosing repository — the main checkout, or `~` for a relocated base — and
+ * `reset --hard` there exits 0 after discarding its uncommitted edits (CR-R1,
+ * reproduced on git 2.39.5). An unreadable `.git` file therefore fails the
+ * checkout instead.
+ */
+async function checkoutNewWorktree(worktreePath: string): Promise<void> {
+  const gitDir = await readLinkedWorktreeGitDir(worktreePath);
+  await runGit(["reset", "--hard", "--no-recurse-submodules"], worktreePath, {
+    timeoutMs: getWorktreeAddTimeoutMs(),
+    timeoutEnvHint: "HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS",
+    repo: { gitDir, workTree: worktreePath },
+  });
+}
+
+/**
+ * The admin dir (`<common>/worktrees/<id>`) a linked worktree's `.git` file
+ * points at. Throws when the file is missing, is not a file, or holds no
+ * `gitdir:` line, because every caller would otherwise let git discover a
+ * repository on its own.
+ */
+async function readLinkedWorktreeGitDir(worktreePath: string): Promise<string> {
+  let content: string;
+  try {
+    content = await readFile(join(worktreePath, ".git"), "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown error";
+    throw new Error(
+      `refusing to check out ${worktreePath}: its .git file cannot be read (${code}), so git would resolve the enclosing repository`
+    );
+  }
+  const match = content.match(/^gitdir:[ \t]*(.+?)[ \t]*$/m);
+  if (!match) {
+    throw new Error(
+      `refusing to check out ${worktreePath}: its .git file names no gitdir, so git would resolve the enclosing repository`
+    );
+  }
+  return resolve(worktreePath, match[1]);
+}
+
+export type WorktreeAddRollbackResult = {
+  /** null when the facts could not be read (nothing was touched). */
+  plan: WorktreeAddRollbackPlan | null;
+  worktreeRemoved: boolean;
+  branchDeleted: boolean;
+  /** Everything left in place that this attempt may have created. */
+  residual: string[];
+};
+
+/**
+ * Issue #4058: roll back what a failed worktree add created, scoped by
+ * {@link planWorktreeAddRollback}. A SIGKILLed `git worktree add` leaves a
+ * `.git/worktrees/<id>/locked` file reading `initializing` that git itself
+ * never removes (prune skips locked entries), so a registered worktree is
+ * removed with `--force --force`, falling back to `unlock` + `prune` when the
+ * directory is missing. The worktree goes before the branch, because
+ * `branch -D` refuses a branch that a worktree still has checked out.
+ *
+ * Best-effort and never throws: every git call is bounded by runGit's generic
+ * timeout, and the caller still returns the ORIGINAL error. Anything left in
+ * place is reported once under `daemon-worktree-add-rollback`.
+ */
+export async function rollbackFailedWorktreeAdd(options: {
+  repoRoot: string;
+  worktreePath: string;
+  branch: string;
+  baseCommit: string | null;
+  errMsg: string;
+  stage?: "add" | "after-add";
+  addAttempts?: number;
+}): Promise<WorktreeAddRollbackResult> {
+  const { repoRoot, worktreePath, branch, baseCommit, errMsg } = options;
+  const stage = options.stage ?? "add";
+  const residual: string[] = [];
+  let plan: WorktreeAddRollbackPlan | null = null;
+  let worktreeRemoved = false;
+  let branchDeleted = false;
+
+  try {
+    const spellings = await worktreePathSpellings(worktreePath);
+    const entries = await listWorktrees(repoRoot);
+    const branchRef = `refs/heads/${branch}`;
+    let branchTip: string | null = null;
+    try {
+      branchTip =
+        (
+          await runGit(
+            ["rev-parse", "--verify", "--quiet", branchRef],
+            repoRoot
+          )
+        ).stdout.trim() || null;
+    } catch {
+      // The branch does not exist.
+    }
+    plan = planWorktreeAddRollback({
+      errMsg,
+      stage,
+      addAttempts: options.addAttempts ?? 1,
+      registered: entries.some(entry => spellings.has(entry.path)),
+      pathExists: await pathExists(worktreePath),
+      pathInsideBase: isWithinWorktreeBase(
+        resolveWorktreeHostBase(repoRoot),
+        worktreePath
+      ).valid,
+      branchTip,
+      baseCommit,
+      branchCheckedOutElsewhere: entries.some(
+        entry => entry.branch === branchRef && !spellings.has(entry.path)
+      ),
+      branchPreserved:
+        branchTip !== null && (await isPreservedBranch({ repoRoot, branch })),
+    });
+    residual.push(...plan.residual);
+
+    if (plan.worktree === "remove-registered") {
+      try {
+        await runGit(
+          ["worktree", "remove", "--force", "--force", worktreePath],
+          repoRoot
+        );
+      } catch {
+        // The directory is missing or the remove refused: drop the
+        // registration directly (prune skips a still-locked entry).
+        try {
+          await runGit(["worktree", "unlock", worktreePath], repoRoot);
+        } catch {
+          // Not locked.
+        }
+        try {
+          await runGit(["worktree", "prune"], repoRoot);
+        } catch {
+          // Best-effort; the re-probe below decides.
+        }
+      }
+      let stillRegistered = false;
+      try {
+        stillRegistered = await isRegisteredWorktree(repoRoot, spellings);
+      } catch {
+        residual.push("could not re-read the worktree list after removal");
+      }
+      worktreeRemoved = !stillRegistered && !(await pathExists(worktreePath));
+    } else if (plan.worktree === "remove-unregistered-dir") {
+      // The purge-convergence precedent: an unregistered directory git will
+      // never reap, at the exact path, inside the worktree base (checked above).
+      await rm(worktreePath, { recursive: true, force: true });
+      try {
+        await runGit(["worktree", "prune"], repoRoot);
+      } catch {
+        // Best-effort.
+      }
+      worktreeRemoved = !(await pathExists(worktreePath));
+    }
+    if (plan.worktree !== "keep" && !worktreeRemoved) {
+      residual.push("worktree survived removal");
+    }
+
+    if (plan.branch === "delete") {
+      try {
+        await runGit(["branch", "-D", branch], repoRoot);
+        branchDeleted = true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        residual.push(`branch delete failed: ${message}`);
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    residual.push(`rollback could not read the repository state: ${message}`);
+  }
+
+  logger.info(
+    `[worktree] add rollback for ${worktreePath} (${branch}): worktree=${plan?.worktree ?? "unknown"} removed=${worktreeRemoved} branch=${plan?.branch ?? "unknown"} deleted=${branchDeleted}`
+  );
+  if (residual.length > 0) {
+    logger.reportError({
+      message: `[worktree] add rollback left ${worktreePath} (${branch}) partly in place: ${residual.join("; ")}`,
+      category: "daemon-worktree-add-rollback",
+      severity: "warn",
+      context: JSON.stringify({
+        worktreePath,
+        branch,
+        baseCommit,
+        stage,
+        errMsg,
+        plan,
+        residual,
+      }),
+    });
+  }
+  return { plan, worktreeRemoved, branchDeleted, residual };
+}
+
 export async function createWorktree(options: {
   basePath: string;
   nameHint?: string;
@@ -1165,10 +1544,11 @@ export async function createWorktree(options: {
   issueNumber?: number | null;
   /**
    * hapimatic-private#4481: open the worktree on this EXISTING branch instead of
-   * creating a new one (`git worktree add <path> <branch>`, no `-b`). A
-   * `remote: true` branch exists only as `origin/<name>` and gets a local
-   * tracking branch. Handled by {@link addWorktreeForExistingBranch}; the
-   * new-branch path below is unchanged.
+   * creating a new one (`git worktree add --no-checkout <path> <branch>`, no
+   * `-b`, then the #4058 checkout). A `remote: true` branch exists only as
+   * `origin/<name>` and gets a local tracking branch. Handled by
+   * {@link addWorktreeForExistingBranch}; #4481 left the new-branch path
+   * unchanged.
    */
   existingBranch?: ExistingBranch;
 }): Promise<WorktreeResult> {
@@ -1213,8 +1593,9 @@ export async function createWorktree(options: {
     makeDefaultBaseName();
 
   // hapimatic-private#4481: existing-branch worktrees take a sibling path — no
-  // HEAD resolve, no base fetch, no `-b` loop. The new-branch path below stays
-  // byte-identical (Fallback Preservation Rule).
+  // HEAD resolve, no base fetch, no `-b` loop. #4481 left the new-branch path
+  // below unchanged (Fallback Preservation Rule); #4058 later gave both paths
+  // the two-phase add and the scoped rollback.
   if (options.existingBranch) {
     return addWorktreeForExistingBranch({
       repoRoot,
@@ -1283,7 +1664,8 @@ export async function createWorktree(options: {
     // of syncConfigFromMain's config fetch. It takes the SAME short, independent
     // budget (HAPI_GIT_FETCH_TIMEOUT_MS, default 8s) so a slow/hung fetch fails
     // fast to the local-HEAD fallback below WITHOUT consuming the fatal
-    // `git worktree add` timeout (HAPI_GIT_TIMEOUT_MS, 30s).
+    // worktree-add budgets (HAPI_GIT_TIMEOUT_MS for the registration,
+    // HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS for the checkout, #4058).
     // [perf] issue #2147 stage (d1): time createWorktree's base-branch fetch —
     // freshly answers #2852 R5's deferred "is the duplicate git fetch material?"
     // question (the paired fetch is in syncConfigFromMain). Daemon log file, not
@@ -1357,99 +1739,158 @@ export async function createWorktree(options: {
     // The directory basename stays `name` (unprefixed) — Option B, branch-only.
     const branch = deriveWorktreeBranchName(name);
     const worktreePath = join(repoWorktreesRoot, name);
+    const inFlightKey = resolve(worktreePath);
 
-    if (await pathExists(worktreePath)) {
+    // #4058 (K-1): claim the path before any await, so a concurrent same-name
+    // createWorktree in this daemon moves on to a suffixed name instead of
+    // working (and later rolling back) the same path.
+    if (inFlightWorktreePaths.has(inFlightKey)) {
       continue;
     }
-
-    if (await branchExists(repoRoot, branch)) {
-      continue;
-    }
-
+    inFlightWorktreePaths.add(inFlightKey);
     try {
-      let runGitAttempts = 0;
-      while (true) {
-        runGitAttempts += 1;
-        try {
-          await runGit(
-            ["worktree", "add", "-b", branch, worktreePath, baseCommit],
-            repoRoot
-          );
-          break;
-        } catch (addError) {
-          const errMsg =
-            addError instanceof Error ? addError.message : String(addError);
-          const action = classifyWorktreeAddFailure(runGitAttempts, errMsg);
-          if (action === "retry-head") {
-            logger.warn(
-              `[worktree] git worktree add hit HEAD-failure on attempt ${runGitAttempts}; retrying once. headCommit=${headCommit} raw=${errMsg}`
-            );
-            logger.reportCaught(addError, {
-              category: "daemon-worktree-add-head-retry",
-              severity: "warn",
-            });
-            await new Promise(resolve => setTimeout(resolve, 100));
-            continue;
-          }
-          if (action === "fresh-name") {
-            // The HEAD-retry already fired and the attempt still failed. The
-            // first `git worktree add -b` may have partially created `branch`,
-            // so retrying THIS name would hit "branch already exists". Fall
-            // through to the outer loop for a fresh randomized name (#1464).
-            // `continue attemptLoop` is control flow, not a throw — it bypasses
-            // both the success path and the outer catch.
-            logger.warn(
-              `[worktree] git worktree add retry exhausted for name=${name}; recovering via fresh randomized name. raw=${errMsg}`
-            );
-            logger.reportCaught(addError, {
-              category: "daemon-worktree-add-fresh-name-fallthrough",
-              severity: "warn",
-            });
-            continue attemptLoop;
-          }
-          throw addError;
-        }
+      if (await pathExists(worktreePath)) {
+        continue;
       }
 
-      // Write `.worktree-meta.json` inline so the contract is enforced by the
-      // function that produces worktrees, not by every caller. Issue #1145.
-      // Non-fatal: meta-write failures are logged via the result type but do
-      // NOT fail createWorktree — the caller's bolt-on path (or the auto-
-      // bootstrap in issue-worker SKILL.md, #1025) recovers either way.
-      // Reuse the source-branch label resolved once above (issue #1470) instead
-      // of re-running detectSourceBranch — single resolution for both the fetch
-      // and this `.worktree-meta.json` write.
-      const sourceBranch = baseBranch;
-      const resolvedIssueNumber =
-        options.issueNumber !== undefined
-          ? options.issueNumber
-          : issueNumberFromBranch(branch);
-      await writeWorktreeMeta({
-        worktreePath,
-        repoRoot,
-        branch,
-        sourceBranch,
-        sessionId: options.hapiSessionId ?? branch,
-        port: options.claimedPort ?? null,
-        issueNumber: resolvedIssueNumber,
-      });
+      if (await branchExists(repoRoot, branch)) {
+        continue;
+      }
 
-      return {
-        ok: true,
-        info: {
-          basePath: repoRoot,
+      try {
+        let runGitAttempts = 0;
+        while (true) {
+          runGitAttempts += 1;
+          try {
+            // #4058 phase 1 of 2: register the worktree and create the branch
+            // WITHOUT a checkout. This is metadata only and fits the generic
+            // budget. A one-phase `git worktree add` runs its checkout as a
+            // separate `git reset --hard` child that a timeout kill does not
+            // reach, so that child kept writing into a path being rolled back.
+            await runGit(
+              [
+                "worktree",
+                "add",
+                "--no-checkout",
+                "-b",
+                branch,
+                worktreePath,
+                baseCommit,
+              ],
+              // The failure is classified (HEAD retry, rollback conflict
+              // rules), so read git's English wording under any locale.
+              repoRoot,
+              { cLocale: true }
+            );
+            break;
+          } catch (addError) {
+            const errMsg =
+              addError instanceof Error ? addError.message : String(addError);
+            const action = classifyWorktreeAddFailure(runGitAttempts, errMsg);
+            if (action === "retry-head") {
+              logger.warn(
+                `[worktree] git worktree add hit HEAD-failure on attempt ${runGitAttempts}; retrying once. headCommit=${headCommit} raw=${errMsg}`
+              );
+              logger.reportCaught(addError, {
+                category: "daemon-worktree-add-head-retry",
+                severity: "warn",
+              });
+              await new Promise(resolve => setTimeout(resolve, 100));
+              continue;
+            }
+            // #4058: both exits below roll back what this name's attempts
+            // created first, so a retry (here, or the caller's next spawn of
+            // the same name) does not trip over the residue.
+            await rollbackFailedWorktreeAdd({
+              repoRoot,
+              worktreePath,
+              branch,
+              baseCommit,
+              errMsg,
+              stage: "add",
+              addAttempts: runGitAttempts,
+            });
+            if (action === "fresh-name") {
+              // The HEAD-retry already fired and the attempt still failed. The
+              // first `git worktree add -b` may have partially created `branch`
+              // (rolled back above). Fall through to the outer loop for a fresh
+              // randomized name (#1464). `continue attemptLoop` is control flow,
+              // not a throw — it bypasses both the success path and the outer
+              // catch.
+              logger.warn(
+                `[worktree] git worktree add retry exhausted for name=${name}; recovering via fresh randomized name. raw=${errMsg}`
+              );
+              logger.reportCaught(addError, {
+                category: "daemon-worktree-add-fresh-name-fallthrough",
+                severity: "warn",
+              });
+              continue attemptLoop;
+            }
+            throw addError;
+          }
+        }
+
+        // #4058 phase 2 of 2: the checkout (see checkoutNewWorktree).
+        try {
+          await checkoutNewWorktree(worktreePath);
+        } catch (checkoutError) {
+          await rollbackFailedWorktreeAdd({
+            repoRoot,
+            worktreePath,
+            branch,
+            baseCommit,
+            errMsg:
+              checkoutError instanceof Error
+                ? checkoutError.message
+                : String(checkoutError),
+            stage: "after-add",
+            addAttempts: runGitAttempts,
+          });
+          throw checkoutError;
+        }
+
+        // Write `.worktree-meta.json` inline so the contract is enforced by the
+        // function that produces worktrees, not by every caller. Issue #1145.
+        // Non-fatal: meta-write failures are logged via the result type but do
+        // NOT fail createWorktree — the caller's bolt-on path (or the auto-
+        // bootstrap in issue-worker SKILL.md, #1025) recovers either way.
+        // Reuse the source-branch label resolved once above (issue #1470)
+        // instead of re-running detectSourceBranch — single resolution for both
+        // the fetch and this `.worktree-meta.json` write.
+        const sourceBranch = baseBranch;
+        const resolvedIssueNumber =
+          options.issueNumber !== undefined
+            ? options.issueNumber
+            : issueNumberFromBranch(branch);
+        await writeWorktreeMeta({
           worktreePath,
+          repoRoot,
           branch,
-          name,
-          createdAt: Date.now(),
-        },
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        ok: false,
-        error: `Failed to create worktree: ${message}`,
-      };
+          sourceBranch,
+          sessionId: options.hapiSessionId ?? branch,
+          port: options.claimedPort ?? null,
+          issueNumber: resolvedIssueNumber,
+        });
+
+        return {
+          ok: true,
+          info: {
+            basePath: repoRoot,
+            worktreePath,
+            branch,
+            name,
+            createdAt: Date.now(),
+          },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          error: `Failed to create worktree: ${message}`,
+        };
+      }
+    } finally {
+      inFlightWorktreePaths.delete(inFlightKey);
     }
   }
 
@@ -1459,24 +1900,24 @@ export async function createWorktree(options: {
   };
 }
 
-/** git's "branch is held by another worktree" refusal (wording varies by version). */
-const BRANCH_HELD_PATTERN =
-  /is already (?:checked out|used by worktree) at '([^']+)'/;
-
 /**
  * hapimatic-private#4481: create a worktree on a branch that ALREADY exists.
  *
- *  - local branch  → `git worktree add -- <path> <branch>` (no `-b`)
+ *  - local branch  → `git worktree add --no-checkout -- <path> <branch>` (no `-b`)
  *  - remote-only   → `git fetch origin <name>`, then
- *                    `git worktree add --track -b <name> -- <path> origin/<name>`
+ *                    `git worktree add --no-checkout --track -b <name> -- <path> origin/<name>`
  *
+ * Either add is followed by the checkout (`git reset --hard` in the worktree,
+ * under the checkout budget), the same two phases as createWorktree (#4058).
  * The parent checkout's branch is never switched. The directory name is the
  * branch slug (`feature/x` → `feature-x`), randomized only on a path collision —
  * the BRANCH is fixed, so there is no fresh-name retry around `git worktree add`.
- * On failure, only what THIS call created is rolled back: the partial worktree
- * registration, and (remote-only) the tracking branch it created. A pre-existing
- * local branch is never deleted. The worktree meta records `branch_origin` so
- * config sync and every cleanup path treat the branch correctly.
+ * On failure, only what THIS call created is rolled back, by
+ * {@link rollbackFailedWorktreeAdd}: the worktree registered at this path, and
+ * (remote-only) the tracking branch while it still points at the remote tip it
+ * was created at. A pre-existing local branch is never deleted. The worktree
+ * meta records `branch_origin` so config sync and every cleanup path treat the
+ * branch correctly.
  */
 async function addWorktreeForExistingBranch(args: {
   repoRoot: string;
@@ -1539,17 +1980,43 @@ async function addWorktreeForExistingBranch(args: {
     };
   }
 
+  // #4058 (K-2): the commit the tracking branch is created at (the remote tip
+  // this call opens), so a rollback deletes that branch only while its tip is
+  // still there. null → this call creates no branch, so none is ever deleted.
+  let createdBranchSha: string | null = null;
+  if (useRemote) {
+    try {
+      createdBranchSha =
+        (
+          await runGit(
+            ["rev-parse", "--verify", `refs/remotes/origin/${name}`],
+            repoRoot
+          )
+        ).stdout.trim() || null;
+    } catch {
+      // Unreadable: keep whatever the rollback finds (fails toward keeping).
+    }
+  }
+
   const dirBase = normalizeNameHint(name) ?? makeDefaultBaseName();
   let dirName: string | null = null;
+  let inFlightKey: string | null = null;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
     const candidate =
       attempt === 0 ? dirBase : `${dirBase}-${randomBytes(2).toString("hex")}`;
+    // #4058 (K-1): a path another add in this daemon is creating reads as taken
+    // (claimed before any await, released in the finally below).
+    const key = resolve(join(repoWorktreesRoot, candidate));
+    if (inFlightWorktreePaths.has(key)) continue;
+    inFlightWorktreePaths.add(key);
     if (!(await pathExists(join(repoWorktreesRoot, candidate)))) {
       dirName = candidate;
+      inFlightKey = key;
       break;
     }
+    inFlightWorktreePaths.delete(key);
   }
-  if (!dirName) {
+  if (!dirName || !inFlightKey) {
     return {
       ok: false,
       error: "Failed to find a free worktree directory name. Try again.",
@@ -1557,120 +2024,141 @@ async function addWorktreeForExistingBranch(args: {
   }
   const worktreePath = join(repoWorktreesRoot, dirName);
 
-  const addArgs = useRemote
-    ? [
-        "worktree",
-        "add",
-        "--track",
-        "-b",
-        name,
-        "--",
-        worktreePath,
-        `origin/${name}`,
-      ]
-    : ["worktree", "add", "--", worktreePath, name];
-  // Roll back only what this call created: the worktree registration, and
-  // (remote-only) the tracking branch. A pre-existing local branch is kept.
-  const rollback = async (): Promise<void> => {
-    try {
-      await runGit(["worktree", "remove", "--force", worktreePath], repoRoot);
-    } catch {
-      // Not registered — nothing to remove.
-    }
-    try {
-      await runGit(["worktree", "prune"], repoRoot);
-    } catch {
-      // Best-effort.
-    }
-    if (useRemote && (await branchExists(repoRoot, name))) {
-      try {
-        await runGit(["branch", "-D", name], repoRoot);
-      } catch {
-        // Best-effort: the tracking branch this call created.
-      }
-    }
-  };
-
   try {
-    await runGit(addArgs, repoRoot);
-  } catch (addError) {
-    const errMsg =
-      addError instanceof Error ? addError.message : String(addError);
-    await rollback();
-    const held = errMsg.match(BRANCH_HELD_PATTERN);
-    return {
-      ok: false,
-      error: held
-        ? `Branch '${name}' is already checked out at ${held[1]}.`
-        : `Failed to create worktree on branch '${name}': ${errMsg}`,
-    };
-  }
+    // #4058: two-phase add, as in createWorktree — register without a checkout
+    // (generic budget), then check out in the worktree under the checkout
+    // budget so the timeout kills the writer itself.
+    const addArgs = useRemote
+      ? [
+          "worktree",
+          "add",
+          "--no-checkout",
+          "--track",
+          "-b",
+          name,
+          "--",
+          worktreePath,
+          `origin/${name}`,
+        ]
+      : ["worktree", "add", "--no-checkout", "--", worktreePath, name];
+    // Roll back only what this call created (#4058 rules, K-2): the worktree
+    // registered at this path, and the tracking branch only while it still
+    // points at `createdBranchSha`. A pre-existing local branch is kept.
+    const rollback = (
+      errMsg: string,
+      stage: "add" | "after-add"
+    ): Promise<WorktreeAddRollbackResult> =>
+      rollbackFailedWorktreeAdd({
+        repoRoot,
+        worktreePath,
+        branch: name,
+        baseCommit: createdBranchSha,
+        errMsg,
+        stage,
+        addAttempts: 1,
+      });
 
-  const branchOrigin = useRemote ? "existing-remote" : "existing-local";
-  // The durable second record (survives the folder and `git clean`). A few
-  // attempts because a concurrent `worktree add --track` can hold
-  // `.git/config.lock` for a moment. Non-fatal: the meta below is the primary
-  // record, and the create fails without it.
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      await runGit(
-        ["config", `branch.${name}.${BRANCH_ORIGIN_CONFIG_KEY}`, branchOrigin],
-        repoRoot
-      );
-      break;
-    } catch (configError) {
-      if (attempt === 3) {
-        const message =
-          configError instanceof Error
-            ? configError.message
-            : String(configError);
-        logger.warn(
-          `[worktree] existing-branch: could not write the ${BRANCH_ORIGIN_CONFIG_KEY} marker for ${name} (the worktree meta still records it): ${message}`
+      // cLocale: the failure is classified (rollback rules, branch-held).
+      await runGit(addArgs, repoRoot, { cLocale: true });
+    } catch (addError) {
+      const errMsg =
+        addError instanceof Error ? addError.message : String(addError);
+      await rollback(errMsg, "add");
+      const held = errMsg.match(BRANCH_HELD_PATTERN);
+      return {
+        ok: false,
+        error: held
+          ? `Branch '${name}' is already checked out at ${held[1]}.`
+          : `Failed to create worktree on branch '${name}': ${errMsg}`,
+      };
+    }
+    try {
+      await checkoutNewWorktree(worktreePath);
+    } catch (checkoutError) {
+      const errMsg =
+        checkoutError instanceof Error
+          ? checkoutError.message
+          : String(checkoutError);
+      await rollback(errMsg, "after-add");
+      return {
+        ok: false,
+        error: `Failed to create worktree on branch '${name}': ${errMsg}`,
+      };
+    }
+
+    const branchOrigin = useRemote ? "existing-remote" : "existing-local";
+    // The durable second record (survives the folder and `git clean`). A few
+    // attempts because a concurrent `worktree add --track` can hold
+    // `.git/config.lock` for a moment. Non-fatal: the meta below is the primary
+    // record, and the create fails without it.
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await runGit(
+          [
+            "config",
+            `branch.${name}.${BRANCH_ORIGIN_CONFIG_KEY}`,
+            branchOrigin,
+          ],
+          repoRoot
         );
-      } else {
-        await new Promise(resolve => setTimeout(resolve, 100));
+        break;
+      } catch (configError) {
+        if (attempt === 3) {
+          const message =
+            configError instanceof Error
+              ? configError.message
+              : String(configError);
+          logger.warn(
+            `[worktree] existing-branch: could not write the ${BRANCH_ORIGIN_CONFIG_KEY} marker for ${name} (the worktree meta still records it): ${message}`
+          );
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
       }
     }
-  }
-  const metaResult = await writeWorktreeMeta({
-    worktreePath,
-    repoRoot,
-    branch: name,
-    sourceBranch: args.sourceBranch,
-    sessionId: args.hapiSessionId ?? name,
-    port: args.claimedPort,
-    issueNumber:
-      args.issueNumber !== undefined
-        ? args.issueNumber
-        : issueNumberFromBranch(name),
-    branchOrigin,
-  });
-  if (!metaResult.ok) {
-    // The meta is what config sync and every cleanup path read first; without
-    // it the auto-bootstrap rewrite would drop branch_origin. Undo the worktree
-    // (keeping a pre-existing branch) and fail loudly instead.
-    await rollback();
-    logger.warn(
-      `[worktree] existing-branch: meta write failed for ${worktreePath}; worktree rolled back: ${metaResult.error}`
+    const metaResult = await writeWorktreeMeta({
+      worktreePath,
+      repoRoot,
+      branch: name,
+      sourceBranch: args.sourceBranch,
+      sessionId: args.hapiSessionId ?? name,
+      port: args.claimedPort,
+      issueNumber:
+        args.issueNumber !== undefined
+          ? args.issueNumber
+          : issueNumberFromBranch(name),
+      branchOrigin,
+    });
+    if (!metaResult.ok) {
+      // The meta is what config sync and every cleanup path read first; without
+      // it the auto-bootstrap rewrite would drop branch_origin. Undo the worktree
+      // (keeping a pre-existing branch) and fail loudly instead.
+      await rollback(`meta write failed: ${metaResult.error}`, "after-add");
+      logger.warn(
+        `[worktree] existing-branch: meta write failed for ${worktreePath}; worktree rolled back: ${metaResult.error}`
+      );
+      return {
+        ok: false,
+        error: `Failed to record the worktree on branch '${name}': ${metaResult.error}`,
+      };
+    }
+    logger.info(
+      `[worktree] Created worktree on existing branch ${name} (${branchOrigin}) at ${worktreePath}`
     );
     return {
-      ok: false,
-      error: `Failed to record the worktree on branch '${name}': ${metaResult.error}`,
+      ok: true,
+      info: {
+        basePath: repoRoot,
+        worktreePath,
+        branch: name,
+        name: dirName,
+        createdAt: Date.now(),
+      },
     };
+  } finally {
+    inFlightWorktreePaths.delete(inFlightKey);
   }
-  logger.info(
-    `[worktree] Created worktree on existing branch ${name} (${branchOrigin}) at ${worktreePath}`
-  );
-  return {
-    ok: true,
-    info: {
-      basePath: repoRoot,
-      worktreePath,
-      branch: name,
-      name: dirName,
-      createdAt: Date.now(),
-    },
-  };
 }
 
 export type SyncConfigResult =
@@ -1837,8 +2325,9 @@ export async function fetchSourceBranch(args: {
 }): Promise<void> {
   // Issue #1557: the non-fatal config fetch gets its OWN short timeout
   // (HAPI_GIT_FETCH_TIMEOUT_MS, default 8s) so a slow/hung fetch fails fast to
-  // the local-ref fallback WITHOUT consuming the fatal 30s worktree-op
-  // budget (HAPI_GIT_TIMEOUT_MS). `git worktree add` keeps the generous default.
+  // the local-ref fallback WITHOUT consuming the fatal worktree-op budgets
+  // (HAPI_GIT_TIMEOUT_MS, and HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS for the checkout,
+  // #4058).
   // [perf] issue #2147 stage (d1): time syncConfigFromMain's config fetch —
   // the SECOND per-spawn fetch #2852 R5 deferred measuring. grep `[perf][spawn]`.
   const perfCfgFetchT0 = Date.now();

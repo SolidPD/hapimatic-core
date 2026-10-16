@@ -19,7 +19,12 @@ import {
 import { deriveInstanceProvenance } from "./porterKey";
 import { toPlanSummary } from "../../porter/importArchive";
 import type { PorterTokenStore } from "../../porter/porterToken";
+import {
+  createPorterStagingSweeper,
+  type PorterStagingSweeper,
+} from "../../porter/porterStagingSweeper";
 import { createRateLimiter } from "../middleware/rateLimit";
+import { clientAddrKey } from "../clientAddress";
 import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
 
@@ -32,7 +37,8 @@ import { cataloged } from "../../capabilities/cataloged";
  *  - {@link createPorterOnelinerPublicRoutes} → mounted at the app ROOT →
  *    public by mount position (`/p/:token` fetch + `/p/:token/archive` upload).
  *    The TOKEN is the auth: base64url + short TTL + fetch ≤ 5 + upload single-use
- *    + a token lookup BEFORE any body read + a Content-Length 413 pre-check. The
+ *    (reserved synchronously before any `await`, #5170) + a token lookup BEFORE
+ *    any body read + a Content-Length 413 pre-check. The
  *    JWT middleware is `/api/*`-scoped (`server.ts` `app.use("/api/*", …)`), so
  *    these routes never enter it — precedent `/ext-assets` (`server.ts:1147`).
  *
@@ -41,20 +47,6 @@ import { cataloged } from "../../capabilities/cataloged";
  * the SAME injected {@link PorterTokenStore} and {@link PlanStore} — the upload
  * leg stages into the plan store `POST /api/porter/import/commit` reads (K6).
  */
-
-/**
- * Rate-limit key for the PUBLIC legs: the client address (the mint leg keys on
- * the namespace instead — the default). `createRateLimiter`'s default key is the
- * namespace, which is `"anonymous"` for every unauthenticated caller → one
- * shared bucket; keying on the forwarded client address restores per-client
- * limiting behind a reverse proxy (Tailscale Serve sets `x-forwarded-for`). This
- * is defense-in-depth; the token + TTL + single-use are the real protection.
- */
-function clientAddrKey(c: Context<WebAppEnv>): string {
-  const xff = c.req.header("x-forwarded-for");
-  if (xff) return xff.split(",")[0]?.trim() || "anonymous";
-  return c.req.header("x-real-ip") ?? "anonymous";
-}
 
 /**
  * Resolve the instance's public origin (scheme://host[:port]) for building the
@@ -102,6 +94,8 @@ export function mountPorterOnelinerRoutes(
     dataDir: string;
     errorLogger?: ErrorLogger | null;
     getSseManager?: () => SSEManager | null;
+    /** #5170: the shared staging sweeper the upload leg kicks. */
+    stagingSweeper?: PorterStagingSweeper;
   }
 ): void {
   app.route(
@@ -231,8 +225,24 @@ export function createPorterOnelinerPublicRoutes(opts: {
   claudeDir?: string;
   hostConfigPath?: string;
   accountConfigBases?: string[];
+  /**
+   * #5170: the shared staging sweeper (built in `buildWebApp.ts`). Defaults to a
+   * timer-less sweeper over `planStore`, so tests that omit it are unchanged.
+   */
+  stagingSweeper?: PorterStagingSweeper;
+  /**
+   * Test/DI seam forwarded to `stageAndPlan`'s `statDev`, the same seam the plan
+   * route has (`porterImport.ts`). Production leaves it undefined.
+   */
+  statDev?: (path: string) => number;
 }): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
+  const stagingSweeper =
+    opts.stagingSweeper ??
+    createPorterStagingSweeper({
+      dataDir: opts.dataDir,
+      planStore: opts.planStore,
+    });
 
   // GET /p/:token — serve the personalized export script. Public by mount
   // position; the token IS the auth. Variant is bash (A) or powershell (B fills
@@ -340,84 +350,156 @@ export function createPorterOnelinerPublicRoutes(opts: {
     async c => {
       const token = c.req.param("token");
 
-      const entry = opts.tokenStore.getForUpload(token);
-      if (!entry) {
-        return opts.tokenStore.status(token)
-          ? c.json({ error: "Upload link expired or already used" }, 410)
-          : c.json({ error: "Not found" }, 404);
+      // #5170 (R1): claim the single-use leg SYNCHRONOUSLY, before the first
+      // await. Two concurrent uploads on one token then stage at most one plan:
+      // the second is refused while the first holds the reservation.
+      const claim = opts.tokenStore.reserveUpload(token);
+      if (!claim.ok) {
+        if (claim.reason === "unknown") {
+          return c.json({ error: "Not found" }, 404);
+        }
+        if (claim.reason === "in-progress") {
+          return c.json(
+            { error: "An upload for this link is already in progress" },
+            409
+          );
+        }
+        return c.json({ error: "Upload link expired or already used" }, 410);
       }
+      const { entry, reservation } = claim;
 
-      // 413 on Content-Length BEFORE parseBody() — curl -F always sends it, and
-      // parseBody() buffers the whole body up to the 220 MB socket limit, a
-      // per-request memory lever on a public route. `-F` bodies exceed the raw
-      // archive size by the multipart envelope, so this is a conservative outer
-      // guard; stageAndPlan re-checks the exact archive bytes below.
-      const contentLength = Number(c.req.header("content-length") ?? "0");
-      if (Number.isFinite(contentLength) && contentLength > MAX_ARCHIVE_BYTES) {
-        return c.json(
-          {
-            error: `Archive too large. Maximum is ${MAX_ARCHIVE_BYTES / 1024 / 1024}MB`,
-          },
-          413
-        );
-      }
-
-      let body: Awaited<ReturnType<typeof c.req.parseBody>>;
+      // Set once the upload leg is consumed. Every other exit — an early 4xx, a
+      // failed stage, a client disconnect mid-body — releases the reservation in
+      // `finally`, so the owner can retry.
+      let stagingHandle: string | null = null;
       try {
-        body = await c.req.parseBody();
-      } catch {
-        return c.json({ error: "Malformed multipart body" }, 400);
-      }
-      const file = body["file"];
-      if (!file || !(file instanceof File)) {
-        return c.json(
-          { error: "No archive file provided (field 'file')" },
-          400
-        );
-      }
+        // 413 on Content-Length BEFORE parseBody() — curl -F always sends it, and
+        // parseBody() buffers the whole body up to the 220 MB socket limit, a
+        // per-request memory lever on a public route. `-F` bodies exceed the raw
+        // archive size by the multipart envelope, so this is a conservative outer
+        // guard; stageAndPlan re-checks the exact archive bytes below.
+        const contentLength = Number(c.req.header("content-length") ?? "0");
+        if (
+          Number.isFinite(contentLength) &&
+          contentLength > MAX_ARCHIVE_BYTES
+        ) {
+          return c.json({ error: publicUploadErrorMessage(413) }, 413);
+        }
 
-      const buf = new Uint8Array(await file.arrayBuffer());
-      try {
-        const outcome = await stageAndPlan(
-          buf,
-          {
-            name: file.name,
-            mime: file.type,
-            dataDir: opts.dataDir,
-            settingsFile: opts.settingsFile,
-            errorLogger: opts.errorLogger,
-            claudeDir: opts.claudeDir,
-            hostConfigPath: opts.hostConfigPath,
-            accountConfigBases: opts.accountConfigBases,
-          },
-          opts.planStore
-        );
-        if (!outcome.ok)
+        let body: Awaited<ReturnType<typeof c.req.parseBody>>;
+        try {
+          body = await c.req.parseBody();
+        } catch {
+          return c.json({ error: "Malformed multipart body" }, 400);
+        }
+        const file = body["file"];
+        if (!file || !(file instanceof File)) {
+          return c.json(
+            { error: "No archive file provided (field 'file')" },
+            400
+          );
+        }
+
+        const buf = new Uint8Array(await file.arrayBuffer());
+        let outcome: Awaited<ReturnType<typeof stageAndPlan>>;
+        try {
+          outcome = await stageAndPlan(
+            buf,
+            {
+              name: file.name,
+              mime: file.type,
+              dataDir: opts.dataDir,
+              settingsFile: opts.settingsFile,
+              errorLogger: opts.errorLogger,
+              claudeDir: opts.claudeDir,
+              hostConfigPath: opts.hostConfigPath,
+              accountConfigBases: opts.accountConfigBases,
+              statDev: opts.statDev,
+            },
+            opts.planStore
+          );
+        } catch (err) {
+          const status = statusForError(err);
+          const message =
+            err instanceof Error ? err.message : "Import plan failed";
+          // The full message goes to the log only; the token holder gets a
+          // fixed per-status text (#5170 R7) — these errors carry absolute
+          // data-dir, staging and destination paths.
+          opts.errorLogger?.log(
+            status >= 500 ? "error" : "warn",
+            `[porter-oneliner] upload failed: ${message}`,
+            { category: "porter-oneliner", source: "server" }
+          );
+          return c.json({ error: publicUploadErrorMessage(status) }, status);
+        }
+        if (!outcome.ok) {
           return c.json({ error: outcome.error }, outcome.status);
+        }
 
-        // Consume the single-use upload leg ONLY on a successful stage (a failed
-        // stage leaves the leg open for a retry), then wake the waiting page.
-        opts.tokenStore.markUploaded(token, outcome.plan.stagingHandle);
+        // Consume the single-use upload leg ONLY on a successful stage. A false
+        // return means the store no longer holds this reservation: drop the plan
+        // rather than answer 200 for a token nothing points at.
+        const handle = outcome.plan.stagingHandle;
+        if (!opts.tokenStore.markUploaded(token, reservation, handle)) {
+          opts.planStore.delete(handle);
+          return c.json({ error: publicUploadErrorMessage(410) }, 410);
+        }
+        stagingHandle = handle;
+        // #5170 (R3): expire stale plans and reap abandoned staging dirs. Kicked
+        // only after a successful stage, so neither an unknown token nor a
+        // token holder's failing requests can trigger disk I/O; the sweeper's
+        // own timer covers an idle instance.
+        void stagingSweeper.sweep();
+      } finally {
+        if (stagingHandle === null) {
+          opts.tokenStore.releaseUpload(token, reservation);
+        }
+      }
+
+      // Wake the waiting page. Outside the try: the upload is already staged and
+      // consumed, so a broadcast failure must not turn it into a 500.
+      try {
         opts.getSseManager?.()?.broadcast({
           type: "porter-token-received",
           namespace: entry.namespace, // captured at mint → passes shouldSend()
           token,
-          stagingHandle: outcome.plan.stagingHandle,
+          stagingHandle,
         });
-        return c.json({ stagingHandle: outcome.plan.stagingHandle });
       } catch (err) {
-        const status = statusForError(err);
-        const message =
-          err instanceof Error ? err.message : "Import plan failed";
         opts.errorLogger?.log(
-          status >= 500 ? "error" : "warn",
-          `[porter-oneliner] upload failed: ${message}`,
+          "warn",
+          `[porter-oneliner] received broadcast failed: ${err instanceof Error ? err.message : String(err)}`,
           { category: "porter-oneliner", source: "server" }
         );
-        return c.json({ error: message }, status);
       }
+      return c.json({ stagingHandle });
     }
   );
 
   return app;
+}
+
+/**
+ * The body text for a failed public upload (#5170 R7): a fixed message per
+ * status, never the error's own message. Import errors carry absolute paths —
+ * `SameFilesystemError` names the data dir and destination, `PathEscapeError`
+ * and its subclasses the destination root, untyped fs errors the staging dir,
+ * and `SecretDecryptionError` wraps inner text verbatim. No built-in client
+ * shows this body (bash `curl -fsS -o /dev/null`; PowerShell
+ * `EnsureSuccessStatusCode`): both send the user to the Configuration page
+ * upload, whose JWT-gated plan route returns the full detail.
+ */
+export function publicUploadErrorMessage(status: number): string {
+  switch (status) {
+    case 400:
+      return "The archive was refused. Upload it on the Configuration page to see why.";
+    case 409:
+      return "The archive needs review. Upload it on the Configuration page.";
+    case 410:
+      return "This upload expired. Run the export again.";
+    case 413:
+      return `Archive too large. Maximum is ${MAX_ARCHIVE_BYTES / 1024 / 1024}MB`;
+    default:
+      return "The server could not stage this archive. Check the instance's error log.";
+  }
 }

@@ -134,7 +134,7 @@ export function isSessionLiveForGuard(
 /**
  * Resolve the freshness window from `HAPI_LIVE_FRESHNESS_WINDOW_MS`, falling back
  * to {@link LIVE_SESSION_FRESHNESS_WINDOW_MS}. Mirrors the numeric-env house pattern
- * (`getGitTimeoutMs` in `cli/src/daemon/worktree.ts`): only a finite, positive
+ * (`getGitTimeoutMs` in `cli/src/daemon/worktreeMeta.ts`): only a finite, positive
  * value overrides; anything else (unset, non-numeric, ≤ 0) keeps the default.
  *
  * Resolve ONCE where the closure is constructed and thread the number in — do not

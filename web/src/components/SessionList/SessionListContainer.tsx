@@ -254,6 +254,14 @@ export function SessionList(props: {
   onCreateSchedule?: () => void;
   /** Deep-link: auto-expand this schedule ID */
   initialScheduleId?: string;
+  /**
+   * Ids of the sessions that passed the search/filter (router.tsx's
+   * `filteredSessions`). When provided, only these nest under a schedule row, so
+   * an active search narrows the scheduled peers too. `sessions` stays the
+   * UNFILTERED list on purpose: the empty-state branch and the hover /
+   * relationship lookups below read it.
+   */
+  visibleSessionIds?: ReadonlySet<string>;
 }) {
   const { api } = props;
   const filterView = props.filterView ?? "all";
@@ -264,9 +272,12 @@ export function SessionList(props: {
   // Build lookup: scheduleId → sessions spawned by that scheduler.
   // Sessions are filtered out of the main list at render time (in the
   // clustering loop) so this works with both internal and lifted groups.
+  // A `visibleSessionIds` set (search active) keeps only the matching peers.
+  const visibleSessionIds = props.visibleSessionIds;
   const sessionsByScheduleId = useMemo(() => {
     const map = new Map<string, SessionSummary[]>();
     for (const session of props.sessions) {
+      if (visibleSessionIds && !visibleSessionIds.has(session.id)) continue;
       const sid = schedulerScheduleId(session);
       if (sid) {
         const list = map.get(sid) ?? [];
@@ -275,7 +286,7 @@ export function SessionList(props: {
       }
     }
     return map;
-  }, [props.sessions]);
+  }, [props.sessions, visibleSessionIds]);
 
   // #2700: ids of every schedule that renders a row. A scheduler-spawned session is
   // nested (and excluded from the main list) only when its schedule is in this set;

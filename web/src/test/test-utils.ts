@@ -131,6 +131,8 @@ export function createMockApiClient(): Record<string, Mock> {
     addNodeRecentPath: vi.fn(),
     getCreateSessionPreferences: vi.fn(),
     setCreateSessionPreferences: vi.fn(),
+    getOnboardingState: vi.fn(),
+    setOnboardingState: vi.fn(),
     getSlashCommands: vi.fn(),
     getPushVapidPublicKey: vi.fn(),
     subscribePushNotifications: vi.fn(),

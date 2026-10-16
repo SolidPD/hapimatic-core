@@ -27,6 +27,7 @@ import type { Server as SocketEngine } from "@socket.io/bun-engine";
 import type { WebSocketData } from "@socket.io/bun-engine";
 import { loadEmbeddedAssetMap } from "./embeddedAssets";
 import { isBunCompiled } from "../utils/bunCompiled";
+import { stampOnboardingStateAtBoot } from "../config/onboardingState";
 import type { Store } from "../store";
 import type { RpcRegistry } from "../socket/rpcRegistry";
 import type { FederationTerminalNodeHandler } from "../federation/federationTerminalNode";
@@ -37,6 +38,8 @@ import {
   type DesktopWsData,
 } from "./desktopProxy";
 import type { ErrorLogger } from "../logging/errorLogger";
+import { porterExposed } from "../config/porterExposureConfig";
+import { ensurePorterAgeKeys } from "../config/porterAgeKeys";
 import { buildWebApp } from "./buildWebApp";
 
 // Re-exported for compatibility so downstream mounts (#3744, #3751) can import
@@ -245,6 +248,34 @@ export async function startWebServer(options: {
     },
   };
 
+  // #3865 (ruling 3865-D2 → D): stamp the onboarding state BEFORE the listener
+  // starts, so it reads the database before this process can accept a daemon's
+  // machine/session registration. Lives here, not in index.ts, because index.ts
+  // has no max-lines headroom left. Order pinned by onboardingState.test.ts.
+  await stampOnboardingStateAtBoot(
+    options.store,
+    configuration.settingsFile,
+    options.errorLogger
+  );
+
+  // #5170 (R4): generate the Porter keypair before listening, so no request
+  // path ever writes settings.json — and only when Porter is exposed (#4533).
+  // Fail-soft: a failure is logged and the recipient routes answer 503
+  // `porter_key_unavailable` until the next start.
+  if (porterExposed()) {
+    try {
+      const keys = await ensurePorterAgeKeys(configuration.settingsFile);
+      if (keys === "generated") {
+        console.log("[Web] Generated the Configuration Porter keypair");
+      }
+    } catch (err) {
+      options.errorLogger?.error(
+        `[porter] keypair generation at startup failed: ${err instanceof Error ? err.message : String(err)}`,
+        { category: "porter", source: "server" }
+      );
+    }
+  }
+
   const server = Bun.serve<CombinedWsData>({
     port: configuration.webappPort,
     idleTimeout: Math.max(30, socketHandler.idleTimeout),
@@ -304,7 +335,9 @@ export async function startWebServer(options: {
         return socketHandler.fetch(req, server);
       }
 
-      return app.fetch(req);
+      // The server is Hono's env, so getConnInfo (web/clientAddress.ts) can
+      // read the peer address for rate-limit keys (#5170).
+      return app.fetch(req, server);
     },
   });
 

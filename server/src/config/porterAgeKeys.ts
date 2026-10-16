@@ -13,10 +13,18 @@ import { readSettingsOrThrow, writeSettings, type Settings } from "./settings";
  * `AGE-SECRET-KEY-1…` key. Callers OUTSIDE this module must never receive the
  * full object — the R1 guarantee ("the identity never leaves the instance") is
  * enforced by MODULE SHAPE: this type is produced only by the module-private
- * {@link getOrCreatePorterAgeKeys}, and the exported surface is limited to
- * {@link getPorterRecipient} (returns the public half only) and
- * {@link decryptPorterArchive} (uses the identity strictly in-process, never
- * returning or logging it).
+ * {@link getOrCreatePorterAgeKeys} and {@link readPorterAgeKeys}, and the
+ * exported surface is limited to {@link getPorterRecipient} /
+ * {@link readPorterRecipient} (the public half only), {@link ensurePorterAgeKeys}
+ * (a status, never key material) and {@link decryptPorterArchive} (uses the
+ * identity strictly in-process, never returning or logging it).
+ *
+ * #5170: no request path generates the keypair. `web/server.ts` calls
+ * {@link ensurePorterAgeKeys} before the server listens, on an exposed instance
+ * only; the recipient routes and {@link decryptPorterArchive} read it
+ * read-only. {@link getPorterRecipient} (generate-on-first-call) remains for
+ * tests, and `web/porterExposure.test.ts` keeps both generating calls out of
+ * every other module.
  */
 export type PorterAgeKeys = {
   recipient: string;
@@ -97,6 +105,51 @@ async function getOrCreatePorterAgeKeys(
 }
 
 /**
+ * The persisted keypair, or `null` when either half is missing — a recipient
+ * with no identity behind it would publish a key nothing can decrypt (see
+ * {@link inflight}). Never writes.
+ */
+async function readPorterAgeKeys(
+  settingsFile: string
+): Promise<PorterAgeKeys | null> {
+  const settings = await readSettingsOrThrow(settingsFile);
+  const keys = settings.porterAgeKeys;
+  if (keys?.recipient && keys?.identity) {
+    return { recipient: keys.recipient, identity: keys.identity };
+  }
+  return null;
+}
+
+/**
+ * The instance's PUBLIC `age1…` recipient, or `null` when no keypair exists.
+ * Read-only: the recipient routes use this so no request writes
+ * `settings.json` (#5170).
+ */
+export async function readPorterRecipient(
+  settingsFile: string
+): Promise<string | null> {
+  const keys = await readPorterAgeKeys(settingsFile);
+  return keys?.recipient ?? null;
+}
+
+/**
+ * Generate the keypair if it is missing (#5170). Policy-free — the caller
+ * decides whether Porter is exposed. Reads the file back after generating and
+ * throws when the pair did not persist (another process's settings write can
+ * drop it), so a loss is reported rather than silent. Returns a status only.
+ */
+export async function ensurePorterAgeKeys(
+  settingsFile: string
+): Promise<"present" | "generated"> {
+  if (await readPorterAgeKeys(settingsFile)) return "present";
+  await getOrCreatePorterAgeKeys(settingsFile);
+  if (!(await readPorterAgeKeys(settingsFile))) {
+    throw new Error("The Porter keypair did not persist to settings.json");
+  }
+  return "generated";
+}
+
+/**
  * The instance's PUBLIC `age1…` recipient key (R2). Generates the keypair on
  * first call (see {@link getOrCreatePorterAgeKeys}) and returns ONLY the public
  * half — the secret identity is never exposed through this accessor. Sub C
@@ -128,12 +181,21 @@ export async function getPorterRecipient(
  * `docs/internal/architecture/config-porter-encryption.md`). No model
  * participates in this server-side decrypt — which is exactly why D2 uses a
  * pure-JS age implementation here rather than shelling out to the `age` binary.
+ *
+ * #5170: reads the keypair read-only. Generating one here could never decrypt
+ * anything (nothing was encrypted to a key that did not exist) and was a
+ * `settings.json` write reachable from the public upload leg.
  */
 export async function decryptPorterArchive(
   settingsFile: string,
   ciphertext: Uint8Array
 ): Promise<Uint8Array> {
-  const keys = await getOrCreatePorterAgeKeys(settingsFile);
+  const keys = await readPorterAgeKeys(settingsFile);
+  if (!keys) {
+    throw new Error(
+      "This instance has no Configuration Porter key; restart the server to generate it."
+    );
+  }
   const decrypter = new Decrypter();
   decrypter.addIdentity(keys.identity);
   return decrypter.decrypt(ciphertext, "uint8array");

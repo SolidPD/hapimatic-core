@@ -102,7 +102,9 @@ import {
 import { SelectModeChipRow } from "@/components/SessionList/SelectModeChipRow";
 import { useSelectMode } from "@/components/SessionList/useSelectMode";
 import {
+  applyScheduleSearchFilter,
   applySessionSearchFilter,
+  heartbeatMatchesSearch,
   makeSessionComparator,
 } from "@/lib/sessionSearchFilterSort";
 import { useSearchFilterPreferences } from "@/hooks/useSearchFilterPreferences";
@@ -285,6 +287,29 @@ function SessionsPage() {
         resolvedNodeAccounts
       ),
     [sessions, searchFilterPrefs, resolvedNodeAccounts]
+  );
+
+  // The search text also narrows what rides UNDER the project headers: the
+  // schedule rows (kept when the schedule itself or one of its nested scheduled
+  // peers matched), the heartbeat row, and — via `visibleSessionIds` — which
+  // scheduled peers nest under a kept schedule. Before this, hub-local schedules
+  // attached for ANY query (unmatched ones synthesized their own project group),
+  // so searching for an emoji returned the schedulers instead of the sessions
+  // carrying it.
+  const filteredSchedules = useMemo(
+    () =>
+      applyScheduleSearchFilter(schedules, searchFilterPrefs, filteredSessions),
+    [schedules, searchFilterPrefs, filteredSessions]
+  );
+  const visibleHeartbeatConfig = heartbeatMatchesSearch(
+    heartbeatConfig,
+    searchFilterPrefs
+  )
+    ? heartbeatConfig
+    : null;
+  const visibleSessionIds = useMemo(
+    () => new Set(filteredSessions.map(s => s.id)),
+    [filteredSessions]
   );
 
   // Distinct nodes present in the (unfiltered) session list — feeds the Node
@@ -765,8 +790,9 @@ function SessionsPage() {
                 selectMode={selectMode}
                 selectedIds={selectedIds}
                 onToggleSelect={toggleSelect}
-                schedules={schedules}
-                heartbeatConfig={heartbeatConfig}
+                schedules={filteredSchedules}
+                heartbeatConfig={visibleHeartbeatConfig}
+                visibleSessionIds={visibleSessionIds}
                 heartbeatStatus={heartbeatStatus}
                 filterView={filterView}
                 onEditSchedule={handleEditSchedule}
@@ -831,8 +857,9 @@ function SessionsPage() {
                     selectMode={selectMode}
                     selectedIds={selectedIds}
                     onToggleSelect={toggleSelect}
-                    schedules={schedules}
-                    heartbeatConfig={heartbeatConfig}
+                    schedules={filteredSchedules}
+                    heartbeatConfig={visibleHeartbeatConfig}
+                    visibleSessionIds={visibleSessionIds}
                     heartbeatStatus={heartbeatStatus}
                     filterView={filterView}
                     onEditSchedule={handleEditSchedule}

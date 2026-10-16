@@ -38,6 +38,7 @@ import { ThreadFullscreenProvider } from "@/lib/thread-fullscreen-context";
 import { ToastProvider, useToast } from "@/components/Toast";
 import { ApiErrorToastListener } from "@/components/ApiErrorToastListener";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
+import { OnboardingHost } from "@/components/onboarding/OnboardingHost";
 import { useSplitViewContext } from "@/lib/split-view-context";
 import useDensity from "@/hooks/useDensity";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -660,6 +661,10 @@ export function App() {
           </ThreadFullscreenProvider>
           <InstallPrompt />
           <SettingsDrawer />
+          {/* #3865: the in-app first-run tour — one app-level host (auto-present
+              over /sessions while the node-local state is pending; Settings
+              re-entry via the hapi:onboarding-open window event). */}
+          <OnboardingHost />
         </ExtensionHostProvider>
       </AppContextProvider>
     </ToastProvider>

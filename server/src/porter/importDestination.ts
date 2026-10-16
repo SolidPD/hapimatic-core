@@ -93,7 +93,7 @@ export function assertSameFilesystem(
   }
 }
 
-/** Subtrees under `dataDir` that `sweepExpiredPorterDirs` reaps on a 30-min TTL (RC-6). */
+/** Subtrees under `dataDir` that `sweepExpiredPorterDirs` reaps (30-min TTL + 5-min grace, #5170) (RC-6). */
 const REAPED_SUBTREES = ["porter-staging", "porter-backup"] as const;
 
 /** The slice of `PlanImportOptions` that governs destination resolution. */

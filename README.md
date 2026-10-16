@@ -4,16 +4,16 @@
 
 # Hapimatic
 
-**Reach and resume your AI coding-agent sessions from any browser or phone,<br/>served from a machine you own**
+**Reach and resume your AI coding-agent sessions from any browser or phone, served from a machine you&nbsp;own**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-5ae6ab?style=flat-square)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/SolidPD/hapimatic-core?style=flat-square&color=5ae6ab)](https://github.com/SolidPD/hapimatic-core/releases/latest)
-![Runtime](https://img.shields.io/badge/runtime-Bun-black?style=flat-square&logo=bun)
-![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square&logo=typescript&logoColor=white)
-![React](https://img.shields.io/badge/React-19-61dafb?style=flat-square&logo=react&logoColor=black)
-![Platform](<https://img.shields.io/badge/platform-64--bit%20Linux%20(x86--64%20%C2%B7%20ARM64)-2c2c2e?style=flat-square>)
+![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-black?style=flat-square&logo=bun)
+![TypeScript: strict](https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square&logo=typescript&logoColor=white)
+![React 19](https://img.shields.io/badge/React-19-61dafb?style=flat-square&logo=react&logoColor=black)
+![Platform: 64-bit Linux (x86-64 and ARM64)](<https://img.shields.io/badge/platform-64--bit%20Linux%20(x86--64%20%C2%B7%20ARM64)-2c2c2e?style=flat-square>)
 
-[Website](https://hapimatic.com) · [Docs](https://hapimatic.com/docs/) · [Install guide](https://hapimatic.com/docs/guide/installation) · [Releases](https://github.com/SolidPD/hapimatic-core/releases)
+[Website](https://hapimatic.com) · [Docs](https://hapimatic.com/docs/) · [Install](https://hapimatic.com/install) · [Install guide](https://hapimatic.com/docs/guide/installation) · [Releases](https://github.com/SolidPD/hapimatic-core/releases)
 
 </div>
 
@@ -32,11 +32,17 @@ Hapimatic, released under the GNU Affero General Public License v3.0.
 
 **Sessions, grouped by project**
 
-<img src="docs/readme-assets/desktop-sessions.png" alt="The session list, with two demo projects and three sessions" width="860" />
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/readme-assets/desktop-sessions-mobile.png" />
+  <img src="docs/readme-assets/desktop-sessions.png" alt="The session list, with two demo projects and three sessions" width="860" />
+</picture>
 
 **A live session, mid-task**
 
-<img src="docs/readme-assets/desktop-chat.png" alt="A session chat showing the agent's messages, tool calls, and edits" width="860" />
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/readme-assets/desktop-chat-mobile.png" />
+  <img src="docs/readme-assets/desktop-chat.png" alt="A session chat showing the agent's messages, tool calls, and edits" width="860" />
+</picture>
 
 **The same session on a phone**
 
@@ -103,11 +109,17 @@ phone, or by Telegram with your own bot.
 ## Architecture
 
 <div align="center">
-<img src="docs/readme-assets/architecture.png" alt="Architecture: the web app and the hapi CLI reach one machine you run, where a single binary holds the server and the daemon, and the daemon starts Claude Code, Codex, Gemini CLI, and OpenCode sessions" width="760" />
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/readme-assets/architecture-mobile.png" />
+  <img src="docs/readme-assets/architecture.png" alt="Architecture: the web app and the hapi CLI reach one machine you run, where a single binary holds the server and the daemon, and the daemon starts Claude Code, Codex, Gemini CLI, and OpenCode sessions" width="760" />
+</picture>
 </div>
 
 <div align="center">
-<img src="docs/readme-assets/session-lifecycle.png" alt="One session in five steps: start it, watch it work, restart the server, walk away, and come back to it" width="760" />
+<picture>
+  <source media="(max-width: 600px)" srcset="docs/readme-assets/session-lifecycle-mobile.png" />
+  <img src="docs/readme-assets/session-lifecycle.png" alt="One session in five steps: start it, watch it work, restart the server, walk away, and come back to it" width="760" />
+</picture>
 </div>
 
 The monorepo has four packages that develop and test independently:
@@ -133,6 +145,10 @@ Hapimatic with one command:
 ```bash
 curl -fsSL https://github.com/SolidPD/hapimatic-core/releases/latest/download/install-hapimatic-v1.sh | bash
 ```
+
+For a step-by-step walkthrough, see [hapimatic.com/install](https://hapimatic.com/install) and the
+[installation guide](https://hapimatic.com/docs/guide/installation). The documentation lives on
+hapimatic.com; this repository does not ship the docs site.
 
 Open a new shell so that `hapi` is on your `PATH`, then start the server:
 
@@ -210,6 +226,21 @@ products and are not part of this repository.
 
 ---
 
+## Acknowledgements
+
+Hapimatic builds on [HAPI](https://hapi.run/), the open-source project by tiann
+([tiann/hapi](https://github.com/tiann/hapi)), which credits [Happy Coder](https://happy.engineering/)
+([slopus/happy](https://github.com/slopus/happy)) as its original project; the `cli` package also
+carries code from Happy's MIT-licensed [happy-cli](https://github.com/slopus/happy-cli). We're grateful
+to the people behind both projects for their work.
+
+Hapimatic is an independent project, with thanks and appreciation to [HAPI](https://hapi.run/) |
+[tiann/hapi](https://github.com/tiann/hapi) and [Happy Coder](https://happy.engineering/) |
+[slopus/happy](https://github.com/slopus/happy), whose work made it possible. It is not officially
+affiliated with tiann/hapi, slopus/happy, or hapi.dev.
+
+---
+
 ## License
 
 Hapimatic is licensed under the **GNU Affero General Public License v3.0**; see [`LICENSE`](LICENSE). It
@@ -221,14 +252,10 @@ attribution is in [`NOTICE`](NOTICE).
 Under AGPL-3.0 §13, the complete, corresponding source for every released build is published here and
 tagged `v<VERSION>` before or with that build.
 
-Hapimatic is an independent project, with thanks and appreciation to [HAPI](https://hapi.run/) |
-[tiann/hapi](https://github.com/tiann/hapi) and [Happy Coder](https://happy.engineering/) |
-[slopus/happy](https://github.com/slopus/happy), whose work made it possible. It is not officially
-affiliated with tiann/hapi, slopus/happy, or hapi.dev.
-
 ## Contributing
 
 Contributions are welcome under a Contributor License Agreement; see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+The CLA-signing process is not live yet, so outside pull requests cannot be merged until it is.
 This repository is a generated export: changes are reviewed here and then integrated into the canonical
 source tree, so they appear in the next release export.
 

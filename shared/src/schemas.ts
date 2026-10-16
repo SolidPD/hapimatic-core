@@ -2967,3 +2967,36 @@ export const AgentTranscriptQuerySchema = z
     { message: "full=1 requires limit=1 and after", path: ["full"] }
   );
 export type AgentTranscriptQuery = z.infer<typeof AgentTranscriptQuerySchema>;
+
+// ── In-app onboarding tour state (node-local, #3865) ─────────────────
+//
+// The progress of the P22 first-run feature tour, persisted in THIS instance's
+// own settings file under the `onboardingState` key (OQ-2: node-local, never the
+// gateway). Steps are stored as IDs, never indexes, so the v2 connector
+// checklist can add steps without changing what a stored value means.
+// `status` is REQUIRED and has no default: `pending` is the one value that opens
+// the tour automatically, and a default would turn every absent or half-written
+// value into it. The patch schema has every key optional and no default, so a
+// `{ lastStep }`-only PUT cannot fabricate a `status`.
+export const ONBOARDING_STEP_IDS = ["t1", "t2", "t3", "t4", "t5"] as const;
+export const OnboardingStepIdSchema = z.enum(ONBOARDING_STEP_IDS);
+export type OnboardingStepId = z.infer<typeof OnboardingStepIdSchema>;
+
+export const OnboardingStatusSchema = z.enum([
+  "pending",
+  "dismissed",
+  "completed",
+]);
+export type OnboardingStatus = z.infer<typeof OnboardingStatusSchema>;
+
+export const OnboardingStateSchema = z.object({
+  status: OnboardingStatusSchema,
+  lastStep: OnboardingStepIdSchema.optional(),
+});
+export type OnboardingState = z.infer<typeof OnboardingStateSchema>;
+
+export const OnboardingStatePatchSchema = z.object({
+  status: OnboardingStatusSchema.optional(),
+  lastStep: OnboardingStepIdSchema.optional(),
+});
+export type OnboardingStatePatch = z.infer<typeof OnboardingStatePatchSchema>;

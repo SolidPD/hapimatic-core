@@ -445,6 +445,20 @@ Collect these surfaces from the config root:
 
 ${portableScope}
 
+Copy each folder you stage whole, with one \`cp -RH\` that names only that
+folder (\`cp -RH "<config root>/skills" skills\`), never a child or a glob of its
+children (\`"<config root>/skills"/*\`): \`-H\` follows every link named on the
+command line, so naming a child would follow a child that is a link into
+whatever it points to. \`-H\` follows the folder itself when it is a link (in an
+account-config folder each of these folders is usually a symbolic link to the
+same-named folder in \`~/.claude\`) and copies a link inside the folder as a
+link, which Step 11 refuses, by name, before anything is written. To leave out
+a path Step 2 excludes, delete it from the staged copy after copying. Never
+copy with \`cp -L\` or \`cp -RL\`: a link inside a folder can point into a
+credential store (\`~/.ssh\`, \`~/.aws\`, \`~/.kube\`), and copying through it
+would put that store in the archive. Leave such a link out and list it in
+\`omissions\` (Step 10).
+
 - \`~/.claude/hooks/\` is collected via the registration walk in Step 4 — **not**
   as a blind directory sweep (a hook file with no \`settings.json\` registration
   is dead and must be reported as an omission, not shipped). The ONLY exception
@@ -743,18 +757,17 @@ ${sectionFolders}
 
   Write it canonically, exactly \`<folder>/<child>\`: no leading \`/\` or \`./\`
   prefix, no trailing \`/\`, and no \`.\` or \`..\` segment anywhere. The
-  destination plans nothing for a \`./\`-prefixed or \`/\`-terminated entry:
-  \`./skills/foo\` or \`skills/foo/\` silently loses that whole entry (a
-  \`hookSupport\` entry is only listed as missing after the import).
+  destination reads a leading \`./\` or a trailing \`/\` as if it were not there
+  (\`./skills/foo\` and \`skills/foo/\` import as \`skills/foo\`), but an entry
+  with an empty, \`.\` or \`..\` part imports nothing and is listed as an omission.
   Give every child its own entry, and never point an entry at its own section's
   folder, at another section's folder, or at a top-level file such as
   \`settings.json\`, \`.claude.json\` or \`CLAUDE.md\`. An entry at the section's
   own folder (e.g. \`skills\`) imports that whole folder as ONE entry, under that
   entry's \`name\`. An entry at another section's folder or at a top-level file
-  imports nothing; it is listed as an omission only when the archive holds files
-  at that path (\`CLAUDE.md\`, or files in another section's folder), so an entry
-  naming \`settings.json\` or \`.claude.json\` (never archived) is dropped without
-  a report (a \`hookSupport\` entry is only listed as missing after the import).
+  imports nothing and is listed as an omission, and so is any entry that no file
+  in the archive matches (an entry naming \`settings.json\` or \`.claude.json\`,
+  which are never archived, is one).
 - \`claudeMd\`: \`{ "path": "CLAUDE.md", "includes": [...] }\` (Step 3) —
   \`includes\` lists only the includes Step 3 packaged, each as
   \`claude-includes/<include>\`; a refused include appears only in \`omissions\`.
@@ -801,9 +814,14 @@ cannot read this directory's physical path (\`pwd -P\`), where
 \`${PORTER_STAGING_MARKER}\` is missing, when \`CLAUDE_CONFIG_DIR\` is not an
 absolute path, or in the config root (however its path is spelled). Otherwise it
 removes any earlier \`config-port.${ARCHIVE_FORMAT}\` (when it cannot, it refuses and
-says the earlier one is still there), and refuses unless \`jq\`, \`find\`,
-\`sed\`, \`sort\` and \`cmp\` are installed and \`manifest.json\` is a single JSON
-object whose \`schemaVersion\` is \`${schemaVersion}\`. Past those checks it
+says the earlier one is still there), and refuses when \`TMPDIR\` is a relative
+path, unless \`jq\`, \`find\`, \`sed\`, \`sort\`, \`cmp\` and \`grep\` are installed,
+unless \`manifest.json\` is a readable file holding a single JSON object whose
+\`schemaVersion\` is \`${schemaVersion}\`, when this user cannot enter the config
+root or read its \`CLAUDE.md\`, and when anything you staged under the listed
+names is a link — a symbolic link (a dangling one too) or a file with a second
+hard link — naming each, because the archive would carry it as a link, which the
+importer does not import. Past those checks it
 re-applies the Step 3 include rule with
 the bash exporter's own code: it builds \`CLAUDE.md\` and \`claude-includes/\` from
 the config root in a temp directory and archives those, so a \`CLAUDE.md\` or
@@ -816,8 +834,8 @@ it rewrites \`settings\` (with those two values normalized), \`settingsScripts\`
 and the settings-script omissions in \`manifest.json\` to match.
 It then builds the gzip-compressed POSIX tar from the top-level names in this
 fixed list that exist — ${promptArchiveMembers} — so no other top-level file in
-the staging directory is archived; every other listed folder carries what you
-staged under it, less every credential-bearing file or folder under the Step 2
+the staging directory is archived; every other listed folder carries the files
+and folders you staged under it, less every credential-bearing file or folder under the Step 2
 folders: the block leaves those out of its own copy (it deletes nothing you
 staged), records each as an omission, and drops any section or
 \`hookSupport\` entry that named one. It assembles those names in one temp
@@ -826,16 +844,16 @@ directory and tars that one directory, then reads the archive back and writes
 name it lists is canonical (no leading \`/\` or \`./\`, no \`//\`, no \`.\` or \`..\`
 segment) and appears once, its \`manifest.json\` is byte for byte the one the block
 wrote, its \`CLAUDE.md\` and \`claude-includes/\` are exactly the ones it built
-from the config root, and its \`${SETTINGS_SCRIPTS_DIR}/\` is exactly the one it
-built. Those are the members the importer reads to choose what it installs as
-\`CLAUDE.md\`, its includes and the scripts, so a \`tar\` that misplaces, adds,
-duplicates or rewrites any of them, as that \`tar\` reads the archive back,
-leaves no archive; every other listed folder carries what you staged,
-unchecked. It clears \`TAR_OPTIONS\` and every other
+from the config root, its \`${SETTINGS_SCRIPTS_DIR}/\` is exactly the one it
+built, and every other listed name holds exactly what you staged (less the
+credential-bearing paths). Those are the members the importer reads to choose
+what it installs, so a \`tar\` that misplaces, adds, drops, duplicates or
+rewrites any of them, as that \`tar\` reads the archive back, leaves no archive.
+It clears \`TAR_OPTIONS\` and every other
 \`TAR_*\` variable, and \`GZIP\`, before it runs \`tar\`.
 Only after the archive is in place does it print its summary
-line, \`${INCLUDE_CHECK_SUMMARY_PREFIX} <n> ${INCLUDE_CHECK_PACKAGED} …\` (its own
-error messages start with \`${INCLUDE_CHECK_SUMMARY_PREFIX}\` too), followed by a
+line, \`${INCLUDE_CHECK_SUMMARY_PREFIX} <n> ${INCLUDE_CHECK_PACKAGED} …\` (each refusal,
+and the line naming a step that failed, starts with \`${INCLUDE_CHECK_SUMMARY_PREFIX}\` too), followed by a
 second line, \`${SETTINGS_SCRIPT_CHECK_SUMMARY_PREFIX} <n> ${SETTINGS_SCRIPT_CHECK_CARRIED} …\`:
 
 \`\`\`sh
@@ -843,8 +861,14 @@ ${includeCheck}
 \`\`\`
 
 If the block exits non-zero, or ends without printing its summary line
-(\`${INCLUDE_CHECK_SUMMARY_PREFIX} <n> ${INCLUDE_CHECK_PACKAGED} …\`), stop and report
-the error — do not build the archive another way. A failed run leaves no archive
+(\`${INCLUDE_CHECK_SUMMARY_PREFIX} <n> ${INCLUDE_CHECK_PACKAGED} …\`), never build the
+archive another way. When its message tells you what to change and to run this
+block again (for a listed folder that is a link, named with no \`/\`: remove the
+link and copy that folder alone with \`cp -RH\`; for a link named with a \`/\`,
+inside a folder: remove it and list it in \`omissions\`, never copying it; write
+\`manifest.json\`; \`cd\` into the staging directory; delete an earlier archive;
+set \`TMPDIR\` to an absolute path), make that change and run the block again;
+otherwise stop and report the error. A failed run leaves no archive
 of its own; only a refusal that changed nothing can leave an earlier one in
 place. Keep the summary line and the
 \`${SETTINGS_SCRIPT_CHECK_SUMMARY_PREFIX}\` line after it, unchanged, for your
@@ -874,7 +898,8 @@ ${exportFragment}
 
 The final \`echo\` prints the archive's absolute path (\`$DEST/$FINAL\`). Tell me
 that path — that is the file the user uploads to the destination instance — and
-the \`${INCLUDE_CHECK_SUMMARY_PREFIX}\` and \`${SETTINGS_SCRIPT_CHECK_SUMMARY_PREFIX}\`
-lines from the block above.
+the two summary lines from the block above: the
+\`${INCLUDE_CHECK_SUMMARY_PREFIX} <n> ${INCLUDE_CHECK_PACKAGED} …\` line and the
+\`${SETTINGS_SCRIPT_CHECK_SUMMARY_PREFIX}\` line after it.
 `;
 }

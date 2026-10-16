@@ -28,6 +28,8 @@ import type {
   TranscriptMessagesResponse,
   TranscriptResumeResponse,
   DaemonCapSource,
+  OnboardingState,
+  OnboardingStatePatch,
 } from "@hapi/protocol/schemas";
 import type { QueuedMessage, SessionView } from "@hapi/protocol/types";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
@@ -3430,6 +3432,21 @@ export class ApiClient {
       "/api/preferences/create-session",
       { method: "PUT", body: JSON.stringify(prefs) }
     );
+  }
+
+  /** #3865: this instance's in-app onboarding-tour state (node-local). */
+  async getOnboardingState(): Promise<OnboardingState> {
+    return await this.request<OnboardingState>("/api/preferences/onboarding");
+  }
+
+  /** #3865: merge a patch into the onboarding-tour state; returns the result. */
+  async setOnboardingState(
+    patch: OnboardingStatePatch
+  ): Promise<OnboardingState> {
+    return await this.request<OnboardingState>("/api/preferences/onboarding", {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    });
   }
 
   /** Bookmarked per-field Create-Session defaults (sibling settings key). */

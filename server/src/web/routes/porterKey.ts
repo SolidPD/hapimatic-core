@@ -7,11 +7,13 @@ import {
   buildExtractionPrompt,
 } from "@hapi/protocol/porter";
 import type { WebAppEnv } from "../middleware/auth";
-import { getPorterRecipient } from "../../config/porterAgeKeys";
+import { readPorterRecipient } from "../../config/porterAgeKeys";
 import { readSettingsOrThrow } from "../../config/settings";
 import { VERSION } from "../../version.generated";
 import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
+import { createRateLimiter } from "../middleware/rateLimit";
+import { clientAddrKey } from "../clientAddress";
 
 /**
  * Config Porter recipient route (issue #2341, epic #2339 Sub B).
@@ -32,7 +34,7 @@ import { cataloged } from "../../capabilities/cataloged";
  * 🔴 SECURITY (R1, R2):
  * - The response carries ONLY the public `age1…` recipient. The secret identity
  *   (`AGE-SECRET-KEY-1…`) is never read here: this route calls
- *   {@link getPorterRecipient}, which returns the public half only. The identity
+ *   {@link readPorterRecipient}, which returns the public half only. The identity
  *   lives exclusively inside `config/porterAgeKeys.ts` and never crosses the
  *   wire. `porterKey.test.ts` asserts the response body contains no
  *   `AGE-SECRET-KEY` substring — a regression guard against a future refactor
@@ -56,6 +58,12 @@ import { cataloged } from "../../capabilities/cataloged";
  * instance-fingerprinting surface (an unauth caller learns the instance runs the
  * porter + its recipient); the exposure is bounded to the recipient, with no
  * listing/enumeration.
+ *
+ * #5170: both routes are READ-ONLY. The keypair is generated before the server
+ * listens (`web/server.ts`, on an exposed instance only), so neither an
+ * anonymous call nor `hapi capabilities audit --probe` writes `settings.json`;
+ * a missing keypair answers 503 `porter_key_unavailable`. The public route is
+ * rate-limited per client ({@link clientAddrKey}).
  *
  * Follows the `createApiKeysRoutes` factory shape (`web/routes/apiKeys.ts`).
  */
@@ -100,6 +108,13 @@ export async function deriveInstanceProvenance(
   return { instanceUrl, instanceLabel };
 }
 
+/** #5170: the body for a recipient read on an instance with no keypair. */
+const KEY_UNAVAILABLE = {
+  error:
+    "The Configuration Porter key is not available. Restart the server to generate it.",
+  code: "porter_key_unavailable",
+} as const;
+
 export function createPorterKeyRoutes(settingsFile: string): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
 
@@ -130,7 +145,8 @@ export function createPorterKeyRoutes(settingsFile: string): Hono<WebAppEnv> {
       })
     ),
     async c => {
-      const recipient = await getPorterRecipient(settingsFile);
+      const recipient = await readPorterRecipient(settingsFile);
+      if (!recipient) return c.json(KEY_UNAVAILABLE, 503);
       const { instanceUrl, instanceLabel } = await deriveInstanceProvenance(
         c,
         settingsFile
@@ -177,9 +193,17 @@ export function createPorterKeyRoutes(settingsFile: string): Hono<WebAppEnv> {
   // Exact-match exempt in middleware/auth.ts. Returns ONLY the public recipient
   // + schema version — NEVER the prompt, NEVER any secret — so a cold extraction
   // session with no JWT can run the recipient consistency check the extraction
-  // prompt instructs. `getPorterRecipient` returns the public half only.
+  // prompt instructs. `readPorterRecipient` returns the public half only.
+  // #5170: limited to 30 per minute per client — count AND window pinned, so an
+  // env change cannot loosen it; the extraction prompt re-fetches it once or twice.
   app.get(
     "/porter/recipient/public",
+    createRateLimiter({
+      name: "porter-recipient-public",
+      limit: 30,
+      windowMs: 60_000,
+      keyFn: clientAddrKey,
+    }),
     cataloged(
       defineCapability({
         id: "porter.get-recipient-public",
@@ -200,7 +224,8 @@ export function createPorterKeyRoutes(settingsFile: string): Hono<WebAppEnv> {
       })
     ),
     async c => {
-      const recipient = await getPorterRecipient(settingsFile);
+      const recipient = await readPorterRecipient(settingsFile);
+      if (!recipient) return c.json(KEY_UNAVAILABLE, 503);
       return c.json({
         recipient,
         schemaVersion: PORTER_SCHEMA_VERSION,

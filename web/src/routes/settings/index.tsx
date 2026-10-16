@@ -26,6 +26,7 @@ import {
   ClipboardList, // Harness Scorecard
   Boxes, // Capabilities (#3752)
   ScrollText, // Transcripts (#3839)
+  Compass, // Getting started (#3865, nested under Preferences)
   type LucideIcon,
 } from "lucide-react";
 import { AccentChip } from "@/components/ui/AccentChip";
@@ -167,6 +168,15 @@ const ADMIN_SECTIONS: SectionGroup[] = [
             icon: ArrowRightLeft,
             to: "/settings/preferences",
             hash: "session-handoff",
+          },
+          {
+            // #3865: the in-app first-run tour's re-entry (NOT the gateway
+            // #onboarding section, which keeps its own anchor).
+            key: "getting-started",
+            label: "Getting started",
+            icon: Compass,
+            to: "/settings/preferences",
+            hash: "getting-started",
           },
         ],
       },

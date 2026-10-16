@@ -32,6 +32,103 @@ export {
   type WorktreeMeta,
 };
 
+// Issue #4058 (decision D1 = B): the git timeout getters and the GIT_* env
+// scrub live HERE, and worktree.ts imports them; worktree.ts already imports
+// this module, so this is the direction that adds no import. Each getter reads
+// its env var on every call (never cached at module load), so a daemon's
+// systemd `Environment=` and a test's process.env change both take effect
+// immediately.
+
+// Issue #1327: default 30s ceiling for git operations under runGit.
+// Env-overridable via HAPI_GIT_TIMEOUT_MS. Protects all runGit callers (local
+// ops normally complete in ms, so 30s is generous defense-in-depth). Pattern
+// matches the precedent at cli/src/modules/common/handlers/git.ts:64-99 (the
+// user-facing git RPC handler uses 10s). The spawn-time fetches it once
+// covered (#1320) run under getGitFetchTimeoutMs() since #1557, and the
+// worktree checkout under getWorktreeAddTimeoutMs() since #4058.
+const DEFAULT_GIT_TIMEOUT_MS = 30_000;
+export function getGitTimeoutMs(): number {
+  const raw = process.env.HAPI_GIT_TIMEOUT_MS;
+  if (!raw) return DEFAULT_GIT_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_GIT_TIMEOUT_MS;
+}
+
+// Issue #1557: the non-fatal spawn-time config fetch gets a SHORTER, independent
+// budget than the fatal worktree-op timeout. A slow/hung fetch fails fast to the
+// local-ref fallback (in syncConfigFromMain and createWorktree's fetch-first
+// base) WITHOUT starving the worktree add. Default 8s is under the 30s generic
+// budget yet above a typical incremental fetch; env-overridable via
+// HAPI_GIT_FETCH_TIMEOUT_MS.
+const DEFAULT_GIT_FETCH_TIMEOUT_MS = 8_000;
+export function getGitFetchTimeoutMs(): number {
+  const raw = process.env.HAPI_GIT_FETCH_TIMEOUT_MS;
+  if (!raw) return DEFAULT_GIT_FETCH_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_GIT_FETCH_TIMEOUT_MS;
+}
+
+// Issue #4058: the worktree CHECKOUT (phase 2 of createWorktree's two-phase
+// add, `git reset --hard` in the new worktree) gets its own, larger budget. It
+// writes every tracked file, so it is the one git call whose cost scales with
+// the repo: a full checkout of hapimatic-private took 74s at load 37 on RP1
+// against the 30s generic default. 180s (operator ruling, 2026-09-27) is about
+// 2.4x that worst observation. Env-overridable via
+// HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS. It is never below HAPI_GIT_TIMEOUT_MS when
+// that is set, so an instance that raised the generic budget (prod runs
+// HAPI_GIT_TIMEOUT_MS=60000) never gets a SHORTER checkout budget than before.
+// Note: a budget above about 60s lets the server's 75s spawn RPC give up before
+// the daemon finishes (the #2862 timeout-after-success class, #4000).
+const DEFAULT_GIT_WORKTREE_ADD_TIMEOUT_MS = 180_000;
+export function getWorktreeAddTimeoutMs(): number {
+  const raw = process.env.HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS;
+  const parsed = raw ? Number(raw) : Number.NaN;
+  const knob =
+    Number.isFinite(parsed) && parsed > 0
+      ? parsed
+      : DEFAULT_GIT_WORKTREE_ADD_TIMEOUT_MS;
+  return process.env.HAPI_GIT_TIMEOUT_MS
+    ? Math.max(knob, getGitTimeoutMs())
+    : knob;
+}
+
+// Issue #1435: defense-in-depth scrub of inherited GIT_* env vars before
+// invoking git. Mirrors the issue #283 SESSION_ENV_VARS_TO_STRIP pattern at
+// run.ts:230-240. If any GIT_* var leaks into the daemon's process.env (from
+// a parent shell, a systemd drop-in, or a future caller that sets one for a
+// local operation), it would override git's normal repo discovery — producing
+// symptoms like `fatal: not a valid object name: 'HEAD'` against a target
+// repo whose HEAD demonstrably resolves from a shell.
+//
+// Allow-list extension: if a future workflow legitimately needs to pass a
+// GIT_* var through (e.g. GIT_SSH_COMMAND for federation node SSH keys), add
+// it to the allow-list below — do NOT widen by removing entries from the
+// strip list, as that would re-open the bug class.
+export const GIT_ENV_VARS_TO_STRIP = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_NAMESPACE",
+  "GIT_CONFIG",
+  "GIT_CONFIG_PARAMETERS",
+] as const;
+
+export function buildScrubbedGitEnv(): NodeJS.ProcessEnv {
+  const scrubbed: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of GIT_ENV_VARS_TO_STRIP) {
+    delete scrubbed[key];
+  }
+  return scrubbed;
+}
+
 export type WriteWorktreeMetaOptions = {
   worktreePath: string;
   repoRoot: string;
@@ -173,11 +270,14 @@ export async function claimWorktreePort(
 // dominant claim through the already-serialized bash deploy path).
 const PORT_CLAIM_LOCK_PATH = "/tmp/hapimatic-wt-claim-ts.lock";
 
-// staleTimeoutMs MUST exceed the `git worktree add` budget inside the critical
-// section (HAPI_GIT_TIMEOUT_MS, default 30_000 — see worktree.ts) or a
-// concurrent waiter would reap the live lock mid-create and reopen the TOCTOU.
-// 60_000 leaves a 2x margin. Exported so the test suite can assert the
-// ">= git budget" invariant without a multi-second behavioral test.
+// Stale = no heartbeat for 60s (#4502). The critical section can legitimately
+// run longer than this window: since #4058 it holds the worktree checkout,
+// whose budget is getWorktreeAddTimeoutMs() (default 180s). Epic #4402 ruled
+// D-4402-1 = A: the window stays at 60s because withFileLock's heartbeat
+// (#4502; every staleTimeoutMs / 3, so 20s here — withPortClaimLock sets no
+// heartbeatMs) keeps a LIVE holder's lock fresh. The window only decides how
+// long a DEAD holder (a daemon SIGKILLed mid-create) locks the next
+// claimPort:true spawn out. Exported so the test suite can pin the value.
 export const PORT_CLAIM_STALE_TIMEOUT_MS = 60_000;
 
 /**
@@ -190,9 +290,12 @@ export const PORT_CLAIM_STALE_TIMEOUT_MS = 60_000;
  * unit-testable) a testable seam. `opts` overrides the production defaults
  * (lock path, attempts, intervals, stale window) for TESTS ONLY; production
  * callers pass `fn` alone. Default acquire window = maxAttempts*retryIntervalMs
- * = 350*100 = 35s, slightly above the 30s git budget so a legitimate waiter does
- * not time out while the holder finishes a worst-case `git worktree add`. Models
- * the precedent at worktree.ts (`tearDownWorktreeInstance`, a per-port
+ * = 350*100 = 35s. A holder running a long checkout (budget
+ * getWorktreeAddTimeoutMs(), default 180s, #4058) can outlast it, so a
+ * concurrent claimPort:true spawn then fails after that 35s window with the
+ * "retry shortly" message; nothing retries it automatically. claimPort
+ * defaults to false (#1683). Models the
+ * precedent at worktree.ts (`tearDownWorktreeInstance`, a per-port
  * withFileLock around a slow critical section).
  */
 export async function withPortClaimLock<T>(

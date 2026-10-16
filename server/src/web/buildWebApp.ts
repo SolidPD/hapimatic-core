@@ -134,6 +134,7 @@ import { createConflictCheckRoutes } from "./routes/conflictCheck";
 import { liveSessionIdSet } from "../store/fileClaimLifecycle";
 import { createErrorLogRoutes } from "./routes/errorLogs";
 import { createPreferencesRoutes } from "./routes/preferences";
+import { createOnboardingPreferenceRoutes } from "./routes/onboardingPreference";
 import { createClaudeModelsRoutes } from "./routes/claudeModels";
 import { createOutputStylesRoutes } from "./routes/outputStyles";
 import { createHarnessManifestsRoutes } from "./routes/harnessManifests";
@@ -159,6 +160,7 @@ import {
 import { createPorterInstalledRoutes } from "./routes/porterInstalled";
 import { mountPorterOnelinerRoutes } from "./routes/porterOneliner";
 import { createPorterTokenStore } from "../porter/porterToken";
+import { createPorterStagingSweeper } from "../porter/porterStagingSweeper";
 import { createOpenRouterRoutes } from "./routes/openrouter";
 import {
   createTelemetryRoutes,
@@ -1263,6 +1265,12 @@ export function buildWebApp(options: {
       getSseManager: options.getSseManager,
     })
   );
+  // Issue #3865: node-local in-app onboarding tour state (its own file —
+  // preferences.ts is at its line ceiling). After the JWT gate, like its sibling.
+  app.route(
+    "/api",
+    createOnboardingPreferenceRoutes(configuration.settingsFile)
+  );
   // Issue #2456: live Claude model catalog (authed).
   app.route("/api", createClaudeModelsRoutes(claudeModelCatalog));
   // Issue #3121 (epic #3117 Sub-Issue E): harness capability-manifest catalog for
@@ -1321,6 +1329,15 @@ export function buildWebApp(options: {
   const porterPlanStore: PlanStore = new Map();
   const porterLastImport: PorterLastImportBox = { current: null };
   const porterTokenStore = createPorterTokenStore();
+  // #5170: ONE staging sweeper over the shared plan store — plan expiry first,
+  // then staging/backup dirs after a grace — on an unref'd 5-minute timer that
+  // sweeps only while Porter is exposed, so an uncommitted upload is reaped
+  // without any further request. The plan route and upload leg also kick it.
+  const porterStagingSweeper = createPorterStagingSweeper({
+    dataDir: configuration.dataDir,
+    planStore: porterPlanStore,
+    intervalMs: 5 * 60 * 1000,
+  });
   app.route(
     "/api",
     createPorterImportRoutes({
@@ -1329,6 +1346,7 @@ export function buildWebApp(options: {
       errorLogger: options.errorLogger,
       planStore: porterPlanStore,
       lastImport: porterLastImport,
+      stagingSweeper: porterStagingSweeper,
     })
   );
   app.route(
@@ -1340,6 +1358,7 @@ export function buildWebApp(options: {
   mountPorterOnelinerRoutes(app, {
     tokenStore: porterTokenStore,
     planStore: porterPlanStore,
+    stagingSweeper: porterStagingSweeper,
     settingsFile: configuration.settingsFile,
     dataDir: configuration.dataDir,
     errorLogger: options.errorLogger,

@@ -13,10 +13,33 @@ import { LOCAL_NODE_ID } from "@hapi/protocol";
 import type { SessionSummary } from "@hapi/protocol";
 import type { SearchFilterPreferences } from "@hapi/protocol/schemas";
 import { isClaudeFlavor } from "@/hooks/queries/useSessionAccountEmail";
+import type { HeartbeatConfig, ScheduledTask } from "@/types/api";
 
 /** Stable empty resolved-account map so the default 2-arg call keeps a stable
  *  identity (avoids re-running the memoized filter on every render). */
 const EMPTY_RESOLVED: ReadonlyMap<string, string | undefined> = new Map();
+
+/**
+ * Normalize one side of a search comparison: case-fold, and drop U+FE0F
+ * (VARIATION SELECTOR-16). An emoji picker may store "☀️" (with the selector)
+ * while a keyboard types "☀" (without it), or the reverse; the selector carries
+ * no meaning for matching, so stripping it on BOTH sides makes an emoji typed
+ * into the search box find the session that carries it. Other sequence
+ * joiners (U+200D) are kept: "👨‍💻" must not match a bare "👨".
+ */
+export function normalizeSearchText(value: string): string {
+  return value.toLowerCase().replace(/️/g, "");
+}
+
+/** True when any string in `haystacks` contains the (already normalized) query. */
+function anyIncludes(
+  haystacks: ReadonlyArray<string | null | undefined>,
+  query: string
+): boolean {
+  return haystacks.some(
+    v => typeof v === "string" && normalizeSearchText(v).includes(query)
+  );
+}
 
 /**
  * Classify a session into its bound-account bucket for the Account filter
@@ -63,8 +86,12 @@ export function classifyAccount(
  * Filter a flat session list by the active search text + filter selections.
  *
  * - Search is a case-insensitive substring match across session name, linked
- *   issue title, branch label, project path, and session tag (OR logic — any
- *   field matching keeps the session).
+ *   issue title, branch label, project path, session tag, and the session's
+ *   emoji (OR logic — any field matching keeps the session). The emoji field
+ *   is what makes "drop the emoji into the search box" work: an operator marks
+ *   sessions with an emoji as a status note, then types that emoji to find
+ *   them. Comparison goes through `normalizeSearchText` (variation-selector
+ *   insensitive) on both sides.
  * - Each filter category narrows conjunctively (AND across categories). A
  *   category set to "all" is a no-op.
  *
@@ -81,21 +108,22 @@ export function applySessionSearchFilter(
   prefs: SearchFilterPreferences,
   resolvedNodeAccounts: ReadonlyMap<string, string | undefined> = EMPTY_RESOLVED
 ): SessionSummary[] {
-  const query = prefs.searchText.trim().toLowerCase();
+  const query = normalizeSearchText(prefs.searchText.trim());
   const f = prefs.filters;
 
   return sessions.filter(s => {
     // Search (OR across fields)
     if (query) {
-      const haystacks = [
-        s.metadata?.name,
-        s.linkedIssue?.title,
-        s.branchLabel,
-        s.metadata?.path,
-        s.tag,
-      ];
-      const matches = haystacks.some(
-        v => typeof v === "string" && v.toLowerCase().includes(query)
+      const matches = anyIncludes(
+        [
+          s.metadata?.name,
+          s.linkedIssue?.title,
+          s.branchLabel,
+          s.metadata?.path,
+          s.tag,
+          s.emoji,
+        ],
+        query
       );
       if (!matches) return false;
     }
@@ -152,6 +180,75 @@ export function applySessionSearchFilter(
 
     return true;
   });
+}
+
+/** The scheduler-spawned session's schedule id, or undefined for any other session. */
+function nestedScheduleId(s: SessionSummary): string | undefined {
+  const sid = s.metadata?.scheduleId;
+  return s.metadata?.source === "scheduler" && sid ? sid : undefined;
+}
+
+/**
+ * Narrow the schedule rows that ride under the project headers by the active
+ * search text. A schedule stays when the query matches its own name, emoji,
+ * project directory, or cron expression, OR when one of `matchedSessions` (the
+ * sessions that already passed `applySessionSearchFilter`) is a scheduled peer
+ * nested under it — so an emoji typed to find a scheduled peer still reaches
+ * that peer's row. The prompt text is deliberately NOT searched (sessions do
+ * not search theirs either, and a long prompt would match almost any word).
+ *
+ * With no query the input array is returned as-is (same identity), so the
+ * list's memoized grouping is undisturbed. Before this filter existed every
+ * hub-local schedule attached to the list regardless of the query — unmatched
+ * ones even spawned a synthetic project group — so any search surfaced the
+ * schedulers instead of the sessions it matched.
+ */
+export function applyScheduleSearchFilter(
+  schedules: ScheduledTask[] | undefined,
+  prefs: SearchFilterPreferences,
+  matchedSessions: ReadonlyArray<SessionSummary>
+): ScheduledTask[] {
+  const list = schedules ?? [];
+  const query = normalizeSearchText(prefs.searchText.trim());
+  if (!query) return list;
+  const nestedIds = new Set<string>();
+  for (const s of matchedSessions) {
+    const sid = nestedScheduleId(s);
+    if (sid) nestedIds.add(sid);
+  }
+  return list.filter(
+    t =>
+      nestedIds.has(t.id) ||
+      anyIncludes(
+        [t.name, t.emoji, t.projectDirectory, t.cronExpression],
+        query
+      )
+  );
+}
+
+/**
+ * Whether the heartbeat row should render under the active search text: with
+ * no query always (when a config exists); with a query only when it matches
+ * the literal word "heartbeat" or the heartbeat's session name, emoji, or
+ * directory. Same motivation as `applyScheduleSearchFilter` — the heartbeat
+ * row used to attach (and synthesize its project group) for any query.
+ */
+export function heartbeatMatchesSearch(
+  config: HeartbeatConfig | null | undefined,
+  prefs: SearchFilterPreferences
+): boolean {
+  if (!config) return false;
+  const query = normalizeSearchText(prefs.searchText.trim());
+  if (!query) return true;
+  return anyIncludes(
+    [
+      "heartbeat",
+      config.sessionName,
+      config.sessionEmoji,
+      config.sessionDirectory,
+    ],
+    query
+  );
 }
 
 /**

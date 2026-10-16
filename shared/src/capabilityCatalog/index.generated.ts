@@ -10884,6 +10884,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Read this instance's in-app onboarding tour state (pending, dismissed or completed, plus the last step reached).",
+    "domain": "ui",
+    "id": "ui.onboarding-preference",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/preferences/onboarding"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the web app decides whether to present the first-run tour, or which label the Settings entry shows."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "A session's Claude PTY (terminal-launcher) view.",
     "domain": "ui",
     "id": "ui.session-claude-pty",
@@ -11011,6 +11031,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To point a human at the full sessions list."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Record progress through this instance's in-app onboarding tour (the step reached, a dismissal, or completion).",
+    "domain": "ui",
+    "id": "ui.set-onboarding-preference",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/preferences/onboarding"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user advances, skips or finishes the first-run tour."
   },
   {
     "auth": "jwt",

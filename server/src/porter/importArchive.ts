@@ -510,7 +510,7 @@ interface PluginExecOptions {
   secretResolutionEnv?: Record<string, string | undefined>;
 }
 
-const DEFAULT_TTL_MS = 30 * 60 * 1000;
+export const PORTER_STAGING_TTL_MS = 30 * 60 * 1000; // an uncommitted plan's lifetime
 /* ── Helpers — destination resolvers moved to ./importDestination (#2806, #2077 max-lines) ── */
 
 /** Shell-quote an interpolated field for the F12 remediation command list. */
@@ -946,7 +946,7 @@ export async function planImport(
       pluginRemediation,
       pluginDescriptorPresent: Boolean(manifest.plugins),
       createdAt: now,
-      ttlMs: opts.ttlMs ?? DEFAULT_TTL_MS,
+      ttlMs: opts.ttlMs ?? PORTER_STAGING_TTL_MS,
     };
     return plan;
   } catch (err) {
@@ -1464,13 +1464,15 @@ async function mergeSettings(
 /* ── TTL sweep (Task 6) ── */
 
 /**
- * Remove staging/backup dirs older than `ttlMs`. Called by the plan endpoint so
- * an abandoned plan (never committed) does not accumulate. Best-effort.
+ * Remove staging/backup dirs older than `ttlMs`. Called by the staging sweeper
+ * (`./porterStagingSweeper`) so an abandoned plan does not accumulate. Best-effort.
+ * Names in `keep` (live plans' staging handles, #5170) are never removed.
  */
 export async function sweepExpiredPorterDirs(
   dataDir: string,
-  ttlMs: number = DEFAULT_TTL_MS,
-  now: number = Date.now()
+  ttlMs: number = PORTER_STAGING_TTL_MS,
+  now: number = Date.now(),
+  keep: ReadonlySet<string> = new Set()
 ): Promise<void> {
   const { readdir, stat } = await import("node:fs/promises");
   for (const sub of ["porter-staging", "porter-backup"]) {
@@ -1482,6 +1484,7 @@ export async function sweepExpiredPorterDirs(
       continue;
     }
     for (const name of entries) {
+      if (keep.has(name)) continue;
       const p = join(base, name);
       try {
         const s = await stat(p);

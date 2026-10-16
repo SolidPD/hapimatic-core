@@ -24,6 +24,13 @@ export type NodeRegistryOptions = {
    * that construct a NodeRegistry without claim-sync still compile.
    */
   fileClaimSync?: FileClaimSync | null;
+  /**
+   * Inactivity ceiling for one SSE event-bridge stream, in ms (default
+   * `EVENT_BRIDGE_IDLE_TIMEOUT_MS`, 90 s = three remote heartbeat periods).
+   * A connect or read that makes no progress for this long is treated as a
+   * dead stream and reconnected. Tests lower it to exercise the watchdog.
+   */
+  eventBridgeIdleTimeoutMs?: number;
 };
 
 export type CachedRemoteSessions = {

@@ -95,6 +95,18 @@ export const EVICTION_THRESHOLD = 10;
 const EVENT_BRIDGE_BACKOFF = [1000, 2000, 4000, 8000, 16000, 30000];
 
 /**
+ * Inactivity ceiling for one event-bridge stream (ms). The remote
+ * `/api/federation/events` route writes a `: heartbeat` comment every 30 s
+ * (`web/routes/federation/events.ts`), so a connect or a read that makes no
+ * progress for three heartbeat periods is a dead stream — a NAT / proxy idle
+ * drop, a half-open TCP, or a fetch that is never answered. None of those
+ * reject on their own (fetch has no read timeout), so without a watchdog the
+ * bridge would sit "connected" while the hub's browsers see nothing for that
+ * node's sessions. Overridable per registry via `eventBridgeIdleTimeoutMs`.
+ */
+export const EVENT_BRIDGE_IDLE_TIMEOUT_MS = 90_000;
+
+/**
  * Backoff delays for poll failures (ms), indexed by (consecutiveFailures - OFFLINE_THRESHOLD).
  * Starts after a node crosses the offline threshold: 60s → 120s → 240s → 300s cap.
  */
@@ -217,6 +229,8 @@ export class NodeRegistry {
   private eventBridgeSseManager: SSEManager | null = null;
   private eventBridgeAbortControllers = new Map<string, AbortController>();
   private eventBridgeReconnectAttempts = new Map<string, number>();
+  /** Inactivity ceiling per bridge stream (see EVENT_BRIDGE_IDLE_TIMEOUT_MS). */
+  private readonly eventBridgeIdleTimeoutMs: number;
 
   /** Per-node poll backoff: skip polling a node until this timestamp. */
   private pollBackoffUntil = new Map<string, number>();
@@ -278,6 +292,8 @@ export class NodeRegistry {
     this.peerStore = options.peerStore ?? null;
     this.evictionThreshold = options.evictionThreshold ?? EVICTION_THRESHOLD;
     this.fileClaimSync = options.fileClaimSync ?? null;
+    this.eventBridgeIdleTimeoutMs =
+      options.eventBridgeIdleTimeoutMs ?? EVENT_BRIDGE_IDLE_TIMEOUT_MS;
 
     // Filter out self from the static nodes list to prevent self-polling.
     // In P2P mode a peer's config may include itself in the nodes array.
@@ -523,16 +539,49 @@ export class NodeRegistry {
       headers["Authorization"] = `Bearer ${this.apiToken}`;
     }
 
+    // Inactivity watchdog (see EVENT_BRIDGE_IDLE_TIMEOUT_MS). `attempt` is this
+    // run's own controller: the parent `signal` (a newer connect, eviction,
+    // stop) aborts it too, while the watchdog aborts ONLY it, so a tripped
+    // watchdog is distinguishable from a supersede and leads to a reconnect.
+    const attempt = new AbortController();
+    const onParentAbort = () => attempt.abort();
+    signal.addEventListener("abort", onParentAbort, { once: true });
+    if (signal.aborted) attempt.abort();
+    let idleTripped = false;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    // The watchdog only needs cancel(); the loop reads from the typed reader.
+    let reader: { cancel(): Promise<void> } | null = null;
+    const armIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimer = null;
+        idleTripped = true;
+        attempt.abort();
+        // A pending body read does not reliably reject when the fetch signal
+        // aborts; cancelling the reader resolves it with `done`.
+        void reader?.cancel().catch(() => {});
+      }, this.eventBridgeIdleTimeoutMs);
+    };
+    const disarmIdle = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+    const idleMessage = `[Federation] Event bridge: no data from ${nodeConfig.id} for ${this.eventBridgeIdleTimeoutMs}ms, reconnecting`;
+
     try {
-      const resp = await fetch(url, { headers, signal });
+      armIdle();
+      const resp = await fetch(url, { headers, signal: attempt.signal });
 
       if (signal.aborted) return;
 
       if (!resp.ok || !resp.body) {
+        disarmIdle();
         console.warn(
           `[Federation] Event bridge: ${nodeConfig.id} returned ${resp.status}`
         );
-        this.scheduleEventBridgeReconnect(nodeConfig);
+        this.scheduleEventBridgeReconnect(nodeConfig, signal);
         return;
       }
 
@@ -542,13 +591,15 @@ export class NodeRegistry {
         `[Federation] Event bridge connected to ${nodeConfig.id} (${nodeConfig.label})`
       );
 
-      const reader = resp.body.getReader();
+      const bodyReader = resp.body.getReader();
+      reader = bodyReader;
       const decoder = new TextDecoder();
       let buffer = "";
 
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await bodyReader.read();
         if (done || signal.aborted) break;
+        armIdle();
 
         buffer += decoder.decode(value, { stream: true });
 
@@ -601,32 +652,75 @@ export class NodeRegistry {
         }
       }
 
-      // Stream ended normally — reconnect
-      if (!signal.aborted) {
+      disarmIdle();
+      if (signal.aborted) return;
+
+      // Stream ended (or the watchdog cancelled it) — reconnect
+      if (idleTripped) {
+        console.warn(idleMessage);
+      } else {
         console.log(
           `[Federation] Event bridge: stream ended for ${nodeConfig.id}, reconnecting`
         );
-        this.scheduleEventBridgeReconnect(nodeConfig);
       }
+      this.scheduleEventBridgeReconnect(nodeConfig, signal);
     } catch (err) {
+      disarmIdle();
       if (signal.aborted) return;
+      if (idleTripped) {
+        // The watchdog aborted a connect that was never answered, or a read
+        // that rejected on abort — either way the stream is dead, not superseded.
+        console.warn(idleMessage);
+        this.scheduleEventBridgeReconnect(nodeConfig, signal);
+        return;
+      }
       if (err instanceof Error && err.name === "AbortError") return;
 
       console.warn(
         `[Federation] Event bridge error for ${nodeConfig.id}:`,
         err instanceof Error ? err.message : err
       );
-      this.scheduleEventBridgeReconnect(nodeConfig);
+      this.scheduleEventBridgeReconnect(nodeConfig, signal);
+    } finally {
+      disarmIdle();
+      signal.removeEventListener("abort", onParentAbort);
     }
   }
 
-  private scheduleEventBridgeReconnect(nodeConfig: FederationNodeConfig): void {
+  /**
+   * Schedule the next bridge connect for `nodeConfig`, or suspend while the
+   * node is offline. `ownSignal` is the calling run's signal: only the run that
+   * still owns the node's live controller may act, so a superseded run's late
+   * call never touches the newer bridge.
+   */
+  private scheduleEventBridgeReconnect(
+    nodeConfig: FederationNodeConfig,
+    ownSignal: AbortSignal
+  ): void {
+    const current = this.eventBridgeAbortControllers.get(nodeConfig.id);
+    if (current && current.signal !== ownSignal) return;
+
     // Suspend event bridge reconnection for nodes past the offline threshold.
     // The bridge will be restarted by pollNode() when the node recovers.
     const state = this.nodeStates.get(nodeConfig.id);
     if (state && state.consecutiveFailures >= OFFLINE_THRESHOLD) {
+      // The run that called us has ended, so release its controller entry.
+      // pollNode()'s recovery restart is gated on
+      // `!eventBridgeAbortControllers.has(id)`; leaving the dead run's entry in
+      // place kept that gate shut, so a node that went offline while its
+      // bridge was failing (a peer restarting during a deploy, #5217) never got its
+      // bridge back until this process restarted — the hub then showed no
+      // live updates for that node's sessions.
+      this.eventBridgeAbortControllers.delete(nodeConfig.id);
+      console.log(
+        `[Federation] Event bridge suspended for ${nodeConfig.id} (node offline) — restarts on the next successful poll`
+      );
       return;
     }
+
+    // One pending reconnect per node: a second schedule (e.g. the watchdog and
+    // a read error in the same run) must not double-connect.
+    if (this.eventBridgeReconnectTimers.has(nodeConfig.id)) return;
 
     const attempts = this.eventBridgeReconnectAttempts.get(nodeConfig.id) ?? 0;
     this.eventBridgeReconnectAttempts.set(nodeConfig.id, attempts + 1);
@@ -2160,7 +2254,9 @@ export class NodeRegistry {
 
       // Restart event bridge if it was suspended during offline period.
       // The bridge stops reconnecting when consecutiveFailures >= OFFLINE_THRESHOLD
-      // (see scheduleEventBridgeReconnect), so we restart it here on recovery.
+      // (see scheduleEventBridgeReconnect, which releases the suspended run's
+      // controller entry precisely so this gate can open), so we restart it
+      // here on recovery.
       if (
         this.eventBridgeSseManager &&
         !this.eventBridgeAbortControllers.has(nodeConfig.id)

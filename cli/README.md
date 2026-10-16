@@ -23,7 +23,7 @@ Run Claude Code, Codex, or Gemini sessions from your terminal and control them r
 ### Session commands
 
 - `hapi` - Start a Claude Code session (passes through Claude CLI flags). See `src/index.ts`.
-- `hapi codex` - Start Codex mode. See `src/codex/runCodex.ts`.
+- `hapi codex` - Start Codex mode. See `src/extensions/agent-codex/codex/runCodex.ts`.
 - `hapi gemini` - Start Gemini mode via ACP. See `src/agent/runners/runAgentSession.ts`.
   Note: Gemini runs in remote mode only; it waits for messages from the server UI/Telegram.
 
@@ -57,7 +57,7 @@ See `src/ui/doctor.ts`.
 
 ### Other
 
-- `hapi mcp` - Start MCP stdio bridge. See `src/codex/happyMcpStdioBridge.ts`.
+- `hapi mcp` - Start MCP stdio bridge. See `src/extensions/agent-codex/codex/happyMcpStdioBridge.ts`.
 - `hapi server` - Start the bundled server (single binary workflow).
 
 ## Configuration
@@ -113,7 +113,7 @@ bun run build:single-exe
 
 - `src/api/` - Bot communication (Socket.IO + REST).
 - `src/claude/` - Claude Code integration.
-- `src/codex/` - Codex mode integration.
+- `src/extensions/agent-codex/` - Codex mode integration.
 - `src/agent/` - Multi-agent support (Gemini via ACP).
 - `src/daemon/` - Background service.
 - `src/commands/` - CLI command handlers.

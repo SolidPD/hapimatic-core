@@ -63,6 +63,7 @@ import { tokens } from "@/design/tokens";
 import { ThemePicker } from "@/components/settings/ThemePicker";
 import { NotificationsSection } from "@/components/settings/sections/NotificationsSection";
 import { SessionHandoffSection } from "@/components/settings/sections/SessionHandoffSection";
+import { GettingStartedSection } from "@/components/settings/sections/GettingStartedSection";
 import { OnboardingSection } from "@/components/settings/sections/OnboardingSection";
 import { VoiceInputSection } from "@/components/settings/sections/VoiceInputSection";
 import { useScrollToLocationHash } from "@/hooks/useScrollToLocationHash";
@@ -993,6 +994,13 @@ export default function AdminPreferencesPage() {
             from the composer's "not installed" message) and renders nothing when
             the builtin.voice-input extension is disabled. */}
         <VoiceInputSection api={api} />
+
+        {/* Getting started (#3865) — re-entry to the IN-APP first-run tour
+            (node-local state, every instance). Distinct from the gateway
+            Onboarding section below. Self-contained: owns its own
+            <section id="getting-started">, deep-linked from the drawer's
+            "Getting started" sub-row. */}
+        <GettingStartedSection />
 
         {/* Onboarding (#2711) — "Restart onboarding" re-entry to the gateway
             /setup wizard. Self-contained + ssoEnabled-gated: it owns its own

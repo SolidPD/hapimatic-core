@@ -9,7 +9,6 @@ import {
   planImport,
   commitImport,
   toPlanSummary,
-  sweepExpiredPorterDirs,
   resolveClaudeDir,
   ManifestValidationError,
   SecretDecryptionError,
@@ -35,6 +34,11 @@ import {
   type SecretOverlay,
 } from "../../porter/mcpRebuild";
 import { createRateLimiter } from "../middleware/rateLimit";
+import {
+  createPorterStagingSweeper,
+  isPlanExpired,
+  type PorterStagingSweeper,
+} from "../../porter/porterStagingSweeper";
 import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
 
@@ -339,6 +343,12 @@ export function createPorterImportRoutes(opts: {
    * `isolatedDest` cross-filesystem rejection is deterministic (#3299 Task 3d).
    */
   statDev?: (path: string) => number;
+  /**
+   * #5170: the SHARED staging sweeper (plan expiry + dir reaping, on a timer),
+   * built in `buildWebApp.ts`. Defaults to a timer-less sweeper over this
+   * factory's own plan store, so tests that omit it are unchanged.
+   */
+  stagingSweeper?: PorterStagingSweeper;
 }): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
 
@@ -348,6 +358,9 @@ export function createPorterImportRoutes(opts: {
   // use the injected shared store when present so the one-liner upload leg's
   // handle lands here; otherwise a fresh per-factory Map (test default).
   const planStore = opts.planStore ?? new Map<string, ImportPlan>();
+  const stagingSweeper =
+    opts.stagingSweeper ??
+    createPorterStagingSweeper({ dataDir: opts.dataDir, planStore });
 
   // #3546 (ADR-0006 §Security): the commit route carries recipient secrets in its
   // body (secretOverlay), so rate-limit it like the other secret-bearing mutations
@@ -380,8 +393,9 @@ export function createPorterImportRoutes(opts: {
       })
     ),
     async c => {
-      // Reap abandoned staging/backup dirs opportunistically (Task 6 TTL sweep).
-      sweepExpiredPorterDirs(opts.dataDir).catch(() => {});
+      // Expire stale plans and reap abandoned staging/backup dirs
+      // opportunistically (Task 6 TTL sweep; #5170 shared sweeper).
+      void stagingSweeper.sweep();
 
       let body: Awaited<ReturnType<typeof c.req.parseBody>>;
       try {
@@ -559,7 +573,11 @@ export function createPorterImportRoutes(opts: {
         );
       }
       const plan = planStore.get(parsed.data.stagingHandle);
-      if (!plan) {
+      // #5170: a plan past its own TTL is expired even before the sweeper has
+      // removed it, so no commit can start on it while its staging dir is due
+      // for removal.
+      if (!plan || isPlanExpired(plan, Date.now())) {
+        if (plan) planStore.delete(plan.stagingHandle);
         return c.json(
           { error: "Import plan not found or expired. Re-run the plan step." },
           410
