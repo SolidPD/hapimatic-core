@@ -9,24 +9,23 @@ import {
   FileWarning, // File Conflicts
   Puzzle, // Extensions
   FolderCog, // Configuration (Porter)
-  Gauge, // Account Usage
+  Gauge, // Provider Accounts
   BarChart3, // Analytics
-  History, // Time Log
+  History, // Work Log
   Database, // Session Metadata
   AlertTriangle, // Error Log
   MessageSquare, // Feedback
-  Bell, // Notifications (nested under Preferences)
+  Bell, // Notifications (#4906: its own page)
   Sliders, // Preferences
   Info, // About
   LogOut, // Sign Out
   ChevronDown, // group + parent-row expand/collapse chevron
-  KeyRound, // Keys / API Keys
-  ShieldCheck, // Backup Key
-  ArrowRightLeft, // Session Handoff (nested under Preferences)
+  KeyRound, // Provider API Keys (nested under Provider Accounts)
   ClipboardList, // Harness Scorecard
   Boxes, // Capabilities (#3752)
   ScrollText, // Transcripts (#3839)
   Compass, // Getting started (#3865, nested under Preferences)
+  LifeBuoy, // Help (#4371)
   type LucideIcon,
 } from "lucide-react";
 import { AccentChip } from "@/components/ui/AccentChip";
@@ -40,37 +39,36 @@ import {
   isPorterExposed,
   usePorterStatus,
 } from "@/hooks/queries/usePorterStatus";
-import {
-  useBackupIdentityStatus,
-  isBackupProvisioned,
-} from "@/hooks/queries/useBackupIdentityStatus";
 import { getStorageKey } from "@/lib/storage-keys";
 
 /**
  * SettingsLandingPage — the Settings drawer's landing page (Sub-Issue B, #1036;
- * regrouped by the Settings sidebar reorganization).
+ * regrouped by the Settings sidebar reorganization, then by #4906).
  *
  * Rendered DIRECTLY by SettingsDrawer when the URL has `?drawer=settings` (search-param
  * overlay — no `/settings` landing route, no `<Outlet />`). Presents a vertical list
- * of section rows grouped into TWO categories — USER (things you configure) and
- * SYSTEM (things you observe) — plus a standalone Sign Out footer row below a
- * divider. Each row is a `<button>` (NOT a `<Link>` — the codebase convention is
- * programmatic `useNavigate`) wired to its own route (#1935 promoted every
+ * of section rows grouped into FOUR categories, in the operator's order (#4906) —
+ * USER (things you configure), SYSTEM (this instance and its federation),
+ * OPERATIONS (things you observe and run) and ADMIN (operator-only; rendered only
+ * when the admin-VM capability gate is open) — plus a standalone Sign Out footer row
+ * below a divider. Each row is a `<button>` (NOT a `<Link>` — the codebase convention
+ * is programmatic `useNavigate`) wired to its own route (#1935 promoted every
  * informational section to its own `/settings/*` page); navigating there drops the
  * `?drawer=settings` param, dismissing the drawer.
  *
- * The USER/SYSTEM group headings and the two parent rows with sub-rows —
- * Preferences (Notifications, Session Handoff) and Keys (API Keys, Backup Key)
- * — are collapsible. A parent row is a SPLIT control: clicking the row itself
- * (icon, label, empty space) navigates to the page, while its trailing chevron
- * is a SEPARATE button with its own hit area that only expands/collapses the
- * sub-rows. Rows without sub-pages carry no chevron at all — a chevron here
- * means "expandable", never "navigable". Collapse state defaults to expanded
- * and persists per instance in localStorage (`hapi:settingsMenuCollapse:v1`).
- * The folded pages' contents live as anchored sections on the parent page, and
- * a sub-row navigates to the parent route with a URL hash
+ * The group headings and the two parent rows with sub-rows — Provider Accounts
+ * (Provider API Keys) and Preferences (Getting started) — are collapsible. A parent
+ * row is a SPLIT control: clicking the row itself (icon, label, empty space)
+ * navigates to the page, while its trailing chevron is a SEPARATE button with its
+ * own hit area that only expands/collapses the sub-rows. Rows without sub-pages
+ * carry no chevron at all — a chevron here means "expandable", never "navigable".
+ * Collapse state defaults to expanded and persists per instance in localStorage
+ * (`hapi:settingsMenuCollapse:v2`; the v1 blob of the two-group menu is dropped on
+ * first read, #4906). The folded pages' contents live as anchored sections on the
+ * parent page, and a sub-row navigates to the parent route with a URL hash
  * (`navigate({ to, hash })`) so the page scrolls to that section via
- * `useScrollToLocationHash`.
+ * `useScrollToLocationHash`. Session Handoff and Backup Key are sections on the
+ * Preferences page with no menu row (#4906).
  *
  * The Sign Out row is hidden when `useAppContext().onLogout` is undefined
  * (Telegram mode). On a gateway-onboarded (`ssoEnabled`) instance, confirming
@@ -90,15 +88,16 @@ type AdminRoute =
   | "/settings/session-metadata"
   | "/settings/transcripts"
   | "/settings/preferences"
+  | "/settings/notifications"
   | "/settings/about"
-  | "/settings/keys"
   | "/settings/extensions"
   | "/settings/configuration"
   | "/settings/vms"
   | "/settings/harness-scorecard"
   | "/settings/file-conflicts"
   | "/settings/capabilities"
-  | "/settings/feedback";
+  | "/settings/feedback"
+  | "/settings/help";
 
 type SubRow = {
   key: string;
@@ -128,22 +127,41 @@ type SectionRow = {
 
 type SectionGroup = { heading: string; items: SectionRow[] };
 
+/**
+ * #4906: the operator-only group. It renders only while the admin-VM preflight
+ * gate is open (the VMs row's existing #2470 gate, which #2910 also plans for the
+ * Feedback read surface), so a user-VM instance never advertises it.
+ */
+const ADMIN_GROUP_HEADING = "ADMIN";
+
 const ADMIN_SECTIONS: SectionGroup[] = [
   {
     heading: "USER",
     items: [
       {
         key: "account-usage",
-        // Epic #3285 round 14: the page manages accounts (add/remove/reorder/
-        // nickname/usage), so it is titled "Accounts"; the route path is unchanged.
-        label: "Accounts",
+        // Epic #3285 round 14 titled the page "Accounts"; #4906 names it for what
+        // it holds, model-provider accounts and keys. The route path is unchanged.
+        label: "Provider Accounts",
         icon: Gauge,
         accent: "var(--accent-cyan)", // #3355 C1 — decorative cyan via the --accent-cyan token
         to: "/settings/account-usage",
+        children: [
+          {
+            // #4906: the provider API-key vault moved here from the Keys page.
+            key: "api-keys",
+            label: "Provider API Keys",
+            icon: KeyRound,
+            to: "/settings/account-usage",
+            hash: "api-keys",
+          },
+        ],
       },
       {
         key: "timelog",
-        label: "Time Log",
+        // #4906: the operator's label. #4428 renames the page and route; until it
+        // lands the route stays /settings/time-log.
+        label: "Work Log",
         icon: History,
         accent: "var(--accent-purple-400)",
         to: "/settings/time-log",
@@ -154,21 +172,10 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         icon: Sliders,
         accent: "var(--accent-teal-400)",
         to: "/settings/preferences",
+        // #4906: Session Handoff and Backup Key are sections on the page with no
+        // menu row. Getting started keeps its row: #3865 keeps the tour's re-entry
+        // in the Settings drawer.
         children: [
-          {
-            key: "notifications",
-            label: "Notifications",
-            icon: Bell,
-            to: "/settings/preferences",
-            hash: "notifications",
-          },
-          {
-            key: "session-handoff",
-            label: "Session Handoff",
-            icon: ArrowRightLeft,
-            to: "/settings/preferences",
-            hash: "session-handoff",
-          },
           {
             // #3865: the in-app first-run tour's re-entry (NOT the gateway
             // #onboarding section, which keeps its own anchor).
@@ -181,34 +188,22 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         ],
       },
       {
-        key: "configuration",
-        label: "Configuration",
-        icon: FolderCog,
-        accent: "var(--accent-teal-200)",
-        to: "/settings/configuration",
+        // #4906: its own page, ready for the #4916 inbox beside the settings.
+        key: "notifications",
+        label: "Notifications",
+        icon: Bell,
+        accent: "var(--accent-amber-400)",
+        to: "/settings/notifications",
       },
       {
-        key: "keys",
-        label: "Keys",
-        icon: KeyRound,
-        accent: "var(--accent-amber-300)",
-        to: "/settings/keys",
-        children: [
-          {
-            key: "api-keys",
-            label: "API Keys",
-            icon: KeyRound,
-            to: "/settings/keys",
-            hash: "api-keys",
-          },
-          {
-            key: "backup-key",
-            label: "Backup Key",
-            icon: ShieldCheck,
-            to: "/settings/keys",
-            hash: "backup-key",
-          },
-        ],
+        // #4371 (operator ruling 4371-D1 = C): the in-app Help page — the
+        // support assistant, the tour, and the human lifeline. The drawer stays
+        // a pure menu (#1935), so the row navigates to its own page.
+        key: "help",
+        label: "Help",
+        icon: LifeBuoy,
+        accent: "var(--accent-sky-400)",
+        to: "/settings/help",
       },
     ],
   },
@@ -223,11 +218,11 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         to: "/settings/federation",
       },
       {
-        key: "vms",
-        label: "VMs",
-        icon: ServerCog,
-        accent: "var(--accent-sky-400)",
-        to: "/settings/vms",
+        key: "configuration",
+        label: "Configuration",
+        icon: FolderCog,
+        accent: "var(--accent-teal-200)",
+        to: "/settings/configuration",
       },
       {
         key: "extensions",
@@ -237,12 +232,17 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         to: "/settings/extensions",
       },
       {
-        key: "system-jobs",
-        label: "System Jobs",
-        icon: CalendarClock,
-        accent: "var(--accent-violet-400)",
-        to: "/settings/system-jobs",
+        key: "about",
+        label: "About",
+        icon: Info,
+        accent: "var(--accent-amber-500)",
+        to: "/settings/about",
       },
+    ],
+  },
+  {
+    heading: "OPERATIONS",
+    items: [
       {
         key: "harness-updates",
         label: "Harness Updates",
@@ -251,13 +251,8 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         to: "/settings/harness-updates",
       },
       {
-        key: "analytics",
-        label: "Analytics",
-        icon: BarChart3,
-        accent: "var(--accent-blue-400)",
-        to: "/settings/analytics",
-      },
-      {
+        // #4906 D1: not in the operator's list; kept beside Harness Updates so a
+        // working page stays reachable from the menu.
         key: "harness-scorecard",
         label: "Harness Scorecard",
         icon: ClipboardList,
@@ -270,6 +265,20 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         icon: Boxes,
         accent: "var(--accent-cyan)",
         to: "/settings/capabilities",
+      },
+      {
+        key: "system-jobs",
+        label: "System Jobs",
+        icon: CalendarClock,
+        accent: "var(--accent-violet-400)",
+        to: "/settings/system-jobs",
+      },
+      {
+        key: "analytics",
+        label: "Analytics",
+        icon: BarChart3,
+        accent: "var(--accent-blue-400)",
+        to: "/settings/analytics",
       },
       {
         key: "file-conflicts",
@@ -299,6 +308,18 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         accent: "var(--accent-rose-400)",
         to: "/error-logs",
       },
+    ],
+  },
+  {
+    heading: ADMIN_GROUP_HEADING,
+    items: [
+      {
+        key: "vms",
+        label: "VMs",
+        icon: ServerCog,
+        accent: "var(--accent-sky-400)",
+        to: "/settings/vms",
+      },
       {
         key: "feedback",
         label: "Feedback",
@@ -306,16 +327,24 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         accent: "var(--accent-pink-400)",
         to: "/settings/feedback",
       },
-      {
-        key: "about",
-        label: "About",
-        icon: Info,
-        accent: "var(--accent-amber-500)",
-        to: "/settings/about",
-      },
     ],
   },
 ];
+
+/**
+ * Every route the menu navigates to (rows and sub-rows), de-duplicated. #4906:
+ * `router.test.tsx` checks each one against the REAL route table, so a row whose
+ * page is not registered (an invisible page, #2344) or is only a redirect fails.
+ */
+export function listSettingsMenuRoutes(): string[] {
+  const routes = ADMIN_SECTIONS.flatMap(group =>
+    group.items.flatMap(item => [
+      item.to,
+      ...(item.children ?? []).map(sub => sub.to),
+    ])
+  );
+  return [...new Set(routes)];
+}
 
 /** Collapsed-state map (true = collapsed) for group headings and parent rows. */
 type CollapseState = {
@@ -323,12 +352,22 @@ type CollapseState = {
   rows: Record<string, boolean>;
 };
 
-const COLLAPSE_STORAGE_KEY = getStorageKey("hapi:settingsMenuCollapse:v1");
+const COLLAPSE_STORAGE_KEY = getStorageKey("hapi:settingsMenuCollapse:v2");
+
+/**
+ * #4906: v1 keyed the two-group menu (USER/SYSTEM, the Keys row). Its entries name
+ * groups and rows that moved or no longer exist, so the blob is dropped rather than
+ * mapped — an existing instance opens with every group expanded.
+ */
+const LEGACY_COLLAPSE_STORAGE_KEY = getStorageKey(
+  "hapi:settingsMenuCollapse:v1"
+);
 
 // Guarded read (themePersistence.ts pattern): a disabled/full store or corrupt
 // blob degrades to the default (everything expanded) and never throws into render.
 function readCollapseState(): CollapseState {
   try {
+    localStorage.removeItem(LEGACY_COLLAPSE_STORAGE_KEY);
     const raw = localStorage.getItem(COLLAPSE_STORAGE_KEY);
     if (!raw) return { groups: {}, rows: {} };
     const parsed = JSON.parse(raw) as Partial<CollapseState>;
@@ -373,11 +412,11 @@ export default function SettingsLandingPage() {
       rows: { ...prev.rows, [key]: !prev.rows[key] },
     }));
 
-  // The VMs row is gated FAIL-CLOSED on the admin-VM preflight verdict: it shows
-  // only when the capability gate is open. On a user-VM binary the preflight
-  // route 404s, so `data` stays undefined and the row is hidden — a non-operator
-  // instance never advertises the page (issue #2470 R1; the page itself gates
-  // again as defense-in-depth).
+  // The ADMIN group (VMs, Feedback) is gated FAIL-CLOSED on the admin-VM preflight
+  // verdict: it shows only when the capability gate is open. On a user-VM binary
+  // the preflight route 404s, so `data` stays undefined and the group is hidden — a
+  // non-operator instance never advertises it (issue #2470 R1, #4906 R6). The VMs
+  // row keeps its own check too, and the VMs page gates again as defense-in-depth.
   const vmEnabled = useVmPreflight(api).data?.enabled === true;
 
   // #4533 / #5165: the Configuration (Porter) row is gated FAIL-CLOSED on the
@@ -388,33 +427,17 @@ export default function SettingsLandingPage() {
   // the row once a refetch fails.
   const porterExposed = isPorterExposed(usePorterStatus(api));
 
-  // #3059 round-4: the sidebar mirrors the keys page — a node that was never
-  // backup-provisioned (every physical node) hides the Backup Key sub-row,
-  // matching the hidden section on /settings/keys. Same fail-closed shared
-  // derivation, so the sidebar can never deep-link to an unrendered section.
-  const backupEligible = isBackupProvisioned(useBackupIdentityStatus(api).data);
-
   return (
     <div data-testid="settings-landing-root" className="flex flex-col pb-2">
       {ADMIN_SECTIONS.map(group => {
-        const visibleItems = group.items
-          .filter(item =>
-            item.key === "vms"
-              ? vmEnabled
-              : item.key === "configuration"
-                ? porterExposed
-                : true
-          )
-          .map(item =>
-            item.key === "keys" && !backupEligible
-              ? {
-                  ...item,
-                  children: item.children?.filter(
-                    sub => sub.key !== "backup-key"
-                  ),
-                }
-              : item
-          );
+        if (group.heading === ADMIN_GROUP_HEADING && !vmEnabled) return null;
+        const visibleItems = group.items.filter(item =>
+          item.key === "vms"
+            ? vmEnabled
+            : item.key === "configuration"
+              ? porterExposed
+              : true
+        );
         if (visibleItems.length === 0) return null;
         const groupCollapsed = Boolean(collapse.groups[group.heading]);
 
@@ -516,7 +539,7 @@ export default function SettingsLandingPage() {
       })}
 
       {/* Standalone Sign Out footer — an action, not a destination, so it sits
-          below a divider outside the USER/SYSTEM groups (no chevron). */}
+          below a divider outside the groups (no chevron). */}
       {onLogout && (
         <div className="mt-1.5 border-t border-black/10 pt-1.5">
           <button /* design-tokens-allow: settings-landing sign-out action row (bespoke nav-list widget) - D2 E3 exception (#3358) */

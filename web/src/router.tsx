@@ -131,9 +131,10 @@ import TimeLogPage from "@/extensions/time-log/routes/time-log";
 import SessionMetadataPage from "@/routes/settings/session-metadata";
 import TranscriptsPage from "@/routes/settings/transcripts";
 import AdminFeedbackPage from "@/routes/settings/feedback";
+import AdminHelpPage from "@/routes/settings/help";
 import AdminPreferencesPage from "@/routes/settings/preferences";
 import AdminAboutPage from "@/routes/settings/about";
-import AdminKeysPage from "@/routes/settings/keys";
+import NotificationsPage from "@/routes/settings/notifications";
 import ExtensionsAdminPage from "@/routes/settings/extensions";
 import ConfigurationAdminPage from "@/routes/settings/configuration";
 import AdminVmsPage from "@/routes/settings/vms";
@@ -1638,25 +1639,42 @@ const settingsFeedbackRoute = createRoute({
   component: AdminFeedbackPage,
 });
 
+// In-app Help (issue #4371, operator ruling 4371-D1 = C). Registered here AND
+// as an ADMIN_SECTIONS row (settings/index.tsx) — an unregistered route is an
+// invisible page (#2344). The footer's Help link navigates here too.
+const settingsHelpRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/help",
+  component: AdminHelpPage,
+});
+
+// #4906: the notification settings moved to their own page, so an old
+// /settings/preferences#notifications link (the former menu sub-row, a bookmark)
+// lands there rather than on a Preferences page with no such section.
 const settingsPreferencesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/preferences",
   component: AdminPreferencesPage,
+  beforeLoad: ({ location }) => {
+    if (location.hash.replace(/^#/, "") === "notifications") {
+      throw redirect({ to: "/settings/notifications" });
+    }
+  },
+});
+
+// Notifications (#4906): the menu's top-level Notifications row. Registered here
+// AND as an ADMIN_SECTIONS row (settings/index.tsx) — an unregistered route is an
+// invisible page (#2344). Epic #4912's Sub D (#4916) adds the inbox to the page.
+const settingsNotificationsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/notifications",
+  component: NotificationsPage,
 });
 
 const settingsAboutRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/about",
   component: AdminAboutPage,
-});
-
-// Keys — the provider API-key vault (#1955) + the per-VM backup age identity
-// (#2507) folded onto one page by the Settings sidebar reorganization. The
-// sidebar's nested rows deep-link to its `#api-keys` / `#backup-key` anchors.
-const settingsKeysRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/settings/keys",
-  component: AdminKeysPage,
 });
 
 // Extension control plane (issue #2329, epic #2325). Distinct from `/extensions`,
@@ -1748,9 +1766,10 @@ export const routeTree = rootRoute.addChildren([
   settingsSessionMetadataRoute,
   settingsTranscriptsRoute,
   settingsFeedbackRoute,
+  settingsHelpRoute,
   settingsPreferencesRoute,
+  settingsNotificationsRoute,
   settingsAboutRoute,
-  settingsKeysRoute,
   settingsExtensionsRoute,
   settingsConfigurationRoute,
   settingsVmsRoute,

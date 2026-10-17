@@ -192,6 +192,8 @@ export const queryKeys = {
   // persisted feedback rows from `GET /api/feedback`.
   feedbackList: (limit: number, offset: number) =>
     ["feedback-list", limit, offset] as const,
+  // Issue #4371: in-app support channel info from `GET /api/support/channel`.
+  supportChannel: ["support-channel"] as const,
   searchFilterPreferences: ["search-filter-preferences"] as const,
   mcpStatus: (projectDir?: string) =>
     ["mcp-status", projectDir ?? "global"] as const,

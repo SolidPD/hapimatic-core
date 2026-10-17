@@ -28,6 +28,10 @@ import {
 } from "@hapi/protocol/usage";
 import type { AccountIndexEntry } from "@hapi/protocol/accounts";
 import { logger } from "@/ui/logger";
+import {
+  ANTHROPIC_OAUTH_USAGE_URL,
+  isTenantVm,
+} from "@hapi/protocol/tenantMode";
 import type {
   UtilizationSnapshot,
   UtilizationStatus,
@@ -42,6 +46,9 @@ const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
  * time so the override is honored without a rebuild).
  */
 function usageEndpoint(): string {
+  // Issue #4349 (ruling D10): on a TENANT VM the endpoint is PINNED to api.anthropic.com — an
+  // override would send the customer's credential somewhere else.
+  if (isTenantVm()) return ANTHROPIC_OAUTH_USAGE_URL;
   const override = process.env.HAPI_UTILIZATION_ENDPOINT;
   return override && override.length > 0 ? override : OAUTH_USAGE_URL;
 }

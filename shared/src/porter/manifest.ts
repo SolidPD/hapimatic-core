@@ -31,6 +31,12 @@ import {
 // the optional per-entry `source?` tag and the `sources[]` metadata record shape.
 // `sources.ts` imports only `zod`, so this stays a one-way dependency (no cycle).
 import { PORTER_SOURCE_IDS, SourceRecordSchema } from "./sources";
+// #4373: the tenant export profile and its auto-memory section. `tenantProfile.ts`
+// imports only `zod`, so this stays a one-way dependency (no cycle).
+import {
+  MemorySectionSchema,
+  PorterExportProfileSchema,
+} from "./tenantProfile";
 
 // Re-export the container/version constants so a single import of
 // `@hapi/protocol/porter` gives a consumer everything it needs.
@@ -941,6 +947,22 @@ export const PorterManifestSchema = z
      * (`"1.0.0"` stays — strip mode already accepts the add) [K10, 1B#36].
      */
     sources: z.array(SourceRecordSchema).optional(),
+    /**
+     * #4373: the export profile that produced the archive. Absent on a `full`
+     * archive (the default, byte-identical to before #4373); `tenant` on a
+     * hosted customer's export. `.optional()` + strip mode: no `schemaVersion`
+     * bump, and an importer older than #4373 ignores it.
+     */
+    profile: PorterExportProfileSchema.optional(),
+    /**
+     * #4373 (R2): the tenant profile's auto-memory, `memory/<source project
+     * key>/…` members (never the transcripts beside them). The importer remaps
+     * each key from the source home to the destination home and writes only
+     * into a project folder that exists there. An importer older than #4373
+     * ignores the section, which is why the policy names the minimum
+     * destination version.
+     */
+    memory: MemorySectionSchema.optional(),
   })
   /**
    * #3448 (Sub C, D4(a)): a manifest must not carry two `mcpServers` with the

@@ -33,6 +33,7 @@ import {
   type LegacyMigrationOutcome,
 } from "@/accounts/legacyConfigDirMigration";
 import { logger } from "@/ui/logger";
+import { isTenantVm, tenantSignInRequiredMessage } from "@/accounts/tenantMode";
 
 /**
  * Multi-account OAuth (epic #1446, Sub-Issue D): per-session account-token
@@ -276,6 +277,9 @@ export async function resolveAccountConfigDirForSession(
   // default. Verified end-to-end by the #1562 live red-team (skills/hooks/CLAUDE.md/
   // transcript-continuity/refresh-ownership on a real isolated session at runtime 2.1.x).
   //
+  // Issue #4349 (R3): a TENANT VM binds only through the account's own config dir.
+  if (tenantSpawn(deps)) return resolveTenantConfigDir(deps);
+
   // KILL-SWITCH: set HAPI_ACCOUNT_CONFIG_ISOLATION to a falsy value (`0`/`false`/`no`/
   // `off`) to revert to the env-token path (inject CLAUDE_CODE_OAUTH_TOKEN, use the
   // real ~/.claude) WITHOUT a code change — the #1551-era behavior, retained as the
@@ -481,6 +485,59 @@ export interface ResolveAccountTokenDeps {
    * Defaults to {@link reportProvisionOutcome}.
    */
   reportProvision?: (report: ProvisionReport) => void;
+  /**
+   * Issue #4349: the tenant predicate (test seam). Defaults to {@link isTenantVm}. On a tenant
+   * the resolvers take the in-VM sign-in path ({@link resolveTenantConfigDir}) and never a token.
+   */
+  tenantVm?: () => boolean;
+  /** Issue #4349: whether an account's own dir holds the binary's credential (test seam). */
+  hasConfigDir?: (accountUuid: string) => Promise<boolean>;
+  /** Issue #4349: the host `~/.claude` login's account uuid (test seam). */
+  hostDefaultUuid?: () => Promise<string | null>;
+}
+
+/**
+ * Issue #4349 (R3, Task 4(c)): the TENANT spawn binding. On a tenant VM a bound account is
+ * selected ONLY by its own `CLAUDE_CONFIG_DIR`, the dir the customer signed in to with the
+ * unmodified binary's `/login`: never seeded from the store, never probed or re-seeded
+ * (`validateAndRecoverIsolatedSnapshot`), never rotated or bootstrapped by Hapimatic, and the
+ * `HAPI_ACCOUNT_CONFIG_ISOLATION` kill switch does not apply (its fallback is token injection).
+ *
+ * Returns the dir, or `null` for: an unbound session and the host-default account (native Claude
+ * Code reads `~/.claude`, nothing injected), and a bound account whose dir holds no credential —
+ * then {@link resolveAccountTokenForSession} raises "sign in to this account". The user-scope
+ * config (skills, CLAUDE.md, settings) is still linked into the dir — symlinks, never a
+ * credential; a provisioning gap is logged, not a reason to inject a token.
+ */
+async function resolveTenantConfigDir(
+  deps: ResolveAccountTokenDeps
+): Promise<string | null> {
+  const accountUuid = readBoundAccountUuid();
+  if (!accountUuid) return null;
+  const hostDefault = await (
+    deps.hostDefaultUuid ?? readHostDefaultAccountUuid
+  )().catch(() => null);
+  if (hostDefault && hostDefault === accountUuid) return null;
+  if (!(await (deps.hasConfigDir ?? hasIsolatedConfigDir)(accountUuid)))
+    return null;
+  const dir = accountConfigDirFor(accountUuid);
+  const provision = await (
+    deps.provisionConfigDir ?? provisionUserScopeConfigDir
+  )(dir).catch(() => null);
+  if (
+    provision &&
+    (provision.failed.length > 0 || provision.conflicts.length > 0)
+  ) {
+    logger.warn(
+      `[TENANT] user-scope config incomplete for ${accountUuid} (failed=[${provision.failed.join(", ")}], conflicts=[${provision.conflicts.join(", ")}]); spawning with its own config dir anyway (#4349)`
+    );
+  }
+  return dir;
+}
+
+/** Issue #4349: true when the tenant path applies to this spawn. */
+function tenantSpawn(deps: ResolveAccountTokenDeps): boolean {
+  return (deps.tenantVm ?? isTenantVm)();
 }
 
 /** What {@link resolveAccountConfigDirForSession} reports about one provisioning run (#4681). */
@@ -579,6 +636,21 @@ export async function resolveAccountTokenForSession(
 ): Promise<string | null> {
   void session;
   const now = deps.now ?? Date.now;
+
+  // Issue #4349 (R3): a TENANT VM never injects CLAUDE_CODE_OAUTH_TOKEN — not a stored token, not
+  // the instance credential, not a refreshed one. An unbound session and the host-default account
+  // get nothing (native reads ~/.claude); a bound account reaches here only when its own dir holds
+  // no credential (resolveTenantConfigDir), so the customer must sign in to it in the VM.
+  if (tenantSpawn(deps)) {
+    const bound = readBoundAccountUuid();
+    if (!bound || readBoundApiKeyId()) return null;
+    const hostDefault = await (
+      deps.hostDefaultUuid ?? readHostDefaultAccountUuid
+    )().catch(() => null);
+    if (hostDefault && hostDefault === bound) return null;
+    logger.warn(`[TENANT] ${tenantSignInRequiredMessage(bound)}`);
+    throw new Error(tenantSignInRequiredMessage(bound));
+  }
 
   // Issue #4568: an API-key session has NO account token — its only credential is
   // the vault key, which Claude Code reads through `hapi api-key-helper` (the

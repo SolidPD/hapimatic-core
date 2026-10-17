@@ -74,6 +74,7 @@ import {
   ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
   ARCHIVE_BACKSLASH_PATH_OMISSION_REASON,
   headerCommentLabel,
+  psq,
   validUploadUrl,
 } from "./exportShared";
 // #3448 (Sub C, K7): the multi-source discovery table — the same candidate
@@ -83,11 +84,14 @@ import { SOURCE_CONFIG_PATHS, type PorterSourceId } from "./sources";
 // type (never re-exported) so the barrel's `export *` does not double-export it
 // (TS2308) [1B#28, K7].
 import type { ExportScriptInput } from "./exportScript";
-
-/** A PowerShell single-quoted string literal for `s` (embedded doubling of `'`). */
-function psq(s: string): string {
-  return `'${s.replace(/'/g, "''")}'`;
-}
+// #4373: the tenant profile's PowerShell lines and the hygiene gate step, a
+// sibling module so this file grows only by its call sites.
+import {
+  hygieneGatePowerShellLines,
+  memoryStagingPowerShellLines,
+  premiumFilterPowerShellLines,
+  profileDetectionPowerShellLines,
+} from "./tenantProfilePowerShell";
 
 /**
  * #3448 (Sub C): render a NON-Claude-Code source's candidate MCP config paths
@@ -134,6 +138,8 @@ export function buildExportScriptPowerShell(
   } = input;
   // #5239: only an http(s) URL gets the self-upload leg (the bash twin's gate).
   const uploadUrl = validUploadUrl(input.uploadUrl);
+  // #4373: only the two known profiles; anything else mints the default.
+  const profile = input.profile === "tenant" ? "tenant" : "full";
 
   const TOTAL_STEPS = uploadUrl ? 12 : 11;
 
@@ -739,6 +745,7 @@ export function buildExportScriptPowerShell(
     "      $croot = physicalPath $CONFIG_ROOT",
     "      if ($croot) { $CONFIG_ROOT = $croot }",
     "    }",
+    ...profileDetectionPowerShellLines(profile),
     "",
     "    # ---- Step 1 & 2 - collect dimension directories, pruning junk ----",
     "    step 'Collecting configuration directories'",
@@ -1143,6 +1150,8 @@ export function buildExportScriptPowerShell(
     "      if (-not $covered) { recordOmission $hr.surface $hr.reason }",
     "    }",
     "",
+    ...memoryStagingPowerShellLines(),
+    "",
     "    # ---- Step 5 - MCP server DEFINITIONS from every source (names only) ----",
     "    step 'Extracting MCP server definitions (names only - no secret values)'",
     "    function extractMcp($cfgRoot, $sourceId) {",
@@ -1306,6 +1315,7 @@ export function buildExportScriptPowerShell(
     "          }",
     "        }",
     "      }",
+    ...premiumFilterPowerShellLines(),
     "      if (($markets.Count + $plugs.Count) -gt 0) { $PLUGINS = [ordered]@{ marketplaces = @($markets); plugins = @($plugs) } }",
     "    }",
     "",
@@ -1332,6 +1342,9 @@ export function buildExportScriptPowerShell(
     "    if ($sourceMachine -ne '') { $manifest['sourceMachine'] = $sourceMachine }",
     "    if ($null -ne $CLAUDE_MD) { $manifest['claudeMd'] = $CLAUDE_MD }",
     "    if ($null -ne $PLUGINS) { $manifest['plugins'] = $PLUGINS }",
+    "    # #4373: a full manifest stays as before (no profile field).",
+    "    if ($EXPORT_PROFILE -eq 'tenant') { $manifest['profile'] = 'tenant' }",
+    "    if ($null -ne $MEMORY) { $manifest['memory'] = $MEMORY }",
     "    # ConvertTo-Json -Depth 20: 5.1's default depth 2 truncates nested arrays.",
     "    $json = $manifest | ConvertTo-Json -Depth 20",
     "    $manifestPath = Join-Path $STAGING 'manifest.json'",
@@ -1368,6 +1381,7 @@ export function buildExportScriptPowerShell(
     `    $stagingArchive = Join-Path $STAGING 'config-port.${ARCHIVE_FORMAT}'`,
     "    & $TAR (@('-czf', $stagingArchive, '-C', $STAGING) + $members)",
     "    if ($LASTEXITCODE -ne 0) { throw 'tar failed building the archive' }",
+    ...hygieneGatePowerShellLines(),
     "",
     "    [Console]::Error.WriteLine('')",
     "    [Console]::Error.WriteLine('Done. Upload THIS file to the destination instance:')",

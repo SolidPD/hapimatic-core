@@ -2,7 +2,7 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 
-import type { FeedbackCategory } from "@hapi/protocol/types";
+import type { FeedbackEntryCategory } from "@hapi/protocol/types";
 
 /**
  * One persisted feedback row (issue #2664, epic #2663 — In-app feedback system).
@@ -13,7 +13,7 @@ export type StoredFeedback = {
   id: string;
   createdAt: number;
   namespace: string | null;
-  category: FeedbackCategory;
+  category: FeedbackEntryCategory;
   description: string;
   submitterEmail: string | null;
   /** Scrubbed, composed safe-metadata (`FeedbackMetadata`), JSON-serialized. */
@@ -32,7 +32,7 @@ export type StoredFeedback = {
 /** Input to {@link FeedbackStore.createEntry} — the route supplies scrubbed content. */
 export type CreateFeedbackEntry = {
   namespace?: string | null;
-  category: FeedbackCategory;
+  category: FeedbackEntryCategory;
   description: string;
   submitterEmail?: string | null;
   metadataJson: string;
@@ -42,7 +42,7 @@ export type CreateFeedbackEntry = {
 
 export type FeedbackFilters = {
   namespace?: string;
-  category?: FeedbackCategory;
+  category?: FeedbackEntryCategory;
   limit?: number;
   offset?: number;
 };
@@ -65,7 +65,7 @@ function toStoredFeedback(row: DbFeedbackRow): StoredFeedback {
     id: row.id,
     createdAt: row.created_at,
     namespace: row.namespace,
-    category: row.category as FeedbackCategory,
+    category: row.category as FeedbackEntryCategory,
     description: row.description,
     submitterEmail: row.submitter_email,
     metadataJson: row.metadata_json,

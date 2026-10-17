@@ -72,6 +72,8 @@ export interface ImportGroups {
   outputStyles: string[];
   /** `claude-md` + `claude-md-include` file destPaths. */
   claudeMd: string[];
+  /** #4373: a tenant archive's memory file destPaths (`projects/<key>/memory/…`). */
+  memory: string[];
   /**
    * #3448 (Sub C, R3/D3(a)): per-source grouping for the archive-received review
    * cards. Each source id maps to `found` (manifest `sources[]` metadata — TRUE
@@ -177,6 +179,7 @@ export function computeGroups(plan: PlanForSelection): ImportGroups {
   const rules = byKind("rule");
   const outputStyles = byKind("output-style");
   const claudeMd = [...byKind("claude-md"), ...byKind("claude-md-include")];
+  const memory = byKind("memory");
 
   // #3448 (Sub C, R3): per-source grouping for the review cards. `found` is the
   // manifest `sources[]` metadata (TRUE even for a found-but-empty source; a
@@ -198,6 +201,7 @@ export function computeGroups(plan: PlanForSelection): ImportGroups {
     ...rules,
     ...outputStyles,
     ...claudeMd,
+    ...memory,
     ...mcpNamesFor("claude-code"),
   ];
   const bySource = {} as Record<
@@ -221,6 +225,7 @@ export function computeGroups(plan: PlanForSelection): ImportGroups {
     rules,
     outputStyles,
     claudeMd,
+    memory,
     bySource,
   };
 }
@@ -362,6 +367,7 @@ export function unknownExclusions(
     ...groups.rules,
     ...groups.outputStyles,
     ...groups.claudeMd,
+    ...groups.memory,
     ...groups.mcpServers,
     ...Object.values(groups.bySource).flatMap(s => s.keys),
   ]);

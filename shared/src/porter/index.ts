@@ -50,3 +50,7 @@ export * from "./token";
 export * from "./exposure";
 // #5172: the import review's view of an MCP server definition + field roles.
 export * from "./mcpReview";
+// #4373: the tenant export profile (premium predicate, memory section) and the
+// archive hygiene gate both exporters and the standalone verifier run.
+export * from "./tenantProfile";
+export * from "./archiveHygiene";

@@ -6,6 +6,20 @@ import type {
 } from "./feedbackSender";
 
 /**
+ * The category the relay accepts on the wire (issue #4371). The gateway's relay
+ * schema (`gateway/src/lib/feedbackEmail.ts`) predates `support-escalation` and
+ * rejects an unknown category with a 400, and the gateway deploys separately
+ * from tenant VMs — so a support escalation travels as `other`. Its description
+ * already opens with "Support escalation", so the operator still sees what it
+ * is. The persisted row keeps the true category.
+ */
+export function relayWireCategory(
+  category: FeedbackEmailInput["category"]
+): "bug" | "feature" | "other" {
+  return category === "support-escalation" ? "other" : category;
+}
+
+/**
  * Relay transport (Sub-Issue D, #2667, epic #2663).
  *
  * Cloud tenancy is single-user-per-VM (1 VM = 1 untrusted customer), so the
@@ -50,7 +64,7 @@ export async function sendViaRelay(
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        category: input.category,
+        category: relayWireCategory(input.category),
         description: input.description,
         submitterEmail: input.submitterEmail,
         metadata: input.metadata,

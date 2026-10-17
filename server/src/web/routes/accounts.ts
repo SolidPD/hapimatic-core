@@ -21,7 +21,10 @@ import { createRateLimiter } from "../middleware/rateLimit";
 import { cataloged } from "../../capabilities/cataloged";
 import { logAndJson } from "./routeErrorHelper";
 import type { AccountService } from "../../services/accountService";
-import type { AccountLoginService } from "../../services/accountLoginService";
+import {
+  IN_VM_SIGN_IN_REQUIRED,
+  type AccountLoginService,
+} from "../../services/accountLoginService";
 import type { CodexLoginService } from "../../services/codexLoginService";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { UsageService } from "../../accounts/usageService";
@@ -241,6 +244,12 @@ export function createAccountsRoutes(opts: {
   const loginLimiter = createRateLimiter({
     name: "accounts-login",
     limit: 10,
+  });
+  // #4349: the in-VM sign-in dialog polls native-login/complete every 4 s while the user
+  // runs /login, so it needs its own bucket; 60/min still bounds a misbehaving client.
+  const nativeLoginPollLimiter = createRateLimiter({
+    name: "accounts-native-login-poll",
+    limit: 60,
   });
   // Nickname set/clear (epic #1855 follow-up). Mutating → rate-limited; 30/min
   // is generous for human edits.
@@ -1083,6 +1092,18 @@ export function createAccountsRoutes(opts: {
       if (!login) {
         return c.json({ error: "Account login service unavailable" }, 503);
       }
+      // #4349 (R3): on a tenant VM Hapimatic runs no OAuth flow; the wizard switches to the
+      // in-VM sign-in (POST /accounts/native-login/start) when it sees this code.
+      if (login.inVmSignInRequired()) {
+        return c.json(
+          {
+            error:
+              "On this VM, sign in with Claude Code's own /login — Hapimatic never handles the sign-in.",
+            code: IN_VM_SIGN_IN_REQUIRED,
+          },
+          409
+        );
+      }
       try {
         return c.json(login.start());
       } catch (error) {
@@ -1159,7 +1180,14 @@ export function createAccountsRoutes(opts: {
             .catch(() => undefined);
           return c.json({ ok: true, account: result.account });
         }
-        // 400 for client-side fixable causes; 502 for upstream OAuth failures.
+        // 400 for client-side fixable causes; 502 for upstream OAuth failures; 409 on a
+        // tenant VM, where the code is never exchanged (#4349).
+        if (result.code === IN_VM_SIGN_IN_REQUIRED) {
+          return c.json(
+            { ok: false, error: result.error, code: result.code },
+            409
+          );
+        }
         const status =
           result.code === "expired_state" ||
           result.code === "csrf" ||
@@ -1178,6 +1206,157 @@ export function createAccountsRoutes(opts: {
           fallbackMessage: "Failed to complete account login",
         });
       }
+    }
+  );
+
+  // ── In-VM sign-in (issue #4349, Task 5) ───────────────────────────────────
+  // On a TENANT VM the customer signs in with the unmodified binary's own /login, in a new
+  // per-account CLAUDE_CONFIG_DIR, in a terminal on the VM itself. `start` creates the empty dir
+  // and returns the command; `complete` registers the account from the identity the binary writes
+  // (`.claude.json`, never `.credentials.json`); `cancel` forgets it. No token ever reaches these
+  // routes or their responses.
+
+  app.post(
+    "/accounts/native-login/start",
+    cataloged(
+      defineCapability({
+        id: "accounts.native-login-start",
+        domain: "accounts",
+        surface: "rest",
+        description:
+          "On a tenant VM, create an empty per-account Claude config dir (or resume the caller's unfinished one) and return the command to run claude there and sign in with /login.",
+        whenToUse:
+          "When a user adds a Claude account on a tenant VM (the web OAuth login answers in_vm_sign_in_required).",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/accounts/native-login/start",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+        probe: "skip",
+      })
+    ),
+    loginLimiter,
+    c => {
+      const login = opts.getLoginService?.();
+      if (!login) {
+        return c.json({ error: "Account login service unavailable" }, 503);
+      }
+      if (!login.inVmSignInRequired()) {
+        return c.json(
+          {
+            error: "In-VM sign-in runs only on a tenant VM",
+            code: "not_tenant",
+          },
+          409
+        );
+      }
+      try {
+        return c.json(login.startInVm(c.get("namespace") ?? ""));
+      } catch (error) {
+        return logAndJson(c, error, 500, {
+          errorLogger,
+          category: "accounts",
+          fallbackMessage: "Failed to start in-VM sign-in",
+        });
+      }
+    }
+  );
+
+  app.post(
+    "/accounts/native-login/complete",
+    cataloged(
+      defineCapability({
+        id: "accounts.native-login-complete",
+        domain: "accounts",
+        surface: "rest",
+        description:
+          "Register an in-VM sign-in once the claude binary has written the account identity into its config dir; returns only the redacted account, or not_signed_in while the identity is absent.",
+        whenToUse:
+          "After the user runs the in-VM sign-in command and finishes /login on a tenant VM.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/accounts/native-login/complete",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+        probe: "skip",
+      })
+    ),
+    nativeLoginPollLimiter,
+    async c => {
+      const login = opts.getLoginService?.();
+      if (!login) {
+        return c.json({ error: "Account login service unavailable" }, 503);
+      }
+      let body: { loginToken?: string };
+      try {
+        body = await c.req.json();
+      } catch {
+        return c.json(
+          { ok: false, error: "Invalid JSON body", code: "invalid_request" },
+          400
+        );
+      }
+      const result = login.completeInVm(body?.loginToken ?? "");
+      if (result.ok) {
+        void opts
+          .getUsageService?.()
+          ?.refresh()
+          .catch(() => undefined);
+        return c.json({ ok: true, account: result.account });
+      }
+      // not_signed_in is the normal "keep waiting" answer, not a failure.
+      const status =
+        result.code === "not_signed_in"
+          ? 202
+          : result.code === "already_added"
+            ? 409
+            : 400;
+      return c.json(
+        { ok: false, error: result.error, code: result.code },
+        status
+      );
+    }
+  );
+
+  app.post(
+    "/accounts/native-login/cancel",
+    cataloged(
+      defineCapability({
+        id: "accounts.native-login-cancel",
+        domain: "accounts",
+        surface: "rest",
+        description:
+          "Abandon a started in-VM sign-in; removes its config dir only while it is still empty, never a credential.",
+        whenToUse:
+          "When the user starts the in-VM sign-in over; closing the dialog keeps the sign-in so a reopened dialog resumes it.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/accounts/native-login/cancel",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+        probe: "skip",
+      })
+    ),
+    async c => {
+      const login = opts.getLoginService?.();
+      if (!login) {
+        return c.json({ error: "Account login service unavailable" }, 503);
+      }
+      const body = (await c.req.json().catch(() => null)) as {
+        loginToken?: unknown;
+      } | null;
+      if (typeof body?.loginToken === "string")
+        login.cancelInVm(body.loginToken);
+      return c.json({ ok: true });
     }
   );
 

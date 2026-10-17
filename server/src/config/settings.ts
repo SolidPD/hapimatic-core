@@ -74,6 +74,14 @@ export interface Settings {
   webappPort?: number;
   webappUrl?: string;
   corsOrigins?: string[];
+  /** Issue #4371: in-app support escalation (non-credential values only — the
+   *  channel credentials stay in env). See `resolveSupportChannel`. */
+  supportEscalation?: {
+    hoursText?: string;
+    issueUrl?: string;
+    telegramChatId?: string;
+    channel?: string;
+  };
   /** Federation configuration for distributed cluster */
   federation?: {
     enabled?: boolean;

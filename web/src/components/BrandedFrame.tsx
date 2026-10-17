@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useState, type ReactNode } from "react";
 import { Link, useNavigate, useLocation } from "@tanstack/react-router";
-import { Settings as SettingsIcon, Mail as MailIcon } from "lucide-react";
+import {
+  Settings as SettingsIcon,
+  Mail as MailIcon,
+  LifeBuoy as LifeBuoyIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { BareButton } from "@/components/ui/BareButton";
 import { useVersion } from "@/hooks/useVersion";
@@ -378,6 +382,25 @@ export function BrandedFrame({
                 >
                   <MailIcon size={16} />
                   <span className="hidden sm:inline">Feedback</span>
+                </Button>
+                {/* #4371 (operator ruling 4371-D1 = C): Help beside Feedback,
+                    same pattern — icon-only below `sm`, icon + word at `sm`+.
+                    The negative-margin padding widens the hit area to a 44px
+                    touch target without changing the footer line's height. */}
+                <span aria-hidden="true" className="mx-1 text-xs text-white/50">
+                  •
+                </span>
+                <Button
+                  type="button"
+                  variant="ghostStatic"
+                  onClick={() => void navigate({ to: "/settings/help" })}
+                  aria-label="Help"
+                  title="Help"
+                  data-testid="help-button"
+                  className="-mx-2 -my-3.5 inline-flex h-auto items-center gap-1 px-2 py-3.5 text-xs font-normal text-white/50 transition-colors hover:text-white active:text-white"
+                >
+                  <LifeBuoyIcon size={16} />
+                  <span className="hidden sm:inline">Help</span>
                 </Button>
               </>
             ) : null}

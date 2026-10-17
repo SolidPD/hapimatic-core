@@ -42,7 +42,7 @@ export function NativeProviderModelFields(props: {
     <>
       <FormField
         label="Provider"
-        hint={hasKeys ? undefined : "no keys — add one on the API Keys page"}
+        hint={hasKeys ? undefined : "no keys — add one under Provider API Keys"}
         tooltip="The native provider this OpenCode session authenticates against, using a per-provider key from your API Keys vault. Pick a provider OpenCode supports natively (e.g. Anthropic, OpenAI, Google). The key never leaves the node."
       >
         <UiSelect

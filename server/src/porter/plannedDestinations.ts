@@ -65,7 +65,8 @@ type DestinationRule =
   | { folder: string }
   | { exact: "CLAUDE.md" }
   | { include: true }
-  | { settingsScript: true };
+  | { settingsScript: true }
+  | { memory: true };
 
 /** Every planned kind's allowed destination — a new kind will not compile without one. */
 const KIND_DESTINATION: Record<PlannedItemKind, DestinationRule> = {
@@ -79,6 +80,8 @@ const KIND_DESTINATION: Record<PlannedItemKind, DestinationRule> = {
   "claude-md": { exact: "CLAUDE.md" },
   "claude-md-include": { include: true },
   "settings-script": { settingsScript: true },
+  // #4373: only `projects/<key>/memory/<file>` (./planTenant).
+  memory: { memory: true },
 };
 
 /**
@@ -112,6 +115,20 @@ function settingsScriptDestinationOk(
 }
 
 /**
+ * #4373: a memory file may write only `projects/<key>/memory/<file…>`: one
+ * project key (no empty, `.` or `..` part) and a file below its memory folder.
+ */
+function memoryDestinationOk(destRel: string): boolean {
+  const segs = destRel.split(sep);
+  return (
+    segs.length >= 4 &&
+    segs[0] === "projects" &&
+    segs[2] === "memory" &&
+    segs.every(seg => seg !== "" && seg !== "." && seg !== "..")
+  );
+}
+
+/**
  * Is `destRel` strictly inside `folder` (a file under it, never the folder
  * itself)? Splits on the platform `sep` on purpose — unlike the `/[\\/]/`
  * "not top-level" test in ./claudeMdIncludes, which only has to reject: on
@@ -141,6 +158,7 @@ export function classifyPlannedDestination(
   if ("settingsScript" in rule) {
     return { ok: settingsScriptDestinationOk(destRel, ctx), destRel };
   }
+  if ("memory" in rule) return { ok: memoryDestinationOk(destRel), destRel };
   return {
     ok: classifyClaudeMdInclude(claudeDir, destPath, new Set()).ok,
     destRel,
@@ -196,6 +214,8 @@ const CREDENTIAL_RULE_KINDS: ReadonlySet<PlannedItemKind> = new Set([
   "hook-file",
   // #4173 (the #4172 cross-seam): also refused by its own name rule above.
   "settings-script",
+  // #4373: ./planTenant skips a credential-named memory file first.
+  "memory",
 ]);
 
 /**

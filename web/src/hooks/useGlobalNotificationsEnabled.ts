@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Issue #3150: read-only "is push delivery globally active on THIS device?" —
-// the subscription state the Settings → Preferences → Notifications
+// the subscription state the Settings → Notifications
 // Enable/Disable control manages. usePushNotifications owns the mutating
 // subscribe/unsubscribe flow (and needs an ApiClient for it); this hook is the
 // cheap read-only mirror per-row consumers can mount without one. Global-off ≡

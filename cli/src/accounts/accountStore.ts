@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { FileLockTimeoutError, withFileLock } from "@/utils/fileLock";
+import { isTenantVm } from "@hapi/protocol/tenantMode";
 import { configuration } from "@/configuration";
 import { logger } from "@/ui/logger";
 import {
@@ -151,9 +152,16 @@ export class AccountStore {
     UtilizationSnapshot
   >();
 
+  /**
+   * @param tenantVm Issue #4349 (R3): the tenant predicate (test seam). On a TENANT VM the
+   * first-run migration is a no-op — Hapimatic never copies the host `claude /login` credential
+   * into its own store there. Defaults to `@hapi/protocol/tenantMode`'s `isTenantVm` (imported
+   * directly, not through the cli's tenantMode module, so this foundation module has no cycle).
+   */
   constructor(
     private readonly accountsDir: string,
-    private readonly migrationSources: AccountStoreMigrationSources = {}
+    private readonly migrationSources: AccountStoreMigrationSources = {},
+    private readonly tenantVm: () => boolean = isTenantVm
   ) {}
 
   private get indexPath(): string {
@@ -532,6 +540,12 @@ export class AccountStore {
    * `mcpOAuth` and NEVER deletes the source files.
    */
   private async migrateFromClaudeCredentials(): Promise<void> {
+    if (this.tenantVm()) {
+      logger.info(
+        "[ACCOUNT_STORE] tenant VM: the host credential is not copied into the account store (#4349)"
+      );
+      return;
+    }
     const credentialsPath =
       this.migrationSources.credentialsPath ??
       join(homedir(), ".claude", ".credentials.json");

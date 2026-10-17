@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { randomUUID } from "node:crypto";
-import { StoredAccountSchema } from "@hapi/protocol";
+import { existsSync, mkdirSync, readFileSync, rmdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import {
+  NativeAnthropicStoredAccountSchema,
+  StoredAccountSchema,
+  isNativeAnthropicAccount,
+} from "@hapi/protocol";
+import { isTenantVm } from "@hapi/protocol/tenantMode";
 import {
   buildAuthorizeUrl,
   exchangeCodeForTokens,
@@ -67,6 +75,46 @@ export const NOT_AN_AUTHORIZATION_CODE_MSG =
 /** RR4: 5-minute single-use window for a login attempt. */
 const LOGIN_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * #4349: the error code every Hapimatic-driven sign-in path answers on a TENANT VM — the customer
+ * signs in inside the VM with the unmodified binary's own `/login` instead ({@link
+ * AccountLoginService.startInVm}).
+ */
+export const IN_VM_SIGN_IN_REQUIRED = "in_vm_sign_in_required";
+
+/** #4349: how long a started in-VM sign-in stays registrable (the user runs `/login` meanwhile). */
+const IN_VM_LOGIN_TTL_MS = 30 * 60 * 1000;
+
+/** #4349: an in-VM sign-in waiting for the binary to write its identity into the new dir. */
+interface PendingInVmLogin {
+  accountUuid: string;
+  configDir: string;
+  /** The namespace that started it; only that namespace resumes it. */
+  owner: string;
+  /** Unix epoch ms. */
+  expiresAt: number;
+}
+
+export type InVmLoginStartResult = {
+  loginToken: string;
+  accountUuid: string;
+  configDir: string;
+  /** The exact command to run in a terminal on this VM; the user then types `/login`. */
+  command: string;
+};
+
+export type InVmLoginCompleteResult =
+  | { ok: true; account: RedactedAccount }
+  | {
+      ok: false;
+      code:
+        | "not_signed_in"
+        | "expired_state"
+        | "already_added"
+        | "invalid_request";
+      error: string;
+    };
+
 export type LoginStartResult = { loginToken: string; authorizeUrl: string };
 
 export type LoginCompleteFailureCode =
@@ -75,7 +123,9 @@ export type LoginCompleteFailureCode =
   | "exchange_failed"
   | "profile_failed"
   | "invalid_request"
-  | "invalid_code";
+  | "invalid_code"
+  // #4349: a tenant VM — Hapimatic does not run the OAuth exchange there.
+  | typeof IN_VM_SIGN_IN_REQUIRED;
 
 export type LoginCompleteResult =
   | { ok: true; account: RedactedAccount }
@@ -83,6 +133,10 @@ export type LoginCompleteResult =
 
 export class AccountLoginService {
   private readonly pending = new Map<string, PendingLogin>();
+  /** #4349: in-VM sign-ins waiting for the binary's identity (never a token). */
+  private readonly pendingInVm = new Map<string, PendingInVmLogin>();
+  private readonly tenantVm: () => boolean;
+  private readonly accountConfigsDir: string;
   private readonly fetchImpl?: FetchLike;
   private readonly now: () => number;
   private readonly isolatedSyncOptions: IsolatedCredentialsSyncOptions;
@@ -109,8 +163,22 @@ export class AccountLoginService {
         token: FreshOauthToken,
         opts: IsolatedCredentialsSyncOptions
       ) => string[];
+      /** #4349: the tenant predicate (test seam; defaults to `isTenantVm`). */
+      tenantVm?: () => boolean;
+      /**
+       * #4349: the account-configs base the in-VM sign-in creates its dir under (test seam).
+       * Defaults to {@link resolveInVmAccountConfigsDir} over `isolatedSyncOptions.dataDir` — the
+       * base the cli spawn path resolves `CLAUDE_CONFIG_DIR=<base>/<uuid>` from.
+       */
+      accountConfigsDir?: string;
     } = {}
   ) {
+    this.tenantVm = opts.tenantVm ?? isTenantVm;
+    this.accountConfigsDir =
+      opts.accountConfigsDir ??
+      resolveInVmAccountConfigsDir({
+        dataDir: opts.isolatedSyncOptions?.dataDir,
+      });
     this.fetchImpl = opts.fetchImpl;
     this.now = opts.now ?? Date.now;
     this.isolatedSyncOptions = opts.isolatedSyncOptions ?? {};
@@ -127,7 +195,18 @@ export class AccountLoginService {
    * `loginToken` the client echoes back to `complete`. The `state`/`verifier`
    * stay server-side.
    */
+  /** #4349: true on a TENANT VM, where only {@link startInVm} signs an account in. */
+  inVmSignInRequired(): boolean {
+    return this.tenantVm();
+  }
+
   start(): LoginStartResult {
+    // #4349 (R3, Task 4(a)): Hapimatic never runs its own provider OAuth flow on a tenant VM.
+    if (this.tenantVm()) {
+      throw new Error(
+        `${IN_VM_SIGN_IN_REQUIRED}: on this VM, sign in with Claude Code's own /login (#4349)`
+      );
+    }
     this.sweepExpired();
     const { verifier, challenge, state } = generatePkce();
     const loginToken = randomUUID();
@@ -156,6 +235,14 @@ export class AccountLoginService {
     code: string;
     state?: string;
   }): Promise<LoginCompleteResult> {
+    // #4349 (R3): never exchange a code on a tenant VM (the code is not even read).
+    if (this.tenantVm()) {
+      return {
+        ok: false,
+        code: IN_VM_SIGN_IN_REQUIRED,
+        error: "On this VM, sign in with Claude Code's own /login (#4349).",
+      };
+    }
     this.sweepExpired();
 
     const rawCode = (args.code ?? "").trim();
@@ -325,10 +412,238 @@ export class AccountLoginService {
     return { ok: true, account: toRedactedAccount(parsed.data) };
   }
 
+  /**
+   * #4349 (Task 5): begin an in-VM sign-in. Creates a NEW, EMPTY per-account config dir
+   * (`<accountConfigsDir>/<uuid>/`, mode 0700) and returns the exact command to run in a terminal
+   * on this VM — the unmodified `claude` with only that `CLAUDE_CONFIG_DIR` (an inherited
+   * `CLAUDE_CODE_OAUTH_TOKEN` unset, so it cannot shadow the new sign-in). The user types `/login`;
+   * the binary performs its own login and writes its own credential into the dir. The terminal is
+   * the VM's own, so no authorization code passes through SPD's gateway. Only on a tenant VM.
+   *
+   * The user has to leave the dialog to reach a terminal, so an unexpired sign-in `owner` already
+   * started is resumed (same token, dir and command, expiry renewed) rather than replaced: a
+   * reopened dialog then polls the dir `/login` wrote into. Only {@link cancelInVm} ends one early.
+   */
+  startInVm(owner = ""): InVmLoginStartResult {
+    if (!this.tenantVm()) {
+      throw new Error("in-VM sign-in runs only on a tenant VM (#4349)");
+    }
+    this.sweepExpired();
+    let resumable: [string, PendingInVmLogin] | undefined;
+    for (const pending of this.pendingInVm) {
+      if (pending[1].owner === owner) resumable = pending; // the latest one started wins
+    }
+    if (resumable) {
+      const [loginToken, entry] = resumable;
+      entry.expiresAt = this.now() + IN_VM_LOGIN_TTL_MS;
+      return {
+        loginToken,
+        accountUuid: entry.accountUuid,
+        configDir: entry.configDir,
+        command: inVmSignInCommand(entry.configDir),
+      };
+    }
+    const accountUuid = randomUUID();
+    const configDir = join(this.accountConfigsDir, accountUuid);
+    mkdirSync(this.accountConfigsDir, { recursive: true, mode: 0o700 });
+    // Not recursive: a fresh uuid must never name an existing dir.
+    mkdirSync(configDir, { mode: 0o700 });
+    const loginToken = randomUUID();
+    this.pendingInVm.set(loginToken, {
+      accountUuid,
+      configDir,
+      owner,
+      expiresAt: this.now() + IN_VM_LOGIN_TTL_MS,
+    });
+    return {
+      loginToken,
+      accountUuid,
+      configDir,
+      command: inVmSignInCommand(configDir),
+    };
+  }
+
+  /**
+   * #4349 (Task 5): register a started in-VM sign-in once the binary has written the account's
+   * identity into its dir. Reads ONLY `<dir>/.claude.json` `oauthAccount` (email, uuids, names) —
+   * never `.credentials.json` — and stores a token-less `native` record whose key is the dir's
+   * uuid. `not_signed_in` until the identity appears; the pending entry survives that answer so
+   * the client can check again.
+   */
+  completeInVm(loginToken: string): InVmLoginCompleteResult {
+    this.sweepExpired();
+    if (!loginToken) {
+      return {
+        ok: false,
+        code: "invalid_request",
+        error: "loginToken is required.",
+      };
+    }
+    const entry = this.pendingInVm.get(loginToken);
+    if (!entry) {
+      return {
+        ok: false,
+        code: "expired_state",
+        error: "This sign-in expired or is unknown. Start over.",
+      };
+    }
+    const identity = readDirIdentity(entry.configDir);
+    if (!identity) {
+      return {
+        ok: false,
+        code: "not_signed_in",
+        error:
+          "No sign-in found yet. Run the command in a terminal on this VM, type /login and finish Claude's prompts.",
+      };
+    }
+    const duplicate = this.accountService
+      .list()
+      .map(a => this.accountService.getRawAny(a.accountUuid))
+      .find(
+        a =>
+          a !== null &&
+          isNativeAnthropicAccount(a) &&
+          a.identityAccountUuid === identity.accountUuid
+      );
+    if (duplicate) {
+      this.pendingInVm.delete(loginToken);
+      return {
+        ok: false,
+        code: "already_added",
+        error: `${identity.emailAddress} is already signed in on this VM.`,
+      };
+    }
+    const now = this.now();
+    const parsed = NativeAnthropicStoredAccountSchema.safeParse({
+      schema_version: 1,
+      authKind: "native",
+      accountUuid: entry.accountUuid,
+      identityAccountUuid: identity.accountUuid,
+      emailAddress: identity.emailAddress,
+      organizationUuid: identity.organizationUuid,
+      organizationName: identity.organizationName,
+      displayName: identity.displayName,
+      billingType: identity.billingType,
+      configDir: entry.configDir,
+      capturedAt: now,
+      lastUsedAt: 0,
+    });
+    if (!parsed.success) {
+      return {
+        ok: false,
+        code: "not_signed_in",
+        error: `The sign-in identity is incomplete: ${parsed.error.message}`,
+      };
+    }
+    this.accountService.add(parsed.data);
+    this.pendingInVm.delete(loginToken);
+    return { ok: true, account: toRedactedAccount(parsed.data) };
+  }
+
+  /** #4349: abandon a started in-VM sign-in; removes its dir only while it is still empty. */
+  cancelInVm(loginToken: string): void {
+    const entry = this.pendingInVm.get(loginToken);
+    this.pendingInVm.delete(loginToken);
+    if (entry) removeDirIfEmpty(entry.configDir);
+  }
+
   private sweepExpired(): void {
     const t = this.now();
     for (const [k, v] of this.pending) {
       if (t > v.expiresAt) this.pending.delete(k);
     }
+    for (const [k, v] of this.pendingInVm) {
+      if (t > v.expiresAt) {
+        this.pendingInVm.delete(k);
+        removeDirIfEmpty(v.configDir);
+      }
+    }
+  }
+}
+
+/** #4349: remove an in-VM sign-in dir only while it is empty — never a dir `/login` wrote into. */
+function removeDirIfEmpty(configDir: string): void {
+  try {
+    rmdirSync(configDir); // fails (and keeps the dir) unless it is empty
+  } catch {
+    // Not empty, or already gone: never delete a credential.
+  }
+}
+
+/**
+ * #4349: the base the in-VM sign-in creates `<base>/<uuid>` under — the same base the cli spawn
+ * path binds `CLAUDE_CONFIG_DIR` from (`resolveAccountConfigsDir` in `cli/src/configuration.ts`,
+ * #1643). By default it is the machine-global `${XDG_CONFIG_HOME:-~/.config}/hapimatic/account-configs`.
+ * Under the `HAPI_ACCOUNT_CONFIG_SHARED` ∈ {0,false,no,off} kill switch it is the per-instance
+ * `<dataDir>/account-configs`. This reads the SERVER's env: the VM env file
+ * `~/.config/hapimatic/env` feeds both the server and the daemon unit, so the switch set there
+ * reaches both. Without a `dataDir` the per-instance layout cannot be named, so the shared base is
+ * kept.
+ */
+export function resolveInVmAccountConfigsDir(opts: {
+  dataDir?: string;
+  env?: NodeJS.ProcessEnv;
+  homeDir?: string;
+}): string {
+  const env = opts.env ?? process.env;
+  const flag = (env.HAPI_ACCOUNT_CONFIG_SHARED ?? "").toLowerCase();
+  const shared = !(
+    flag === "0" ||
+    flag === "false" ||
+    flag === "no" ||
+    flag === "off"
+  );
+  if (!shared && opts.dataDir) return join(opts.dataDir, "account-configs");
+  const xdgConfigBase =
+    env.XDG_CONFIG_HOME?.trim() || join(opts.homeDir ?? homedir(), ".config");
+  return join(xdgConfigBase, "hapimatic", "account-configs");
+}
+
+/**
+ * #4349: the in-VM sign-in command for a fresh config dir. The dir is `<base>/<uuid>`, so it is
+ * single-quoted; a quote in the base path (never produced by the default) is refused rather than
+ * escaped.
+ */
+export function inVmSignInCommand(configDir: string): string {
+  if (configDir.includes("'")) {
+    throw new Error("account config dir path must not contain a single quote");
+  }
+  return `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR='${configDir}' claude`;
+}
+
+/** The identity fields #4349 registers from a config dir's `.claude.json` — never a credential. */
+interface DirIdentity {
+  accountUuid: string;
+  emailAddress: string;
+  organizationUuid: string;
+  organizationName: string;
+  displayName: string;
+  billingType: string;
+}
+
+/**
+ * Read `<dir>/.claude.json` `oauthAccount` (what Claude Code writes after `/login`), or null while
+ * it is absent or incomplete. NEVER opens `.credentials.json`.
+ */
+export function readDirIdentity(configDir: string): DirIdentity | null {
+  const path = join(configDir, ".claude.json");
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8")) as {
+      oauthAccount?: Record<string, unknown>;
+    };
+    const a = parsed.oauthAccount;
+    const str = (v: unknown): string => (typeof v === "string" ? v : "");
+    if (!a || !str(a.accountUuid) || !str(a.emailAddress)) return null;
+    return {
+      accountUuid: str(a.accountUuid),
+      emailAddress: str(a.emailAddress),
+      organizationUuid: str(a.organizationUuid),
+      organizationName: str(a.organizationName),
+      displayName: str(a.displayName),
+      billingType: str(a.billingType),
+    };
+  } catch {
+    return null;
   }
 }

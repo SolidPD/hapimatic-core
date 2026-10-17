@@ -7,9 +7,9 @@ import { useRevealBackupIdentity } from "@/hooks/mutations/useRevealBackupIdenti
 import { Button } from "@/components/ui/button";
 
 /**
- * BackupKeySection — the "Backup Key" section of Settings → Keys (issue #2507,
- * epic #2493; folded from the former `/settings/backup-key` page by the Settings
- * sidebar reorganization).
+ * BackupKeySection — the "Backup Key" section of Settings → Preferences (issue
+ * #2507, epic #2493; folded from the former `/settings/backup-key` page onto the
+ * Keys page by the Settings sidebar reorganization, then onto Preferences by #4906).
  *
  * The user-facing half of the VM-born backup age identity custody model: the
  * authenticated user reveals the per-VM backup private key EXACTLY ONCE, saves

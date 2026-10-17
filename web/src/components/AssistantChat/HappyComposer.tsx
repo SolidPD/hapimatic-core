@@ -24,6 +24,10 @@ import { useActiveWord } from "@/hooks/useActiveWord";
 import { useActiveSuggestions } from "@/hooks/useActiveSuggestions";
 import { useQueuedMessages } from "@/hooks/queries/useQueuedMessages";
 import { useAppContext } from "@/lib/app-context";
+import {
+  insertTextAtSelection,
+  plainTextForUrlSniffedPaste,
+} from "@/lib/clipboard";
 import { usePromptDraft } from "@/hooks/usePromptDraft";
 import { useAttachments } from "@/hooks/useAttachments";
 import { type Attachment } from "@/lib/attachment-store";
@@ -634,18 +638,28 @@ export function HappyComposer(props: {
     showToast("Attachments cleared");
   }, [clearAttachments, haptic, showToast]);
 
-  // Paste handler: intercept paste events with file data and auto-upload
+  // Paste handler: intercept paste events with file data and auto-upload, and
+  // (#5313) dodge iOS WebKit's URL-preferring default paste. When the pasteboard
+  // carries a public.url representation next to the text (any `scheme:` shaped
+  // copy on iOS), the default action inserts the percent-encoded URL while the
+  // event's text/plain is the real text — so insert that ourselves.
   const handlePaste = useCallback(
-    (e: React.ClipboardEvent) => {
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
       const files = e.clipboardData?.files;
-      if (!files || files.length === 0) return;
-      // Has file data — prevent default paste behavior and auto-upload
+      if (files && files.length > 0) {
+        // Has file data — prevent default paste behavior and auto-upload
+        e.preventDefault();
+        if (!sessionId) return;
+        addAndUpload(files);
+        haptic("light");
+        const count = files.length;
+        showToast(count === 1 ? "File attached" : `${count} files attached`);
+        return;
+      }
+      const plain = plainTextForUrlSniffedPaste(e.clipboardData);
+      if (plain === null) return;
       e.preventDefault();
-      if (!sessionId) return;
-      addAndUpload(files);
-      haptic("light");
-      const count = files.length;
-      showToast(count === 1 ? "File attached" : `${count} files attached`);
+      insertTextAtSelection(e.currentTarget, plain);
     },
     [sessionId, addAndUpload, haptic, showToast]
   );

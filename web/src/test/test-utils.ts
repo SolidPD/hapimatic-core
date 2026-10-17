@@ -94,6 +94,10 @@ export function createMockApiClient(): Record<string, Mock> {
     // Web-initiated OAuth login (issue #1263)
     startAccountLogin: vi.fn(),
     completeAccountLogin: vi.fn(),
+    // In-VM Claude sign-in on a tenant VM (issue #4349)
+    startInVmAccountLogin: vi.fn(),
+    completeInVmAccountLogin: vi.fn(),
+    cancelInVmAccountLogin: vi.fn(),
     getGitStatus: vi.fn(),
     getGitRemoteUrl: vi.fn(),
     getGitDiffNumstat: vi.fn(),

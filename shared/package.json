@@ -19,6 +19,7 @@
     "./modelCatalog": "./src/modelCatalog.ts",
     "./geminiModelCatalog": "./src/geminiModelCatalog.ts",
     "./codexModelCatalog": "./src/codexModelCatalog.ts",
+    "./companion": "./src/companion.ts",
     "./ext": "./src/ext/index.ts",
     "./extensionsMetadata": "./src/extensionsMetadata.generated.ts",
     "./extensions/heartbeat/manifestShared": "./src/extensions/heartbeat/manifestShared.ts",
@@ -46,13 +47,15 @@
     "./sentryScrub": "./src/sentryScrub.ts",
     "./sessionInfoText": "./src/sessionInfoText.ts",
     "./systemJobs": "./src/systemJobs.ts",
+    "./tenantMode": "./src/tenantMode.ts",
     "./tokenUsageAggregation": "./src/tokenUsageAggregation.ts",
     "./types": "./src/types.ts",
     "./usage": "./src/usage.ts",
     "./workflowPhases": "./src/workflowPhases.ts",
     "./worktreeMeta": "./src/worktreeMeta.ts",
     "./gitBranches": "./src/gitBranches.ts",
-    "./voice": "./src/voice.ts"
+    "./voice": "./src/voice.ts",
+    "./vmClass": "./src/vmClass.ts"
   },
   "sideEffects": false,
   "scripts": {

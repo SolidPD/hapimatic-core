@@ -42,6 +42,18 @@ function readSettingsLauncher(): string | undefined {
   }
 }
 
+/**
+ * The resolved launcher kind, exactly as `GET /api/launcher/status` reports it
+ * (issue #4371: the support escalation bundle reads it in-process rather than
+ * shelling out to the CLI).
+ */
+export function resolveCurrentLauncherKind(): string {
+  return resolveLauncherKind(
+    process.env.HAPI_CLAUDE_LAUNCHER,
+    readSettingsLauncher()
+  ).kind;
+}
+
 function which(binary: string): boolean {
   const r = spawnSync("which", [binary], {
     stdio: ["ignore", "ignore", "ignore"],

@@ -69,6 +69,7 @@ import {
   SECRET_URL_QUERYFRAG_PATTERN,
   SECRET_URL_USERINFO_PATTERN,
   SETTINGS_KEYS_NO_ENV,
+  bashSingleQuote,
   headerCommentLabel,
   toJqRegex,
   validUploadUrl,
@@ -93,6 +94,15 @@ import {
   type PorterPathBase,
   type PorterSourceId,
 } from "./sources";
+// #4373: the tenant profile's bash lines (a sibling module, so this file grows
+// only by its call sites) and the archive hygiene gate this script runs last.
+import { type PorterExportProfile } from "./tenantProfile";
+import {
+  memoryStagingShellLines,
+  premiumFilterShellLines,
+  profileDetectionShellLines,
+} from "./tenantProfileShell";
+import { archiveHygieneShellLines } from "./archiveHygiene";
 
 /**
  * Input to {@link buildExportScript}. Mirrors the relevant subset of
@@ -147,6 +157,15 @@ export interface ExportScriptInput {
    * not an http(s) URL is treated as absent (#5239, `validUploadUrl`).
    */
   uploadUrl?: string;
+  /**
+   * #4373 (R2): the export profile to mint, `full` (the default, today's
+   * definitions-only export) or `tenant` (the hosted customer's own surfaces:
+   * plus auto-memory, minus premium plugin descriptors). The minted value is a
+   * floor: on a hosted customer VM the script reads the VM's markers at run
+   * time (K13, `../vmClass`) and uses `tenant` whatever was minted, because the
+   * destination that mints the script cannot know where it will run.
+   */
+  profile?: PorterExportProfile;
 }
 
 // #3447 (K7): DIMENSION_DIRS, DIMENSION_FIELD and SETTINGS_KEYS_NO_ENV now live
@@ -387,11 +406,6 @@ function pluginExtractionJq(): string {
   ].join("\n");
 }
 
-/** A bash single-quoted string literal for `s` (each `'` becomes `'\''`). */
-function bashSingleQuote(s: string): string {
-  return `'${s.replace(/'/g, "'\\''")}'`;
-}
-
 /**
  * Build the script-driven, secrets-free export script (R1). Pure — no I/O.
  *
@@ -411,6 +425,9 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
   } = input;
   // #5239: only an http(s) URL gets the self-upload leg.
   const uploadUrl = validUploadUrl(input.uploadUrl);
+  // #4373: only the two known profiles; anything else mints the default.
+  const profile: PorterExportProfile =
+    input.profile === "tenant" ? "tenant" : "full";
 
   // The export-dir move/rename/collision fragment (#3239), single-sourced. It
   // moves `config-port.<fmt>` from the CWD — the script `cd`s into $STAGING
@@ -457,6 +474,10 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "# a credential named that way was never pruned, and a link was never checked.",
     "# Every name is handled as bytes.",
     "export LC_ALL=C",
+    "# #4587 (R7-R1-6): when this is not set, macOS bsdtar adds a ._<name>",
+    "# AppleDouble member for a file with extended attributes. GNU tar and",
+    "# BusyBox ignore it.",
+    "export COPYFILE_DISABLE=1",
     "# An inherited BASHOPTS/SHELLOPTS could break the globs and path checks:",
     "# failglob (an unmatched .[!.]* or ..?* is an error), nocasematch (a path",
     "# case matches any letter case, while the ${x#...} removal after it does",
@@ -551,6 +572,7 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     '  _croot="${_croot%x}"; _croot="${_croot%?}"',
     '  if [ -n "$_croot" ]; then CONFIG_ROOT="$_croot"; fi',
     "fi",
+    ...profileDetectionShellLines(profile),
     "",
     "# Staging holds the archive tree; WORK holds scratch JSON kept OUT of the tar.",
     'STAGING="$(mktemp -d)"',
@@ -941,6 +963,8 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "  fi",
     'done < "$WORK/hook-refused.tsv"; fi',
     "",
+    ...memoryStagingShellLines(tarExcludeFlags()),
+    "",
     "# ── Step 5 — MCP server DEFINITIONS from EVERY source (key names only, NO values) ──",
     'step "Extracting MCP server definitions (names only — no secret values)"',
     "# Claude Code — the host ~/.claude.json (definitions-only). Its found flag is the",
@@ -1010,6 +1034,7 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     '  _desc="$(jq -cn --argjson km "$_kmc" --argjson ip "$_ipc" \'' +
       pluginExtractionJq() +
       "' 2>/dev/null || echo 'null')\"",
+    ...premiumFilterShellLines(),
     "  # Include the plugins member only when it carries at least one entry.",
     '  if [ -n "$_desc" ] && [ "$_desc" != "null" ] \\',
     '     && [ "$(printf \'%s\' "$_desc" | jq -r \'((.marketplaces | length) + (.plugins | length))\')" != "0" ]; then',
@@ -1048,6 +1073,8 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     '  --argjson settingsScripts "$SETTINGS_SCRIPTS_JSON" \\',
     '  --argjson plugins "$PLUGINS_JSON" \\',
     '  --argjson omissions "$OMISSIONS_JSON" \\',
+    '  --arg profile "$PROFILE" \\',
+    '  --argjson memory "$MEMORY_JSON" \\',
     "  '{",
     "    schemaVersion: $schemaVersion,",
     "    generatedAt: $generatedAt,",
@@ -1066,7 +1093,10 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "  }",
     '  + (if $sourceMachine != "" then {sourceMachine: $sourceMachine} else {} end)',
     "  + (if $claudeMd != null then {claudeMd: $claudeMd} else {} end)",
-    "  + (if $plugins != null then {plugins: $plugins} else {} end)' \\",
+    "  + (if $plugins != null then {plugins: $plugins} else {} end)",
+    // #4373: a `full` manifest stays byte-identical to before (no profile field).
+    '  + (if $profile == "tenant" then {profile: $profile} else {} end)',
+    "  + (if $memory != null then {memory: $memory} else {} end)' \\",
     '  > "$STAGING/manifest.json"',
     "",
     "# ── Step 10.5 — break hard links (the import refuses hardlink members too) ──",
@@ -1092,6 +1122,31 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     '  [ -e "$_m" ] && _members="$_members $_m"',
     "done",
     `tar -czf "config-port.${ARCHIVE_FORMAT}" $_members`,
+    "",
+    "# ── Step 11.5 — #4373 (R5): the hygiene gate ──",
+    "# (no step call: the step count and progress bar are unchanged)",
+    "# An archive copied off this machine cannot be recalled, so it is checked",
+    "# before its path is printed or it is uploaded: no plugin payload, credential",
+    "# file, transcript or credential-bearing name, no secret value shape in any",
+    "# file, and no premium plugin in a tenant manifest. On a hit the archive is",
+    "# deleted and the export stops, naming each rule and file.",
+    ...archiveHygieneShellLines(),
+    'mkdir -p "$WORK/hygiene"',
+    "_grc=0",
+    `porter_archive_hygiene "config-port.${ARCHIVE_FORMAT}" "$WORK/hygiene" > "$WORK/hygiene-hits.txt" || _grc=$?`,
+    'if [ "$_grc" -ne 0 ]; then',
+    `  rm -f "config-port.${ARCHIVE_FORMAT}"`,
+    '  if [ "$_grc" -eq 2 ]; then',
+    "    printf '\\nerror: the hygiene check could not read the archive, so it was deleted\\n' >&2",
+    "    printf 'and nothing was written or uploaded.\\n' >&2",
+    "  else",
+    "    printf '\\nerror: the archive failed its hygiene check, so it was deleted and nothing\\n' >&2",
+    "    printf 'was written or uploaded. Each line names the rule and the file:\\n' >&2",
+    '    while IFS= read -r _gl; do printf \'  %s\\n\' "$_gl" >&2; done < "$WORK/hygiene-hits.txt"',
+    "    printf 'Remove the secret (or the file) from your configuration, then run the export again.\\n' >&2",
+    "  fi",
+    "  exit 1",
+    "fi",
     "",
     "printf '\\nDone. Upload THIS file to the destination instance:\\n' >&2",
     ...exportFragment.split("\n"),

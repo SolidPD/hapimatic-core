@@ -89,8 +89,8 @@ export function ApiKeyRegistrationCard({
       >
         <KeyRound className="h-4 w-4 flex-shrink-0" aria-hidden="true" />
         <span>
-          Registered the {descriptor.provider} key ({maskedResult}). It's now on
-          your API Keys page and ready to validate.
+          Registered the {descriptor.provider} key ({maskedResult}). It's now in
+          your Provider API Keys and ready to validate.
         </span>
       </div>
     );

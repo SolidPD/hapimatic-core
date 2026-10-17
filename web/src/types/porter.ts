@@ -179,7 +179,9 @@ export type PlannedItemKind =
   // manifest `hookSupport` dimension (mirror drift-fix, #3590).
   | "hook-lib"
   // #4173: the top-level script an imported statusLine/apiKeyHelper runs.
-  | "settings-script";
+  | "settings-script"
+  // #4373: a tenant archive's auto-memory file (`projects/<key>/memory/…`).
+  | "memory";
 
 /** #4173 (D5): a carried script's content preview — inert text, never executed. */
 export interface ScriptPreview {
@@ -353,6 +355,8 @@ export interface ImportGroups {
   rules: string[];
   outputStyles: string[];
   claudeMd: string[];
+  /** #4373: a tenant archive's memory file destPaths (absent from an older server). */
+  memory?: string[];
   /**
    * #3448 (Sub C): per-source grouping for the archive-received review cards.
    * MIRROR of `ImportGroups.bySource` in `server/src/porter/commitSelection.ts`;

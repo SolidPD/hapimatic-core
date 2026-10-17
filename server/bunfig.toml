@@ -1,0 +1,3 @@
+# Issue #4349: pin the VM class for every server test (see src/test/tenantModeDefault.ts).
+[test]
+preload = ["./src/test/tenantModeDefault.ts"]

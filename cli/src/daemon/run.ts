@@ -3,6 +3,13 @@ import { ApiClient } from "@/api/api";
 import { accountStore } from "@/accounts/accountStore";
 import { createUtilizationSampler } from "@/accounts/utilizationSampler";
 import { CredentialsWatcher } from "@/accounts/credentialsWatcher";
+import {
+  isTenantVm,
+  scrubTenantProviderEnv,
+  tenantBootLine,
+  tenantUsageReadAllowed,
+} from "@/accounts/tenantMode";
+import { createTenantUtilizationSampler } from "@/accounts/tenantUtilizationSampler";
 import { fetchOauthProfile } from "@/accounts/oauthProfile";
 import {
   seedAccountsAtBoot,
@@ -482,6 +489,14 @@ export async function startDaemon(
     const daemonJobRegistry = new JobRegistry();
     const daemonJobNode = machineId ?? "standalone";
 
+    // #4349 (R3): the tenant decision, ONCE, at the daemon's single choke point. On a tenant
+    // the SPD-delivered onboarding token(s) leave the daemon env BEFORE the boot record could
+    // hold them, so nothing below seeds, holds, injects or hands them to a tmux server or child.
+    const tenantVm = isTenantVm();
+    ctx.tenantVm = tenantVm;
+    if (tenantVm)
+      logger.info(tenantBootLine(scrubTenantProviderEnv(process.env)));
+
     // #4153: what `hapi doctor` judges (socket path, accounts dir, token state),
     // for the boot write. It holds the instance credential (#3731 R0b) BEFORE the
     // control server can accept a spawn.
@@ -679,16 +694,21 @@ export async function startDaemon(
     let credentialsWatcher: CredentialsWatcher | undefined;
     try {
       await accountStore.list();
-      credentialsWatcher = new CredentialsWatcher({
-        accountStore,
-        notify: notice => api.reportAccountCaptured(notice),
-        profileFetch: fetchOauthProfile,
-        jobRegistry: daemonJobRegistry,
-        jobNode: daemonJobNode,
-      });
-      credentialsWatcher.start();
+      // #4349 (R3): a tenant never captures a `claude /login` into Hapimatic's store.
+      credentialsWatcher = tenantVm
+        ? undefined
+        : new CredentialsWatcher({
+            accountStore,
+            notify: notice => api.reportAccountCaptured(notice),
+            profileFetch: fetchOauthProfile,
+            jobRegistry: daemonJobRegistry,
+            jobNode: daemonJobNode,
+          });
+      credentialsWatcher?.start();
       logger.debug(
-        "[DAEMON RUN] Credentials watcher started (account auto-capture)"
+        tenantVm
+          ? "[TENANT] credentials watcher not started (#4349)"
+          : "[DAEMON RUN] Credentials watcher started (account auto-capture)"
       );
     } catch (error) {
       logger.debug(
@@ -1166,22 +1186,43 @@ export async function startDaemon(
       // mirroring usageService), computes the shared pacing score, and caches it on the
       // account store; the veto in sessionSpawner reads that cache at spawn time. The
       // factory swallows its own errors so a sampler fault never breaks the refresh tick.
-      sampleUtilization: createUtilizationSampler({
-        readAccessToken: async uuid => {
-          const res = await accountStore.get(uuid).catch(() => null);
-          return res && res.ok ? res.account.accessToken : null;
-        },
-        writeSnapshot: (uuid, snapshot) =>
-          accountStore.setUtilizationSnapshot(uuid, snapshot),
-        readSnapshot: uuid => accountStore.getUtilizationSnapshot(uuid),
-      }),
+      // #4349: a tenant runs no refresh tick — its sampler is re-hosted on its own timer below.
+      sampleUtilization: tenantVm
+        ? undefined
+        : createUtilizationSampler({
+            readAccessToken: async uuid => {
+              const res = await accountStore.get(uuid).catch(() => null);
+              return res && res.ok ? res.account.accessToken : null;
+            },
+            writeSnapshot: (uuid, snapshot) =>
+              accountStore.setUtilizationSnapshot(uuid, snapshot),
+            readSnapshot: uuid => accountStore.getUtilizationSnapshot(uuid),
+          }),
       // #1964 (Sub-D): register the token-refresh loop into the daemon job
       // registry (Approach 2 — the central watchdog below supplies its missing
       // stall detection since it keeps its own adaptive scheduler).
       jobRegistry: daemonJobRegistry,
       jobNode: daemonJobNode,
     });
-    tokenRefreshService.start();
+    // #4349 (R3): Hapimatic never refreshes a provider token on a tenant — native Claude Code
+    // rotates each account in its own dir. The #3023 sampler that rides this tick moves onto its
+    // own timer (reading each isolated dir, D10), unless HAPI_TENANT_USAGE_READ=0 turns it off —
+    // then the un-pinned spawn veto has no utilization data on this VM.
+    const tenantSampler =
+      tenantVm && tenantUsageReadAllowed()
+        ? createTenantUtilizationSampler({
+            accountStore,
+            registry: daemonJobRegistry,
+            node: daemonJobNode,
+          })
+        : null;
+    if (!tenantVm) tokenRefreshService.start();
+    else {
+      tenantSampler?.start();
+      logger.info(
+        `[TENANT] token refresh off; usage/pacing reads ${tenantSampler ? "on (VM-local, api.anthropic.com only)" : "off (HAPI_TENANT_USAGE_READ=0)"} (#4349)`
+      );
+    }
 
     // #1964 (Sub-D): central stall-watchdog for Approach-2 loops. token-refresh
     // keeps its own adaptive scheduler (it is NOT a SupervisedLoop), so this
@@ -1277,11 +1318,26 @@ export async function startDaemon(
     // dedup, and the daemon's restartBoundSessions closure so it can observe
     // steps 3/4.
     forceRefreshHandler = (accountUuid: string): Promise<ForceRefreshReport> =>
-      runForceRefreshHarness(accountUuid, {
-        accountStore,
-        forceRefresh: uuid => tokenRefreshService.forceRefresh(uuid),
-        restartBoundSessions,
-      });
+      tenantVm
+        ? Promise.resolve({
+            accountUuid,
+            overall: "fail" as const,
+            durationMs: 0,
+            steps: [
+              {
+                name: "tenant VM",
+                status: "fail" as const,
+                detail:
+                  "Hapimatic does not refresh provider credentials on a tenant VM (#4349).",
+              },
+            ],
+            warnings: [],
+          })
+        : runForceRefreshHarness(accountUuid, {
+            accountStore,
+            forceRefresh: uuid => tokenRefreshService.forceRefresh(uuid),
+            restartBoundSessions,
+          });
 
     // #2081: assign the late-created members the health scheduler reads onto
     // ctx, then build + start the daemon-maintenance loop via the extracted
@@ -1331,6 +1387,7 @@ export async function startDaemon(
       // and awaits any in-flight refresh within a bounded timeout so daemon
       // shutdown can't hang.
       await tokenRefreshService.stop();
+      tenantSampler?.stop(); // #4349: the tenant's re-hosted utilization sampler
       // Issue #4679: cancel scheduled post-rotation restart retries.
       boundSessionRestarter.stop();
 

@@ -91,6 +91,7 @@ import {
 } from "./visibilityProbe";
 import { resolveCommitExclusions } from "./commitSelection";
 import { tolerateMissingSecrets } from "./definitionsOnly";
+import { buildPluginRemediation, planTenant } from "./planTenant";
 import { rebuildMcpItemsWithOverlay, type SecretOverlay } from "./mcpRebuild";
 import {
   findEntry,
@@ -194,7 +195,10 @@ export type PlannedItemKind =
   | "hook-lib"
   // #4173: the top-level script an imported statusLine/apiKeyHelper runs
   // (./planSettingsScripts), written only at the exact path the value names.
-  | "settings-script";
+  | "settings-script"
+  // #4373: a tenant archive's auto-memory file, remapped into an existing
+  // project's `projects/<key>/memory/` folder (./planTenant).
+  | "memory";
 
 /** A single file staged for import. `stagedPath` is server-internal (never wired). */
 export interface PlannedFileItem {
@@ -513,13 +517,6 @@ interface PluginExecOptions {
 export const PORTER_STAGING_TTL_MS = 30 * 60 * 1000; // an uncommitted plan's lifetime
 /* ── Helpers — destination resolvers moved to ./importDestination (#2806, #2077 max-lines) ── */
 
-/** Shell-quote an interpolated field for the F12 remediation command list. */
-function shellQuote(value: string): string {
-  if (value.length === 0) return "''";
-  if (/^[A-Za-z0-9_./:@=-]+$/.test(value)) return value;
-  return "'" + value.replace(/'/g, `'\\''`) + "'";
-}
-
 /* ── findEntry moved to ./planHooks (#3590, #2077 max-lines) — imported above. ── */
 
 /* ── Plan ── */
@@ -823,6 +820,12 @@ export async function planImport(
       files,
     });
     await stageSettingsScripts(scriptPlans, files, stagedItems);
+    // #4373: the memory section and the premium refusal (./planTenant).
+    const tenant = await planTenant(entries, manifest, files, stagedItems, {
+      claudeDir,
+      stagingDir,
+      homeDir,
+    });
     // #4160 backstop: every producer's destination, checked once (fail-closed).
     // #4173 (R7): the referenced-script set is recomputed here, not taken from the planner.
     assertPlannedDestinations(claudeDir, files, {
@@ -898,7 +901,7 @@ export async function planImport(
         : undefined;
 
     // 11. F12 plugin remediation (import execution is #2465; we only emit commands).
-    const pluginRemediation = buildPluginRemediation(manifest);
+    const pluginRemediation = buildPluginRemediation(tenant.manifest);
 
     const plan: ImportPlan = {
       stagingHandle,
@@ -908,7 +911,7 @@ export async function planImport(
       dataDir: opts.dataDir,
       settingsFile: opts.settingsFile,
       accountConfigBases,
-      manifest,
+      manifest: tenant.manifest,
       files,
       fileConflicts,
       modeReconcile,
@@ -932,6 +935,8 @@ export async function planImport(
         ...(claudeMdPlan?.notices ?? []),
         ...scriptPlan.skipped,
         ...hookHolds,
+        ...tenant.notices,
+        ...tenant.skipped,
       ],
       // A missing carried script is a notice; a #5178 / #4331 hold is a refusal.
       policySkips: [
@@ -941,10 +946,11 @@ export async function planImport(
           o => o.reason !== SETTINGS_SCRIPT_IMPORT_REASONS.missing
         ),
         ...hookHolds,
+        ...tenant.skipped,
       ],
       claudeMdRewrite: claudeMdPlan?.rewrite,
       pluginRemediation,
-      pluginDescriptorPresent: Boolean(manifest.plugins),
+      pluginDescriptorPresent: Boolean(tenant.manifest.plugins),
       createdAt: now,
       ttlMs: opts.ttlMs ?? PORTER_STAGING_TTL_MS,
     };
@@ -957,19 +963,7 @@ export async function planImport(
   }
 }
 
-/** Build the deterministic F12 plugin-remediation command list (shell-quoted). */
-function buildPluginRemediation(manifest: PorterManifest): string[] {
-  if (!manifest.plugins) return [];
-  const cmds: string[] = [];
-  for (const m of manifest.plugins.marketplaces) {
-    cmds.push(`claude plugin marketplace add ${shellQuote(m.source)}`);
-  }
-  for (const p of manifest.plugins.plugins) {
-    const ref = `${p.name}@${p.marketplace}`;
-    cmds.push(`claude plugin install ${shellQuote(ref)}`);
-  }
-  return cmds;
-}
+/* ── buildPluginRemediation moved to ./planTenant (#4373, #2077 max-lines). ── */
 
 async function readJsonObject(path: string): Promise<Record<string, unknown>> {
   try {

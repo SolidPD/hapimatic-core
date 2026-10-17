@@ -134,7 +134,7 @@ export function settingsScriptLoopLines(): string[] {
     '_sscarried="$_ssnl"',
     "# D3: the literal <home>/.claude/ prefix becomes $HOME/.claude/ in the two values.",
     `SETTINGS_JSON="$(printf '%s' "$SETTINGS_JSON" | jq -c --arg home "$HOME/.claude/" '${settingsScriptNormalizeJq()}' 2>/dev/null || printf '%s' "$SETTINGS_JSON")"`,
-    `printf '%s' "$SETTINGS_JSON" | jq -c ${settingsScriptClassifierArgs()} '${settingsScriptClassifierJq()}' > "$WORK/sscript-rows.jsonl"`,
+    `printf '%s' "$SETTINGS_JSON" | jq -c ${settingsScriptClassifierArgs()} '${settingsScriptClassifierJq()}' >| "$WORK/sscript-rows.jsonl"`,
     "while IFS= read -r _ssrow; do",
     '  [ -n "$_ssrow" ] || continue',
     '  _sskey="$(printf \'%s\' "$_ssrow" | jq -r .key)"',

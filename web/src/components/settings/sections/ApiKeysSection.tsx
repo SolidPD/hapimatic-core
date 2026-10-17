@@ -17,9 +17,10 @@ const INPUT_CLASS =
   "rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2 text-[var(--app-fg)]";
 
 /**
- * ApiKeysSection — the "API Keys" section of Settings → Keys (issue #1955,
- * epic #1954; folded from the former `/settings/api-keys` page by the Settings
- * sidebar reorganization).
+ * ApiKeysSection — the "Provider API Keys" section of Settings → Provider Accounts
+ * (issue #1955, epic #1954; folded from the former `/settings/api-keys` page onto
+ * the Keys page by the Settings sidebar reorganization, then onto the Provider
+ * Accounts page by #4906).
  *
  * The management-UI half of the secrets vault: list / add / remove node-local
  * provider API keys. Persistence goes through the server's createApiKeysRoutes,

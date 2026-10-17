@@ -7,6 +7,7 @@ import {
 } from "@hapi/protocol/schemas";
 import type {
   FeedbackAttachment,
+  FeedbackEntryCategory,
   FeedbackMetadata,
 } from "@hapi/protocol/types";
 import type { Store } from "../../store";
@@ -43,6 +44,80 @@ function scrubDeep(value: unknown): unknown {
 
 function scrubMetadata(metadata: FeedbackMetadata): FeedbackMetadata {
   return scrubDeep(metadata) as FeedbackMetadata;
+}
+
+export interface PersistAndSendInput {
+  namespace: string;
+  category: FeedbackEntryCategory;
+  /** Already scrubbed by the caller. */
+  description: string;
+  submitterEmail: string | null;
+  /** Already scrubbed by the caller. */
+  metadata: FeedbackMetadata;
+  /** Already validated by the caller (MIME allowlist + size cap). */
+  attachments: FeedbackAttachment[];
+}
+
+export interface PersistAndSendResult {
+  id: string;
+  delivery: "sent" | "skipped" | "error";
+}
+
+/**
+ * The feedback pipeline's persist-then-send core (R7, R10), shared by
+ * `POST /api/feedback` and the support escalation (`routes/support.ts`, issue
+ * #4371): persist the row FIRST, then deliver best-effort through the resolved
+ * transport and record the outcome. A skipped or failed send never loses the
+ * persisted row.
+ */
+export async function persistAndSendFeedback(
+  store: Store,
+  senderConfig: FeedbackSenderConfig,
+  input: PersistAndSendInput
+): Promise<PersistAndSendResult> {
+  const attachmentRefs = input.attachments.map(att => ({
+    filename: att.filename,
+    mimeType: att.mimeType,
+    size: Buffer.from(att.data, "base64").length,
+  }));
+  const attachmentsJson =
+    attachmentRefs.length > 0 ? JSON.stringify(attachmentRefs) : null;
+
+  // R7 — persist FIRST. The row is the durable record; email is best-effort.
+  const entry = store.feedback.createEntry({
+    namespace: input.namespace,
+    category: input.category,
+    description: input.description,
+    submitterEmail: input.submitterEmail,
+    metadataJson: JSON.stringify(input.metadata),
+    attachmentsJson,
+  });
+
+  // R10 — best-effort email. A skip/failure never loses the persisted row.
+  // The SAME structured input both renders the direct-AgentMail email and is
+  // the relay's request payload (#2667): the relay rebuilds the email from these
+  // fields rather than trusting a caller-rendered body. Kept fork-free (R3) — the
+  // route always builds `emailInput`; `sendFeedbackEmail` selects the transport.
+  const emailInput: FeedbackEmailInput = {
+    category: input.category,
+    description: input.description,
+    submitterEmail: input.submitterEmail,
+    metadata: input.metadata,
+    attachments: input.attachments.length > 0 ? input.attachments : undefined,
+  };
+  const email = buildFeedbackEmail(emailInput);
+  const result = await sendFeedbackEmail(senderConfig, email, emailInput);
+  if (result.status === "sent") {
+    store.feedback.updateEmailStatus(entry.id, true, null);
+  } else if (result.status === "error") {
+    console.error(
+      `[feedback] email send failed for ${entry.id}: ${result.error}`
+    );
+    store.feedback.updateEmailStatus(entry.id, false, result.error);
+  } else {
+    console.log(`[feedback] email skipped for ${entry.id}: ${result.reason}`);
+  }
+  return { id: entry.id, delivery: result.status };
 }
 
 /**
@@ -111,11 +186,6 @@ export function createFeedbackRoutes(
       // row (and its attachment refs) persisted. The bytes ride the email; the row
       // persists only the refs (filename/mimeType/size), not the file bytes.
       const emailAttachments: FeedbackAttachment[] = [];
-      const attachmentRefs: Array<{
-        filename: string;
-        mimeType: string;
-        size: number;
-      }> = [];
       let attachmentBytes = 0;
       for (const att of data.attachments ?? []) {
         const bytes = Buffer.from(att.data, "base64").length;
@@ -147,49 +217,18 @@ export function createFeedbackRoutes(
           mimeType: att.mimeType,
           data: att.data,
         });
-        attachmentRefs.push({ filename, mimeType: att.mimeType, size: bytes });
       }
-      const attachmentsJson =
-        attachmentRefs.length > 0 ? JSON.stringify(attachmentRefs) : null;
 
-      // R7 — persist FIRST. The row is the durable record; email is best-effort.
-      const entry = store.feedback.createEntry({
+      const { id } = await persistAndSendFeedback(store, senderConfig, {
         namespace,
         category: data.category,
         description,
         submitterEmail: data.submitterEmail ?? null,
-        metadataJson: JSON.stringify(metadata),
-        attachmentsJson,
+        metadata,
+        attachments: emailAttachments,
       });
 
-      // R10 — best-effort email. A skip/failure never loses the persisted row.
-      // The SAME structured input both renders the direct-AgentMail email and is
-      // the relay's request payload (#2667): the relay rebuilds the email from these
-      // fields rather than trusting a caller-rendered body. Kept fork-free (R3) — the
-      // route always builds `emailInput`; `sendFeedbackEmail` selects the transport.
-      const emailInput: FeedbackEmailInput = {
-        category: data.category,
-        description,
-        submitterEmail: data.submitterEmail ?? null,
-        metadata,
-        attachments: emailAttachments.length > 0 ? emailAttachments : undefined,
-      };
-      const email = buildFeedbackEmail(emailInput);
-      const result = await sendFeedbackEmail(senderConfig, email, emailInput);
-      if (result.status === "sent") {
-        store.feedback.updateEmailStatus(entry.id, true, null);
-      } else if (result.status === "error") {
-        console.error(
-          `[feedback] email send failed for ${entry.id}: ${result.error}`
-        );
-        store.feedback.updateEmailStatus(entry.id, false, result.error);
-      } else {
-        console.log(
-          `[feedback] email skipped for ${entry.id}: ${result.reason}`
-        );
-      }
-
-      return c.json({ id: entry.id }, 201);
+      return c.json({ id }, 201);
     }
   );
 

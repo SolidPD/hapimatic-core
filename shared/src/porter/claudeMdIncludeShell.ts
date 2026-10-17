@@ -355,11 +355,22 @@ export const PORTER_STAGING_MARKER = ".hapi-porter-staging";
  * failure after the archive clear exits non-zero with no
  * `config-port.tar.gz` present, including a summary line that cannot be
  * printed (SIGPIPE is ignored, so a closed pipe fails the `echo` rather than
- * killing the run first); a step that fails is named on a prefixed line after
- * the failing tool's own message, saying whether `manifest.json` was already
- * rewritten. The exit cleanup removes its temp directory and temp
- * files, reports a temp directory it could not remove, and exits with the
- * run's own status. It never prints an include's contents; a `jq` error on a
+ * killing the run first) and (#4587) a TERM, INT or HUP: from the archive
+ * clear on, a signal ends the run with a prefixed line naming the step it
+ * interrupted, and an archive the run had already published is removed unless
+ * its last summary line was printed. A step that fails is named on a prefixed
+ * line after the failing tool's own message, saying whether `manifest.json`
+ * was already rewritten. Just before it publishes, the run checks that the
+ * shell that ran the block is still alive (`kill -0` on its parent): a TERM to
+ * that shell alone ends it and leaves this script running, and an orphaned run
+ * publishes nothing. The archive's `manifest.json` must be a regular file
+ * before `cmp` reads it (a FIFO would block it forever). When the read-back
+ * refuses and a staged name holds a newline, a second prefixed line names it,
+ * as BusyBox lists such a name as two. The exit cleanup removes its temp
+ * directory and temp files, reports a temp directory or temp file it could not
+ * remove, and exits with the run's own status. `COPYFILE_DISABLE=1` is set, so
+ * macOS bsdtar adds no `._` AppleDouble member. Every write that truncates a
+ * file is `>|`. It never prints an include's contents; a `jq` error on a
  * malformed `manifest.json` can echo a short fragment of it.
  *
  * The wrapper writes the script to a temp file with `>|` (so a `noclobber`
@@ -368,8 +379,16 @@ export const PORTER_STAGING_MARKER = ".hapi-porter-staging";
  * script only when the write succeeded AND the file ends with
  * {@link INCLUDE_CHECK_END_LINE}, so a failed or truncated write runs none of
  * it; that path exits non-zero and, in a marked directory, removes an earlier
- * `config-port.tar.gz`, as it does for a relative `TMPDIR` and when the script
- * exits 126 or 127 (bash could not run it, or a command it ran was missing).
+ * `config-port.tar.gz`, as it does for a relative `TMPDIR`. #4587: bash runs
+ * through `env` without `BASH_ENV`, `SHELLOPTS`, `BASHOPTS` or any variable
+ * whose value starts with `() {` (an exported shell function, in every spelling
+ * bash imports), so the caller's shell can neither skip the script nor shadow
+ * a command it runs. The script's first command removes the script, so a
+ * script still there after bash returns never ran (bash crashed, was a shim, or
+ * skipped it): whatever bash returned, the run fails and, in a marked
+ * directory, removes an earlier archive, as it also does when the script
+ * exits 126 or 127. A signal that arrives before the script's first line, or a
+ * SIGKILL at any point, can still leave the temp script in `TMPDIR`.
  * `mktemp` and `cat` run in conditions, `bash` runs as an `if` condition, and
  * each archive clear ends in `|| :`, so a `set -e` shell still reaches the
  * removal of the temp script; the final status test sets the exit status.
@@ -387,6 +406,11 @@ export function buildIncludeCheckShellFragment(
     `if [ "$_tmprel" -eq 0 ]; then CHECK="$(mktemp)" || CHECK=''; else CHECK=''; fi`,
     `if [ -n "$CHECK" ] && cat >| "$CHECK" <<'INCLUDE_CHECK_EOF'`,
     "set -eu",
+    "# #4587: this script removes itself first, so the wrapper reads a script",
+    "# still there after bash returns as one that never ran (bash keeps reading",
+    "# it from its open file). _ckparent is the shell that ran this block.",
+    'rm -f -- "$0"',
+    "_ckparent=$PPID",
     "# A closed stdout makes the summary echo fail (EPIPE), which removes the",
     "# archive, instead of killing the run with SIGPIPE before it can.",
     "trap '' PIPE",
@@ -394,6 +418,11 @@ export function buildIncludeCheckShellFragment(
     "# trailing byte that is not UTF-8 as the start of a character and swallows",
     "# the newline after it, so a listed credential path would be lost.",
     "export LC_ALL=C",
+    "# #4587 (R7-R1-6): when this is not set, macOS bsdtar adds a ._<name>",
+    "# AppleDouble member for a file with extended attributes, and a macOS",
+    "# extraction folds it back in, so the read-back below could not see it.",
+    "# GNU tar and BusyBox ignore it.",
+    "export COPYFILE_DISABLE=1",
     "# GNU tar reads TAR_OPTIONS from the environment (bsdtar TAR_READER_OPTIONS",
     "# and TAR_WRITER_OPTIONS); clear every TAR_* variable, so the operator's shell",
     "# cannot change what the tars below write or list (and so an honest run is",
@@ -443,6 +472,21 @@ export function buildIncludeCheckShellFragment(
     `  echo "${INCLUDE_CHECK_SUMMARY_PREFIX} could not remove the earlier ${archive} here, so it is still there and nothing else was changed; delete it and run this block again" >&2`,
     "  exit 1",
     "fi",
+    "# #4587 (SF-F9, R7-SF7): an interrupted run leaves no archive of its own and",
+    "# says so. Without these traps a signal ends the run with the exit trap",
+    "# reading status 0, so the cleanup could not tell it from a finished run.",
+    "# They are set after the clear above: until then a signal changes nothing.",
+    "_sig=''",
+    "_published=0",
+    "_cleanup_on=0",
+    "on_signal() {",
+    '  _sig="$1"',
+    `  if [ "$_cleanup_on" -eq 0 ]; then echo "${INCLUDE_CHECK_SUMMARY_PREFIX} interrupted by SIG$1, so no ${archive} was written (${cleared})" >&2; fi`,
+    '  exit "$2"',
+    "}",
+    "trap 'on_signal TERM 143' TERM",
+    "trap 'on_signal INT 130' INT",
+    "trap 'on_signal HUP 129' HUP",
     "if ! command -v jq >/dev/null 2>&1; then",
     `  echo "${INCLUDE_CHECK_SUMMARY_PREFIX} jq is not installed (${cleared}); it must be installed before this block can run" >&2`,
     "  exit 1",
@@ -557,21 +601,31 @@ export function buildIncludeCheckShellFragment(
     "cleanup() {",
     "  _st=$?",
     "  set +e",
-    '  if [ "$_st" -ne 0 ] && [ -n "$_step" ]; then',
-    "    if [ \"$_rewritten\" -eq 1 ]; then _done='manifest.json here was already rewritten'; else _done='nothing staged here was changed'; fi",
+    "  if [ \"$_rewritten\" -eq 1 ]; then _done='manifest.json here was already rewritten'; else _done='nothing staged here was changed'; fi",
+    '  if [ -n "$_sig" ] && [ "$_published" -eq 2 ]; then',
+    `    echo "${INCLUDE_CHECK_SUMMARY_PREFIX} interrupted by SIG$_sig after the run finished; the ${archive} it reported was kept" >&2`,
+    '  elif [ -n "$_sig" ]; then',
+    `    echo "${INCLUDE_CHECK_SUMMARY_PREFIX} interrupted by SIG$_sig\${_step:+ while $_step}, so no ${archive} was written ($_done; ${cleared})" >&2`,
+    '  elif [ "$_st" -ne 0 ] && [ -n "$_step" ]; then',
     `    echo "${INCLUDE_CHECK_SUMMARY_PREFIX} $_step failed (its error is above), so no ${archive} was written ($_done; ${cleared})" >&2`,
     "  fi",
-    '  if [ -n "$TMP_MANIFEST" ]; then rm -f "$TMP_MANIFEST" 2>/dev/null || :; fi',
-    '  if [ -n "$TMP_ARCHIVE" ]; then rm -f "$TMP_ARCHIVE" 2>/dev/null || :; fi',
+    "  # #4587 (R7-SF7): a run that ends before its last summary line leaves no",
+    "  # archive of its own, even when it had already published one.",
+    `  if [ "$_st" -ne 0 ] && [ "$_published" -eq 1 ]; then rm -f ${archive} 2>/dev/null || echo "${INCLUDE_CHECK_SUMMARY_PREFIX} could not remove the ${archive} this unfinished run wrote; delete it, and never upload it" >&2; fi`,
+    "  # #4587 (R7-SF6): a temp file of ours that cannot be removed is named, as a",
+    "  # temp directory is; the temp archive was never verified.",
+    `  if [ -n "$TMP_MANIFEST" ]; then rm -f "$TMP_MANIFEST" 2>/dev/null || echo "${INCLUDE_CHECK_SUMMARY_PREFIX} could not remove the temp file $TMP_MANIFEST here; delete it" >&2; fi`,
+    `  if [ -n "$TMP_ARCHIVE" ]; then rm -f "$TMP_ARCHIVE" 2>/dev/null || echo "${INCLUDE_CHECK_SUMMARY_PREFIX} could not remove the unverified temp archive $TMP_ARCHIVE here; delete it, and never upload it" >&2; fi`,
     '  if [ -z "$WORK" ]; then exit "$_st"; fi',
     '  chmod -R u+w "$WORK" 2>/dev/null',
     `  rm -rf "$WORK" 2>/dev/null || echo "${INCLUDE_CHECK_SUMMARY_PREFIX} could not remove the temp directory $WORK; delete it" >&2`,
     '  exit "$_st"',
     "}",
     "trap cleanup EXIT",
+    "_cleanup_on=1",
     "_step='creating the temp directory (mktemp -d)'",
     'WORK="$(mktemp -d)"',
-    'OMISSIONS="$WORK/omissions.jsonl"; : > "$OMISSIONS"',
+    'OMISSIONS="$WORK/omissions.jsonl"; : >| "$OMISSIONS"',
     "record_omission() {",
     '  jq -cn --arg s "$1" --arg r "$2" \'{surface: $s, reason: $r}\' >> "$OMISSIONS"',
     "}",
@@ -600,9 +654,9 @@ export function buildIncludeCheckShellFragment(
     "# hooks (find only reads here). The manifest names each as an omission, and",
     "# the temp tree below leaves them out; nothing staged is removed.",
     "_step='listing the credential-bearing names staged here'",
-    'CREDENTIAL_PATHS="$WORK/credential-paths.txt"; : > "$CREDENTIAL_PATHS"',
+    'CREDENTIAL_PATHS="$WORK/credential-paths.txt"; : >| "$CREDENTIAL_PATHS"',
     `for _d in ${CREDENTIAL_DIRS.join(" ")}; do list_credential_names "$HERE" "$_d" "$CREDENTIAL_PATHS"; done`,
-    `jq -Rc --arg r '${ARCHIVE_CREDENTIAL_OMISSION_REASON}' 'select(length > 0) | {surface: ., reason: $r}' "$CREDENTIAL_PATHS" > "$WORK/credential-omissions.jsonl"`,
+    `jq -Rc --arg r '${ARCHIVE_CREDENTIAL_OMISSION_REASON}' 'select(length > 0) | {surface: ., reason: $r}' "$CREDENTIAL_PATHS" >| "$WORK/credential-omissions.jsonl"`,
     "# #4173: the scripts the two executable settings run are built into the",
     "# build directory with the bash exporter's own lines, from $HOME/.claude and",
     "# the settings in manifest.json (normalized there, D3). A settings-scripts",
@@ -628,7 +682,7 @@ export function buildIncludeCheckShellFragment(
     '      if (.[$f] | type) == "array"',
     '      then .[$f] |= map(select((type == "object" and (.path | type) == "string" and (.path as $p | any($cut[]; . as $c | $p == $c or ($p | startswith($c + "/"))))) | not))',
     "      else . end)",
-    `' manifest.json > "$TMP_MANIFEST"`,
+    `' manifest.json >| "$TMP_MANIFEST"`,
     "# The read-back check compares the archive's manifest.json with this copy.",
     'cp "$TMP_MANIFEST" "$WORK/manifest.written"',
     'chmod "$_mmode" "$TMP_MANIFEST"',
@@ -670,7 +724,7 @@ export function buildIncludeCheckShellFragment(
     "# means the copy differs from it, and the run refuses.",
     '_step="taking the credential-bearing paths out of the archive\'s temp copy"',
     'remove_credential_paths "$TREE" "$CREDENTIAL_PATHS"',
-    ': > "$WORK/credential-left.txt"',
+    ': >| "$WORK/credential-left.txt"',
     `for _d in ${CREDENTIAL_DIRS.join(" ")}; do list_credential_names "$TREE" "$_d" "$WORK/credential-left.txt"; done`,
     'if [ -s "$WORK/credential-left.txt" ]; then',
     "  _step=''",
@@ -703,7 +757,7 @@ export function buildIncludeCheckShellFragment(
     'mkdir "$CHK"',
     "archive_matches_build() (",
     "  set -o pipefail",
-    '  _list="$(tar -tzf "$TMP_ARCHIVE" 2>"$WORK/list.err")" || return 1',
+    '  _list="$(tar -tzf "$TMP_ARCHIVE" 2>|"$WORK/list.err")" || return 1',
     "  # Refuse ONLY on tar's own name-stripping warning (GNU 'Removing leading",
     "  # ...', BusyBox 'removing leading ...'), which is the one stderr line that",
     "  # hides a non-canonical name from the case rules below. Any other stderr",
@@ -746,6 +800,8 @@ export function buildIncludeCheckShellFragment(
     "  # root has a CLAUDE.md.",
     '  (cd "$CHK" && tar -xzf "$TMP_ARCHIVE" manifest.json) || return 1',
     '  [ ! -L "$CHK/manifest.json" ] || return 1',
+    "  # #4587 (R9-FIFO): a FIFO or device member would make cmp wait forever.",
+    '  [ -f "$CHK/manifest.json" ] || return 1',
     '  cmp -s "$WORK/manifest.written" "$CHK/manifest.json" || return 1',
     "  # #4235: a manifest.json member written as a hard link to the copy kept",
     "  # above would make cmp compare that copy with itself.",
@@ -824,12 +880,35 @@ export function buildIncludeCheckShellFragment(
     "if ! archive_matches_build; then",
     "  _step=''",
     `  echo "${INCLUDE_CHECK_SUMMARY_PREFIX} could not confirm that the archive holds exactly the CLAUDE.md and claude-includes built from the config root, the settings-scripts built from \\$HOME/.claude and the manifest.json this block wrote, and every other listed name as it is staged here, under canonical names, so no ${archive} was written (manifest.json here was already rewritten; ${cleared})" >&2`,
+    "  # #4587 (R8-BB-NL): BusyBox lists a name holding a newline raw, so the",
+    "  # listing can read it as two names, a repeated or non-canonical one. Name",
+    "  # the first such name, quoted by bash so the newline shows (names only).",
+    "  _NL=$'\\n'",
+    "  _nl=''",
+    "  if [ ${#_here[@]} -gt 0 ]; then",
+    "    # No process substitution: bash before 5.1 cannot parse one in posix",
+    "    # mode (an exported POSIXLY_CORRECT), which would fail every run here.",
+    `    find "\${_here[@]}" -name "*\${_NL}*" -print0 >| "$WORK/newline-names" 2>/dev/null || :`,
+    `    while IFS= read -r -d '' _l; do _nl="$(printf '%q' "$_l")"; break; done < "$WORK/newline-names"`,
+    "  fi",
+    `  if [ -n "$_nl" ]; then echo "${INCLUDE_CHECK_SUMMARY_PREFIX} a name staged here holds a newline ($_nl); a tar that prints such a name as two (BusyBox does) can make the check refuse it: rename it and run this block again" >&2; fi`,
     "  exit 1",
     "fi",
     `_step="publishing ${archive}"`,
+    "# #4587 (SF-F9): a TERM to the shell that ran this block alone ends that",
+    "# shell and leaves this script running; it does not publish for nobody.",
+    'if ! kill -0 "$_ckparent" 2>/dev/null; then',
+    "  _step=''",
+    `  echo "${INCLUDE_CHECK_SUMMARY_PREFIX} the shell that ran this block has ended (a signal stopped it), so no ${archive} was written (manifest.json here was already rewritten; ${cleared})" >&2`,
+    "  exit 1",
+    "fi",
     "# #4235: the archive gets the mode the bash exporter's tar gives it, 0666",
     "# minus the umask (the temp file it was built in is 0600).",
     `chmod "$(printf '%o' $(( 0666 & ~$(umask) )))" "$TMP_ARCHIVE"`,
+    "# #4587 (R7-SF7): marked before the rename, because bash runs a trapped",
+    "# signal only after the rename returns; the name was cleared above, so the",
+    "# cleanup removes only this run's archive (or nothing).",
+    "_published=1",
     `mv -f "$TMP_ARCHIVE" ${archive}`,
     "TMP_ARCHIVE=''",
     "# The summary names the config root it read (#4235).",
@@ -844,17 +923,35 @@ export function buildIncludeCheckShellFragment(
     "_step='printing the summary line'",
     `echo "${INCLUDE_CHECK_SUMMARY_PREFIX} $_packaged ${INCLUDE_CHECK_PACKAGED} $_omitted omitted (listed in manifest.json omissions); $_removed ${INCLUDE_CHECK_CREDENTIALS_REMOVED}; $_src; nothing staged here was changed except manifest.json and ${archive}." || { rm -f ${archive}; exit 1; }`,
     `echo "${SETTINGS_SCRIPT_CHECK_SUMMARY_PREFIX} $_sscarried_n ${SETTINGS_SCRIPT_CHECK_CARRIED} $_ssomitted omitted (listed in manifest.json omissions); the archive's ${SETTINGS_SCRIPTS_DIR} were built from \\$HOME/.claude" || { rm -f ${archive}; exit 1; }`,
+    "# The run is finished: a signal from here on keeps the archive it reported.",
+    "_published=2",
     INCLUDE_CHECK_END_LINE,
     "INCLUDE_CHECK_EOF",
     "then _w=0; else _w=1; fi",
     "_last=''",
     'if [ "$_w" -eq 0 ]; then while IFS= read -r _l; do _last="$_l"; done < "$CHECK"; fi',
     `if [ "$_last" = "${INCLUDE_CHECK_END_LINE}" ]; then`,
-    '  if bash "$CHECK"; then _rc=0; else _rc=$?; fi',
-    "  # 126/127: bash could not run the script (missing or not executable), or a",
-    "  # command the script ran was missing (also 127). Either way the script may",
-    "  # not have cleared an earlier archive, so clear it here.",
-    `  if [ "$_rc" -eq 126 ] || [ "$_rc" -eq 127 ]; then if [ -f ${PORTER_STAGING_MARKER} ]; then rm -f ${archive} || :; fi; fi`,
+    "  # #4587 (SF-F10, R8, R9): bash reads BASH_ENV, SHELLOPTS and BASHOPTS at",
+    '  # startup and imports every variable whose value starts with "() {" as a',
+    "  # function, so the caller's shell could change or skip this script. Run it",
+    "  # without them (SHELLOPTS is readonly in bash, so only env can drop it).",
+    "  if (",
+    "    set --",
+    `    while IFS= read -r _ckl; do case "\${_ckl#*=}" in '() {'*) set -- \${1+"$@"} -u "\${_ckl%%=*}" ;; esac; done <<CHECK_ENV_EOF`,
+    "$(env)",
+    "CHECK_ENV_EOF",
+    `    exec env -u BASH_ENV -u SHELLOPTS -u BASHOPTS \${1+"$@"} bash "$CHECK"`,
+    "  ); then _rc=0; else _rc=$?; fi",
+    "  # #4587 (SF-F7): the script removes itself first, so a script still here",
+    "  # never ran (bash crashed, was a shim, or skipped it): whatever bash",
+    "  # returned, the run failed, and it may not have cleared an earlier archive.",
+    "  # 126/127 (bash could not run the script, or a command it ran was missing)",
+    "  # still clears one too.",
+    '  if [ -e "$CHECK" ]; then',
+    `    echo "${INCLUDE_CHECK_SUMMARY_PREFIX} bash did not run the check script (status $_rc: env or bash may be missing, or bash skipped the script), so none of it ran" >&2`,
+    "    _rc=1",
+    `    if [ -f ${PORTER_STAGING_MARKER} ]; then rm -f ${archive} || :; fi`,
+    `  elif [ "$_rc" -eq 126 ] || [ "$_rc" -eq 127 ]; then if [ -f ${PORTER_STAGING_MARKER} ]; then rm -f ${archive} || :; fi; fi`,
     'elif [ "$_tmprel" -eq 1 ]; then',
     `  echo "${INCLUDE_CHECK_SUMMARY_PREFIX} TMPDIR is a relative path ($TMPDIR), so the check script was not written and none of it ran; set TMPDIR to an absolute path, or unset it, and run this block again" >&2`,
     `  [ ! -f ${PORTER_STAGING_MARKER} ] || rm -f ${archive} || :`,

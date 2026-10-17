@@ -699,6 +699,10 @@ export function createHealthScheduler(
       // worktree daemon; a dev daemon opts out with HAPI_IDLE_REFRESH=off), so a
       // non-rotator never enters the rotating pass and never takes or renews a
       // rotation lease through it. The method never throws; wrap defensively.
+      // Issue #4349 (R3): on a TENANT VM Hapimatic never refreshes a provider token, never clears
+      // its flags and never mirrors a native credential into its own store — native Claude Code
+      // owns each account's dir there. Skip all three provider-credential steps below.
+      if (ctx.tenantVm) return;
       if (ctx.machineRotator) {
         try {
           await tokenRefreshService.refreshIdleIsolatedAccounts();

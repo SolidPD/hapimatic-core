@@ -4,9 +4,9 @@ import { useAppContext } from "@/lib/app-context";
 import { NotificationSettingsBody } from "@/components/NotificationSettings";
 
 /**
- * NotificationsSection — the "Notifications" section of Settings → Preferences
- * (Sub-Issue D, #1038; folded from the former `/settings/notifications` page by the
- * Settings sidebar reorganization).
+ * NotificationsSection — the notification settings on Settings → Notifications
+ * (Sub-Issue D, #1038; folded onto Preferences by the Settings sidebar
+ * reorganization, then back onto its own page by #4906).
  *
  * Renders the same `NotificationSettingsBody` content as the legacy notification
  * modal so the two surfaces stay behaviorally identical (the modal is retained
@@ -18,8 +18,8 @@ import { NotificationSettingsBody } from "@/components/NotificationSettings";
  * section-local instance's refresh would be a no-op for the bell. This mirrors
  * the modal's existing on-close refresh.
  *
- * Rendered inside `routes/settings/preferences.tsx` under the `#notifications`
- * anchor; the sidebar's nested "Notifications" row deep-links there via URL hash.
+ * Rendered inside `routes/settings/notifications.tsx` under the `#preferences`
+ * anchor; the menu's top-level "Notifications" row opens that page.
  */
 export function NotificationsSection() {
   const { api, refreshPushSubscription } = useAppContext();

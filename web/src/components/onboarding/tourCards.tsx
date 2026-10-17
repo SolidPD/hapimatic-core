@@ -14,8 +14,8 @@ import type { OnboardingStepId } from "@hapi/protocol/schemas";
  * and account e-mails into a shipped product. They are decorative
  * (`aria-hidden`); the card text carries the meaning.
  *
- * T5 (v1) names only surfaces that exist today — provider API keys under
- * Settings → Keys and model-subscription accounts under Settings → Accounts.
+ * T5 (v1) names only surfaces that exist today — provider API keys and
+ * model-subscription accounts, both under Settings → Provider Accounts (#4906).
  * The connector checklist (spec §4) is v2 and waits on epic #2716.
  */
 export interface TourCard {
@@ -310,13 +310,13 @@ export const TOUR_CARDS: readonly TourCard[] = [
   {
     id: "t4",
     title: "Watch your usage",
-    body: "Settings → Accounts shows each account's 5-hour and weekly budgets, including per-model limits such as Fable, and when each one resets.",
+    body: "Settings → Provider Accounts shows each account's 5-hour and weekly budgets, including per-model limits such as Fable, and when each one resets.",
     Illustration: UsageIllustration,
   },
   {
     id: "t5",
     title: "Connect your services (optional)",
-    body: "Add model-provider API keys under Settings → Keys, and sign in to your model subscriptions under Settings → Accounts — or skip this and do it later.",
+    body: "Sign in to your model subscriptions and add model-provider API keys under Settings → Provider Accounts — or skip this and do it later. Questions any time: Settings → Help.",
     Illustration: ConnectIllustration,
   },
 ];

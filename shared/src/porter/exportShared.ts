@@ -74,6 +74,9 @@ export const DEFINITIONS_ARCHIVE_MEMBERS: readonly string[] = [
   CLAUDE_INCLUDES_DIR,
   "hooks",
   "settings-scripts",
+  // #4373: the tenant profile's auto-memory (MEMORY_ARCHIVE_DIR, `./tenantProfile`,
+  // spelled here because a full export never stages it; a test pins the two).
+  "memory",
 ];
 
 /** Manifest field name for each dimension DIRECTORY (`output-styles` → `outputStyles`). */
@@ -384,6 +387,22 @@ export function classifyClaudeMdIncludeName(
  */
 export function headerCommentLabel(label: string): string {
   return label.replace(/[\r\n]+/g, " ");
+}
+
+/**
+ * A bash single-quoted string literal for `s` (each `'` becomes `'\''`): the
+ * one quoting rule every bash builder in this folder embeds values with.
+ */
+export function bashSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * A PowerShell single-quoted string literal for `s` (each `'` doubled): the
+ * PowerShell twin of {@link bashSingleQuote}.
+ */
+export function psq(s: string): string {
+  return `'${s.replace(/'/g, "''")}'`;
 }
 
 /**

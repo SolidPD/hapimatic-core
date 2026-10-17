@@ -187,9 +187,23 @@ export function createSessionSpawner(
 
   // Spawn a new session (sessionId reserved for future --resume functionality)
   const spawnSession = async (
-    options: SpawnSessionOptions
+    requested: SpawnSessionOptions
   ): Promise<SpawnSessionResult> => {
-    logger.debugLargeJson("[DAEMON RUN] Spawning session", options);
+    logger.debugLargeJson("[DAEMON RUN] Spawning session", requested);
+    // Issue #4349 (R3): a TENANT VM never injects CLAUDE_CODE_OAUTH_TOKEN into a Claude session —
+    // not a token named by the spawn request, not the held instance credential (below). The
+    // account is selected only by its own CLAUDE_CONFIG_DIR, where the customer signed in.
+    const options: SpawnSessionOptions =
+      ctx.tenantVm &&
+      (requested.agent ?? "claude") === "claude" &&
+      requested.token
+        ? { ...requested, token: undefined }
+        : requested;
+    if (options !== requested) {
+      logger.warn(
+        "[TENANT] ignored an OAuth token named by a Claude spawn request — sign-in happens inside the VM (#4349)"
+      );
+    }
 
     const {
       directory: rawDirectory,
@@ -484,7 +498,10 @@ export function createSessionSpawner(
     const unboundInstanceToken = resolveUnboundInstanceToken({
       agent,
       accountUuid,
-      heldToken: ctx.instanceOAuthToken ?? process.env.CLAUDE_CODE_OAUTH_TOKEN,
+      // #4349: a tenant holds no instance credential (run.ts scrubs it at boot); be explicit.
+      heldToken: ctx.tenantVm
+        ? undefined
+        : (ctx.instanceOAuthToken ?? process.env.CLAUDE_CODE_OAUTH_TOKEN),
       explicitToken: options.token,
       // Issue #4568: the vault key is an API-key session's only credential.
       apiKeyBound: apiKeyBinding !== null,
@@ -2146,7 +2163,7 @@ export function createSessionSpawner(
             await maybeCleanupWorktree("opencode-no-native-key");
             return {
               type: "error",
-              errorMessage: `OpenCode selected the "${nativeProvider}" provider but no API key for it is configured on this node. Add one on the API Keys page (provider: ${nativeProvider}) and retry.`,
+              errorMessage: `OpenCode selected the "${nativeProvider}" provider but no API key for it is configured on this node. Add one in Settings → Provider Accounts → Provider API Keys (provider: ${nativeProvider}) and retry.`,
             };
           }
           extraEnv = {
@@ -2203,7 +2220,7 @@ export function createSessionSpawner(
             return {
               type: "error",
               errorMessage:
-                "OpenCode selected but no OpenRouter API key is configured on this node. Add one on the API Keys page (provider: openrouter) and retry.",
+                "OpenCode selected but no OpenRouter API key is configured on this node. Add one in Settings → Provider Accounts → Provider API Keys (provider: openrouter) and retry.",
             };
           }
           extraEnv = {
@@ -2288,7 +2305,7 @@ export function createSessionSpawner(
           return {
             type: "error",
             errorMessage:
-              "Gemini selected but no Gemini API key is configured on this node. Add one on the API Keys page (provider: gemini) or set GEMINI_API_KEY in the daemon environment, and retry.",
+              "Gemini selected but no Gemini API key is configured on this node. Add one in Settings → Provider Accounts → Provider API Keys (provider: gemini) or set GEMINI_API_KEY in the daemon environment, and retry.",
           };
         }
         // else: no vault key but a node-local GEMINI_API_KEY IS present → leave

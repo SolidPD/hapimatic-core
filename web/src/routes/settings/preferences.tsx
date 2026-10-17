@@ -61,13 +61,17 @@ import { Checkbox } from "@/components/ui/Checkbox";
 import { Input } from "@/components/ui/Input";
 import { tokens } from "@/design/tokens";
 import { ThemePicker } from "@/components/settings/ThemePicker";
-import { NotificationsSection } from "@/components/settings/sections/NotificationsSection";
+import { BackupKeySection } from "@/components/settings/sections/BackupKeySection";
 import { SessionHandoffSection } from "@/components/settings/sections/SessionHandoffSection";
 import { GettingStartedSection } from "@/components/settings/sections/GettingStartedSection";
 import { OnboardingSection } from "@/components/settings/sections/OnboardingSection";
 import { VoiceInputSection } from "@/components/settings/sections/VoiceInputSection";
 import { useScrollToLocationHash } from "@/hooks/useScrollToLocationHash";
-import { Bell, ArrowRightLeft, Sliders } from "lucide-react";
+import { ArrowRightLeft, ShieldCheck, Sliders } from "lucide-react";
+import {
+  useBackupIdentityStatus,
+  isBackupProvisioned,
+} from "@/hooks/queries/useBackupIdentityStatus";
 
 // Copied verbatim from SearchFilterBar.tsx (not exported there — see directive
 // Convention Patterns; copy-verbatim avoids cross-module coupling).
@@ -484,6 +488,9 @@ export default function AdminPreferencesPage() {
   // #2624 (B): the 🌐 engine — per-key inherit flags + provenance.
   const fedSettings = useFederationSettings(api);
   const { localNode, remoteNodes } = useFederatedSessions(api);
+  // #4906 D2: the Backup Key section's gate, the same fail-closed derivation the
+  // retired Keys page used.
+  const backupEligible = isBackupProvisioned(useBackupIdentityStatus(api).data);
 
   // #2624 (B): whenever the 🌐 view refreshes (mount hydrate or a toggle
   // response), push the federated effective values into the value hooks via
@@ -523,7 +530,7 @@ export default function AdminPreferencesPage() {
       className="flex flex-col"
       header={
         // design-system gap (#3038): the decorative section hues (the teal
-        // TitleChip accent here, the amber Notifications tile below) have no
+        // TitleChip accent here, the green Backup Key tile below) have no
         // token — only the cyan was named (--accent-cyan). Sub B follow-up
         // #3335 (decorative section-accent family).
         <SettingsSectionHeader
@@ -959,23 +966,8 @@ export default function AdminPreferencesPage() {
           </div>
         </section>
 
-        {/* Notifications (folded from /settings/notifications — Settings reorg).
-            The sidebar's nested "Notifications" row deep-links here via #notifications. */}
-        <section
-          id="notifications"
-          aria-label="Notifications"
-          className="flex scroll-mt-2 flex-col gap-3 border-t border-[var(--app-border)] pt-6"
-        >
-          <IconSectionHeading
-            icon={Bell}
-            accent="var(--accent-amber-400)"
-            title="Notifications"
-          />
-          <NotificationsSection />
-        </section>
-
         {/* Session Handoff (folded from /settings/watermark — Settings reorg).
-            The sidebar's nested "Session Handoff" row deep-links here via #session-handoff. */}
+            #4906: no menu row; the section stays deep-linkable via #session-handoff. */}
         <section
           id="session-handoff"
           aria-label="Session Handoff"
@@ -988,6 +980,25 @@ export default function AdminPreferencesPage() {
           />
           <SessionHandoffSection />
         </section>
+
+        {/* Backup Key (#2507; #4906 D2: moved here from the retired Keys page, no
+            menu row). Hidden on a node that was never backup-provisioned (every
+            physical node), as the Keys page hid it (#3059 round-3). Deep-linkable
+            via #backup-key, which /settings/keys#backup-key redirects to. */}
+        {backupEligible ? (
+          <section
+            id="backup-key"
+            aria-label="Backup Key"
+            className="flex scroll-mt-2 flex-col gap-3 border-t border-[var(--app-border)] pt-6"
+          >
+            <IconSectionHeading
+              icon={ShieldCheck}
+              accent="var(--accent-green-400)"
+              title="Backup Key"
+            />
+            <BackupKeySection />
+          </section>
+        ) : null}
 
         {/* Voice input (#4707) — installs and configures the on-node speech
             engine. Self-contained: owns <section id="voice-input"> (deep-linked

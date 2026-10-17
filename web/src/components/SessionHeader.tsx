@@ -78,6 +78,7 @@ import { IssueInputModal } from "@/components/IssueInputModal";
 import { Spinner } from "@/components/Spinner";
 import type { RecoveryStatus } from "@/types/api";
 import { Button } from "@/components/ui/button";
+import { SupportSessionBar } from "@/components/SupportSessionBar";
 
 export function SessionHeader(props: {
   session: Session;
@@ -929,6 +930,11 @@ export function SessionHeader(props: {
         nonBlocking
         onError={() => showToast("Failed to branch session", { type: "error" })}
       />
+
+      {/* #4371: the support session's persistent "Contact a human" bar, in flow
+          directly under the header card — renders nothing for every other
+          session (outside the closed icon-row registry, #2366). */}
+      <SupportSessionBar session={session} api={api} />
 
       {/* Issue #2149 / #3290: the Session Configuration modal — opened by the
           Row-1 Account Badge (E9). The kebab entry that also opened it was

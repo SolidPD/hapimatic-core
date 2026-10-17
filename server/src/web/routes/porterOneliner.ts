@@ -299,11 +299,17 @@ export function createPorterOnelinerPublicRoutes(opts: {
       // script self-uploads back to this exact token (R2). No origin → serve the
       // legacy Download/Copy script (no upload step) rather than a broken URL.
       const uploadUrl = origin ? `${origin}/p/${token}/archive` : undefined;
+      // #4373: `?profile=tenant` mints the tenant export (own surfaces plus
+      // memory, no premium descriptors). Any other value mints the default; a
+      // hosted customer VM uses the tenant profile whatever is minted.
+      const profile: "tenant" | undefined =
+        c.req.query("profile") === "tenant" ? "tenant" : undefined;
       const scriptInput = {
         instanceLabel,
         generatedAt: new Date().toISOString(),
         generatorVersion: VERSION,
         uploadUrl,
+        profile,
       };
       if (variant === "powershell") {
         // #3447 (Sub B, R1): the Windows-native PowerShell twin, built from the

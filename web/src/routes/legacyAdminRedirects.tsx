@@ -2,6 +2,21 @@
 import { createRoute, redirect, type AnyRoute } from "@tanstack/react-router";
 
 /**
+ * #4906: the retired Keys page's redirect, shared by `/settings/keys` and `/admin/keys`.
+ * A `#backup-key` link lands on the Backup Key section of Preferences; anything else on
+ * the Provider API Keys section of Provider Accounts.
+ */
+function redirectRetiredKeysPage({
+  location,
+}: {
+  location: { hash: string };
+}): never {
+  throw location.hash.replace(/^#/, "") === "backup-key"
+    ? redirect({ to: "/settings/preferences", hash: "backup-key" })
+    : redirect({ to: "/settings/account-usage", hash: "api-keys" });
+}
+
+/**
  * Legacy `/admin/*` → `/settings/*` permanent redirects (issue #2765, R2/R3/R7).
  *
  * The Settings-menu surface was renamed from "admin" to "settings" (drawer, routes,
@@ -28,6 +43,11 @@ import { createRoute, redirect, type AnyRoute } from "@tanstack/react-router";
  * redirect here alongside `/admin/*`; the never-shipped `/admin/analytics` +
  * `/admin/account-usage` redirects also register purely to keep the 1:1
  * settings↔admin invariant test uniform.
+ *
+ * #4906: the Keys page was retired. `/settings/keys` (and `/admin/keys`) now redirect to
+ * whichever section the link's hash named — `#backup-key` to the Backup Key section on
+ * Preferences, anything else to the Provider API Keys section on Provider Accounts — so
+ * `/settings/keys` is the one redirect-only `/settings/*` path (router.test.tsx counts it).
  *
  * Exposed as a factory because the redirect routes need the app's `rootRoute` as their
  * parent, which is a module-local const in `router.tsx`. The caller passes it in and
@@ -99,6 +119,16 @@ export function makeLegacyAdminRedirects<TRoot extends AnyRoute>(
         throw redirect({ to: "/settings/feedback" });
       },
     }),
+    // #4371: /settings/help is new (never an /admin/* URL); this alias only
+    // keeps the 1:1 /admin/* ↔ /settings/* invariant uniform (the #2745
+    // analytics precedent).
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: "/admin/help",
+      beforeLoad: () => {
+        throw redirect({ to: "/settings/help" });
+      },
+    }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: "/admin/preferences",
@@ -113,11 +143,25 @@ export function makeLegacyAdminRedirects<TRoot extends AnyRoute>(
         throw redirect({ to: "/settings/about" });
       },
     }),
+    // #4906: straight to the split Keys page's new homes (no hop via /settings/keys).
     createRoute({
       getParentRoute: () => rootRoute,
       path: "/admin/keys",
+      beforeLoad: redirectRetiredKeysPage,
+    }),
+    // #4906: the retired Keys page itself — bookmarks, the old menu sub-rows' links.
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: "/settings/keys",
+      beforeLoad: redirectRetiredKeysPage,
+    }),
+    // #4906: the Notifications page. Never-shipped /admin/* alias, registered only
+    // to keep the 1:1 settings↔admin invariant.
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: "/admin/notifications",
       beforeLoad: () => {
-        throw redirect({ to: "/settings/keys" });
+        throw redirect({ to: "/settings/notifications" });
       },
     }),
     createRoute({

@@ -2,6 +2,7 @@
 import { logger } from "@/ui/logger";
 import { accountStore } from "@/accounts/accountStore";
 import { fetchOauthProfile } from "@/accounts/oauthProfile";
+import { isTenantVm } from "@/accounts/tenantMode";
 import type { ResolvedIdentity } from "@/accounts/credentialsWatcher";
 import {
   StoredAccountSchema,
@@ -78,6 +79,11 @@ export interface SeedFromEnvTokenDeps {
    * `opus[1m]` pin (R3).
    */
   deliveredIdentity?: DeliveredAccountIdentity | null;
+  /**
+   * Issue #4349 (R3): the tenant predicate (test seam; defaults to `isTenantVm`). On a TENANT VM
+   * the SPD-delivered token is never seeded into the store — the customer signs in inside the VM.
+   */
+  tenantVm?: () => boolean;
 }
 
 /** Outcome of a seeding attempt — `reason` explains a `seeded:false`. */
@@ -90,7 +96,9 @@ export type SeedFromEnvTokenResult = {
     | "present-invalid"
     | "no-email"
     | "invalid-record"
-    | "error";
+    | "error"
+    // #4349: a tenant VM — the env token is ignored (in-VM sign-in only).
+    | "tenant-vm";
   /**
    * The resolved `accountUuid`, set on the paths where a record for it is on
    * disk — `seeded:true` AND the idempotent `already-present` / `present-invalid`
@@ -118,7 +126,9 @@ export type SeedFromEnvTokenResult = {
 export function seedSkipLogLevel(
   reason: SeedFromEnvTokenResult["reason"]
 ): "info" | "warn" {
-  return reason === "already-present" ? "info" : "warn";
+  return reason === "already-present" || reason === "tenant-vm"
+    ? "info"
+    : "warn";
 }
 
 export async function seedAccountStoreFromEnvToken(
@@ -131,6 +141,13 @@ export async function seedAccountStoreFromEnvToken(
 
   try {
     if (!token) return { seeded: false, reason: "no-token" };
+    // #4349 (R3): never seed an SPD-delivered token on a tenant VM. NEVER log the token.
+    if ((deps.tenantVm ?? isTenantVm)()) {
+      logger.info(
+        "[ACCOUNT_SEED] tenant VM: CLAUDE_CODE_OAUTH_TOKEN ignored — sign-in happens inside the VM (#4349)"
+      );
+      return { seeded: false, reason: "tenant-vm" };
+    }
 
     // Identity resolution: the gateway-DELIVERED identity is PRIMARY (issue
     // #2554), with the profile fetch as the fallback for tokens that CAN reach
@@ -318,6 +335,13 @@ export async function seedAdditionalOnboardingAccounts(
     skippedCount: 0,
     activeAccountUuid: null,
   };
+  // #4349 (R3): never seed SPD-delivered extra accounts on a tenant VM. NEVER log a token.
+  if ((deps.tenantVm ?? isTenantVm)()) {
+    logger.info(
+      "[ACCOUNT_SEED] tenant VM: HAPI_ONBOARDING_OAUTH_TOKENS ignored — sign-in happens inside the VM (#4349)"
+    );
+    return empty;
+  }
 
   // Decode base64 → JSON string[]. Any malformation → skip the whole batch (the
   // primary CLAUDE_CODE_OAUTH_TOKEN account is unaffected). NEVER log a token.

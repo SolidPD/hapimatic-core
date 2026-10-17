@@ -55,6 +55,7 @@ const KIND_TO_DIM: Record<PlannedItemKind, string> = {
   "hook-file": "hooks",
   "hook-lib": "hookSupport",
   "settings-script": "settingsScripts",
+  memory: "memory",
 };
 
 /**

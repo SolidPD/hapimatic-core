@@ -94,6 +94,13 @@ export interface DaemonContext {
    * clear and spawn-time recovery are NOT gated by it.
    */
   machineRotator: boolean;
+  /**
+   * Issue #4349 (R3): this daemon runs on a TENANT VM (`isTenantVm()`, evaluated once at boot).
+   * The maintenance tick and the spawn path skip every Hapimatic-driven provider-credential step
+   * (refresh, flag clear, store mirror, instance-token delivery). Optional so a context built
+   * without it (tests, pre-#4349 callers) reads as not-a-tenant.
+   */
+  tenantVm?: boolean;
   /** The daemon control server's bearer token (spawned children call back with it). */
   controlToken: string;
   /** The daemon control server's bound port. */

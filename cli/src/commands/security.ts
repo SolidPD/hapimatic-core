@@ -642,7 +642,8 @@ function checkAccounts(accounts: {
       id: "account-record-invalid",
       severity: "low",
       message: `account record ${uuid} failed validation and is ignored by the store`,
-      fixHint: "remove the account in Settings → Accounts and add it again",
+      fixHint:
+        "remove the account in Settings → Provider Accounts and add it again",
       fixable: null,
     });
   }

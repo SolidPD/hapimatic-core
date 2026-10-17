@@ -16,6 +16,7 @@ import {
   ProviderIdSchema,
   validateAnyStoredAccount,
   accountProviderOf,
+  isNativeAnthropicAccount,
   type StoredAccount,
   type AnyStoredAccount,
   type OpenAiStoredAccount,
@@ -111,6 +112,25 @@ export type RedactedAccount = z.infer<typeof RedactedAccountSchema>;
  */
 export function toRedactedAccount(account: AnyStoredAccount): RedactedAccount {
   const provider = accountProviderOf(account);
+  // #4349: a token-less account signed in inside the VM — identity only; no expiry, no refresh.
+  if (isNativeAnthropicAccount(account)) {
+    return {
+      provider,
+      accountUuid: account.accountUuid,
+      emailAddress: account.emailAddress,
+      organizationUuid: account.organizationUuid,
+      organizationName: account.organizationName,
+      displayName: account.displayName,
+      billingType: account.billingType,
+      subscriptionType: "",
+      rateLimitTier: "",
+      expiresAt: 0,
+      capturedAt: account.capturedAt,
+      lastUsedAt: account.lastUsedAt,
+      lastRefreshedAt: 0,
+      unrefreshable: false,
+    };
+  }
   if (provider === "anthropic") {
     const a = account as StoredAccount;
     return {

@@ -168,8 +168,9 @@ export const uiCatalogEntries = [
     domain: "ui",
     surface: "ui",
     description:
-      "The Accounts page — add, remove, reorder, and view account usage.",
-    whenToUse: "To point a human at Anthropic account management and usage.",
+      "The Provider Accounts page — model-provider accounts, their usage, and the provider API keys.",
+    whenToUse:
+      "To point a human at provider account management, usage, or provider API keys.",
     invocation: { kind: "ui", location: "/settings/account-usage" },
     auth: "jwt",
     riskTier: "readonly",
@@ -257,7 +258,8 @@ export const uiCatalogEntries = [
     id: "ui.settings-preferences",
     domain: "ui",
     surface: "ui",
-    description: "The user-preferences page (theme, notifications, defaults).",
+    description:
+      "The user-preferences page (theme, defaults, session handoff, backup key).",
     whenToUse: "To point a human at their app preferences.",
     invocation: { kind: "ui", location: "/settings/preferences" },
     auth: "jwt",
@@ -276,12 +278,12 @@ export const uiCatalogEntries = [
     availability: { scope: "user" },
   }),
   defineCapability({
-    id: "ui.settings-keys",
+    id: "ui.settings-notifications",
     domain: "ui",
     surface: "ui",
-    description: "The API keys / service-credentials management page.",
-    whenToUse: "To point a human at provider API-key management.",
-    invocation: { kind: "ui", location: "/settings/keys" },
+    description: "The Notifications page — the notification settings.",
+    whenToUse: "To point a human at their notification settings.",
+    invocation: { kind: "ui", location: "/settings/notifications" },
     auth: "jwt",
     riskTier: "readonly",
     availability: { scope: "user" },

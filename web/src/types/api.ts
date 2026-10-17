@@ -11,7 +11,7 @@ import type {
 } from "@hapi/protocol";
 import type {
   DecryptedMessage as ProtocolDecryptedMessage,
-  FeedbackCategory,
+  FeedbackEntryCategory,
   FederationNodeInfo,
   FederationNodeState,
   FederationNodeStatus,
@@ -26,6 +26,7 @@ import type {
 export type {
   FeedbackAttachment,
   FeedbackCategory,
+  FeedbackEntryCategory,
   FeedbackMetadata,
   FeedbackRequest,
   FeedbackResponse,
@@ -207,7 +208,7 @@ export type FeedbackListItem = {
   id: string;
   createdAt: number;
   namespace: string | null;
-  category: FeedbackCategory;
+  category: FeedbackEntryCategory;
   description: string;
   submitterEmail: string | null;
   /** Scrubbed, composed `FeedbackMetadata`, JSON-serialized (render read-only). */
@@ -220,6 +221,32 @@ export type FeedbackListResponse = {
   items: FeedbackListItem[];
   total: number;
 };
+
+// In-app self-help support (issue #4371, E6 Sub F). The shapes of
+// `server/src/web/routes/support.ts`.
+export type SupportChannelKind = "relay" | "agentmail" | "telegram" | "none";
+
+export type SupportChannelInfo = {
+  kind: SupportChannelKind;
+  /** The human-support reply-times text; empty when none is configured. */
+  hoursText: string;
+  /** Operator-configured issue URL; empty → the public Core repo's. */
+  issueUrl: string;
+  /** Absolute path of the support workspace (identifies support sessions). */
+  workspacePath: string;
+};
+
+export type SupportSessionResponse = { sessionId: string; reused: boolean };
+
+export type SupportEscalationPreview = {
+  /** The exact text that will be sent. */
+  bundle: string;
+  /** sha256 of `bundle`; `send` refuses when it no longer matches. */
+  hash: string;
+  channel: SupportChannelKind;
+};
+
+export type SupportEscalationSendResponse = { id: string; delivered: boolean };
 // Web-initiated OAuth login (issue #1263). `start` returns the Anthropic
 // authorize URL + an opaque loginToken; `complete` returns the redacted new
 // account on success, or a structured error code on failure. Token values are
@@ -229,6 +256,22 @@ export type AccountLoginStartResponse = {
   authorizeUrl: string;
 };
 export type AccountLoginCompleteResponse =
+  | { ok: true; account: RedactedAccount }
+  | { ok: false; error: string; code: string };
+/**
+ * Issue #4349: the error code the web OAuth login answers on a tenant VM, where the user signs in
+ * inside the VM with Claude Code's own /login instead (the in-VM routes below).
+ */
+export const IN_VM_SIGN_IN_REQUIRED = "in_vm_sign_in_required";
+/** Issue #4349: a started in-VM sign-in — the command to run in a terminal on the VM. */
+export type InVmLoginStartResponse = {
+  loginToken: string;
+  accountUuid: string;
+  configDir: string;
+  command: string;
+};
+/** Issue #4349: `not_signed_in` (HTTP 202) means "keep waiting", not a failure. */
+export type InVmLoginCompleteResponse =
   | { ok: true; account: RedactedAccount }
   | { ok: false; error: string; code: string };
 // Codex (OpenAI) in-app login (issue #3807, epic #3345). The API-key path

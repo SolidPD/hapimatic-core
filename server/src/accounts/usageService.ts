@@ -16,6 +16,10 @@ import type {
   RedactedAccount,
 } from "../services/accountService";
 import { VERSION } from "../version.generated";
+import {
+  isTenantVm,
+  providerUsageReadAllowed,
+} from "@hapi/protocol/tenantMode";
 
 /**
  * Per-account usage-fetch service (epic #1855, Sub-Issue B / #1857).
@@ -49,6 +53,7 @@ import { VERSION } from "../version.generated";
 
 /** Anthropic usage endpoint — validated live (HTTP 200 with the oauth-beta header). */
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+// #4349 (D10): this reader is pinned to api.anthropic.com on every node — no override exists.
 /** Required for the OAuth-token usage endpoint (CC `constants/oauth.ts` OAUTH_BETA_HEADER). */
 const OAUTH_BETA_HEADER = "oauth-2025-04-20";
 /** The scope the usage endpoint requires; its absence yields an empty `{}` upstream. */
@@ -173,6 +178,13 @@ export interface UsageServiceOptions {
   /** Host config path — source of the host-default uuid (test seam). */
   hostConfigPath?: string;
   /**
+   * Issue #4349 (ruling D10): the tenant predicate (test seam; defaults to `isTenantVm`). On a
+   * tenant the usage read uses only the credential the binary keeps in the account's own dir (or
+   * the host login's own file) — never the account store — and `HAPI_TENANT_USAGE_READ=0` turns
+   * the read off entirely.
+   */
+  tenantVm?: () => boolean;
+  /**
    * Resolves an account's user-set nickname for the `AccountUsage.nickname`
    * field. Injected (not imported) so the service stays decoupled from the
    * nickname store. Absent → `nickname` is left undefined.
@@ -210,6 +222,8 @@ export class UsageService {
   private readonly hostCredentialsPath: string;
   private readonly hostConfigPath: string;
   private readonly nicknameLookup?: (uuid: string) => string | undefined;
+  /** #4349: the tenant predicate (D10). */
+  private readonly tenantVm: () => boolean;
   private readonly staleAfterMs: number;
   private readonly preserveStaleMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -248,6 +262,7 @@ export class UsageService {
     this.hostConfigPath =
       opts.hostConfigPath ?? join(homedir(), ".claude.json");
     this.nicknameLookup = opts.nicknameLookup;
+    this.tenantVm = opts.tenantVm ?? isTenantVm;
     this.staleAfterMs = opts.staleAfterMs ?? DEFAULT_USAGE_STALE_AFTER_MS;
     this.preserveStaleMs = opts.preserveStaleMs ?? DEFAULT_PRESERVE_STALE_MS;
     this.sleep =
@@ -456,7 +471,13 @@ export class UsageService {
   /** The classification state machine (mirrors CC's `fetchUtilization`). */
   private async classify(account: RedactedAccount): Promise<AccountUsage> {
     const uuid = account.accountUuid;
-    const rec = this.accountService.getRaw(uuid);
+    // #4349 (D10): the tenant kill switch — no credential is read at all; "usage unavailable".
+    const tenant = this.tenantVm();
+    if (tenant && !providerUsageReadAllowed(process.env, true)) {
+      return this.buildUsage(account, "no_scope", {});
+    }
+    // #4349: a tenant never reads a token from the store (Tier 2) — only the binary's own files.
+    const rec = tenant ? null : this.accountService.getRaw(uuid);
     const token = this.resolveToken(uuid, rec);
 
     // Cannot resolve any token → error (nothing to call the endpoint with).

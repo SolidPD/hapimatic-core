@@ -326,6 +326,15 @@ function includeLabel(key: string): string {
   return at >= 0 ? key.slice(at + 1) : leafLabel(key);
 }
 
+/**
+ * #4373: a memory file's label is its project key and file
+ * (`-home-me-projects-app/MEMORY.md`), from `…/projects/<key>/memory/<file>`.
+ */
+function memoryLabel(key: string): string {
+  const m = /\/projects\/([^/]+)\/memory\/(.+)$/.exec(key);
+  return m ? `${m[1]}/${m[2]}` : leafLabel(key);
+}
+
 /** Tri-state of a skill's parent checkbox, derived from its leaves' exclusion. */
 function skillCheckState(
   leaves: readonly string[],
@@ -439,6 +448,7 @@ function sourceSummary(
         [groups.commands.length, "command"],
         [groups.agents.length, "agent"],
         [groups.rules.length, "rule"],
+        [(groups.memory ?? []).length, "memory file"],
         [mcpCount, "MCP server"],
       ] as [number, string][]
     )
@@ -554,7 +564,8 @@ function SelectionTree({
     groups.commands.length === 0 &&
     groups.rules.length === 0 &&
     groups.outputStyles.length === 0 &&
-    groups.claudeMd.length === 0;
+    groups.claudeMd.length === 0 &&
+    (groups.memory ?? []).length === 0;
 
   return (
     <section data-testid="selection-tree">
@@ -676,6 +687,13 @@ function SelectionTree({
             excluded={excluded}
             onToggle={onToggleLeaf}
             labelOf={includeLabel}
+          />
+          <DimGroup
+            title="Memory"
+            keys={groups.memory ?? []}
+            excluded={excluded}
+            onToggle={onToggleLeaf}
+            labelOf={memoryLabel}
           />
         </div>
       )}

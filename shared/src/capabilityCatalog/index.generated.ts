@@ -808,6 +808,66 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Abandon a started in-VM sign-in; removes its config dir only while it is still empty, never a credential.",
+    "domain": "accounts",
+    "id": "accounts.native-login-cancel",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/accounts/native-login/cancel"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user starts the in-VM sign-in over; closing the dialog keeps the sign-in so a reopened dialog resumes it."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Register an in-VM sign-in once the claude binary has written the account identity into its config dir; returns only the redacted account, or not_signed_in while the identity is absent.",
+    "domain": "accounts",
+    "id": "accounts.native-login-complete",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/accounts/native-login/complete"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "After the user runs the in-VM sign-in command and finishes /login on a tenant VM."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "On a tenant VM, create an empty per-account Claude config dir (or resume the caller's unfinished one) and return the command to run claude there and sign in with /login.",
+    "domain": "accounts",
+    "id": "accounts.native-login-start",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/accounts/native-login/start"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a user adds a Claude account on a tenant VM (the web OAuth login answers in_vm_sign_in_required)."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Cancel an in-progress Codex device-auth login by its login token; kills the login child and removes its staging dir, leaving any prior auth untouched.",
     "domain": "accounts",
     "id": "accounts.openai-login-cancel",
@@ -4595,6 +4655,66 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "jwt",
     "availability": {
+      "scope": "user"
+    },
+    "description": "Report where in-app support escalations are delivered (relay, agentmail, telegram, or none), the human-support hours text, and the support workspace path.",
+    "domain": "harness-admin",
+    "id": "harness-admin.support-channel",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/support/channel"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the Help page decides between a Send button and the open-an-issue link."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Compose the redacted Contact-a-human bundle for a support session (version, launcher, harness, recent errors, conversation text) and return it with its sha256, without sending anything.",
+    "domain": "harness-admin",
+    "id": "harness-admin.support-escalation-preview",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/support/escalation/preview"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "Before the user decides to contact a human."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Send the previewed Contact-a-human bundle to the configured support channel; refuses (409) when the bundle changed since the preview or no channel is configured.",
+    "domain": "harness-admin",
+    "id": "harness-admin.support-escalation-send",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/support/escalation/send"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user confirms sending the previewed bundle."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
       "scope": "operator"
     },
     "description": "Apply a harness self-update to a specific harness (privileged, host-mutating).",
@@ -5257,6 +5377,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "cli-token",
     "availability": {
+      "scope": "user"
+    },
+    "description": "Local hardware companion: pair a bench machine and reach it over SSH from a cloud session (start, stop, status, pair, list, ssh, ssh-config, revoke).",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.cli-companion",
+    "invocation": {
+      "command": "companion",
+      "kind": "cli"
+    },
+    "probe": "safe",
+    "riskTier": "destructive",
+    "surface": "cli",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To give a cloud session SSH access to a local bench PC, or to use it."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
       "scope": "operator"
     },
     "description": "Manage the background daemon (start, stop, status) that spawns and manages sessions.",
@@ -5331,6 +5470,195 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To start the local Hapimatic server."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "Ask for a short-lived SSH certificate so a cloud session can reach the paired bench; the bench must approve the session first.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-certificate",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/companion/certificates"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "Called by hapi companion ssh inside a cloud session."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "Confirm a pairing code with the host-key fingerprint shown to the owner; creates the pairing and its in-memory CA.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-code-confirm",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/companion/pair-requests/confirm"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "After the owner compared the bench host-key fingerprint."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "Show the bench machine, account and host-key fingerprint behind a pairing code before confirming it.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-code-lookup",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/companion/pair-requests/lookup"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the owner enters the code shown by hapi companion start."
+  },
+  {
+    "auth": "none",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "Bench helper heartbeat: liveness, approve/deny decisions and instance reports in; the principals to admit and their renewed validity out.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-heartbeat",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/companion/helper/heartbeat"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "Called by a running bench helper every heartbeat interval."
+  },
+  {
+    "auth": "none",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "The bench helper ends its pairing on Stop; the pairing's CA is discarded.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-helper-end",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/companion/helper/end"
+    },
+    "probe": "skip",
+    "riskTier": "destructive",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "Called by hapi companion when the bench user stops it."
+  },
+  {
+    "auth": "none",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "Poll a companion pairing request; once confirmed, returns the pairing token and CA public key exactly once.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-pair-claim",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/companion/helper/pair-requests/:requestId/claim"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "Called by hapi companion start while it waits for the owner."
+  },
+  {
+    "auth": "none",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "Open a pending companion pairing request from a bench helper; returns a short code the owner confirms on the VM.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-pair-request",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/companion/helper/pair-requests"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "Called by hapi companion start on the bench machine."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "List this owner's bench pairings, their live state and principals, and the pairing requests waiting for a code.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-pairings",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/companion/pairings"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To show which bench machines are paired and who is connected."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "HAPI_COMPANION=1",
+      "scope": "user"
+    },
+    "description": "Revoke a bench pairing: its CA is discarded and the helper tears down at its next heartbeat.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.companion-revoke",
+    "invocation": {
+      "kind": "rest",
+      "method": "DELETE",
+      "path": "/api/companion/pairings/:pairingId"
+    },
+    "probe": "skip",
+    "riskTier": "destructive",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To cut a paired bench machine off from this VM."
   },
   {
     "auth": "jwt",
@@ -9654,6 +9982,27 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Open the in-app support session — reuse the caller's active one, else spawn a simple session primed with the support persona and offline docs on this host's machine, in the default permission mode.",
+    "domain": "session-lifecycle",
+    "example": "{\"agent\":\"claude\"}",
+    "id": "session-lifecycle.open-support-session",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/support/session"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user asks the in-app assistant for help."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Retroactively set a session's managed-peer parent link (parentSessionId + spawn relationship) so an orphan whose spawn timed out after success groups under its PM.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.parent",
@@ -11076,7 +11425,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "The Accounts page — add, remove, reorder, and view account usage.",
+    "description": "The Provider Accounts page — model-provider accounts, their usage, and the provider API keys.",
     "domain": "ui",
     "id": "ui.settings-account-usage",
     "invocation": {
@@ -11088,7 +11437,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "ui",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "To point a human at Anthropic account management and usage."
+    "whenToUse": "To point a human at provider account management, usage, or provider API keys."
   },
   {
     "auth": "jwt",
@@ -11285,26 +11634,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "The API keys / service-credentials management page.",
+    "description": "The Notifications page — the notification settings.",
     "domain": "ui",
-    "id": "ui.settings-keys",
+    "id": "ui.settings-notifications",
     "invocation": {
       "kind": "ui",
-      "location": "/settings/keys"
+      "location": "/settings/notifications"
     },
     "probe": "safe",
     "riskTier": "readonly",
     "surface": "ui",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "To point a human at provider API-key management."
+    "whenToUse": "To point a human at their notification settings."
   },
   {
     "auth": "jwt",
     "availability": {
       "scope": "user"
     },
-    "description": "The user-preferences page (theme, notifications, defaults).",
+    "description": "The user-preferences page (theme, defaults, session handoff, backup key).",
     "domain": "ui",
     "id": "ui.settings-preferences",
     "invocation": {

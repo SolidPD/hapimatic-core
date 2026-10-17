@@ -2,6 +2,7 @@
 export type {
   FeedbackAttachment,
   FeedbackCategory,
+  FeedbackEntryCategory,
   FeedbackMetadata,
   FeedbackRequest,
   FeedbackResponse,

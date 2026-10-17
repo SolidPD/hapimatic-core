@@ -71,8 +71,8 @@ export function AddAccountInstructions({
         <p className="text-[var(--app-hint)]">{intro}</p>
         <ol className="list-decimal space-y-1 pl-5 text-[var(--app-hint)]">
           <li>
-            Add a <code className="text-[var(--app-fg)]">gemini</code> key on
-            the API Keys page of this node (its local vault), or set{" "}
+            Add a <code className="text-[var(--app-fg)]">gemini</code> key under
+            Provider API Keys on this node (its local vault), or set{" "}
             <code className="text-[var(--app-fg)]">GEMINI_API_KEY</code> via the
             node&apos;s daemon env-file drop-in.
           </li>

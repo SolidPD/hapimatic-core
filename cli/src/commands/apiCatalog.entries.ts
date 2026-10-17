@@ -100,6 +100,23 @@ export const cliCatalogEntries = [
     availability: { scope: "operator" },
   }),
   defineCapability({
+    id: "machine-daemon.cli-companion",
+    domain: "machine-daemon",
+    surface: "cli",
+    description:
+      "Local hardware companion: pair a bench machine and reach it over SSH from a cloud session (start, stop, status, pair, list, ssh, ssh-config, revoke).",
+    whenToUse:
+      "To give a cloud session SSH access to a local bench PC, or to use it.",
+    invocation: { kind: "cli", command: "companion" },
+    auth: "cli-token",
+    // `destructive`: `hapi companion ssh` runs arbitrary commands on a
+    // hardware-attached bench machine, and `revoke` ends pairings. It also
+    // keeps this pilot, dark-by-default command out of the always-loaded
+    // Tier-0 primer (#4352).
+    riskTier: "destructive",
+    availability: { scope: "user" },
+  }),
+  defineCapability({
     id: "federation.cli-federation",
     domain: "federation",
     surface: "cli",

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { jwtVerify } from "jose";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { CatalogEntry } from "@hapi/protocol";
+import { COMPANION_TOKEN_PREFIX } from "@hapi/protocol/companion";
 
 export type WebAppEnv = {
   Variables: {
@@ -65,6 +66,18 @@ export function createAuthMiddleware(
 
     if (!token) {
       return c.json({ error: "Missing authorization token" }, 401);
+    }
+
+    // Issue #4352: a companion pairing token (`hcp_…`) is valid only on the
+    // `/api/companion/helper/*` routes, which are mounted before this
+    // middleware and check it themselves. Refuse it here explicitly, so a
+    // leaked pairing token can never reach any JWT route — even if a future
+    // change made such tokens verify as a JWT.
+    if (token.startsWith(COMPANION_TOKEN_PREFIX)) {
+      return c.json(
+        { error: "Companion pairing tokens are not valid on this route" },
+        401
+      );
     }
 
     try {

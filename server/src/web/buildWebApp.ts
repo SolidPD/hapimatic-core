@@ -30,6 +30,7 @@ import { homedir } from "node:os";
 import { Database } from "bun:sqlite";
 import { serveStatic } from "hono/bun";
 import { configuration } from "../configuration";
+import { VERSION } from "../version.generated"; // eslint-disable-line -- generated file
 import type { SyncEngine } from "../sync/syncEngine";
 import { createAuthMiddleware, type WebAppEnv } from "./middleware/auth";
 import {
@@ -123,7 +124,14 @@ import { createHarnessChangelogRoutes } from "./routes/harnessChangelog";
 import type { JobRegistry, JobStatus } from "@hapi/protocol";
 import { createErrorReportRoutes } from "./routes/errorReports";
 import { createFeedbackRoutes } from "./routes/feedback";
-import { resolveFeedbackSenderConfig } from "../config/serverSettings";
+import { createSupportRoutes } from "./routes/support";
+import { resolveCurrentLauncherKind } from "./routes/launcher";
+import { getKnownSecretLiterals } from "../services/knownSecretLiterals";
+import {
+  readSupportEscalationSettings,
+  resolveFeedbackSenderConfig,
+  resolveSupportChannel,
+} from "../config/serverSettings";
 import { createFileClaimsRoutes } from "./routes/fileClaims";
 import { createInitiativesRoutes } from "./routes/initiatives";
 import { createGitHubWebhookRoutes } from "./routes/githubWebhook";
@@ -187,6 +195,15 @@ import type { ErrorLogger } from "../logging/errorLogger";
 import { HTTPException } from "hono/http-exception";
 import { scrubString } from "../sentry";
 import { devManifestResponse, MANIFEST_PATH } from "./instanceManifest";
+import {
+  createCompanionHelperRoutes,
+  createCompanionRoutes,
+} from "./routes/companion";
+import {
+  CompanionPairingService,
+  companionTimingFromEnv,
+  isCompanionEnabled,
+} from "../services/companionPairingService";
 
 function findWebappDistDir(): { distDir: string; indexHtmlPath: string } {
   const candidates = [
@@ -740,6 +757,40 @@ export function buildWebApp(options: {
     })
   );
 
+  // Issue #4352: the local hardware companion. The service exists only when
+  // HAPI_COMPANION is truthy (both route sets answer 404 otherwise); it is
+  // in-memory, so a restart ends every pairing. The bench-helper routes sit
+  // BEFORE the JWT middleware (their own pairing-token / poll-secret auth); the
+  // VM-side routes sit after it. Design: docs/internal/architecture/hardware-companion.md.
+  const companionService = isCompanionEnabled()
+    ? new CompanionPairingService({
+        timing: companionTimingFromEnv(),
+        lookupSession: (namespace, idOrTag) => {
+          const engine = options.getSyncEngine();
+          if (!engine) return null;
+          const byId = engine.getSession(idOrTag);
+          const session =
+            byId && byId.namespace === namespace
+              ? byId
+              : engine.getSessionByTagAndNamespace(idOrTag, namespace);
+          if (!session) return null;
+          return {
+            id: session.id,
+            label:
+              session.metadata?.name ??
+              session.metadata?.summary?.text ??
+              session.tag ??
+              session.id,
+            active: session.active,
+          };
+        },
+      })
+    : null;
+  app.route(
+    "/api",
+    createCompanionHelperRoutes({ getService: () => companionService })
+  );
+
   app.use(
     "/api/*",
     createAuthMiddleware(options.jwtSecret, options.errorLogger)
@@ -767,6 +818,13 @@ export function buildWebApp(options: {
   // federation node IDs, and lastError strings. Previously sat in the pre-gate
   // block, which left it publicly readable (security fix — see review of v1.0.644).
   app.route("/api", createJobsRoutes(options.getJobRegistry));
+
+  // Issue #4352: VM-side companion routes (pairings, code confirm, revoke,
+  // certificates) — after the JWT gate.
+  app.route(
+    "/api",
+    createCompanionRoutes({ getService: () => companionService })
+  );
 
   // #1772 (Sub C, epic #1769): impact-analysis consumer API. Mounted AFTER the
   // global JWT gate (above) so /api/harness/:id/analyze + .../analysis require
@@ -1197,9 +1255,38 @@ export function buildWebApp(options: {
   app.route("/api", createErrorReportRoutes(options.store));
   // Issue #2664 (epic #2663): in-app user feedback → persist-first + best-effort
   // AgentMail email. Sender config resolved from env (off when unconfigured).
+  const feedbackSender = resolveFeedbackSenderConfig();
+  app.route("/api", createFeedbackRoutes(options.store, feedbackSender));
+  // Issue #4371 (E6 Sub F): in-app self-help support — the support session,
+  // its channel info, and the previewed "Contact a human" escalation, which
+  // rides the feedback pipeline above. The channel honours decision 2: a
+  // hosted (relay) tenant resolves to the relay only.
   app.route(
     "/api",
-    createFeedbackRoutes(options.store, resolveFeedbackSenderConfig())
+    createSupportRoutes({
+      store: options.store,
+      getSyncEngine: options.getSyncEngine,
+      dataDir: configuration.dataDir,
+      version: VERSION,
+      feedbackSender,
+      channel: resolveSupportChannel({
+        feedback: feedbackSender,
+        telegramBotToken: configuration.telegramBotToken,
+        settings: readSupportEscalationSettings(configuration.dataDir),
+      }),
+      telegramBotToken: configuration.telegramBotToken,
+      getSecretLiterals: () => [
+        ...getKnownSecretLiterals({ ownToken: configuration.cliApiToken }),
+        ...[
+          process.env.FEEDBACK_RELAY_TOKEN,
+          process.env.HAPI_GOOGLE_HANDOFF_SECRET,
+          configuration.googleHandoffSecret,
+          configuration.telegramBotToken,
+          process.env.AGENTMAIL_API_KEY,
+        ].filter((v): v is string => typeof v === "string" && v.length >= 6),
+      ],
+      getLauncherKind: resolveCurrentLauncherKind,
+    })
   );
   // Issue #1967 (Epic #1965 Sub B): file-claim write/release/query API,
   // JWT-gated, store-direct (observe-first MVP — no SSE until #1971/#1969).

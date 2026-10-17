@@ -41,6 +41,8 @@ const CATEGORY_LABEL: Record<FeedbackListItem["category"], string> = {
   bug: "Bug",
   feature: "Feature",
   other: "Other",
+  // #4371: a "Contact a human" escalation from the in-app support session.
+  "support-escalation": "Support escalation",
 };
 
 function fmtTime(ms: number): string {

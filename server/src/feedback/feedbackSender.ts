@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type {
   FeedbackAttachment,
-  FeedbackCategory,
+  FeedbackEntryCategory,
   FeedbackMetadata,
 } from "@hapi/protocol/types";
 import { sendViaRelay } from "./relayTransport";
@@ -73,10 +73,12 @@ export function escapeHtml(value: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
-const CATEGORY_LABEL: Record<FeedbackCategory, string> = {
+const CATEGORY_LABEL: Record<FeedbackEntryCategory, string> = {
   bug: "Bug",
   feature: "Feature request",
   other: "Other",
+  // Issue #4371: the in-app support "Contact a human" escalation.
+  "support-escalation": "Support escalation",
 };
 
 /** Flatten the whitelisted metadata into RAW (label, value) rows. HTML escaping
@@ -147,7 +149,7 @@ function metadataRows(metadata: FeedbackMetadata): Array<[string, string]> {
  * must not be able to make the relay send arbitrary markup as Matt's identity.
  */
 export interface FeedbackEmailInput {
-  category: FeedbackCategory;
+  category: FeedbackEntryCategory;
   description: string;
   submitterEmail: string | null;
   metadata: FeedbackMetadata;

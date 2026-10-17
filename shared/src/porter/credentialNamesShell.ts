@@ -69,7 +69,7 @@ export function credentialPathsFunctionLines(): string[] {
     "# only reads; remove takes a link out as a link.",
     "list_credential_names() { # $1 = root, $2 = subtree under it, $3 = list to append to",
     '  [ -d "$1/$2" ] || return 0',
-    `  ( cd "$1" && LC_ALL=C find "$2" ${credentialFindPredicate()} -prune -print ) > "$WORK/credential-names.raw"`,
+    `  ( cd "$1" && LC_ALL=C find "$2" ${credentialFindPredicate()} -prune -print ) >| "$WORK/credential-names.raw"`,
     '  LC_ALL=C sort "$WORK/credential-names.raw" >> "$3"',
     "}",
     "remove_credential_paths() { # $1 = root, $2 = list of paths under it",

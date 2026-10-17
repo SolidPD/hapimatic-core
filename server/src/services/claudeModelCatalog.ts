@@ -28,6 +28,10 @@ import {
   type EffortLevel,
 } from "@hapi/protocol";
 import type { AccountService } from "./accountService";
+import {
+  isTenantVm,
+  providerUsageReadAllowed,
+} from "@hapi/protocol/tenantMode";
 import type { ErrorLogger } from "../logging/errorLogger";
 
 const ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models?limit=100";
@@ -40,6 +44,14 @@ interface CacheEntry {
   models: ClaudeModelInfo[];
 }
 
+/** Where the catalog reads credential files (test seams; production passes nothing). */
+export interface CatalogCredentialPaths {
+  /** Defaults to `~/.claude/.credentials.json`. */
+  hostCredentialsPath?: string;
+  /** #4349: defaults to `${XDG_CONFIG_HOME:-~/.config}/hapimatic/account-configs`. */
+  accountConfigsDir?: string;
+}
+
 export class ClaudeModelCatalogService {
   private cache: CacheEntry | null = null;
   private cooldownUntil = 0;
@@ -49,7 +61,8 @@ export class ClaudeModelCatalogService {
     private readonly accountService: AccountService,
     private readonly errorLogger?: ErrorLogger | null,
     // Injectable for tests; defaults to the global fetch.
-    private readonly fetchImpl: typeof fetch = fetch
+    private readonly fetchImpl: typeof fetch = fetch,
+    private readonly paths: CatalogCredentialPaths = {}
   ) {}
 
   /**
@@ -146,6 +159,18 @@ export class ClaudeModelCatalogService {
     const add = (token: string | null | undefined): void => {
       if (token && !tokens.includes(token)) tokens.push(token);
     };
+    // #4349 (ruling D10): on a TENANT VM the catalog read uses only the credential the binary keeps
+    // in each account's own dir (and the host login's own file) — never the account store — and
+    // HAPI_TENANT_USAGE_READ=0 turns it off (the static fallback catalog is served instead).
+    if (isTenantVm()) {
+      if (!providerUsageReadAllowed(process.env, true)) return tokens;
+      for (const account of this.accountService.list()) {
+        if ((account.provider ?? "anthropic") !== "anthropic") continue;
+        add(readIsolatedToken(this.paths, account.accountUuid));
+      }
+      add(readHostToken(this.paths));
+      return tokens;
+    }
     const activeUuid = this.accountService.getActiveAccount()?.accountUuid;
     if (activeUuid) add(this.accountService.getRaw(activeUuid)?.accessToken);
     for (const account of this.accountService.list()) {
@@ -156,7 +181,7 @@ export class ClaudeModelCatalogService {
       if ((account.provider ?? "anthropic") !== "anthropic") continue;
       add(this.accountService.getRaw(account.accountUuid)?.accessToken);
     }
-    add(readHostToken());
+    add(readHostToken(this.paths));
     return tokens;
   }
 }
@@ -213,11 +238,36 @@ export function normalizeModels(body: unknown): ClaudeModelInfo[] {
 }
 
 /** Host-default OAuth token from `~/.claude/.credentials.json`, or null. */
-function readHostToken(): string | null {
+function readHostToken(paths: CatalogCredentialPaths): string | null {
+  return readOauthToken(
+    paths.hostCredentialsPath ?? join(homedir(), ".claude", ".credentials.json")
+  );
+}
+
+/**
+ * #4349 (D10): an account's OAuth token from its own isolated dir — the file the unmodified binary
+ * writes and rotates (`<account-configs>/<uuid>/.credentials.json`), or null. Read-only, VM-local.
+ */
+function readIsolatedToken(
+  paths: CatalogCredentialPaths,
+  accountUuid: string
+): string | null {
+  const base =
+    paths.accountConfigsDir ??
+    join(
+      process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config"),
+      "hapimatic",
+      "account-configs"
+    );
+  return readOauthToken(join(base, accountUuid, ".credentials.json"));
+}
+
+/** The `claudeAiOauth.accessToken` of a credentials file, or null. Never logs it. */
+function readOauthToken(path: string): string | null {
   try {
-    const raw = JSON.parse(
-      readFileSync(join(homedir(), ".claude", ".credentials.json"), "utf-8")
-    ) as { claudeAiOauth?: { accessToken?: unknown } };
+    const raw = JSON.parse(readFileSync(path, "utf-8")) as {
+      claudeAiOauth?: { accessToken?: unknown };
+    };
     const token = raw.claudeAiOauth?.accessToken;
     return typeof token === "string" && token.length > 0 ? token : null;
   } catch {

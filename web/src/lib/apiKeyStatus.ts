@@ -6,7 +6,7 @@ import type { RedactedApiKey } from "@hapi/protocol/schemas";
  * 🟢 valid / 🔴 invalid / 🟠 unverified / ⚪ none.
  *
  * The ONE copy (#4568, per #4466 Task 3's contract): moved verbatim from
- * `ApiKeysSection.tsx` so the Settings → Keys list and the spawn picker's
+ * `ApiKeysSection.tsx` so the Provider API Keys list and the spawn picker's
  * "API keys" rows color a key's status identically. Add no third copy.
  */
 export const API_KEY_STATUS_META: Record<

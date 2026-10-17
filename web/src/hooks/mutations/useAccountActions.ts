@@ -5,6 +5,7 @@ import type {
   AccountsResponse,
   AccountUsageResponse,
   RedactedAccount,
+  InVmLoginStartResponse,
   SetSessionPaymentMethodRequest,
 } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
@@ -431,5 +432,55 @@ export function useAccountLogin(api: ApiClient | null): {
     complete: completeMutation.mutateAsync,
     isStarting: startMutation.isPending,
     isCompleting: completeMutation.isPending,
+  };
+}
+
+/**
+ * Issue #4349: the in-VM sign-in a tenant VM uses instead of the web OAuth login. `start` creates
+ * an empty per-account config dir and returns the command to run in a terminal on the VM; `check`
+ * asks the server whether Claude Code's own `/login` has finished there — it resolves `null` while
+ * not yet signed in, and the new account once registered (refreshing the account list). No token
+ * passes through any of these calls.
+ */
+export function useInVmAccountLogin(api: ApiClient | null): {
+  start: () => Promise<InVmLoginStartResponse>;
+  check: (loginToken: string) => Promise<RedactedAccount | null>;
+  cancel: (loginToken: string) => Promise<void>;
+} {
+  const queryClient = useQueryClient();
+  return {
+    start: async () => {
+      if (!api) throw new Error("API unavailable");
+      return await api.startInVmAccountLogin();
+    },
+    check: async loginToken => {
+      if (!api) throw new Error("API unavailable");
+      try {
+        const res = await api.completeInVmAccountLogin(loginToken);
+        if (!res.ok) return null; // not_signed_in (HTTP 202): keep waiting
+        await queryClient.invalidateQueries({ queryKey: queryKeys.accounts });
+        return res.account;
+      } catch (err) {
+        // Surface the body's human `error` (e.g. already_added), not the transport string. A rate
+        // limit or server error passes through unchanged so the dialog keeps waiting.
+        if (err instanceof ApiError && err.status !== 429 && err.status < 500) {
+          let message = err.message;
+          if (err.body) {
+            try {
+              const parsed = JSON.parse(err.body) as { error?: unknown };
+              if (typeof parsed.error === "string") message = parsed.error;
+            } catch {
+              // Non-JSON body — keep the transport-message fallback.
+            }
+          }
+          throw new Error(message);
+        }
+        throw err;
+      }
+    },
+    cancel: async loginToken => {
+      if (!api) return;
+      await api.cancelInVmAccountLogin(loginToken).catch(() => undefined);
+    },
   };
 }

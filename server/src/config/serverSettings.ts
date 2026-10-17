@@ -16,6 +16,7 @@
  * for instances configured before this policy.
  */
 
+import { readFileSync } from "node:fs";
 import { getSettingsFile, readSettings, writeSettings } from "./settings";
 import type { FeedbackSenderConfig } from "../feedback/feedbackSender";
 
@@ -258,4 +259,131 @@ export function resolveFeedbackSenderConfig(): FeedbackSenderConfig {
     relayUrl,
     relayToken,
   };
+}
+
+/**
+ * The hosted tier's human-support reply-times text (issue #4371 R6; #4350
+ * ruling D-4350-5, contract K15). Byte-equal with #4351 Task 1. The Core
+ * (self-hosted) default is empty.
+ */
+export const HOSTED_SUPPORT_HOURS_TEXT =
+  "Support replies within one business day, in business hours. This is a target, not an SLA.";
+
+export type SupportChannelKind = "relay" | "agentmail" | "telegram" | "none";
+
+export interface SupportChannelConfig {
+  /** Where a "Contact a human" escalation is delivered. */
+  kind: SupportChannelKind;
+  /** The human-support reply-times text shown on the Help page. */
+  hoursText: string;
+  /**
+   * An operator-configured "open an issue" URL. Empty = the client uses the
+   * public Core repo's `/issues/new` (`web/src/lib/publicCoreSource.ts` holds
+   * that URL — not duplicated here, because `test-public-source-gate.sh` pins
+   * its copies to `scripts/lib/public-core-repo.txt`).
+   */
+  issueUrl: string;
+  /** The operator's Telegram chat id, set only when `kind === "telegram"`. */
+  telegramChatId: string | null;
+}
+
+/** settings.json `supportEscalation` block (non-credential values only). */
+export interface SupportEscalationSettings {
+  hoursText?: string;
+  issueUrl?: string;
+  telegramChatId?: string;
+  channel?: string;
+}
+
+/**
+ * Resolve where support escalations go (issue #4371 Task 5). Env-first, then
+ * settings.json `supportEscalation`, then defaults.
+ *
+ * DECISION 2 (product map §8.4): platform credentials stay off customer VMs.
+ * A hosted tenant (feedback transport `relay`) therefore resolves to `relay`
+ * ONLY — never to an AgentMail or Telegram credential, even when one is also
+ * present in its environment. Relay is checked FIRST for the same reason
+ * `resolveFeedbackSenderConfig` infers it first.
+ *
+ * An operator or self-hosted install resolves to `agentmail` when the feedback
+ * pipeline sends direct email (which already requires FEEDBACK_DEST_EMAIL,
+ * #4638), else `telegram` when the Telegram bot is configured AND an operator
+ * chat id is named, else `none` (the client shows the GitHub-issue link).
+ *
+ * `HAPI_SUPPORT_CHANNEL` / `supportEscalation.channel` can only NARROW: it
+ * selects among the channels this install already has (or `none`), and an
+ * unavailable value is ignored — it never adds a credential.
+ */
+export function resolveSupportChannel(opts: {
+  feedback: FeedbackSenderConfig;
+  telegramBotToken: string | null;
+  settings?: SupportEscalationSettings;
+  env?: Record<string, string | undefined>;
+}): SupportChannelConfig {
+  const env = opts.env ?? process.env;
+  const settings = opts.settings ?? {};
+  const pick = (envKey: string, fileValue: string | undefined): string =>
+    (env[envKey] || fileValue || "").trim();
+
+  const hosted = opts.feedback.transport === "relay";
+  const telegramChatId =
+    pick("HAPI_SUPPORT_TELEGRAM_CHAT_ID", settings.telegramChatId) || null;
+
+  const available: SupportChannelKind[] = [];
+  if (hosted) {
+    available.push("relay");
+  } else {
+    if (opts.feedback.transport === "agentmail") available.push("agentmail");
+    if (opts.telegramBotToken && telegramChatId) available.push("telegram");
+  }
+
+  let kind: SupportChannelKind = available[0] ?? "none";
+  const override = pick("HAPI_SUPPORT_CHANNEL", settings.channel);
+  if (override === "none") {
+    kind = "none";
+  } else if (available.includes(override as SupportChannelKind)) {
+    kind = override as SupportChannelKind;
+  }
+
+  const hoursText =
+    pick("HAPI_SUPPORT_HOURS_TEXT", settings.hoursText) ||
+    (hosted ? HOSTED_SUPPORT_HOURS_TEXT : "");
+
+  return {
+    kind,
+    hoursText,
+    issueUrl: pick("HAPI_SUPPORT_ISSUE_URL", settings.issueUrl),
+    telegramChatId: kind === "telegram" ? telegramChatId : null,
+  };
+}
+
+/**
+ * Read settings.json's `supportEscalation` block synchronously (issue #4371).
+ * Tolerant: a missing or unreadable file, or a malformed block, yields `{}` and
+ * the env/default layers of `resolveSupportChannel` apply. Only string values
+ * are kept.
+ */
+export function readSupportEscalationSettings(
+  dataDir: string
+): SupportEscalationSettings {
+  try {
+    const raw = JSON.parse(readFileSync(getSettingsFile(dataDir), "utf8")) as {
+      supportEscalation?: Record<string, unknown>;
+    };
+    const block = raw?.supportEscalation;
+    if (!block || typeof block !== "object") return {};
+    const out: SupportEscalationSettings = {};
+    for (const key of [
+      "hoursText",
+      "issueUrl",
+      "telegramChatId",
+      "channel",
+    ] as const) {
+      const value = block[key];
+      if (typeof value === "string") out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
 }

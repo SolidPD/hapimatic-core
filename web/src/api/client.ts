@@ -74,6 +74,8 @@ import type {
   ProviderAuthStateResponse,
   SessionMetadataTurnsResponse,
   AccountLoginStartResponse,
+  InVmLoginCompleteResponse,
+  InVmLoginStartResponse,
   AccountLoginCompleteResponse,
   OpenAiLoginStartResponse,
   OpenAiLoginStatusResponse,
@@ -87,6 +89,10 @@ import type {
   ExecutionHistoryResponse,
   ExecutionResponse,
   FeedbackListResponse,
+  SupportChannelInfo,
+  SupportEscalationPreview,
+  SupportEscalationSendResponse,
+  SupportSessionResponse,
   FederationAllSessionsResponse,
   FederationNodesResponse,
   FileMutationResponse,
@@ -1399,6 +1405,43 @@ export class ApiClient {
     });
   }
 
+  // In-app self-help support (issue #4371).
+  async getSupportChannel(): Promise<SupportChannelInfo> {
+    return await this.request<SupportChannelInfo>("/api/support/channel");
+  }
+
+  async openSupportSession(
+    agent?: "claude" | "codex" | "gemini" | "opencode"
+  ): Promise<SupportSessionResponse> {
+    return await this.request<SupportSessionResponse>("/api/support/session", {
+      method: "POST",
+      body: JSON.stringify(agent ? { agent } : {}),
+    });
+  }
+
+  async previewSupportEscalation(
+    sessionId: string
+  ): Promise<SupportEscalationPreview> {
+    return await this.request<SupportEscalationPreview>(
+      "/api/support/escalation/preview",
+      { method: "POST", body: JSON.stringify({ sessionId }) }
+    );
+  }
+
+  async sendSupportEscalation(
+    sessionId: string,
+    hash: string,
+    submitterEmail: string | null
+  ): Promise<SupportEscalationSendResponse> {
+    return await this.request<SupportEscalationSendResponse>(
+      "/api/support/escalation/send",
+      {
+        method: "POST",
+        body: JSON.stringify({ sessionId, hash, submitterEmail }),
+      }
+    );
+  }
+
   async getAbout(nodeId?: string): Promise<AboutInfo> {
     const url = nodeId
       ? `/api/about?nodeId=${encodeURIComponent(nodeId)}`
@@ -1458,6 +1501,33 @@ export class ApiClient {
     >("/api/accounts/login/complete", {
       method: "POST",
       body: JSON.stringify({ loginToken, code }),
+    });
+  }
+
+  // Issue #4349: in-VM sign-in on a tenant VM. `start` creates an empty per-account config dir
+  // and returns the command to run in a terminal on the VM (the user then types /login);
+  // `complete` registers the account from the identity the binary writes — `not_signed_in`
+  // (HTTP 202) until it appears. No token is ever sent or returned.
+  async startInVmAccountLogin(): Promise<InVmLoginStartResponse> {
+    return await this.request<InVmLoginStartResponse>(
+      "/api/accounts/native-login/start",
+      { method: "POST", body: JSON.stringify({}) }
+    );
+  }
+
+  async completeInVmAccountLogin(
+    loginToken: string
+  ): Promise<InVmLoginCompleteResponse> {
+    return await this.request<InVmLoginCompleteResponse>(
+      "/api/accounts/native-login/complete",
+      { method: "POST", body: JSON.stringify({ loginToken }) }
+    );
+  }
+
+  async cancelInVmAccountLogin(loginToken: string): Promise<void> {
+    await this.request<{ ok: boolean }>("/api/accounts/native-login/cancel", {
+      method: "POST",
+      body: JSON.stringify({ loginToken }),
     });
   }
 

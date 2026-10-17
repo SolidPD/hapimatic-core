@@ -242,6 +242,60 @@ export const GoogleStoredAccountSchema = z
 export type GoogleStoredAccount = z.infer<typeof GoogleStoredAccountSchema>;
 
 /**
+ * #4349 (E6 Sub A, Task 4a): a TOKEN-LESS Anthropic account — the customer signed in inside their
+ * own VM with the unmodified Claude Code binary's `/login`, in this account's own isolated
+ * `CLAUDE_CONFIG_DIR`. The binary holds, reads and rotates its credential in that directory;
+ * Hapimatic stores only identity metadata (read from the dir's `.claude.json`, never its
+ * `.credentials.json`) and the `configDir` REFERENCE, modelled on the reference-only Codex record
+ * ({@link OpenAiStoredAccountSchema}'s `codexHome`).
+ *
+ * PK (`accountUuid`): a MINTED uuid that names the directory, so `configDir` is the canonical
+ * `<accountConfigsDir>/<accountUuid>` every isolated-dir reader already uses. The dir exists before
+ * `/login` reveals who signed in, so the Anthropic account's own uuid is kept separately as
+ * `identityAccountUuid`. `provider` stays absent on disk (⇒ anthropic), like every Anthropic record.
+ *
+ * It is deliberately NOT a {@link StoredAccount}: {@link validateStoredAccount} refuses it, so no
+ * token consumer (refresh, injection, the usage sampler's store read) can ever be handed one. The
+ * refine forbids any token field, so a placeholder token can never be written into one.
+ */
+export const NativeAnthropicStoredAccountSchema = z
+  .object({
+    schema_version: z.literal(1).default(1),
+    provider: z.literal("anthropic").optional(),
+    authKind: z.literal("native"),
+    accountUuid: z.string().min(1),
+    /** The Anthropic account uuid from the dir's `.claude.json` `oauthAccount` (identity only). */
+    identityAccountUuid: z.string().min(1),
+    emailAddress: z.string().min(1),
+    organizationUuid: z.string().default(""),
+    organizationName: z.string().default(""),
+    displayName: z.string().default(""),
+    billingType: z.string().default(""),
+    /** The isolated `CLAUDE_CONFIG_DIR` the binary signed in to — a REFERENCE, never a secret. */
+    configDir: z.string().min(1),
+    capturedAt: z.number(),
+    lastUsedAt: z.number(),
+  })
+  .passthrough()
+  .refine(
+    account =>
+      !["accessToken", "refreshToken", "expiresAt", "scopes"].some(
+        key => key in account
+      ),
+    { message: "a native account never carries a token (#4349)" }
+  );
+export type NativeAnthropicStoredAccount = z.infer<
+  typeof NativeAnthropicStoredAccountSchema
+>;
+
+/** #4349: true for a token-less, in-VM-signed-in Anthropic account record. */
+export function isNativeAnthropicAccount(
+  account: AnyStoredAccount
+): account is NativeAnthropicStoredAccount {
+  return (account as { authKind?: unknown }).authKind === "native";
+}
+
+/**
  * The provider-aware union — the discriminated union on `provider`. `StoredAccount`
  * (Anthropic, `provider` absent ⇒ anthropic) stays the base type used by every
  * Anthropic-only consumer; this superset is used ONLY at the new boundaries (the
@@ -251,6 +305,7 @@ export type GoogleStoredAccount = z.infer<typeof GoogleStoredAccountSchema>;
  */
 export type AnyStoredAccount =
   | StoredAccount
+  | NativeAnthropicStoredAccount
   | OpenAiStoredAccount
   | GoogleStoredAccount;
 
@@ -279,6 +334,15 @@ export function validateAnyStoredAccount(
   }
   if (provider === "google") {
     const result = GoogleStoredAccountSchema.safeParse(input);
+    return result.success
+      ? { ok: true, account: result.data }
+      : { ok: false, error: result.error.message };
+  }
+  // #4349: a token-less in-VM-signed-in Anthropic record (authKind "native").
+  if (
+    (input as { authKind?: unknown } | null | undefined)?.authKind === "native"
+  ) {
+    const result = NativeAnthropicStoredAccountSchema.safeParse(input);
     return result.success
       ? { ok: true, account: result.data }
       : { ok: false, error: result.error.message };
@@ -335,6 +399,17 @@ export type ValidateAccountResult =
  * surface a malformed record (issue #1447 R6). Mirrors `validateWorktreeMeta`.
  */
 export function validateStoredAccount(input: unknown): ValidateAccountResult {
+  // #4349: a native (token-less) record is never a token-bearing StoredAccount — say so plainly,
+  // so a token consumer that reads it skips it instead of reporting a malformed token.
+  if (
+    (input as { authKind?: unknown } | null | undefined)?.authKind === "native"
+  ) {
+    return {
+      ok: false,
+      error:
+        "native account: signed in inside the VM; the binary holds its credential in its config dir (#4349)",
+    };
+  }
   const result = StoredAccountSchema.safeParse(input);
   if (result.success) return { ok: true, account: result.data };
   return { ok: false, error: result.error.message };

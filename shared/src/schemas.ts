@@ -2598,6 +2598,20 @@ export type AddApiKeyRequest = z.infer<typeof AddApiKeyRequestSchema>;
 export const FeedbackCategorySchema = z.enum(["bug", "feature", "other"]);
 export type FeedbackCategory = z.infer<typeof FeedbackCategorySchema>;
 
+/**
+ * The category a STORED / emailed feedback row carries (issue #4371): the
+ * user-selectable categories above plus `support-escalation`, which only the
+ * server composes (the in-app support "Contact a human" bundle,
+ * `POST /api/support/escalation/send`). `FeedbackRequestSchema` deliberately
+ * keeps the narrower {@link FeedbackCategorySchema}, so a client can never
+ * submit a row that poses as a support escalation.
+ */
+export const FeedbackEntryCategorySchema = z.enum([
+  ...FeedbackCategorySchema.options,
+  "support-escalation",
+]);
+export type FeedbackEntryCategory = z.infer<typeof FeedbackEntryCategorySchema>;
+
 /** Whitelisted install-metadata block, composed client-side from GET /api/about. */
 const FeedbackAboutSchema = z
   .object({

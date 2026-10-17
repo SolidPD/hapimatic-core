@@ -6,6 +6,7 @@ import { apiKeyHelperCommand } from "./apiKeyHelper";
 import { authCommand } from "./auth";
 import { capabilitiesCommand } from "./capabilities";
 import { claudeCommand } from "./claude";
+import { companionCommand } from "./companion";
 import { connectCommand } from "./connect";
 import { daemonCommand } from "./daemon";
 import { doctorCommand } from "./doctor";
@@ -42,6 +43,7 @@ function ensureRegistry(): {
       apiCommand,
       authCommand,
       capabilitiesCommand,
+      companionCommand,
       connectCommand,
       federationCommand,
       opencodeCommand,

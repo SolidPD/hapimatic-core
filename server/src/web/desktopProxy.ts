@@ -26,9 +26,7 @@
 
 import { jwtVerify } from "jose";
 import { z } from "zod";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { readVmTier } from "@hapi/protocol/tenantMode";
 import type { ServerWebSocket } from "bun";
 import type { Store } from "../store";
 
@@ -65,29 +63,16 @@ const DESKTOP_TIER_ALLOWLIST = (
 const WEBSOCKIFY_URL =
   process.env.HAPI_DESKTOP_WEBSOCKIFY_URL ?? "ws://127.0.0.1:6080/websockify";
 
-const VM_TIER_MARKER = join(homedir(), ".config", "hapimatic", "vm-tier");
-
 /**
  * Read the VM's persisted tier (written by provision.sh Phase 9.7 to
  * ~/.config/hapimatic/vm-tier). Env `HAPI_VM_TIER` overrides (tests / dev). A
  * missing marker → undefined (treated as not-eligible: dev/worktree instances and
  * non-cloud hosts have no VM tier, so the desktop toggle stays hidden there).
- * `markerPath` is a test seam (#4954): production callers pass nothing and read
- * the real marker; tests point it at a temp file so the result never depends on
- * whether the host carries a marker (operator VMs do).
+ * `markerPath` is a test seam (#4954). #4349: the one implementation lives in
+ * `@hapi/protocol/tenantMode` (shared with the cli's tenant predicate); this
+ * re-export keeps every existing importer unchanged.
  */
-export function readVmTier(
-  markerPath: string = VM_TIER_MARKER
-): string | undefined {
-  const env = process.env.HAPI_VM_TIER?.trim().toLowerCase();
-  if (env) return env;
-  try {
-    const t = readFileSync(markerPath, "utf8").trim().toLowerCase();
-    return t || undefined;
-  } catch {
-    return undefined;
-  }
-}
+export { readVmTier };
 
 /** True iff this VM's tier is desktop-eligible. Fail-closed: an unknown/absent
  * tier is never allowed. */

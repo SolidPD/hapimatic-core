@@ -13,6 +13,7 @@ import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
 import { useAppGoBack } from "@/hooks/useAppGoBack";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
+import { useScrollToLocationHash } from "@/hooks/useScrollToLocationHash";
 import { BackIcon, SortIcon, FilterIcon } from "@/components/icons";
 import { Spinner } from "@/components/Spinner";
 import { TitleChip } from "@/components/settings/SettingsSectionHeader";
@@ -51,6 +52,7 @@ import { GeminiKeyEntry } from "@/components/AccountUsage/GeminiKeyEntry";
 import { AddOpenAIAccountWizard } from "@/components/AccountUsage/AddOpenAIAccountWizard";
 import type { ApiClient } from "@/api/client";
 import { DeviceConnectionFooter } from "@/components/AccountUsage/DeviceConnectionFooter";
+import { ApiKeysSection } from "@/components/settings/sections/ApiKeysSection";
 import { AddAccountSection } from "@/components/AccountUsage/AddAccountSection";
 import {
   RemoveAccountsModal,
@@ -121,8 +123,9 @@ const PULL_MAX = 96; // clamp the indicator travel
  * Mounts the Sub D data hooks (`useAccountUsage` / `useRefreshAccountUsage`) and the Sub E
  * presentational `<AccountUsageCard>` into a page shell modeled on `analytics.tsx`
  * (`BackIcon` + `useDocumentTitle` + `useEmojiFavicon` + `useAppGoBack`). A top-level route
- * (registered in `router.tsx`, reached via the SYSTEM-group drawer row) — opening it
- * dismisses the admin drawer.
+ * (registered in `router.tsx`, reached via the USER group's Provider Accounts drawer row)
+ * — opening it dismisses the admin drawer. #4906: it also hosts the Provider API Keys
+ * section (`#api-keys`), moved from the retired Keys page.
  *
  * Refresh model (R5/R6): `useAccountUsage`'s `staleTime: 0` refetches on mount (on-open
  * refresh); the header exposes a manual refresh button and an "Updated Xs ago" indicator
@@ -531,7 +534,7 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
   const { api } = useAppContext();
   const defaultGoBack = useAppGoBack();
   const goBack = props?.onBack ?? defaultGoBack;
-  useDocumentTitle("Accounts - Hapimatic");
+  useDocumentTitle("Provider Accounts - Hapimatic");
   useEmojiFavicon(null);
 
   const {
@@ -564,10 +567,16 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
 
   // Non-Anthropic provider auth state — Codex (OpenAI) + Gemini (Google), one row
   // per federation node (issue #3806, epic #3345). DERIVED fields only.
-  const { nodes: providerNodes, error: providerError } = useProviderAuthState(
-    api,
-    true
-  );
+  const {
+    nodes: providerNodes,
+    error: providerError,
+    isLoading: providerLoading,
+  } = useProviderAuthState(api, true);
+
+  // #4906: the menu's Provider API Keys sub-row (and old /settings/keys links)
+  // deep-link to #api-keys at the foot of the page. Scroll once the usage cards
+  // and provider sections above it have loaded, or they push it back down.
+  useScrollToLocationHash(!isLoading && !providerLoading);
 
   // Issue #3809: split the sibling providerUsage[] into the OpenAI meter map
   // (accountUuid → the login row's meter slot) and the Google counter rows
@@ -973,7 +982,7 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
             </Button>
             <TitleChip icon={Gauge} accent="var(--accent-cyan)" />
             <h1 className="min-w-0 flex-1 truncate text-lg font-bold text-[var(--app-fg)]">
-              Accounts
+              Provider Accounts
             </h1>
             {relUpdated != null && (
               <span
@@ -1337,6 +1346,19 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
               googleUsageRows={googleUsageRows}
             />
           </ProviderSection>
+
+          {/* Provider API Keys (#1955's vault; #4906: moved here from the retired
+              Keys page). The menu's Provider API Keys sub-row and old
+              /settings/keys links land on this anchor; scroll-mt-14 clears the
+              sticky header. */}
+          <div id="api-keys" className="scroll-mt-14">
+            <ProviderSection
+              title="Provider API Keys"
+              testId="provider-section-api-keys"
+            >
+              <ApiKeysSection />
+            </ProviderSection>
+          </div>
 
           {/* "This device & connection" footer (epic #1855, Sub G / #1862) —
               the Hapimatic CLIENT identity, absorbed from the removed Profile page.
