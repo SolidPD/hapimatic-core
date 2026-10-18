@@ -118,7 +118,7 @@ export function LoginPrompt(props: LoginPromptProps) {
   const displayError = error || props.error;
   const serverSummary = props.serverUrl ?? `${props.baseUrl} (same origin)`;
   const title = isBindMode ? "Bind Telegram" : "Hapimatic";
-  const subtitle = "Vibe Coding Anytime, Anywhere";
+  const subtitle = "Your own server, on your own machine";
   const submitLabel = isBindMode ? "Bind" : "Sign In";
   // Issue #1003 + #2312: runtime-gated Google SSO button. Default OFF (hidden), so
   // RP1/personal instances are unaffected. The gate is now RUNTIME (not the old
@@ -319,9 +319,6 @@ export function LoginPrompt(props: LoginPromptProps) {
 
       {/* Footer */}
       <div className="absolute bottom-4 left-0 right-0 text-center text-xs text-[var(--app-hint)] space-y-1">
-        <div>
-          Designed with <span className="text-red-500">♥</span> for Vibe Coding
-        </div>
         <div>© {new Date().getFullYear()} Hapimatic</div>
       </div>
     </div>
