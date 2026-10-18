@@ -118,7 +118,6 @@ export function LoginPrompt(props: LoginPromptProps) {
   const displayError = error || props.error;
   const serverSummary = props.serverUrl ?? `${props.baseUrl} (same origin)`;
   const title = isBindMode ? "Bind Telegram" : "Hapimatic";
-  const subtitle = "Your own server, on your own machine";
   const submitLabel = isBindMode ? "Bind" : "Sign In";
   // Issue #1003 + #2312: runtime-gated Google SSO button. Default OFF (hidden), so
   // RP1/personal instances are unaffected. The gate is now RUNTIME (not the old
@@ -222,7 +221,6 @@ export function LoginPrompt(props: LoginPromptProps) {
               </text>
             </svg>
           )}
-          <div className="text-sm text-[var(--app-hint)]">{subtitle}</div>
         </div>
 
         {/* Form */}

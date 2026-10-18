@@ -12,13 +12,17 @@ import type { UsageService } from "../../../accounts/usageService";
 import type { ProviderUsageService } from "../../../accounts/providerUsageService";
 import type { ProviderAuthFacts } from "../../../services/providerAuthState";
 import type { CodexLoginService } from "../../../services/codexLoginService";
+import type { AccountLoginService } from "../../../services/accountLoginService";
 import type { LeaseStore } from "../../../store/leaseStore";
 import type { SystemJobsService } from "../../../systemJobs/service";
 import type { OutputStyleSyncService } from "../../../services/outputStyleSyncService";
 import type { SettingsSyncService } from "../../../services/settingsSyncService";
 import type { LiveCatalog } from "../../../capabilities/catalogCollector";
 import type { ServerAuditResult } from "../../../capabilities/auditCollector";
-import type { AvailabilityContext } from "@hapi/protocol";
+import type {
+  AvailabilityContext,
+  NodeAccountHealthFacts,
+} from "@hapi/protocol";
 import type {
   Caller,
   SessionLike,
@@ -53,11 +57,28 @@ export type FederationDeps = {
   // + POST receiver. Optional because federation test stubs omit it (mirrors
   // getUsageService). [ER 2026-09-19: 3806-5]
   getProviderAuthState?: () => Promise<ProviderAuthFacts>;
+  // Issue #4461 (epic #4460 A): the LOCAL-node account-health reader for the
+  // /federation/account-health GET aggregator + POST receiver. Synchronous and
+  // cache-only (never refreshes, never fetches usage). Optional because
+  // federation test stubs omit it (mirrors getProviderAuthState).
+  getAccountHealth?: () => NodeAccountHealthFacts;
   // Issue #3807 (epic #3345, K9 chain): the LOCAL-node Codex login driver, for
   // the peer-incoming /federation/openai-login/{start,status,cancel} receivers
   // so node-side codex auth executes on the OWNING node (R4). Optional because
   // federation test stubs omit it (mirrors getProviderAuthState). [ER 2026-09-19: 3807-4]
   getCodexLoginService?: () => CodexLoginService | null;
+  // Issue #4462 (epic #4460 B): the LOCAL-node Anthropic login service — the SAME
+  // instance the /api/accounts/login/* routes use, because its PKCE pending map is
+  // per process — for the peer-incoming /federation/anthropic-login/{start,complete}
+  // receivers, so a node-targeted login is stored on the OWNING node. Optional
+  // because federation test stubs omit it (mirrors getCodexLoginService).
+  getAccountLoginService?: () => AccountLoginService | null;
+  // Issue #4462 Task 8 (epic #4460 overview T7): re-import provider records after a
+  // peer-side OpenAI login lands, so the new account surfaces without a restart.
+  // Injected (never imported from routes/accounts.ts) so a stub that omits it stays
+  // hermetic: the real trigger reads this host's account-configs, ~/.codex and
+  // settings.json. Swallows its own errors.
+  forceProviderImport?: () => Promise<void>;
   // Issue #2627 (Sub-Issue E): the custom output-style store + federation
   // replicator, for the peer-incoming /federation/output-style-sync receiver +
   // /federation/output-style-digest reconcile endpoint. Optional because

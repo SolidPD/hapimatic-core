@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { hostname } from "node:os";
 import { Hono } from "hono";
 import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
-import { localNodeDisplayLabel } from "../../../config/nodeLabel";
+import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
 import type { FederationDeps } from "./shared";
 import {
   FederationSpawnBodySchema,
   LOCAL_NODE_ID,
-  LOCAL_NODE_LABEL,
   defineCapability,
 } from "@hapi/protocol";
 import { cataloged } from "../../../capabilities/cataloged";
@@ -153,17 +151,9 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         // that need to distinguish standalone from federated are unaffected.
         // Matches the sibling synthesis at :35 (/federation/active-accounts) and the
         // client-side fallback at web/src/routes/admin/account-usage.tsx:155.
-        localNode: {
-          nodeId: config?.nodeId ?? LOCAL_NODE_ID,
-          // `||` not `??` — os.hostname() returns "" (not null) when the host name
-          // is unavailable, and `??` would let that empty string through.
-          // Epic #3285 round 11: the hostname fallback follows the system-wide
-          // casing rule too (a federated config label is already normalized at
-          // load) — it was the lone "rp1" among "RP1"s.
-          nodeLabel:
-            config?.nodeLabel ??
-            localNodeDisplayLabel(hostname() || LOCAL_NODE_LABEL),
-        },
+        // #4461: one copy of the identity rule (`||` hostname fallback, casing)
+        // shared with the account-health read and the 409 / SSE stamps.
+        localNode: resolveLocalNodeIdentity(config),
         nodes: registry ? registry.getNodeStates() : [],
       });
     }

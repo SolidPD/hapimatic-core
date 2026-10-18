@@ -53,6 +53,12 @@ import { useFocusRestoration } from "@/hooks/useFocusRestoration";
 import { getLastSeenSeq, clearSeqTracker } from "@/lib/seq-tracker";
 import { upsertMessagesInCache } from "@/lib/messages";
 import { ACCOUNT_UNREFRESHABLE_TOAST_MESSAGE } from "@/lib/reconnectError";
+import {
+  buildReloginSearch,
+  buildReloginToast,
+  RELOGIN_EVENT,
+  type ReloginRequest,
+} from "@/lib/reloginLink";
 import { signOut } from "@/lib/signOut";
 
 export function App() {
@@ -622,6 +628,7 @@ export function App() {
       <PromptBlockToastListener />
       <ErrorOutboxDropToastListener />
       <AccountUnrefreshableToastListener />
+      <ReloginLinkListener />
       <SessionRestartFailedToastListener />
       <LoopsResumingToastListener />
       <WaitingForSlotToastListener />
@@ -845,11 +852,23 @@ function ErrorOutboxDropToastListener() {
 function AccountUnrefreshableToastListener() {
   const { showToast } = useToast();
   useEffect(() => {
-    const handler = () => {
-      // Issue #1835: this string is now the shared
-      // ACCOUNT_UNREFRESHABLE_TOAST_MESSAGE constant (reconnectError.ts) so the
-      // HTTP-catch reconnect branch emits BYTE-IDENTICAL text and ToastProvider
-      // dedups the SSE+HTTP pair into one toast.
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ nodeId?: string; nodeLabel?: string }>)
+        .detail;
+      // Issue #4461 (R8): a server-stamped event names its node — build the toast
+      // with the SAME builder (and no account name) the HTTP reconnect 409 uses,
+      // so the SSE+HTTP pair stays byte-identical, ToastProvider dedups it into
+      // ONE toast, and that toast carries the "Log in" action whichever side
+      // fired first. An unstamped event (a pre-#4461 node) keeps the shared
+      // #1835 message, matching the HTTP side for a node-less 409.
+      if (detail?.nodeId && detail.nodeLabel) {
+        const { message, action } = buildReloginToast({
+          nodeId: detail.nodeId,
+          nodeLabel: detail.nodeLabel,
+        });
+        showToast(message, { type: "warning", duration: 5000, action });
+        return;
+      }
       showToast(ACCOUNT_UNREFRESHABLE_TOAST_MESSAGE, {
         type: "warning",
         duration: 5000,
@@ -859,6 +878,29 @@ function AccountUnrefreshableToastListener() {
     return () =>
       window.removeEventListener("hapi:accountUnrefreshable", handler);
   }, [showToast]);
+  return null;
+}
+
+/**
+ * Issue #4461 (R9): turns a `hapi:relogin` request (the "Log in" action on an
+ * account_unrefreshable toast, and #4466's red-ring tap) into a navigation to
+ * the Accounts page's deep link, `/settings/account-usage?relogin=<provider>
+ * &node=<nodeId>`. The page decides what this UI can do for that node (D-A1 = A).
+ */
+function ReloginLinkListener() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<ReloginRequest>).detail;
+      if (!detail?.nodeId) return;
+      void navigate({
+        to: "/settings/account-usage",
+        search: buildReloginSearch(detail),
+      });
+    };
+    window.addEventListener(RELOGIN_EVENT, handler);
+    return () => window.removeEventListener(RELOGIN_EVENT, handler);
+  }, [navigate]);
   return null;
 }
 

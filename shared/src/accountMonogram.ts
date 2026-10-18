@@ -11,6 +11,7 @@
  * JSON file must not be coupled to the web layer's Tailwind naming. `AccountChip`
  * maps each id to its literal Tailwind class.
  */
+import { z } from "zod";
 
 /**
  * The six monogram color ids — 1:1 (same order) with `AccountChip`'s
@@ -64,6 +65,17 @@ export type AccountMonogram = {
   letter?: string;
   color?: AccountMonoColorId;
 };
+
+/**
+ * The wire schema of an {@link AccountMonogram} (issue #4461; shared with #4463 —
+ * whichever lands second imports it). A plain whitelist `z.object()`: an unknown
+ * key is stripped on parse, and the letter budget is the same
+ * `ACCOUNT_MONO_MAX_CHARS` the normalizer enforces.
+ */
+export const AccountMonogramSchema = z.object({
+  letter: z.string().min(1).max(ACCOUNT_MONO_MAX_CHARS).optional(),
+  color: z.enum(ACCOUNT_MONO_COLOR_IDS).optional(),
+});
 
 /**
  * Normalize a raw monogram input into a valid, stored-shape `AccountMonogram`, or

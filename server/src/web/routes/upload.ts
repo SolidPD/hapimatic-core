@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
+import { proxyTransportFailure } from "./routeErrorHelper";
 import type { WebAppEnv } from "../middleware/auth";
 import { defineCapability } from "@hapi/protocol";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
@@ -350,15 +351,19 @@ export function createUploadRoutes(
             if (options?.federationApiToken) {
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
             }
-            // #5375: transport failure → 502, not an onError 500.
+            // #5375/#5404: a transport failure is logged and answers 502; any
+            // other error is rethrown so app.onError logs it as a 500.
             let resp: Response;
             try {
               resp = await fetch(
                 `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/upload/${encodeURIComponent(filename)}`,
                 { method: "GET", headers }
               );
-            } catch {
-              return c.json({ error: "Remote node unreachable" }, 502);
+            } catch (error) {
+              return proxyTransportFailure(c, error, {
+                errorLogger: options?.errorLogger,
+                nodeId: node.nodeId,
+              });
             }
             if (resp.ok) {
               // Stream the binary response back with the remote's headers
@@ -505,7 +510,8 @@ export function createUploadRoutes(
             if (options?.federationApiToken) {
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
             }
-            // #5375: transport failure → 502, not an onError 500.
+            // #5375/#5404: a transport failure is logged and answers 502; any
+            // other error is rethrown so app.onError logs it as a 500.
             let resp: Response;
             try {
               resp = await fetch(
@@ -517,8 +523,11 @@ export function createUploadRoutes(
                   duplex: "half",
                 }
               );
-            } catch {
-              return c.json({ error: "Remote node unreachable" }, 502);
+            } catch (error) {
+              return proxyTransportFailure(c, error, {
+                errorLogger: options?.errorLogger,
+                nodeId: node.nodeId,
+              });
             }
             const body = await resp.json().catch(() => ({}));
             return c.json(
@@ -744,8 +753,11 @@ export function createUploadRoutes(
                 `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/uploads/delete`,
                 { method: "POST", headers, body: deleteBody }
               );
-            } catch {
-              return c.json({ error: "Remote node unreachable" }, 502);
+            } catch (error) {
+              return proxyTransportFailure(c, error, {
+                errorLogger: options?.errorLogger,
+                nodeId: node.nodeId,
+              });
             }
             const body = await resp.json().catch(() => ({}));
             return c.json(

@@ -31,6 +31,7 @@ export * from "./sentryScrub";
 export * from "./worktreeMeta";
 export * from "./accounts";
 export * from "./accountMonogram";
+export * from "./accountHealth";
 export * from "./usage";
 export * from "./selectOptimalAccount";
 export * from "./providerAuthState";

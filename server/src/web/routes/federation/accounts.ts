@@ -418,6 +418,17 @@ export function createFederationAccountRoutes(
         kind === "api-key"
           ? await svc.loginWithApiKey({ key: key!.trim(), label })
           : await svc.startDeviceAuth({ label });
+      // #4462 Task 8 (mirror of routes/accounts.ts): an api-key login writes the
+      // account's codex dir synchronously, so re-import now and the new account
+      // surfaces without a restart. The trigger swallows its own errors.
+      if (
+        result &&
+        typeof result === "object" &&
+        "state" in result &&
+        (result as { state?: string }).state === "ok"
+      ) {
+        await deps.forceProviderImport?.();
+      }
       return c.json(result);
     }
   );
@@ -457,7 +468,13 @@ export function createFederationAccountRoutes(
       if (!parsed.success) {
         return c.json({ error: "Invalid body", code: "invalid_request" }, 400);
       }
-      return c.json(svc.deviceAuthStatus(parsed.data.loginToken));
+      const status = svc.deviceAuthStatus(parsed.data.loginToken);
+      // #4462 Task 8: a completed device-auth login surfaces at once (mirror of
+      // the local status route).
+      if (status.state === "ok") {
+        await deps.forceProviderImport?.();
+      }
+      return c.json(status);
     }
   );
 

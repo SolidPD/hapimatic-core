@@ -393,6 +393,11 @@ export function useSSE(options: {
             detail: {
               sessionId: event.sessionId,
               accountUuid: event.accountUuid,
+              // Issue #4461 (R7/R8): the node whose store refused — stamped by
+              // the server (the hub's bridge for a peer, GET /api/events for the
+              // serving node), so the toast names it without guessing.
+              nodeId: event.nodeId,
+              nodeLabel: event.nodeLabel,
             },
           })
         );

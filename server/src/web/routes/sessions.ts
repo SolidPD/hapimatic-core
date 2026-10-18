@@ -17,6 +17,7 @@ import {
   SetPermissionModeRequestSchema,
 } from "@hapi/protocol/schemas";
 import { Hono, type Context } from "hono";
+import { resolveLocalNodeIdentity } from "../../config/nodeLabel";
 import { z } from "zod";
 import type { SyncEngine, Session } from "../../sync/syncEngine";
 import { reconcile, listForNamespace } from "../../sync/pendingSpawns";
@@ -24,7 +25,7 @@ import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
-import { logAndJson } from "./routeErrorHelper";
+import { logAndJson, proxyTransportFailure } from "./routeErrorHelper";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import { federationReadSignal } from "../../federation/proxyFetchSignal";
 import type { SessionService } from "../../services/sessionService";
@@ -203,10 +204,15 @@ export function createSessionsRoutes(
     getSessionService?: () => SessionService | null;
     getAccountService?: () => AccountService | null;
     errorLogger?: ErrorLogger | null;
+    // Issue #4461 (R6): THIS node's identity, stamped on an account_unrefreshable
+    // reconnect refusal. Absent ⇒ the non-federated identity.
+    getLocalNode?: () => { nodeId: string; nodeLabel: string };
   }
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   const errorLogger = options?.errorLogger ?? null;
+  const getLocalNode =
+    options?.getLocalNode ?? (() => resolveLocalNodeIdentity(null));
 
   app.get(
     "/sessions",
@@ -470,8 +476,11 @@ export function createSessionsRoutes(
               `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/abort`,
               { method: "POST", headers, body: "{}" }
             );
-          } catch {
-            return c.json({ error: "Remote node unreachable" }, 502);
+          } catch (error) {
+            return proxyTransportFailure(c, error, {
+              errorLogger: errorLogger,
+              nodeId: node.nodeId,
+            });
           }
           if (resp.ok) {
             return c.json({ ok: true });
@@ -549,15 +558,19 @@ export function createSessionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          // #5375: transport failure → 502, not an onError 500.
+          // #5375/#5404: a transport failure is logged and answers 502; any
+          // other error is rethrown so app.onError logs it as a 500.
           let resp: Response;
           try {
             resp = await fetch(
               `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/archive`,
               { method: "POST", headers, body: "{}" }
             );
-          } catch {
-            return c.json({ error: "Remote node unreachable" }, 502);
+          } catch (error) {
+            return proxyTransportFailure(c, error, {
+              errorLogger: errorLogger,
+              nodeId: node.nodeId,
+            });
           }
           if (resp.ok) {
             // Immediately update cached session state so subsequent
@@ -627,7 +640,17 @@ export function createSessionsRoutes(
         // (not a generic 500) so the UI shows the re-login CTA. reconnectSession
         // also emitted the session-scoped SSE toast event for this case.
         if (result.code === "account_unrefreshable") {
-          return c.json({ error: result.message, code: result.code }, 409);
+          // Issue #4461 (R6): name the refusing node (this one) and the account.
+          const accountUuid = sessionResult.session.metadata?.accountUuid;
+          return c.json(
+            {
+              error: result.message,
+              code: result.code,
+              ...getLocalNode(),
+              ...(accountUuid ? { accountUuid } : {}),
+            },
+            409
+          );
         }
 
         // Issue #1778: the session's working directory (worktree) was deleted out
@@ -660,6 +683,28 @@ export function createSessionsRoutes(
           const result = await registry.reconnectOnNode(node.nodeId, sessionId);
           if (result.type === "success") {
             return c.json({ ok: true, newSessionId: result.newSessionId });
+          }
+          // Issue #4461 (R6): a forward-compatible branch only. Today the peer's
+          // reconnect receiver answers { ok: true } before its engine runs
+          // (federation/sessionLifecycle.ts), so this code never arrives here and
+          // a peer-owned session's refusal reaches the browser as the bridged
+          // account-unrefreshable SSE event alone. Should a peer ever answer it
+          // synchronously, answer 409 with the HUB's identity for that node.
+          if (result.code === "account_unrefreshable") {
+            const accountUuid =
+              registry.locateSession(sessionId)?.session.metadata?.accountUuid;
+            return c.json(
+              {
+                error: result.message,
+                code: result.code,
+                ...(registry.getNodeIdentity(node.nodeId) ?? {
+                  nodeId: node.nodeId,
+                  nodeLabel: node.nodeId,
+                }),
+                ...(accountUuid ? { accountUuid } : {}),
+              },
+              409
+            );
           }
           // Issue #1778: thread the terminal error code (e.g. "cwd_missing") to
           // the client so the UI can show an actionable message rather than
@@ -1286,8 +1331,22 @@ export function createSessionsRoutes(
           404
         );
       }
+      // Issue #4461 (R6): an account_unrefreshable refusal carries the refusing
+      // node and the target account (the service sets them for that code only,
+      // so every other code's body is byte-identical to before).
       return c.json(
-        { ok: false, error: result.message, code: result.code },
+        {
+          ok: false,
+          error: result.message,
+          code: result.code,
+          ...(result.nodeId
+            ? {
+                nodeId: result.nodeId,
+                nodeLabel: result.nodeLabel,
+                accountUuid: result.accountUuid,
+              }
+            : {}),
+        },
         result.status as 400 | 404 | 409 | 500 | 502 | 503
       );
     }
@@ -2210,15 +2269,19 @@ export function createSessionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          // #5375: transport failure → 502, not an onError 500.
+          // #5375/#5404: a transport failure is logged and answers 502; any
+          // other error is rethrown so app.onError logs it as a 500.
           let resp: Response;
           try {
             resp = await fetch(
               `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}`,
               { method: "DELETE", headers }
             );
-          } catch {
-            return c.json({ error: "Remote node unreachable" }, 502);
+          } catch (error) {
+            return proxyTransportFailure(c, error, {
+              errorLogger: errorLogger,
+              nodeId: node.nodeId,
+            });
           }
           if (resp.ok) {
             // Immediately remove from cache so subsequent queries

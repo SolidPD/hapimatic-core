@@ -41,6 +41,8 @@ export function useFederatedSessions(api: ApiClient | null): {
   remoteSessions: SessionSummary[];
   remoteNodes: FederationRemoteNode[];
   localNode: { nodeId: string; nodeLabel: string } | null;
+  /** #4461: the federation-nodes read has answered or failed (not pending). */
+  localNodeSettled: boolean;
   isLoading: boolean;
   error: string | null;
   isEnabled: boolean;
@@ -91,6 +93,10 @@ export function useFederatedSessions(api: ApiClient | null): {
     remoteNodes: (allSessionsQuery.data?.nodes ??
       EMPTY_REMOTE_NODES) as FederationRemoteNode[],
     localNode: nodesQuery.data?.localNode ?? null,
+    // Issue #4461: true once `GET /api/federation/nodes` has answered OR failed.
+    // A null `localNode` alone cannot tell a pending read from a failed one, and
+    // the re-login deep link must not decide "UI host or not" while pending.
+    localNodeSettled: nodesQuery.isFetched,
     isLoading: allSessionsQuery.isLoading,
     error:
       allSessionsQuery.error instanceof Error

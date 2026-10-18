@@ -4,6 +4,8 @@ import type { Context } from "hono";
 import { z } from "zod";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
+import type { ErrorLogger } from "../../logging/errorLogger";
+import { proxyTransportFailure } from "./routeErrorHelper";
 import {
   federationReadSignal,
   readProxyJson,
@@ -59,6 +61,8 @@ export function createMessagesRoutes(
   options?: {
     getNodeRegistry?: () => NodeRegistry | null;
     federationApiToken?: string | null;
+    /** Logs federation proxy transport failures (#5404). */
+    errorLogger?: ErrorLogger | null;
   }
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
@@ -148,8 +152,11 @@ export function createMessagesRoutes(
               body as Record<string, unknown>,
               resp.status as 400 | 404 | 409 | 500 | 503
             );
-          } catch {
-            return c.json({ error: "Remote node unreachable" }, 502);
+          } catch (error) {
+            return proxyTransportFailure(c, error, {
+              errorLogger: options?.errorLogger,
+              nodeId: node.nodeId,
+            });
           }
         }
       }
@@ -300,8 +307,11 @@ export function createMessagesRoutes(
               respBody as Record<string, unknown>,
               resp.status as 400 | 404 | 409 | 500 | 503
             );
-          } catch {
-            return c.json({ error: "Remote node unreachable" }, 502);
+          } catch (error) {
+            return proxyTransportFailure(c, error, {
+              errorLogger: options?.errorLogger,
+              nodeId: node.nodeId,
+            });
           }
         }
       }

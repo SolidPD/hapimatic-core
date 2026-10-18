@@ -123,6 +123,7 @@ import TerminalPage from "@/routes/sessions/terminal";
 import ClaudePtyPage from "@/routes/sessions/claude-pty";
 import DesktopPage from "@/routes/sessions/desktop";
 import AccountUsagePage from "@/routes/account-usage";
+import { parseReloginSearch, type ReloginSearch } from "@/lib/reloginLink";
 // Admin pages promoted from in-drawer `?section=` overlays to their own routes (#1935).
 import FederationDashboard from "@/routes/settings/federation";
 import { NodeDetailView } from "@/components/federation/NodeDetailView";
@@ -1555,6 +1556,11 @@ const accountUsageRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/account-usage",
   component: AccountUsagePage,
+  // Issue #4461 (R9): the re-login deep link `?relogin=anthropic&node=<id>`. Both
+  // keys are OPTIONAL (a normal visit carries neither); an unknown provider or a
+  // malformed node is dropped, so a hand-edited URL never opens a flow.
+  validateSearch: (search: Record<string, unknown>): ReloginSearch =>
+    parseReloginSearch(search),
 });
 
 // Admin sections promoted to their own routes (#1935). Each is a FLAT child of the

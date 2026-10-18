@@ -9,6 +9,7 @@ import {
   Gauge,
 } from "lucide-react";
 import { useAppContext } from "@/lib/app-context";
+import { ReloginDeepLink } from "@/components/AccountUsage/ReloginDeepLink";
 import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
 import { useAppGoBack } from "@/hooks/useAppGoBack";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
@@ -597,7 +598,8 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
   // to { nodeId, nodeLabel } via the federation node list, so the card can offer
   // an inline per-node "Set active" switch. `machines` are labels, but the
   // per-node switch mutation is keyed by nodeId.
-  const { localNode, remoteNodes, remoteSessions } = useFederatedSessions(api);
+  const { localNode, localNodeSettled, remoteNodes, remoteSessions } =
+    useFederatedSessions(api);
   // The "currently-viewed" node for R3's pre-check. On a non-federated install
   // localNode is null, so fall back to the synthesized "local" id (D2) — the same
   // idiom the server's /federation/active-accounts uses (webClient.ts:34).
@@ -1224,6 +1226,15 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
                 during setup
               </div>
             )}
+
+            {/* #4461 (R9): the re-login deep link — the add flow for the UI
+              host, an inline explanation naming any other node. */}
+            <ReloginDeepLink
+              api={api}
+              localNode={localNode}
+              localNodeSettled={localNodeSettled}
+              resolveNodeLabel={resolveNodeLabel}
+            />
 
             {showInitialLoading ? (
               <div

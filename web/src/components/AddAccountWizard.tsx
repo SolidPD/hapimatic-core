@@ -34,6 +34,14 @@ export type AddAccountWizardProps = {
   api: ApiClient | null;
   /** Fired with the new account after a successful login. */
   onAdded?: (account: RedactedAccount) => void;
+  /**
+   * #4462 (D-B1 = A): store the login on this federation node instead of the
+   * node serving the UI. The hub proxies both steps to it; the browser never
+   * talks to the node.
+   */
+  nodeId?: string;
+  /** #4462: shown as "Stored on <nodeLabel>" while `nodeId` is set. */
+  nodeLabel?: string;
 };
 
 /**
@@ -65,8 +73,13 @@ export function AddAccountWizard({
   onClose,
   api,
   onAdded,
+  nodeId,
+  nodeLabel,
 }: AddAccountWizardProps) {
-  const { start, complete, isStarting, isCompleting } = useAccountLogin(api);
+  const { start, complete, isStarting, isCompleting } = useAccountLogin(
+    api,
+    nodeId ? { nodeId } : undefined
+  );
   // Issue #4349: on a tenant VM the user signs in inside the VM with Claude Code's own /login.
   const inVmLogin = useInVmAccountLogin(api);
   const [inVm, setInVm] = useState<InVmLoginStartResponse | null>(null);
@@ -226,6 +239,14 @@ export function AddAccountWizard({
               ? "Sign in inside this VM with Claude Code's own sign-in. Your credential stays on this VM, in the account's own folder. Hapimatic uses it only to read the account's usage and model list from Anthropic."
               : "Sign in to Anthropic in your browser, approve access, then paste the authorization code Anthropic shows you back here. No desktop access required. Finish within 5 minutes of opening this dialog."}
           </DialogDescription>
+          {nodeId ? (
+            <p
+              className="text-sm text-[var(--app-hint)]"
+              data-testid="add-account-target-node"
+            >
+              Stored on {nodeLabel ?? nodeId}
+            </p>
+          ) : null}
         </DialogHeader>
 
         <div className="flex flex-col gap-4 p-1 text-sm text-[var(--app-fg)]">

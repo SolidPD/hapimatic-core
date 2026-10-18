@@ -13,7 +13,11 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { KNOWN_AGENT_IDS, resolveToolCapabilities } from "@hapi/protocol";
+import {
+  ANTHROPIC_LOGIN_CAPABILITY,
+  KNOWN_AGENT_IDS,
+  resolveToolCapabilities,
+} from "@hapi/protocol";
 import { configuration } from "../configuration";
 import { ACCOUNT_LEASE_COORDINATOR_CAPABILITY } from "../services/rotationLeaseService";
 
@@ -124,7 +128,13 @@ export function detectCapabilities(opts?: {
   role?: "hub" | "node" | "peer";
 }): string[] {
   if (!cachedBaseCapabilities) {
-    const capabilities = ["read-sessions", "spawn-session"];
+    // #4462: ANTHROPIC_LOGIN_CAPABILITY is static (every binary since #4462 ships
+    // the receivers), so it is cached with the base set and precedes agent:*.
+    const capabilities = [
+      "read-sessions",
+      "spawn-session",
+      ANTHROPIC_LOGIN_CAPABILITY,
+    ];
 
     for (const agent of KNOWN_AGENT_IDS) {
       // Bun.which returns the full path if found, null if not

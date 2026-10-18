@@ -53,7 +53,7 @@ import {
 import { useSessionActionPending } from "@/hooks/useSessionActionPending";
 import { useSessionStaleness } from "@/hooks/useSessionStaleness";
 import { queryKeys } from "@/lib/query-keys";
-import { getReconnectErrorToast } from "@/lib/reconnectError";
+import { getReconnectErrorToastOptions } from "@/lib/reconnectError";
 import {
   markActionPending,
   reconcileActionPending,
@@ -1043,10 +1043,10 @@ export function SessionItem(props: {
             // always returns a message, so the old non-empty-message guard is
             // gone. The 90s safety timeout (above) remains the backstop for silent/
             // non-throwing failures (Fallback Preservation Rule).
-            showToast(getReconnectErrorToast(err), {
-              type: "warning",
-              duration: 6000,
-            });
+            // #4461: the action ("Log in" on the refusing node) rides with the
+            // message, matching the SSE toast so the pair collapses into one.
+            const { message, action } = getReconnectErrorToastOptions(err);
+            showToast(message, { type: "warning", duration: 6000, action });
             setReconnectInitiated(false);
           }
         }}

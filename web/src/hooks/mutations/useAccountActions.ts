@@ -10,6 +10,7 @@ import type {
 } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 import { useToast } from "@/components/Toast";
+import { reloginToastFromError } from "@/lib/reloginLink";
 import {
   markActionPending,
   clearActionPending,
@@ -59,13 +60,27 @@ export type RemoveAccountsFromNodesVars = {
  * default falls back to the server's human `error` message from the JSON body —
  * NOT `err.message`, which is the transport `HTTP <status>: <raw body>` composite.
  */
-function mapSwitchError(err: unknown): string {
+export function mapSwitchError(err: unknown): {
+  message: string;
+  action?: { label: string; onClick: () => void };
+} {
   const code = err instanceof ApiError ? err.code : undefined;
+  if (code === "account_unrefreshable") {
+    // Issue #4461 (R8): name the node whose store refused and offer the re-login
+    // for THAT node. A pre-#4461 peer's body carries no node — keep today's text.
+    return (
+      reloginToastFromError(err) ?? {
+        message: "Re-login required for this account before it can be used.",
+      }
+    );
+  }
+  return { message: mapSwitchErrorText(err, code) };
+}
+
+function mapSwitchErrorText(err: unknown, code: string | undefined): string {
   switch (code) {
     case "at_capacity":
       return "This node is full — free a session (disconnect or delete one) and retry the switch.";
-    case "account_unrefreshable":
-      return "Re-login required for this account before it can be used.";
     case "switch_failed_rollback_failed":
       return "Switch failed and the session is disconnected — reconnect it.";
     // Issue #4823: a key target the session cannot take (refused before any kill —
@@ -153,7 +168,8 @@ export function useAccountActions(
     },
     onError: (err: unknown) => {
       if (sessionId) clearActionPending(sessionId, "switch");
-      showToast(mapSwitchError(err), { type: "error" });
+      const { message, action } = mapSwitchError(err);
+      showToast(message, { type: "error", action });
     },
     onSettled: () => {
       if (sessionId) clearActionPending(sessionId, "switch");
@@ -359,13 +375,39 @@ export function useAccountActions(
 }
 
 /**
+ * Issue #1720 / #2300 / #4462: rethrow a login failure as an `ApiError` whose
+ * `.message` is the server's clean `error` text (not the raw `HTTP <status>:
+ * <json>` transport string the wizard would otherwise print) while keeping the
+ * `status`, `code` and `body`, so callers (the wizard, #4464) can branch on the
+ * code — `login_session_lost`, `node_offline`, `login_outcome_unknown`, …. An
+ * `ApiError` without a body (the client's own timeout answer) passes unchanged.
+ */
+function cleanLoginError(err: unknown): unknown {
+  if (!(err instanceof ApiError) || !err.body) return err;
+  let message = err.message;
+  try {
+    const parsed = JSON.parse(err.body) as { error?: unknown };
+    if (typeof parsed.error === "string") message = parsed.error;
+  } catch {
+    // Non-JSON body — keep the transport-message fallback.
+  }
+  return new ApiError(message, err.status, err.code, err.body);
+}
+
+/**
  * Web-initiated OAuth login mutations (issue #1263), backing `AddAccountWizard`.
  * `start` requests the Anthropic authorize URL; `complete` exchanges the pasted
- * code and, on success, invalidates the accounts query so the new account
- * appears in the list. A failed `complete` throws with the server's error
- * message so the wizard can surface it.
+ * code and, on success, invalidates the account queries so the new account
+ * appears. Both reject with an `ApiError` carrying the server's clean message
+ * and its `code` (see {@link cleanLoginError}).
+ *
+ * #4462: `nodeId` stores the login on that federation node; `complete` needs no
+ * node, because the token returned by `start` routes it.
  */
-export function useAccountLogin(api: ApiClient | null): {
+export function useAccountLogin(
+  api: ApiClient | null,
+  opts?: { nodeId?: string }
+): {
   start: () => Promise<{ loginToken: string; authorizeUrl: string }>;
   complete: (args: {
     loginToken: string;
@@ -375,13 +417,18 @@ export function useAccountLogin(api: ApiClient | null): {
   isCompleting: boolean;
 } {
   const queryClient = useQueryClient();
+  const nodeId = opts?.nodeId;
 
   const startMutation = useMutation({
     mutationFn: async () => {
       if (!api) {
         throw new Error("API unavailable");
       }
-      return await api.startAccountLogin();
+      try {
+        return await api.startAccountLogin(nodeId);
+      } catch (err) {
+        throw cleanLoginError(err);
+      }
     },
   });
 
@@ -400,30 +447,15 @@ export function useAccountLogin(api: ApiClient | null): {
         const { account } = await api.completeAccountLogin(loginToken, code);
         return account;
       } catch (err) {
-        // Issue #1720 / #2300 (Task 6 companion): surface the server's clean
-        // `error` message from the JSON body so AddAccountWizard renders it —
-        // not the raw `HTTP <status>: <json>` transport string. Before #2300
-        // this read `err.code`, which parseErrorCode populated with the `error`
-        // message; #2300 makes `err.code` carry the code LITERAL (e.g.
-        // "invalid_code" after #3452), so the human message now comes from the
-        // body's `error` field.
-        if (err instanceof ApiError) {
-          let message = err.message;
-          if (err.body) {
-            try {
-              const parsed = JSON.parse(err.body) as { error?: unknown };
-              if (typeof parsed.error === "string") message = parsed.error;
-            } catch {
-              // Non-JSON body — keep the transport-message fallback.
-            }
-          }
-          throw new Error(message);
-        }
-        throw err;
+        throw cleanLoginError(err);
       }
     },
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.accounts });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.accounts }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.accountUsage }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.accountHealth }),
+      ]);
     },
   });
 

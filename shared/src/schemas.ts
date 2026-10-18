@@ -992,6 +992,11 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
     sessionId: z.string(),
     accountUuid: z.string(),
     namespace: z.string().optional(),
+    // Issue #4461 (R7): the node whose store refused. The hub's event bridge stamps
+    // a peer's event with that peer's node; `GET /api/events` stamps this node's own
+    // events on egress. Optional + additive — an older emitter still validates.
+    nodeId: z.string().optional(),
+    nodeLabel: z.string().optional(),
   }),
   // Issue #1532: a token-refresh restart failed BOTH the respawn and the
   // same-account rollback. The session is disconnected but RECONNECTABLE (the

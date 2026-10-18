@@ -364,6 +364,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When the user deletes a saved provider key."
   },
   {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Per-node account health across the mesh: every account record each node holds, with needsRelogin and since derived; every known peer is listed, even unreachable. Never a token.",
+    "domain": "accounts",
+    "id": "accounts.federation-account-health-aggregate",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/federation/account-health"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When a UI must show which node needs a re-login for an account, for example after an account_unrefreshable refusal."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Return this node's account-health row (every account record it holds, derived fields only) for the hub's per-node aggregate; no token crosses the boundary.",
+    "domain": "accounts",
+    "id": "accounts.federation-account-health-receiver",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/account-health"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When the hub gathers a peer node's account records for the per-node account-health view."
+  },
+  {
     "auth": "federation-token",
     "availability": {
       "scope": "operator"
@@ -402,6 +442,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the hub changes a specific node's default account and proxies the switch to that node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Complete an Anthropic OAuth login on THIS node for the hub: exchange the code, store the account here, and return only the redacted account.",
+    "domain": "accounts",
+    "id": "accounts.federation-anthropic-login-complete",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/anthropic-login/complete"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub forwards the authorization code of a login it started on this node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Begin an Anthropic OAuth (PKCE) login on THIS node for the hub; returns the authorize URL and an opaque login token, never a token or verifier.",
+    "domain": "accounts",
+    "id": "accounts.federation-anthropic-login-start",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/anthropic-login/start"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub proxies a node-targeted Anthropic login to the node that will store the account."
   },
   {
     "auth": "federation-token",
@@ -768,7 +848,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Complete web OAuth by exchanging the login token and code, persisting the new account; returns only the redacted account.",
+    "description": "Complete web OAuth by exchanging the login token and code, persisting the new account on the node that started the login (its nodeId is carried in the token); returns only the redacted account.",
     "domain": "accounts",
     "id": "accounts.login-complete",
     "invocation": {
@@ -788,7 +868,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Begin web-initiated Anthropic OAuth (PKCE): returns the authorize URL plus an opaque login token to complete the flow.",
+    "description": "Begin web-initiated Anthropic OAuth (PKCE): returns the authorize URL plus an opaque login token to complete the flow. An optional nodeId stores the login on that federation node instead of this one.",
     "domain": "accounts",
     "id": "accounts.login-start",
     "invocation": {

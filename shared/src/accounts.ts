@@ -57,8 +57,11 @@ export const StoredAccountSchema = z
     // has no refresh token). The "oauth" branch STILL requires it — enforced by
     // the `.refine` below so legacy/oauth records keep their non-empty invariant.
     refreshToken: z.string().min(1).optional(),
-    // #3392: ADVISORY CACHE — non-authoritative for availability. A
-    // Hapimatic-synthesized copy of the token expiry that LAGS the live isolated
+    // #3392: ADVISORY CACHE — non-authoritative for availability. ONLY this
+    // field and `lastRefreshedAt` below are advisory: `unrefreshable` on this
+    // same store record is AUTHORITATIVE (the spawn gate's input, written only
+    // here — never to a live `.credentials.json`; rp1-home#2549, #4461).
+    // A Hapimatic-synthesized copy of the token expiry that LAGS the live isolated
     // `.credentials.json` by up to ~24h for isolated (non-host) accounts: native
     // Claude Code owns the isolated refresh and Hapimatic's scheduler defers it
     // (#1635), so this copy is only re-written by migration / host-default capture /

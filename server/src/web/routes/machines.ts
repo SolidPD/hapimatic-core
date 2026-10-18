@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { Hono } from "hono";
+import { resolveLocalNodeIdentity } from "../../config/nodeLabel";
 import { z } from "zod";
 import { optionalSessionNameSchema } from "@hapi/protocol";
 import {
@@ -195,9 +196,14 @@ export function createMachinesRoutes(
   options?: {
     errorLogger?: ErrorLogger | null;
     getSseManager?: () => SSEManager | null;
+    // Issue #4461 (R6): THIS node's identity, stamped on an account_unrefreshable
+    // create refusal. Absent ⇒ the non-federated identity.
+    getLocalNode?: () => { nodeId: string; nodeLabel: string };
   }
 ): Hono<WebAppEnv> {
   const errorLogger = options?.errorLogger ?? null;
+  const getLocalNode =
+    options?.getLocalNode ?? (() => resolveLocalNodeIdentity(null));
   const getSseManager = options?.getSseManager ?? null;
   const app = new Hono<WebAppEnv>();
 
@@ -497,6 +503,21 @@ export function createMachinesRoutes(
           // the "Too many concurrent sessions" message.
           result.code === "at_capacity")
       ) {
+        // Issue #4461 (R6): name the refusing node and the account — for
+        // account_unrefreshable only; the other 409 bodies are unchanged.
+        if (result.code === "account_unrefreshable") {
+          return c.json(
+            {
+              error: result.message,
+              code: result.code,
+              ...getLocalNode(),
+              ...(spawnOptions.accountUuid
+                ? { accountUuid: spawnOptions.accountUuid }
+                : {}),
+            },
+            409
+          );
+        }
         return c.json({ error: result.message, code: result.code }, 409);
       }
       return c.json(result);

@@ -2,6 +2,7 @@
 import type { SyncEngine } from "../sync/syncEngine";
 import type { PaymentMethodTarget } from "../sync/accountRestart";
 import type { NodeRegistry } from "../federation/nodeRegistry";
+import { resolveLocalNodeIdentity } from "../config/nodeLabel";
 import {
   federationReadSignal,
   readProxyJson,
@@ -93,7 +94,17 @@ export type SwitchAccountServiceResult =
   // account was staged for the next reconnect rather than switched live.
   | { type: "success"; accountEmail: string; staged?: boolean }
   | { type: "not-found" }
-  | { type: "error"; message: string; status: number; code: string };
+  | {
+      type: "error";
+      message: string;
+      status: number;
+      code: string;
+      // Issue #4461 (R6): set ONLY for `account_unrefreshable` — the node whose
+      // store refused (hub-canonical for a peer-owned session) and the target.
+      nodeId?: string;
+      nodeLabel?: string;
+      accountUuid?: string;
+    };
 
 /**
  * Issue #4823: result of SessionService.switchPaymentMethod — the account variants
@@ -205,15 +216,43 @@ export class SessionService {
   private readonly engine: SyncEngine;
   private readonly registry: NodeRegistry | null;
   private readonly apiToken: string | null;
+  private readonly localNode: () => { nodeId: string; nodeLabel: string };
 
   constructor(
     engine: SyncEngine,
     registry: NodeRegistry | null,
-    apiToken: string | null
+    apiToken: string | null,
+    // Issue #4461 (R6): THIS node's identity for an account_unrefreshable stamp.
+    // Optional: absent ⇒ the non-federated identity (`LOCAL_NODE_ID`).
+    localNode?: () => { nodeId: string; nodeLabel: string }
   ) {
     this.engine = engine;
     this.registry = registry;
     this.apiToken = apiToken;
+    this.localNode = localNode ?? (() => resolveLocalNodeIdentity(null));
+  }
+
+  /**
+   * Issue #4461 (R6): the identity of the node whose store refused an
+   * `account_unrefreshable` switch, or `{}` for every other code so its body
+   * stays byte-identical. A peer-owned session's node comes from the hub's
+   * registry (never the peer's body — the proxy forwards only error/code).
+   */
+  private refusalStamp(
+    code: string | undefined,
+    accountUuid: string | undefined,
+    // `null` = this node; otherwise the peer that owns the session.
+    nodeId: string | null
+  ): { nodeId?: string; nodeLabel?: string; accountUuid?: string } {
+    if (code !== "account_unrefreshable") return {};
+    const identity =
+      nodeId === null
+        ? this.localNode()
+        : (this.registry?.getNodeIdentity(nodeId) ?? {
+            nodeId,
+            nodeLabel: nodeId,
+          });
+    return accountUuid ? { ...identity, accountUuid } : identity;
   }
 
   private async proxyToNode(
@@ -231,7 +270,30 @@ export class SessionService {
     if (!node) {
       return { type: "not-found" };
     }
+    return this.proxyToResolvedNode(
+      node,
+      sessionId,
+      pathSuffix,
+      method,
+      namespace,
+      body
+    );
+  }
 
+  /**
+   * The send half of {@link proxyToNode}, for a node already resolved. Issue
+   * #4461: `switchPaymentMethod` resolves the node ONCE and keeps it, so an
+   * `account_unrefreshable` refusal is stamped with the node that answered — a
+   * second lookup after the call could miss a node that just went offline.
+   */
+  private async proxyToResolvedNode(
+    node: { nodeId: string; url: string },
+    sessionId: string,
+    pathSuffix: string,
+    method: string,
+    namespace: string,
+    body?: unknown
+  ): Promise<ProxyResult> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       // Issue #1097: forward the caller's JWT namespace so the receiver can
@@ -527,6 +589,11 @@ export class SessionService {
         message: result.message,
         status: switchAccountCodeToStatus(result.code),
         code: result.code ?? "unknown",
+        ...this.refusalStamp(
+          result.code,
+          target.kind === "account" ? target.accountUuid : undefined,
+          null
+        ),
       };
     }
 
@@ -545,7 +612,13 @@ export class SessionService {
       };
     }
 
-    const result = await this.proxyToNode(
+    // Issue #4461 (R6): resolve the owning node once and keep it for the stamp.
+    const node = this.registry?.findNodeForSession(sessionId) ?? null;
+    if (!node) {
+      return { type: "not-found" };
+    }
+    const result = await this.proxyToResolvedNode(
+      node,
       sessionId,
       "/account",
       "POST",
@@ -586,6 +659,7 @@ export class SessionService {
       // fall back to "transport_failed" for a genuine transport fault
       // (proxyToNode's catch leaves result.code undefined).
       code: result.code ?? "transport_failed",
+      ...this.refusalStamp(result.code, target.accountUuid, node.nodeId),
     };
   }
 

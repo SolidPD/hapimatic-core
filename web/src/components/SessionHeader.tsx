@@ -33,7 +33,7 @@ import {
   markActionPending,
   reconcileActionPending,
 } from "@/lib/session-action-pending";
-import { getReconnectErrorToast } from "@/lib/reconnectError";
+import { getReconnectErrorToastOptions } from "@/lib/reconnectError";
 import { queryKeys } from "@/lib/query-keys";
 import { useBranchInfo } from "@/hooks/queries/useBranchInfo";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
@@ -860,10 +860,10 @@ export function SessionHeader(props: {
           // fallback) — getReconnectErrorToast always returns a message, so the
           // old non-empty-message guard is gone.
           setReconnectInitiated(false);
-          showToast(getReconnectErrorToast(err), {
-            type: "warning",
-            duration: 6000,
-          });
+          // #4461: the action ("Log in" on the refusing node) rides with the
+          // message, matching the SSE toast so the pair collapses into one.
+          const { message, action } = getReconnectErrorToastOptions(err);
+          showToast(message, { type: "warning", duration: 6000, action });
         }}
       />
 

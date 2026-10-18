@@ -11,6 +11,8 @@ import type { WebAppEnv } from "../middleware/auth";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
+import type { ErrorLogger } from "../../logging/errorLogger";
+import { proxyTransportFailure } from "./routeErrorHelper";
 
 const decisionSchema = z.enum([
   "approved",
@@ -35,6 +37,8 @@ export function createPermissionsRoutes(
   options?: {
     getNodeRegistry?: () => NodeRegistry | null;
     federationApiToken?: string | null;
+    /** Logs federation proxy transport failures (#5404). */
+    errorLogger?: ErrorLogger | null;
   }
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
@@ -121,15 +125,19 @@ export function createPermissionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          // #5375: transport failure → 502, not an onError 500.
+          // #5375/#5404: a transport failure is logged and answers 502; any
+          // other error is rethrown so app.onError logs it as a 500.
           let resp: Response;
           try {
             resp = await fetch(
               `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}/approve`,
               { method: "POST", headers, body: JSON.stringify(parsed.data) }
             );
-          } catch {
-            return c.json({ error: "Remote node unreachable" }, 502);
+          } catch (error) {
+            return proxyTransportFailure(c, error, {
+              errorLogger: options?.errorLogger,
+              nodeId: node.nodeId,
+            });
           }
           if (resp.ok) {
             return c.json({ ok: true });
@@ -208,15 +216,19 @@ export function createPermissionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          // #5375: transport failure → 502, not an onError 500.
+          // #5375/#5404: a transport failure is logged and answers 502; any
+          // other error is rethrown so app.onError logs it as a 500.
           let resp: Response;
           try {
             resp = await fetch(
               `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}/deny`,
               { method: "POST", headers, body: JSON.stringify(parsed.data) }
             );
-          } catch {
-            return c.json({ error: "Remote node unreachable" }, 502);
+          } catch (error) {
+            return proxyTransportFailure(c, error, {
+              errorLogger: options?.errorLogger,
+              nodeId: node.nodeId,
+            });
           }
           if (resp.ok) {
             return c.json({ ok: true });

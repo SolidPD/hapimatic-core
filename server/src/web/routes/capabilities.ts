@@ -10,6 +10,7 @@ import {
   isAbortError,
 } from "../../federation/proxyFetchSignal";
 import type { ErrorLogger } from "../../logging/errorLogger";
+import { proxyTransportFailure } from "./routeErrorHelper";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { cataloged } from "../../capabilities/cataloged";
 import { auditInvoke, runCapabilityInvoke } from "./capabilityPolicy";
@@ -134,8 +135,12 @@ export function createCapabilitiesRoutes(
               )}/capabilities`,
               { headers, signal: federationReadSignal(c.req.raw.signal) }
             );
-          } catch {
-            return c.json({ ok: false, error: "Remote node unreachable" }, 502);
+          } catch (error) {
+            return proxyTransportFailure(c, error, {
+              errorLogger: options?.errorLogger,
+              nodeId: node.nodeId,
+              body: { ok: false, error: "Remote node unreachable" },
+            });
           }
           if (resp.ok) {
             try {
@@ -144,10 +149,11 @@ export function createCapabilitiesRoutes(
             } catch (error) {
               // #5375: a body read cut off by the timeout is a transport failure.
               if (isAbortError(error)) {
-                return c.json(
-                  { ok: false, error: "Remote node unreachable" },
-                  502
-                );
+                return proxyTransportFailure(c, error, {
+                  errorLogger: options?.errorLogger,
+                  nodeId: node.nodeId,
+                  body: { ok: false, error: "Remote node unreachable" },
+                });
               }
               // Malformed success body → fall through to the 404 below (unchanged).
             }
@@ -280,11 +286,15 @@ export function createCapabilitiesRoutes(
               .json()
               .catch(() => SESSION_NOT_FOUND)) as Record<string, unknown>;
             return c.json(relayed, resp.status as ContentfulStatusCode);
-          } catch {
-            // #5375: a transport failure is a 502 the remote-session
+          } catch (error) {
+            // #5375/#5404: a transport failure is a 502 the remote-session
             // availability guard labels — never the 404 session_not_found it
             // used to fall through to while the node was online.
-            return c.json({ ok: false, error: "Remote node unreachable" }, 502);
+            return proxyTransportFailure(c, error, {
+              errorLogger: options?.errorLogger,
+              nodeId: node.nodeId,
+              body: { ok: false, error: "Remote node unreachable" },
+            });
           }
         }
       }

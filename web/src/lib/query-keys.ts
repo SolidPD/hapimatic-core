@@ -88,6 +88,9 @@ export const queryKeys = {
   // OpenAI + Google Gemini sections (issue #3806, epic #3345). The key #3807
   // invalidates after a successful in-app add (K9).
   providerAuthState: ["provider-auth-state"] as const,
+  // Per-node account health (issue #4461, epic #4460 A) — the read #4462/#4464/
+  // #4466 consume; a re-login on a node should invalidate it.
+  accountHealth: ["account-health"] as const,
   // Admin session-metadata query surface (epic #1662, Sub M — issue #1675)
   sessionMetadataTurns: (filters: Record<string, unknown>) =>
     ["session-metadata-turns", JSON.stringify(filters ?? {})] as const,

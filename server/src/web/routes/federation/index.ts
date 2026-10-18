@@ -14,6 +14,8 @@ import { createSettingsSyncReceiverRoutes } from "./settingsSync";
 import { createWebClientRoutes } from "./webClient";
 import { createQueueMutationRoutes } from "./queueMutations";
 import { createFederationAccountRoutes } from "./accounts";
+import { createFederationAccountHealthRoutes } from "./accountHealth";
+import { createFederationAnthropicLoginRoutes } from "./anthropicLogin";
 import { createFederationCapacityRoutes } from "./capacity";
 import { createFederationUsageRoutes } from "./usage";
 import { createFederationAccountLeaseRoutes } from "./accountLease";
@@ -51,6 +53,13 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   app.route("/", createQueueMutationRoutes(deps));
   // Issue #1452 (Sub-Issue F): node-to-node active-account receivers.
   app.route("/", createFederationAccountRoutes(deps));
+  // Issue #4461 (epic #4460 A): per-node account health — hub aggregator (JWT
+  // GET) + peer-incoming receiver (fed-token POST).
+  app.route("/", createFederationAccountHealthRoutes(deps));
+  // Issue #4462 (epic #4460 B): node-targeted Anthropic login — peer-incoming
+  // start/complete receivers (fed-token POST), advertised as
+  // ANTHROPIC_LOGIN_CAPABILITY.
+  app.route("/", createFederationAnthropicLoginRoutes(deps));
   // Issue #1805 (R11): node-to-node set-max-concurrency receiver.
   app.route("/", createFederationCapacityRoutes(deps));
   // Epic #1855 (Sub-Issue C #1858): federation usage aggregator (JWT GET) +

@@ -10,6 +10,8 @@ import type {
   FederationPollResult,
   FederationSpawnBody,
   ModelMode,
+  NodeAccountHealth,
+  NodeAccountHealthReason,
   NodePmSpawnRoster,
   NodeProviderAuthState,
   NodeTurnAggregates,
@@ -25,6 +27,8 @@ import type {
 import type { SyncEvent } from "@hapi/protocol/types";
 import type { GitBranchListing } from "@hapi/protocol/gitBranches";
 import {
+  ANTHROPIC_LOGIN_CAPABILITY,
+  parseNodeAccountHealthPerEntry,
   SupervisedLoop,
   displayNodeLabel,
   LIVE_SESSION_FRESHNESS_WINDOW_MS,
@@ -77,6 +81,44 @@ export type RemoteSessionActionError = {
 
 /** Longer timeout for spawn/reconnect: daemon must spawn CLI + wait for Socket.IO. */
 const SPAWN_TIMEOUT_MS = 30_000;
+
+/**
+ * #4462: how long the hub waits for a peer's Anthropic login `complete`. The peer
+ * may need up to 25 s (token exchange 15 s + profile 10 s,
+ * `anthropicOauthLoginClient.ts`), and a hub that gave up first would report a
+ * failure for a login the peer then stored, after consuming the single-use token.
+ * Below Bun's 50 s idle limit and the web client's 45 s wait.
+ */
+export const ANTHROPIC_LOGIN_COMPLETE_TIMEOUT_MS = 35_000;
+
+/**
+ * #4462: the outcome of one proxied Anthropic login call. `answer` carries the
+ * peer's raw 2xx JSON — the hub route parses it with the whitelist schemas. The
+ * error kinds let the route tell "nothing was sent" (`offline`) from "the peer
+ * may have acted" (`timeout`, `transport`) and from a peer that answered non-2xx
+ * (`http`).
+ */
+export type AnthropicLoginProxyResult =
+  | { type: "answer"; body: unknown }
+  | {
+      type: "error";
+      kind: "offline" | "timeout" | "transport" | "http";
+      status?: number;
+      message: string;
+    };
+
+/**
+ * #4462: everything the hub's login routes gate on, read from ONE `nodeStates`
+ * entry so identity, liveness and capability cannot disagree when a poll lands
+ * between separate reads. `polled` is false until the first `/federation/info`.
+ */
+export type NodeLoginGate = {
+  nodeId: string;
+  nodeLabel: string;
+  online: boolean;
+  polled: boolean;
+  supportsAnthropicLogin: boolean;
+};
 const OFFLINE_THRESHOLD = 3;
 
 /** Maximum number of active peers in the mesh. New announcements are rejected at capacity. */
@@ -206,6 +248,25 @@ export function shouldForwardBridgeEvent(
   // Cache miss: session not yet polled — forward to avoid dropping
   // real-time events for newly-spawned sessions
   return true;
+}
+
+/**
+ * True when a 401 body is exactly the JWT middleware's `{"error":"Invalid token"}`
+ * — a peer answering for a federation route it does not have (issue #4461; the
+ * #4073 K13 rule). Any other 401 body is a real auth failure.
+ */
+function isInvalidTokenBody(text: string): boolean {
+  try {
+    const body = JSON.parse(text) as unknown;
+    return (
+      typeof body === "object" &&
+      body !== null &&
+      Object.keys(body).length === 1 &&
+      (body as { error?: unknown }).error === "Invalid token"
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -612,7 +673,19 @@ export class NodeRegistry {
             try {
               const event = JSON.parse(line.slice(6)) as SyncEvent;
               if (this.shouldForwardEvent(event)) {
-                this.eventBridgeSseManager.broadcast(event);
+                // Issue #4461 (R7): name the node whose store refused. The hub's
+                // own id and label for this peer win over anything the peer
+                // reported (hub-canonical identity), so the browser's toast and
+                // the 409 for the same refusal name the same node.
+                this.eventBridgeSseManager.broadcast(
+                  event.type === "account-unrefreshable"
+                    ? {
+                        ...event,
+                        nodeId: nodeConfig.id,
+                        nodeLabel: nodeConfig.label,
+                      }
+                    : event
+                );
                 this.bridgeStats.forwarded++;
                 // [perf] issue #2147 (interaction, bridge-hop): stamp when a
                 // remote message-received event is rebroadcast to hub clients —
@@ -1839,6 +1912,108 @@ export class NodeRegistry {
   }
 
   /**
+   * Read a peer's per-node account health (issue #4461, epic #4460 A).
+   *
+   * Deliberately NOT `proxyToNode`, which collapses every failure into one error
+   * string: the aggregator must tell an old peer from a broken one. Mirrors the
+   * structured idiom of `removeAccountOnNode`:
+   *   - registry already marks the node offline (or it is unknown) → `offline`,
+   *     with no fetch;
+   *   - HTTP 404, or HTTP 401 whose body is exactly `{"error":"Invalid token"}` →
+   *     `unsupported`. A peer without the route never answers 404: the request
+   *     falls through to its JWT middleware, which answers 401 "Invalid token"
+   *     (`web/middleware/auth.ts`). A real federation-token mismatch is answered
+   *     by the receiver itself with `{"error":"Unauthorized"}` and stays
+   *     `unreachable`. Same rule as #4073's K13 (`needs_update`);
+   *   - any other non-2xx, a throw, or the 10 s fetch timeout → `unreachable`,
+   *     with a whitelisted `reason` for the row and a free-text `message` for the
+   *     hub's log only (issue #5420);
+   *   - 2xx → the row re-parsed one account entry at a time with the whitelist
+   *     schemas (hub-side ingress parse, R4; `parseNodeAccountHealthPerEntry`), so
+   *     one entry this build cannot read is dropped and counted, not the whole
+   *     row. A body that is not JSON or not a row is `unreachable`/`malformed`.
+   */
+  async getAccountHealthOnNode(nodeId: string): Promise<
+    | { kind: "ok"; row: NodeAccountHealth }
+    | { kind: "offline" }
+    | { kind: "unsupported" }
+    | {
+        kind: "unreachable";
+        reason: NodeAccountHealthReason;
+        message: string;
+      }
+  > {
+    const state = this.nodeStates.get(nodeId);
+    if (!state || state.status === "offline") {
+      return { kind: "offline" };
+    }
+    const url = `${state.config.url}/api/federation/account-health`;
+    let res: Response;
+    try {
+      res = await this.fetchWithAuth(url, "POST", {});
+    } catch (err) {
+      const timedOut = err instanceof Error && err.name === "TimeoutError";
+      return {
+        kind: "unreachable",
+        reason: timedOut ? "timeout" : "network",
+        message: err instanceof Error ? err.message : "Request failed",
+      };
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      if (
+        res.status === 404 ||
+        (res.status === 401 && isInvalidTokenBody(text))
+      ) {
+        return { kind: "unsupported" };
+      }
+      return {
+        kind: "unreachable",
+        reason:
+          res.status === 401 || res.status === 403
+            ? "auth"
+            : res.status >= 500
+              ? "http_5xx"
+              : "http_4xx",
+        message: `Node returned ${res.status}`,
+      };
+    }
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch (err) {
+      return {
+        kind: "unreachable",
+        reason: "malformed",
+        message: `Account-health body is not JSON: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    const row = parseNodeAccountHealthPerEntry(body);
+    if (!row) {
+      return {
+        kind: "unreachable",
+        reason: "malformed",
+        message: "Malformed account-health row",
+      };
+    }
+    return { kind: "ok", row };
+  }
+
+  /**
+   * The hub's canonical identity for a tracked node, whatever its status (issue
+   * #4461). `null` ONLY for an unknown id — #4462's `node_not_found` versus
+   * `node_offline` gates depend on that distinction. Used to stamp the
+   * `account_unrefreshable` 409 for a peer-owned session.
+   */
+  getNodeIdentity(
+    nodeId: string
+  ): { nodeId: string; nodeLabel: string } | null {
+    const state = this.nodeStates.get(nodeId);
+    if (!state) return null;
+    return { nodeId: state.config.id, nodeLabel: state.config.label };
+  }
+
+  /**
    * Proxy a Codex (OpenAI) in-app login START to the owning node's #3807
    * receiver. POST-only (`proxyToNode`). The per-account codex dir lives on the
    * TARGET node (R4), so the login must run there. Only the login token + state
@@ -1873,6 +2048,104 @@ export class NodeRegistry {
     return this.proxyToNode(nodeId, "/api/federation/openai-login/cancel", {
       loginToken,
     });
+  }
+
+  /** True when the node's last polled `/federation/info` advertises `capability`. */
+  nodeSupports(nodeId: string, capability: string): boolean {
+    return (
+      this.nodeStates.get(nodeId)?.info?.capabilities?.includes(capability) ??
+      false
+    );
+  }
+
+  /** #4462: the gate inputs for a node-targeted login; `null` for an unknown id. */
+  getNodeLoginGate(nodeId: string): NodeLoginGate | null {
+    const state = this.nodeStates.get(nodeId);
+    if (!state) return null;
+    return {
+      nodeId: state.config.id,
+      nodeLabel: state.config.label,
+      online: state.status !== "offline",
+      polled: state.info !== null,
+      supportsAnthropicLogin:
+        state.info?.capabilities?.includes(ANTHROPIC_LOGIN_CAPABILITY) ?? false,
+    };
+  }
+
+  /**
+   * #4462: run an Anthropic PKCE login START on the node that will store the
+   * account (`/api/federation/anthropic-login/start`). PKCE generation is local
+   * and fast, so the default per-peer timeout applies. Structured (not
+   * `proxyToNode`) so the receiver's refusal `code` survives.
+   */
+  async startAnthropicLoginOnNode(
+    nodeId: string
+  ): Promise<AnthropicLoginProxyResult> {
+    return this.anthropicLoginCall(
+      nodeId,
+      "/api/federation/anthropic-login/start",
+      {},
+      FETCH_TIMEOUT_MS
+    );
+  }
+
+  /**
+   * #4462: forward an Anthropic login COMPLETE to the node that ran `start` (its
+   * PKCE pending map is per process). Waits {@link ANTHROPIC_LOGIN_COMPLETE_TIMEOUT_MS}
+   * because the peer's token exchange can take 25 s; a timeout is reported as
+   * `kind: "timeout"`, never as a failed login.
+   */
+  async completeAnthropicLoginOnNode(
+    nodeId: string,
+    body: { loginToken: string; code: string; state?: string },
+    timeoutMs: number = ANTHROPIC_LOGIN_COMPLETE_TIMEOUT_MS
+  ): Promise<AnthropicLoginProxyResult> {
+    return this.anthropicLoginCall(
+      nodeId,
+      "/api/federation/anthropic-login/complete",
+      body,
+      timeoutMs
+    );
+  }
+
+  private async anthropicLoginCall(
+    nodeId: string,
+    endpoint: string,
+    body: unknown,
+    timeoutMs: number
+  ): Promise<AnthropicLoginProxyResult> {
+    const state = this.nodeStates.get(nodeId);
+    if (!state || state.status === "offline") {
+      return { type: "error", kind: "offline", message: "Node is offline" };
+    }
+    try {
+      const res = await this.fetchWithAuth(
+        `${state.config.url}${endpoint}`,
+        "POST",
+        body,
+        timeoutMs
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        return {
+          type: "error",
+          kind: "http",
+          status: res.status,
+          message: `Node returned ${res.status}: ${text}`.slice(0, 500),
+        };
+      }
+      return { type: "answer", body: await res.json() };
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      return {
+        type: "error",
+        kind:
+          name === "TimeoutError" || name === "AbortError"
+            ? "timeout"
+            : "transport",
+        message: err instanceof Error ? err.message : "Request failed",
+      };
+    }
   }
 
   /** Proxy node-global turn/session aggregates from a remote node (issue #1674, Sub L). */

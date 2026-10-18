@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { ApiError } from "@/api/client";
+import { reloginToastFromError } from "@/lib/reloginLink";
 
 /**
  * Shared re-login toast copy for an account whose login expired and could not
@@ -23,7 +24,9 @@ export const ACCOUNT_UNREFRESHABLE_TOAST_MESSAGE =
  *
  *   - `cwd_missing` (502) → actionable "worktree deleted" terminal message.
  *   - `at_capacity` (409, #2300) → actionable "node full — free a slot" message.
- *   - `account_unrefreshable` (409) → the shared re-login message above.
+ *   - `account_unrefreshable` (409) → the shared re-login message above, or
+ *     "Re-login required on <node>" when the 409 names its node (#4461; see
+ *     {@link getReconnectErrorToastOptions}, which also carries the action).
  *   - anything else (a code-less 500, a thrown network/timeout error, a plain
  *     `Error`, or a non-error value) → a generic "try again" fallback.
  *
@@ -37,6 +40,27 @@ export const ACCOUNT_UNREFRESHABLE_TOAST_MESSAGE =
  * text-only "actionable" toast convention of the #1531 / #1532 listeners.
  */
 export function getReconnectErrorToast(err: unknown): string {
+  return getReconnectErrorToastOptions(err).message;
+}
+
+/**
+ * Issue #4461 (R8): the reconnect toast's message AND its optional action. An
+ * `account_unrefreshable` 409 that names its node gets "Re-login required on
+ * <node>" plus a "Log in" action from {@link buildReloginToast} — the SAME builder
+ * the SSE listener (App.tsx) uses with the same server-stamped node and no account
+ * name, so the pair stays byte-identical and collapses into ONE toast carrying the
+ * action whichever side fires first. A 409 without a node (a pre-#4461 node) keeps
+ * the shared message and no action, as the SSE listener does for an unstamped
+ * event. Every other failure maps exactly as {@link getReconnectErrorToast}.
+ */
+export function getReconnectErrorToastOptions(err: unknown): {
+  message: string;
+  action?: { label: string; onClick: () => void };
+} {
+  return reloginToastFromError(err) ?? { message: reconnectErrorMessage(err) };
+}
+
+function reconnectErrorMessage(err: unknown): string {
   if (err instanceof ApiError && err.code === "cwd_missing") {
     return (
       "This session's working directory (worktree) was deleted and can't be " +

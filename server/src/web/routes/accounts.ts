@@ -20,6 +20,10 @@ import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { cataloged } from "../../capabilities/cataloged";
 import { logAndJson } from "./routeErrorHelper";
+import {
+  createAnthropicLoginRouting,
+  unwrapLoginToken,
+} from "./anthropicLoginRouting";
 import type { AccountService } from "../../services/accountService";
 import {
   IN_VM_SIGN_IN_REQUIRED,
@@ -59,7 +63,7 @@ import { readOnboardingSeedState } from "../../utils/daemonControlClient";
  * Best-effort (the method swallows its own errors). `force` re-imports after a
  * new #3807 login; the default GET path is once-per-process (idempotent). [ER 2026-09-19: 3808-2]
  */
-async function triggerProviderImport(
+export async function triggerProviderImport(
   service: AccountService,
   opts?: { force?: boolean }
 ): Promise<void> {
@@ -292,6 +296,14 @@ export function createAccountsRoutes(opts: {
   };
   const isLocalOpenAiRequest = (nodeId: string): boolean =>
     nodeId === LOCAL_NODE_ID || !isRemoteOpenAiNode(nodeId);
+
+  // #4462: node-targeted Anthropic login. The strict local test and the remote
+  // start/complete live in ./anthropicLoginRouting; the local flow below is
+  // unchanged.
+  const anthropicLoginRouting = createAnthropicLoginRouting({
+    getNodeRegistry: opts.getNodeRegistry,
+    getLocalNodeId: opts.getLocalNodeId,
+  });
 
   app.get(
     "/accounts",
@@ -1073,7 +1085,7 @@ export function createAccountsRoutes(opts: {
         domain: "accounts",
         surface: "rest",
         description:
-          "Begin web-initiated Anthropic OAuth (PKCE): returns the authorize URL plus an opaque login token to complete the flow.",
+          "Begin web-initiated Anthropic OAuth (PKCE): returns the authorize URL plus an opaque login token to complete the flow. An optional nodeId stores the login on that federation node instead of this one.",
         whenToUse: "When the user starts adding an account via browser login.",
         invocation: {
           kind: "rest",
@@ -1087,7 +1099,16 @@ export function createAccountsRoutes(opts: {
       })
     ),
     loginLimiter,
-    c => {
+    async c => {
+      // #4462: an optional `nodeId` stores the login on another node. Absent, the
+      // LOCAL_NODE_ID sentinel or this node's own id → the local flow, unchanged.
+      const body = (await c.req.json().catch(() => null)) as {
+        nodeId?: unknown;
+      } | null;
+      const nodeId = typeof body?.nodeId === "string" ? body.nodeId : undefined;
+      if (!anthropicLoginRouting.isLocalTarget(nodeId)) {
+        return await anthropicLoginRouting.startRemote(c, nodeId!);
+      }
       const login = opts.getLoginService?.();
       if (!login) {
         return c.json({ error: "Account login service unavailable" }, 503);
@@ -1124,7 +1145,7 @@ export function createAccountsRoutes(opts: {
         domain: "accounts",
         surface: "rest",
         description:
-          "Complete web OAuth by exchanging the login token and code, persisting the new account; returns only the redacted account.",
+          "Complete web OAuth by exchanging the login token and code, persisting the new account on the node that started the login (its nodeId is carried in the token); returns only the redacted account.",
         whenToUse: "When the user finishes browser login and submits the code.",
         invocation: {
           kind: "rest",
@@ -1143,7 +1164,12 @@ export function createAccountsRoutes(opts: {
       if (!login) {
         return c.json({ error: "Account login service unavailable" }, 503);
       }
-      let body: { loginToken?: string; code?: string; state?: string };
+      let body: {
+        loginToken?: string;
+        code?: string;
+        state?: string;
+        nodeId?: unknown;
+      };
       try {
         body = await c.req.json();
       } catch {
@@ -1161,6 +1187,22 @@ export function createAccountsRoutes(opts: {
           },
           400
         );
+      }
+      // #4462: a hub-wrapped token routes the call to the node that ran `start`; a
+      // plain token with no (or a local) nodeId keeps the local flow unchanged.
+      const nodeId = typeof body.nodeId === "string" ? body.nodeId : undefined;
+      const routed =
+        typeof body.loginToken === "string"
+          ? unwrapLoginToken(body.loginToken)
+          : ({ kind: "plain", token: body.loginToken } as const);
+      if (
+        routed.kind !== "plain" ||
+        !anthropicLoginRouting.isLocalTarget(nodeId)
+      ) {
+        return await anthropicLoginRouting.completeRemote(c, routed, nodeId, {
+          code: body.code,
+          state: typeof body.state === "string" ? body.state : undefined,
+        });
       }
       try {
         const result = await login.complete({

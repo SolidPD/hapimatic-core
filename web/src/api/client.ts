@@ -77,6 +77,7 @@ import type {
   AccountUsageHistoryResponse,
   AccountUsageResponse,
   ProviderAuthStateResponse,
+  AccountHealthResponse,
   SessionMetadataTurnsResponse,
   AccountLoginStartResponse,
   InVmLoginCompleteResponse,
@@ -264,6 +265,18 @@ function parseErrorCode(bodyText: string): string | undefined {
   }
 }
 
+/**
+ * Issue #4462: the request's own timeout fired (no answer at all). Same message
+ * as before, so every existing caller that reads `.message` is unaffected; a
+ * caller that must tell "no answer" from any other failure checks the class.
+ */
+export class RequestTimeoutError extends Error {
+  constructor() {
+    super(REQUEST_TIMED_OUT_MESSAGE);
+    this.name = "RequestTimeoutError";
+  }
+}
+
 export class ApiError extends Error {
   status: number;
   code?: string;
@@ -441,6 +454,12 @@ export class ApiClient {
   // than the deadline and never reports a finished batch as failed.
   private static readonly BULK_TIMEOUT_MS = 45_000;
 
+  // #4462: a node-targeted Anthropic login `complete` waits up to 35 s on the hub
+  // for the peer's token exchange; the browser waits longer so the hub's own
+  // `login_outcome_unknown` answer reaches the wizard (and stays below the hub's
+  // 50 s idle limit).
+  private static readonly LOGIN_COMPLETE_TIMEOUT_MS = 45_000;
+
   private async request<T>(
     path: string,
     init?: RequestInit,
@@ -476,7 +495,7 @@ export class ApiClient {
       });
     } catch (err) {
       if (err instanceof DOMException && err.name === "TimeoutError") {
-        throw new Error(REQUEST_TIMED_OUT_MESSAGE);
+        throw new RequestTimeoutError();
       }
       if (err instanceof DOMException && err.name === "AbortError") {
         throw new Error(REQUEST_CANCELLED_MESSAGE);
@@ -1137,6 +1156,18 @@ export class ApiClient {
     );
   }
 
+  /**
+   * Per-node account health across the federation (issue #4461): every account
+   * record each node holds, with `needsRelogin` / `since` derived server-side,
+   * and every known peer present (`ok` / `offline` / `unreachable` /
+   * `unsupported`). Never carries a token.
+   */
+  async getAccountHealth(): Promise<AccountHealthResponse> {
+    return await this.request<AccountHealthResponse>(
+      "/api/federation/account-health"
+    );
+  }
+
   // Issue #1675 (Sub M): admin session-metadata query surface.
 
   /** Node-local per-turn query (all six filters incl. event-kind). */
@@ -1492,10 +1523,15 @@ export class ApiClient {
 
   // Web-initiated OAuth login (issue #1263). Two-step PKCE: start → user
   // authenticates in a browser and copies the code → complete.
-  async startAccountLogin(): Promise<AccountLoginStartResponse> {
+  // #4462: `nodeId` stores the login on that federation node (the body stays
+  // exactly `{}` without it).
+  async startAccountLogin(nodeId?: string): Promise<AccountLoginStartResponse> {
     return await this.request<AccountLoginStartResponse>(
       "/api/accounts/login/start",
-      { method: "POST", body: JSON.stringify({}) }
+      {
+        method: "POST",
+        body: JSON.stringify(nodeId === undefined ? {} : { nodeId }),
+      }
     );
   }
 
@@ -1507,12 +1543,30 @@ export class ApiClient {
     loginToken: string,
     code: string
   ): Promise<Extract<AccountLoginCompleteResponse, { ok: true }>> {
-    return await this.request<
-      Extract<AccountLoginCompleteResponse, { ok: true }>
-    >("/api/accounts/login/complete", {
-      method: "POST",
-      body: JSON.stringify({ loginToken, code }),
-    });
+    // #4462: no `nodeId` — a node-targeted login's token alone routes the call,
+    // so a picker that changes its selection mid-flow cannot cause a mismatch.
+    try {
+      return await this.request<
+        Extract<AccountLoginCompleteResponse, { ok: true }>
+      >(
+        "/api/accounts/login/complete",
+        { method: "POST", body: JSON.stringify({ loginToken, code }) },
+        0,
+        undefined,
+        ApiClient.LOGIN_COMPLETE_TIMEOUT_MS
+      );
+    } catch (err) {
+      // The browser gave up before the server answered: the login may still have
+      // completed, so report it with the same code as the hub's own timeout.
+      if (err instanceof RequestTimeoutError) {
+        throw new ApiError(
+          "No answer from the server. The login may have completed; check the node's accounts before starting over.",
+          504,
+          "login_outcome_unknown"
+        );
+      }
+      throw err;
+    }
   }
 
   // Issue #4349: in-VM sign-in on a tenant VM. `start` creates an empty per-account config dir

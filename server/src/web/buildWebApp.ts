@@ -72,7 +72,7 @@ import {
 } from "../capabilities/availabilityContext";
 import type { AvailabilityContext } from "@hapi/protocol";
 import { SessionService } from "../services/sessionService";
-import { createAccountsRoutes } from "./routes/accounts";
+import { createAccountsRoutes, triggerProviderImport } from "./routes/accounts";
 import { readProviderAuthState } from "../services/providerAuthState";
 import { CodexLoginService } from "../services/codexLoginService";
 import { readSettings } from "../config/settings";
@@ -180,6 +180,8 @@ import {
   createScorecardIngestRoute,
 } from "./routes/scorecard";
 import { createFederationRoutes } from "./routes/federation";
+import { readNodeAccountHealth } from "../services/accountHealth";
+import { resolveLocalNodeIdentity } from "../config/nodeLabel";
 import type { NodeRegistry } from "../federation/nodeRegistry";
 import type { FileClaimSync } from "../federation/fileClaimSync";
 import type { HealthAggregator } from "../federation/healthAggregator";
@@ -659,6 +661,21 @@ export function buildWebApp(options: {
       },
     });
 
+  // Issue #4461 (epic #4460 A): the LOCAL-node account-health reader for the
+  // /federation/account-health aggregator + peer receiver. Read-only and
+  // cache-only (UsageService.getLatest never fetches upstream).
+  const getAccountHealth = () =>
+    readNodeAccountHealth({
+      accountService,
+      nicknameStore,
+      monogramStore,
+      usageService,
+      now: Date.now,
+    });
+  // Issue #4461: THIS node's identity, the one stamped on an
+  // account_unrefreshable 409 and on this node's own SSE refusal events.
+  const localNode = () => resolveLocalNodeIdentity(options.federationConfig);
+
   // Issue #3807 (epic #3345): the LOCAL-node Codex login driver, shared by the
   // local /api/accounts/openai/login/* routes and the peer-incoming
   // /api/federation/openai-login/* receivers. `accountConfigsDir` is LEFT to its
@@ -691,10 +708,21 @@ export function buildWebApp(options: {
       // Issue #3806 (epic #3345): local provider auth-state reader for the
       // /federation/provider-auth-state aggregator + peer receiver.
       getProviderAuthState,
+      // Issue #4461 (epic #4460 A): local account-health reader for the
+      // /federation/account-health aggregator + peer receiver.
+      getAccountHealth,
       // Issue #3807 (epic #3345): local Codex login driver for the peer-incoming
       // /federation/openai-login/* receivers (node-side codex auth runs on the
       // owning node, R4).
       getCodexLoginService: () => codexLoginService,
+      // Issue #4462 (epic #4460 B): the SAME AccountLoginService instance the
+      // /api/accounts/login/* routes use (its PKCE pending map is per process),
+      // for the peer-incoming /federation/anthropic-login/* receivers.
+      getAccountLoginService: () => accountLoginService,
+      // Issue #4462 Task 8: a peer-side OpenAI login re-imports provider records
+      // so the new account surfaces without a restart.
+      forceProviderImport: () =>
+        triggerProviderImport(accountService, { force: true }),
       // Issue #1644: the hub's authoritative lease ledger for peer-incoming
       // /federation/account-lease/* receivers.
       getLeaseStore: () => options.store.leases,
@@ -1020,6 +1048,8 @@ export function buildWebApp(options: {
     createEventsRoutes(options.getSseManager, options.getSyncEngine, {
       getNodeRegistry: options.getNodeRegistry,
       federationApiToken: options.federationApiToken,
+      // Issue #4461 (R7): stamp this node's own account-unrefreshable events.
+      getLocalNode: localNode,
     })
   );
   app.route(
@@ -1034,10 +1064,14 @@ export function buildWebApp(options: {
         return new SessionService(
           engine,
           options.getNodeRegistry(),
-          options.federationApiToken
+          options.federationApiToken,
+          // Issue #4461 (R6): names this node on an account_unrefreshable switch.
+          localNode
         );
       },
       getAccountService: () => accountService,
+      // Issue #4461 (R6): names this node on an account_unrefreshable reconnect.
+      getLocalNode: localNode,
     })
   );
   // Issue #2418 (epic #2416 B): capability enumeration read path. Same federation
@@ -1178,6 +1212,7 @@ export function buildWebApp(options: {
     createMessagesRoutes(options.getSyncEngine, {
       getNodeRegistry: options.getNodeRegistry,
       federationApiToken: options.federationApiToken,
+      errorLogger: options.errorLogger,
     })
   );
   // #3331 (Task 11 / GAP-1): approval-state read surface consumed by #3333's card.
@@ -1186,6 +1221,7 @@ export function buildWebApp(options: {
     createApprovalsRoutes(options.getSyncEngine, {
       getNodeRegistry: options.getNodeRegistry,
       federationApiToken: options.federationApiToken,
+      errorLogger: options.errorLogger,
     })
   );
   app.route(
@@ -1193,6 +1229,7 @@ export function buildWebApp(options: {
     createPermissionsRoutes(options.getSyncEngine, {
       getNodeRegistry: options.getNodeRegistry,
       federationApiToken: options.federationApiToken,
+      errorLogger: options.errorLogger,
     })
   );
   app.route(
@@ -1200,6 +1237,8 @@ export function buildWebApp(options: {
     createMachinesRoutes(options.getSyncEngine, {
       errorLogger: options.errorLogger,
       getSseManager: options.getSseManager,
+      // Issue #4461 (R6): names this node on an account_unrefreshable create.
+      getLocalNode: localNode,
     })
   );
   // hapimatic-private#4481: Create-page Branch control listing (local + federated).

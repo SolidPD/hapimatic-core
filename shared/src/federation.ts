@@ -35,6 +35,14 @@ export const LOCAL_NODE_ID = "local";
 export const LOCAL_NODE_LABEL = "This node";
 
 /**
+ * Issue #4462: advertised by every node whose binary carries the
+ * `/api/federation/anthropic-login/{start,complete}` receivers, so a hub only
+ * routes a node-targeted Anthropic login to a peer that can store it. A peer
+ * without the tag is refused before any proxy call (`node_login_unsupported`).
+ */
+export const ANTHROPIC_LOGIN_CAPABILITY = "accounts:anthropic-login";
+
+/**
  * The DNS suffix every cloud-provisioned Hapimatic VM lives under
  * (`scripts/provision.sh`: `FQDN="${SUBDOMAIN}.hapimatic.com"`, and the seeded
  * federation block's `selfUrl` is `https://<subdomain>.hapimatic.com`). Local

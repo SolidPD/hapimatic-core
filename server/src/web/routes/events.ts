@@ -9,6 +9,10 @@ import type { SyncEngine } from "../../sync/syncEngine";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { WebAppEnv } from "../middleware/auth";
 import { cataloged } from "../../capabilities/cataloged";
+import {
+  resolveLocalNodeIdentity,
+  stampAccountUnrefreshable,
+} from "../../config/nodeLabel";
 
 function parseOptionalId(value: string | undefined): string | null {
   if (!value) {
@@ -30,9 +34,14 @@ export function createEventsRoutes(
   options?: {
     getNodeRegistry?: () => NodeRegistry | null;
     federationApiToken?: string | null;
+    // Issue #4461 (R7): THIS node's identity, stamped on its own
+    // account-unrefreshable events on egress. Absent ⇒ the non-federated one.
+    getLocalNode?: () => { nodeId: string; nodeLabel: string };
   }
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
+  const getLocalNode =
+    options?.getLocalNode ?? (() => resolveLocalNodeIdentity(null));
 
   app.get(
     "/events",
@@ -117,7 +126,16 @@ export function createEventsRoutes(
           all,
           sessionId,
           machineId,
-          send: event => stream.writeSSE({ data: JSON.stringify(event) }),
+          // Issue #4461 (R7): an account-unrefreshable event that carries no node
+          // is this node's own (a peer's arrives already stamped by the hub's
+          // bridge), so name this node — the browser never guesses which node
+          // refused. Every other event is written unchanged.
+          send: event =>
+            stream.writeSSE({
+              data: JSON.stringify(
+                stampAccountUnrefreshable(event, getLocalNode())
+              ),
+            }),
           sendHeartbeat: async () => {
             await stream.write(": heartbeat\n\n");
           },

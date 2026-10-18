@@ -3,7 +3,7 @@ import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { SyncEngine } from "../../sync/syncEngine";
-import { isAbortError } from "../../federation/proxyFetchSignal";
+import { isFetchTransportError } from "../../federation/proxyFetchSignal";
 import type { WebAppEnv } from "./auth";
 
 /**
@@ -39,7 +39,10 @@ import type { WebAppEnv } from "./auth";
  *   non-object / error-less body, or a code-less hub transport message). A 5xx
  *   that carries a peer `code` (e.g. `reconnect`'s `cwd_missing`) or any other
  *   application error passes through. If the owner went offline while the call
- *   was in flight, the failure is labelled 503 `node_offline` instead.
+ *   was in flight, the failure is labelled 503 `node_offline` instead. For
+ *   `node_unreachable`, a GET or HEAD says the node is reconnecting and any
+ *   other method says the action may not have been applied; `node_offline`
+ *   wording is the same for every method (see `unavailableMessage`, #5405).
  * - 404 session-not-found for an id the hub has not cached → 503
  *   `node_offline` (nodeId null) ONLY while the hub, just started, has not
  *   finished its first poll of every static peer
@@ -117,18 +120,12 @@ export function isSessionNotFoundBody(body: unknown): boolean {
  * application error relayed from the peer.
  */
 export function isTransportFailure(error: unknown, body: unknown): boolean {
-  // Bun's fetch errors are TypeErrors carrying a string `code`
-  // ("ConnectionRefused", "ConnectionReset", …). A TypeError without one is a
-  // hub programming bug, which must not be dressed up as a restarting node.
-  if (
-    error instanceof TypeError &&
-    typeof (error as { code?: unknown }).code === "string"
-  ) {
-    return true;
-  }
-  // A fetch timeout/abort (the peer never answered) — the same predicate the
-  // proxy body reads use.
-  if (isAbortError(error)) return true;
+  // Bun's fetch network errors (TypeErrors carrying a string `code` such as
+  // "ConnectionRefused") and fetch timeouts/aborts — the same predicate the
+  // proxy routes use (#5404). A code-less TypeError or an `ERR_INVALID_*`
+  // validation error (a malformed node URL) is a hub bug, which must not be
+  // dressed up as a restarting node.
+  if (isFetchTransportError(error)) return true;
   if (!isJsonObject(body)) return true; // null, non-JSON, array, primitive
   if (typeof body.code === "string") return false; // peer application code
   const message = body.error;
@@ -180,6 +177,31 @@ async function readJsonBody(res: Response): Promise<unknown> {
   }
 }
 
+/**
+ * The user-facing text for a node-unavailable rewrite (issue #5405). Reads
+ * issued through the web's default query retry (`queryRetry`) are retried
+ * quietly, so "reconnecting" is accurate for them. The web client never
+ * resends a non-GET request — TanStack mutations default to `retry: 0`
+ * (`web/src/lib/query-client.ts`) and direct `ApiClient` calls such as
+ * `approvePermission` have no 5xx retry — so a failed POST/PUT/PATCH/DELETE
+ * must tell the user the action may not have landed and to try again. A failed
+ * permission approval that said "reconnecting" left the agent waiting for an
+ * answer nobody would resend.
+ */
+export function unavailableMessage(
+  nodeLabel: string | null,
+  code: "node_offline" | "node_unreachable",
+  method: string
+): string {
+  if (code === "node_offline") {
+    return `${nodeLabel ?? "The session's node"} is offline or restarting — try again in a moment`;
+  }
+  const isRead = method === "GET" || method === "HEAD";
+  return isRead
+    ? `${nodeLabel ?? "The session's node"} is not responding — reconnecting`
+    : `Couldn't reach ${nodeLabel ?? "the session's node"} — your action may not have been applied. Try again.`;
+}
+
 /** Replace the handler's response with the labelled node-unavailable body. */
 function replaceResponse(
   c: Context<WebAppEnv>,
@@ -194,13 +216,9 @@ function replaceResponse(
   if (isJsonObject(original) && original.success === false) {
     shape.success = false;
   }
-  const subject = nodeLabel ?? "The session's node";
   const rewritten: JsonObject = {
     ...shape,
-    error:
-      code === "node_offline"
-        ? `${subject} is offline or restarting — try again in a moment`
-        : `${subject} is not responding — reconnecting`,
+    error: unavailableMessage(nodeLabel, code, c.req.method),
     code,
     nodeId,
     nodeLabel,

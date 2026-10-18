@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type {
+  AccountHealthEnvelope,
   AccountMonogram,
   AccountUsage,
   AccountUsageHistory,
@@ -195,6 +196,11 @@ export type AccountUsageResponse = {
 // `{ nodes: NodeProviderAuthState[] }` envelope — the DERIVED-fields-only view of
 // each node's Codex (OpenAI) + Gemini (Google) auth state (shared/src/providerAuthState.ts).
 export type ProviderAuthStateResponse = ProviderAuthStateEnvelope;
+// Per-node account health (issue #4461, epic #4460 A). Server route
+// GET /api/federation/account-health returns one row per known node (this node
+// first), each listing every account record THAT node holds with needsRelogin /
+// since derived server-side (shared/src/accountHealth.ts). Never a token.
+export type AccountHealthResponse = AccountHealthEnvelope;
 // Admin session-metadata node-local query envelope (issue #1675, Sub M). Server
 // route GET /api/session-metadata/turns returns `{ turns }`; SessionMetadataTurn
 // is the curated per-turn row from shared/src/sessionMetadata.ts.
@@ -254,9 +260,18 @@ export type SupportEscalationSendResponse = { id: string; delivered: boolean };
 export type AccountLoginStartResponse = {
   loginToken: string;
   authorizeUrl: string;
+  /** #4462: present when the login runs on another federation node. */
+  nodeId?: string;
+  nodeLabel?: string;
 };
 export type AccountLoginCompleteResponse =
-  | { ok: true; account: RedactedAccount }
+  | {
+      ok: true;
+      account: RedactedAccount;
+      /** #4462: the node the account was stored on (node-targeted login only). */
+      nodeId?: string;
+      nodeLabel?: string;
+    }
   | { ok: false; error: string; code: string };
 /**
  * Issue #4349: the error code the web OAuth login answers on a tenant VM, where the user signs in

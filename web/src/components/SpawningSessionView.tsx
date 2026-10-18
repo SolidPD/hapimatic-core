@@ -24,7 +24,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { ApiClient } from "@/api/client";
+import { LOCAL_NODE_ID, LOCAL_NODE_LABEL } from "@hapi/protocol";
 import { useSessions } from "@/hooks/queries/useSessions";
+import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
+import { buildReloginToast } from "@/lib/reloginLink";
 import { useToast } from "@/components/Toast";
 import { LoadingState } from "@/components/LoadingState";
 import {
@@ -37,8 +40,6 @@ import {
 /** Map a pre-daemon refusal code to actionable copy; fall back to the message. */
 function failureMessage(code: string | undefined, fallback?: string): string {
   switch (code) {
-    case "account_unrefreshable":
-      return "Spawn failed — the selected account needs to be re-authenticated. Re-login and try again.";
     case "account_token_expired":
       return "Spawn failed — the selected account's token expired. Re-login and try again.";
     case "at_capacity":
@@ -63,6 +64,9 @@ export function SpawningSessionView({
   const navigate = useNavigate();
   const { sessions } = useSessions(api);
   const { showToast } = useToast();
+  // Issue #4461 (R8): this placeholder is the LOCAL optimistic create, so the
+  // node that refused an account_unrefreshable spawn is the UI host.
+  const { localNode } = useFederatedSessions(api);
 
   // The placeholder row (id === tag === hapiSessionId) while spawning/failed.
   const placeholder = sessions.find(s => s.id === placeholderId);
@@ -150,15 +154,31 @@ export function SpawningSessionView({
     const handover = getSpawnHandover(placeholderId);
     if (handover) stashRetryForm(handover.form);
     endSpawnHandover(placeholderId);
-    showToast(
-      failureMessage(
-        failureCodeRef.current,
-        placeholder?.metadata?.summary?.text
-      ),
-      { type: "error" }
-    );
+    if (failureCodeRef.current === "account_unrefreshable") {
+      // Issue #4461 (R8): name the node and offer the re-login there.
+      const { message, action } = buildReloginToast({
+        nodeId: localNode?.nodeId ?? LOCAL_NODE_ID,
+        nodeLabel: localNode?.nodeLabel ?? LOCAL_NODE_LABEL,
+      });
+      showToast(`Spawn failed — ${message}.`, { type: "error", action });
+    } else {
+      showToast(
+        failureMessage(
+          failureCodeRef.current,
+          placeholder?.metadata?.summary?.text
+        ),
+        { type: "error" }
+      );
+    }
     onFailureBack();
-  }, [placeholderState, placeholderId, placeholder, showToast, onFailureBack]);
+  }, [
+    placeholderState,
+    placeholderId,
+    placeholder,
+    showToast,
+    onFailureBack,
+    localNode,
+  ]);
 
   // ── Render ────────────────────────────────────────────────────────
   if (placeholderState === "failed" || realSession) {

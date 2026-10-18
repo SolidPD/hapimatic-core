@@ -16,7 +16,10 @@
  *
  * On Bun 1.4 a timeout rejects with `name === "TimeoutError"` and a client
  * disconnect (the request signal) with `name === "AbortError"`; neither is a
- * `TypeError`.
+ * `TypeError`. `isFetchTransportError` is the one definition of "the peer could
+ * not be reached" shared by the proxy routes and the remote-session guard
+ * (#5404): a network TypeError or an abort/timeout, never a URL or argument
+ * validation error.
  */
 
 /**
@@ -45,6 +48,20 @@ export function federationReadSignal(
 export function isAbortError(error: unknown): boolean {
   const name = (error as { name?: unknown } | null)?.name;
   return name === "TimeoutError" || name === "AbortError";
+}
+
+/**
+ * True for a genuine hub→peer transport failure: a Bun fetch network error (a
+ * TypeError with a string `code` such as "ConnectionRefused" or "ENOTFOUND") or
+ * an abort/timeout. URL and argument validation errors also carry a string code
+ * (`ERR_INVALID_URL` for a malformed node URL) — those are hub bugs and must
+ * surface as 500, never as an unreachable node (#5404).
+ */
+export function isFetchTransportError(error: unknown): boolean {
+  if (isAbortError(error)) return true;
+  if (!(error instanceof TypeError)) return false;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && !code.startsWith("ERR_INVALID_");
 }
 
 /**
