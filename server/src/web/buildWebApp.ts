@@ -834,6 +834,7 @@ export function buildWebApp(options: {
     createRemoteSessionAvailabilityGuard({
       getSyncEngine: options.getSyncEngine,
       getNodeRegistry: options.getNodeRegistry,
+      errorLogger: options.errorLogger,
     })
   );
 
@@ -1066,7 +1067,9 @@ export function buildWebApp(options: {
           options.getNodeRegistry(),
           options.federationApiToken,
           // Issue #4461 (R6): names this node on an account_unrefreshable switch.
-          localNode
+          localNode,
+          // Issue #5408: logs a failed peer proxy.
+          options.errorLogger
         );
       },
       getAccountService: () => accountService,
@@ -1271,7 +1274,9 @@ export function buildWebApp(options: {
       return new SessionService(
         engine,
         options.getNodeRegistry(),
-        options.federationApiToken
+        options.federationApiToken,
+        undefined,
+        options.errorLogger
       );
     })
   );
@@ -1441,7 +1446,16 @@ export function buildWebApp(options: {
       })
     );
   }
-  app.route("/api", createApiKeysRoutes(configuration.settingsFile));
+  app.route(
+    "/api",
+    createApiKeysRoutes(configuration.settingsFile, {
+      // #4463: a Gemini key's Google account is minted on add, mirrored on edit
+      // and removed on delete.
+      getAccountService: () => accountService,
+      getNicknameStore: () => nicknameStore,
+      getMonogramStore: () => monogramStore,
+    })
+  );
   // Issues #4533 and #5165: the Porter exposure gate — exposed by default;
   // `HAPI_PORTER_EXPOSED=0` makes it answer 404 `porter_withheld` on BOTH Porter
   // prefixes. Registered BEFORE every Porter mount below (Hono runs handlers in

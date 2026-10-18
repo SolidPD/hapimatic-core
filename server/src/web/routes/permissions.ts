@@ -121,6 +121,8 @@ export function createPermissionsRoutes(
         if (node) {
           const headers: Record<string, string> = {
             "Content-Type": "application/json",
+            // #5411: the peer re-asserts the caller's namespace (#1097).
+            "X-Hapi-Caller-Namespace": c.get("namespace"),
           };
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
@@ -212,6 +214,8 @@ export function createPermissionsRoutes(
         if (node) {
           const headers: Record<string, string> = {
             "Content-Type": "application/json",
+            // #5411: the peer re-asserts the caller's namespace (#1097).
+            "X-Hapi-Caller-Namespace": c.get("namespace"),
           };
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;

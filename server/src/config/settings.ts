@@ -171,3 +171,75 @@ export async function writeSettings(
   await rename(tmpFile, settingsFile);
   await chmod(settingsFile, 0o600).catch(() => {});
 }
+
+/**
+ * Thrown by {@link updateSettings} when `settings.json` exists but cannot be read
+ * or parsed (issue #4463 Task 1, the contract #4056 Task 1 specifies). The message
+ * is FIXED and built from nothing but the constant text: a JSON parse message can
+ * quote file content, and this file holds provider keys and tokens (#4168, #4056 R4).
+ * The path rides `settingsFile` for the caller's log line; HTTP bodies stay generic.
+ */
+export class SettingsUnreadableError extends Error {
+  readonly settingsFile: string;
+
+  constructor(settingsFile: string) {
+    super("Settings file is unreadable; refusing to overwrite");
+    this.name = "SettingsUnreadableError";
+    this.settingsFile = settingsFile;
+  }
+}
+
+/** Per-file tail of the in-process write chain (see {@link updateSettings}). */
+const settingsWriteChains = new Map<string, Promise<unknown>>();
+
+/**
+ * The one sanctioned read-modify-write of `settings.json` (issue #4463 Task 1;
+ * #4056 Task 1 specifies the same helper and #4365 later puts the CLI's
+ * cross-process lock inside it).
+ *
+ * - A missing file reads as `{}`; an unreadable or non-object file throws
+ *   {@link SettingsUnreadableError} and writes nothing.
+ * - Calls are serialized per file through an in-process promise chain (the
+ *   `settingsSyncService.ts` idiom), so two writers never interleave a stale read
+ *   with a newer write — the #4463 X5 lost-update class.
+ * - `mutate` MUST be synchronous and free of I/O: the chain is held for its whole
+ *   run. Network probes and account-store writes happen before or after the call.
+ * - When `mutate` returns `current` itself (an unchanged copy — "not found",
+ *   "duplicate"), nothing is written, so a refusal leaves the file byte-identical.
+ *
+ * Resolves to the settings now on disk.
+ */
+export function updateSettings(
+  settingsFile: string,
+  mutate: (current: Settings) => Settings
+): Promise<Settings> {
+  const previous = settingsWriteChains.get(settingsFile) ?? Promise.resolve();
+  const run = previous
+    .catch(() => {
+      // A failed earlier write must not block the ones queued behind it.
+    })
+    .then(async () => {
+      const current = await readSettings(settingsFile);
+      if (
+        current === null ||
+        typeof current !== "object" ||
+        Array.isArray(current)
+      ) {
+        throw new SettingsUnreadableError(settingsFile);
+      }
+      const next = mutate(current);
+      if (next === current) return current;
+      await writeSettings(settingsFile, next);
+      return next;
+    });
+  settingsWriteChains.set(settingsFile, run);
+  // Drop the map entry once this call is the tail, so idle files hold no promise.
+  void run
+    .catch(() => {})
+    .then(() => {
+      if (settingsWriteChains.get(settingsFile) === run) {
+        settingsWriteChains.delete(settingsFile);
+      }
+    });
+  return run;
+}

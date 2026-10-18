@@ -12,6 +12,7 @@ import {
 } from "@/lib/nodeAvailability";
 import type {
   AddApiKeyRequest,
+  PatchApiKeyRequest,
   AutoRecoverPreference,
   AutoSelectOptimalAccountPreference,
   AutoSwitchOnRateLimitPreference,
@@ -2626,7 +2627,16 @@ export class ApiClient {
       }
     }
 
-    return await res.json();
+    // #5408: an OK response whose body is empty, null, not an object or not
+    // JSON is a failed upload — never `null`, which callers would dereference.
+    const parsed: unknown = await res.json().catch(() => null);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {
+        success: false,
+        error: "Upload failed: empty response from server",
+      };
+    }
+    return parsed as Awaited<ReturnType<ApiClient["uploadFile"]>>;
   }
 
   /**
@@ -3638,11 +3648,33 @@ export class ApiClient {
     return await this.request<RedactedApiKey[]>("/api/api-keys");
   }
 
+  /**
+   * #4463: with `validate: true` the server probes first and stores only an
+   * accepted key. Its three designed refusals — 409 `duplicate_key`, 422
+   * `key_rejected` (with `upstreamStatus`) and 424 `key_unverified` — are
+   * expected answers, not faults, so they are not error-reported; the thrown
+   * `ApiError` carries `code` and the JSON `body`.
+   */
   async addApiKey(input: AddApiKeyRequest): Promise<RedactedApiKey> {
-    return await this.request<RedactedApiKey>("/api/api-keys", {
-      method: "POST",
-      body: JSON.stringify(input),
-    });
+    return await this.request<RedactedApiKey>(
+      "/api/api-keys",
+      { method: "POST", body: JSON.stringify(input) },
+      0,
+      undefined,
+      undefined,
+      { expectedStatuses: [409, 422, 424] }
+    );
+  }
+
+  /** #4463 R6: set a stored key's name and monogram in one write. */
+  async updateApiKey(
+    id: string,
+    body: PatchApiKeyRequest
+  ): Promise<RedactedApiKey> {
+    return await this.request<RedactedApiKey>(
+      `/api/api-keys/${encodeURIComponent(id)}`,
+      { method: "PATCH", body: JSON.stringify(body) }
+    );
   }
 
   async removeApiKey(id: string): Promise<RedactedApiKey[]> {
@@ -3654,9 +3686,14 @@ export class ApiClient {
 
   // POST /api/api-keys/:id/validate — probe the stored key and update its status
   // (B3 #1956). Returns the redacted view with the refreshed status — never the key.
-  async validateApiKey(id: string): Promise<RedactedApiKey> {
+  // #4463 R5: `force` bypasses the server's 60 s validation cache (a re-Test).
+  async validateApiKey(
+    id: string,
+    opts?: { force?: boolean }
+  ): Promise<RedactedApiKey> {
+    const query = opts?.force ? "?force=1" : "";
     return await this.request<RedactedApiKey>(
-      `/api/api-keys/${encodeURIComponent(id)}/validate`,
+      `/api/api-keys/${encodeURIComponent(id)}/validate${query}`,
       { method: "POST" }
     );
   }

@@ -22,6 +22,7 @@ import {
 } from "@/components/session/AccountChip";
 import { useSetAccountMonogram } from "@/hooks/mutations/useSetAccountMonogram";
 import { useSetAccountNickname } from "@/hooks/mutations/useSetAccountNickname";
+import { useApiKeyActions } from "@/hooks/mutations/useApiKeyActions";
 
 /**
  * V2 centered editor modal for an account's chip identity (issue #3621).
@@ -42,28 +43,66 @@ import { useSetAccountNickname } from "@/hooks/mutations/useSetAccountNickname";
  *
  * Kept under components/AccountUsage/ (NOT components/ui/) — the #3568 catalog
  * guard scans ui/ + layouts/ only, and this is a feature modal, not a primitive.
+ *
+ * #4463 R9: the same editor names an API KEY. Pass `subject`:
+ * - `{ kind: "key", id, seed }` — a stored key; Save sends ONE atomic
+ *   `PATCH /api/api-keys/:id` with the name and monogram (no two-PATCH split).
+ * - `{ kind: "draft", seed, onSave }` — a key not stored yet (a #4464 modal row
+ *   before its Test passes, which under D-1 A has no id to PATCH). Save sends no
+ *   request: it hands `{ label, monogram }` to `onSave` and closes; the caller
+ *   sends them with the add request.
+ * `seed` is the auto-colour hash seed (a stored key's id, or a row-local id for a
+ * draft). Without `subject` the editor edits the account named by `uuid`/`email`.
  */
 
 type LetterMode = "auto" | "pinned";
-type SaveError = null | "monogram" | "nickname";
+type SaveError = null | "monogram" | "nickname" | "key";
 
-export function AccountMonogramEditor(props: {
+/** A key's name and monogram as the draft subject hands them back. */
+export type KeyIdentityDraft = {
+  label: string;
+  monogram: AccountMonogram;
+};
+
+export type KeyEditorSubject =
+  | { kind: "key"; id: string; seed: string }
+  | {
+      kind: "draft";
+      seed: string;
+      onSave: (draft: KeyIdentityDraft) => void;
+    };
+
+type EditorCommonProps = {
   api: ApiClient | null;
-  uuid: string;
-  email: string;
-  /** The account's current nickname (may be empty/undefined). */
+  /** The current name — the account's nickname or the key's label. */
   nickname: string | undefined;
-  /** The account's current monogram override (may be undefined). */
+  /** The current monogram override (may be undefined). */
   monogram: AccountMonogram | undefined;
-  /** Fallback label (OAuth display name → email local part) for the preview. */
+  /** Fallback label for the preview (account: display name → email local part;
+   *  key: e.g. the provider name). */
   fallback: string;
   open: boolean;
   onClose: () => void;
-}) {
-  const { api, uuid, email, nickname, monogram, fallback, open, onClose } =
-    props;
+};
 
-  const [draftNickname, setDraftNickname] = useState(nickname ?? "");
+export type AccountMonogramEditorProps = EditorCommonProps &
+  (
+    | { subject?: undefined; uuid: string; email: string }
+    | { subject: KeyEditorSubject; uuid?: undefined; email?: undefined }
+  );
+
+export function AccountMonogramEditor(props: AccountMonogramEditorProps) {
+  const { api, nickname, monogram, fallback, open, onClose, subject } = props;
+  const uuid = props.uuid ?? "";
+  // The auto-colour hash seed: the account's email (else its uuid — #3982
+  // Task 3), or the key subject's seed.
+  const colorSeed = subject ? subject.seed : props.email || uuid;
+  const isKey = subject !== undefined;
+  // A key name stored before #4463 may be up to 120 characters; the editor
+  // trims the draft to the 64 the PATCH accepts so Save can always succeed.
+  const initialName = (nickname ?? "").slice(0, ACCOUNT_NICKNAME_MAX_CHARS);
+
+  const [draftNickname, setDraftNickname] = useState(initialName);
   const [letterMode, setLetterMode] = useState<LetterMode>(
     monogram?.letter ? "pinned" : "auto"
   );
@@ -77,7 +116,7 @@ export function AccountMonogramEditor(props: {
   // reopen never shows a stale prior edit.
   useEffect(() => {
     if (!open) return;
-    setDraftNickname(nickname ?? "");
+    setDraftNickname((nickname ?? "").slice(0, ACCOUNT_NICKNAME_MAX_CHARS));
     setLetterMode(monogram?.letter ? "pinned" : "auto");
     setDraftLetter(monogram?.letter ?? "");
     setDraftColor(monogram?.color);
@@ -86,7 +125,8 @@ export function AccountMonogramEditor(props: {
 
   const { setMonogram, isPending: monoPending } = useSetAccountMonogram(api);
   const { setNickname, isPending: nickPending } = useSetAccountNickname(api);
-  const busy = monoPending || nickPending;
+  const { update: updateKey } = useApiKeyActions(api);
+  const busy = monoPending || nickPending || updateKey.isPending;
 
   // The pinned letters, normalized exactly as the store/route will store them
   // (trimmed, at most ACCOUNT_MONO_MAX_CHARS code units, upper-cased) so the
@@ -106,6 +146,25 @@ export function AccountMonogramEditor(props: {
     const next: AccountMonogram = {};
     if (pinnedLetter) next.letter = pinnedLetter;
     if (draftColor) next.color = draftColor;
+    if (subject?.kind === "draft") {
+      subject.onSave({ label: draftNickname.trim(), monogram: next });
+      onClose();
+      return;
+    }
+    if (subject?.kind === "key") {
+      // One atomic PATCH sets the key's name and monogram (#4463 R6).
+      try {
+        await updateKey.mutateAsync({
+          id: subject.id,
+          body: { label: draftNickname.trim(), monogram: next },
+        });
+      } catch {
+        setSaveError("key");
+        return;
+      }
+      onClose();
+      return;
+    }
     // Monogram PATCH FIRST (non-atomic ordering — finding 3621-13).
     try {
       await setMonogram(uuid, next);
@@ -127,18 +186,20 @@ export function AccountMonogramEditor(props: {
     <Dialog open={open} onOpenChange={o => !o && onClose()}>
       <DialogContent className="max-w-md" data-testid="monogram-editor">
         <DialogHeader>
-          <DialogTitle>Edit account chip</DialogTitle>
+          <DialogTitle>
+            {isKey ? "Edit key name and monogram" : "Edit account chip"}
+          </DialogTitle>
           <DialogDescription className="mt-1">
-            Set this account&rsquo;s nickname and its chip monogram (one or two
-            letters) and color. These are node-local display settings — your
-            Claude login is not affected.
+            {isKey
+              ? "Set this key’s name and its monogram (one or two letters) and color. These are node-local display settings — the key itself is not changed."
+              : "Set this account’s nickname and its chip monogram (one or two letters) and color. These are node-local display settings — the account’s sign-in is not affected."}
           </DialogDescription>
         </DialogHeader>
 
         {/* Live preview */}
         <div className="flex items-center justify-center py-2">
           <AccountChip
-            email={email}
+            email={colorSeed}
             label={previewLabel}
             monogram={previewMonogram}
           />
@@ -147,7 +208,7 @@ export function AccountMonogramEditor(props: {
         {/* Nickname */}
         <label className="flex flex-col gap-1">
           <span className="text-[length:var(--text-caption)] font-semibold text-[var(--app-hint)]">
-            Nickname
+            {isKey ? "Name" : "Nickname"}
           </span>
           <input
             autoCapitalize="none"
@@ -155,7 +216,7 @@ export function AccountMonogramEditor(props: {
             maxLength={ACCOUNT_NICKNAME_MAX_CHARS}
             onChange={e => setDraftNickname(e.target.value)}
             placeholder={fallback}
-            aria-label="Account nickname"
+            aria-label={isKey ? "Key name" : "Account nickname"}
             data-testid="monogram-nickname-input"
             className="w-full rounded border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-2 py-1 text-[length:var(--text-caption)] text-[var(--app-fg)] outline-none focus:border-[var(--app-accent)]"
           />
@@ -202,7 +263,7 @@ export function AccountMonogramEditor(props: {
               </>
             ) : (
               <span className="text-[length:var(--text-caption-xs)] text-[var(--app-hint)]">
-                follows the nickname&rsquo;s initial
+                follows the {isKey ? "name" : "nickname"}&rsquo;s initial
               </span>
             )}
           </div>
@@ -219,12 +280,12 @@ export function AccountMonogramEditor(props: {
               variant="ghostStatic"
               size="bare"
               onClick={() => setDraftColor(undefined)}
-              aria-label="Auto color (per-account default)"
+              aria-label={`Auto color (per-${isKey ? "key" : "account"} default)`}
               aria-pressed={!draftColor}
               data-testid="monogram-swatch-auto"
-              title="Auto (per-account default)"
+              title={`Auto (per-${isKey ? "key" : "account"} default)`}
               className={`flex h-6 w-6 items-center justify-center rounded-full ${accountMonogramColor(
-                email
+                colorSeed
               )} ${
                 !draftColor
                   ? "ring-2 ring-[var(--app-link)] ring-offset-1 ring-offset-[var(--app-bg)]"
@@ -261,9 +322,11 @@ export function AccountMonogramEditor(props: {
             className="mt-3 text-[length:var(--text-caption)] text-destructive"
             data-testid="monogram-save-error"
           >
-            {saveError === "monogram"
-              ? "Could not save the monogram. Nothing was changed — try again."
-              : "The monogram was saved, but the nickname could not be. Try saving again to retry the nickname."}
+            {saveError === "key"
+              ? "Could not save the key's name and monogram. Nothing was changed — try again."
+              : saveError === "monogram"
+                ? "Could not save the monogram. Nothing was changed — try again."
+                : "The monogram was saved, but the nickname could not be. Try saving again to retry the nickname."}
           </p>
         ) : null}
 
@@ -283,7 +346,7 @@ export function AccountMonogramEditor(props: {
             variant="accent"
             size="sm"
             onClick={() => void handleSave()}
-            disabled={busy || !api}
+            disabled={busy || (!api && subject?.kind !== "draft")}
             data-testid="monogram-save"
           >
             {busy ? "Saving…" : "Save"}

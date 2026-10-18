@@ -41,8 +41,10 @@ const UUID_REGEX =
  * Deterministic UUID-v5 over a name (D4: "if a non-UUID id is ever seen, uuid-v5
  * over `openai:<id>`"). Returns a canonical, path-safe UUID that is STABLE for a
  * given id, so the same host login imports to the same PK across runs/instances.
+ * Exported for #4463, which mints a Gemini key's Google account as
+ * `uuidV5("google:<vault entry id>")` at add time.
  */
-function uuidV5(name: string): string {
+export function uuidV5(name: string): string {
   const nsHex = UUID_V5_NAMESPACE.replace(/-/g, "");
   const nsBytes = Buffer.from(nsHex, "hex");
   const hash = createHash("sha1");

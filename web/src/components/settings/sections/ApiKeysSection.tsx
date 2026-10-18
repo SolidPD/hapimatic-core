@@ -155,7 +155,8 @@ export function ApiKeysSection() {
             </Button>
             <p className="text-[length:var(--text-body-dense)] text-[var(--app-hint)]">
               Stored on this node only and masked after entry. Adding a key for
-              a provider that already has one replaces it.
+              a provider that already has one replaces it (Gemini keys are added
+              as separate accounts).
             </p>
             {add.isError && (
               <p
@@ -279,7 +280,10 @@ export function ApiKeysSection() {
         confirmingLabel="Removing…"
         onConfirm={async () => {
           if (!pendingDelete) return;
-          await remove.mutateAsync(pendingDelete.id);
+          await remove.mutateAsync({
+            id: pendingDelete.id,
+            provider: pendingDelete.provider,
+          });
           setPendingDelete(null);
         }}
         isPending={remove.isPending}

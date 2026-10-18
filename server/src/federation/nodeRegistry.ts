@@ -1380,10 +1380,14 @@ export class NodeRegistry {
    * The node-side endpoint is fire-and-forget: it validates the session,
    * kicks off reconnect in the background, and returns immediately.
    * We then rapid-poll to discover when the session becomes genuinely active.
+   *
+   * `namespace` is the JWT caller's namespace. It is forwarded as
+   * `X-Hapi-Caller-Namespace` and the receiver re-asserts it (#1097, #5411).
    */
   async reconnectOnNode(
     nodeId: string,
-    sessionId: string
+    sessionId: string,
+    namespace: string
   ): Promise<
     | { type: "success"; newSessionId: string }
     | { type: "error"; message: string; code?: string }
@@ -1396,7 +1400,9 @@ export class NodeRegistry {
     const url = `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/reconnect`;
     try {
       // Default timeout is fine — node responds immediately (fire-and-forget).
-      const res = await this.fetchWithAuth(url, "POST", {});
+      const res = await this.fetchWithAuth(url, "POST", {}, undefined, {
+        "X-Hapi-Caller-Namespace": namespace,
+      });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         return {
@@ -1432,9 +1438,15 @@ export class NodeRegistry {
     }
   }
 
+  /** Branch a session on a remote node via its federation API.
+   *
+   * `namespace` is the JWT caller's namespace. It is forwarded as
+   * `X-Hapi-Caller-Namespace` and the receiver re-asserts it (#1097, #5411).
+   */
   async branchOnNode(
     nodeId: string,
     sessionId: string,
+    namespace: string,
     branchLabel?: string
   ): Promise<
     | { type: "success"; newSessionId: string }
@@ -1447,7 +1459,13 @@ export class NodeRegistry {
 
     const url = `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/branch`;
     try {
-      const res = await this.fetchWithAuth(url, "POST", { branchLabel });
+      const res = await this.fetchWithAuth(
+        url,
+        "POST",
+        { branchLabel },
+        undefined,
+        { "X-Hapi-Caller-Namespace": namespace }
+      );
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         return {

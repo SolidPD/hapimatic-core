@@ -11,7 +11,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Add or upsert a provider API key (one entry per provider); the raw secret is accepted once and never returned.",
+    "description": "Add a provider API key (replace in place, or append on request), optionally validated first; the raw secret is accepted once and never returned.",
     "domain": "accounts",
     "id": "accounts.add-api-key",
     "invocation": {
@@ -1141,6 +1141,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the user renames an account in the switcher."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Set a stored provider key's name and monogram in one write; a Gemini key's Google account shows the same identity.",
+    "domain": "accounts",
+    "id": "accounts.update-api-key",
+    "invocation": {
+      "kind": "rest",
+      "method": "PATCH",
+      "path": "/api/api-keys/:id"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user renames a saved key or edits its monogram."
   },
   {
     "auth": "jwt",

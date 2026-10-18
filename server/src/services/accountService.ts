@@ -366,11 +366,25 @@ export class AccountService {
    * Remove an account. Refuses to delete the ONLY stored account (R4 — the
    * "I removed my only login" footgun) with code `last_account`. An unknown
    * UUID returns `not_found`.
+   *
+   * #4463: `allowLastOfProvider` is for `DELETE /api/api-keys/:id`, which removes a
+   * Gemini key together with its Google mirror record. It is honoured ONLY for a
+   * record carrying a `vaultKeyRef` (the record holds no credential — a key card's
+   * "Remove Key" must not be refused because it is the node's only Google
+   * account). On that path a per-node default pointer naming the removed uuid is
+   * cleared too, so no default points at a deleted account (#3982 Task 1 shape;
+   * #3982 extends the cleanup to every delete and adds its tombstone).
    */
-  delete(accountUuid: string): DeleteAccountResult {
+  delete(
+    accountUuid: string,
+    opts?: { allowLastOfProvider?: boolean }
+  ): DeleteAccountResult {
     if (!UUID_REGEX.test(accountUuid)) return { ok: false, code: "not_found" };
     const uuids = this.listAccountUuids();
     if (!uuids.includes(accountUuid)) return { ok: false, code: "not_found" };
+    const vaultMirror =
+      opts?.allowLastOfProvider === true &&
+      "vaultKeyRef" in (this.getRawAny(accountUuid) ?? {});
 
     // #3808: the last-account guard is now PER-PROVIDER. Removing the only OpenAI
     // account must succeed while Anthropic accounts remain, and removing the only
@@ -388,7 +402,9 @@ export class AccountService {
           sameProviderCount++;
         }
       }
-      if (sameProviderCount <= 1) return { ok: false, code: "last_account" };
+      if (sameProviderCount <= 1 && !vaultMirror) {
+        return { ok: false, code: "last_account" };
+      }
     }
 
     unlinkSync(this.accountPath(accountUuid));
@@ -396,7 +412,39 @@ export class AccountService {
     // index-based list() does not surface a phantom entry. Non-fatal — the
     // per-account file (source of truth) is already gone.
     this.removeFromIndex(accountUuid);
+    if (vaultMirror) this.clearActivePointerTo(accountUuid);
     return { ok: true };
+  }
+
+  /** #4463: drop any per-node default (`activeAccountUuid` or a `byProvider`
+   *  entry) that names `accountUuid`. Best-effort — the record is already gone. */
+  private clearActivePointerTo(accountUuid: string): void {
+    try {
+      const pointer = this.readActivePointer();
+      if (!pointer) return;
+      const byProvider = pointer.byProvider
+        ? Object.fromEntries(
+            Object.entries(pointer.byProvider).filter(
+              ([, uuid]) => uuid !== accountUuid
+            )
+          )
+        : undefined;
+      const changed =
+        pointer.activeAccountUuid === accountUuid ||
+        Object.keys(byProvider ?? {}).length !==
+          Object.keys(pointer.byProvider ?? {}).length;
+      if (!changed) return;
+      const next: ActivePointer = {
+        activeAccountUuid:
+          pointer.activeAccountUuid === accountUuid
+            ? null
+            : pointer.activeAccountUuid,
+        ...(byProvider ? { byProvider } : {}),
+      };
+      this.atomicWrite(this.activePath, JSON.stringify(next, null, 2));
+    } catch {
+      // Non-fatal: a dangling pointer already reads as "no active account".
+    }
   }
 
   /**

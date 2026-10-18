@@ -5,8 +5,10 @@ import type { NodeRegistry } from "../federation/nodeRegistry";
 import { resolveLocalNodeIdentity } from "../config/nodeLabel";
 import {
   federationReadSignal,
+  isFetchTransportError,
   readProxyJson,
 } from "../federation/proxyFetchSignal";
+import type { ErrorLogger } from "../logging/errorLogger";
 import type {
   McpBatchSnapshot,
   McpToggleResponse,
@@ -217,6 +219,7 @@ export class SessionService {
   private readonly registry: NodeRegistry | null;
   private readonly apiToken: string | null;
   private readonly localNode: () => { nodeId: string; nodeLabel: string };
+  private readonly errorLogger: ErrorLogger | null;
 
   constructor(
     engine: SyncEngine,
@@ -224,12 +227,15 @@ export class SessionService {
     apiToken: string | null,
     // Issue #4461 (R6): THIS node's identity for an account_unrefreshable stamp.
     // Optional: absent ⇒ the non-federated identity (`LOCAL_NODE_ID`).
-    localNode?: () => { nodeId: string; nodeLabel: string }
+    localNode?: () => { nodeId: string; nodeLabel: string },
+    // Issue #5408: logs a failed peer proxy. Optional: absent ⇒ console only.
+    errorLogger?: ErrorLogger | null
   ) {
     this.engine = engine;
     this.registry = registry;
     this.apiToken = apiToken;
     this.localNode = localNode ?? (() => resolveLocalNodeIdentity(null));
+    this.errorLogger = errorLogger ?? null;
   }
 
   /**
@@ -316,11 +322,12 @@ export class SessionService {
         signal: method === "GET" ? federationReadSignal() : undefined,
       });
 
-      // #5375: on Bun, resp.json() RESOLVES null for an empty body (it does not
-      // throw), so `.catch(() => ({}))` alone yields null — which made the
-      // `.error` read below throw and masked the peer's real status as a
-      // transport failure. `?? {}` restores the intended empty-object fallback.
-      // readProxyJson rethrows a body read cut off by the GET timeout, so it
+      // #5375/#5408: readProxyJson returns null for an empty body, and a bare
+      // null made the `.error` read below throw and masked the peer's real
+      // status as a transport failure. `?? {}` restores the intended
+      // empty-object fallback.
+      // readProxyJson rethrows a body read cut off by the GET timeout or a
+      // connection reset mid-body, and an unparseable OK body (#5408), so each
       // reaches the catch below instead of reading as an empty success.
       if (resp.ok) {
         const data = (await readProxyJson(resp)) ?? {};
@@ -346,13 +353,65 @@ export class SessionService {
         status: resp.status,
         ...(typeof code === "string" ? { code } : {}),
       };
-    } catch {
+    } catch (error) {
+      // Both branches leave `code` undefined: switchPaymentMethod maps that to
+      // "transport_failed" and refusalStamp stamps only account_unrefreshable
+      // (#4461 / #2300).
+      if (isFetchTransportError(error)) {
+        this.logProxyFailure("warn", error, node, method, pathSuffix, 502);
+        return {
+          type: "error",
+          message: "Remote node unreachable",
+          status: 502,
+        };
+      }
+      // #5404/#5408: not a transport failure (a malformed node URL, an
+      // unparseable OK body, a bug) — never dressed up as an unreachable node.
+      this.logProxyFailure("error", error, node, method, pathSuffix, 500);
       return {
         type: "error",
-        message: "Remote node unreachable",
-        status: 502,
+        message: "Federation proxy failed",
+        status: 500,
       };
     }
+  }
+
+  /**
+   * Issue #5408: log a failed peer proxy in the same category / stack /
+   * context shape as the routes' proxyTransportFailure (no user agent; the
+   * path is templated so the session id is never logged, and no body is).
+   */
+  private logProxyFailure(
+    severity: "warn" | "error",
+    error: unknown,
+    node: { nodeId: string },
+    method: string,
+    pathSuffix: string,
+    statusCode: number
+  ): void {
+    const detail = error instanceof Error ? error.message : String(error);
+    const message =
+      severity === "warn"
+        ? `federation proxy: peer unreachable (${detail})`
+        : `federation proxy: request failed (${detail})`;
+    if (!this.errorLogger) {
+      const log = severity === "warn" ? console.warn : console.error;
+      log("[federation]", message, { nodeId: node.nodeId });
+      return;
+    }
+    const rawCode = (error as { code?: unknown } | null)?.code;
+    const code =
+      typeof rawCode === "string"
+        ? rawCode
+        : ((error as { name?: unknown } | null)?.name ?? null);
+    this.errorLogger[severity](message, {
+      category: "federation",
+      stack: error instanceof Error ? error.stack : null,
+      requestMethod: method,
+      requestPath: `/api/federation/sessions/:id${pathSuffix}`,
+      statusCode,
+      context: { nodeId: node.nodeId, code },
+    });
   }
 
   private isLocalSession(sessionId: string): boolean {

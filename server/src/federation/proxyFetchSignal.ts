@@ -65,16 +65,34 @@ export function isFetchTransportError(error: unknown): boolean {
 }
 
 /**
- * Read a proxied JSON body. An empty or malformed body reads as null, so callers
- * keep their existing fallback. A read cut off by the abort signal rethrows: the
- * signal also bounds the body, and swallowing that would turn a timed-out read
- * into an empty success instead of the route's transport-failure 502.
+ * Read a proxied JSON body. Three cases (#5408):
+ * - An empty body reads as null, so callers keep their existing `?? {}`
+ *   fallback. The body is read as text first because Bun versions disagree on
+ *   `resp.json()` for an empty body (1.4.0 resolves null; 1.4.3 throws
+ *   "Unexpected end of JSON input" on a 204), and an empty reply must never
+ *   look unparseable.
+ * - A transport failure during the read — a connection reset mid-body (a
+ *   TypeError code "ECONNRESET" on Bun 1.4) or an abort/timeout from the
+ *   signal that also bounds the body — rethrows whatever the status, so the
+ *   caller answers its transport-failure 502 instead of an empty success.
+ * - A body that does not parse rethrows on an OK status (it must not become an
+ *   empty success) and reads as null on a non-OK status, so the caller keeps
+ *   the peer's real status and its fallback message.
  */
 export async function readProxyJson(resp: Response): Promise<unknown> {
+  let text: string;
   try {
-    return await resp.json();
+    text = await resp.text();
   } catch (error) {
-    if (isAbortError(error)) throw error;
+    if (isFetchTransportError(error)) throw error;
+    if (resp.ok) throw error;
+    return null;
+  }
+  if (text.trim() === "") return null;
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    if (resp.ok) throw error;
     return null;
   }
 }

@@ -680,7 +680,11 @@ export function createSessionsRoutes(
         const sessionId = c.req.param("id");
         const node = registry.findNodeForSession(sessionId);
         if (node) {
-          const result = await registry.reconnectOnNode(node.nodeId, sessionId);
+          const result = await registry.reconnectOnNode(
+            node.nodeId,
+            sessionId,
+            c.get("namespace")
+          );
           if (result.type === "success") {
             return c.json({ ok: true, newSessionId: result.newSessionId });
           }
@@ -779,6 +783,7 @@ export function createSessionsRoutes(
           const result = await registry.branchOnNode(
             node.nodeId,
             sessionId,
+            c.get("namespace"),
             branchLabel
           );
           if (result.type === "success") {

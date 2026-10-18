@@ -2,6 +2,7 @@
 import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
+import type { ErrorLogger } from "../../logging/errorLogger";
 import type { SyncEngine } from "../../sync/syncEngine";
 import { isFetchTransportError } from "../../federation/proxyFetchSignal";
 import type { WebAppEnv } from "./auth";
@@ -58,7 +59,8 @@ import type { WebAppEnv } from "./auth";
  * Matching: mounted on `/api/sessions/:id/*`, which in Hono also matches the
  * bare `/api/sessions/:id` and static siblings such as
  * `/api/sessions/bulk-abort` (id "bulk-abort"); those are harmless because
- * `locateSession()` returns null for them.
+ * `locateSession()` returns null for them. Both fail-open catches report a
+ * rate-limited `federation` warning (#5406).
  *
  * Namespace tier: the hub holds no namespace for remote sessions
  * (`SessionSummary` has none), and `/api/federation/all-sessions` plus the
@@ -75,6 +77,13 @@ import type { WebAppEnv } from "./auth";
 
 /** Hint returned to clients; the registry's private poll backoff is not exposed. */
 export const REMOTE_SESSION_RETRY_AFTER_SECONDS = 5;
+
+/**
+ * At most one fail-open warning per catch site per window (#5406). ErrorLogger's
+ * own limit is per category, and `federation` is shared with other components,
+ * so a guard failing on every request would spend their budget too.
+ */
+export const GUARD_FAILURE_LOG_INTERVAL_MS = 60_000;
 
 /** Hub-written transport messages that carry no peer `code` (exact match). */
 export const TRANSPORT_ERROR_MESSAGES: readonly string[] = [
@@ -98,7 +107,13 @@ export type RemoteSessionAvailabilityDeps = {
     NodeRegistry,
     "locateSession" | "getNodeSummaries" | "isAwaitingInitialPoll"
   > | null;
+  /** #5406: where a fail-open catch reports. Absent = silent (pre-#5406 behavior). */
+  errorLogger?: Pick<ErrorLogger, "warn"> | null;
+  /** Injectable clock for the failure-log rate window (tests). */
+  getNow?: () => number;
 };
+
+type FailOpenSite = "locate" | "rewrite";
 
 type JsonObject = Record<string, unknown>;
 
@@ -232,6 +247,48 @@ function replaceResponse(
 export function createRemoteSessionAvailabilityGuard(
   deps: RemoteSessionAvailabilityDeps
 ): MiddlewareHandler<WebAppEnv> {
+  // Per guard instance: when each site last logged, and how many failures it
+  // has suppressed since.
+  const getNow = deps.getNow ?? (() => Date.now());
+  const lastLoggedAt = new Map<FailOpenSite, number>();
+  const suppressed = new Map<FailOpenSite, number>();
+  const reportFailOpen = (
+    site: FailOpenSite,
+    err: unknown,
+    c: Context<WebAppEnv>,
+    sessionId: string | undefined
+  ): void => {
+    try {
+      const logger = deps.errorLogger;
+      if (!logger) return;
+      const now = getNow();
+      const last = lastLoggedAt.get(site);
+      if (last !== undefined && now - last < GUARD_FAILURE_LOG_INTERVAL_MS) {
+        suppressed.set(site, (suppressed.get(site) ?? 0) + 1);
+        return;
+      }
+      lastLoggedAt.set(site, now);
+      const suppressedSinceLastLog = suppressed.get(site) ?? 0;
+      suppressed.set(site, 0);
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        `remote-session availability guard failed open (${site}): ${message}`,
+        {
+          category: "federation",
+          stack: err instanceof Error ? (err.stack ?? null) : null,
+          sessionId: sessionId ?? null,
+          requestPath: c.req.path,
+          requestMethod: c.req.method,
+          context: { site, suppressedSinceLastLog },
+        }
+      );
+    } catch {
+      // The reporter must never change the guard's fail-open outcome: an
+      // escaping throw would 500 at either site (skipping the handler at
+      // locate, replacing the handler's response at rewrite).
+    }
+  };
+
   return async (c, next) => {
     const sessionId = c.req.param("id");
     let before: ReturnType<NodeRegistry["locateSession"]> = null;
@@ -240,8 +297,9 @@ export function createRemoteSessionAvailabilityGuard(
         // Memory-only cache scan. Deliberately NOT engine.getSession() here: on a
         // miss that falls back to a SQLite read, and a remote id always misses.
         before = deps.getNodeRegistry()?.locateSession(sessionId) ?? null;
-      } catch {
+      } catch (err) {
         before = null;
+        reportFailOpen("locate", err, c, sessionId);
       }
     }
 
@@ -299,8 +357,10 @@ export function createRemoteSessionAvailabilityGuard(
         registry.getNodeSummaries().find(s => s.nodeId === after.nodeId)
           ?.nodeLabel ?? after.nodeId;
       replaceResponse(c, after.nodeId, nodeLabel, code, newStatus, body);
-    } catch {
-      // Fail-open to today's behavior: never turn a response into a 500.
+    } catch (err) {
+      // Fail-open to today's behavior: never turn a response into a 500, but
+      // leave a rate-limited trace (#5406).
+      reportFailOpen("rewrite", err, c, sessionId);
     }
   };
 }

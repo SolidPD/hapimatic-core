@@ -14,7 +14,11 @@ import {
   type AmbientOnboardingTokenState,
 } from "@hapi/protocol";
 import { configuration } from "../../configuration";
-import { readSettings, writeSettings } from "../../config/settings";
+import {
+  readSettings,
+  SettingsUnreadableError,
+  updateSettings,
+} from "../../config/settings";
 import type { ProviderAuthFacts } from "../../services/providerAuthState";
 import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
@@ -59,7 +63,7 @@ import { readOnboardingSeedState } from "../../utils/daemonControlClient";
  * sidecars, the host `~/.codex` login, and the legacy Gemini vault key → store
  * records). Resolves the account-configs dir + host codex home to the SAME
  * defaults as the #3806 reader, and threads the async vault I/O (readSettings /
- * writeSettings) so `AccountService` stays decoupled from `config/settings`.
+ * updateSettings) so `AccountService` stays decoupled from `config/settings`.
  * Best-effort (the method swallows its own errors). `force` re-imports after a
  * new #3807 login; the default GET path is once-per-process (idempotent). [ER 2026-09-19: 3808-2]
  */
@@ -87,15 +91,17 @@ export async function triggerProviderImport(
           }));
       },
       applyVaultStamps: async stamps => {
-        const settings = await readSettings(configuration.settingsFile);
-        if (!settings) return;
-        const apiKeys = (settings.apiKeys ?? []).map(k => {
-          const stamp = stamps.find(s => s.entryId === k.id);
-          return stamp ? { ...k, accountUuid: stamp.accountUuid } : k;
-        });
-        await writeSettings(configuration.settingsFile, {
+        // #4463 Task 1: one locked read-modify-write, so a stamp never writes
+        // back a stale copy over a key added meanwhile. An unreadable file
+        // skips the write (as before).
+        await updateSettings(configuration.settingsFile, settings => ({
           ...settings,
-          apiKeys,
+          apiKeys: (settings.apiKeys ?? []).map(k => {
+            const stamp = stamps.find(s => s.entryId === k.id);
+            return stamp ? { ...k, accountUuid: stamp.accountUuid } : k;
+          }),
+        })).catch(error => {
+          if (!(error instanceof SettingsUnreadableError)) throw error;
         });
       },
     },

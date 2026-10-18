@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
+import { readProxyJson } from "../../federation/proxyFetchSignal";
 import { proxyTransportFailure } from "./routeErrorHelper";
 import type { WebAppEnv } from "../middleware/auth";
 import { defineCapability } from "@hapi/protocol";
@@ -347,7 +348,10 @@ export function createUploadRoutes(
           const node = registry.findNodeForSession(sessionId);
           if (node) {
             const filename = c.req.param("filename");
-            const headers: Record<string, string> = {};
+            const headers: Record<string, string> = {
+              // #5411: the peer re-asserts the caller's namespace (#1097).
+              "X-Hapi-Caller-Namespace": c.get("namespace"),
+            };
             if (options?.federationApiToken) {
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
             }
@@ -389,7 +393,19 @@ export function createUploadRoutes(
                 },
               });
             }
-            const body = await resp.json().catch(() => ({}));
+            let body: unknown;
+            try {
+              // #5408: only a non-OK response reaches this read (an OK one is
+              // streamed above). A body cut off mid-read is a transport failure
+              // (logged 502); an unparseable or empty error body falls back to
+              // {} with the peer's real status.
+              body = (await readProxyJson(resp)) ?? {};
+            } catch (error) {
+              return proxyTransportFailure(c, error, {
+                errorLogger: options?.errorLogger,
+                nodeId: node.nodeId,
+              });
+            }
             return c.json(
               body as Record<string, unknown>,
               resp.status as 400 | 404 | 500 | 503
@@ -503,7 +519,10 @@ export function createUploadRoutes(
           const node = registry.findNodeForSession(sessionId);
           if (node) {
             const contentType = c.req.header("content-type");
-            const headers: Record<string, string> = {};
+            const headers: Record<string, string> = {
+              // #5411: the peer re-asserts the caller's namespace (#1097).
+              "X-Hapi-Caller-Namespace": c.get("namespace"),
+            };
             if (contentType) {
               headers["Content-Type"] = contentType;
             }
@@ -529,7 +548,19 @@ export function createUploadRoutes(
                 nodeId: node.nodeId,
               });
             }
-            const body = await resp.json().catch(() => ({}));
+            let body: unknown;
+            try {
+              // #5408: a body cut off mid-read is a transport failure (logged
+              // 502) and an unparseable OK body is rethrown to onError (500) —
+              // never an empty success. Only an empty body, or an unparseable
+              // non-OK body (peer status kept), falls back to {}.
+              body = (await readProxyJson(resp)) ?? {};
+            } catch (error) {
+              return proxyTransportFailure(c, error, {
+                errorLogger: options?.errorLogger,
+                nodeId: node.nodeId,
+              });
+            }
             return c.json(
               body as Record<string, unknown>,
               resp.status as 200 | 400 | 404 | 409 | 500 | 503
@@ -739,6 +770,8 @@ export function createUploadRoutes(
           if (node) {
             const headers: Record<string, string> = {
               "Content-Type": "application/json",
+              // #5411: the peer re-asserts the caller's namespace (#1097).
+              "X-Hapi-Caller-Namespace": c.get("namespace"),
             };
             if (options?.federationApiToken) {
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
@@ -759,7 +792,19 @@ export function createUploadRoutes(
                 nodeId: node.nodeId,
               });
             }
-            const body = await resp.json().catch(() => ({}));
+            let body: unknown;
+            try {
+              // #5408: a body cut off mid-read is a transport failure (logged
+              // 502) and an unparseable OK body is rethrown to onError (500) —
+              // never an empty success. Only an empty body, or an unparseable
+              // non-OK body (peer status kept), falls back to {}.
+              body = (await readProxyJson(resp)) ?? {};
+            } catch (error) {
+              return proxyTransportFailure(c, error, {
+                errorLogger: options?.errorLogger,
+                nodeId: node.nodeId,
+              });
+            }
             return c.json(
               body as Record<string, unknown>,
               resp.status as 200 | 400 | 404 | 500 | 503

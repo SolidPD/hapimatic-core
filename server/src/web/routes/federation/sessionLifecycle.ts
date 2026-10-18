@@ -223,6 +223,11 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5411: re-assert the caller's namespace right after the
+      // existence check, before any state check, lookup or side effect, so
+      // another namespace's session reads as not found.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
       if (!session.active) {
         return c.json({ error: "Session is inactive" }, 409);
       }
@@ -306,6 +311,11 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5411: re-assert the caller's namespace right after the
+      // existence check, before any state check, lookup or side effect, so
+      // another namespace's session reads as not found.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
       if (!session.active) {
         return c.json({ error: "Session is inactive" }, 409);
       }
@@ -374,6 +384,11 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5411: re-assert the caller's namespace right after the
+      // existence check, before any state check, lookup or side effect, so
+      // another namespace's session reads as not found.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
       if (session.active) {
         return c.json({ error: "Session is already active" }, 400);
       }
@@ -462,6 +477,11 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5411: re-assert the caller's namespace right after the
+      // existence check, before any state check, lookup or side effect, so
+      // another namespace's session reads as not found.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
 
       // Parse optional branch label
       let branchLabel: string | undefined;
@@ -588,6 +608,11 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5411: re-assert the caller's namespace right after the
+      // existence check, before any state check, lookup or side effect, so
+      // another namespace's session reads as not found.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
       if (!session.active) {
         return c.json({ error: "Session is inactive" }, 409);
       }
@@ -760,6 +785,11 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5411: re-assert the caller's namespace right after the
+      // existence check, before any state check, lookup or side effect, so
+      // another namespace's session reads as not found.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
 
       const cwd = session.metadata?.path;
       if (!cwd) {
@@ -868,6 +898,11 @@ export function createSessionLifecycleRoutes(
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #1097 / #5411: re-assert the caller's namespace right after the
+      // existence check, before any state check, lookup or side effect, so
+      // another namespace's session reads as not found.
+      const nsCheck = checkCallerNamespace(c, session);
+      if (nsCheck) return nsCheck;
 
       const cwd = session.metadata?.path;
       if (!cwd) {

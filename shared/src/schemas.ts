@@ -15,6 +15,7 @@ import { ClaudeRemoteLauncherKindSchema } from "./launcherResolver";
 import { FileClaimSyncSnapshotSchema } from "./fileClaims";
 import { hookCoverageRecordSchema } from "./messageHookConfig";
 import { SPEND_LIMIT_VARIANTS } from "./apiErrorClasses";
+import { AccountMonogramSchema } from "./accountMonogram";
 
 export const PermissionModeSchema = z.enum(PERMISSION_MODES);
 /** Issue #2346: the Claude-only permission-mode subset (no codex modes). The
@@ -2513,11 +2514,28 @@ export const ServiceDescriptorSchema = z
   .passthrough();
 export type ServiceDescriptor = z.infer<typeof ServiceDescriptorSchema>;
 
+/** What the last validation probe honestly reported (#4463): the provider's HTTP
+ *  status, and for a models-list probe the number of models the key can reach
+ *  (`modelCountCapped` when the list held more than one page). Every field is
+ *  optional — a network error has no status, and OpenRouter lists no models. No
+ *  quota, rate-limit or billing figure exists here; no provider text is stored. */
+export const ApiKeyLastValidationSchema = z.object({
+  httpStatus: z.number().int().optional(),
+  modelCount: z.number().int().nonnegative().optional(),
+  modelCountCapped: z.boolean().optional(),
+});
+export type ApiKeyLastValidation = z.infer<typeof ApiKeyLastValidationSchema>;
+
+/** A key's user-set name budget in the #4463 flows (append add, PATCH). The
+ *  schema-wide `label` cap stays 120 for keys stored before. */
+export const API_KEY_NAME_MAX_CHARS = 64;
+
 /** A stored provider API key — server-internal; holds the secret `key`.
  *  Persisted in settings.json `apiKeys[]` (0600). `.passthrough()` so B3/B4 can
- *  extend it without a schema break. Invariant: at most ONE entry per `provider`
- *  (POST upserts). NEVER serialize this to a client — use {@link RedactedApiKey}
- *  at the HTTP boundary. */
+ *  extend it without a schema break. A provider may hold several entries: the
+ *  default POST upserts one entry in place, while an append add (#4463 D-2) and
+ *  every Gemini/Google add (each its own Google account) add a new one. NEVER
+ *  serialize this to a client — use {@link RedactedApiKey} at the HTTP boundary. */
 export const StoredApiKeySchema = z
   .object({
     id: z.string(),
@@ -2545,6 +2563,12 @@ export const StoredApiKeySchema = z
      *  provenance captured by the conversational registration flow. Optional —
      *  absent on manually-added keys; rides `.passthrough()` without a break. */
     descriptor: ServiceDescriptorSchema.optional(),
+    /** #4463 (D-3 A): the key's monogram override `{ letter?, color? }`, the same
+     *  shape the accounts use. Absent ⇒ the client draws the default (the initial
+     *  of `label` and a hash colour); the server never generates one. */
+    monogram: AccountMonogramSchema.optional(),
+    /** #4463: what the last probe reported (status code, reachable models). */
+    lastValidation: ApiKeyLastValidationSchema.optional(),
   })
   .passthrough();
 export type StoredApiKey = z.infer<typeof StoredApiKeySchema>;
@@ -2556,6 +2580,9 @@ export type StoredApiKey = z.infer<typeof StoredApiKeySchema>;
 export const RedactedApiKeySchema = z.object({
   id: z.string(),
   provider: z.string(),
+  /** #4463 R4: the account the key is bound to (a Gemini key's Google account),
+   *  so a key card can join its usage row. Non-secret. */
+  accountUuid: z.string().optional(),
   label: z.string().optional(),
   maskedKey: z.string(),
   createdAt: z.string(),
@@ -2571,6 +2598,10 @@ export const RedactedApiKeySchema = z.object({
    *  API Keys page reads `descriptor.source` to badge "via chat" registrations.
    *  Explicitly listed (field-by-field) per the no-leak discipline. */
   descriptor: ServiceDescriptorSchema.optional(),
+  /** #4463 R4: the key's monogram override; absent ⇒ the client default. */
+  monogram: AccountMonogramSchema.optional(),
+  /** #4463 R4: the last probe's status code and reachable-model count. */
+  lastValidation: ApiKeyLastValidationSchema.optional(),
 });
 export type RedactedApiKey = z.infer<typeof RedactedApiKeySchema>;
 
@@ -2589,22 +2620,58 @@ export function maskApiKey(key: string): string {
   return `••••${last4}`;
 }
 
+/** How POST /api/api-keys places a key (#4463 D-2 A). `upsert` (the default,
+ *  what Settings → Keys and the chat registration card send) replaces one entry of
+ *  the provider in place; `append` adds a new entry (anthropic, openai, gemini,
+ *  google only). */
+export const ApiKeyAddModeSchema = z.enum(["upsert", "append"]);
+export type ApiKeyAddMode = z.infer<typeof ApiKeyAddModeSchema>;
+
 /** Request body for POST /api/api-keys (add / upsert a provider key). The raw
  *  `key` crosses the wire exactly ONCE here (client → server); thereafter only
  *  the redacted view is returned. */
-export const AddApiKeyRequestSchema = z.object({
-  provider: ApiKeyProviderSchema,
-  /** #3808: OPTIONAL account binding — a per-account Gemini key upserts against the
-   *  (`provider`, `accountUuid`) pair rather than clobbering the provider's single
-   *  entry. Absent ⇒ the provider's unbound (default) key (today's behaviour). */
-  accountUuid: z.string().optional(),
-  label: z.string().max(120).optional(),
-  key: z.string().min(1).max(4096),
-  /** Reusable service descriptor (B4 #1957). Sent by the conversational flow's
-   *  secure entry card alongside the key; persisted onto the StoredApiKey. */
-  descriptor: ServiceDescriptorSchema.optional(),
-});
+export const AddApiKeyRequestSchema = z
+  .object({
+    provider: ApiKeyProviderSchema,
+    /** #3808: OPTIONAL account binding — a per-account Gemini key upserts against the
+     *  (`provider`, `accountUuid`) pair rather than clobbering the provider's single
+     *  entry. Absent ⇒ the provider's unbound (default) key (today's behaviour). */
+    accountUuid: z.string().optional(),
+    label: z.string().max(120).optional(),
+    key: z.string().min(1).max(4096),
+    /** Reusable service descriptor (B4 #1957). Sent by the conversational flow's
+     *  secure entry card alongside the key; persisted onto the StoredApiKey. */
+    descriptor: ServiceDescriptorSchema.optional(),
+    /** #4463 D-1 A: probe the key first and store it only when the provider
+     *  accepts it. Absent ⇒ store without a probe (today's behaviour). */
+    validate: z.boolean().optional(),
+    /** #4463 D-2 A: absent ⇒ `upsert`. Deliberately no zod `.default()`: this
+     *  type is the parse OUTPUT, and a default would make `mode` required for
+     *  every existing caller. */
+    mode: ApiKeyAddModeSchema.optional(),
+    /** #4463 D-3 A: the key's monogram, normalized by the route before storing. */
+    monogram: AccountMonogramSchema.optional(),
+  })
+  .refine(
+    r =>
+      r.mode !== "append" ||
+      r.label === undefined ||
+      r.label.length <= API_KEY_NAME_MAX_CHARS,
+    {
+      path: ["label"],
+      message: `label must be at most ${API_KEY_NAME_MAX_CHARS} characters in append mode`,
+    }
+  );
 export type AddApiKeyRequest = z.infer<typeof AddApiKeyRequestSchema>;
+
+/** Request body for PATCH /api/api-keys/:id (#4463 R6): set the key's name and
+ *  monogram in one write. An absent field is left as it is; an empty `label`
+ *  clears the name, and a monogram that normalizes to `{}` clears the override. */
+export const PatchApiKeyRequestSchema = z.object({
+  label: z.string().max(API_KEY_NAME_MAX_CHARS).optional(),
+  monogram: AccountMonogramSchema.optional(),
+});
+export type PatchApiKeyRequest = z.infer<typeof PatchApiKeyRequestSchema>;
 
 // ── Feedback (epic #2663 — In-app feedback system; Sub-Issue A #2664) ────────
 // Shared payload for POST /api/feedback. Pinned HERE in @hapi/protocol (the
