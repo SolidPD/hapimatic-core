@@ -26,6 +26,7 @@ import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
 import { logAndJson } from "./routeErrorHelper";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
+import { federationReadSignal } from "../../federation/proxyFetchSignal";
 import type { SessionService } from "../../services/sessionService";
 import {
   BULK_SESSION_MAX_IDS,
@@ -343,9 +344,12 @@ export function createSessionsRoutes(
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
             }
             try {
+              // #5375: bounded read — a hung peer falls through to the cached
+              // summary below instead of holding the request past the browser's
+              // 30 s timeout.
               const resp = await fetch(
                 `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}`,
-                { headers }
+                { headers, signal: federationReadSignal(c.req.raw.signal) }
               );
               if (resp.ok) {
                 const body = (await resp.json()) as {
@@ -457,10 +461,18 @@ export function createSessionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          const resp = await fetch(
-            `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/abort`,
-            { method: "POST", headers, body: "{}" }
-          );
+          // #5375: a transport failure answers 502 (normalized to node_unreachable
+          // by the remote-session availability guard) instead of throwing into
+          // app.onError as a 500.
+          let resp: Response;
+          try {
+            resp = await fetch(
+              `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/abort`,
+              { method: "POST", headers, body: "{}" }
+            );
+          } catch {
+            return c.json({ error: "Remote node unreachable" }, 502);
+          }
           if (resp.ok) {
             return c.json({ ok: true });
           }
@@ -537,10 +549,16 @@ export function createSessionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          const resp = await fetch(
-            `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/archive`,
-            { method: "POST", headers, body: "{}" }
-          );
+          // #5375: transport failure → 502, not an onError 500.
+          let resp: Response;
+          try {
+            resp = await fetch(
+              `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/archive`,
+              { method: "POST", headers, body: "{}" }
+            );
+          } catch {
+            return c.json({ error: "Remote node unreachable" }, 502);
+          }
           if (resp.ok) {
             // Immediately update cached session state so subsequent
             // client queries see the session as inactive without waiting
@@ -2192,10 +2210,16 @@ export function createSessionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          const resp = await fetch(
-            `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}`,
-            { method: "DELETE", headers }
-          );
+          // #5375: transport failure → 502, not an onError 500.
+          let resp: Response;
+          try {
+            resp = await fetch(
+              `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}`,
+              { method: "DELETE", headers }
+            );
+          } catch {
+            return c.json({ error: "Remote node unreachable" }, 502);
+          }
           if (resp.ok) {
             // Immediately remove from cache so subsequent queries
             // reflect the deletion without waiting for re-poll
@@ -3042,7 +3066,8 @@ export function createSessionsRoutes(
           try {
             const resp = await fetch(
               `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/slash-commands`,
-              { headers }
+              // #5375: bounded read-only proxy fetch.
+              { headers, signal: federationReadSignal(c.req.raw.signal) }
             );
             if (resp.ok) {
               const body = await resp.json();

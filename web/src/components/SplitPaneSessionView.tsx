@@ -3,7 +3,9 @@ import { useCallback } from "react";
 import type { ApiClient } from "@/api/client";
 import { SessionChat } from "@/components/SessionChat";
 import { LoadingState } from "@/components/LoadingState";
+import { SessionUnavailableView } from "@/components/SessionUnavailableView";
 import { useSession } from "@/hooks/queries/useSession";
+import { useSessionNodeRecovery } from "@/hooks/useSessionNodeRecovery";
 import { useMessages } from "@/hooks/queries/useMessages";
 import { useParentMessages } from "@/hooks/queries/useParentMessages";
 import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
@@ -32,6 +34,8 @@ export function SplitPaneSessionView(props: {
     session,
     messageCount,
     isLoading: sessionLoading,
+    error: sessionError,
+    loadFailure: sessionLoadFailure,
     refetch: refetchSession,
   } = useSession(api, sessionId, true);
   const { localNode } = useFederatedSessions(api);
@@ -94,25 +98,27 @@ export function SplitPaneSessionView(props: {
     void refetchMessages();
   }, [refetchMessages, refetchSession]);
 
+  // #5375: refetch this session's queries when its federation node comes back.
+  useSessionNodeRecovery(sessionId, session?.nodeStatus, refetchMessages);
+
   if (!session) {
-    if (sessionLoading) {
+    // #5375: once a failure is known, keep its view through the poll's
+    // refetches instead of flashing the spinner.
+    if (sessionLoading && sessionLoadFailure === null) {
       return (
         <div className="flex-1 flex items-center justify-center p-4">
           <LoadingState label="Loading session…" className="text-sm" />
         </div>
       );
     }
+    // #5375: only a definite 404 says "Session not found"; a restarting node
+    // shows "Reconnecting…" while the 5 s poll recovers it.
     return (
-      <div className="flex-1 flex flex-col items-center justify-center p-4 gap-3">
-        <p className="text-sm text-[var(--app-fg)]/60">Session not found</p>
-        <button /* design-tokens-allow: bare text link (text-link style, hover:underline, no box); Button chrome breaks the inline link - L2 exception (#3404) */
-          type="button"
-          onClick={onBack}
-          className="text-sm text-[var(--app-link)] hover:underline"
-        >
-          Back to sessions
-        </button>
-      </div>
+      <SessionUnavailableView
+        loadFailure={sessionLoadFailure}
+        errorMessage={sessionError}
+        onBack={onBack}
+      />
     );
   }
 

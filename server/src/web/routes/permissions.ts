@@ -121,10 +121,16 @@ export function createPermissionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          const resp = await fetch(
-            `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}/approve`,
-            { method: "POST", headers, body: JSON.stringify(parsed.data) }
-          );
+          // #5375: transport failure → 502, not an onError 500.
+          let resp: Response;
+          try {
+            resp = await fetch(
+              `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}/approve`,
+              { method: "POST", headers, body: JSON.stringify(parsed.data) }
+            );
+          } catch {
+            return c.json({ error: "Remote node unreachable" }, 502);
+          }
           if (resp.ok) {
             return c.json({ ok: true });
           }
@@ -202,10 +208,16 @@ export function createPermissionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
-          const resp = await fetch(
-            `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}/deny`,
-            { method: "POST", headers, body: JSON.stringify(parsed.data) }
-          );
+          // #5375: transport failure → 502, not an onError 500.
+          let resp: Response;
+          try {
+            resp = await fetch(
+              `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}/deny`,
+              { method: "POST", headers, body: JSON.stringify(parsed.data) }
+            );
+          } catch {
+            return c.json({ error: "Remote node unreachable" }, 502);
+          }
           if (resp.ok) {
             return c.json({ ok: true });
           }

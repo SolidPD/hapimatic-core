@@ -5,6 +5,10 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
+import {
+  federationReadSignal,
+  isAbortError,
+} from "../../federation/proxyFetchSignal";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { cataloged } from "../../capabilities/cataloged";
@@ -118,21 +122,44 @@ export function createCapabilitiesRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
+          // #5375: a transport failure (refused, reset, timed out) is a 502 the
+          // remote-session availability guard normalizes to node_unreachable —
+          // not the 404 session_not_found it used to fall through to. Read-only
+          // GET, so it is bounded by the federation read timeout.
+          let resp: Response;
           try {
-            const resp = await fetch(
+            resp = await fetch(
               `${node.url}/api/federation/sessions/${encodeURIComponent(
                 sessionId
               )}/capabilities`,
-              { headers }
+              { headers, signal: federationReadSignal(c.req.raw.signal) }
             );
-            if (resp.ok) {
+          } catch {
+            return c.json({ ok: false, error: "Remote node unreachable" }, 502);
+          }
+          if (resp.ok) {
+            try {
               const body = (await resp.json()) as Record<string, unknown>;
               return c.json(body);
+            } catch (error) {
+              // #5375: a body read cut off by the timeout is a transport failure.
+              if (isAbortError(error)) {
+                return c.json(
+                  { ok: false, error: "Remote node unreachable" },
+                  502
+                );
+              }
+              // Malformed success body → fall through to the 404 below (unchanged).
             }
-            // Non-2xx from the owning node → fall through to the 404 below.
-          } catch {
-            // Proxy failed (node offline / network) → fall through to the 404.
+          } else if (resp.status !== 404) {
+            // #5375: the owning node answered but failed (e.g. its engine is
+            // still starting) — that is not "session not found".
+            return c.json(
+              { ok: false, error: `Remote node returned ${resp.status}` },
+              502
+            );
           }
+          // 404 from the owning node → fall through to the 404 below.
         }
       }
 
@@ -254,7 +281,10 @@ export function createCapabilitiesRoutes(
               .catch(() => SESSION_NOT_FOUND)) as Record<string, unknown>;
             return c.json(relayed, resp.status as ContentfulStatusCode);
           } catch {
-            // Proxy failed (node offline / network) → fall through to the 404.
+            // #5375: a transport failure is a 502 the remote-session
+            // availability guard labels — never the 404 session_not_found it
+            // used to fall through to while the node was online.
+            return c.json({ ok: false, error: "Remote node unreachable" }, 502);
           }
         }
       }

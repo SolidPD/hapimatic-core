@@ -849,6 +849,25 @@ export class NodeRegistry {
     return null;
   }
 
+  /**
+   * True until every static peer has finished its first poll since this hub
+   * started (success or failure). Until then the session cache is empty, so a
+   * peer's live session reads as unknown — the hub-restart case of #5375.
+   */
+  isAwaitingInitialPoll(): boolean {
+    for (const nodeId of this.staticNodeIds) {
+      const state = this.nodeStates.get(nodeId);
+      if (
+        state &&
+        state.lastSuccessfulPoll === null &&
+        state.consecutiveFailures === 0
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Remove a session from the local cache (e.g. after confirmed deletion). */
   evictSessionFromCache(sessionId: string): void {
     for (const cached of this.sessionCache.values()) {

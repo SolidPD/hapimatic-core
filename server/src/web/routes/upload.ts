@@ -350,10 +350,16 @@ export function createUploadRoutes(
             if (options?.federationApiToken) {
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
             }
-            const resp = await fetch(
-              `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/upload/${encodeURIComponent(filename)}`,
-              { method: "GET", headers }
-            );
+            // #5375: transport failure → 502, not an onError 500.
+            let resp: Response;
+            try {
+              resp = await fetch(
+                `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/upload/${encodeURIComponent(filename)}`,
+                { method: "GET", headers }
+              );
+            } catch {
+              return c.json({ error: "Remote node unreachable" }, 502);
+            }
             if (resp.ok) {
               // Stream the binary response back with the remote's headers
               return new Response(resp.body, {
@@ -499,15 +505,21 @@ export function createUploadRoutes(
             if (options?.federationApiToken) {
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
             }
-            const resp = await fetch(
-              `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/upload`,
-              {
-                method: "POST",
-                headers,
-                body: c.req.raw.body,
-                duplex: "half",
-              }
-            );
+            // #5375: transport failure → 502, not an onError 500.
+            let resp: Response;
+            try {
+              resp = await fetch(
+                `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/upload`,
+                {
+                  method: "POST",
+                  headers,
+                  body: c.req.raw.body,
+                  duplex: "half",
+                }
+              );
+            } catch {
+              return c.json({ error: "Remote node unreachable" }, 502);
+            }
             const body = await resp.json().catch(() => ({}));
             return c.json(
               body as Record<string, unknown>,
@@ -722,10 +734,19 @@ export function createUploadRoutes(
             if (options?.federationApiToken) {
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
             }
-            const resp = await fetch(
-              `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/uploads/delete`,
-              { method: "POST", headers, body: await c.req.text() }
-            );
+            // #5375: transport failure → 502, not an onError 500. The request
+            // body is read before the try so a client-side read error still
+            // surfaces as it did before.
+            const deleteBody = await c.req.text();
+            let resp: Response;
+            try {
+              resp = await fetch(
+                `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/uploads/delete`,
+                { method: "POST", headers, body: deleteBody }
+              );
+            } catch {
+              return c.json({ error: "Remote node unreachable" }, 502);
+            }
             const body = await resp.json().catch(() => ({}));
             return c.json(
               body as Record<string, unknown>,

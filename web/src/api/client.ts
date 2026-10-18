@@ -5,6 +5,11 @@ import type {
   GitBranchListing,
 } from "@hapi/protocol/gitBranches";
 import { errorReporter } from "@/lib/error-reporter";
+import {
+  isNodeUnavailableCode,
+  REQUEST_CANCELLED_MESSAGE,
+  REQUEST_TIMED_OUT_MESSAGE,
+} from "@/lib/nodeAvailability";
 import type {
   AddApiKeyRequest,
   AutoRecoverPreference,
@@ -471,10 +476,10 @@ export class ApiClient {
       });
     } catch (err) {
       if (err instanceof DOMException && err.name === "TimeoutError") {
-        throw new Error("Request timed out. Please try again.");
+        throw new Error(REQUEST_TIMED_OUT_MESSAGE);
       }
       if (err instanceof DOMException && err.name === "AbortError") {
-        throw new Error("Request was cancelled.");
+        throw new Error(REQUEST_CANCELLED_MESSAGE);
       }
       throw err;
     }
@@ -515,7 +520,13 @@ export class ApiClient {
       // useHealthStatus's disabled/outage split) keep working.
       const isExpectedStatus =
         opts?.expectedStatuses?.includes(res.status) ?? false;
-      if (!isExpectedStatus) {
+      // #5375: a node_offline / node_unreachable answer means the session's
+      // federation node is briefly restarting. The queries retry it quietly, so
+      // reporting each attempt would exhaust the same 10/60 s budget #2362
+      // protects; the hub already logs the outage itself. The ApiError is still
+      // thrown unchanged.
+      const isTransientNodeError = isNodeUnavailableCode(parseErrorCode(body));
+      if (!isExpectedStatus && !isTransientNodeError) {
         errorReporter.report({
           message: `HTTP ${res.status} ${res.statusText}: ${body}`.slice(
             0,

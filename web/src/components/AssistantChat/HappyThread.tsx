@@ -13,6 +13,7 @@ import type { SessionMetadataSummary } from "@/types/api";
 import type { UseBookmarksResult } from "@/hooks/useBookmarks";
 import { HappyChatProvider } from "@/components/AssistantChat/context";
 import { useChatSectionPrefs } from "@/hooks/useChatSectionPrefs";
+import { useMessagesReconnecting } from "@/hooks/queries/useMessages";
 import { HappyAssistantMessage } from "@/components/AssistantChat/messages/AssistantMessage";
 import { HappyUserMessage } from "@/components/AssistantChat/messages/UserMessage";
 import { HappySystemMessage } from "@/components/AssistantChat/messages/SystemMessage";
@@ -161,6 +162,10 @@ export function HappyThread(props: {
   // Cleared when the user reaches the bottom or explicitly jumps to bottom.
   const userScrollDirectionRef = useRef<"up" | "down" | null>(null);
   const lastScrollTopForDirRef = useRef<number>(0);
+
+  // #5375: reconnecting notice while this session's federation node is briefly
+  // offline / restarting and the messages query retries quietly.
+  const messagesReconnecting = useMessagesReconnecting(props.sessionId);
 
   // Scroll position restore state (#833): tracks whether we're restoring a
   // cached position so we can suppress assistant-ui's scrollToBottomOnInitialize.
@@ -946,11 +951,23 @@ export function HappyThread(props: {
                 className="h-px w-full"
                 aria-hidden="true"
               />
+              {/* #5375: the session's node is briefly offline / restarting and the
+                  messages query is retrying quietly. Rendered OUTSIDE the skeleton
+                  branch: on a cold open TanStack keeps isLoading true while it
+                  retries, so a notice inside the non-loading branch never shows. */}
+              {messagesReconnecting ? (
+                <div
+                  role="status"
+                  className="mb-3 rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] p-2 text-xs text-[var(--app-hint)]"
+                >
+                  {messagesReconnecting}
+                </div>
+              ) : null}
               {props.isLoadingMessages ? (
                 <MessageSkeleton />
               ) : (
                 <>
-                  {props.messagesWarning ? (
+                  {props.messagesWarning && !messagesReconnecting ? (
                     <div className="mb-3 rounded-md bg-amber-500/10 p-2 text-xs">
                       {props.messagesWarning}
                     </div>

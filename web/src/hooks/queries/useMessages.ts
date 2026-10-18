@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
+  notifyManager,
   useInfiniteQuery,
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import type { ApiClient } from "@/api/client";
 import type { DecryptedMessage, MessagesResponse } from "@/types/api";
 import { mergeMessages, reconcileOptimisticStore } from "@/lib/messages";
+import {
+  describeNodeUnavailableAfterRetries,
+  describeNodeUnavailable,
+  isNodeUnavailableError,
+} from "@/lib/nodeAvailability";
 import { queryKeys } from "@/lib/query-keys";
 
 // Stable empty default so the client-only optimistic-store read never returns a
@@ -103,6 +109,11 @@ export function useMessages(
 
   const warning = useMemo(() => {
     if (!query.error) return null;
+    // #5375: the session's node stayed offline past the retry budget — say so
+    // in words instead of the raw `HTTP 503 : {…}` text.
+    if (isNodeUnavailableError(query.error)) {
+      return describeNodeUnavailableAfterRetries(query.error);
+    }
     return query.error instanceof Error
       ? query.error.message
       : "Failed to load messages";
@@ -122,4 +133,38 @@ export function useMessages(
     loadMore,
     refetch: query.refetch,
   };
+}
+
+/**
+ * #5375: the reconnecting notice for a session's messages, read straight from
+ * the query cache (no second fetch observer, no prop threading). While TanStack
+ * retries a node_offline / node_unreachable error it keeps `error` null and
+ * records the attempt's error as `fetchFailureReason` (cleared when a new fetch
+ * starts or succeeds), so the notice shows exactly for that window — on a cold
+ * open as well as on a loaded thread. Returns null otherwise, including once the
+ * retry budget is spent and `error` is set (`useMessages`' warning takes over).
+ */
+export function useMessagesReconnecting(
+  sessionId: string | null
+): string | null {
+  const queryClient = useQueryClient();
+  const resolvedSessionId = sessionId ?? "unknown";
+  // batchCalls, as TanStack's own hooks do: the cache notifies synchronously,
+  // possibly while another component renders, so the update is deferred to
+  // the notify manager's batch instead of setting state mid-render.
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      queryClient.getQueryCache().subscribe(notifyManager.batchCalls(onChange)),
+    [queryClient]
+  );
+  const getSnapshot = useCallback((): string | null => {
+    const state = queryClient.getQueryState(
+      queryKeys.messages(resolvedSessionId)
+    );
+    if (!state || state.error) return null;
+    return isNodeUnavailableError(state.fetchFailureReason)
+      ? describeNodeUnavailable(state.fetchFailureReason)
+      : null;
+  }, [queryClient, resolvedSessionId]);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }

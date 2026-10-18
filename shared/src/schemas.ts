@@ -1956,6 +1956,13 @@ export const McpToggleErrorCodeSchema = z.enum([
    * `MetadataSchema.path`, but this catches anything that bypasses the
    * boundary. NOT retryable — the projectDir itself must change. (Issue #1098) */
   "unsafe_path",
+  /** The session's owning federation node is offline or restarting (the hub's
+   * remote-session availability guard rewrote a session-not-found). Transient —
+   * retry once the node returns. (Issue #5375) */
+  "node_offline",
+  /** The owning node is marked online but the hub's proxy call failed at the
+   * transport layer. Transient. (Issue #5375) */
+  "node_unreachable",
   "unknown",
 ]);
 
@@ -2019,6 +2026,9 @@ export const SetModelErrorCodeSchema = z.enum([
   "claude_exited",
   "invalid_request",
   "session_not_found",
+  /** Owning federation node offline / unreachable (#5375, see McpToggleErrorCodeSchema). */
+  "node_offline",
+  "node_unreachable",
   "unknown",
 ]);
 
@@ -2102,6 +2112,9 @@ export const SetPermissionModeErrorCodeSchema = z.enum([
   "claude_exited",
   "invalid_request",
   "session_not_found",
+  /** Owning federation node offline / unreachable (#5375, see McpToggleErrorCodeSchema). */
+  "node_offline",
+  "node_unreachable",
   "unknown",
 ]);
 

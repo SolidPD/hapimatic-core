@@ -2,6 +2,10 @@
 import type { SyncEngine } from "../sync/syncEngine";
 import type { PaymentMethodTarget } from "../sync/accountRestart";
 import type { NodeRegistry } from "../federation/nodeRegistry";
+import {
+  federationReadSignal,
+  readProxyJson,
+} from "../federation/proxyFetchSignal";
 import type {
   McpBatchSnapshot,
   McpToggleResponse,
@@ -245,17 +249,26 @@ export class SessionService {
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        // #5375: bound READ-ONLY proxies only. A timed-out mutation may already
+        // have been applied on the peer (duplicate risk) — tracked in #3627.
+        signal: method === "GET" ? federationReadSignal() : undefined,
       });
 
+      // #5375: on Bun, resp.json() RESOLVES null for an empty body (it does not
+      // throw), so `.catch(() => ({}))` alone yields null — which made the
+      // `.error` read below throw and masked the peer's real status as a
+      // transport failure. `?? {}` restores the intended empty-object fallback.
+      // readProxyJson rethrows a body read cut off by the GET timeout, so it
+      // reaches the catch below instead of reading as an empty success.
       if (resp.ok) {
-        const data = await resp.json().catch(() => ({}));
+        const data = (await readProxyJson(resp)) ?? {};
         return {
           type: "success",
           data: data as Record<string, unknown>,
         };
       }
 
-      const errBody = await resp.json().catch(() => ({}));
+      const errBody = (await readProxyJson(resp)) ?? {};
       const message =
         (errBody as { error?: string }).error ??
         `Remote node returned ${resp.status}`;

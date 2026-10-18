@@ -5,6 +5,10 @@ import { z } from "zod";
 import { defineCapability } from "@hapi/protocol";
 import type { SyncEngine } from "../../../sync/syncEngine";
 import type { NodeRegistry } from "../../../federation/nodeRegistry";
+import {
+  federationReadSignal,
+  readProxyJson,
+} from "../../../federation/proxyFetchSignal";
 import type { WebAppEnv } from "../../../web/middleware/auth";
 import type { ErrorLogger } from "../../../logging/errorLogger";
 import { cataloged } from "../../../capabilities/cataloged";
@@ -131,8 +135,13 @@ async function federationGetProxy(
   }
 
   try {
-    const resp = await fetch(url.toString(), { headers });
-    const body = await resp.json().catch(() => ({}));
+    // #5375: bounded read-only proxy fetch (covers every git read route). The
+    // body read is bounded too; a cut-off read lands in the catch below.
+    const resp = await fetch(url.toString(), {
+      headers,
+      signal: federationReadSignal(c.req.raw.signal),
+    });
+    const body = (await readProxyJson(resp)) ?? {};
     return c.json(
       body as Record<string, unknown>,
       resp.status as 200 | 400 | 404 | 409 | 500 | 502 | 503

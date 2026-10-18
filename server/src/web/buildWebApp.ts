@@ -159,6 +159,7 @@ import { createApiKeysRoutes } from "./routes/apiKeys";
 import { createPorterKeyRoutes } from "./routes/porterKey";
 import { createPorterStatusRoutes } from "./routes/porterStatus";
 import { createPorterExposureGate } from "./middleware/porterExposure";
+import { createRemoteSessionAvailabilityGuard } from "./middleware/remoteSessionAvailability";
 import { createBackupIdentityRoutes } from "./routes/backupIdentity";
 import {
   createPorterImportRoutes,
@@ -794,6 +795,18 @@ export function buildWebApp(options: {
   app.use(
     "/api/*",
     createAuthMiddleware(options.jwtSecret, options.errorLogger)
+  );
+
+  // #5375: a live session on a briefly offline/restarting peer must not read as
+  // "not found". Response-rewrite only (runs after each handler and its
+  // fallbacks). Registered BEFORE the extension-route loop (git-rpc) and every
+  // per-session mount below — Hono runs handlers in registration order.
+  app.use(
+    "/api/sessions/:id/*",
+    createRemoteSessionAvailabilityGuard({
+      getSyncEngine: options.getSyncEngine,
+      getNodeRegistry: options.getNodeRegistry,
+    })
   );
 
   // Mount extension-contributed route factories (issue #1270, locked §5f) at ONE

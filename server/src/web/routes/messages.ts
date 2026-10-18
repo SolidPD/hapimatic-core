@@ -4,6 +4,10 @@ import type { Context } from "hono";
 import { z } from "zod";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
+import {
+  federationReadSignal,
+  readProxyJson,
+} from "../../federation/proxyFetchSignal";
 import type { WebAppEnv } from "../middleware/auth";
 import type { MessageOrigin } from "../../sync/sentFrom";
 import { defineCapability } from "@hapi/protocol";
@@ -130,12 +134,16 @@ export function createMessagesRoutes(
           if (query.afterSeq) url.searchParams.set("afterSeq", query.afterSeq);
 
           try {
-            const resp = await fetch(url.toString(), { headers });
+            // #5375: bounded read-only proxy fetch.
+            const resp = await fetch(url.toString(), {
+              headers,
+              signal: federationReadSignal(c.req.raw.signal),
+            });
             if (resp.ok) {
               const body = await resp.json();
               return c.json(body as Record<string, unknown>);
             }
-            const body = await resp.json().catch(() => ({}));
+            const body = (await readProxyJson(resp)) ?? {};
             return c.json(
               body as Record<string, unknown>,
               resp.status as 400 | 404 | 409 | 500 | 503

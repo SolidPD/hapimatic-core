@@ -24,6 +24,10 @@ import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
+import {
+  federationReadSignal,
+  readProxyJson,
+} from "../../federation/proxyFetchSignal";
 import type { WebAppEnv } from "../middleware/auth";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { computeApprovalState } from "../../services/approvalTokens";
@@ -110,12 +114,16 @@ export function createApprovalsRoutes(
             nonce ? `?nonce=${encodeURIComponent(nonce)}` : ""
           }`;
           try {
-            const resp = await fetch(url, { headers });
+            // #5375: bounded read-only proxy fetch.
+            const resp = await fetch(url, {
+              headers,
+              signal: federationReadSignal(c.req.raw.signal),
+            });
             if (resp.ok) {
               const body = await resp.json();
               return c.json(body as Record<string, unknown>);
             }
-            const body = await resp.json().catch(() => ({}));
+            const body = (await readProxyJson(resp)) ?? {};
             return c.json(
               body as Record<string, unknown>,
               resp.status as 400 | 404 | 409 | 500 | 503

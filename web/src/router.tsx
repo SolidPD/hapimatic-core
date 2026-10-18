@@ -44,6 +44,7 @@ import {
 } from "@/components/NewSession";
 import type { AgentType } from "@/components/NewSession/types";
 import { LoadingState } from "@/components/LoadingState";
+import { SessionUnavailableView } from "@/components/SessionUnavailableView";
 import { useAppContext } from "@/lib/app-context";
 import { clearLastRoute } from "@/lib/route-persistence";
 import { useAppGoBack } from "@/hooks/useAppGoBack";
@@ -51,6 +52,7 @@ import { useMessages } from "@/hooks/queries/useMessages";
 import { useParentMessages } from "@/hooks/queries/useParentMessages";
 import { useMachines } from "@/hooks/queries/useMachines";
 import { useSession } from "@/hooks/queries/useSession";
+import { useSessionNodeRecovery } from "@/hooks/useSessionNodeRecovery";
 import { useSessions } from "@/hooks/queries/useSessions";
 import { SpawningSessionView } from "@/components/SpawningSessionView";
 import { useSpawnHandoverActive } from "@/lib/spawn-draft";
@@ -968,6 +970,8 @@ function SessionPage() {
     session,
     messageCount,
     isLoading: sessionLoading,
+    error: sessionError,
+    loadFailure: sessionLoadFailure,
     refetch: refetchSession,
   } = useSession(api, sessionId, true); // isActiveSession=true enables polling fallback for timer
   const { localNode } = useFederatedSessions(api);
@@ -1070,38 +1074,44 @@ function SessionPage() {
     void refetchMessages();
   }, [refetchMessages, refetchSession]);
 
+  // #5375: refetch this session's queries when its federation node comes back.
+  useSessionNodeRecovery(sessionId, session?.nodeStatus, refetchMessages);
+
   // Self-heal (#1257): if the persisted deep link resolved to a session that no
   // longer exists, clear the lastRoute key so the next cold start doesn't
   // re-trap the user on this not-found view. Gated on a definitively-failed
   // load (!sessionLoading && !session) — a bare-[] effect would also clear the
   // key on successful loads and defeat the iOS PWA route persistence (#518).
+  // #5375: ONLY a definite 404 means the session is gone; a hung or restarting
+  // federation node must not drop the user's saved route.
+  const sessionNotFound =
+    !sessionLoading && !session && sessionLoadFailure === "not_found";
   useEffect(() => {
-    if (!sessionLoading && !session) {
+    if (sessionNotFound) {
       clearLastRoute();
     }
-  }, [sessionLoading, session]);
+  }, [sessionNotFound]);
 
   if (!session) {
     // Still loading — show spinner
-    if (sessionLoading) {
+    // #5375: once a failure is known, keep its view through the poll's
+    // refetches instead of flashing the spinner.
+    if (sessionLoading && sessionLoadFailure === null) {
       return (
         <div className="flex-1 flex items-center justify-center p-4">
           <LoadingState label="Loading session…" className="text-sm" />
         </div>
       );
     }
-    // Load finished but session doesn't exist — show not-found UI
+    // #5375: only a definite 404 says "Session not found" (and clears the saved
+    // route above); a restarting node shows "Reconnecting…" while the 5 s poll
+    // recovers it; any other error is shown with a way back.
     return (
-      <div className="flex-1 flex flex-col items-center justify-center p-4 gap-3">
-        <p className="text-sm text-[var(--app-fg)]/60">Session not found</p>
-        <button
-          type="button"
-          onClick={goBack}
-          className="text-sm text-[var(--app-link)] hover:underline"
-        >
-          Back to sessions
-        </button>
-      </div>
+      <SessionUnavailableView
+        loadFailure={sessionLoadFailure}
+        errorMessage={sessionError}
+        onBack={goBack}
+      />
     );
   }
 
