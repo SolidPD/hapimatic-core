@@ -39,6 +39,7 @@ import { assertSafeEntry } from "./archiveContainment";
 import { hashContent, type StagedFileItem } from "./conflictDetection";
 import type { PlannedFileItem } from "./importArchive";
 import type { TarEntry } from "./tarArchive";
+import { trimTrailingChars } from "@hapi/protocol/trimChars";
 
 /** The omission surface of one refused premium plugin or marketplace. */
 function premiumSurface(what: string): string {
@@ -205,7 +206,12 @@ export async function planMemory(
     if (seen.has(srcKey)) continue;
     seen.add(srcKey);
     const prefix = `${MEMORY_ARCHIVE_DIR}/${srcKey}`;
-    if (!validProjectKey(srcKey) || entry.path.replace(/\/+$/, "") !== prefix) {
+    // `entry.path` comes from the imported archive, so the trim must stay
+    // linear — the `/\/+$/` form is quadratic on a long run of slashes.
+    if (
+      !validProjectKey(srcKey) ||
+      trimTrailingChars(entry.path, "/") !== prefix
+    ) {
       skipped.push({
         surface: memorySurface(srcKey),
         reason: `not imported: this is not a valid memory entry (it must be ${MEMORY_ARCHIVE_DIR}/<project key>)`,

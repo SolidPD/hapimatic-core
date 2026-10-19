@@ -7,6 +7,7 @@ export * from "./geminiModelCatalog";
 export * from "./codexModelCatalog";
 export * from "./sessionName";
 export * from "./sessionId";
+export * from "./trimChars";
 export * from "./sessionSummary";
 export * from "./notes";
 export * from "./federation";

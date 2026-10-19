@@ -45,6 +45,7 @@ import type { EffectDecl, GraphNode } from "../ir";
 import type { EffectLifecycle } from "../run-record";
 import type { LedgerHook, LedgerHookContext, NodeHandlerResult } from "./types";
 import { Cancelled } from "./cancellation";
+import { trimTrailingChars } from "../../trimChars";
 
 // ── Runtime ledger records — an explicit SUPERSET of the compiled shapes ──────
 /**
@@ -178,7 +179,7 @@ export class JsonlRunSubstrate implements LedgerSubstrate {
   private readonly path: string;
 
   constructor(runDir: string) {
-    this.path = `${runDir.replace(/\/+$/, "")}/ledger.jsonl`;
+    this.path = `${trimTrailingChars(runDir, "/")}/ledger.jsonl`;
   }
 
   private async append(rec: RuntimeLedgerRecord): Promise<void> {

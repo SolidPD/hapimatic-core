@@ -75,6 +75,7 @@ import {
   SETTINGS_SCRIPT_CHECK_CARRIED,
   SETTINGS_SCRIPT_CHECK_SUMMARY_PREFIX,
 } from "./settingsScriptShell";
+import { trimTrailingChars } from "../trimChars";
 
 /**
  * Shape guard for an age recipient (R2). Classic X25519 recipients are
@@ -323,7 +324,7 @@ export function buildExtractionPrompt(input: ExtractionPromptInput): string {
   const recipientPublicPath = "/api/porter/recipient/public";
   const trimmedInstanceUrl =
     typeof instanceUrl === "string" && instanceUrl.length > 0
-      ? instanceUrl.replace(/\/+$/, "")
+      ? trimTrailingChars(instanceUrl, "/")
       : undefined;
   const recipientPublicUrl = trimmedInstanceUrl
     ? `${trimmedInstanceUrl}${recipientPublicPath}`

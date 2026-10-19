@@ -49,8 +49,7 @@ import { UsageBar } from "@/components/AccountUsage/UsageBar";
 import { useProviderAuthState } from "@/hooks/queries/useProviderAuthState";
 import { useAccounts } from "@/hooks/queries/useAccounts";
 import { AddAccountInstructions } from "@/components/AddAccountInstructions";
-import { GeminiKeyEntry } from "@/components/AccountUsage/GeminiKeyEntry";
-import { AddOpenAIAccountWizard } from "@/components/AccountUsage/AddOpenAIAccountWizard";
+import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
 import type { ApiClient } from "@/api/client";
 import { DeviceConnectionFooter } from "@/components/AccountUsage/DeviceConnectionFooter";
 import { ApiKeysSection } from "@/components/settings/sections/ApiKeysSection";
@@ -317,7 +316,6 @@ function DegradedNodeRow(props: { nodeLabel: string }) {
 function OpenAiSectionBody(props: {
   nodes: NodeProviderAuthState[];
   resolveNodeLabel: (nodeId: string) => string;
-  currentNodeId: string;
   api: ApiClient | null;
   // Issue #3809: the OpenAI providerUsage[] rows keyed by accountUuid, rendered
   // into each login row's meter slot below.
@@ -329,10 +327,9 @@ function OpenAiSectionBody(props: {
   );
   const allReachableNoLogin =
     !anyRows && props.nodes.every(n => n.status === "ok");
-  // The in-app "Add account" opens the #3807 wizard (API key + ChatGPT
-  // device-auth). It targets the local node (currentNodeId) for this MVP; the
-  // server-side driver + federation receivers are node-agnostic (R4), so #3808
-  // can surface per-node adds without a driver change.
+  // #4464: the in-app "Add account" opens the OpenAI "+ Add" modal — ChatGPT
+  // device-auth or a Codex API-key login on the node the user picks (the UI
+  // host by default), plus OpenAI vault keys.
   const addButton = (
     <div className="flex justify-end">
       <Button
@@ -346,11 +343,11 @@ function OpenAiSectionBody(props: {
     </div>
   );
   const wizard = wizardOpen ? (
-    <AddOpenAIAccountWizard
+    <AddToProviderModal
       isOpen
       onClose={() => setWizardOpen(false)}
       api={props.api}
-      nodeId={props.currentNodeId}
+      provider="openai"
     />
   ) : null;
 
@@ -449,13 +446,11 @@ function GeminiSectionBody(props: {
   // node-keyed like the auth rows), rendered at the top of the section.
   googleUsageRows: ProviderAccountUsage[];
 }) {
-  // R1/R4 (#3807): the in-app "Add account" (GeminiKeyEntry) targets THIS node's
-  // LOCAL vault (POST /api/api-keys — there is no federation key-persistence
-  // receiver until #1996), so it renders for the local node only. A peer node's
-  // row shows the #3806 host-side instruction instead. The local node is
-  // normally the first row the aggregator emits; when the envelope has no local
-  // row yet (empty / loading), the fallback below still offers the local add.
-  const localSeen = props.nodes.some(n => n.nodeId === props.currentNodeId);
+  // #4464: ONE "Add key" button opens the Gemini "+ Add" modal (keys only). It
+  // writes THIS node's local vault (POST /api/api-keys — there is no federation
+  // key store until #1996); a peer node's row keeps the #3806 host-side
+  // instruction.
+  const [addOpen, setAddOpen] = useState(false);
   return (
     <div className="flex flex-col gap-3">
       {/* Issue #3809: the derived Google token-spend counters (account-keyed),
@@ -501,31 +496,39 @@ function GeminiSectionBody(props: {
                 />
               </div>
             )}
-            {isLocal ? (
-              // In-app add for THIS node's local vault (#3807 Task 1, R1).
-              <GeminiKeyEntry api={props.api} />
-            ) : (
-              !g?.bound && (
-                // A peer node with no bound Gemini key → host-side instruction
-                // (federation key persistence is #1996's; R4).
-                <div
-                  className="flex flex-col gap-2 text-[length:var(--text-body)]"
-                  data-testid="provider-section-google-peer-empty"
-                >
-                  <AddAccountInstructions
-                    provider="google"
-                    intro={`No Gemini key bound on ${nodeLabel} yet:`}
-                  />
-                </div>
-              )
+            {!isLocal && !g?.bound && (
+              // A peer node with no bound Gemini key → host-side instruction
+              // (federation key persistence is #1996's; R4).
+              <div
+                className="flex flex-col gap-2 text-[length:var(--text-body)]"
+                data-testid="provider-section-google-peer-empty"
+              >
+                <AddAccountInstructions
+                  provider="google"
+                  intro={`No Gemini key bound on ${nodeLabel} yet:`}
+                />
+              </div>
             )}
           </div>
         );
       })}
-      {!localSeen && (
-        // The local node is not in the envelope yet (empty / loading) — still
-        // offer the in-app add for this node's local vault (#3807 Task 1).
-        <GeminiKeyEntry api={props.api} />
+      <div className="flex justify-end">
+        <Button
+          type="button"
+          size="sm"
+          onClick={() => setAddOpen(true)}
+          data-testid="gemini-add-key"
+        >
+          Add key
+        </Button>
+      </div>
+      {addOpen && (
+        <AddToProviderModal
+          isOpen
+          onClose={() => setAddOpen(false)}
+          api={props.api}
+          provider="google"
+        />
       )}
     </div>
   );
@@ -1227,13 +1230,12 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
               </div>
             )}
 
-            {/* #4461 (R9): the re-login deep link — the add flow for the UI
-              host, an inline explanation naming any other node. */}
+            {/* #4461 (R9): the re-login deep link — the "+ Add" modal with the
+              requested node preselected (#4464). */}
             <ReloginDeepLink
               api={api}
               localNode={localNode}
               localNodeSettled={localNodeSettled}
-              resolveNodeLabel={resolveNodeLabel}
             />
 
             {showInitialLoading ? (
@@ -1332,19 +1334,18 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
           )}
 
           {/* OpenAI (Codex) section — per-node derived login rows (#3806) + the
-              in-app "Add account" wizard (#3807 Task 4). */}
+              in-app "Add account" (the OpenAI "+ Add" modal, #4464). */}
           <ProviderSection title="OpenAI" testId="provider-section-openai">
             <OpenAiSectionBody
               nodes={providerNodes}
               resolveNodeLabel={resolveNodeLabel}
-              currentNodeId={currentNodeId}
               api={api}
               openaiUsageByUuid={openaiUsageByUuid}
             />
           </ProviderSection>
 
           {/* Google Gemini section — per-node auth type + key binding (#3806) +
-              the in-app "Add account" for the local node (#3807 Task 1). */}
+              the "Add key" button (the Gemini "+ Add" modal, #4464). */}
           <ProviderSection
             title="Google Gemini"
             testId="provider-section-google"

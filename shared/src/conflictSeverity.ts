@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { ChangeKind } from "./fileClaims";
+import { trimChars } from "./trimChars";
 
 // Epic #1965 (File Conflict Monitor) Sub E / #1970 — pure conflict-computation
 // helpers shared by the orchestrator-local batch-conflict endpoint (#1970) and the
@@ -208,7 +209,7 @@ export function recommendAction(
  */
 function ignoreRegex(pattern: string): RegExp {
   const anchored = pattern.startsWith("/");
-  const body = globToRegexBody(pattern.replace(/^\/+|\/+$/g, ""));
+  const body = globToRegexBody(trimChars(pattern, "/"));
   return new RegExp((anchored ? "^" : "(?:^|/)") + body + "(?:/.*)?$");
 }
 

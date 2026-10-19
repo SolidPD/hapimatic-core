@@ -1910,6 +1910,8 @@ export const NewSession = forwardRef<
           onClose={() => setAccountModalOpen(false)}
           api={props.api}
           scope="spawn"
+          // #4464: an add from the picker stores the login on the spawn target.
+          addTargetNodeId={remoteNodeId ?? undefined}
           // #3808 Task 5: scope the list to the chosen harness's provider so a
           // codex spawn offers OpenAI accounts, a gemini spawn Google accounts.
           providerScope={accountSelectorProvider ?? "anthropic"}

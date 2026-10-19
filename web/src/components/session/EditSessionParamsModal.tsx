@@ -974,6 +974,8 @@ function EditSessionParamsForm({
         // Round 14 (item 7): stage the pick; `handleApply` performs the switch.
         scope="stage"
         sessionId={session.id}
+        // #4464: an add from the picker stores the login on the session's node.
+        addTargetNodeId={effectiveNodeId ?? undefined}
         currentAccountEmail={shownEmail}
         sessionFlavor={flavor}
         selectedAccountUuid={draftAccountUuid}

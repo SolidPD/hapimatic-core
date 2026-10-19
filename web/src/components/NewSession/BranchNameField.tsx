@@ -2,6 +2,7 @@
 import { FormField } from "./FormField";
 import { BareButton } from "@/components/ui/BareButton";
 import type { NewBranchFeedback } from "./branchSelection";
+import { trimChars, trimTrailingChars } from "@hapi/protocol";
 
 /**
  * Branch-friendly name derived from a linked issue: `issue-<N>-<kebab-title>`,
@@ -9,12 +10,13 @@ import type { NewBranchFeedback } from "./branchSelection";
  * (Moved here from `index.tsx` alongside the field it feeds.)
  */
 export function toBranchName(num: number, title: string): string {
-  const slug = title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 40)
-    .replace(/-+$/g, "");
+  const slug = trimTrailingChars(
+    trimChars(title.toLowerCase().replace(/[^a-z0-9]+/g, "-"), "-").slice(
+      0,
+      40
+    ),
+    "-"
+  );
   return slug ? `issue-${num}-${slug}` : `issue-${num}`;
 }
 

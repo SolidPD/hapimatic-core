@@ -149,6 +149,22 @@ const EVENT_BRIDGE_BACKOFF = [1000, 2000, 4000, 8000, 16000, 30000];
 export const EVENT_BRIDGE_IDLE_TIMEOUT_MS = 90_000;
 
 /**
+ * Upper bound on the hub-restart grace window (ms), measured from registry
+ * construction (#5407). While a static peer has never polled successfully,
+ * `isAwaitingInitialPoll()` holds the window open so the peer's sessions read
+ * as unavailable rather than not found. A peer that refuses connections is
+ * polled at about 0 s, 15 s and 30 s, then (offline) after 60 s and 120 s of
+ * backoff — about 90 s and 210 s; a peer whose fetches hang adds up to
+ * FETCH_TIMEOUT_MS per poll. A peer that comes back announces itself and
+ * skips the backoff (`notePeerAnnouncement`), so it polls successfully within
+ * seconds.
+ * Three minutes covers a normal peer restart; past it a permanently dead peer
+ * stops holding the window, and a genuinely unknown session id is held back
+ * from a 404 at most this long.
+ */
+export const HUB_RESTART_GRACE_MS = 180_000;
+
+/**
  * Backoff delays for poll failures (ms), indexed by (consecutiveFailures - OFFLINE_THRESHOLD).
  * Starts after a node crosses the offline threshold: 60s → 120s → 240s → 300s cap.
  */
@@ -321,6 +337,9 @@ export class NodeRegistry {
 
   /** IDs of static nodes (from config) — these are never evicted. */
   private readonly staticNodeIds: Set<string>;
+
+  /** When this registry was built (≈ hub start); anchors HUB_RESTART_GRACE_MS. */
+  private readonly constructedAt = Date.now();
 
   /** Pending reconnect timers — tracked so eviction can cancel them. */
   private eventBridgeReconnectTimers = new Map<
@@ -923,20 +942,18 @@ export class NodeRegistry {
   }
 
   /**
-   * True until every static peer has finished its first poll since this hub
-   * started (success or failure). Until then the session cache is empty, so a
-   * peer's live session reads as unknown — the hub-restart case of #5375.
+   * True until every static peer has completed one SUCCESSFUL poll since this
+   * hub started, or until `HUB_RESTART_GRACE_MS` has passed. Until a peer polls
+   * successfully the session cache holds nothing for it, so its live sessions
+   * read as unknown — the hub-restart case of #5375. A failed first poll does
+   * not close the window (#5407): a peer that is down at hub start would
+   * otherwise answer plain 404s and the web client would drop the saved route.
    */
   isAwaitingInitialPoll(): boolean {
+    if (Date.now() - this.constructedAt >= HUB_RESTART_GRACE_MS) return false;
     for (const nodeId of this.staticNodeIds) {
       const state = this.nodeStates.get(nodeId);
-      if (
-        state &&
-        state.lastSuccessfulPoll === null &&
-        state.consecutiveFailures === 0
-      ) {
-        return true;
-      }
+      if (state && state.lastSuccessfulPoll === null) return true;
     }
     return false;
   }

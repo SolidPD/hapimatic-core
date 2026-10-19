@@ -3,7 +3,7 @@ import { useState } from "react";
 import { ChevronIcon } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { AddAccountInstructions } from "@/components/AddAccountInstructions";
-import { AddAccountWizard } from "@/components/AddAccountWizard";
+import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
 import { useAppContext } from "@/lib/app-context";
 import { useRefreshAccountUsage } from "@/hooks/queries/useAccountUsage";
 
@@ -12,8 +12,8 @@ import { useRefreshAccountUsage } from "@/hooks/queries/useAccountUsage";
  * Usage page (epic #2049, Sub-Issue F / #2055; in-app wizard entry added by
  * #3452).
  *
- * Header row: an "Add account" button that opens the in-app OAuth wizard
- * (`AddAccountWizard`, #1263) — the PRIMARY path — beside the "How to add a
+ * Header row: an "Add account" button that opens the Anthropic "+ Add" modal
+ * (`AddToProviderModal`, #4464) — the PRIMARY path — beside the "How to add a
  * new account" chevron toggle. Expanding the toggle reveals the shared
  * `AddAccountInstructions` host-login procedure, retained as the fallback for
  * environments where the in-app flow can't be used (R4 — single source of
@@ -26,9 +26,9 @@ import { useRefreshAccountUsage } from "@/hooks/queries/useAccountUsage";
  * unconditionally by the page (in every state, like `DeviceConnectionFooter`),
  * so the entry point is always available.
  *
- * The wizard is mounted only while open: `useAccountLogin` is a mutation hook
- * and the wizard starts a login in its open-effect, so there is no reason to
- * instantiate either on every page render. On `onAdded` the page's usage list
+ * The modal is mounted only while open, so its data reads and login hooks are
+ * not instantiated on every page render. (The block itself moves into an
+ * "Other ways" popover in #4466.) On `onAdded` the page's usage list
  * is refreshed the way the Refresh button does it (`useRefreshAccountUsage`,
  * `?force=1`): the 60s auto-poll reads the server's push-to-cache snapshot
  * (#1909), which does not contain the new account until the sampler's next
@@ -81,10 +81,11 @@ export function AddAccountSection() {
       )}
 
       {wizardOpen && (
-        <AddAccountWizard
+        <AddToProviderModal
           isOpen
           onClose={() => setWizardOpen(false)}
           api={api}
+          provider="anthropic"
           onAdded={() => {
             void refreshUsage();
           }}

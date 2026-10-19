@@ -395,7 +395,8 @@ function cleanLoginError(err: unknown): unknown {
 }
 
 /**
- * Web-initiated OAuth login mutations (issue #1263), backing `AddAccountWizard`.
+ * Web-initiated OAuth login mutations (issue #1263), backing the Anthropic step
+ * of the "+ Add" modal (`NodeLoginList`, #4464).
  * `start` requests the Anthropic authorize URL; `complete` exchanges the pasted
  * code and, on success, invalidates the account queries so the new account
  * appears. Both reject with an `ApiError` carrying the server's clean message

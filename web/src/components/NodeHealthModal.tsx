@@ -33,6 +33,7 @@ export function NodeHealthModal({
   nodeLabel,
   nodeUrl,
   nodeStatus,
+  labelAsReceived = false,
   open,
   onOpenChange,
 }: {
@@ -40,6 +41,9 @@ export function NodeHealthModal({
   nodeLabel?: string;
   nodeUrl?: string;
   nodeStatus?: NodeHealthStatus;
+  /** #4468 Task 2 (added by #4464): render `nodeLabel` as given — the server has
+   *  already cased it and a URL-less label cannot be classified client-side. */
+  labelAsReceived?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -51,9 +55,12 @@ export function NodeHealthModal({
   // cloud VMs lower case — the same helper the Node Badge applies, so the badge
   // and its modal can never disagree. (The old 3-letter uppercased id chip is
   // gone: it was one of the "random" casings the rule replaces.)
-  const label = displayNodeLabel(node?.nodeLabel ?? nodeLabel ?? nodeId, {
-    url: nodeUrl,
-  });
+  const label =
+    labelAsReceived && nodeLabel
+      ? nodeLabel
+      : displayNodeLabel(node?.nodeLabel ?? nodeLabel ?? nodeId, {
+          url: nodeUrl,
+        });
   // An unknown status on a node we can render is, by construction, reachable
   // (the same call NodeBadge makes for its health dot).
   const health: NodeHealthStatus = nodeStatus ?? "online";

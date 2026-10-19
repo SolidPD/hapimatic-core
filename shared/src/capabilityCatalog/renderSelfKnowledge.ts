@@ -41,6 +41,7 @@
 import type { CatalogEntry, Invocation } from "./types";
 import { DOMAIN_SLUGS, DOMAIN_LABELS, type DomainSlug } from "./domains";
 import { isVisibleToScope } from "./availability";
+import { trimTrailingChars } from "../trimChars";
 
 /** The two scopes a self-knowledge doc is rendered for. */
 export type SelfKnowledgeScope = "user" | "operator";
@@ -206,7 +207,7 @@ export function renderSelfKnowledge(
   );
 
   // Verbatim preamble (the hand-authored prose with no catalog counterpart).
-  lines.push(preambleText.replace(/\n+$/, ""), "");
+  lines.push(trimTrailingChars(preambleText, "\n"), "");
 
   // (R3) The ONE-LINE Tier-0 pointer — the compact primer is injected separately;
   // this doc is the on-demand detail, so the Tier-0 table is NOT repeated here.
@@ -233,7 +234,7 @@ export function renderSelfKnowledge(
     }
   }
 
-  const out = lines.join("\n").replace(/\n+$/, "") + "\n";
+  const out = trimTrailingChars(lines.join("\n"), "\n") + "\n";
 
   // (R3) HARD size budget — a render past the ceiling fails the build rather than
   // shipping an unbounded always-loaded doc. `TextEncoder` (WHATWG, browser-safe)

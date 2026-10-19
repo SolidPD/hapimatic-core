@@ -2,6 +2,7 @@
 import { basename, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { trimChars } from "@hapi/protocol/trimChars";
 
 /**
  * Local slug helper — identical to the private `toSlug` in
@@ -12,10 +13,7 @@ import { createHash } from "node:crypto";
  * relocated host base a trusted, unique, traversal-free path.
  */
 function toSlug(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  return trimChars(value.toLowerCase().replace(/[^a-z0-9]+/g, "-"), "-");
 }
 
 /**

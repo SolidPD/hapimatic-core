@@ -303,6 +303,9 @@ export function NodeBadge({
   nodeUrl,
   nodeStatus,
   fillCell = false,
+  interactive = true,
+  resourceHealth = true,
+  labelAsReceived = false,
 }: {
   nodeId?: string;
   nodeLabel?: string;
@@ -316,6 +319,24 @@ export function NodeBadge({
    * health dot are identical in both forms (the project header shrink-wraps).
    */
   fillCell?: boolean;
+  /**
+   * #4464: `false` renders the chip as a plain span — no tap target, no Node
+   * Health modal, and no " — node health" suffix on its title or aria-label —
+   * for use inside another control (the "+ Add" modal's node radio rows).
+   */
+  interactive?: boolean;
+  /**
+   * #4468 Task 2 (added by #4464, the first lander): `false` skips the ~30 s
+   * resource-health poll, for a node without a health aggregator (federation
+   * disabled, or a spoke with role `node`), which would only answer 503.
+   */
+  resourceHealth?: boolean;
+  /**
+   * #4468 Task 2 (added by #4464): render `nodeLabel` as given, skipping the
+   * client re-casing. Pass it for the UI host node: its label has no URL to
+   * classify, and the server has already applied the casing rule.
+   */
+  labelAsReceived?: boolean;
 }): React.ReactElement | null {
   // Hook before the early return (rules-of-hooks); the modal mounts only while
   // open, so a closed badge in a long list carries no data/mutation hooks.
@@ -326,7 +347,9 @@ export function NodeBadge({
   // top of the aggregate already polled elsewhere (enabled: Boolean(api)). These
   // hooks sit ABOVE the `!nodeId` early return for rules-of-hooks.
   const { api } = useAppContext();
-  const health = useFederationHealthNodes(nodeId ? api : null);
+  const health = useFederationHealthNodes(
+    nodeId && resourceHealth ? api : null
+  );
   const { nodes, isError } = health;
   // #4538: the ids to rank against (live list, else the remembered one).
   const knownNodeIds = useKnownNodeIds(health);
@@ -335,7 +358,10 @@ export function NodeBadge({
   // System-wide casing rule (epic #3285 round 11): local machines UPPER CASE,
   // cloud VMs lower case. The server normalizes labels at their entry points;
   // this is the client-side safety net for a stale peer's label.
-  const casedLabel = displayNodeLabel(nodeLabel ?? nodeId, { url: nodeUrl });
+  const casedLabel =
+    labelAsReceived && nodeLabel
+      ? nodeLabel
+      : displayNodeLabel(nodeLabel ?? nodeId, { url: nodeUrl });
   // 6 chars max: the E8 cell holds "5 characters, centered"; our 51px cell with
   // its 4px + 10px (dot pocket) padding fits six 6px mono glyphs.
   const display = casedLabel.slice(0, 6);
@@ -404,7 +430,8 @@ export function NodeBadge({
     healthStyle = { backgroundColor: severityToColor(worst) };
   }
 
-  const title = `${casedLabel} (${healthLabel}) — node health`;
+  const baseTitle = `${casedLabel} (${healthLabel})`;
+  const title = `${baseTitle} — node health`;
   const stop = (e: React.SyntheticEvent) => e.stopPropagation();
 
   const badge = (
@@ -428,6 +455,19 @@ export function NodeBadge({
       />
     </span>
   );
+
+  if (!interactive) {
+    return (
+      <span
+        className={`inline-flex ${fillCell ? "w-full" : ""}`}
+        title={baseTitle}
+        aria-label={baseTitle}
+        data-testid="node-badge-static"
+      >
+        {badge}
+      </span>
+    );
+  }
 
   return (
     <>
@@ -462,6 +502,7 @@ export function NodeBadge({
           nodeLabel={nodeLabel}
           nodeUrl={nodeUrl}
           nodeStatus={nodeStatus}
+          labelAsReceived={labelAsReceived}
           open={healthOpen}
           onOpenChange={setHealthOpen}
         />

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { z } from "zod";
+import { trimChars } from "./trimChars";
 
 /**
  * Create-page Branch control contract (hapimatic-private#4481).
@@ -236,9 +237,11 @@ export function validateBranchName(raw: string): string | null {
  * a byte-for-byte mirror of `toSlug` in `cli/src/daemon/worktree.ts`.
  */
 export function slugBranchName(raw: string): string {
-  return raw
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  return trimChars(
+    raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-"),
+    "-"
+  );
 }

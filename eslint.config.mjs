@@ -2,6 +2,7 @@ import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 import eslintConfigPrettier from "eslint-config-prettier";
 import reactHooks from "eslint-plugin-react-hooks";
+import regexp from "eslint-plugin-regexp";
 import requireDialogDescriptionPolicy from "./scripts/eslint-rules/require-dialog-description-policy.mjs";
 import noUncatalogedRoute from "./scripts/eslint-rules/no-uncataloged-route.mjs";
 
@@ -51,6 +52,75 @@ export default tseslint.config(
       "no-control-regex": "warn",
       // Upstream regex escaping
       "no-useless-escape": "warn",
+    },
+  },
+  {
+    // Super-linear regexes block the single-threaded server for seconds on a
+    // long input (a `/\/+$/` trim took 13 s on 100 000 chars). CodeQL raised
+    // nine of them on the public core as js/polynomial-redos (2026-10-18);
+    // `shared/src/trimChars.ts` is the linear replacement for the trailing-
+    // run case. Errors, not warnings, so a new one fails the PR.
+    files: [
+      "web/src/**/*.{ts,tsx}",
+      "server/src/**/*.{ts,tsx}",
+      "cli/src/**/*.{ts,tsx}",
+      "shared/**/*.{ts,tsx}",
+      "gateway/src/**/*.{ts,tsx}",
+      "scripts/**/*.ts",
+    ],
+    // A test's regexes run over its own fixtures, so they are not an attack
+    // surface (and trimChars.test.ts deliberately uses the slow forms as the
+    // oracle it compares against).
+    ignores: ["**/*.test.{ts,tsx}"],
+    plugins: { regexp },
+    rules: {
+      "regexp/no-super-linear-move": "error",
+      "regexp/no-super-linear-backtracking": "error",
+    },
+  },
+  {
+    // GRANDFATHERED: the 32 files that already violated the two rules when
+    // they were introduced. Each site reads bounded or operator-controlled
+    // input (verified 2026-10-18). Downgraded to `warn` so the rule can ship
+    // as an error everywhere else; fix a file and REMOVE it from this list —
+    // never add to it. Drain-down tracked in hapimatic-private#5441.
+    files: [
+      "cli/src/agent/projection/agentPlugins.ts",
+      "cli/src/agent/projection/provenance.ts",
+      "cli/src/claude/utils/rateLimitDetector.ts",
+      "cli/src/commands/securityFailClosed.ts",
+      "cli/src/commands/securitySeams.ts",
+      "cli/src/companion/privateSshd.ts",
+      "cli/src/daemon/sessionCapacity.ts",
+      "cli/src/daemon/systemdInvariants.ts",
+      "cli/src/daemon/worktree.ts",
+      "gateway/src/lib/instanceClass.ts",
+      "scripts/check-design-catalog-completeness.ts",
+      "scripts/check-icon-col-registry.ts",
+      "scripts/check-settings-scroll.ts",
+      "scripts/generate-sbom-v1.ts",
+      "scripts/generate-support-docs-bundle-v1.ts",
+      "server/src/accounts/usageService.ts",
+      "server/src/porter/hookRegistrationValidator.ts",
+      "server/src/porter/tarArchive.ts",
+      "server/src/provisioner/jobModel.ts",
+      "server/src/provisioner/jobRunner.ts",
+      "server/src/provisioner/logMasking.ts",
+      "server/src/services/anthropicOauthLoginClient.ts",
+      "server/src/systemJobs/osCronReader.ts",
+      "server/src/utils/slashCommands.ts",
+      "server/src/web/routes/cli.ts",
+      "server/src/web/routes/impactArtifact.ts",
+      "shared/src/companion.ts",
+      "shared/src/mcpListParse.ts",
+      "shared/src/messages.ts",
+      "web/src/chat/messagePreview.ts",
+      "web/src/components/vms/JobLogViewer.tsx",
+      "web/src/lib/gitParsers.ts",
+    ],
+    rules: {
+      "regexp/no-super-linear-move": "warn",
+      "regexp/no-super-linear-backtracking": "warn",
     },
   },
   {

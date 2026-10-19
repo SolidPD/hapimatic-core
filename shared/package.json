@@ -49,6 +49,7 @@
     "./systemJobs": "./src/systemJobs.ts",
     "./tenantMode": "./src/tenantMode.ts",
     "./tokenUsageAggregation": "./src/tokenUsageAggregation.ts",
+    "./trimChars": "./src/trimChars.ts",
     "./types": "./src/types.ts",
     "./usage": "./src/usage.ts",
     "./workflowPhases": "./src/workflowPhases.ts",

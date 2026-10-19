@@ -20,6 +20,7 @@ import {
   type CompanionPairRequestCreate,
   type CompanionPairRequestCreated,
 } from "@hapi/protocol/companion";
+import { trimTrailingChars } from "@hapi/protocol/trimChars";
 
 export type ServerUrlCheck =
   | { ok: true; url: string }
@@ -41,7 +42,7 @@ export async function checkServerUrl(
   } catch {
     return { ok: false, message: `Not a URL: ${raw}` };
   }
-  const base = `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
+  const base = `${url.protocol}//${url.host}${trimTrailingChars(url.pathname, "/")}`;
   if (url.protocol === "https:") return { ok: true, url: base };
   if (url.protocol !== "http:") {
     return { ok: false, message: "--server must be an http(s) URL" };

@@ -7,13 +7,18 @@
 // server early-return spawn route share ONE definition. Re-exported here for
 // backward-compat so existing `@/utils/id` importers are unaffected.
 export { generateSessionId } from "@hapi/protocol";
+import { randomBase36 } from "@hapi/protocol";
 
 /**
  * Generate a short unique ID
- * Format: <random 8 chars>
+ * Format: <random 8 chars of [0-9a-z]>
+ *
+ * Names the per-spawn temp files under `os.tmpdir()` (including the 0600 env
+ * file that carries tokens), so it draws from the CSPRNG like
+ * `generateSessionId` rather than `Math.random()`.
  */
 export function generateShortId(): string {
-  return Math.random().toString(36).slice(2, 10);
+  return randomBase36(8);
 }
 
 /** Branch-namespace prefix for Hapimatic-minted worktree branches (epic rp1-home#914). */

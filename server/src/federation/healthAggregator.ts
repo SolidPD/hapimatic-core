@@ -29,6 +29,7 @@ import {
   type JobRegistry,
 } from "@hapi/protocol";
 import type { SystemHealthMetrics } from "../metrics/systemHealth";
+import { trimTrailingChars } from "@hapi/protocol/trimChars";
 
 // ─── Severity algebra ────────────────────────────────────────
 
@@ -460,7 +461,7 @@ export class HealthAggregator {
   }
 
   private metricsUrl(base: string): string {
-    return `${base.replace(/\/+$/, "")}/api/federation/node-metrics`;
+    return `${trimTrailingChars(base, "/")}/api/federation/node-metrics`;
   }
 
   private getEntry(nodeId: string, nodeLabel: string): NodeCacheEntry {

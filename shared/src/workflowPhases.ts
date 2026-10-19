@@ -98,7 +98,11 @@ export const WORKFLOW_PHASES: readonly WorkflowPhase[] = Object.freeze([
  * Idempotent and safe on checkpoint labels (which have no ellipsis).
  */
 export function normalizeLockLabel(label: string): string {
-  return label.replace(/\s*\.{3}\s*$/, "").trim();
+  // Same result as `/\s*\.{3}\s*$/` (`\s` and `trim()` strip the identical
+  // character set), without that regex's quadratic backtracking on trailing
+  // whitespace (CodeQL js/polynomial-redos, hapimatic-core #9).
+  const end = label.trimEnd();
+  return (end.endsWith("...") ? end.slice(0, -3) : end).trim();
 }
 
 /**

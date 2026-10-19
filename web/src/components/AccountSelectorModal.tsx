@@ -58,7 +58,7 @@ import {
 } from "@/lib/accountFilter";
 import { AccountUsageCard } from "@/components/AccountUsage/AccountUsageCard";
 import { AccountSelectorEmptyState } from "@/components/AccountSelectorEmptyState";
-import { AddAccountWizard } from "@/components/AddAccountWizard";
+import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
 import { useVisualViewportHeight } from "@/hooks/useVisualViewportHeight";
 import { useAccounts } from "@/hooks/queries/useAccounts";
 import { useAccountActions } from "@/hooks/mutations/useAccountActions";
@@ -70,7 +70,11 @@ import { queryKeys } from "@/lib/query-keys";
 import { formatRelativeTime } from "@/lib/sessionHelpers";
 import type { ApiClient } from "@/api/client";
 import type { RedactedAccount } from "@/types/api";
-import type { AccountUsage, ProviderId } from "@hapi/protocol";
+import {
+  LOCAL_NODE_ID,
+  type AccountUsage,
+  type ProviderId,
+} from "@hapi/protocol";
 import type { RedactedApiKey } from "@hapi/protocol/schemas";
 import { API_KEY_STATUS_META, apiKeyDisplayName } from "@/lib/apiKeyStatus";
 
@@ -144,6 +148,11 @@ export type AccountSelectorModalProps = {
    * which the server would refuse anyway.
    */
   apiKeysDisabledReason?: string;
+  /**
+   * Issue #4464: the node an add should store the login on, for the spawn and
+   * stage scopes (the per-node scope uses `nodeId`). Absent ⇒ the UI host.
+   */
+  addTargetNodeId?: string;
 };
 
 /**
@@ -266,6 +275,7 @@ export function AccountSelectorModal({
   selectedApiKeyId,
   onSelectApiKey,
   apiKeysDisabledReason,
+  addTargetNodeId,
 }: AccountSelectorModalProps) {
   const { accounts: allAccounts, isLoading, error } = useAccounts(api, isOpen);
 
@@ -499,6 +509,29 @@ export function AccountSelectorModal({
   const [showHelp, setShowHelp] = useState(false);
   // Issue #1263: in-app web OAuth login wizard ("Add account").
   const [showAddWizard, setShowAddWizard] = useState(false);
+  // Issue #4464: the "+ Add" modal opens on the add target node. A Gemini add
+  // writes the UI host's key vault only (no key sync until #1996), so the
+  // selector offers no add entry for a Gemini target on another node — the key
+  // would land on the wrong node.
+  const addNodeId = scope === "per-node" ? nodeId : addTargetNodeId;
+  const { data: federationNodes } = useQuery({
+    queryKey: queryKeys.federationNodes,
+    queryFn: async () => {
+      if (!api) throw new Error("API unavailable");
+      return await api.getFederationNodes();
+    },
+    enabled: Boolean(api && isOpen && addNodeId),
+    staleTime: 60000,
+    retry: 1,
+  });
+  const addTargetIsUiHost =
+    !addNodeId ||
+    addNodeId === LOCAL_NODE_ID ||
+    addNodeId === federationNodes?.localNode?.nodeId;
+  const openAdd =
+    targetProvider === "google" && !addTargetIsUiHost
+      ? undefined
+      : () => setShowAddWizard(true);
 
   // Master expand/collapse-all for the account cards — mirrors the
   // account-usage page's header chevron. Each card owns its expanded state
@@ -618,7 +651,7 @@ export function AccountSelectorModal({
           showHelp
           onShowHelp={() => setShowHelp(true)}
           onHideHelp={() => setShowHelp(false)}
-          onAddAccount={() => setShowAddWizard(true)}
+          onAddAccount={openAdd}
         />
       );
     }
@@ -644,7 +677,7 @@ export function AccountSelectorModal({
             showHelp={false}
             onShowHelp={() => setShowHelp(true)}
             onHideHelp={() => setShowHelp(false)}
-            onAddAccount={() => setShowAddWizard(true)}
+            onAddAccount={openAdd}
           />
           {apiKeySection}
         </>
@@ -962,7 +995,7 @@ export function AccountSelectorModal({
           {renderBody()}
           {/* Cancel — the explicit dismiss now that the header ✕ is gone (the
               expand/collapse chevron took its corner). Tap-outside and ESC
-              still close too. Hidden while the Add-account wizard overlay is up
+              still close too. Hidden while the "+ Add" modal overlay is up
               (its own Dialog owns dismissal then). */}
           {!showAddWizard && (
             <div className="mt-3 flex shrink-0 items-center gap-2 border-t border-[var(--app-border)] pt-3">
@@ -975,17 +1008,17 @@ export function AccountSelectorModal({
                 Cancel
               </Button>
               {/* #3465: compact "Add account" convenience trigger, populated
-                  branch only (hasCards). Reuses the already-mounted wizard
-                  (setShowAddWizard) — no second wizard. The empty state has its
-                  own CTA, so this is gated OUT of it (R5). data-testid because
+                  branch only (hasCards). Reuses the already-mounted "+ Add" modal
+                  (setShowAddWizard) — no second modal. The empty state has its
+                  own CTA, so this is gated OUT of it (R5). Hidden for a Gemini target on another node (#4464). data-testid because
                   the wizard's submit button shares the visible label. */}
-              {hasCards && (
+              {hasCards && openAdd && (
                 <Button
                   type="button"
                   size="sm"
                   className="shrink-0"
                   data-testid="account-selector-add-account"
-                  onClick={() => setShowAddWizard(true)}
+                  onClick={openAdd}
                 >
                   Add account
                 </Button>
@@ -1021,17 +1054,18 @@ export function AccountSelectorModal({
         isPending={false}
       />
 
-      {/* Issue #1263: in-app web OAuth login. On success the accounts query is
-          invalidated (useAccountLogin), so the new account APPEARS in the list
-          regardless of onAdded. #3465: onAdded additionally force-refreshes the
-          usage envelope (mirroring #3452's AddAccountSection) so the new
-          account's card shows LIVE meters instead of the synthesized degraded
-          envelope (:177-190). Fires for a login started from EITHER the
-          empty-state CTA or the populated-footer trigger — one shared mount. */}
-      <AddAccountWizard
+      {/* Issue #4464: the unified "+ Add" modal, opened on the add target node
+          with the selector's provider (it used to be the Anthropic-only
+          wizard, whatever the provider). The accounts query is invalidated on
+          success, so a new account APPEARS in the list; onAdded additionally
+          force-refreshes the usage envelope (#3465) so its card shows live
+          meters. A key added here also refreshes the selector's key list. */}
+      <AddToProviderModal
         isOpen={showAddWizard}
         onClose={() => setShowAddWizard(false)}
         api={api}
+        provider={targetProvider}
+        initialNodeId={addTargetIsUiHost ? undefined : addNodeId}
         onAdded={() => {
           void refreshUsage();
         }}

@@ -46,9 +46,9 @@ import type { WebAppEnv } from "./auth";
  *   wording is the same for every method (see `unavailableMessage`, #5405).
  * - 404 session-not-found for an id the hub has not cached → 503
  *   `node_offline` (nodeId null) ONLY while the hub, just started, has not
- *   finished its first poll of every static peer
- *   (`NodeRegistry.isAwaitingInitialPoll`). After that, an unknown id is a
- *   plain 404 again.
+ *   yet polled every static peer successfully, bounded by
+ *   `HUB_RESTART_GRACE_MS` (`NodeRegistry.isAwaitingInitialPoll`). After that,
+ *   an unknown id is a plain 404 again.
  *
  * `findNodeForSession()` is deliberately unchanged: it is an "is remote"
  * predicate (autoRecoveryService, autoSwitchOnRateLimit, sessionService,
@@ -314,8 +314,9 @@ export function createRemoteSessionAvailabilityGuard(
       if (!engine) return; // the hub's own 503 "Not connected" is not a node problem
       if (!before) {
         // An id the hub has never cached for a peer passes through — unless the
-        // hub has just started and has not finished its first poll of every
-        // static peer, when a peer's live session reads as unknown too.
+        // hub has just started and has not yet polled every static peer
+        // successfully (bounded by `HUB_RESTART_GRACE_MS`), when a peer's live
+        // session reads as unknown too.
         if (status !== 404) return;
         const registry = deps.getNodeRegistry();
         if (!registry?.isAwaitingInitialPoll()) return;

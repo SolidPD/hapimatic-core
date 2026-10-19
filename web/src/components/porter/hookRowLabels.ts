@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { trimTrailingChars } from "@hapi/protocol";
+
 /**
  * The label of each hook row in the import selection tree (#4331).
  *
@@ -18,7 +20,7 @@ export function hookRowLabels(
   hookIds: readonly string[],
   claudeDir: string
 ): Map<string, string> {
-  const root = claudeDir.replace(/\/+$/, "");
+  const root = trimTrailingChars(claudeDir, "/");
   const rel = (id: string): string =>
     root.length > 0 && id.startsWith(`${root}/`)
       ? id.slice(root.length + 1)

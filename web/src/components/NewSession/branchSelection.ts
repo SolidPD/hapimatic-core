@@ -8,6 +8,7 @@ import {
   type GitCurrentRef,
 } from "@hapi/protocol/gitBranches";
 import type { SessionMode, SessionType } from "./types";
+import { trimTrailingChars } from "@hapi/protocol";
 
 /**
  * hapimatic-private#4481 — the Create-page Branch control's pure model.
@@ -118,7 +119,7 @@ export function currentRefLabel(current: GitCurrentRef | null): string | null {
 
 /** Last path segment of a directory, for compact copy (`~/projects/x` → `x`). */
 export function directoryLabel(directory: string): string {
-  const trimmed = directory.trim().replace(/\/+$/, "");
+  const trimmed = trimTrailingChars(directory.trim(), "/");
   const last = trimmed.split("/").pop();
   return last || trimmed || "this directory";
 }

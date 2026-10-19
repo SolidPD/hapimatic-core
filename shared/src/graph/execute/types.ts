@@ -21,6 +21,7 @@
  * lives in the runtime module and is not re-exported web-side.
  */
 import type { ConstructKind, GraphNode } from "../ir";
+import { trimTrailingChars } from "../../trimChars";
 import type {
   CompiledNode,
   CompiledWorkflow,
@@ -142,12 +143,12 @@ export function buildRunDir(
   runId: string,
   instanceSegment: string
 ): string {
-  const root = runsRoot.replace(/\/+$/, "");
+  const root = trimTrailingChars(runsRoot, "/");
   // #3684: replace NTFS-illegal chars in a single path segment with `__` and
   // strip a trailing dot/space. Applied to `runId`/`instanceSegment` only — a
   // segment never contains `/`, so this cannot alter the directory nesting.
   const safeSegment = (s: string): string =>
-    s.replace(/[:<>"|?*]/g, "__").replace(/[. ]+$/, "");
+    trimTrailingChars(s.replace(/[:<>"|?*]/g, "__"), ". ");
   return `${root}/${safeSegment(runId)}/${safeSegment(instanceSegment)}`;
 }
 

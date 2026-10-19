@@ -13,7 +13,7 @@ import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import { configuration } from "@/configuration";
 import { API_KEY_PROVIDERS } from "@hapi/protocol/schemas";
-import { DOMAIN_SLUGS } from "@hapi/protocol";
+import { DOMAIN_SLUGS, trimTrailingChars } from "@hapi/protocol";
 
 // Constants for image fetching
 const IMAGE_FETCH_TIMEOUT_MS = 10000; // 10 seconds
@@ -275,7 +275,7 @@ function markUntrustedCatalog(body: unknown): unknown {
  */
 export function createCapabilityTools(deps: CapabilityToolDeps) {
   const doFetch: FetchLike = deps.fetchFn ?? ((url, init) => fetch(url, init));
-  const base = deps.serverUrl.replace(/\/+$/, "");
+  const base = trimTrailingChars(deps.serverUrl, "/");
 
   let cachedJwt: string | null = null;
   let jwtExpiresAtMs = 0;

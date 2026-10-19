@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { MAX_CONCURRENCY_DEFAULT } from "@hapi/protocol/schemas";
+import { trimTrailingChars } from "@hapi/protocol/trimChars";
 import {
   instanceSliceFor,
   resolveSessionSliceConfig,
@@ -260,7 +261,7 @@ export function resolveSessionSliceLimit(
         ? process.getuid()
         : null;
   if (uid === null) return NO_SESSION_SLICE;
-  const root = (deps.cgroupRoot ?? DEFAULT_CGROUP_ROOT).replace(/\/+$/, "");
+  const root = trimTrailingChars(deps.cgroupRoot ?? DEFAULT_CGROUP_ROOT, "/");
   const read = deps.readText ?? readTextOrNull;
   // The daemon's tmux socket — the same default as `configuration.tmuxSessionName`
   // (cli/src/configuration.ts); importing configuration here would drag the daemon's

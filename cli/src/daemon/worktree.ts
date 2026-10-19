@@ -18,7 +18,7 @@ import {
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { WorktreeMetaSchema } from "@hapi/protocol";
+import { WorktreeMetaSchema, trimChars } from "@hapi/protocol";
 import type { ExistingBranch } from "@hapi/protocol/gitBranches";
 
 import { logger } from "@/ui/logger";
@@ -706,10 +706,10 @@ export async function probeSourceRepoHead(
 }
 
 function toSlug(value: string): string {
-  const cleaned = value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  const cleaned = trimChars(
+    value.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+    "-"
+  );
   return cleaned;
 }
 

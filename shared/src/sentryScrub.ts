@@ -338,13 +338,16 @@ export function scrubTranscriptValue(
  * are redacted unconditionally, unknown names get token-shape scrubbing.
  * See #1058 R2.
  */
+/** Base synthesized for relative inputs so `new URL()` can parse them (RFC 2606 reserved TLD). */
+const SYNTHETIC_RELATIVE_BASE = "http://internal.invalid";
+
 export function scrubUrl(input: string): string {
   if (typeof input !== "string") return input;
   let url: URL;
+  // URL constructor needs an absolute URL — synthesize a base for relative paths.
+  const isAbsolute = /^[a-z][a-z0-9+.-]*:/i.test(input);
   try {
-    // URL constructor needs an absolute URL — synthesize a base for relative paths.
-    const isAbsolute = /^[a-z][a-z0-9+.-]*:/i.test(input);
-    url = new URL(input, isAbsolute ? undefined : "http://internal.invalid");
+    url = new URL(input, isAbsolute ? undefined : SYNTHETIC_RELATIVE_BASE);
   } catch {
     // Fall back to regex scrub for malformed URLs.
     return scrubString(input);
@@ -389,9 +392,12 @@ export function scrubUrl(input: string): string {
     .toString()
     .replace(/%5BREDACTED%5D/g, "[REDACTED]")
     .replace(/%5BJWT-REDACTED%5D/g, "[JWT-REDACTED]");
-  // Strip the synthesized base when input was relative.
-  if (out.startsWith("http://internal.invalid")) {
-    out = out.slice("http://internal.invalid".length);
+  // Strip the synthesized base ONLY when the input was relative. A prefix test
+  // alone would also truncate an absolute URL whose host merely starts with
+  // the base (`http://internal.invalid.example/…`) — CodeQL
+  // js/incomplete-url-substring-sanitization, hapimatic-core #20.
+  if (!isAbsolute && out.startsWith(SYNTHETIC_RELATIVE_BASE)) {
+    out = out.slice(SYNTHETIC_RELATIVE_BASE.length);
   }
   return out;
 }
