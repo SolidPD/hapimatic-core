@@ -275,7 +275,7 @@ function GoogleUsageCounter(props: { usage: ProviderAccountUsage }) {
   const spend = usage.tokenSpend;
   return (
     <div
-      className="rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2"
+      className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
       data-testid="google-usage-counter"
     >
       <div className="mb-1 flex items-center justify-between gap-2">
@@ -303,7 +303,7 @@ function GoogleUsageCounter(props: { usage: ProviderAccountUsage }) {
 function DegradedNodeRow(props: { nodeLabel: string }) {
   return (
     <div
-      className="rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2"
+      className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
       data-testid="provider-node-unreachable"
     >
       <p className="text-[length:var(--text-body)] text-[var(--toast-warning)]">
@@ -383,7 +383,7 @@ function OpenAiSectionBody(props: {
             {node.openai.map((row, i) => (
               <div
                 key={`${node.nodeId}:${row.source}:${row.accountUuid ?? i}`}
-                className="rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2"
+                className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
                 data-testid="openai-login-row"
               >
                 <div className="mb-1 flex items-center justify-between gap-2">
@@ -476,7 +476,7 @@ function GeminiSectionBody(props: {
           <div key={node.nodeId} className="flex flex-col gap-2">
             {g && (
               <div
-                className="rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2"
+                className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
                 data-testid="gemini-node-row"
               >
                 <div className="mb-1 flex items-center justify-between gap-2">
@@ -945,7 +945,7 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
-        className="relative flex-1 overflow-y-auto"
+        className="relative flex-1 overflow-y-auto bg-[var(--app-deepest-bg)]"
         data-testid="account-usage-page"
       >
         {/* Pull-to-refresh indicator (R8) */}
@@ -973,7 +973,7 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
             the chevron only appear when there are accounts to sort/expand. The
             Sort control is the SAME dropdown implementation as the session
             list's sort (ui/menuPrimitives, issue #2133 + unification). */}
-        <div className="sticky top-0 z-10 bg-[var(--app-bg)]">
+        <div className="sticky top-0 z-10 bg-[var(--app-deepest-bg)]">
           <div className="mx-auto flex w-full max-w-content items-center gap-1 px-3 py-2">
             <Button
               variant="ghost"

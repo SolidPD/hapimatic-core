@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * Un-pinned spawn utilization veto + healthy-account fallback (issue #3023).
+ * Un-pinned spawn account resolution: utilization-aware pick + healthy-account fallback
+ * (issues #3023, #5460).
  *
  * An un-pinned session spawn (no `--account`, so no `HAPI_ACCOUNT_UUID`) binds the
- * host machine's default Claude login. Nothing on the daemon spawn path checked that
- * account's utilization, so the daemon could silently bind an account at 100% weekly /
- * Fable — or one being actively rate-limited — producing a session that spawns
- * "successfully" and then dies on its first turn ("You've hit your weekly limit …"),
- * dead on arrival.
+ * host machine's default Claude login. Before #3023 nothing on the daemon spawn path
+ * looked at that account's utilization, so the daemon silently bound an account at 100%
+ * weekly — or one being rate-limited — even when a healthier account was available.
+ * #3023 made the spawn prefer a healthy account and log every decision. #5460 removed its
+ * refusal: when no account is healthy, the host-default is bound anyway (logged loudly),
+ * because creating a session never needs usage and the user can switch its account later.
  *
  * This module is the pure decision core for the veto. It is deliberately I/O-free:
  * callers inject a `readSnapshot` reader (backed by the daemon's cached utilization
@@ -32,11 +34,16 @@
  *
  *   - `ok` + a fresh numeric score `< HARD_LOCK_SCORE` → **healthy** (auto-selectable; the
  *     score is the tiebreak AMONG `ok` accounts).
- *   - `ok` + score `>= HARD_LOCK_SCORE` (a 5-hour/weekly window at cap) → **exhausted** → refuse.
- *   - `terminal` (401/403 — credential-dead) → **refuse**.
- *   - `rate_limited` (persistent 429) → **deprioritised**: prefer any healthy account; bind it
- *     only as a loud, logged LAST RESORT when no healthy account exists (it is bindable, just
- *     never the preferred auto-pick).
+ *   - `ok` + score `>= HARD_LOCK_SCORE` (a 5-hour/weekly window at cap) → **exhausted**.
+ *   - `terminal` (401/403 from the usage probe) → **refused**.
+ *   - `rate_limited` (persistent 429) → **deprioritised**.
+ *
+ * An unhealthy host-default (exhausted / refused / deprioritised) is never the auto-pick:
+ * the spawn falls back to the healthiest account. When no healthy account exists, the
+ * host-default is bound anyway as a loud, logged LAST RESORT. The resolver NEVER refuses a
+ * spawn (#5460): usage never blocks creating a session, because the user can switch a live
+ * session's account; and a `terminal` sample reads the store's advisory token copy, which can
+ * be stale. A genuinely dead login still surfaces as an auth error on the session's first turn.
  *   - `unknown` (timeout / 5xx / empty / malformed / no cached snapshot / stale) → **pass
  *     through**: the utilization is genuinely undetermined, so do NOT coerce it into a veto or
  *     a health signal. A `null` score NEVER reaches a `<`/`>=` comparison here (the numeric
@@ -129,9 +136,9 @@ export type SnapshotReader = (
 /** How a snapshot classifies for UN-PINNED SELECTION (the preference axis). */
 export type SelectionClass =
   | "healthy" // ok + fresh numeric score below the hard lock — auto-selectable
-  | "exhausted" // ok + fresh numeric score at/above the hard lock — refuse
-  | "deprioritised" // rate_limited — bindable last-resort, never the auto-pick
-  | "refused" // terminal (401/403) — credential-dead, never bound for un-pinned
+  | "exhausted" // ok + fresh numeric score at/above the hard lock — never auto-picked; bound only as a last resort
+  | "deprioritised" // rate_limited — never auto-picked; bound only as a last resort
+  | "refused" // terminal (401/403 probe) — never auto-picked; bound only as a last resort
   | "unknown"; // stale / no snapshot / status unknown — pass through
 
 /** A snapshot is FRESH when it exists and was taken within the freshness window. */
@@ -176,14 +183,21 @@ export interface SelectHealthyOptions {
   freshnessMs?: number;
   /** Exclude this UUID from consideration (e.g. the deprioritised host-default itself). */
   excludeUuid?: string | null;
+  /**
+   * #5460: skip an account whose store record is flagged `unrefreshable` (its login is
+   * dead). Its access token can still answer the usage probe with an `ok` snapshot for a
+   * while, but token injection refuses to bind it, so picking it would fail the spawn.
+   */
+  isUnrefreshable?: (accountUuid: string) => boolean;
 }
 
 /**
  * Pick the healthiest bindable account: the `healthy` account (status `ok`, fresh numeric
  * score below the hard lock) with the LOWEST score. Returns `null` when none qualifies.
  * Only `healthy` accounts are candidates — `deprioritised` / `refused` / `exhausted` /
- * `unknown` are never chosen (a positive whitelist, never a status blacklist). Ties on
- * score break by first-seen order (stable) for determinism under test.
+ * `unknown` are never chosen (a positive whitelist, never a status blacklist), and neither
+ * is an account `isUnrefreshable` flags. Ties on score break by first-seen order (stable)
+ * for determinism under test.
  */
 export function selectHealthyAccount(
   accountUuids: readonly string[],
@@ -194,6 +208,7 @@ export function selectHealthyAccount(
   let best: { uuid: string; score: number } | null = null;
   for (const uuid of accountUuids) {
     if (opts.excludeUuid && uuid === opts.excludeUuid) continue;
+    if (opts.isUnrefreshable?.(uuid)) continue;
     const snap = readSnapshot(uuid);
     if (classifyForSelection(snap, opts.now, freshnessMs) !== "healthy")
       continue;
@@ -214,22 +229,21 @@ export type UnpinnedDecision =
   | "unknown-utilization" // host-default's utilization is stale/undetermined — pass through
   | "fallback" // host-default exhausted/deprioritised/refused → rebind to a healthy account
   | "degraded-last-resort" // host-default rate-limited, no healthy account → bind it LOUDLY as a last resort
-  | "no-healthy-account"; // host-default exhausted/refused, no healthy account → loud failure
+  | "exhausted-last-resort" // host-default at its usage cap, no healthy account → bind it anyway (#5460: usage never blocks a spawn)
+  | "rejected-last-resort"; // host-default probe answered 401/403, no healthy account → bind it anyway (#5460: a stale store-token sample must not block a spawn)
 
 export interface UnpinnedResolution {
   /**
    * The UUID to bind. `null` means "leave the incoming binding unchanged" — either the
-   * spawn was already pinned/respawn, the host-default is being kept (pass-through /
-   * healthy / last-resort), or the veto refused. A non-null value is a rebind — either a
-   * FALLBACK (host-default unhealthy) or an #3611 `optimal-pick` (opt-in ON, a healthier
-   * account scores strictly lower than a healthy host-default).
+   * spawn was already pinned/respawn, or the host-default is being kept (pass-through /
+   * healthy / last-resort). A non-null value is a rebind — either a FALLBACK (host-default
+   * unhealthy) or an #3611 `optimal-pick` (opt-in ON, a healthier account scores strictly
+   * lower than a healthy host-default). The resolver never refuses a spawn (#5460).
    */
   accountUuid: string | null;
   decision: UnpinnedDecision;
   /** Human-readable rationale for the spawn-time observability log (R2 / AC2). */
   reason: string;
-  /** Set ONLY on `no-healthy-account`: the loud failure the caller must surface (R1). */
-  loudError?: { code: string; message: string };
 }
 
 export interface ResolveUnpinnedOpts {
@@ -254,7 +268,7 @@ export interface ResolveUnpinnedOpts {
   /**
    * #3611: the un-pinned optimal-account-selection opt-in, resolved server-side
    * from the `autoSelectOptimalAccount` preference mirror and delivered on the
-   * spawn RPC. Absent/false ⇒ NO pick — behavior is byte-identical to #3023 (R3).
+   * spawn RPC. Absent/false ⇒ NO optimal pick (R3).
    */
   autoSelectOptimalAccount?: boolean;
   /**
@@ -270,9 +284,10 @@ export interface ResolveUnpinnedOpts {
    */
   isFreshLocalSpawn?: boolean;
   /**
-   * #3611 R8: the `unrefreshable` exclusion predicate (injected so the resolver
-   * stays I/O-free). Consulted ONLY inside the optimal-pick branch — never the
-   * opt-in-OFF fallback — so opt-in-OFF resolution is byte-identical to #3023 (R3).
+   * #3611 R8 / #5460: the `unrefreshable` exclusion predicate (injected so the resolver
+   * stays I/O-free). Consulted by the optimal-pick branch AND by the unhealthy-host
+   * fallback (step 6), so neither ever binds an account whose login is dead. The caller
+   * builds it only when one of those branches can run; absent ⇒ no account is excluded.
    */
   isUnrefreshable?: (accountUuid: string) => boolean;
 }
@@ -405,7 +420,7 @@ export function resolveUnpinnedSpawnAccount(
   }
 
   // 6. exhausted / refused / deprioritised → the host-default is not an auto-pick.
-  //    Prefer any healthy account.
+  //    Prefer any healthy account whose login is not dead (#5460).
   const fallback = selectHealthyAccount(
     opts.candidateUuids,
     opts.readSnapshot,
@@ -413,6 +428,7 @@ export function resolveUnpinnedSpawnAccount(
       now: opts.now,
       freshnessMs,
       excludeUuid: opts.hostDefaultUuid,
+      isUnrefreshable: opts.isUnrefreshable,
     }
   );
   if (fallback) {
@@ -423,10 +439,9 @@ export function resolveUnpinnedSpawnAccount(
     };
   }
 
-  // 7. No healthy account exists. A `rate_limited` (deprioritised) host-default is still
-  //    BINDABLE — bind it as a LOUD, logged last resort (transient; may clear). An
-  //    `exhausted` (ok+cap) or `refused` (terminal) host-default is definitively DOA →
-  //    fail LOUDLY (R1: never a SILENT dead-on-arrival bind).
+  // 7. No healthy account exists. Bind the host-default anyway as a LOUD, logged last
+  //    resort — never refuse the spawn (#5460). Each case keeps its own decision so the
+  //    spawn-time log says why the host-default was kept.
   if (klass === "deprioritised") {
     return {
       accountUuid: null, // keep the host-default binding
@@ -434,13 +449,17 @@ export function resolveUnpinnedSpawnAccount(
       reason: `host-default ${opts.hostDefaultUuid} is rate-limited and no healthy account is available — binding it as a LAST RESORT (transient; may clear). Pin --account to override.`,
     };
   }
+  if (klass === "exhausted") {
+    return {
+      accountUuid: null, // keep the host-default binding
+      decision: "exhausted-last-resort",
+      reason: `host-default ${opts.hostDefaultUuid} is at its usage cap (status=${snap?.status}, score=${snap?.score ?? "null"}) and no healthy account is available — binding it anyway; usage never blocks a spawn (#5460). Switch the session's account if it hits the limit.`,
+    };
+  }
+  const refused: "refused" = klass;
   return {
-    accountUuid: null,
-    decision: "no-healthy-account",
-    reason: `host-default ${opts.hostDefaultUuid} is ${klass} (status=${snap?.status}, score=${snap?.score ?? "null"}) and no healthy account is available — refusing the spawn`,
-    loudError: {
-      code: "account_exhausted",
-      message: `Un-pinned spawn refused: the host-default account (${opts.hostDefaultUuid}) is ${klass} (utilization status=${snap?.status}, score=${snap?.score ?? "null"}) and no other account is healthy enough to bind. Pin a specific --account, or wait for a weekly window to reset. (issue #3023)`,
-    },
+    accountUuid: null, // keep the host-default binding
+    decision: "rejected-last-resort",
+    reason: `host-default ${opts.hostDefaultUuid} answered the usage probe with 401/403 (status=${snap?.status}, class=${refused}) and no healthy account is available — binding it anyway (#5460): the probe reads the store's advisory token copy, so it can be stale. If the login is really dead the session reports an auth error; re-login or switch its account.`,
   };
 }

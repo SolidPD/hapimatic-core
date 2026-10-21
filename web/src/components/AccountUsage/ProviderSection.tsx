@@ -22,8 +22,10 @@ type ProviderSectionProps = {
  * (a local `useState`), so the three collapse independently (R1). Presentational
  * and self-contained; the caller supplies the section body.
  *
- * Styling mirrors `AddAccountSection` (design tokens only, no hardcoded hex — the
- * new-file design-token ratchet) so the sections read as one system.
+ * Styling uses design tokens only (no hardcoded hex — the new-file design-token
+ * ratchet). D2 layering (#4465): the section paints `--app-bg`, one step above
+ * the page's `--app-deepest-bg` and one step below the `--app-secondary-bg`
+ * account / key cards and inner rows it holds, so the three layers read apart.
  */
 export function ProviderSection({
   title,
@@ -36,7 +38,7 @@ export function ProviderSection({
   return (
     <section
       data-testid={testId}
-      className="mt-2 overflow-hidden rounded-[13px] border border-[var(--app-border)] bg-[var(--app-secondary-bg)]" /* design-tokens-allow: 13px card radius — matches AddAccountSection (no --radius token maps to 13px) */
+      className="mt-2 overflow-hidden rounded-[13px] border border-[var(--app-border)] bg-[var(--app-bg)]" /* design-tokens-allow: 13px card radius — matches AddAccountSection (no --radius token maps to 13px) */
     >
       <div className="flex items-center gap-2 px-3.5 py-2">
         <Button

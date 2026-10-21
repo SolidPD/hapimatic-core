@@ -69,7 +69,10 @@ import {
 } from "./tmuxSpawnAdapter";
 import { readHostDefaultAccountUuid } from "@/utils/claudeCredentials";
 import { accountStore } from "@/accounts/accountStore";
-import { resolveUnpinnedSpawnAccount } from "@/accounts/selectHealthyAccount";
+import {
+  classifyForSelection,
+  resolveUnpinnedSpawnAccount,
+} from "@/accounts/selectHealthyAccount";
 import { generateSessionId } from "@/utils/id";
 import { TmuxManager } from "@/tmux";
 import { globalEnvNamesOrNull } from "@/tmux/TmuxManager";
@@ -253,8 +256,7 @@ export function createSessionSpawner(
     // codex, "google" for gemini, "anthropic" otherwise (claude + opencode — opencode
     // binds no per-account provider record, so it stays in the pre-#3808 Anthropic
     // veto path unchanged). A codex/gemini spawn must NEVER route through the Anthropic
-    // health veto (NEW-3808-16: it would refuse the spawn or rebind it to an Anthropic
-    // account). [ER 2026-09-19: 3808-4] [ER 2026-09-19: NEW-3808-16]
+    // health veto (NEW-3808-16: it would rebind the spawn to an Anthropic account). [ER 2026-09-19: 3808-4] [ER 2026-09-19: NEW-3808-16]
     const agent = options.agent ?? "claude";
     const spawnProvider: ProviderId =
       agent === "codex"
@@ -330,8 +332,8 @@ export function createSessionSpawner(
 
     // #3808 (NEW-3808-16): the EFFECTIVE bound account. The Anthropic un-pinned
     // veto below runs ONLY for an Anthropic spawn (claude / opencode). A codex or
-    // gemini spawn skips it entirely — it must never be refused for "no healthy
-    // Anthropic account" nor rebound to one; it binds the pinned provider account
+    // gemini spawn skips it entirely — Anthropic utilization never applies to it and
+    // it is never rebound to an Anthropic account; it binds the pinned provider account
     // (Task 4/4b add the provider node-default / first-record fallback).
     let accountUuid: string | undefined;
     if (apiKeyBinding) {
@@ -365,9 +367,11 @@ export function createSessionSpawner(
       // the daemon controlServer `/spawn-session` bypass both land here — and
       // `requestedAccountUuid` is definitively empty for an un-pinned spawn. Before an
       // un-pinned spawn binds the (possibly exhausted) host-default account, resolve
-      // against the cached utilization: bind a healthy account instead, or fail loudly —
-      // never a silent dead-on-arrival bind. Pinned spawns and respawns/resumes are
-      // exempt (a rebind would break `--resume` per-account CLAUDE_CONFIG_DIR isolation).
+      // against the cached utilization: bind a healthy account instead, or — when none is
+      // healthy — keep the host-default and log it loudly. The resolver never refuses a
+      // spawn (#5460): usage never blocks creating a session. Pinned spawns and
+      // respawns/resumes are exempt (a rebind would break `--resume` per-account
+      // CLAUDE_CONFIG_DIR isolation).
       // Pure decision core in `selectHealthyAccount.ts`; utilization is sampled per-tick
       // by `tokenRefreshService` (via `utilizationSampler`) into the account-store cache.
       // #3808 (R7): the un-pinned veto is Anthropic-only today — restrict the
@@ -391,14 +395,30 @@ export function createSessionSpawner(
         !originatingNodeId &&
         !parentSessionId &&
         !parentRelationship;
-      // Issue #3611 R8: build the `unrefreshable` exclusion set ONLY when the pick
-      // could actually fire (opt-in ON + fresh local spawn), so the opt-in-OFF path
-      // does ZERO extra store reads and stays byte-identical to #3023 (R3). An
-      // unrefreshable account can briefly present a stale `ok` snapshot, so the
-      // daemon honors R8's store flag explicitly rather than relying on its coarse
-      // status axis alone.
+      // Issue #3611 R8 / #5460: build the `unrefreshable` exclusion set ONLY when a
+      // branch that consults it can run — the optimal pick (opt-in ON + fresh local
+      // spawn) or the unhealthy-host fallback (an un-pinned, non-respawn spawn whose
+      // host-default snapshot is exhausted / rate-limited / terminal). A healthy or
+      // unknown host-default still does ZERO extra store reads. An unrefreshable
+      // account can briefly present a stale `ok` snapshot, so the daemon honors the
+      // store flag explicitly rather than relying on its coarse status axis alone.
+      const now = Date.now();
+      const hostClass =
+        hostDefaultAccountUuid && !requestedAccountUuid && !resumeSessionId
+          ? classifyForSelection(
+              accountStore.getUtilizationSnapshot(hostDefaultAccountUuid),
+              now
+            )
+          : null;
+      const hostNeedsFallback =
+        hostClass !== null &&
+        hostClass !== "healthy" &&
+        hostClass !== "unknown";
       let unrefreshableUuids = new Set<string>();
-      if (autoSelectOptimalAccount && isFreshLocalSpawn) {
+      if (
+        (autoSelectOptimalAccount && isFreshLocalSpawn) ||
+        hostNeedsFallback
+      ) {
         const flags = await Promise.all(
           candidateUuids.map(uuid =>
             accountStore
@@ -427,33 +447,29 @@ export function createSessionSpawner(
         hostDefaultUuid: hostDefaultAccountUuid,
         candidateUuids,
         readSnapshot: uuid => accountStore.getUtilizationSnapshot(uuid),
-        now: Date.now(),
-        // #3611: the opt-in pick + its R7 whitelist + R8 unrefreshable predicate.
+        now,
+        // #3611: the opt-in pick + its R7 whitelist; #3611 R8 / #5460: the unrefreshable
+        // predicate, consulted by the optimal pick and the unhealthy-host fallback.
         autoSelectOptimalAccount,
         isFreshLocalSpawn,
         isUnrefreshable: uuid => unrefreshableUuids.has(uuid),
       });
       // R2/AC2: the chosen account + utilization status is ALWAYS observable at spawn
       // (no silent UNCHECKED pass-through) — logged for every un-pinned resolution. A
-      // `degraded-last-resort` bind (rate-limited host-default, no healthy account) is
-      // logged LOUDLY (warn) so it is never a silent DOA bind.
+      // last-resort bind (host-default rate-limited, at its usage cap, or answering the
+      // probe with 401/403, and no healthy account) is logged LOUDLY (warn) so it is
+      // never silent. The resolver never refuses the spawn (#5460).
       {
         const line = `[DAEMON RUN] Un-pinned spawn account resolution (#3023): decision=${unpinnedResolution.decision} — ${unpinnedResolution.reason}`;
-        if (unpinnedResolution.decision === "degraded-last-resort") {
+        const lastResort =
+          unpinnedResolution.decision === "degraded-last-resort" ||
+          unpinnedResolution.decision === "exhausted-last-resort" ||
+          unpinnedResolution.decision === "rejected-last-resort";
+        if (lastResort) {
           logger.warn(line);
         } else {
           logger.info(line);
         }
-      }
-      if (unpinnedResolution.loudError) {
-        // R1: host-default exhausted/terminal and no healthy account — refuse LOUDLY
-        // rather than bind a session that would die on its first turn. Surfaces as a
-        // spawn error.
-        return {
-          type: "error",
-          errorMessage: unpinnedResolution.loudError.message,
-          code: unpinnedResolution.loudError.code,
-        };
       }
       // The EFFECTIVE account: the veto's healthy-fallback UUID when it rebound, else the
       // originally-requested account (or empty for an un-pinned pass-through). Every

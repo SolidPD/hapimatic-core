@@ -47,6 +47,13 @@
     var(--app-banner-bg)
   );
   --app-secondary-bg: #2c2c2e; /* panel/surface bg */
+  /* Deepest page layer — D2 (#4465); the brand guide's "deepest" charcoal.
+     Accounts page only: page #161618 → provider section --app-bg → card
+     --app-secondary-bg. Consumed as an arbitrary value (no @theme inline, no
+     tokens.ts accessor), like the other --app-* surfaces. Dark-only: #2114 adds
+     the light value in its :root[data-theme="light"] block, and #2112 lists this
+     token in THEMEABLE_VARS. */
+  --app-deepest-bg: #161618;
 
   /* Interactive states */
   /* subtle elevated bg for hover + static "muted gray" surfaces */

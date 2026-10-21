@@ -116,6 +116,7 @@ CSS custom properties in `tokens.css`, exposed to Tailwind via `@theme inline`.
 | `--app-fg` (`--app-text`)                         | Primary text                                  | `#ffffff`                                                                             |
 | `--app-hint` (`--app-muted`)                      | Muted / secondary text                        | `#8e8e93`                                                                             |
 | `--app-secondary-bg` (`--app-surface`)            | Panel / surface background                    | `#2c2c2e`                                                                             |
+| `--app-deepest-bg`                                | Deepest page layer (Accounts page, D2 #4465)  | `#161618`                                                                             |
 | `--app-hover` (`--app-bg-hover`)                  | Subtle elevated hover surface                 | `rgba(255,255,255,0.08)`                                                              |
 | `--app-button` / `--app-button-text`              | Button surface / label                        | `#ffffff` / `#111827`                                                                 |
 | `--app-banner-bg` / `--app-banner-text`           | Banner surface / text                         | `#3a3a3c` / `#ffffff`                                                                 |

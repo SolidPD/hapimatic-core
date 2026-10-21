@@ -201,7 +201,7 @@ export function ApiKeysSection() {
                 return (
                   <li
                     key={k.id}
-                    className="flex items-center gap-3 rounded-md border border-[var(--app-border)] px-3 py-2.5"
+                    className="flex items-center gap-3 rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2.5"
                     data-testid={`api-key-row-${k.id}`}
                   >
                     <div className="flex min-w-0 flex-1 flex-col">
@@ -213,7 +213,7 @@ export function ApiKeysSection() {
                             conversational flow carries descriptor.source. */}
                         {k.descriptor?.source === "conversational" ? (
                           <span
-                            className="flex-shrink-0 rounded-sm bg-[var(--app-secondary-bg)] px-1.5 py-0.5 text-[length:var(--text-caption-xs)] font-normal text-[var(--app-hint)]"
+                            className="flex-shrink-0 rounded-sm bg-[var(--app-hover)] px-1.5 py-0.5 text-[length:var(--text-caption-xs)] font-normal text-[var(--app-hint)]"
                             title="Registered conversationally via chat"
                             data-testid={`api-key-via-chat-${k.id}`}
                           >
@@ -243,7 +243,7 @@ export function ApiKeysSection() {
                       type="button"
                       onClick={() => validate.mutate(k.id)}
                       disabled={validate.isPending}
-                      className="h-auto shrink-0 px-2.5 py-1 text-[length:var(--text-body-dense)] text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)]"
+                      className="h-auto shrink-0 px-2.5 py-1 text-[length:var(--text-body-dense)] text-[var(--app-fg)]"
                       data-testid={`api-key-validate-${k.id}`}
                     >
                       {isValidating ? "Validating…" : "Validate"}
@@ -254,7 +254,7 @@ export function ApiKeysSection() {
                       type="button"
                       onClick={() => setPendingDelete(k)}
                       aria-label={`Remove ${k.provider} key`}
-                      className="shrink-0 rounded-md hover:bg-[var(--app-secondary-bg)]"
+                      className="shrink-0 rounded-md"
                       data-testid={`api-key-remove-${k.id}`}
                     >
                       <Trash2 className="h-4 w-4" />
