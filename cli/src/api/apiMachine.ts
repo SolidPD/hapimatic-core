@@ -33,6 +33,7 @@ import {
   setArchiveTag,
 } from "../daemon/tmuxSpawnAdapter";
 import {
+  cleanupIdleWorktree,
   cleanupWorktreeAndBranch,
   isWithinWorktreeBase,
   listSoftDeletedWorktrees,
@@ -57,6 +58,8 @@ import {
   RENAME_TMUX_WINDOW_META,
   SET_ARCHIVE_TAG_META,
   CLEANUP_WORKTREE_META,
+  CLEANUP_IDLE_WORKTREE_META,
+  cleanupIdleWorktreeInput,
   GET_SESSION_CLAUDE_ID_META,
   HAS_CLAUDE_CONVERSATION_META,
   RECOVER_WORKTREE_META,
@@ -445,6 +448,8 @@ export class ApiMachineClient {
           // hapimatic-private#4481: existing-branch worktree (#1262 trap — an
           // un-listed field is silently dropped on this field-by-field hop).
           existingBranch,
+          // hapimatic-private#4370: explicit worktree base branch (#1262 trap).
+          sourceBranch,
           resumeSessionId,
           hapiSessionId,
           name,
@@ -508,6 +513,8 @@ export class ApiMachineClient {
           // hapimatic-private#4481: existing-branch worktree (#1262 trap — an
           // un-listed field is silently dropped on this field-by-field hop).
           existingBranch,
+          // hapimatic-private#4370: explicit worktree base branch (#1262 trap).
+          sourceBranch,
           resumeSessionId,
           hapiSessionId,
           name,
@@ -587,6 +594,10 @@ export class ApiMachineClient {
               sessionId: result.sessionId,
               ...(result.resolvedName
                 ? { resolvedName: result.resolvedName }
+                : {}),
+              // Issue #5202 (U2): forward the downgrade reason (#1262 trap).
+              ...(result.sessionTypeDowngrade
+                ? { sessionTypeDowngrade: result.sessionTypeDowngrade }
                 : {}),
             };
           case "requestToApproveDirectoryCreation":
@@ -774,6 +785,38 @@ export class ApiMachineClient {
         };
       },
       CLEANUP_WORKTREE_META
+    );
+
+    // #4450: the guarded removal behind the operator `remove_worktree` tool. Its
+    // own method (not a flag on cleanup-worktree), so an older daemon never
+    // registers it: the server's call fails as `daemon_unavailable` rather than
+    // running the unguarded cleanup. The server derives every field from its
+    // own session records.
+    this.rpcHandlerManager.registerHandler(
+      "cleanup-idle-worktree",
+      async (params: unknown) => {
+        const parsed = cleanupIdleWorktreeInput.safeParse(params ?? {});
+        if (!parsed.success) {
+          const issue = parsed.error.issues[0];
+          return {
+            success: false,
+            message: `invalid_request: ${issue?.path.join(".") || "params"} ${issue?.message ?? "is invalid"}`,
+          };
+        }
+        const result = await cleanupIdleWorktree(parsed.data);
+        logger.debug(
+          `[API MACHINE] cleanup-idle-worktree ${parsed.data.worktreePath}: ${result.ok ? "moved" : result.code}`
+        );
+        return result.ok
+          ? {
+              success: true,
+              message: `Worktree moved to ${result.holdingPath}`,
+              holdingPath: result.holdingPath,
+              keptBranch: result.keptBranch,
+            }
+          : { success: false, message: `${result.code}: ${result.error}` };
+      },
+      CLEANUP_IDLE_WORKTREE_META
     );
 
     // Handler for looking up claudeSessionId from the daemon's persisted session store

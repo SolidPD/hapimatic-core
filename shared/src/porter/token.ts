@@ -62,4 +62,9 @@ export interface PorterTokenStatus<Plan = unknown> {
   fetchCount: number;
   /** Present once `state === "received"`: the staged import plan for review. */
   plan?: Plan;
+  /**
+   * #5202 (U14): present instead of `plan` when the archive was staged but its
+   * review could not be built. The detail is in the server log only.
+   */
+  planError?: string;
 }

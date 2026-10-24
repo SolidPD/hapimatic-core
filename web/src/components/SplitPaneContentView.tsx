@@ -92,8 +92,9 @@ function SplitPaneNewSession(props: {
       }
 
       if (!sessionId) {
+        // Issue #2150: an in-progress notice, not a success (see router.tsx).
         showToast("Session is being created on the remote node…", {
-          type: "success",
+          type: "info",
         });
         onBack();
         return;

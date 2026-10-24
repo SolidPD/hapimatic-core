@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   LOCAL_NODE_ID,
   type AccountHealthEntry,
   type NodeAccountHealth,
   type OpenAiAuthState,
 } from "@hapi/protocol";
-import { ApiError, type ApiClient } from "@/api/client";
+import { ApiError, NetworkError, type ApiClient } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { ChevronIcon } from "@/components/icons";
 import { NodeBadge } from "@/components/NodeBadge";
@@ -20,6 +20,7 @@ import {
 import { useOpenAiLogin } from "@/hooks/mutations/useOpenAiLogin";
 import { useAccountHealth } from "@/hooks/queries/useAccountHealth";
 import { useProviderAuthState } from "@/hooks/queries/useProviderAuthState";
+import { useFederationHealthAvailable } from "@/hooks/queries/useFederationHealthAvailable";
 import { queryKeys } from "@/lib/query-keys";
 import {
   IN_VM_SIGN_IN_REQUIRED,
@@ -51,7 +52,11 @@ export const NOT_AN_AUTHORIZATION_CODE_HINT =
 /** Issue #4349: a failed check that should not end the wait (rate limit, server error, network). */
 export function isTransientCheckError(err: unknown): boolean {
   if (err instanceof ApiError) return err.status === 429 || err.status >= 500;
-  return !(err instanceof Error) || err.name === "TypeError";
+  return (
+    !(err instanceof Error) ||
+    err instanceof NetworkError || // #5409: ApiClient tags fetch failures
+    err.name === "TypeError"
+  );
 }
 
 function errCode(err: unknown): string | undefined {
@@ -141,26 +146,6 @@ export function useLoginNodes(
     error: health.error,
     refetch: health.refetch,
   };
-}
-
-/** `GET /api/federation/nodes`, shared by the add modal's two readers. */
-export function useFederationNodesInfo(api: ApiClient | null) {
-  return useQuery({
-    queryKey: queryKeys.federationNodes,
-    queryFn: async () => {
-      if (!api) throw new Error("API unavailable");
-      return await api.getFederationNodes();
-    },
-    enabled: Boolean(api),
-    staleTime: 60000,
-    retry: 1,
-  });
-}
-
-/** The federation read the NodeBadge resource-health switch needs (#4468 Task 2). */
-function useResourceHealthEnabled(api: ApiClient | null): boolean {
-  const { data } = useFederationNodesInfo(api);
-  return Boolean(data?.enabled && data.role !== "node");
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,7 +1212,7 @@ export function NodeLoginList(props: {
   anthropic?: AnthropicStep;
   openai?: OpenAiStep;
 }) {
-  const resourceHealth = useResourceHealthEnabled(props.api);
+  const resourceHealth = useFederationHealthAvailable(props.api);
   const compact = useIsCompact();
   const selected =
     props.nodes.find(n => n.nodeId === props.selectedNodeId) ?? null;

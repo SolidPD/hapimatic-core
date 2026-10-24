@@ -3096,7 +3096,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     },
     "description": "Preview a cloud-VM deprovision as a read-only dry run, returning the masked transcript and a single-use confirmation token bound to the exact previewed teardown.",
     "domain": "harness-admin",
-    "example": "{\"subdomain\":\"ms2\",\"email\":\"ops@example.com\"}",
+    "example": "{\"subdomain\":\"ms2\",\"email\":\"ops@example.com\",\"serviceEnd\":\"2026-10-31\"}",
     "id": "harness-admin.api-admin-vms-deprovision-dry-run",
     "invocation": {
       "kind": "rest",
@@ -4068,6 +4068,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the hub changes a system job on a specific peer node, including removing it."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Report whether this instance is an operator instance that shows the feedback inbox; a non-operator instance answers 404.",
+    "domain": "harness-admin",
+    "id": "harness-admin.feedback-preflight",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/feedback/preflight"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When deciding whether to show the feedback viewer on this instance."
   },
   {
     "auth": "jwt",
@@ -5441,6 +5461,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Move an idle, owner-verified git worktree to .trash; refuses a live, claimed or protected one.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.cleanup-idle-worktree",
+    "invocation": {
+      "kind": "rpc",
+      "method": "cleanup-idle-worktree"
+    },
+    "probe": "safe",
+    "riskTier": "destructive",
+    "surface": "rpc",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To remove a spawned peer's idle worktree (operator tool)."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Remove a session's tmux window and store entry after deletion. Irreversible.",
     "domain": "machine-daemon",
     "id": "machine-daemon.cleanup-tmux-session",
@@ -6142,6 +6181,27 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "To reap a session's dead launcher tmux window."
   },
   {
+    "auth": "jwt",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Move the idle worktree of a session you spawned to .trash (recoverable); operator hosts only.",
+    "domain": "machine-daemon",
+    "example": "{\"worktreePath\":\"/home/matt/projects/app/.worktrees/peer-1\"}",
+    "id": "machine-daemon.remove-idle-worktree",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/machines/:machineId/worktrees/remove"
+    },
+    "probe": "safe",
+    "riskTier": "destructive",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To remove a spawned peer's idle worktree (remove_worktree)."
+  },
+  {
     "auth": "cli-token",
     "availability": {
       "scope": "operator"
@@ -6297,6 +6357,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When toggling an MCP server for a session whose process lives on a remote federation node."
   },
   {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Archive (disconnect) a live peer session you are finished with; its record stays.",
+    "domain": "mcp",
+    "id": "mcp.archive-session",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "archive_session"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To archive peers."
+  },
+  {
     "auth": "jwt",
     "availability": {
       "scope": "user"
@@ -6341,7 +6420,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Invoke a catalogued REST capability by METHOD+path through the tier-gated generic invoker.",
+    "description": "Invoke a catalogued REST capability by METHOD+path (+ optional query object) through the tier-gated generic invoker.",
     "domain": "mcp",
     "id": "mcp.capabilities-call",
     "invocation": {
@@ -6420,7 +6499,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Invoke a catalogued REST capability by method+path through the tier-gated generic invoker.",
+    "description": "Create a scheduled task that runs a prompt on a cron, interval, or one-shot timer; bypass-mode sessions only.",
+    "domain": "mcp",
+    "id": "mcp.create-schedule",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "create_schedule"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To schedule work."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Invoke a catalogued REST capability by method+path (+ optional query object) through the tier-gated generic invoker.",
     "domain": "mcp",
     "id": "mcp.hapi-call",
     "invocation": {
@@ -6452,6 +6550,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To look up one domain's capabilities."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List the sessions in this namespace with their ids, state, and metadata.",
+    "domain": "mcp",
+    "id": "mcp.list-sessions",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "list_sessions"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To list sessions."
   },
   {
     "auth": "jwt",
@@ -6494,6 +6611,82 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When the user re-checks MCP health."
   },
   {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read a session's message history page by page through the tier-gated invoker.",
+    "domain": "mcp",
+    "id": "mcp.read-session-messages",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "read_session_messages"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To read messages."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Move the idle worktree of a session you spawned to .trash (recoverable); operator hosts only.",
+    "domain": "mcp",
+    "id": "mcp.remove-worktree",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "remove_worktree"
+    },
+    "probe": "safe",
+    "riskTier": "destructive",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To remove a spawned peer's idle worktree."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Approve or deny another session's pending permission request; bypass-mode sessions only, never your own.",
+    "domain": "mcp",
+    "id": "mcp.respond-to-permission",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "respond_to_permission"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To grant or deny."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Send a message to a peer session, stamped as sent by this session, through the tier-gated invoker.",
+    "domain": "mcp",
+    "id": "mcp.send-message",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "send_message"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To message peers."
+  },
+  {
     "auth": "jwt",
     "availability": {
       "scope": "user"
@@ -6534,6 +6727,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When the user sets several MCP servers on a session at once."
   },
   {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Spawn a peer session on a machine (sessionType worktree creates a git worktree) through the tier-gated invoker.",
+    "domain": "mcp",
+    "id": "mcp.spawn-session",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "spawn_session"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To spawn a peer."
+  },
+  {
     "auth": "jwt",
     "availability": {
       "scope": "user"
@@ -6570,6 +6782,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To turn an MCP server on or off mid-session (remote mode)."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Update a scheduled task's timing, prompt, or enablement; bypass-mode sessions only.",
+    "domain": "mcp",
+    "id": "mcp.update-schedule",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "update_schedule"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To reschedule."
   },
   {
     "auth": "federation-token",
@@ -8155,6 +8386,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "To read a session's messages via `hapi api sessions messages`."
   },
   {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Block until a session reaches a named state, or a timeout of at most 25 s.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-sessions-wait-until",
+    "invocation": {
+      "command": "api sessions wait-until",
+      "kind": "cli"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "cli",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To wait for a peer session via `hapi api sessions wait-until` instead of polling it."
+  },
+  {
     "auth": "jwt",
     "availability": {
       "scope": "user"
@@ -8690,6 +8940,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When discovering what capabilities a session exposes before invoking one."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Block until a session reaches a named state (idle, busy, blocked, rate-limited, completed, errored) or 25 s pass, then return matched or timeout with its current state.",
+    "domain": "session-introspection",
+    "id": "session-introspection.session-wait-until",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/sessions/:id/wait-until/:state"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When waiting for a peer session to finish or change state instead of polling it. Wait busy then idle after sending work."
   },
   {
     "auth": "jwt",
@@ -10022,7 +10292,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "List this node's PM spawn-roster rows, optionally filtered by PM session id and status.",
+    "description": "List this node's PM spawn-roster rows for one PM session (pmSessionId query parameter, required), optionally filtered by status.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.list-spawn-roster",
     "invocation": {

@@ -5,7 +5,8 @@
  * out of `importArchive.ts` (#3553, #2077 max-lines): the atomic dest-dir write,
  * the R6 rollback restore, their record/DI-seam types, `importFileMode` (whose
  * result the commit loop passes to `atomicWriteFile`), and `settingsWriteMode`
- * (the settings.json merge write's mode, #4130). `importArchive.ts`
+ * (the settings.json merge write's mode, #4130; `writeMergedSettings` uses it
+ * for a regular file or an outside-root link, #4281). `importArchive.ts`
  * newly exports `RestoreFileOps` (module-private before the split) so the type
  * of the `CommitImportOptions.restoreFileOps` seam is nameable from there.
  *
@@ -35,6 +36,7 @@ import {
   SymlinkedSettingsError,
   type SymlinkedSettingsReason,
 } from "./importArchiveErrors";
+import type { SettingsLinkState } from "@hapi/protocol/porter";
 
 /**
  * The fs ops {@link restoreBackups} uses to undo a partial commit — a test-only
@@ -140,13 +142,9 @@ export function settleMcpTouched(
   for (const p of paths) markTouched(backups, [p], wrote.includes(p));
 }
 
-/** What the `settings.json` link resolves to (#4146); see {@link classifySettingsLink}. */
-export type SettingsLinkState =
-  | "inside"
-  | "outside"
-  | "dangling"
-  | "loop"
-  | "not-regular";
+/** What the `settings.json` link resolves to (#4146); see {@link classifySettingsLink}.
+ * One shared source with the web (#4288), re-exported for existing importers. */
+export type { SettingsLinkState };
 
 export interface SettingsLink {
   /** The link's `readlink` string — echoed by the 409 and matched by the acknowledge. */
@@ -240,7 +238,8 @@ export async function writeMergedSettings(
   //  - an acknowledged link → still that link (same `readlink`). Where it
   //    resolves now does not matter, because it is replaced, never written
   //    through. So a dangling link whose target the commit just created (a file
-  //    item) is still replaced as acknowledged.
+  //    item) is still replaced as acknowledged — and at 0o600, because its mode
+  //    comes from the check-time state below, not from that created file (#4281).
   const now = await classifySettingsLink(root, settingsPath);
   const unchanged = !expected
     ? now === undefined
@@ -269,7 +268,13 @@ export async function writeMergedSettings(
     return;
   }
   if (record) record.touched = true;
-  await write(settingsPath, content, await settingsWriteMode(settingsPath));
+  // #4281 (O1 = B): a link that was dangling, looping or not a regular file when
+  // checked commits at 0o600; only an outside-root regular target keeps its mode.
+  const mode =
+    expected && expected.state !== "outside"
+      ? SETTINGS_CREATE_MODE
+      : await settingsWriteMode(settingsPath);
+  await write(settingsPath, content, mode);
 }
 
 /**
@@ -303,13 +308,18 @@ const SETTINGS_CREATE_MODE = 0o600;
  *    `copyFile` can restore over it (a 0o400 file fails that copy with EACCES).
  *    Reusing the archive mask here is deliberate (#4130 D1): the same owner
  *    floor is what keeps the rollback copy writable.
- *  - No prior file (ENOENT, including a dangling symlink) or a mode that
- *    cannot be read (ELOOP, EACCES, EIO): 0o600 — the file can hold `env`
- *    tokens and `apiKeyHelper`, so an unknown prior mode fails closed (#4130 D3).
- *  - A link to something that is not a regular file (a directory or FIFO; the
- *    acknowledged #4146 replacement): 0o600 as well. It has no settings-file
- *    mode to keep, and a directory's 0o755 would commit the file
- *    group/other-readable and executable.
+ *  - No prior file (ENOENT) or a mode that cannot be read (ELOOP, EACCES,
+ *    EIO): 0o600 — the file can hold `env` tokens and `apiKeyHelper`, so an
+ *    unknown prior mode fails closed (#4130 D3).
+ *  - A path that is not a regular file (a directory or FIFO): 0o600 as well. It
+ *    has no settings-file mode to keep, and a directory's 0o755 would commit
+ *    the file group/other-readable and executable.
+ *
+ * `writeMergedSettings` calls this only for a `settings.json` with no link, or
+ * one linked to a regular file outside the root when checked. A link that was
+ * dangling, looping or not a regular file when checked is committed at 0o600
+ * without calling this, whatever it resolves to at write time, since a file
+ * item of the same import may have created its target (#4281).
  */
 export async function settingsWriteMode(settingsPath: string): Promise<number> {
   try {
@@ -325,8 +335,9 @@ export async function settingsWriteMode(settingsPath: string): Promise<number> {
  * With `mode`, the TMP file is chmod'ed before the rename (#3553) — umask-
  * independent, and the live path never exists in an intermediate mode. Without
  * `mode` no chmod runs and the umask default applies — every commit write passes
- * one: file items `importFileMode`, the settings.json merge `settingsWriteMode`
- * (#4130). With `mode`, the tmp file is also CREATED owner-only (0o600) before
+ * one: file items `importFileMode`, the settings.json merge the mode
+ * `writeMergedSettings` chooses (`settingsWriteMode`, or 0o600 for an
+ * acknowledged link that was not a regular file when checked; #4130, #4281). With `mode`, the tmp file is also CREATED owner-only (0o600) before
  * that chmod (#4130), so secret-bearing content (settings.json `env` tokens,
  * `apiKeyHelper`) is never briefly group/other-readable at the umask default —
  * the same create-owner-only convention as mcpImport's tmp write.

@@ -12,14 +12,16 @@ import {
   type BulkToastAction,
 } from "@/lib/bulkSessionToast";
 import { useBulkSessionAction } from "@/hooks/mutations/useBulkSessionAction";
+import { useSendToSelected } from "@/hooks/mutations/useSendToSelected";
 import { BulkActionConfirm, type BulkConfirmCopy } from "./BulkActionConfirm";
+import { SendToSelectedDialog } from "./SendToSelectedDialog";
 
 /**
  * Select-Mode Chip Row (#3292, epic #3285 S7) — the ephemeral bulk-action bar that
  * appears below the Control Bar while Select Mode is active. Plain clickable text
  * (no pills/bubbles), right-justified, minimal height (taxonomy `.chiprow`):
  *
- *   All · None · Connect · Disconnect · Stop turn · Delete
+ *   All · None · Connect · Disconnect · Stop turn · Delete · Send
  *   (Stop turn in the warning tone, Delete red)
  *
  * The retired global Connect/Disconnect-All + Delete-All-Disconnected toolbar
@@ -36,9 +38,13 @@ import { BulkActionConfirm, type BulkConfirmCopy } from "./BulkActionConfirm";
  *   connected, so we stay in Select Mode.
  * - **Delete** is "disconnect and delete": the connected selection is disconnected
  *   first and ONLY the sessions that are disconnected afterwards are deleted.
+ * - **Send** (#3818) delivers one prompt to every selected session: sent now to
+ *   an idle one, queued to a mid-turn one, skipped for a disconnected one
+ *   (`useSendToSelected`). Ids are stable, so we stay in Select Mode.
  *
- * Stop turn, Disconnect and Delete confirm through `BulkActionConfirm` — one step
- * for one session, two for more (#3815 R3). Every action reports through ONE
+ * Stop turn, Disconnect, Delete and Send confirm through `BulkActionConfirm` —
+ * one step for one session, two for more (#3815 R3); Send opens its own dialog
+ * (`SendToSelectedDialog`) around it, carrying the prompt field. Every action reports through ONE
  * per-session summary toast (`summarizeBulkSessionResult`).
  */
 type SelectModeChipRowProps = {
@@ -112,8 +118,10 @@ export function SelectModeChipRow({
   const queryClient = useQueryClient();
   const { showToast } = useToast();
   const { runBulkAction } = useBulkSessionAction(api);
+  const { sendToSelected } = useSendToSelected(api);
   const [isPending, setIsPending] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmKind | null>(null);
+  const [sendOpen, setSendOpen] = useState(false);
 
   const selected = useMemo(
     () => sessions.filter(s => selectedIds.has(s.id)),
@@ -243,6 +251,20 @@ export function SelectModeChipRow({
     }
   };
 
+  const handleSend = async (text: string) => {
+    if (!api || selected.length === 0 || text.length === 0) return;
+    setIsPending(true);
+    try {
+      // Exactly the filtered selection — a session the filter hides is never sent to.
+      const results = await sendToSelected(selected, text);
+      onRefresh();
+      report("send", results);
+    } finally {
+      setIsPending(false);
+      // Ids are stable — stay in Select Mode.
+    }
+  };
+
   const hasSelection = selected.length > 0;
   const someConnected = connectedSelected.length > 0;
 
@@ -335,7 +357,9 @@ export function SelectModeChipRow({
   })();
 
   return (
-    <div className="flex items-center justify-end gap-4 px-3.5 py-0.5 bg-[var(--app-bg)] border-b border-[var(--app-divider)]">
+    // Seven chips overflow a 375 px phone (#3818 Task 1 step 6, measured), so the
+    // row wraps onto a second line rather than hiding a chip.
+    <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-0.5 px-3.5 py-0.5 bg-[var(--app-bg)] border-b border-[var(--app-divider)]">
       <Chip label="All" onClick={() => onSelectAll(sessions.map(s => s.id))} />
       {/* Enabled for ANY selected id, including ones the filter hides — otherwise
           they could not be cleared and would reappear selected (#3815-16). */}
@@ -366,6 +390,22 @@ export function SelectModeChipRow({
         onClick={() => setConfirm("delete")}
         disabled={!hasSelection || isPending}
       />
+      <Chip
+        label="Send"
+        onClick={() => setSendOpen(true)}
+        disabled={!hasSelection || isPending}
+      />
+
+      {sendOpen ? (
+        <SendToSelectedDialog
+          isOpen
+          onClose={() => setSendOpen(false)}
+          targets={selected}
+          note={hiddenNote}
+          onSend={handleSend}
+          isPending={isPending}
+        />
+      ) : null}
 
       {confirmProps ? (
         <BulkActionConfirm

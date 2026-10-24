@@ -25,6 +25,8 @@ import type { ErrorLogger } from "../../../logging/errorLogger";
 import { cataloged } from "../../../capabilities/cataloged";
 import { resolveRepoIdentity } from "../../../utils/repoIdentity";
 import { logAndJson } from "../../../web/routes/routeErrorHelper";
+import { refuseAgentEscalation } from "../../../web/routes/agentEscalation";
+import type { SyncEngine } from "../../../sync/syncEngine";
 
 const scheduleKindSchema = z.enum(["at", "every", "cron"]);
 const overlapPolicySchema = z.enum(["skip", "queue", "allow"]);
@@ -103,9 +105,16 @@ const updateScheduleSchema = z.object({
 
 export function createSchedulesRoutes(
   getSchedulerService: () => SchedulerService | null,
-  options?: { errorLogger?: ErrorLogger | null }
+  options?: {
+    errorLogger?: ErrorLogger | null;
+    /** #3842 R8: resolves the `X-Hapi-Session-Id` caller for the agent-
+     *  escalation floor on create/update. Absent → a stamped caller is refused
+     *  (fail closed); an unstamped request is unaffected. */
+    getSyncEngine?: () => SyncEngine | null;
+  }
 ): Hono<WebAppEnv> {
   const errorLogger = options?.errorLogger ?? null;
+  const getSyncEngine = options?.getSyncEngine ?? (() => null);
   const app = new Hono<WebAppEnv>();
 
   function requireService(c: {
@@ -174,6 +183,12 @@ export function createSchedulesRoutes(
     async c => {
       const service = requireService(c);
       if (service instanceof Response) return service;
+
+      // #3842 R8 (ruling NEW-3842-1 = b): scheduled sessions always run in the
+      // bypass mode, so a non-bypass agent session cannot write a schedule
+      // through the capability channel. Checked before any parse or write.
+      const refusal = refuseAgentEscalation(c, getSyncEngine());
+      if (refusal) return refusal;
 
       const namespace = c.get("namespace");
       const body = await c.req.json().catch(() => null);
@@ -279,6 +294,12 @@ export function createSchedulesRoutes(
     async c => {
       const service = requireService(c);
       if (service instanceof Response) return service;
+
+      // #3842 R8 (ruling NEW-3842-1 = b): scheduled sessions always run in the
+      // bypass mode, so a non-bypass agent session cannot write a schedule
+      // through the capability channel. Checked before any parse or write.
+      const refusal = refuseAgentEscalation(c, getSyncEngine());
+      if (refusal) return refusal;
 
       const namespace = c.get("namespace");
       const id = c.req.param("id");

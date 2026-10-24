@@ -20,6 +20,8 @@ export * from "./version";
 // `manifest.ts` imports the id set + record schema from it (no cycle — this
 // module imports only `zod`).
 export * from "./sources";
+// #4288: the symlinked settings.json vocabulary the server and the web share.
+export * from "./settingsLink";
 export * from "./manifest";
 export * from "./exportNaming";
 export * from "./extractionPrompt";
@@ -54,3 +56,7 @@ export * from "./mcpReview";
 // archive hygiene gate both exporters and the standalone verifier run.
 export * from "./tenantProfile";
 export * from "./archiveHygiene";
+// #5169: the Codex source (the neutral rules, then each dialect's lines).
+export * from "./codexSource";
+export * from "./codexSourceShell";
+export * from "./codexSourcePowerShell";

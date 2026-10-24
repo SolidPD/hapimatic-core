@@ -213,8 +213,10 @@ export function physicalPathFunctionLines(): string[] {
  *   name with a newline in it is refused whole as `u`: its paths cannot be read
  *   one per line. It follows folder links the way `tar -h` does, along every
  *   path (a folder two links reach is checked under both), stops only at a
- *   folder already on the current path (a loop), never descends a refused
- *   link, and only reads.
+ *   folder already on the current path or one that holds the link (a loop),
+ *   and writes one `l<TAB>path` line for each such link, which the copy leaves
+ *   out (#4321: GNU `tar -h` follows a loop without end). It never descends a
+ *   refused link, and only reads.
  * - `under_link <root> <path>` is true when a folder between `<root>` and
  *   `<path>` (relative to `<root>`) is a link. A path below a staged link is not
  *   the export's copy: removing it would remove through the link, into the
@@ -244,7 +246,7 @@ export function credentialLinkFunctionLines(): string[] {
     '  credential_links_in "$1" "$2" "$3" 0 "$_cnl$(physical_path "$1")$_cnl"',
     "}",
     "credential_links_in() { # $1 = folder, $2 = its staging path, $3 = list, $4 = links followed, $5 = physical folders on this path",
-    '  local _cd="$1" _cpre="$2" _cout="$3" _chops="$4" _canc="$5" _cl _crel _cphys _crc',
+    '  local _cd="$1" _cpre="$2" _cout="$3" _chops="$4" _canc="$5" _cl _crel _cphys _crc _cpar _cloop',
     "  # A name with a newline in it cannot be read one per line (a piece of it can",
     "  # even be another link's name): refuse the whole folder, never part of it.",
     '  find -H "$_cd" -name "*$_cnl*" -print > "$WORK/credential-newline-$_chops.txt" 2>/dev/null || true',
@@ -264,14 +266,23 @@ export function credentialLinkFunctionLines(): string[] {
     '    if [ -z "$_cphys" ]; then',
     "      # A target that exists but does not resolve, or one reached through /proc",
     "      # (which tar reads in its own process), is refused (fail closed); a broken",
-    "      # link is left to tar, which skips it.",
+    "      # link is left to tar: GNU tar skips it, while bsdtar (macOS tar) keeps it",
+    "      # as a dangling link, which a later materialize pass records as a broken",
+    "      # symlink and drops (the last pass has none after it).",
     '      if [ "$_crc" -eq 4 ] || [ -e "$_cl" ]; then printf \'u\\t%s\\n\' "$_cpre/$_crel" >> "$_cout"; fi',
     "      continue",
     "    fi",
     '    if has_credential_part "$_cphys"; then',
     '      printf \'c\\t%s\\n\' "$_cpre/$_crel" >> "$_cout"',
     '    elif [ -d "$_cl" ]; then',
-    '      case "$_canc" in *"$_cnl$_cphys$_cnl"*) continue ;; esac',
+    "      # #4321: a loop (its target is a folder on this path, or a folder that",
+    "      # holds the link, such as loop -> . or up -> ..): the copy leaves it out,",
+    "      # since GNU tar -h follows one without end.",
+    "      _cloop=0",
+    '      case "$_canc" in *"$_cnl$_cphys$_cnl"*) _cloop=1 ;; esac',
+    '      _cpar="$(physical_path "${_cl%/*}")" || _cpar=""',
+    '      case "$_cpar/" in "${_cphys%/}/"*) _cloop=1 ;; esac',
+    '      if [ "$_cloop" -eq 1 ]; then printf \'l\\t%s\\n\' "$_cpre/$_crel" >> "$_cout"; continue; fi',
     '      if [ "$_chops" -ge 40 ]; then',
     '        printf \'u\\t%s\\n\' "$_cpre/$_crel" >> "$_cout"',
     "      else",

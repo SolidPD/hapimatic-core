@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { McpReviewValue } from "@hapi/protocol/porter";
 import type { PlannedMcpServer } from "@/types/porter";
+import { offersReAuth } from "./ReAuthStep";
+import { HiddenCharsNotice, VisibleText } from "./VisibleText";
 
 /**
  * #5172 (#5165 R5/H3) — the definition an imported MCP server will run, shown
@@ -15,6 +17,10 @@ import type { PlannedMcpServer } from "@/types/porter";
  * slot; this component never receives a secret value (the server shows slots
  * by name, never value). Rendering branches on `kind` only, never on a value's
  * text, so a literal cannot pose as a slot.
+ *
+ * #5195: every value renders through `VisibleText`, so a hidden or
+ * direction-changing code point shows in place as a `U+XXXX` token, and the
+ * row carries one notice when any of its values contains one.
  */
 
 function SlotToken({ slot, testId }: { slot: string; testId: string }) {
@@ -23,7 +29,7 @@ function SlotToken({ slot, testId }: { slot: string; testId: string }) {
       data-testid={testId}
       className="rounded border border-[var(--app-border)] px-1 font-mono text-[var(--app-hint)]"
     >
-      secret: {slot}
+      secret: <VisibleText text={slot} />
     </span>
   );
 }
@@ -35,10 +41,35 @@ function ReviewValue({ value }: { value: McpReviewValue }) {
     case "value":
       return (
         <span className="font-mono break-all whitespace-pre-wrap">
-          {JSON.stringify(value.value)}
+          <VisibleText text={JSON.stringify(value.value)} />
         </span>
       );
   }
+}
+
+/**
+ * #5195: the text of every value on the row (the server name, transport,
+ * command, literal args and url, path translation, unresolved reason, and slot
+ * names), checked for hidden code points. A literal arg or url is checked in
+ * the JSON form the row renders, so the notice fires only when a `U+XXXX`
+ * token is actually shown (JSON already escapes a line feed as `\n`).
+ */
+function rowValues(s: PlannedMcpServer): string[] {
+  const d = s.definition;
+  const literal = (v: McpReviewValue | undefined): string[] =>
+    v?.kind === "value" ? [JSON.stringify(v.value)] : [];
+  return [
+    s.name,
+    d.transport,
+    ...(d.command !== undefined ? [d.command] : []),
+    ...(d.args ?? []).flatMap(literal),
+    ...literal(d.url),
+    ...(s.commandTranslation
+      ? [s.commandTranslation.from, s.commandTranslation.to]
+      : []),
+    ...(s.unresolvedReason !== undefined ? [s.unresolvedReason] : []),
+    ...declaredSlots(s),
+  ];
 }
 
 /** The declared secret slot names, in the server's `declaredSlotNames` order. */
@@ -62,10 +93,14 @@ export function McpServerDefinition({ server }: { server: PlannedMcpServer }) {
     >
       <div className="flex flex-wrap items-center gap-2 text-[var(--app-hint)]">
         <span data-testid={`${id}-transport`} className="font-mono">
-          {d.transport}
+          <VisibleText text={d.transport} />
         </span>
         {d.disabled && <span data-testid={`${id}-disabled`}>disabled</span>}
       </div>
+      <HiddenCharsNotice
+        testId={`${id}-hidden-chars`}
+        values={rowValues(server)}
+      />
       {d.command !== undefined && (
         <div className="text-warn">
           <span className="text-[var(--app-hint)]">runs </span>
@@ -73,7 +108,7 @@ export function McpServerDefinition({ server }: { server: PlannedMcpServer }) {
             data-testid={`${id}-command`}
             className="font-mono break-all whitespace-pre-wrap"
           >
-            {d.command}
+            <VisibleText text={d.command} />
           </span>
         </div>
       )}
@@ -116,9 +151,17 @@ export function McpServerDefinition({ server }: { server: PlannedMcpServer }) {
             server.secretRestorable ? "text-warn" : "text-[var(--app-hint)]"
           }
         >
-          {server.secretRestorable
-            ? `The archive supplies these values and the review does not show them: ${slots.join(", ")}`
-            : "You supply these values in the re-authenticate step, or the server is skipped"}
+          {server.secretRestorable ? (
+            <>
+              The archive supplies these values and the review does not show
+              them: <VisibleText text={slots.join(", ")} />
+            </>
+          ) : offersReAuth(server) ? (
+            "You supply these values in the re-authenticate step, or the server is skipped"
+          ) : (
+            // #4247: an unresolvable server gets no re-authenticate step.
+            "The server is skipped because its command does not resolve on this machine, so it has no re-authenticate step"
+          )}
         </div>
       )}
     </div>

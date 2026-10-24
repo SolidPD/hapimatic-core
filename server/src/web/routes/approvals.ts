@@ -124,7 +124,9 @@ export function createApprovalsRoutes(
               signal: federationReadSignal(c.req.raw.signal),
             });
             if (resp.ok) {
-              const body = await resp.json();
+              // #5433: an empty OK body reads as {} on every Bun version; a
+              // cut or unparseable one rethrows into the catch below.
+              const body = (await readProxyJson(resp)) ?? {};
               return c.json(body as Record<string, unknown>);
             }
             const body = (await readProxyJson(resp)) ?? {};

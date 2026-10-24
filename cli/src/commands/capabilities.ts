@@ -28,7 +28,10 @@ import type { CommandDefinition } from "./types";
 import { authenticateCli } from "./cliAuth";
 import { listCommands } from "./registry";
 import { API_RESOURCE_ACTIONS } from "./api";
-import { HAPY_MCP_TOOL_NAMES } from "@/claude/utils/startHappyServer";
+import {
+  HAPY_MCP_OPERATOR_TOOL_NAMES,
+  HAPY_MCP_TOOL_NAMES,
+} from "@/claude/utils/startHappyServer";
 import { HAPI_STDIO_BRIDGE_TOOL_NAMES } from "@/extensions/agent-codex/codex/happyMcpStdioBridge";
 // Relative (NOT `@/`) import of the server engine: `@/` aliases to `cli/src` in
 // cli/tsconfig, so a server file MUST be reached by relative path (issue #3742).
@@ -87,7 +90,12 @@ export function buildLocalSurface(): {
   cli: ObservedCli;
 } {
   const mcp: ObservedMcpHarness[] = [
-    { harness: "claude", tools: [...HAPY_MCP_TOOL_NAMES] },
+    // The Claude harness can also be handed the operator tools (#4450): an
+    // operator host registers them, so they are observed here too.
+    {
+      harness: "claude",
+      tools: [...HAPY_MCP_TOOL_NAMES, ...HAPY_MCP_OPERATOR_TOOL_NAMES],
+    },
     { harness: "codex-bridge", tools: [...HAPI_STDIO_BRIDGE_TOOL_NAMES] },
   ];
   // `hapi claude` is the implicit default and NOT in `listCommands()` (its

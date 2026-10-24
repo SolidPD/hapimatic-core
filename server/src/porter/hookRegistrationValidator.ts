@@ -203,6 +203,15 @@ function toDestPath(token: string, claudeDir: string): string {
 }
 
 /**
+ * #5199 (OOS-1): spellings the shell expands to the home directory, rewritten
+ * to the bare `$HOME` the rest of the token rule reads. `${HOME}`, `"$HOME"`
+ * and `"${HOME}"` all name the home directory at run time; a single-quoted
+ * `'$HOME'` is literal in the shell and is deliberately left alone (R4).
+ * Used for path resolution only, never written back to settings.json.
+ */
+const SHELL_HOME_SPELLING_RE = /"\$\{HOME\}"|"\$HOME"|\$\{HOME\}/g;
+
+/**
  * Extract path-like tokens from a command and resolve each to a destination path
  * (F3-expanded). A "path-like" token contains a `/` and either is absolute,
  * begins with a home/`~`/`$HOME` marker, or references `.claude/`. Interpreter
@@ -211,12 +220,19 @@ function toDestPath(token: string, claudeDir: string): string {
  * Exported for #4331: the plan-time dangling-registration warning
  * (`buildHookEntries` in ./planHooks) uses this same token rule, so the plan
  * and the post-commit orphan check below agree on what a command runs.
+ *
+ * #5199: the shell-expanded home spellings `${HOME}`, `"$HOME"` and `"${HOME}"`
+ * are read as `$HOME` (see SHELL_HOME_SPELLING_RE); a single-quoted `'$HOME'`
+ * is not.
  */
 export function referencedPaths(command: string, claudeDir: string): string[] {
   // Apply the canonical `$HOME/.claude` / `~/.claude` denormaliser first, then
   // token-level rewriting handles foreign-home and bare-home forms.
   const destHome = dirname(claudeDir);
-  const normalised = denormalizeHookCommand(command, destHome);
+  const normalised = denormalizeHookCommand(
+    command.replace(SHELL_HOME_SPELLING_RE, () => "$HOME"),
+    destHome
+  );
   const tokens = normalised
     .split(/\s+/)
     .map(t => t.replace(/^['"]|['"]$/g, ""))

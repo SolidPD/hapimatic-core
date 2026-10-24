@@ -22,6 +22,8 @@ import * as os from "node:os";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
+import { logger } from "@/ui/logger";
+import { DEFAULT_TMUX_SESSION_NAME } from "@/tmux/types";
 import { MAX_CONCURRENCY_DEFAULT } from "@hapi/protocol/schemas";
 import { trimTrailingChars } from "@hapi/protocol/trimChars";
 import {
@@ -212,10 +214,31 @@ const NO_SESSION_SLICE: SessionSliceLimit = {
   limitBytes: null,
 };
 
-function readTextOrNull(path: string): string | null {
+/** #5202 (U3): paths already warned about, so a persistent fault logs once. */
+const warnedUnreadablePaths = new Set<string>();
+
+/**
+ * Read a cgroupfs file, or `null` when it does not exist. Only ENOENT means
+ * "absent" (#5202 U3): any other error (EACCES, EIO) also yields `null`, so a
+ * fault still cannot throw out of the capacity reader, but it warns once per
+ * path, because a silent `null` changes the spawn cap's memory input (a failed
+ * `memory.max` read) or over-states capacity (a failed ancestor read).
+ */
+export function readTextOrNull(
+  path: string,
+  readFile: (path: string) => string = p => readFileSync(p, "utf8")
+): string | null {
   try {
-    return readFileSync(path, "utf8");
-  } catch {
+    return readFile(path);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    if (!warnedUnreadablePaths.has(path)) {
+      warnedUnreadablePaths.add(path);
+      logger.warn(
+        `[capacity] could not read ${path} (${code ?? String(err)}); treating it as absent, so the session cap may use the wrong memory input (#5202)`
+      );
+    }
     return null;
   }
 }
@@ -263,10 +286,9 @@ export function resolveSessionSliceLimit(
   if (uid === null) return NO_SESSION_SLICE;
   const root = trimTrailingChars(deps.cgroupRoot ?? DEFAULT_CGROUP_ROOT, "/");
   const read = deps.readText ?? readTextOrNull;
-  // The daemon's tmux socket — the same default as `configuration.tmuxSessionName`
-  // (cli/src/configuration.ts); importing configuration here would drag the daemon's
-  // whole config singleton into this pure module.
-  const socketName = env.HAPI_TMUX_SESSION_NAME || "hapimatic";
+  // The daemon's tmux socket — the same default as `configuration.tmuxSessionName`,
+  // shared through the dependency-free tmux/types module (#5202 U30).
+  const socketName = env.HAPI_TMUX_SESSION_NAME || DEFAULT_TMUX_SESSION_NAME;
   const userManager = `${root}/user.slice/user-${uid}.slice/user@${uid}.service`;
   const start = `${userManager}/${sliceCgroupSegment(instanceSliceFor(socketName, config.slice))}`;
   if (read(`${start}/memory.max`) === null) return NO_SESSION_SLICE;

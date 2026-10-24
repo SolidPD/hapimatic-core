@@ -583,6 +583,34 @@ export const CLEANUP_WORKTREE_META: CapabilityMeta = {
   since: "2026-09-17",
 };
 
+/**
+ * The input of `cleanup-idle-worktree` (#4450 R9). Every field the guarded
+ * removal depends on is required and non-empty; the handler validates with this
+ * schema before anything else, because `RpcHandlerManager` passes params
+ * through unvalidated.
+ */
+export const cleanupIdleWorktreeInput = z.object({
+  basePath: z.string().min(1),
+  worktreePath: z.string().min(1),
+  branch: z.string().min(1),
+  expectedOwnerTag: z.string().min(1),
+  sessionId: z.string().optional(),
+});
+/**
+ * `cleanup-idle-worktree` — the guarded removal behind the operator
+ * `remove_worktree` tool (#4450). `destructive`: it moves a worktree to
+ * `.trash`. A separate method from `cleanup-worktree`, so a daemon older than
+ * the server never registers it and the server's call fails
+ * (`daemon_unavailable`) instead of running the unguarded path.
+ */
+export const CLEANUP_IDLE_WORKTREE_META: CapabilityMeta = {
+  description:
+    "Move an idle, owner-verified git worktree to .trash (recoverable). Refuses a live, claimed, protected or unverifiable worktree. Destructive — removes a git worktree.",
+  inputSchema: z.toJSONSchema(cleanupIdleWorktreeInput),
+  riskTier: "destructive",
+  since: "2026-10-23",
+};
+
 const getSessionClaudeIdInput = z.object({ sessionId: z.string() });
 /**
  * `get-session-claude-id` — read a session's Claude session id. `readonly`

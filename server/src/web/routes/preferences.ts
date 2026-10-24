@@ -30,7 +30,7 @@ import {
   AutoRecoverPreferencePatchSchema,
   AutoSelectOptimalAccountPreferencePatchSchema,
   AutoSwitchOnRateLimitPreferencePatchSchema,
-  CeilingGuardConfigPatchSchema,
+  CeilingGuardPreferencePatchSchema,
   CHAT_SECTIONS_DEFAULT,
   ChatDetailLevelSchema,
   ChatSectionsPreferenceSchema,
@@ -327,7 +327,7 @@ export function createPreferencesRoutes(
     ),
     async c => {
       const body = await c.req.json();
-      const parsed = CeilingGuardConfigPatchSchema.safeParse(body);
+      const parsed = CeilingGuardPreferencePatchSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
           { error: "Invalid preferences", details: parsed.error.issues },

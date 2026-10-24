@@ -273,7 +273,7 @@ export function createSpawnRosterRoutes(
         domain: "session-lifecycle",
         surface: "rest",
         description:
-          "List this node's PM spawn-roster rows, optionally filtered by PM session id and status.",
+          "List this node's PM spawn-roster rows for one PM session (pmSessionId query parameter, required), optionally filtered by status.",
         whenToUse:
           "When a project-manager session reviews the spawns it registered on this node.",
         invocation: {

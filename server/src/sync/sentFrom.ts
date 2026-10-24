@@ -85,3 +85,48 @@ export interface MessageOrigin {
    *  self-send discriminator. */
   sessionId?: string;
 }
+
+/**
+ * Operator-message predicate for the runaway ceiling guard (#5254 R2a).
+ *
+ * A user-role message counts as OPERATOR input — a human at a keyboard — unless
+ * it is provably programmatic:
+ *   - `meta.sentFrom` is in {@link PROGRAMMATIC_SENT_FROM} (scheduler, watchdog,
+ *     handoff, …), or
+ *   - `meta.origin.sessionId` is set: a session-to-session send (`cli-api` with
+ *     `X-Hapi-Session-Id`, or its federated forward), i.e. PM→lane / lane→PM.
+ *
+ * Web UI, telegram, federated-from-hub-UI, queue-drained and local-terminal
+ * input therefore count as operator input. An absent `meta` / `sentFrom` /
+ * `origin` reads as operator input — fail-safe toward NOT hard-stopping a
+ * session. Known gap: a shell or cron send without `X-Hapi-Session-Id` is
+ * classed `web-user` and so reads as operator input too.
+ */
+export function isOperatorUserMessage(content: unknown): boolean {
+  if (!content || typeof content !== "object" || Array.isArray(content)) {
+    return false;
+  }
+  const record = content as { role?: unknown; meta?: unknown };
+  if (record.role !== "user") return false;
+  const meta =
+    record.meta &&
+    typeof record.meta === "object" &&
+    !Array.isArray(record.meta)
+      ? (record.meta as { sentFrom?: unknown; origin?: unknown })
+      : undefined;
+  if (!meta) return true;
+  if (
+    typeof meta.sentFrom === "string" &&
+    PROGRAMMATIC_SENT_FROM.has(meta.sentFrom)
+  ) {
+    return false;
+  }
+  const origin =
+    meta.origin && typeof meta.origin === "object"
+      ? (meta.origin as { sessionId?: unknown })
+      : undefined;
+  if (typeof origin?.sessionId === "string" && origin.sessionId.length > 0) {
+    return false;
+  }
+  return true;
+}

@@ -40,6 +40,7 @@ import {
   classifyPlannedDestination,
   CredentialNameError,
   PlannedDestinationError,
+  stripEntrySpelling,
 } from "./plannedDestinations";
 import type { TarEntry } from "./tarArchive";
 import type { PlannedFileItem } from "./importArchive";
@@ -67,6 +68,26 @@ export function findEntry(
 }
 
 /**
+ * #5188 (S1): the tar member a `hooks[]` file path names. The exact path
+ * wins, as before; otherwise the first FILE member whose path matches once
+ * a leading `./` and a trailing `/` are stripped from both
+ * (./plannedDestinations `stripEntrySpelling`), the spelling a hand-built
+ * `./hooks/h.py` member has. {@link planHookFiles} checks containment on
+ * the member it stages as well as on the manifest path.
+ */
+export function findHookMember(
+  entries: TarEntry[],
+  path: string
+): TarEntry | undefined {
+  const exact = findEntry(entries, path);
+  if (exact) return exact;
+  const want = stripEntrySpelling(path);
+  return entries.find(
+    e => e.kind === "file" && stripEntrySpelling(e.path) === want
+  );
+}
+
+/**
  * Where a registered hook's script lands: `<claudeDir>/<archive path>`, the
  * path-preserved destination (#4331). The ONE definition planning, selection
  * (./commitSelection) and commit attribution (./commitHooks) key a hook on, so
@@ -91,9 +112,12 @@ export function hookFileDest(claudeDir: string, archivePath: string): string {
  * member is spelled, so a hand-built or extraction-prompt archive that violates
  * the one-reference rule is corrected (planned once) instead of double-planned.
  *
- * The owner is the first registration whose tar member is a regular file, the
- * same one {@link planHookFiles} stages; a registration with no such member
- * claims nothing, so its destination is left to `hookSupport`.
+ * Each destination maps to the archive path whose bytes it stages: the path of
+ * the member {@link findHookMember} finds (#5188), which is what
+ * `planDimension` compares members to. The owner is the first registration
+ * whose member {@link findHookMember} finds is a regular file, the same one
+ * {@link planHookFiles} stages; a registration with no such member claims
+ * nothing, so its destination is left to `hookSupport`.
  */
 export function claimedHookPaths(
   entries: TarEntry[],
@@ -102,9 +126,11 @@ export function claimedHookPaths(
 ): ReadonlyMap<string, string> {
   const claimed = new Map<string, string>();
   for (const h of hooks) {
-    if (findEntry(entries, h.file.path)?.kind !== "file") continue;
+    const member = findHookMember(entries, h.file.path);
+    if (member?.kind !== "file") continue;
     const dest = hookFileDest(claudeDir, h.file.path);
-    if (!claimed.has(dest)) claimed.set(dest, h.file.path);
+    // #5188 (S1): the member's own path, which planDimension compares members to.
+    if (!claimed.has(dest)) claimed.set(dest, member.path);
   }
   return claimed;
 }
@@ -132,6 +158,11 @@ export function claimedHookPaths(
  * (`hooks/a/run.py`, `hooks/./a/run.py`) with different bytes refuse the
  * archive with a `ManifestValidationError`, so a merged registration never runs
  * a script other than the one it names and no script is silently dropped.
+ *
+ * #5188 (S1): a `file.path` with no exactly spelled member stages the member
+ * {@link findHookMember} finds (`./hooks/h.py` for `hooks/h.py`), and that
+ * member passes containment too, so an absolute `/hooks/h.py` found for
+ * `.//hooks/h.py` refuses the archive.
  */
 export async function planHookFiles(
   entries: TarEntry[],
@@ -150,13 +181,20 @@ export async function planHookFiles(
   const seen = new Map<string, { archivePath: string; hash: string }>();
   for (const hook of hooks) {
     // 🔴 #4331: the archive path IS the destination (folders kept), so
-    // containment checks it as written: `..`, absolute and NUL refuse here.
+    // containment checks the manifest path as written: `..`, absolute and NUL
+    // refuse here. The member staged below gets its own check (#5188).
     const destPath = assertSafeEntry(claudeDir, {
       path: hook.file.path,
       kind: "file",
     });
-    const entry = findEntry(entries, hook.file.path);
+    const entry = findHookMember(entries, hook.file.path);
     if (!entry || entry.kind !== "file") continue;
+    // 🔴 #5188 (S1): the member whose bytes are staged passes containment too,
+    // so a `/hooks/h.py` member found for `.//hooks/h.py` refuses the archive
+    // (an invalid `hookSupport` entry leaves a claimed member's containment to
+    // this loop, and no valid entry reaches an absolute member).
+    if (entry.path !== hook.file.path)
+      assertSafeEntry(claudeDir, { path: entry.path, kind: entry.kind });
     // 🔴 #4160 (F3): typed refusal before any staging write (./plannedDestinations).
     const v = classifyPlannedDestination(claudeDir, "hook-file", destPath);
     if (!v.ok)
@@ -313,8 +351,11 @@ export function planRegistryMissing(
   );
   if (registryNames.length === 0) return [];
   // Hook names carried by the archive (basename-keyed, any hooks/ depth).
+  // #5188: a `./hooks/…` member counts too (spelling stripped for this test
+  // only; it can only remove a false refusal).
   const archiveNames = new Set(
     entries
+      .map(e => ({ kind: e.kind, path: stripEntrySpelling(e.path) }))
       .filter(e => e.kind === "file" && isHookScriptMember(e.path))
       .map(e => hookNameOf(e.path))
   );

@@ -64,6 +64,7 @@ import {
 import { RenameSessionDialog } from "@/components/RenameSessionDialog";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { BranchConfirmDialog } from "@/components/BranchConfirmDialog";
+import { FanOutDialog } from "@/components/FanOut/FanOutDialog";
 import { WorktreeDeleteDialog } from "@/components/WorktreeDeleteDialog";
 import { EmojiPickerPopover } from "@/components/EmojiPickerPopover";
 import { SessionTimer, ClockIcon } from "@/components/SessionTimer";
@@ -228,6 +229,8 @@ export function SessionHeader(props: {
   const [issueModalOpen, setIssueModalOpen] = useState(false);
   const [issueInfoOpen, setIssueInfoOpen] = useState(false);
   const [branchDialogOpen, setBranchDialogOpen] = useState(false);
+  // #3818 Slice 2: the fan-out dialog (this session becomes the parent).
+  const [fanOutOpen, setFanOutOpen] = useState(false);
   // Issue #2149: the Session Configuration modal (#3290). E9 (operator ruling
   // 2026-09-06): the Row-1 Account Badge opens THIS modal — the account selector
   // lives inside it — so the header no longer mounts its own AccountSelectorModal.
@@ -809,6 +812,12 @@ export function SessionHeader(props: {
                 onKebabOpenChange,
                 onDesktop: props.onDesktop,
                 onViewFiles: props.onViewFiles,
+                // #3818 / #4497: the peers may run on this hub or another
+                // federation node, but the PARENT must be served by this hub:
+                // a session served from another node (nodeUrl set) gets no
+                // fan-out entry, because the hub resolves a spawn's parent
+                // only against its own sessions, so the link would not land.
+                onFanOut: props.nodeUrl ? undefined : () => setFanOutOpen(true),
                 sessionName: title,
                 isPending,
               }}
@@ -930,6 +939,16 @@ export function SessionHeader(props: {
         nonBlocking
         onError={() => showToast("Failed to branch session", { type: "error" })}
       />
+
+      {fanOutOpen ? (
+        <FanOutDialog
+          isOpen
+          onClose={() => setFanOutOpen(false)}
+          api={api}
+          parent={session}
+          parentTitle={title}
+        />
+      ) : null}
 
       {/* #4371: the support session's persistent "Contact a human" bar, in flow
           directly under the header card — renders nothing for every other

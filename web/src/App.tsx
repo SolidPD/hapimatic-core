@@ -37,6 +37,7 @@ import { BrandedFrame } from "@/components/BrandedFrame";
 import { ThreadFullscreenProvider } from "@/lib/thread-fullscreen-context";
 import { ToastProvider, useToast } from "@/components/Toast";
 import { ApiErrorToastListener } from "@/components/ApiErrorToastListener";
+import { RemoteSpawnFailedToastListener } from "@/components/RemoteSpawnFailedToastListener";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
 import { OnboardingHost } from "@/components/onboarding/OnboardingHost";
 import { useSplitViewContext } from "@/lib/split-view-context";
@@ -632,6 +633,8 @@ export function App() {
       <SessionRestartFailedToastListener />
       <LoopsResumingToastListener />
       <WaitingForSlotToastListener />
+      {/* #2150: a remote spawn that fails or times out after the node accepted it */}
+      <RemoteSpawnFailedToastListener />
       <AppContextProvider
         value={{
           api,

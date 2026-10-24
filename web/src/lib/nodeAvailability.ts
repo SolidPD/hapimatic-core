@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * Transient "the session's node is offline / restarting" errors (issue #5375).
+ * Transient "the session's node is offline or not responding" errors (issue #5375).
  *
  * The hub's remote-session availability guard answers a live session on a
  * briefly offline or unreachable federation node with `code: "node_offline"`
@@ -29,10 +29,17 @@ export type NodeUnavailableCode = (typeof NODE_UNAVAILABLE_CODES)[number];
 export const NODE_RETRY_MAX = 8;
 
 /**
- * Retry attempts for `node_unreachable` (≈ 30 s). Each attempt reaches the
- * peer, and a timed-out read also lands here, so a slow request is not re-run
- * eight times; once the node is marked offline its errors become
- * `node_offline` and the longer budget takes over.
+ * Retry attempts for `node_unreachable`. Each attempt reaches the peer, and a
+ * timed-out read also lands here, so a slow request is not re-run eight times;
+ * once the node is marked offline its errors become `node_offline` and the
+ * longer, cheaper budget takes over.
+ *
+ * Worst case (#5410): 4 attempts, each held up to 25 s by the hub's federation
+ * read timeout (`FEDERATION_READ_TIMEOUT_MS`), plus back-off delays of 5 s,
+ * 10 s and 15 s from the hub's 5 s hint ≈ 130 s (up to ~136 s with jitter). A
+ * peer that fails fast (connection refused) takes ≈ 30 s. The budget stays at 3
+ * because the long tail moves to `node_offline` once the hub marks the node
+ * offline.
  */
 export const NODE_UNREACHABLE_RETRY_MAX = 3;
 
@@ -103,15 +110,19 @@ function labelOf(err: unknown, fallbackLabel?: string | null): string | null {
   return nodeUnavailableInfo(err).nodeLabel ?? fallbackLabel ?? null;
 }
 
-/** Shown while the query is retrying. */
+/**
+ * Shown while the query is retrying. `node_unreachable` means the node did not
+ * answer or answered with a transport-level error; neither says it is
+ * restarting, so the message must not claim a restart (#5410).
+ */
 export function describeNodeUnavailable(
   err: unknown,
   fallbackLabel?: string | null
 ): string {
-  const label = labelOf(err, fallbackLabel);
-  return label
-    ? `${label} is restarting — reconnecting…`
-    : "The session's node is restarting — reconnecting…";
+  const subject = labelOf(err, fallbackLabel) ?? "The session's node";
+  return nodeUnavailableCode(err) === "node_unreachable"
+    ? `${subject} isn't responding — reconnecting…`
+    : `${subject} is restarting — reconnecting…`;
 }
 
 /**
@@ -170,6 +181,37 @@ export const REQUEST_TIMED_OUT_MESSAGE = "Request timed out. Please try again.";
 /** `ApiClient`'s message for a request whose caller aborted it. */
 export const REQUEST_CANCELLED_MESSAGE = "Request was cancelled.";
 
+/**
+ * #5409: the request got no (complete) answer — `fetch()` rejected (offline,
+ * DNS, connection refused or reset) or the body read dropped. `ApiClient`
+ * wraps those TypeErrors; for session loads any other TypeError is a code bug
+ * and is shown (classifySessionLoadFailure). Extends
+ * TypeError so callers that test `instanceof TypeError` keep working.
+ * Lives here (not api/client.ts) because client.ts imports from this module
+ * and a runtime import back would create the cycle the header warns about.
+ */
+export class NetworkError extends TypeError {
+  constructor(cause: unknown) {
+    super(
+      cause instanceof Error && cause.message
+        ? cause.message
+        : "Network request failed",
+      { cause }
+    );
+    this.name = "NetworkError";
+  }
+}
+
+/**
+ * #5409: a transient session-load failure escalates from "Reconnecting…" to
+ * its error message and a Retry button this long after the streak's first
+ * settled error (with no data since)…
+ */
+export const RECONNECT_ESCALATE_AFTER_MS = 60_000;
+
+/** …or once the streak reaches this many settled query errors. */
+export const RECONNECT_ESCALATE_AFTER_FAILURES = 5;
+
 /** HTTP statuses that mean "the hub or its gateway could not answer right now". */
 const TRANSIENT_STATUSES = new Set([502, 503, 504]);
 
@@ -178,8 +220,10 @@ const TRANSIENT_STATUSES = new Set([502, 503, 504]);
  * - `not_found` — a definite 404: the session is gone (the only case that may
  *   show "Session not found" and clear the saved route).
  * - `transient` — the session's node or the hub is restarting or unreachable:
- *   a node code, a 502/503/504, or a request that got no answer at all.
- * - `failed` — any other error (403, 400, an expired login…): show it.
+ *   a node code, a 502/503/504, or a request that got no answer at all
+ *   (a `NetworkError`, a timeout, or a cancel).
+ * - `failed` — any other error (403, 400, an expired login, or a plain
+ *   TypeError, which is a code bug — #5409): show it.
  */
 export type SessionLoadFailure = "not_found" | "transient" | "failed";
 
@@ -193,8 +237,9 @@ export function classifySessionLoadFailure(
     if (status === 404) return "not_found";
     return TRANSIENT_STATUSES.has(status) ? "transient" : "failed";
   }
-  // No HTTP status: the request never got an answer.
-  if (err instanceof TypeError) return "transient"; // fetch network failure
+  // No HTTP status: a tagged network failure, a timeout or a cancel is
+  // transient; anything else (e.g. a plain TypeError, a code bug) is failed.
+  if (err instanceof NetworkError) return "transient"; // fetch network failure (#5409)
   if (
     err instanceof Error &&
     (err.message === REQUEST_TIMED_OUT_MESSAGE ||

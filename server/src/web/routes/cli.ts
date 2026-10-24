@@ -872,7 +872,6 @@ export function createCliRoutes(
 
     app.post(
       "/error-reports",
-      errorReportsLimiter,
       cataloged(
         defineCapability({
           id: "messaging.cli-error-report",
@@ -892,6 +891,7 @@ export function createCliRoutes(
           availability: { scope: "user", mountedWhen: "store" },
         })
       ),
+      errorReportsLimiter,
       async c => {
         const json = await c.req.json().catch(() => null);
         const parsed = cliErrorReportSchema.safeParse(json);
@@ -1215,7 +1215,6 @@ export function createCliRoutes(
 
   app.post(
     "/account-captured",
-    accountCapturedLimiter,
     cataloged(
       defineCapability({
         id: "accounts.cli-account-captured",
@@ -1236,6 +1235,7 @@ export function createCliRoutes(
         probe: "skip",
       })
     ),
+    accountCapturedLimiter,
     async c => {
       const json = await c.req.json().catch(() => null);
       const parsed = cliAccountCapturedSchema.safeParse(json);

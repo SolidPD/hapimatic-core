@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Database } from "bun:sqlite";
 import type {
+  CeilingBreachAction,
+  CeilingBreachDimension,
+  CeilingBreachKind,
+  CeilingBreachSummary,
   MirrorAdjustmentRow,
   MirrorTurnRow,
   SessionMetadataFilterOptions,
@@ -14,6 +18,7 @@ import type {
   WorkflowLabelEvent,
 } from "@hapi/protocol";
 
+import { CEILING_RATE_WINDOW_MS } from "../../sync/ceilingGuardEvaluator";
 import { newUuidV7 } from "./ids";
 import { BINDING_COLUMNS, tableHasColumns } from "./schema";
 import type {
@@ -408,6 +413,152 @@ export class TurnStore {
   }
 
   /**
+   * Trailing-window usage for the runaway ceiling guard (#5254 R1): the turns
+   * STARTED at or after `sinceMs` and their uncached (`tok_in + tok_out`) tokens,
+   * plus background-agent tokens whose `COALESCE(ended_at_ms, started_at_ms)`
+   * falls in the window. Runs at every turn finalize, so the turns half is a
+   * range seek on `idx_turns_session_started`.
+   */
+  getRollingUsage(
+    hapiSessionId: string,
+    sinceMs: number
+  ): { turns: number; uncached: number } {
+    const turns = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n,
+                COALESCE(SUM(IFNULL(tok_in, 0) + IFNULL(tok_out, 0)), 0) AS tok
+           FROM turns
+          WHERE hapi_session_id = @sid AND started_at_ms >= @since`
+      )
+      .get({ sid: hapiSessionId, since: sinceMs }) as {
+      n: number;
+      tok: number;
+    };
+    const agents = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(tok_in + tok_out), 0) AS tok
+           FROM background_agent_usage
+          WHERE hapi_session_id = @sid
+            AND COALESCE(ended_at_ms, started_at_ms) >= @since`
+      )
+      .get({ sid: hapiSessionId, since: sinceMs }) as { tok: number };
+    return { turns: turns.n, uncached: turns.tok + agents.tok };
+  }
+
+  /** Persist one ceiling-guard breach (#5254 R4). Returns the row id. */
+  recordCeilingBreach(row: {
+    hapiSessionId: string;
+    kind: CeilingBreachKind;
+    dimension: CeilingBreachDimension;
+    value: number | null;
+    ceiling: number | null;
+    action: CeilingBreachAction;
+    occurredAtMs: number;
+  }): string {
+    const id = newUuidV7();
+    this.db
+      .prepare(
+        `INSERT INTO ceiling_breaches
+           (id, hapi_session_id, kind, dimension, value, ceiling, action, occurred_at_ms)
+         VALUES (@id, @sid, @kind, @dimension, @value, @ceiling, @action, @at)`
+      )
+      .run({
+        id,
+        sid: row.hapiSessionId,
+        kind: row.kind,
+        dimension: row.dimension,
+        value: row.value,
+        ceiling: row.ceiling,
+        action: row.action,
+        at: row.occurredAtMs,
+      });
+    return id;
+  }
+
+  /**
+   * Dedupe lookup for the ceiling guard (#5254 R4): whether a breach of
+   * `dimension` with one of `actions` is already recorded — for a cumulative
+   * dimension at the same `ceiling` value (raising or lowering the ceiling
+   * re-arms it), for a rate dimension at or after `sinceMs`.
+   */
+  findCeilingBreach(
+    hapiSessionId: string,
+    dimension: CeilingBreachDimension,
+    opts: {
+      ceiling?: number | null;
+      sinceMs?: number;
+      actions: readonly CeilingBreachAction[];
+    }
+  ): boolean {
+    if (opts.actions.length === 0) return false;
+    const params: Record<string, string | number | null> = {
+      sid: hapiSessionId,
+      dimension,
+      actions: JSON.stringify(opts.actions),
+    };
+    const clauses = [
+      "hapi_session_id = @sid",
+      "dimension = @dimension",
+      "action IN (SELECT value FROM json_each(@actions))",
+    ];
+    if (opts.ceiling !== undefined) {
+      clauses.push("ceiling IS @ceiling");
+      params.ceiling = opts.ceiling;
+    }
+    if (opts.sinceMs !== undefined) {
+      clauses.push("occurred_at_ms >= @since");
+      params.since = opts.sinceMs;
+    }
+    const hit = this.db
+      .prepare(
+        `SELECT 1 FROM ceiling_breaches WHERE ${clauses.join(" AND ")} LIMIT 1`
+      )
+      .get(params);
+    return hit != null;
+  }
+
+  /** The most recent breach per session for the telemetry aggregate (#5254 R5). */
+  getLatestCeilingBreaches(
+    hapiSessionIds: readonly string[]
+  ): Map<string, CeilingBreachSummary> {
+    const out = new Map<string, CeilingBreachSummary>();
+    if (hapiSessionIds.length === 0) return out;
+    const rows = this.db
+      .prepare(
+        `SELECT hapi_session_id, kind, dimension, value, ceiling, action, occurred_at_ms
+           FROM (
+             SELECT b.*, ROW_NUMBER() OVER (
+                      PARTITION BY hapi_session_id
+                      ORDER BY occurred_at_ms DESC, id DESC) AS rn
+               FROM ceiling_breaches b
+              WHERE hapi_session_id IN (SELECT value FROM json_each(@ids))
+           )
+          WHERE rn = 1`
+      )
+      .all({ ids: JSON.stringify(hapiSessionIds) }) as Array<
+      Record<string, unknown>
+    >;
+    for (const r of rows) {
+      out.set(r.hapi_session_id as string, {
+        dimension: r.dimension as CeilingBreachDimension,
+        kind: r.kind as CeilingBreachKind,
+        value: (r.value as number | null) ?? null,
+        ceiling: (r.ceiling as number | null) ?? null,
+        action: r.action as CeilingBreachAction,
+        occurredAtMs: r.occurred_at_ms as number,
+      });
+    }
+    return out;
+  }
+
+  /** Drop a session's breach records (session delete → a recreated id re-arms). */
+  deleteCeilingBreaches(hapiSessionId: string): void {
+    this.db
+      .prepare("DELETE FROM ceiling_breaches WHERE hapi_session_id = ?")
+      .run(hapiSessionId);
+  }
+
+  /**
    * Per-turn token + cost breakdown for a session, ascending by `seq` — issue
    * #1671. Each turn is one prompt→Stop cycle (the DB turn boundary, D10/S-7);
    * the web footer correlates a turn to its concluding message by timestamp
@@ -595,7 +746,87 @@ export class TurnStore {
          LIMIT @limit`
       )
       .all(params) as Array<Record<string, unknown>>;
-    return rows.map(rowToSessionTotals);
+    const totals = rows.map(rowToSessionTotals);
+    this.attachCeilingRates(totals, Date.now());
+    return totals;
+  }
+
+  /**
+   * Issue #5254 R5: merge the ceiling guard's rate meters and the latest breach
+   * onto an aggregate page — four bounded queries keyed by the page's ids
+   * (never `getSessionTotals`, which the guard reads on the hot path, and never
+   * the locked `v_session_totals` view). The peak is TURN tokens only:
+   * background agents carry no per-turn timestamp to window over. Fail-open: a
+   * failed query leaves the optional fields absent rather than failing the
+   * aggregate read.
+   */
+  private attachCeilingRates(totals: SessionTokenTotals[], now: number): void {
+    if (totals.length === 0) return;
+    try {
+      const ids = JSON.stringify(totals.map(t => t.hapiSessionId));
+      const since = now - CEILING_RATE_WINDOW_MS;
+      const lastHour = new Map<string, { turns: number; uncached: number }>();
+      const turnRows = this.db
+        .prepare(
+          `SELECT hapi_session_id AS sid, COUNT(*) AS n,
+                  COALESCE(SUM(IFNULL(tok_in, 0) + IFNULL(tok_out, 0)), 0) AS tok
+             FROM turns
+            WHERE hapi_session_id IN (SELECT value FROM json_each(@ids))
+              AND started_at_ms >= @since
+            GROUP BY hapi_session_id`
+        )
+        .all({ ids, since }) as Array<{ sid: string; n: number; tok: number }>;
+      for (const r of turnRows) {
+        lastHour.set(r.sid, { turns: r.n, uncached: r.tok });
+      }
+      const agentRows = this.db
+        .prepare(
+          `SELECT hapi_session_id AS sid, COALESCE(SUM(tok_in + tok_out), 0) AS tok
+             FROM background_agent_usage
+            WHERE hapi_session_id IN (SELECT value FROM json_each(@ids))
+              AND COALESCE(ended_at_ms, started_at_ms) >= @since
+            GROUP BY hapi_session_id`
+        )
+        .all({ ids, since }) as Array<{ sid: string; tok: number }>;
+      for (const r of agentRows) {
+        const cur = lastHour.get(r.sid) ?? { turns: 0, uncached: 0 };
+        lastHour.set(r.sid, {
+          turns: cur.turns,
+          uncached: cur.uncached + r.tok,
+        });
+      }
+      const peaks = new Map<string, { turns: number; uncached: number }>();
+      const peakRows = this.db
+        .prepare(
+          `SELECT sid, MAX(n) AS n, MAX(tok) AS tok FROM (
+             SELECT hapi_session_id AS sid,
+                    COUNT(*) OVER w AS n,
+                    SUM(IFNULL(tok_in, 0) + IFNULL(tok_out, 0)) OVER w AS tok
+               FROM turns
+              WHERE hapi_session_id IN (SELECT value FROM json_each(@ids))
+             WINDOW w AS (PARTITION BY hapi_session_id ORDER BY started_at_ms
+                          RANGE BETWEEN ${CEILING_RATE_WINDOW_MS} PRECEDING AND CURRENT ROW)
+           ) GROUP BY sid`
+        )
+        .all({ ids }) as Array<{ sid: string; n: number; tok: number }>;
+      for (const r of peakRows) {
+        peaks.set(r.sid, { turns: r.n, uncached: r.tok });
+      }
+      const breaches = this.getLatestCeilingBreaches(
+        totals.map(t => t.hapiSessionId)
+      );
+      for (const t of totals) {
+        const hour = lastHour.get(t.hapiSessionId);
+        const peak = peaks.get(t.hapiSessionId);
+        t.turnsLastHour = hour?.turns ?? 0;
+        t.uncachedTokensLastHour = hour?.uncached ?? 0;
+        t.peakTurnsPerHour = peak?.turns ?? null;
+        t.peakUncachedTokensPerHour = peak?.uncached ?? null;
+        t.lastCeilingBreach = breaches.get(t.hapiSessionId) ?? null;
+      }
+    } catch (error) {
+      console.error("[TurnStore] ceiling-rate telemetry merge failed:", error);
+    }
   }
 
   /**

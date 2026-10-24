@@ -10,6 +10,11 @@ import {
 } from "@hapi/protocol";
 import { cataloged } from "../../../capabilities/cataloged";
 import { createRateLimiter } from "../../middleware/rateLimit";
+import {
+  addFederationPendingSpawn,
+  dismissPendingSpawn,
+  listFederationForNamespace,
+} from "../../../sync/pendingSpawns";
 
 export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
@@ -193,8 +198,17 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         return c.json({ sessions: [], nodes: [] });
       }
 
+      // Issue #2150 (R1/R4): append this caller's hub-side federation spawn
+      // placeholders — a `spawning` row while the peer works, a `failed` row
+      // carrying the peer's error — as ADDITIVE members of `sessions`. A request
+      // with no pending federation spawn returns exactly the pre-#2150 payload.
+      const placeholders = listFederationForNamespace(
+        c.get("namespace") ?? "default"
+      );
+      const remote = registry.getAllRemoteSessions();
       return c.json({
-        sessions: registry.getAllRemoteSessions(),
+        sessions:
+          placeholders.length > 0 ? [...remote, ...placeholders] : remote,
         nodes: registry.getNodeSummaries(),
       });
     }
@@ -315,9 +329,30 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       };
 
       const nodeId = c.req.param("nodeId");
+
+      // Issue #2150 (R1, ruling D2-A): register the hub-side placeholder BEFORE
+      // forwarding — a fast peer refusal callback can race the accept response —
+      // keyed by the caller's spawnCorrelationId (the only id it holds). The
+      // spawn-status handler marks THIS entry failed or settles it, and reads the
+      // caller's namespace from it for the outcome events (K-4497-1). A body
+      // without a correlation id registers nothing (the field is optional).
+      const spawnCorrelationId = forwardable.spawnCorrelationId;
+      if (spawnCorrelationId) {
+        addFederationPendingSpawn({
+          spawnCorrelationId,
+          namespace: c.get("namespace") ?? "default",
+          directory: forwardable.directory,
+          nodeId,
+          nodeLabel: registry.getNodeIdentity(nodeId)?.nodeLabel,
+        });
+      }
+
       const result = await registry.spawnOnNode(nodeId, spawnBody);
 
       if (result.type === "error") {
+        // The peer never accepted it — the 502 IS the caller's error, so no
+        // placeholder may linger as a second, stale signal.
+        if (spawnCorrelationId) dismissPendingSpawn(spawnCorrelationId);
         return c.json(result, 502);
       }
       return c.json(result);

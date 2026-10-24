@@ -6,10 +6,16 @@
  * `max-lines` guardrail. Each error surfaces to the user and guarantees zero
  * bytes were written to `~/.claude`. importArchive.ts re-exports all of these,
  * so the public API is unchanged — consumers may import them from either module.
- * The exception is {@link CommitRollbackError} (#4246): it is thrown AFTER writes
- * began, and it is imported from this module only, which spares a line of
- * importArchive.ts's `max-lines` budget.
+ * The exception is {@link CommitRollbackError} (#4246): it can be thrown after
+ * writes began — it wraps any failure inside runCommit's try, including one in
+ * the backup phase before any write — and it is imported from this module only,
+ * which spares a line of importArchive.ts's `max-lines` budget.
  */
+import {
+  SETTINGS_LINK_REASON_TEXT,
+  settingsLinkConsequence,
+  type SymlinkedSettingsReason,
+} from "@hapi/protocol/porter";
 
 /** R1 — manifest version/shape validation failed (rejected whole, zero bytes). */
 export class ManifestValidationError extends Error {
@@ -80,19 +86,9 @@ export class RegistryDriftError extends Error {
   }
 }
 
-/** Why a symlinked `settings.json` cannot be written through (#4146). */
-export type SymlinkedSettingsReason =
-  | "outside-root"
-  | "dangling"
-  | "loop"
-  | "not-regular";
-
-const SYMLINK_REASON_TEXT: Record<SymlinkedSettingsReason, string> = {
-  "outside-root": "it points outside the config root",
-  dangling: "it does not resolve to a file",
-  loop: "it is part of a symlink loop",
-  "not-regular": "it does not point at a regular file",
-};
+/** Why a symlinked `settings.json` cannot be written through (#4146); one
+ * shared source with the web (#4288), re-exported for existing importers. */
+export type { SymlinkedSettingsReason };
 
 /**
  * #4146 (D14) — the destination `settings.json` is a symlink the merge must not
@@ -116,9 +112,9 @@ export class SymlinkedSettingsError extends Error {
   ) {
     super(
       `Refusing import: ${linkPath} is a symlink to ${target}, and ` +
-        `${SYMLINK_REASON_TEXT[reason]}. If the settings merge writes, the link ` +
-        `would be replaced by a regular file and ${target} would stop receiving ` +
-        `changes. To replace the link anyway, re-commit with ` +
+        `${SETTINGS_LINK_REASON_TEXT[reason]}. If the settings merge writes, it ` +
+        `replaces the link with a regular file, and ` +
+        `${settingsLinkConsequence(reason, target)}. To replace the link anyway, re-commit with ` +
         `acknowledgeSymlinkedSettings set to "${target}". Otherwise replace the ` +
         `link with a regular file, or import into the config root that holds ` +
         `the link's target.`

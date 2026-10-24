@@ -49,7 +49,9 @@ import {
 } from "./worktree";
 import {
   claimWorktreePort,
-  detectSourceBranch,
+  isValidBranchName,
+  resolveSourceBranch,
+  type ResolvedSourceBranch,
   withPortClaimLock,
   WORKTREE_PORT_MAX,
   WORKTREE_PORT_MIN,
@@ -93,6 +95,7 @@ import {
 import type { ProviderId } from "@hapi/protocol";
 import type {
   SpawnSessionOptions,
+  SessionTypeDowngrade,
   SpawnSessionResult,
 } from "@/modules/common/rpcTypes";
 import type { TrackedSession } from "./types";
@@ -175,6 +178,29 @@ async function noCommitRefusalMessage(
 }
 
 /**
+ * hapimatic-private#4370: the branch a new worktree is cut from, with its
+ * reason. An explicit `sourceBranch` wins; otherwise the daemon resolves the
+ * repo's target branch. The choice is logged at `info` (a fallback at `warn`)
+ * because `logger.debug` is file-only and never reaches the daemon journal.
+ */
+async function resolveWorktreeSourceBranch(
+  repoRoot: string,
+  explicit: string | undefined
+): Promise<ResolvedSourceBranch> {
+  const src: ResolvedSourceBranch =
+    explicit !== undefined
+      ? { branch: explicit, reason: "explicit" }
+      : await resolveSourceBranch(repoRoot);
+  const line = `[DAEMON RUN] worktree base branch: ${src.branch} (reason: ${src.reason}) for ${repoRoot}`;
+  if (src.reason.startsWith("fallback:")) {
+    logger.warn(line);
+  } else {
+    logger.info(line);
+  }
+  return src;
+}
+
+/**
  * Build the session spawner bound to `ctx` (shared maps) and `tracker` (the
  * cap/exit/liveness helpers `spawnSession` calls). Call once during daemon init
  * after the tracker exists; the returned `spawnSession` is wired into the
@@ -189,8 +215,22 @@ export function createSessionSpawner(
     tracker;
 
   // Spawn a new session (sessionId reserved for future --resume functionality)
+  // Issue #5202 (U2): the body below records a silent worktree → simple
+  // downgrade in `downgrade`; this wrapper puts it on a success result, so the
+  // many success returns inside the body need no per-site change.
   const spawnSession = async (
     requested: SpawnSessionOptions
+  ): Promise<SpawnSessionResult> => {
+    const downgrade: { value?: SessionTypeDowngrade } = {};
+    const result = await spawnSessionBody(requested, downgrade);
+    return result.type === "success" && downgrade.value
+      ? { ...result, sessionTypeDowngrade: downgrade.value }
+      : result;
+  };
+
+  const spawnSessionBody = async (
+    requested: SpawnSessionOptions,
+    downgrade: { value?: SessionTypeDowngrade }
   ): Promise<SpawnSessionResult> => {
     logger.debugLargeJson("[DAEMON RUN] Spawning session", requested);
     // Issue #4349 (R3): a TENANT VM never injects CLAUDE_CODE_OAUTH_TOKEN into a Claude session —
@@ -818,9 +858,19 @@ export function createSessionSpawner(
               `[DAEMON RUN] sessionType defaulted to 'worktree' but '${directory}' is not a Git repo — downgrading to 'simple'`
             );
           } else {
+            const reason = describeGitRepoProbeFailure(repoProbe);
             logger.warn(
-              `[DAEMON RUN] Issue #5106: sessionType defaulted to 'worktree' but git could not read '${directory}' (${describeGitRepoProbeFailure(repoProbe)}) — downgrading to 'simple'`
+              `[DAEMON RUN] Issue #5106: sessionType defaulted to 'worktree' but git could not read '${directory}' (${reason}) — downgrading to 'simple'`
             );
+            // Issue #5202 (U2): a probe failure is not the designed scratch-dir
+            // path — it can run the session in the main checkout. Report it and
+            // carry the reason on the spawn result.
+            logger.reportCaught(new Error(reason), {
+              category: "daemon-worktree-probe-downgrade",
+              severity: "warn",
+              context: JSON.stringify({ directory, probe: repoProbe.state }),
+            });
+            downgrade.value = { from: "worktree", to: "simple", reason };
           }
           sessionType = "simple";
         } else {
@@ -841,17 +891,24 @@ export function createSessionSpawner(
         // simple session; an explicit worktree gets a plain-words fix before any
         // side effect. An existing-branch spawn needs no HEAD (it opens the named
         // branch), so it is exempt and keeps its path.
-        // Issue #5106 (R1/R4): the probe reads the HEAD createWorktree branches
-        // from (the main checkout's, via resolveRepoRoot), not the spawn folder's
+        // Issue #5106 (R1/R4): the probe reads the base createWorktree branches
+        // from (#4370: the source branch, else the main checkout's HEAD, via
+        // resolveRepoRoot), not the spawn folder's
         // own HEAD, so an orphan linked worktree is no longer refused. Only an
         // unborn HEAD refuses or downgrades; a probe that cannot tell warns and
         // continues to createWorktree, whose own HEAD check is the backstop.
-        const head = await probeSourceRepoHead(directory);
+        const head = await probeSourceRepoHead(directory, options.sourceBranch);
         if (head.state === "unborn") {
           if (!options.sessionType) {
             logger.debug(
               `[DAEMON RUN] sessionType defaulted to 'worktree' but the branch-from HEAD at '${head.repoRoot}' has no commits yet — downgrading to 'simple'`
             );
+            // Issue #5202 (U2): carry the reason on the spawn result.
+            downgrade.value = {
+              from: "worktree",
+              to: "simple",
+              reason: `the branch-from HEAD at '${head.repoRoot}' has no commits yet`,
+            };
             sessionType = "simple";
           } else {
             logger.debug(
@@ -1094,6 +1151,17 @@ export function createSessionSpawner(
     // Worktree must be created BEFORE the tmux spawn so the directory exists
     // when tmux tries to cd into it
     if (sessionType === "worktree") {
+      // hapimatic-private#4370: an explicit base branch must be a valid branch
+      // name (the server schema checks first; this is the daemon-side check).
+      if (
+        options.sourceBranch !== undefined &&
+        !(await isValidBranchName(options.sourceBranch))
+      ) {
+        return {
+          type: "error",
+          errorMessage: `Invalid source branch name: '${options.sourceBranch}'`,
+        };
+      }
       // #2450 (R4): the expired-worktree purge is now kicked via the
       // single-flight `kickExpiredWorktreePurge()` wrapper (worktree.ts) AFTER
       // createWorktree below — the wrapper resolves the repo root internally, so
@@ -1115,13 +1183,17 @@ export function createSessionSpawner(
         // claimed_port-null meta-write path is already supported (see
         // `createWorktree` in `cli/src/daemon/worktree.ts:381`).
         //
-        // claimWorktreePort and detectSourceBranch both scan/read at the
+        // claimWorktreePort and resolveSourceBranch both scan/read at the
         // *repo root*, so resolve `directory` (which may be a subdir of the
         // repo) to the actual root first. Without this, a spawn from a
         // subdir would scan a non-existent `.worktrees/` and miss sibling
         // claims (port collision risk — code-reviewer M1 on #1145).
         let claimedPort: number | null = null;
-        let resolvedSourceBranch = "ms-dev";
+        // #4370: seeded from the caller's branch so an explicit sourceBranch
+        // survives a resolveRepoRoot failure below. Operator ruling 4370-D1 = C:
+        // fail the create on a missing base only when the caller named it.
+        let resolvedSourceBranch = options.sourceBranch ?? "ms-dev";
+        let failIfBaseMissing = options.sourceBranch !== undefined;
         let resolvedRepoRoot: string | null = null;
         // `worktreeResult` is assigned on every branch below (or the branch
         // early-returns). Hoisted here (was a `const` after the if/else
@@ -1167,7 +1239,12 @@ export function createSessionSpawner(
                   return { kind: "all-claimed" };
                 }
                 claimedPort = port;
-                resolvedSourceBranch = await detectSourceBranch(lockRepoRoot);
+                const src = await resolveWorktreeSourceBranch(
+                  lockRepoRoot,
+                  options.sourceBranch
+                );
+                resolvedSourceBranch = src.branch;
+                failIfBaseMissing = src.reason === "explicit";
                 const result = await createWorktree({
                   basePath: directory,
                   nameHint: worktreeName,
@@ -1175,6 +1252,7 @@ export function createSessionSpawner(
                   hapiSessionId,
                   claimedPort: port,
                   sourceBranch: resolvedSourceBranch,
+                  failIfBaseMissing,
                 });
                 return { kind: "created", result };
               });
@@ -1238,6 +1316,7 @@ export function createSessionSpawner(
                 hapiSessionId,
                 claimedPort: null,
                 sourceBranch: resolvedSourceBranch,
+                failIfBaseMissing,
               });
             }
           } else {
@@ -1249,6 +1328,7 @@ export function createSessionSpawner(
               hapiSessionId,
               claimedPort: null,
               sourceBranch: resolvedSourceBranch,
+              failIfBaseMissing,
             });
           }
         } else {
@@ -1258,7 +1338,12 @@ export function createSessionSpawner(
           // assigned to the hoisted `worktreeResult`.
           try {
             resolvedRepoRoot = await resolveRepoRoot(directory);
-            resolvedSourceBranch = await detectSourceBranch(resolvedRepoRoot);
+            const src = await resolveWorktreeSourceBranch(
+              resolvedRepoRoot,
+              options.sourceBranch
+            );
+            resolvedSourceBranch = src.branch;
+            failIfBaseMissing = src.reason === "explicit";
           } catch (sourceBranchError) {
             logger.warn(
               `[DAEMON RUN] Pre-creation source-branch detect threw (non-fatal, claimPort=false): ${sourceBranchError}`
@@ -1275,6 +1360,7 @@ export function createSessionSpawner(
             hapiSessionId,
             claimedPort,
             sourceBranch: resolvedSourceBranch,
+            failIfBaseMissing,
           });
         }
 

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import { isFetchTransportError } from "../../federation/proxyFetchSignal";
+import {
+  isFetchTransportError,
+  readProxyJson,
+} from "../../federation/proxyFetchSignal";
 import type { ErrorLogger } from "../../logging/errorLogger";
 
 /**
@@ -154,4 +157,37 @@ export function proxyTransportFailure(
   }
 
   return c.json(body, 502);
+}
+
+/**
+ * The read-or-502 step every request proxy shares (#5408, #5433, #5487).
+ *
+ * Reads the peer body with readProxyJson, so an empty or unparseable non-OK
+ * body reads as {} and the caller keeps the peer's real status. A body cut off
+ * mid-read becomes `failure`: the logged transport-failure 502 from
+ * proxyTransportFailure. Any other error (an unparseable OK body, a hub bug)
+ * is rethrown, so app.onError logs a 500 instead of an empty success.
+ *
+ * Usage:
+ * ```ts
+ * const read = await readProxyBodyOr502(c, resp, { errorLogger, nodeId });
+ * if (read.failure) return read.failure;
+ * return c.json(read.body, resp.status as 400 | 404 | 500 | 503);
+ * ```
+ */
+export async function readProxyBodyOr502(
+  c: Context,
+  resp: Response,
+  options: Parameters<typeof proxyTransportFailure>[2]
+): Promise<
+  | { body: Record<string, unknown>; failure?: undefined }
+  | { body?: undefined; failure: Response }
+> {
+  try {
+    return {
+      body: ((await readProxyJson(resp)) ?? {}) as Record<string, unknown>,
+    };
+  } catch (error) {
+    return { failure: proxyTransportFailure(c, error, options) };
+  }
 }

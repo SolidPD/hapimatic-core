@@ -347,6 +347,57 @@ export function resolveCapabilitiesRequest(
   };
 }
 
+/** The server's per-call ceiling for a wait (issue #3816, `sessionStateWaiter`). */
+const WAIT_UNTIL_MAX_MS = 25_000;
+
+const WAIT_UNTIL_USAGE =
+  "Usage: hapi api sessions wait-until <id> --state <state> [--timeout <ms>]";
+
+/**
+ * Issue #3816: build the wait-until request. `--timeout` travels as
+ * `?timeoutMs=` (the server clamps it to 25 000); the HTTP client waits 5 s
+ * longer than the server will hold the request, so a server-side timeout is
+ * always answered rather than cut off.
+ */
+export function resolveWaitUntilRequest(
+  args: string[]
+): { path: string; clientTimeoutMs: number } | { error: string } {
+  const sessionId = args[1];
+  if (!sessionId || sessionId.startsWith("--")) {
+    return { error: WAIT_UNTIL_USAGE };
+  }
+  let state: string | undefined;
+  let timeout: string | undefined;
+  for (let i = 2; i < args.length; i++) {
+    const flag = args[i];
+    const value = args[i + 1];
+    if (flag === "--state" || flag === "--timeout") {
+      if (value === undefined || value.startsWith("--")) {
+        return { error: `${flag} needs a value. ${WAIT_UNTIL_USAGE}` };
+      }
+      if (flag === "--state") state = value;
+      else timeout = value;
+      i++;
+    } else {
+      return { error: `Unknown option "${flag}". ${WAIT_UNTIL_USAGE}` };
+    }
+  }
+  if (!state) return { error: WAIT_UNTIL_USAGE };
+
+  let path = `/api/sessions/${encodeURIComponent(sessionId)}/wait-until/${encodeURIComponent(state)}`;
+  let serverTimeoutMs = WAIT_UNTIL_MAX_MS;
+  if (timeout !== undefined) {
+    if (!/^\d+$/.test(timeout)) {
+      return {
+        error: `--timeout must be a whole number of milliseconds. ${WAIT_UNTIL_USAGE}`,
+      };
+    }
+    serverTimeoutMs = Math.min(Number(timeout), WAIT_UNTIL_MAX_MS);
+    path += `?timeoutMs=${timeout}`;
+  }
+  return { path, clientTimeoutMs: serverTimeoutMs + 5_000 };
+}
+
 async function handleSessions(args: string[]): Promise<void> {
   const action = args[0];
 
@@ -557,6 +608,24 @@ async function handleSessions(args: string[]): Promise<void> {
     return;
   }
 
+  if (action === "wait-until") {
+    // Issue #3816: block until a session reaches a state, or the timeout.
+    // Same-node only; a session on another node answers 409.
+    const resolved = resolveWaitUntilRequest(args);
+    if ("error" in resolved) {
+      console.error(resolved.error);
+      process.exit(1);
+    }
+
+    const jwt = await authenticateCli();
+    const resp = await axios.get(`${configuration.serverUrl}${resolved.path}`, {
+      headers: authHeaders(jwt),
+      timeout: resolved.clientTimeoutMs,
+    });
+    writeStdout(JSON.stringify(resp.data, null, 2));
+    return;
+  }
+
   if (action === "delete") {
     const sessionId = args[1];
     if (!sessionId) {
@@ -751,6 +820,8 @@ ${chalk.bold("Usage:")}
   hapi api sessions send <id> "<message>"              Send a message to a session
   hapi api sessions messages <id>                      Get message history
   hapi api sessions capabilities <id>                  List a session's live RPC capabilities (name + meta)
+  hapi api sessions wait-until <id> --state <state>    Block until the session reaches a state, or the timeout
+                          [--timeout <ms>]             Max wait in ms (default and ceiling 25000)
   hapi api sessions delete <id>                        Delete an inactive session
   hapi api sessions branch <id>                        Branch a session's conversation
   hapi api sessions abort <id>                         Interrupt the active query (session stays active)
@@ -762,6 +833,11 @@ ${chalk.bold("Usage:")}
 ${chalk.bold("Notes:")}
   - 'abort' interrupts the current Claude query but the session stays active
   - 'archive' kills the session process, marking it inactive (required before delete)
+  - 'wait-until' states: idle, busy, blocked, rate-limited, completed, errored. It
+    prints { ok: true, data: { result: "matched"|"timeout", state, sessionId } }.
+    idle must hold 3 s, so a --timeout under 3000 never matches idle. After
+    sending work, wait busy then idle. Same-node only: a session on another
+    node answers 409 federation_unsupported, so poll it instead
   - 'bulk-*' run on each session's owning node and print one result per session
     ({ id, ok, skipped?, code?, error?, queued? }); a session that is not mid-turn
     is skipped by bulk-abort, and bulk-delete refuses a session that is still
@@ -1033,7 +1109,7 @@ ${chalk.bold("Usage:")}
   hapi api auth                Authenticate and print JWT token
   hapi api version             Show server version
   hapi api error-logs <flags>  Query server error_logs (debugging)
-  hapi api call <METHOD> <path> Invoke a catalogued REST capability (tier-gated)
+  hapi api call <METHOD> <path> [--query k=v]...  Invoke a catalogued REST capability (tier-gated)
 
 ${chalk.bold("Run")} ${chalk.cyan("hapi api sessions")} ${chalk.bold("for session subcommand details.")}
 `);
@@ -1059,6 +1135,7 @@ export const API_RESOURCE_ACTIONS: Record<string, readonly string[]> = {
     "send",
     "messages",
     "capabilities",
+    "wait-until",
     "delete",
     "branch",
     "abort",

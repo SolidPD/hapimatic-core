@@ -164,6 +164,9 @@ export async function notifyOriginatingHub(params: {
   spawnCorrelationId?: string;
   success: boolean;
   error?: string;
+  /** Issue #2150 (K-4497-1 §3): the refusal code on failure, when the engine
+   *  returned one — forwarded so the hub can surface it to the caller. */
+  code?: string;
   sessionId?: string;
   deps: FederationDeps;
 }): Promise<void> {
@@ -201,6 +204,7 @@ export async function notifyOriginatingHub(params: {
       spawnCorrelationId: params.spawnCorrelationId,
       success: params.success,
       error: params.error,
+      code: params.code,
       sessionId: params.sessionId,
     };
 

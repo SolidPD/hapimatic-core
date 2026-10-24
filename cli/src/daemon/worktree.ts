@@ -183,7 +183,8 @@ export async function isPreservedBranch(args: {
 
 type SoftDeleteResult =
   | { ok: true; holdingPath: string }
-  | { ok: false; error: string };
+  /** `refused`: the #4450 guard's re-check stopped the move (nothing changed). */
+  | { ok: false; error: string; refused?: true };
 
 type RecoverResult =
   | { ok: true; info: WorktreeInfo }
@@ -363,7 +364,7 @@ export async function runGit(
  * `git merge-base --is-ancestor` (exit 0 = ancestor, exit 1 = not an ancestor).
  * Because `runGit` THROWS on any non-zero exit, a `false` return conflates "not
  * an ancestor" (exit 1) with a genuine git error — both mean "do NOT advance the
- * spawn base off local HEAD", which is the safe direction (Fallback Preservation
+ * spawn base off the local branch", which is the safe direction (Fallback Preservation
  * Rule). Bounded by `runGit`'s timeout; never throws.
  */
 async function gitIsAncestor(
@@ -380,6 +381,45 @@ async function gitIsAncestor(
   } catch {
     return false;
   }
+}
+
+/**
+ * Issue #4370: the commit a ref points at, or `null` when it does not resolve.
+ * Bounded by `runGit`'s timeout; never throws, so a missing ref and a git
+ * error both read as "no such ref" to createWorktree's base resolution. The
+ * cause is logged at `debug` so a timeout is traceable in the daemon log.
+ */
+async function resolveRefSha(
+  repoRoot: string,
+  ref: string
+): Promise<string | null> {
+  try {
+    const result = await runGit(
+      ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+      repoRoot
+    );
+    return result.stdout.trim() || null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.debug(`[worktree] ref ${ref} did not resolve: ${message}`);
+    return null;
+  }
+}
+
+/**
+ * Issue #4370: the two refs a worktree's base can come from — the local branch
+ * and its remote-tracking ref. The ONE lookup shared by createWorktree and
+ * probeSourceRepoHead, so the spawn gate and the create cannot disagree on
+ * which refs count.
+ */
+async function resolveBaseBranchShas(
+  repoRoot: string,
+  branch: string
+): Promise<{ localSha: string | null; originSha: string | null }> {
+  return {
+    localSha: await resolveRefSha(repoRoot, `refs/heads/${branch}`),
+    originSha: await resolveRefSha(repoRoot, `refs/remotes/origin/${branch}`),
+  };
 }
 
 /**
@@ -629,8 +669,16 @@ export async function probeGitRepo(directory: string): Promise<GitRepoProbe> {
     if (!info.isDirectory()) {
       return { state: "not-a-repo" };
     }
-  } catch {
-    return { state: "not-a-repo" };
+  } catch (err) {
+    // #5202 (U4): only a missing path (or a file where a folder is expected)
+    // is "not a repo". EACCES / ELOOP / EIO mean the folder could not be
+    // read — reading those as not-a-repo is the misclassification #5106 set
+    // out to remove (a defaulted spawn would silently run as simple).
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return { state: "not-a-repo" };
+    }
+    return { state: "probe-failed", detail: `stat ${code ?? String(err)}` };
   }
 
   const args = ["rev-parse", "--show-toplevel"];
@@ -664,16 +712,22 @@ export type SourceHeadProbe =
   | { state: "unknown"; detail: string };
 
 /**
- * Issue #5106 (R1/R4): does the HEAD that {@link createWorktree} branches from
+ * Issue #5106 (R1/R4): does the base that {@link createWorktree} branches from
  * have a commit? Never throws.
  *
- * MIRRORS createWorktree's base: `git rev-parse --verify HEAD` at
- * `resolveRepoRoot(basePath)` (the #1435 block; the root is the MAIN checkout,
- * via `--git-common-dir`, #1219), not the HEAD of `basePath` itself, which for a
- * linked worktree is a different branch. If createWorktree's base resolution
- * changes (#4370 Task 3 replaces it with a base-ref resolution), update this
- * probe in the same change. The agreement test in worktree.test.ts fails until
- * it does.
+ * MIRRORS createWorktree's base (#4370): at `resolveRepoRoot(basePath)` (the
+ * MAIN checkout, via `--git-common-dir`, #1219), the source branch
+ * (`sourceBranch`, else `detectSourceBranch`) as `refs/heads/<b>` or
+ * `refs/remotes/origin/<b>` → `present`. Only when neither resolves does
+ * createWorktree fall back to the main checkout's HEAD, and so does this probe:
+ * `git rev-parse --verify HEAD`. Keep the two in step; the agreement test in
+ * worktree.test.ts fails when they diverge. Two differences are deliberate.
+ * The probe does not fetch, so a branch that exists only on the remote and was
+ * never fetched reads from the HEAD fallback here, where createWorktree's fetch
+ * would find it. And for an EXPLICIT branch that resolves nowhere,
+ * createWorktree fails (`failIfBaseMissing`) while this probe still reads HEAD:
+ * on an unborn repo the spawn then shows the no-commits refusal instead of
+ * "Source branch not found".
  *
  * Only exit status 1 (`--quiet` on an unborn HEAD) reads as `unborn`. Any other
  * failure (exit 128, a spawn error, a timeout, or a root that does not resolve,
@@ -681,7 +735,8 @@ export type SourceHeadProbe =
  * createWorktree, whose own HEAD check reports a real failure.
  */
 export async function probeSourceRepoHead(
-  basePath: string
+  basePath: string,
+  sourceBranch?: string
 ): Promise<SourceHeadProbe> {
   let repoRoot: string;
   try {
@@ -692,6 +747,15 @@ export async function probeSourceRepoHead(
       state: "unknown",
       detail: firstGitErrorLine(message) ?? "repository root did not resolve",
     };
+  }
+
+  const baseBranch = sourceBranch ?? (await detectSourceBranch(repoRoot));
+  const { localSha, originSha } = await resolveBaseBranchShas(
+    repoRoot,
+    baseBranch
+  );
+  if (localSha || originSha) {
+    return { state: "present", repoRoot };
   }
 
   const args = ["rev-parse", "--verify", "--quiet", "HEAD"];
@@ -1003,6 +1067,89 @@ export function isWorktreeLive(
     : worktreeDir;
   const prefix = `${normalized}/`;
   return liveCwds.some(cwd => cwd === normalized || cwd.startsWith(prefix));
+}
+
+/** Injectable readers for {@link scanAllProcCwds} (tests never touch real
+ *  processes); each default reads the live `/proc`. */
+export interface ProcScanSeams {
+  platform?: string;
+  listPids?: () => Promise<string[]>;
+  readCwd?: (pid: string) => Promise<string>;
+  /** The uid owning `/proc/<pid>` (who the process runs as). */
+  ownerUid?: (pid: string) => Promise<number>;
+  selfUid?: number;
+  selfPid?: string;
+}
+
+function errnoCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+/**
+ * The liveness scan for the guarded removal (#4450 R5): the cwd of EVERY
+ * process, with no `comm` filter, and every failure reported instead of
+ * swallowed — so a caller can refuse when it cannot prove a worktree idle.
+ * `listLiveCwds` stays as it is: it keeps five process names and drops a
+ * `/proc` read failure, which is fine for a port reclaim but not for a delete.
+ *
+ * Reported as errors: a non-Linux host, a failed `/proc` listing, a cwd read
+ * that fails with any other errno (any user's process), an unreadable
+ * (`EACCES`/`EPERM`) cwd of a process that runs as the daemon's own user, and a
+ * failed owner lookup of such a process. Skipped: the daemon's own process, a
+ * process that exited mid-scan (`ENOENT`/`ESRCH`) and another user's process
+ * whose cwd may not be read (`EACCES`/`EPERM`) — every host runs those, and an
+ * agent session runs as the daemon's user. Never throws.
+ */
+export async function scanAllProcCwds(
+  seams: ProcScanSeams = {}
+): Promise<{ cwds: string[]; errors: string[] }> {
+  const platform = seams.platform ?? process.platform;
+  if (platform !== "linux") {
+    return { cwds: [], errors: [`no /proc on platform ${platform}`] };
+  }
+  const listPids = seams.listPids ?? (() => readdir("/proc"));
+  const readCwd = seams.readCwd ?? (pid => readlink(`/proc/${pid}/cwd`));
+  const ownerUid =
+    seams.ownerUid ?? (async pid => (await stat(`/proc/${pid}`)).uid);
+  const selfUid = seams.selfUid ?? process.getuid?.();
+  const selfPid = seams.selfPid ?? String(process.pid);
+
+  let entries: string[];
+  try {
+    entries = await listPids();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { cwds: [], errors: [`readdir(/proc): ${message}`] };
+  }
+
+  const cwds = new Set<string>();
+  const errors: string[] = [];
+  for (const pid of entries) {
+    if (!/^\d+$/.test(pid) || pid === selfPid) continue;
+    try {
+      cwds.add((await readCwd(pid)).replace(/ \(deleted\)$/, ""));
+      continue;
+    } catch (error) {
+      const code = errnoCode(error);
+      if (code === "ENOENT" || code === "ESRCH") continue;
+      if (code !== "EACCES" && code !== "EPERM") {
+        errors.push(`cwd of pid ${pid}: ${code ?? String(error)}`);
+        continue;
+      }
+    }
+    // Permission denied: refuse only when the process is the daemon's own user.
+    try {
+      if ((await ownerUid(pid)) === selfUid) {
+        errors.push(`cwd of own-user pid ${pid} is unreadable`);
+      }
+    } catch (error) {
+      const code = errnoCode(error);
+      if (code !== "ENOENT" && code !== "ESRCH") {
+        errors.push(`owner of pid ${pid}: ${code ?? String(error)}`);
+      }
+    }
+  }
+  return { cwds: [...cwds], errors };
 }
 
 /**
@@ -1536,9 +1683,16 @@ export async function createWorktree(options: {
   /** Port to record in `.worktree-meta.json`. Pass `null` for the two-phase
    * write (caller patches the port after a later claim). Defaults to `null`. */
   claimedPort?: number | null;
-  /** Source branch to record in `.worktree-meta.json`. Defaults to the result
-   * of `detectSourceBranch(repoRoot)` (current HEAD of the parent repo). */
+  /** Branch the worktree is cut from, also recorded as `source_branch` in
+   * `.worktree-meta.json`. The base commit is `refs/heads/<b>` when it exists,
+   * else `refs/remotes/origin/<b>`, never the parent repo's HEAD (#4370).
+   * Defaults to `detectSourceBranch(repoRoot)`, the repo's target branch. */
   sourceBranch?: string;
+  /** Issue #4370 (operator ruling 4370-D1 = C): fail the create when
+   * `sourceBranch` resolves to neither ref. Set it when the caller named the
+   * branch explicitly. Unset (the default), a missing branch falls back to the
+   * parent's HEAD and logs a `warn` with `fallback:head-commit`. */
+  failIfBaseMissing?: boolean;
   /** Issue number to record. `undefined` falls back to extraction from the
    * branch name via `^issue-(\d+)`; `null` writes `null` explicitly. */
   issueNumber?: number | null;
@@ -1609,50 +1763,20 @@ export async function createWorktree(options: {
     });
   }
 
-  // Issue #1435: resolve HEAD once, BEFORE the attempt loop. Pass the resolved
-  // commit by value to `git worktree add` (last positional arg) so git does
-  // not need to do its own HEAD discovery. The daemon's execution context
-  // intermittently fails the implicit discovery with
-  // `fatal: not a valid object name: 'HEAD'` against repos whose HEAD
-  // demonstrably resolves from a shell. Resolving HEAD ourselves and passing
-  // it by value structurally eliminates that failure surface regardless of
-  // the underlying mechanism. HEAD does not change across retry attempts, so
-  // resolving once is correct.
-  let headCommit: string;
-  try {
-    const headResult = await runGit(
-      ["rev-parse", "--verify", "HEAD"],
-      repoRoot
-    );
-    headCommit = headResult.stdout.trim();
-    if (!headCommit) {
-      throw new Error("HEAD resolved to empty string");
-    }
-  } catch (headError) {
-    const message =
-      headError instanceof Error ? headError.message : String(headError);
-    return {
-      ok: false,
-      error: `Source repo HEAD not resolvable at ${repoRoot}: ${message}. The repo may be in an unborn-branch state.`,
-    };
-  }
-
   // Issue #1470: branch the worktree from origin/<sourceBranch>'s tip when the
   // parent clone's local source branch is behind origin — otherwise every
   // worktree silently inherits a stale snapshot (right branch, but missing
   // commits that already landed on origin). Resolve the source-branch LABEL once
-  // here and reuse it for BOTH the fetch below AND the `.worktree-meta.json`
-  // write further down (the caller passes `sourceBranch` for spawn-path worktrees;
-  // detectSourceBranch is the local-HEAD fallback for ad-hoc callers).
+  // here and reuse it for the fetch, the base-ref lookup AND the
+  // `.worktree-meta.json` write further down (the caller passes `sourceBranch`
+  // for spawn-path worktrees; detectSourceBranch resolves the repo's target
+  // branch for ad-hoc callers, #4370).
   const baseBranch =
     options.sourceBranch ?? (await detectSourceBranch(repoRoot));
 
-  // Default to the local HEAD — this preserves prior behavior and is the
-  // non-fatal fallback for R2 (fetch failure) and R3 (local ahead/diverged).
-  // We only ADVANCE to origin's tip when the local source branch is strictly
-  // BEHIND origin/<baseBranch> (ancestry guard) — the fast path augments, never
-  // replaces, the local-HEAD base (Fallback Preservation Rule, ~/CLAUDE.md).
-  let baseCommit = headCommit;
+  // Fetch first so the origin ref below is current. Non-fatal: a failed or
+  // timed-out fetch still leaves the last-fetched `refs/remotes/origin/<b>`,
+  // which the lookup below reads anyway (#4370).
   try {
     // Route the fetch through runGit so an unroutable/auth-failing origin is
     // bounded by its timeout (SIGKILL) and cannot hang the spawn (R4).
@@ -1663,7 +1787,7 @@ export async function createWorktree(options: {
     // Issue #1557: this fetch-first base (added by #1470) is the non-fatal twin
     // of syncConfigFromMain's config fetch. It takes the SAME short, independent
     // budget (HAPI_GIT_FETCH_TIMEOUT_MS, default 8s) so a slow/hung fetch fails
-    // fast to the local-HEAD fallback below WITHOUT consuming the fatal
+    // fast to the local-ref lookup below WITHOUT consuming the fatal
     // worktree-add budgets (HAPI_GIT_TIMEOUT_MS for the registration,
     // HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS for the checkout, #4058).
     // [perf] issue #2147 stage (d1): time createWorktree's base-branch fetch —
@@ -1678,57 +1802,88 @@ export async function createWorktree(options: {
     logger.debug(
       `[perf][spawn] stage=worktree-fetch which=createWorktree branch=${baseBranch} ms=${Date.now() - perfCwFetchT0}`
     );
-
-    let originSha = "";
-    try {
-      const originResult = await runGit(
-        ["rev-parse", "--verify", `refs/remotes/origin/${baseBranch}`],
-        repoRoot
-      );
-      originSha = originResult.stdout.trim();
-    } catch (originRefError) {
-      // Fetch succeeded but the origin ref is missing (unusual refspec) — keep
-      // the local-HEAD base, non-fatal.
-      const message =
-        originRefError instanceof Error
-          ? originRefError.message
-          : String(originRefError);
-      logger.warn(
-        `[worktree] createWorktree: origin/${baseBranch} not resolvable after fetch (non-fatal): ${message}. Branching from local HEAD ${headCommit}.`
-      );
-    }
-
-    if (originSha && originSha !== headCommit) {
-      if (await gitIsAncestor(repoRoot, headCommit, originSha)) {
-        // Local source branch is strictly behind origin — advance the spawn base
-        // to origin's tip so the worktree gets the already-merged commits (R1).
-        baseCommit = originSha;
-        logger.info(
-          `[worktree] createWorktree: advancing base from local HEAD ${headCommit} to origin/${baseBranch} ${originSha} (local was behind).`
-        );
-      } else {
-        // Local has commits not on origin (ahead/diverged) — branch from local
-        // HEAD to preserve those commits (R3, ancestry guard). Detached-HEAD
-        // parents land here too (a detached commit that isn't an ancestor of
-        // origin/<baseBranch> falls back to itself).
-        logger.warn(
-          `[worktree] createWorktree: local HEAD ${headCommit} is not an ancestor of origin/${baseBranch} ${originSha} (ahead/diverged); branching from local HEAD to preserve local commits.`
-        );
-      }
-    }
   } catch (fetchError) {
     // Fetch failed (offline / auth / timeout / no origin remote) — non-fatal
-    // fallback to local HEAD (R2). Parity with syncConfigFromMain.
+    // (R2). The lookup below still reads the last-fetched origin ref, so a
+    // transient fetch failure never reads as "branch not found" (#4370).
     const message =
       fetchError instanceof Error ? fetchError.message : String(fetchError);
     logger.warn(
-      `[worktree] createWorktree: git fetch origin ${baseBranch} failed (non-fatal): ${message}. Branching from local HEAD ${headCommit}.`
+      `[worktree] createWorktree: git fetch origin ${baseBranch} failed (non-fatal): ${message}. Resolving the base from the local refs.`
     );
     logger.reportCaught(fetchError, {
       category: "daemon-worktree-fetch-base",
       severity: "warn",
     });
   }
+
+  // Issue #4370: the base COMMIT follows the resolved branch, never the
+  // parent's HEAD: `refs/heads/<b>` when it exists, else
+  // `refs/remotes/origin/<b>`. When the parent is checked out on <b>,
+  // `refs/heads/<b>` IS its HEAD, so the #1470 R3 case (local ahead of origin
+  // → local tip) needs no special case.
+  //
+  // Issue #1435: the commit is resolved once, BEFORE the attempt loop, and
+  // passed by value to `git worktree add` (last positional arg), so git never
+  // does its own HEAD discovery — the daemon's execution context
+  // intermittently failed that with `fatal: not a valid object name: 'HEAD'`.
+  const { localSha, originSha } = await resolveBaseBranchShas(
+    repoRoot,
+    baseBranch
+  );
+
+  let baseCommit: string;
+  let baseRef: string;
+  if (localSha) {
+    baseCommit = localSha;
+    baseRef = `refs/heads/${baseBranch}`;
+    // #1470: ADVANCE to origin's tip only when the local branch is strictly
+    // BEHIND it (ancestry guard). Ahead/diverged keeps the local commits.
+    // The fast path augments, never replaces, the local base (Fallback
+    // Preservation Rule, ~/CLAUDE.md).
+    if (originSha && originSha !== localSha) {
+      if (await gitIsAncestor(repoRoot, localSha, originSha)) {
+        baseCommit = originSha;
+        baseRef = `refs/remotes/origin/${baseBranch}`;
+        logger.info(
+          `[worktree] createWorktree: advancing base from ${baseBranch} ${localSha} to origin/${baseBranch} ${originSha} (local was behind).`
+        );
+      } else {
+        logger.warn(
+          `[worktree] createWorktree: ${baseBranch} ${localSha} is not an ancestor of origin/${baseBranch} ${originSha} (ahead/diverged); branching from the local branch to preserve its commits.`
+        );
+      }
+    }
+  } else if (originSha) {
+    baseCommit = originSha;
+    baseRef = `refs/remotes/origin/${baseBranch}`;
+  } else {
+    // Neither ref resolves. Operator ruling 4370-D1 = C: a branch the caller
+    // named explicitly fails the create, because it cannot be "used exactly"
+    // (R2); a daemon-resolved default keeps the degraded path and is cut from
+    // the parent's HEAD under a label that does not match it.
+    if (options.failIfBaseMissing) {
+      return {
+        ok: false,
+        error: `Source branch '${baseBranch}' not found locally or on origin at ${repoRoot}`,
+      };
+    }
+    const headSha = await resolveRefSha(repoRoot, "HEAD");
+    if (!headSha) {
+      return {
+        ok: false,
+        error: `Source repo HEAD not resolvable at ${repoRoot}. The repo may be in an unborn-branch state.`,
+      };
+    }
+    baseCommit = headSha;
+    baseRef = "HEAD";
+    logger.warn(
+      `[worktree] createWorktree: base branch '${baseBranch}' not found locally or on origin at ${repoRoot} (reason: fallback:head-commit); branching from the parent HEAD ${headSha}, so the recorded source_branch does not match the base.`
+    );
+  }
+  logger.info(
+    `[worktree] createWorktree: base ${baseRef} ${baseCommit} (source branch ${baseBranch}) for ${repoRoot}`
+  );
 
   attemptLoop: for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
     const name =
@@ -1789,7 +1944,7 @@ export async function createWorktree(options: {
             const action = classifyWorktreeAddFailure(runGitAttempts, errMsg);
             if (action === "retry-head") {
               logger.warn(
-                `[worktree] git worktree add hit HEAD-failure on attempt ${runGitAttempts}; retrying once. headCommit=${headCommit} raw=${errMsg}`
+                `[worktree] git worktree add hit HEAD-failure on attempt ${runGitAttempts}; retrying once. base=${baseRef} ${baseCommit} raw=${errMsg}`
               );
               logger.reportCaught(addError, {
                 category: "daemon-worktree-add-head-retry",
@@ -2355,7 +2510,12 @@ export async function resolveGitCommonDir(
     );
     const commonDir = result.stdout.trim();
     return commonDir || null;
-  } catch {
+  } catch (err) {
+    // #5202 (U6): a null key makes this worktree fetch on its own, which
+    // brings back the per-record fetches #5117 removed — log why.
+    logger.debug(
+      `[worktree] could not resolve the git common dir of ${worktreePath}, fetching without coalescing: ${err instanceof Error ? err.message : String(err)}`
+    );
     return null;
   }
 }
@@ -2422,7 +2582,12 @@ export function createSourceBranchFetchCoalescer(
       return entry.inFlight;
     }
     if (entry.attempts >= maxAttempts) {
-      throw entry.lastError;
+      // #5202 (U6): label the rethrow, so a record that never ran a fetch of
+      // its own does not report another record's failure as if it were fresh.
+      throw new Error(
+        `stored fetch failure after ${entry.attempts} attempt(s): ${entry.lastError instanceof Error ? entry.lastError.message : String(entry.lastError)}`,
+        { cause: entry.lastError }
+      );
     }
     entry.attempts++;
     const current = entry;
@@ -2923,8 +3088,18 @@ export async function softDeleteWorktree(options: {
   worktreePath: string;
   branch: string;
   sessionId?: string;
+  /**
+   * #4450: the guarded removal (`cleanupIdleWorktree`). It kills no process:
+   * `recheck` runs right before the move and returns a refusal message when the
+   * worktree is no longer idle, and `keepBranch` records the branch as
+   * `existing-local` in the trash meta so the purge keeps it.
+   */
+  guard?: {
+    recheck: () => Promise<string | null>;
+    keepBranch: boolean;
+  };
 }): Promise<SoftDeleteResult> {
-  const { basePath, worktreePath, branch, sessionId } = options;
+  const { basePath, worktreePath, branch, sessionId, guard } = options;
 
   // Issue #1558: resolve the host base so the trash dir lands on the SAME
   // filesystem as a relocated worktree — otherwise `git worktree move` below
@@ -2943,33 +3118,42 @@ export async function softDeleteWorktree(options: {
   // A pre-existing branch is recorded as such in the trash meta when EITHER
   // the worktree meta or the branch's git-config marker says so.
   const metaOrigin = await readWorktreeBranchOrigin(worktreePath);
-  const branchOrigin: BranchOrigin = (await isPreservedBranch({
-    repoRoot: basePath,
-    branch,
-    metaOrigin,
-  }))
-    ? "existing-local"
-    : metaOrigin;
+  const branchOrigin: BranchOrigin =
+    guard?.keepBranch ||
+    (await isPreservedBranch({
+      repoRoot: basePath,
+      branch,
+      metaOrigin,
+    }))
+      ? "existing-local"
+      : metaOrigin;
 
   const worktreeName = basename(worktreePath);
   const timestamp = Date.now();
   const holdingName = `${worktreeName}-${timestamp}`;
   const holdingPath = join(trashDir, holdingName);
 
-  // Issue #1031: SIGTERM any process holding a cwd inside the worktree BEFORE
-  // the git worktree move. Otherwise tsservers/vitest/bash retain an open cwd
-  // on the now-moved inode and become ghosts on a (deleted) path.
-  const killResult = await killProcessesWithCwdUnder(worktreePath);
-  logProcessHygieneEvent({
-    source: "cli-worktree",
-    action: "kill",
-    path: worktreePath,
-    sessionId,
-    pidsTerminated: killResult.terminated,
-    pidsKilled: killResult.killed,
-    errors: killResult.errors.length ? killResult.errors : undefined,
-    reason: "soft-delete",
-  });
+  if (guard) {
+    // #4450: never kill on the guarded path — refuse instead if a holder
+    // appeared since the caller's idle check.
+    const refusal = await guard.recheck();
+    if (refusal) return { ok: false, error: refusal, refused: true };
+  } else {
+    // Issue #1031: SIGTERM any process holding a cwd inside the worktree BEFORE
+    // the git worktree move. Otherwise tsservers/vitest/bash retain an open cwd
+    // on the now-moved inode and become ghosts on a (deleted) path.
+    const killResult = await killProcessesWithCwdUnder(worktreePath);
+    logProcessHygieneEvent({
+      source: "cli-worktree",
+      action: "kill",
+      path: worktreePath,
+      sessionId,
+      pidsTerminated: killResult.terminated,
+      pidsKilled: killResult.killed,
+      errors: killResult.errors.length ? killResult.errors : undefined,
+      reason: "soft-delete",
+    });
+  }
 
   try {
     await runGit(["worktree", "move", worktreePath, holdingPath], basePath);
@@ -3185,6 +3369,222 @@ export async function cleanupWorktreeAndBranch(options: {
   }
 
   return { ok: true };
+}
+
+/** The stable refusal codes of {@link cleanupIdleWorktree} (#4450). */
+export type IdleWorktreeRefusal =
+  | "invalid_request"
+  | "worktree_not_found"
+  | "symlink_escape"
+  | "worktree_in_use"
+  | "worktree_owner_unknown"
+  | "worktree_owner_mismatch"
+  | "worktree_instance_claimed"
+  | "branch_unknown"
+  | "protected_branch"
+  | "soft_delete_failed";
+
+export type IdleWorktreeResult =
+  | { ok: true; holdingPath: string; keptBranch: boolean }
+  | { ok: false; code: IdleWorktreeRefusal; error: string };
+
+/** Branches the guarded removal never takes a worktree off, besides the
+ *  meta's `source_branch` and the branch `origin/HEAD` names. */
+const ALWAYS_PROTECTED_BRANCHES = ["ms-dev", "main", "master"];
+
+/**
+ * The guarded worktree removal behind the operator `remove_worktree` tool
+ * (#4450 R4 meta half, R5, R9, R11). Unlike `cleanupWorktreeAndBranch`, which
+ * session delete uses and which is unchanged, it REFUSES rather than forces:
+ * every check below runs before anything changes on disk, it never kills a
+ * process, never stops a worktree instance, never hard-deletes, and never runs
+ * `git branch -D`. The worktree is only moved to `.worktrees/.trash/`, where
+ * `recoverWorktree` (`hapi-worktree.sh recover`) can restore it.
+ *
+ * Checks, in order: the real path is a direct child of `<hostBase>/.worktrees/`
+ * (a symlink cannot lead out); no process of any name has its cwd inside it,
+ * proven by a scan that reports its own failures; the `.worktree-meta.json`
+ * parses (read ONCE — every later check uses that copy) and names
+ * `expectedOwnerTag`; the meta holds an explicit `"claimed_port": null`; the
+ * HEAD branch is not the meta's `source_branch`, the `origin/HEAD` branch,
+ * `ms-dev`, `main` or `master`.
+ *
+ * Branch keeping (R11): the trash record marks the branch `existing-local` (the
+ * purge's keep signal) unless the meta has no `branch_origin`, the branch has no
+ * `hapimaticOrigin` marker, and HEAD is on `branch`, the branch the server
+ * recorded. Anything else means the branch may not be the session's own.
+ */
+export async function cleanupIdleWorktree(
+  options: {
+    basePath: string;
+    worktreePath: string;
+    branch: string;
+    expectedOwnerTag: string;
+    sessionId?: string;
+  },
+  seams: { scan?: () => Promise<{ cwds: string[]; errors: string[] }> } = {}
+): Promise<IdleWorktreeResult> {
+  const { basePath, worktreePath, branch, expectedOwnerTag, sessionId } =
+    options;
+  const refuse = (
+    code: IdleWorktreeRefusal,
+    error: string
+  ): IdleWorktreeResult => ({ ok: false, code, error });
+  const scan = seams.scan ?? (() => scanAllProcCwds());
+
+  // 1. Path: lexical containment first, then the same test on the real paths.
+  const hostBase = resolveWorktreeHostBase(basePath);
+  const lexical = isWithinWorktreeBase(hostBase, worktreePath);
+  if (!lexical.valid) {
+    return refuse("invalid_request", lexical.error ?? "invalid worktreePath");
+  }
+  let realBase: string;
+  let realWorktree: string;
+  try {
+    realBase = await realpath(hostBase);
+    realWorktree = await realpath(worktreePath);
+  } catch (error) {
+    return refuse(
+      "worktree_not_found",
+      `cannot resolve ${worktreePath}: ${errnoCode(error) ?? String(error)}`
+    );
+  }
+  const worktreesRoot = join(realBase, ".worktrees");
+  if (
+    dirname(realWorktree) !== worktreesRoot ||
+    basename(realWorktree) === TRASH_DIR_NAME
+  ) {
+    return refuse(
+      "symlink_escape",
+      `${worktreePath} resolves to ${realWorktree}, not a worktree directly under ${worktreesRoot}`
+    );
+  }
+
+  // 2. Liveness: any holder, or any doubt, refuses.
+  const inUse = async (): Promise<string | null> => {
+    const { cwds, errors } = await scan();
+    if (errors.length > 0) {
+      return `cannot prove the worktree idle: ${errors.slice(0, 3).join("; ")}`;
+    }
+    return isWorktreeLive(realWorktree, cwds)
+      ? `a live process has its cwd inside ${realWorktree}`
+      : null;
+  };
+  const busy = await inUse();
+  if (busy) return refuse("worktree_in_use", busy);
+
+  // 3. Owner: read and parse the meta once.
+  let raw: Record<string, unknown>;
+  try {
+    const parsedJson: unknown = JSON.parse(
+      await readFile(join(realWorktree, ".worktree-meta.json"), "utf-8")
+    );
+    if (!parsedJson || typeof parsedJson !== "object") {
+      throw new Error("not a JSON object");
+    }
+    raw = parsedJson as Record<string, unknown>;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return refuse("worktree_owner_unknown", `unreadable meta: ${reason}`);
+  }
+  const meta = WorktreeMetaSchema.partial().safeParse(raw);
+  if (!meta.success) {
+    return refuse(
+      "worktree_owner_unknown",
+      `invalid meta: ${meta.error.issues[0]?.message ?? "schema mismatch"}`
+    );
+  }
+  const owner = meta.data.session_id;
+  if (!owner || !expectedOwnerTag) {
+    return refuse("worktree_owner_unknown", "the meta names no owner session");
+  }
+  if (owner !== expectedOwnerTag) {
+    return refuse(
+      "worktree_owner_mismatch",
+      "the meta's owner is not the session the server recorded"
+    );
+  }
+
+  // 4. Instance claim: only an explicit null means no instance owns a port.
+  if (!Object.hasOwn(raw, "claimed_port") || raw.claimed_port !== null) {
+    return refuse(
+      "worktree_instance_claimed",
+      "the worktree still holds an instance port claim; stop its instance first"
+    );
+  }
+
+  // 5. Branch: never take a worktree off a source or default branch.
+  let actualBranch = "";
+  try {
+    actualBranch = (
+      await runGit(["symbolic-ref", "--short", "HEAD"], realWorktree)
+    ).stdout.trim();
+  } catch {
+    // Detached or unreadable HEAD: refused below.
+  }
+  if (!actualBranch) {
+    return refuse("branch_unknown", "the worktree's HEAD is not on a branch");
+  }
+  const protectedBranches = new Set(ALWAYS_PROTECTED_BRANCHES);
+  if (meta.data.source_branch) protectedBranches.add(meta.data.source_branch);
+  try {
+    const originHead = (
+      await runGit(
+        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        basePath
+      )
+    ).stdout.trim();
+    if (originHead) protectedBranches.add(originHead.replace(/^origin\//, ""));
+  } catch {
+    // No origin/HEAD: the fixed names and source_branch still apply.
+  }
+  if (protectedBranches.has(actualBranch)) {
+    return refuse(
+      "protected_branch",
+      `the worktree is on ${actualBranch}, a protected branch`
+    );
+  }
+
+  // R11: keep the branch unless all three records say the session made it.
+  let markerPresent = true;
+  try {
+    markerPresent =
+      (
+        await runGit(
+          [
+            "config",
+            "--default",
+            "",
+            "--get",
+            `branch.${actualBranch}.hapimaticOrigin`,
+          ],
+          basePath
+        )
+      ).stdout.trim() !== "";
+  } catch {
+    // An unreadable marker counts as present: fail toward keeping the branch.
+  }
+  const keepBranch =
+    meta.data.branch_origin !== undefined ||
+    markerPresent ||
+    actualBranch !== branch;
+
+  const soft = await softDeleteWorktree({
+    basePath,
+    worktreePath: realWorktree,
+    branch: actualBranch,
+    sessionId,
+    guard: { recheck: inUse, keepBranch },
+  });
+  if (!soft.ok) {
+    return soft.refused
+      ? refuse("worktree_in_use", soft.error)
+      : refuse("soft_delete_failed", soft.error);
+  }
+  // The move leaves the branch in place (only the purge can delete it), so the
+  // #2007 backup runs after it and a refusal above changes nothing at all.
+  if (!keepBranch) await backupUnpushedBranch(basePath, actualBranch);
+  return { ok: true, holdingPath: soft.holdingPath, keptBranch: keepBranch };
 }
 
 /**

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { isAbsolute, resolve, sep } from "node:path";
-import { isSafeMachinePath, machinePathDenial } from "../utils/pathSecurity";
+import {
+  isSafeMachinePath,
+  machinePathDenial,
+  machinePathPrefixDenial,
+} from "../utils/pathSecurity";
 
 /**
  * Destination containment for the Configuration Porter import path (issue #2343,
@@ -23,8 +27,10 @@ import { isSafeMachinePath, machinePathDenial } from "../utils/pathSecurity";
  * to the destination ROOT and to system prefixes only — never to a path part
  * inside the root. A contained `skills/x/.config/app.json` is an honest file; a
  * credential-bearing name inside the root is skipped per member by the planners
- * instead (`credentialPathPart`, ./planSections, ./plannedDestinations). The
- * read surface keeps {@link assertContained}'s whole-path denylist unchanged.
+ * instead (`credentialPathPart`, ./planSections, ./plannedDestinations), and a
+ * registered hook file with such a name refuses the archive (`planHookFiles`,
+ * ./planHooks: a hook file has no omission channel). The read surface keeps
+ * {@link assertContained}'s whole-path denylist unchanged.
  */
 
 /** The kind of an archive member, as classified by the tar parser. */
@@ -184,8 +190,10 @@ export function isContained(destRoot: string, candidate: string): boolean {
 }
 
 /**
- * Full per-entry archive safety gate: containment ({@link assertContained}) PLUS
- * a link-kind rejection. Symlink and hardlink members are refused outright — a
+ * Full per-entry archive safety gate: lexical containment (`containLexically`,
+ * the first half of {@link assertContained}; its whole-path denylist is replaced
+ * by the root and prefix checks below) PLUS a link-kind rejection. Symlink and
+ * hardlink members are refused outright — a
  * symlink member is a classic escape vector (its target can point anywhere, and
  * a later write THROUGH it escapes containment even though its own path is
  * contained). Returns the resolved absolute path for a `file`/`directory` entry.
@@ -196,7 +204,9 @@ export function isContained(destRoot: string, candidate: string): boolean {
  * Issue #4172: after lexical containment, the denylist is applied to the
  * destination ROOT (a root that is itself sensitive refuses the archive) and to
  * system PREFIXES on the resolved path (a root such as `/var` must not reach
- * `/var/log`), but NOT to path parts inside the root — containment governs
+ * `/var/log`, whatever parts the member holds: #4321 checks the prefixes on
+ * their own, so an allowed part such as `.config` in `log/.config/x` cannot
+ * hide one), but NOT to path parts inside the root — containment governs
  * there, so `skills/x/.config/app.json` imports. Credential-bearing names inside
  * the root are handled per member by the planners, never here.
  */
@@ -229,8 +239,11 @@ export function assertSafeEntry(
       "root"
     );
   }
-  const denial = machinePathDenial(resolved);
-  if (denial?.kind === "prefix") {
+  // #4321 (F4): prefixes only, checked on their own. machinePathDenial returns
+  // a path part first, so a member such as log/.config/x under the root /var
+  // would hide the /var/log prefix behind its allowed .config part.
+  const denial = machinePathPrefixDenial(resolved);
+  if (denial !== null) {
     throw new DenylistedDestinationError(
       destRoot,
       entry.path,

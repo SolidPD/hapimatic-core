@@ -40,8 +40,10 @@ import type {
   PorterTokenState,
   PorterTokenStatus as PorterTokenStatusBase,
   PorterSourceId,
+  SettingsLinkState,
   SettingsScriptNameVerdict,
   SourceRecord,
+  SymlinkedSettingsReason,
 } from "@hapi/protocol/porter";
 
 /**
@@ -427,7 +429,8 @@ export interface ImportPlanSummary {
    */
   settingsLink?: {
     target: string;
-    state: "inside" | "outside" | "dangling" | "loop" | "not-regular";
+    /** #4288: the shared `@hapi/protocol/porter` vocabulary, not a mirror. */
+    state: SettingsLinkState;
   };
   hooks: {
     count: number;
@@ -440,7 +443,11 @@ export interface ImportPlanSummary {
   };
   mcpServers: PlannedMcpServer[];
   plugins: { descriptorPresent: boolean; remediation: string[] };
-  /** The exporter's omissions plus any importer notice that is not a policy refusal. */
+  /**
+   * Everything the plan recorded, refusals included (#5202 U8): `policySkips`
+   * is the refusal subset, which the review subtracts before rendering this
+   * list. A server between #4156 and #5202 sent only the non-refusal part.
+   */
   omissions: Omission[];
   /**
    * #4156: the importer's policy refusals (a skipped CLAUDE.md include, section
@@ -448,6 +455,11 @@ export interface ImportPlanSummary {
    * from a server that predates #4156.
    */
   policySkips?: Omission[];
+  /**
+   * #5202 (U10): the importer's notices, rendered as "Imported with a note"
+   * (also in `omissions`). Absent from a server that predates #5202.
+   */
+  notices?: Omission[];
   expiresAt: number;
 }
 
@@ -458,13 +470,13 @@ export interface ImportPlanSummary {
  * byte-exact, replaces the link, provided the link still reads `target` and the
  * selection still merges settings.json. MIRROR of the echo built in
  * `server/src/web/routes/porterImport.ts` from `SymlinkedSettingsError`;
- * `reason` mirrors `SymlinkedSettingsReason` in
- * `server/src/porter/importArchiveErrors.ts`.
+ * `reason` is the shared `SymlinkedSettingsReason` (`@hapi/protocol/porter`,
+ * #4288) the server error uses, so the two cannot drift.
  */
 export interface SymlinkedSettingsRefusal {
   linkPath: string;
   target: string;
-  reason: "outside-root" | "dangling" | "loop" | "not-regular";
+  reason: SymlinkedSettingsReason;
 }
 
 /** Per-config-file MCP merge outcome. */
@@ -629,4 +641,9 @@ export interface ImportResult {
   parity: ImportParity;
   /** #4173 (D4): carried scripts not written because every setting that runs them was kept. */
   settingsScriptsHeld: { destPath: string; keys: string[] }[];
+  /**
+   * #5202 (U12): notes the commit's choices produced (an include written while
+   * CLAUDE.md was not). Absent from a server that predates #5202.
+   */
+  notices?: Omission[];
 }

@@ -13,6 +13,7 @@ import { spawnHappyCLI } from "@/utils/spawnHappyCLI";
 import { maybeAutoStartServer } from "@/utils/autoStartServer";
 import { withBunRuntimeEnv } from "@/utils/bunRuntime";
 import { formatDaemonBuildSkew } from "@/version";
+import { buildRootHelpText } from "./helpText";
 import type { CommandDefinition } from "./types";
 
 function extractErrorInfo(error: unknown): {
@@ -137,39 +138,7 @@ export const claudeCommand: CommandDefinition = {
     }
 
     if (showHelp) {
-      console.log(`
-${chalk.bold("hapi")} - Claude Code On the Go
-
-${chalk.bold("Usage:")}
-  hapi [options]         Start Claude with Telegram control (direct-connect)
-  hapi auth              Manage authentication
-  hapi codex             Start Codex mode
-  hapi gemini            Start Gemini ACP mode
-  hapi opencode          Start OpenCode ACP mode
-  hapi mcp               Start MCP stdio bridge
-  hapi connect           (not available in direct-connect mode)
-  hapi notify            (not available in direct-connect mode)
-  hapi server            Start the API + web server
-  hapi daemon            Manage background service that allows
-                            to spawn new sessions away from your computer
-  hapi doctor            System diagnostics & troubleshooting
-
-${chalk.bold("Examples:")}
-  hapi                    Start session (will prompt for token if not set)
-  hapi auth login         Configure CLI_API_TOKEN interactively
-  hapi --yolo             Start with bypassing permissions
-                            hapi sugar for --dangerously-skip-permissions
-  hapi auth status        Show direct-connect status
-  hapi doctor             Run diagnostics
-
-${chalk.bold("hapi supports ALL Claude options!")}
-  Use any claude flag with hapi as you would with claude. Our favorite:
-
-  hapi --resume
-
-${chalk.gray("─".repeat(60))}
-${chalk.bold.cyan("Claude Code Options (from `claude --help`):")}
-`);
+      console.log(buildRootHelpText());
 
       try {
         const claudeHelp = execFileSync("claude", ["--help"], {

@@ -7,6 +7,7 @@ import type {
 import { errorReporter } from "@/lib/error-reporter";
 import {
   isNodeUnavailableCode,
+  NetworkError,
   REQUEST_CANCELLED_MESSAGE,
   REQUEST_TIMED_OUT_MESSAGE,
 } from "@/lib/nodeAvailability";
@@ -278,6 +279,10 @@ export class RequestTimeoutError extends Error {
   }
 }
 
+// #5409: defined in the leaf module to avoid an import cycle; re-exported so
+// consumers import it from here like the other error classes.
+export { NetworkError };
+
 export class ApiError extends Error {
   status: number;
   code?: string;
@@ -335,6 +340,18 @@ export interface SendMessageDenial {
   // deploy-all invariant), so a denial always carries it.
   outcome: GateDenialOutcome;
 }
+
+/**
+ * #3818 Slice 2 (epic #4406 T26): the parent link + cut point of a spawned peer,
+ * passed to `spawnSession` and (#4497, remote peers) `spawnOnNode` as ONE
+ * trailing object so these fields never become further positionals.
+ */
+export type SpawnParentOptions = {
+  parentSessionId?: string;
+  parentRelationship?: "branch" | "spawn";
+  /** #4370: cut the worktree from exactly this branch (absent → repo target). */
+  sourceBranch?: string;
+};
 
 /**
  * The parsed result of a message send (#3333, ruling 3333-1). `ok:false` carries a
@@ -501,6 +518,11 @@ export class ApiClient {
       if (err instanceof DOMException && err.name === "AbortError") {
         throw new Error(REQUEST_CANCELLED_MESSAGE);
       }
+      // #5409: fetch rejects with a TypeError when the request got no answer
+      // (offline, DNS, connection refused). Tag it so a TypeError thrown
+      // elsewhere by a code bug (e.g. `new URL("")`) is not mistaken for a
+      // network blip.
+      if (err instanceof TypeError) throw new NetworkError(err);
       throw err;
     }
 
@@ -527,7 +549,14 @@ export class ApiClient {
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      const url = new URL(res.url);
+      // #5409: `new URL("")` throws a TypeError, which used to replace this
+      // ApiError (and its status) with an endless "Reconnecting…".
+      let requestPath = path.split("?")[0] ?? path;
+      try {
+        if (res.url) requestPath = new URL(res.url).pathname;
+      } catch {
+        // keep the requested path
+      }
       // Issue #2362: a caller may declare that a given non-2xx status is a
       // DESIGNED response for its endpoint rather than a fault. Reporting it
       // would be a category error — and on a standalone node the federation
@@ -554,7 +583,7 @@ export class ApiClient {
           ),
           category: "api-error",
           severity: "warn",
-          requestPath: url.pathname,
+          requestPath,
           requestMethod: init?.method ?? "GET",
           statusCode: res.status,
         });
@@ -577,7 +606,22 @@ export class ApiClient {
     // expired-then-refreshed JWT won't fire 'online' but will produce 2xx.
     errorReporter.maybeReplay();
 
-    return (await res.json()) as T;
+    try {
+      return (await res.json()) as T;
+    } catch (err) {
+      // #5409: the connection dropped (or the request's timeout / caller's
+      // signal fired) while the body was downloading — also a request that
+      // got no complete answer, mapped like the fetch() catch above. A bad
+      // body is a SyntaxError and is rethrown as is.
+      if (err instanceof DOMException && err.name === "TimeoutError") {
+        throw new RequestTimeoutError();
+      }
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new Error(REQUEST_CANCELLED_MESSAGE);
+      }
+      if (err instanceof TypeError) throw new NetworkError(err);
+      throw err;
+    }
   }
 
   /**
@@ -1762,7 +1806,9 @@ export class ApiClient {
     // Issue #4568: bill the session to the node-vault Anthropic API key with this
     // id (never the key). LOCAL spawns only — `spawnOnNode` has no such field,
     // because a node's keys never cross the federation. Omitted otherwise.
-    apiKeyId?: string
+    apiKeyId?: string,
+    // #3818: parent link + cut point (one trailing object, never positionals).
+    parent?: SpawnParentOptions
   ): Promise<SpawnResponse> {
     return await this.request<SpawnResponse>(
       `/api/machines/${encodeURIComponent(machineId)}/spawn`,
@@ -1790,6 +1836,9 @@ export class ApiClient {
           nativeModelSelection,
           earlyReturn,
           existingBranch,
+          parentSessionId: parent?.parentSessionId,
+          parentRelationship: parent?.parentRelationship,
+          sourceBranch: parent?.sourceBranch,
         }),
       },
       0,
@@ -1844,7 +1893,11 @@ export class ApiClient {
     nativeModelSelection?: { modelId?: string; reasoningEffort?: string },
     // hapimatic-private#4481: existing-branch worktree on the federated node.
     // Only sent after that node answered the branch listing (same release).
-    existingBranch?: ExistingBranch
+    existingBranch?: ExistingBranch,
+    // #4497: parent link + cut point of a remote fan-out peer (one trailing
+    // object, never positionals). The hub resolves the parent and forwards it
+    // only when it resolves (#2822); an older node strips the fields.
+    parent?: SpawnParentOptions
   ): Promise<SpawnResponse> {
     return await this.request<SpawnResponse>(
       `/api/federation/nodes/${encodeURIComponent(nodeId)}/spawn`,
@@ -1872,6 +1925,9 @@ export class ApiClient {
           outputStyle,
           nativeModelSelection,
           existingBranch,
+          parentSessionId: parent?.parentSessionId,
+          parentRelationship: parent?.parentRelationship,
+          sourceBranch: parent?.sourceBranch,
         }),
       },
       0,
@@ -2156,6 +2212,26 @@ export class ApiClient {
       {
         method: "PUT",
         body: JSON.stringify(linkedIssue),
+      }
+    );
+  }
+
+  /**
+   * #4497: retroactively link a session to its managed-peer parent (the heal
+   * for a remote fan-out peer whose spawn-body link did not land). The hub
+   * resolves `parentSessionId` uuid-then-tag and forwards the call to the
+   * session's owning node; `sessionId` must be a uuid the hub already holds
+   * (404 until its cache has the session).
+   */
+  async setSessionParent(
+    sessionId: string,
+    parentSessionId: string
+  ): Promise<void> {
+    await this.request(
+      `/api/sessions/${encodeURIComponent(sessionId)}/parent`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ parentSessionId, parentRelationship: "spawn" }),
       }
     );
   }
@@ -3274,6 +3350,25 @@ export class ApiClient {
 
   async getErrorLogStats(): Promise<ErrorLogStatsResponse> {
     return await this.request<ErrorLogStatsResponse>("/api/error-logs/stats");
+  }
+
+  /**
+   * Operator-instance gate for the feedback inbox (issue #2910, epic #2909 Sub
+   * A). `GET /api/feedback/preflight` answers `{ enabled: true }` on an operator
+   * instance and 404 everywhere else. The 404 is a designed steady state, so it
+   * is declared in `expectedStatuses`: it still rejects (the caller's query
+   * errors and the gate stays closed) but is never filed as a client error
+   * report — once #2913 mounts this on every page, an unreported 404 matters.
+   */
+  async getFeedbackPreflight(): Promise<{ enabled: boolean }> {
+    return await this.request<{ enabled: boolean }>(
+      "/api/feedback/preflight",
+      undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [404] }
+    );
   }
 
   /**

@@ -198,12 +198,6 @@ export function createPorterKeyRoutes(settingsFile: string): Hono<WebAppEnv> {
   // env change cannot loosen it; the extraction prompt re-fetches it once or twice.
   app.get(
     "/porter/recipient/public",
-    createRateLimiter({
-      name: "porter-recipient-public",
-      limit: 30,
-      windowMs: 60_000,
-      keyFn: clientAddrKey,
-    }),
     cataloged(
       defineCapability({
         id: "porter.get-recipient-public",
@@ -223,6 +217,12 @@ export function createPorterKeyRoutes(settingsFile: string): Hono<WebAppEnv> {
         availability: { scope: "user" },
       })
     ),
+    createRateLimiter({
+      name: "porter-recipient-public",
+      limit: 30,
+      windowMs: 60_000,
+      keyFn: clientAddrKey,
+    }),
     async c => {
       const recipient = await readPorterRecipient(settingsFile);
       if (!recipient) return c.json(KEY_UNAVAILABLE, 503);

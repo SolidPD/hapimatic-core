@@ -17,14 +17,20 @@
  * archive that drifts across `claude` releases fails the version check loudly
  * instead of importing an inconsistent subset.
  *
+ * #5169 (D4): 1.1.0 adds the `codex` source id. `source` is a closed enum on the
+ * config entries, the MCP servers and `sources[]`, so an instance that knows
+ * only 1.0.0 would refuse a codex archive with a field error; the version check
+ * runs first, so 1.1.0 gives it an honest version mismatch instead. Nothing else
+ * changed, so this instance still imports 1.0.0 (additive, hence a minor bump).
+ *
  * Kept zod-only / Node-free (R7) so the whole `@hapi/protocol/porter` module can
  * be bundled for the browser (#2344 validates archives client-side).
  */
 
 /** The current porter manifest schema version. Narrowed via `as const`. */
-export const PORTER_SCHEMA_VERSION = "1.0.0" as const;
+export const PORTER_SCHEMA_VERSION = "1.1.0" as const;
 
-/** Narrow literal type of {@link PORTER_SCHEMA_VERSION} (`"1.0.0"`). */
+/** Narrow literal type of {@link PORTER_SCHEMA_VERSION} (`"1.1.0"`). */
 export type PorterSchemaVersion = typeof PORTER_SCHEMA_VERSION;
 
 /**
@@ -33,7 +39,7 @@ export type PorterSchemaVersion = typeof PORTER_SCHEMA_VERSION;
  * BEFORE field validation runs (R1). Widen this tuple only when a new version
  * is genuinely importable — never to paper over a mismatch.
  */
-export const SUPPORTED_PORTER_SCHEMA_VERSIONS = ["1.0.0"] as const;
+export const SUPPORTED_PORTER_SCHEMA_VERSIONS = ["1.0.0", "1.1.0"] as const;
 
 /**
  * A schema version the instance accepts (element of

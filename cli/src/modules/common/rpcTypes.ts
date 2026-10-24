@@ -24,6 +24,10 @@ export interface SpawnSessionOptions {
   /** hapimatic-private#4481: open the worktree on this EXISTING branch (no `-b`).
    *  Implies `sessionType: "worktree"`; `worktreeName` is ignored when set. */
   existingBranch?: { name: string; remote: boolean };
+  /** hapimatic-private#4370: cut a new worktree from exactly this branch
+   *  (`refs/heads/<b>`, else `refs/remotes/origin/<b>`). The spawn fails when it
+   *  exists nowhere. Absent → the daemon resolves the repo's target branch. */
+  sourceBranch?: string;
   /** Claude session ID to resume (for reconnecting to an existing conversation) */
   resumeSessionId?: string;
   /** HAPI session ID to reuse (for reconnecting within the same session instance) */
@@ -161,8 +165,25 @@ export interface SpawnSessionOptions {
   autoSelectOptimalAccount?: boolean;
 }
 
+/**
+ * Issue #5202 (U2): a defaulted worktree spawn that ran as a simple session
+ * because git could not read the folder, or the branch-from HEAD had no
+ * commits. Absent when the requested type ran, and on the designed
+ * `not-a-repo` scratch-dir downgrade, which stays silent.
+ */
+export interface SessionTypeDowngrade {
+  from: "worktree";
+  to: "simple";
+  reason: string;
+}
+
 export type SpawnSessionResult =
-  | { type: "success"; sessionId: string; resolvedName?: string }
+  | {
+      type: "success";
+      sessionId: string;
+      resolvedName?: string;
+      sessionTypeDowngrade?: SessionTypeDowngrade;
+    }
   | { type: "requestToApproveDirectoryCreation"; directory: string }
   // Issue #1772: optional error classifier (e.g. "at_capacity"). Optional so
   // every existing error producer stays valid; enumerated hop-by-hop on the

@@ -36,6 +36,7 @@ import {
   CopyIcon,
   DesktopIcon,
   FilesIcon,
+  LayersIcon,
   TrashIcon,
 } from "@/components/icons";
 import { SessionKebabMenu, type SessionKebabEntry } from "./SessionKebabMenu";
@@ -68,6 +69,9 @@ export type SessionActionClusterProps = {
   // Interim prop-gated view buttons (instance surface only, retire with #3286).
   onDesktop?: () => void;
   onViewFiles?: () => void;
+  /** #3818: opens the fan-out dialog. Instance surface only — the list surface
+   *  never passes it, so the entry never shows on a session card. */
+  onFanOut?: () => void;
 
   // Dialog copy + pending state for the R5 confirm.
   sessionName: string;
@@ -94,6 +98,7 @@ export function SessionActionCluster({
   onKebabOpenChange,
   onDesktop,
   onViewFiles,
+  onFanOut,
   sessionName,
   isPending,
   notesValue,
@@ -140,6 +145,18 @@ export function SessionActionCluster({
       icon: <CopyIcon className="h-4 w-4" />,
       onSelect: onCopySessionInfo,
     },
+    // #3818: fan out N peers from this session (it becomes their parent).
+    // Instance-only: gated on the surface as well as the prop.
+    ...(onFanOut && !isList
+      ? [
+          {
+            key: "fan-out",
+            label: "Fan out",
+            icon: <LayersIcon className="h-4 w-4" />,
+            onSelect: onFanOut,
+          },
+        ]
+      : []),
   ];
 
   return (

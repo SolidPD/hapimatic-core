@@ -7,8 +7,8 @@ import { createHash } from "node:crypto";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
-import { readProxyJson } from "../../federation/proxyFetchSignal";
-import { proxyTransportFailure } from "./routeErrorHelper";
+import { federationHeadersSignal } from "../../federation/proxyFetchSignal";
+import { proxyTransportFailure, readProxyBodyOr502 } from "./routeErrorHelper";
 import type { WebAppEnv } from "../middleware/auth";
 import { defineCapability } from "@hapi/protocol";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
@@ -357,20 +357,27 @@ export function createUploadRoutes(
             }
             // #5375/#5404: a transport failure is logged and answers 502; any
             // other error is rethrown so app.onError logs it as a 500.
+            // #5410: the timeout bounds only the wait for headers — an OK body
+            // streams up to 200 MB and must not be cut off mid-download.
+            const { signal, disarm } = federationHeadersSignal(
+              c.req.raw.signal
+            );
             let resp: Response;
             try {
               resp = await fetch(
                 `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/upload/${encodeURIComponent(filename)}`,
-                { method: "GET", headers }
+                { method: "GET", headers, signal }
               );
             } catch (error) {
+              disarm();
               return proxyTransportFailure(c, error, {
                 errorLogger: options?.errorLogger,
                 nodeId: node.nodeId,
               });
             }
             if (resp.ok) {
-              // Stream the binary response back with the remote's headers
+              // Headers arrived: stream the binary body back unbounded.
+              disarm();
               return new Response(resp.body, {
                 headers: {
                   "Content-Type":
@@ -393,23 +400,19 @@ export function createUploadRoutes(
                 },
               });
             }
-            let body: unknown;
+            // #5408: a cut body is a logged 502 (readProxyBodyOr502). The
+            // headers timer stays armed through the read, so it is bounded too.
+            let read: Awaited<ReturnType<typeof readProxyBodyOr502>>;
             try {
-              // #5408: only a non-OK response reaches this read (an OK one is
-              // streamed above). A body cut off mid-read is a transport failure
-              // (logged 502); an unparseable or empty error body falls back to
-              // {} with the peer's real status.
-              body = (await readProxyJson(resp)) ?? {};
-            } catch (error) {
-              return proxyTransportFailure(c, error, {
+              read = await readProxyBodyOr502(c, resp, {
                 errorLogger: options?.errorLogger,
                 nodeId: node.nodeId,
               });
+            } finally {
+              disarm();
             }
-            return c.json(
-              body as Record<string, unknown>,
-              resp.status as 400 | 404 | 500 | 503
-            );
+            if (read.failure) return read.failure;
+            return c.json(read.body, resp.status as 400 | 404 | 500 | 503);
           }
         }
         return sessionResult;
@@ -548,21 +551,14 @@ export function createUploadRoutes(
                 nodeId: node.nodeId,
               });
             }
-            let body: unknown;
-            try {
-              // #5408: a body cut off mid-read is a transport failure (logged
-              // 502) and an unparseable OK body is rethrown to onError (500) —
-              // never an empty success. Only an empty body, or an unparseable
-              // non-OK body (peer status kept), falls back to {}.
-              body = (await readProxyJson(resp)) ?? {};
-            } catch (error) {
-              return proxyTransportFailure(c, error, {
-                errorLogger: options?.errorLogger,
-                nodeId: node.nodeId,
-              });
-            }
+            // #5408: a cut body is a logged 502 (readProxyBodyOr502).
+            const read = await readProxyBodyOr502(c, resp, {
+              errorLogger: options?.errorLogger,
+              nodeId: node.nodeId,
+            });
+            if (read.failure) return read.failure;
             return c.json(
-              body as Record<string, unknown>,
+              read.body,
               resp.status as 200 | 400 | 404 | 409 | 500 | 503
             );
           }
@@ -792,21 +788,14 @@ export function createUploadRoutes(
                 nodeId: node.nodeId,
               });
             }
-            let body: unknown;
-            try {
-              // #5408: a body cut off mid-read is a transport failure (logged
-              // 502) and an unparseable OK body is rethrown to onError (500) —
-              // never an empty success. Only an empty body, or an unparseable
-              // non-OK body (peer status kept), falls back to {}.
-              body = (await readProxyJson(resp)) ?? {};
-            } catch (error) {
-              return proxyTransportFailure(c, error, {
-                errorLogger: options?.errorLogger,
-                nodeId: node.nodeId,
-              });
-            }
+            // #5408: a cut body is a logged 502 (readProxyBodyOr502).
+            const read = await readProxyBodyOr502(c, resp, {
+              errorLogger: options?.errorLogger,
+              nodeId: node.nodeId,
+            });
+            if (read.failure) return read.failure;
             return c.json(
-              body as Record<string, unknown>,
+              read.body,
               resp.status as 200 | 400 | 404 | 500 | 503
             );
           }

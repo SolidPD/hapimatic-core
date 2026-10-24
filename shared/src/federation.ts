@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { z } from "zod";
-import { ExistingBranchSchema } from "./gitBranches";
+import { ExistingBranchSchema, SourceBranchSchema } from "./gitBranches";
 import { optionalSessionNameSchema } from "./sessionName";
 import { ClaudeRemoteLauncherKindSchema } from "./launcherResolver";
 import {
@@ -193,6 +193,10 @@ export const FederationSpawnBodySchema = z.object({
    *  that serves `/api/federation/git-branches` also honors this field (same
    *  release), and the web only offers existing branches from such a listing. */
   existingBranch: ExistingBranchSchema.optional(),
+  /** hapimatic-private#4370: cut a new worktree from exactly this branch. A
+   *  plain z.object strips an un-enumerated key here AND at the hub forwarder,
+   *  so the field must be listed for it to reach a peer node. */
+  sourceBranch: SourceBranchSchema.optional(),
   name: optionalSessionNameSchema,
   emoji: z.string().optional(),
   /** NodeId of the peer that initiated this spawn (for dual-node visibility filtering) */
@@ -290,6 +294,11 @@ export const FederationSpawnStatusSchema = z.object({
   success: z.boolean(),
   /** Error message on failure */
   error: z.string().optional(),
+  /** Issue #2150 (K-4497-1 §3): the peer's refusal code on failure
+   *  (account_unrefreshable / account_token_expired / at_capacity …), so the
+   *  caller can show code-specific copy. Optional — an older peer omits it and
+   *  an older hub's schema strips it. */
+  code: z.string().optional(),
   /** The sessionId of the spawned session (on success) */
   sessionId: z.string().optional(),
 });

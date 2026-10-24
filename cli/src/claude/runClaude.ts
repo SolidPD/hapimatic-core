@@ -9,7 +9,10 @@ import { extractSDKMetadataAsync } from "@/claude/sdk/metadataExtractor";
 import { applyModelInPlace } from "@/claude/applyModelInPlace";
 import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { getEnvironmentInfo } from "@/ui/doctor";
-import { startHappyServer } from "@/claude/utils/startHappyServer";
+import {
+  autoApprovedHapiToolNames,
+  startHappyServer,
+} from "@/claude/utils/startHappyServer";
 import {
   startHookServer,
   isBlockingPromptNotification,
@@ -157,8 +160,10 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     }
   });
 
-  // Start HAPI MCP server
-  const happyServer = await startHappyServer(session);
+  // Start HAPI MCP server. This launcher owns an `allowedTools` list, so it may
+  // be handed the operator tools (#4450 R7); the server lists them only on an
+  // operator host.
+  const happyServer = await startHappyServer(session, { operatorTools: true });
   logger.debug(`[START] HAPI MCP server started at ${happyServer.url}`);
 
   // Variable to track current session instance (updated via onSessionReady callback)
@@ -994,7 +999,8 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       startingMode,
       messageQueue,
       api,
-      allowedTools: happyServer.toolNames.map(
+      // #4450 D2 = A: an operator tool keeps its permission prompt.
+      allowedTools: autoApprovedHapiToolNames(happyServer.toolNames).map(
         toolName => `mcp__${HAPI_MCP_SERVER_NAME}__${toolName}`
       ),
       onModeChange: createModeChangeHandler(session),

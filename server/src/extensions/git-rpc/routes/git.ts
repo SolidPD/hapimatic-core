@@ -16,7 +16,10 @@ import {
   requireSessionFromParam,
   requireSyncEngine,
 } from "../../../web/routes/guards";
-import { logAndJson } from "../../../web/routes/routeErrorHelper";
+import {
+  logAndJson,
+  proxyTransportFailure,
+} from "../../../web/routes/routeErrorHelper";
 
 const fileSearchSchema = z.object({
   query: z.string().optional(),
@@ -111,13 +114,16 @@ async function runRpc<T>(
 
 /**
  * Helper: proxy a GET request to a remote node's federation endpoint.
- * Returns the JSON response or a 502 error.
+ * Returns the peer's JSON and status. A transport failure is a logged 502
+ * (#5410); any other error (an unparseable OK body, a hub bug) is rethrown so
+ * app.onError logs it as a 500 (#5404).
  */
 async function federationGetProxy(
   c: Context<WebAppEnv>,
   nodeUrl: string,
   path: string,
   federationApiToken: string | null | undefined,
+  log: { errorLogger: ErrorLogger | null; nodeId: string },
   queryParams?: Record<string, string | undefined>
 ): Promise<Response> {
   const headers: Record<string, string> = {};
@@ -146,15 +152,23 @@ async function federationGetProxy(
       body as Record<string, unknown>,
       resp.status as 200 | 400 | 404 | 409 | 500 | 502 | 503
     );
-  } catch {
-    return c.json({ success: false, error: "Remote node unreachable" }, 502);
+  } catch (error) {
+    return proxyTransportFailure(c, error, {
+      errorLogger: log.errorLogger,
+      nodeId: log.nodeId,
+      // Git web consumers read `success`.
+      body: { success: false, error: "Remote node unreachable" },
+    });
   }
 }
 
 /**
  * Helper: proxy a request with a JSON body (POST/PUT) to a remote node's
  * federation endpoint — the body-carrying sibling of federationGetProxy
- * (issue #2518, for the file-write route).
+ * (issue #2518, for the file-write route). A transport failure, including a
+ * body cut off mid-read on any status, is a logged 502 (#5433); any other
+ * error (an unparseable OK body, a hub bug) is rethrown so app.onError logs it
+ * as a 500 (#5404).
  */
 async function federationBodyProxy(
   c: Context<WebAppEnv>,
@@ -162,7 +176,8 @@ async function federationBodyProxy(
   path: string,
   federationApiToken: string | null | undefined,
   method: "POST" | "PUT",
-  body: unknown
+  body: unknown,
+  log: { errorLogger: ErrorLogger | null; nodeId: string }
 ): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -178,13 +193,20 @@ async function federationBodyProxy(
       headers,
       body: JSON.stringify(body),
     });
-    const respBody = await resp.json().catch(() => ({}));
+    // #5433: this reads every status, so a body cut off mid-read must not
+    // relay as 200 {} on a write that may not have landed.
+    const respBody = (await readProxyJson(resp)) ?? {};
     return c.json(
       respBody as Record<string, unknown>,
       resp.status as 200 | 400 | 404 | 409 | 500 | 502 | 503
     );
-  } catch {
-    return c.json({ success: false, error: "Remote node unreachable" }, 502);
+  } catch (error) {
+    return proxyTransportFailure(c, error, {
+      errorLogger: log.errorLogger,
+      nodeId: log.nodeId,
+      // Git web consumers read `success`.
+      body: { success: false, error: "Remote node unreachable" },
+    });
   }
 }
 
@@ -251,7 +273,8 @@ export function createGitRoutes(
             c,
             node.url,
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/git-status`,
-            options?.federationApiToken
+            options?.federationApiToken,
+            { errorLogger, nodeId: node.nodeId }
           );
         }
       }
@@ -322,7 +345,8 @@ export function createGitRoutes(
             c,
             node.url,
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/git-remote-url`,
-            options?.federationApiToken
+            options?.federationApiToken,
+            { errorLogger, nodeId: node.nodeId }
           );
         }
       }
@@ -388,6 +412,7 @@ export function createGitRoutes(
             node.url,
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/git-diff-numstat`,
             options?.federationApiToken,
+            { errorLogger, nodeId: node.nodeId },
             { staged: c.req.query("staged") }
           );
         }
@@ -467,6 +492,7 @@ export function createGitRoutes(
             node.url,
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/git-diff-file`,
             options?.federationApiToken,
+            { errorLogger, nodeId: node.nodeId },
             { path: c.req.query("path"), staged: c.req.query("staged") }
           );
         }
@@ -541,6 +567,7 @@ export function createGitRoutes(
             node.url,
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/file`,
             options?.federationApiToken,
+            { errorLogger, nodeId: node.nodeId },
             { path: c.req.query("path") }
           );
         }
@@ -640,6 +667,7 @@ export function createGitRoutes(
             node.url,
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/files`,
             options?.federationApiToken,
+            { errorLogger, nodeId: node.nodeId },
             { query: c.req.query("query"), limit: c.req.query("limit") }
           );
         }
@@ -728,7 +756,8 @@ export function createGitRoutes(
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/file`,
             options?.federationApiToken,
             "PUT",
-            body
+            body,
+            { errorLogger, nodeId: node.nodeId }
           );
         }
       }
@@ -797,6 +826,7 @@ export function createGitRoutes(
             node.url,
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/directory`,
             options?.federationApiToken,
+            { errorLogger, nodeId: node.nodeId },
             { path: c.req.query("path") }
           );
         }
@@ -888,7 +918,8 @@ export function createGitRoutes(
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/directory`,
             options?.federationApiToken,
             "POST",
-            body
+            body,
+            { errorLogger, nodeId: node.nodeId }
           );
         }
       }
@@ -975,7 +1006,8 @@ export function createGitRoutes(
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/rename`,
             options?.federationApiToken,
             "POST",
-            body
+            body,
+            { errorLogger, nodeId: node.nodeId }
           );
         }
       }
@@ -1065,7 +1097,8 @@ export function createGitRoutes(
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/delete`,
             options?.federationApiToken,
             "POST",
-            body
+            body,
+            { errorLogger, nodeId: node.nodeId }
           );
         }
       }

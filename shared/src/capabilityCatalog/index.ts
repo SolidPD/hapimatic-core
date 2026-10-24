@@ -28,3 +28,4 @@ export * from "./infraExclusion"; // Sub-Issue F.1 (#3746): audit infra-exclusio
 export * from "./promoted"; // Sub-Issue K (#3751): mutating-tier promotion allowlist.
 export * from "./renderSelfKnowledge"; // #3873: the pure self-knowledge renderer, reachable at runtime for the boot self-heal writer (no ./capabilityCatalog subpath export exists — server imports only via the @hapi/protocol barrel).
 export * from "./selfKnowledge.preamble.generated"; // #3873: embedded preamble const the boot self-heal writer renders with (the .md preamble never ships to the VM).
+export * from "./pathSegment"; // #4316: dispatch-agreement segment predicates for the invoker and (next) #3842's typed tools.

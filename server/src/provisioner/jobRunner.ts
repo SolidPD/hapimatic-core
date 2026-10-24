@@ -126,7 +126,8 @@ export function buildSystemdRunArgs(spec: RunTransientSpec): string[] {
  *   1 for health-check / reconcile-detect    ⇒ succeeded (findings, not failure)
  *   4 from provision (#4183, #3555)          ⇒ failed: the run finished, but the VM
  *                                              is NOT operator-compliant (config-layer,
- *                                              rotation-lease, capability-layer); the
+ *                                              rotation-lease, capability-layer,
+ *                                              operator-mappings #4275, …); the
  *                                              ACTION ITEMS carry the reasons. Only an
  *                                              --operator run exits 4, and this server
  *                                              never passes --operator

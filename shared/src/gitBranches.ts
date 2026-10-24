@@ -42,6 +42,20 @@ export const ExistingBranchSchema = z.object({
 });
 export type ExistingBranch = z.infer<typeof ExistingBranchSchema>;
 
+/**
+ * hapimatic-private#4370: the explicit base branch a spawn cuts a new worktree
+ * from (`sourceBranch` on the spawn wire). Same name rule as
+ * {@link ExistingBranchSchema}'s `name`, so an option-like (`--help`) or
+ * refspec-like value is refused before it reaches the daemon's git calls.
+ */
+export const SourceBranchSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .refine(n => n === n.trim() && validateBranchName(n) === null, {
+    message: "Not a valid git branch name",
+  });
+
 export const GitCurrentRefSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("branch"), name: z.string() }),
   z.object({ kind: z.literal("detached"), sha: z.string() }),

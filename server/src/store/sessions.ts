@@ -832,6 +832,19 @@ export function getMessageCountForSession(
   return row?.message_count ?? 0;
 }
 
+// #5254: the ceiling guard's inactivity gate. A primary-key read of the
+// denormalized column MessageStore.addMessage maintains, so the turn-finalize
+// hot path never scans `messages`. NULL = no operator message ever arrived.
+export function getLastOperatorMessageAt(
+  db: Database,
+  sessionId: string
+): number | null {
+  const row = db
+    .prepare("SELECT last_operator_message_at AS at FROM sessions WHERE id = ?")
+    .get(sessionId) as { at: number | null } | null;
+  return typeof row?.at === "number" ? row.at : null;
+}
+
 export function getMessageCountsByNamespace(
   db: Database,
   namespace: string

@@ -72,6 +72,8 @@ export const register: ServerRegister = async host => {
   host.routes.add(() =>
     createSchedulesRoutes(() => schedulerService, {
       errorLogger: host.getErrorLogger() as ErrorLogger | null,
+      // #3842 R8: the agent-escalation floor resolves the caller's session.
+      getSyncEngine: () => host.getSyncEngine() as SyncEngine | null,
     })
   );
 

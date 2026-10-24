@@ -64,6 +64,7 @@ import type {
   DeviceAuthResult,
   DeviceAuthStatusResult,
 } from "../services/codexLoginService";
+import { readPeerJsonObject } from "./proxyFetchSignal";
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -78,6 +79,27 @@ export type RemoteSessionActionError = {
   status?: number;
   offline?: true;
 };
+
+/**
+ * #5487: read a non-OK peer reply's error body. An empty or unparseable body
+ * reads as {}, so the caller keeps "Node returned <status>". A body cut off
+ * mid-read is a transport failure: warn, then rethrow into the caller's catch,
+ * which answers the same no-status result as an unreachable peer.
+ */
+async function readPeerErrorBody(
+  res: Response,
+  context: string
+): Promise<Record<string, unknown>> {
+  try {
+    return await readPeerJsonObject(res);
+  } catch (error) {
+    console.warn(
+      `[Federation] ${context}: peer reply cut off mid-body (HTTP ${res.status}):`,
+      error instanceof Error ? error.message : error
+    );
+    throw error;
+  }
+}
 
 /** Longer timeout for spawn/reconnect: daemon must spawn CLI + wait for Socket.IO. */
 const SPAWN_TIMEOUT_MS = 30_000;
@@ -1421,7 +1443,10 @@ export class NodeRegistry {
         "X-Hapi-Caller-Namespace": namespace,
       });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
+        const body = await readPeerErrorBody(
+          res,
+          `reconnect on ${state.config.id}`
+        );
         return {
           type: "error",
           message:
@@ -1484,7 +1509,10 @@ export class NodeRegistry {
         { "X-Hapi-Caller-Namespace": namespace }
       );
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
+        const body = await readPeerErrorBody(
+          res,
+          `branch on ${state.config.id}`
+        );
         return {
           type: "error",
           message:
@@ -1851,7 +1879,10 @@ export class NodeRegistry {
     try {
       const res = await this.fetchWithAuth(url, "POST", { accountUuid });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
+        const body = await readPeerErrorBody(
+          res,
+          `remove-account on ${state.config.id}`
+        );
         return {
           type: "error",
           message:
@@ -2757,7 +2788,10 @@ export class NodeRegistry {
         }
       );
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
+        const body = await readPeerErrorBody(
+          res,
+          `delete on ${state.config.id}`
+        );
         return {
           type: "error",
           message:
@@ -2871,7 +2905,10 @@ export class NodeRegistry {
         "X-Hapi-Caller-Namespace": namespace,
       });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
+        const body = await readPeerErrorBody(
+          res,
+          `${action} on ${state.config.id}`
+        );
         return {
           type: "error",
           message:

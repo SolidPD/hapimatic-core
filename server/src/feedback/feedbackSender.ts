@@ -4,6 +4,7 @@ import type {
   FeedbackEntryCategory,
   FeedbackMetadata,
 } from "@hapi/protocol/types";
+import { readPeerJsonObject } from "../federation/proxyFetchSignal";
 import { sendViaRelay } from "./relayTransport";
 
 /**
@@ -294,10 +295,23 @@ export async function sendFeedbackEmail(
           }`,
         };
       }
-      const json = (await res.json().catch(() => ({}))) as {
-        message_id?: string;
+      let json: Record<string, unknown>;
+      try {
+        json = await readPeerJsonObject(res);
+      } catch (error) {
+        // #5487: the 2xx status means AgentMail accepted the send; only the
+        // reply (the message id) was lost or unreadable. Report sent, so the
+        // support modal does not ask the user to resend, and log the lost reply.
+        console.warn(
+          `[feedback] AgentMail accepted the send (HTTP ${res.status}) but the reply could not be read:`,
+          error instanceof Error ? error.message : error
+        );
+        json = {};
+      }
+      return {
+        status: "sent",
+        messageId: typeof json.message_id === "string" ? json.message_id : "",
       };
-      return { status: "sent", messageId: json.message_id ?? "" };
     } catch (err) {
       return {
         status: "error",

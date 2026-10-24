@@ -403,19 +403,138 @@ export async function discoverWorktreeInstances(
   return results;
 }
 
-export async function detectSourceBranch(repoRoot: string): Promise<string> {
+// Issue #4370: the working-branch name this resolver prefers. It mirrors
+// rp1-home's branch-config.json `working_branch`; the scripts read that file,
+// the daemon hardcodes it (see the resolution-order note below).
+export const WORKING_BRANCH = "ms-dev";
+
+export type SourceBranchReason =
+  | "explicit"
+  | "target:working-branch"
+  | "target:origin-default"
+  | "fallback:head"
+  | "fallback:constant";
+
+export type ResolvedSourceBranch = {
+  branch: string;
+  reason: SourceBranchReason;
+};
+
+// Issue #4370: every resolver call runs inside the port-claim critical section
+// (sessionSpawner's withPortClaimLock), so each one is bounded and env-scrubbed
+// the way runGit is: the generic budget, SIGKILL, and the GIT_* scrub. This
+// module cannot import runGit (worktree.ts imports this module), so the three
+// exec options live here.
+async function runResolverGit(args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, {
+    timeout: getGitTimeoutMs(),
+    killSignal: "SIGKILL",
+    env: buildScrubbedGitEnv(),
+  });
+  return stdout.toString().trim();
+}
+
+/**
+ * Issue #4370: resolve the branch a new worktree is cut from: the repo's
+ * TARGET branch, never the parent checkout's current HEAD. Order:
+ *  1. `refs/remotes/origin/ms-dev` or `refs/heads/ms-dev` → `ms-dev`
+ *     (`target:working-branch`);
+ *  2. `refs/remotes/origin/HEAD` → origin's default branch
+ *     (`target:origin-default`);
+ *  3. the parent's checked-out branch (`fallback:head`);
+ *  4. `ms-dev` when git fails outright (`fallback:constant`).
+ *
+ * The order approximates rp1-home's `scripts/resolve-target-branch.sh`, but it
+ * reads only local refs (no `ls-remote`, no `gh api`), so it costs at most
+ * three local git calls. `refs/remotes/origin/HEAD` is a clone-time snapshot:
+ * repair a stale one with `git remote set-head origin -a`. #4487 will add a
+ * bash twin, `resolve_meta_source_branch` in `scripts/hapi-worktree.sh`; when
+ * it lands, keep the two in the same order with the same reason strings.
+ *
+ * If the first call throws (a timeout, or not a repository), step 2 is skipped:
+ * the answer then comes from a `fallback:` reason, which the spawner logs at
+ * `warn`, so a slow git can never pass for a healthy `target:origin-default`.
+ */
+export async function resolveSourceBranch(
+  repoRoot: string
+): Promise<ResolvedSourceBranch> {
+  let workingRefsFailed = false;
   try {
-    const { stdout } = await execFileAsync("git", [
+    // One call for both refs: for-each-ref prints whichever of the two
+    // refnames exists, and nothing (exit 0) when neither does. Its patterns
+    // also match deeper refs (`ms-dev/x`), so compare whole lines.
+    const wanted = [
+      `refs/remotes/origin/${WORKING_BRANCH}`,
+      `refs/heads/${WORKING_BRANCH}`,
+    ];
+    const workingRefs = await runResolverGit([
+      "-C",
+      repoRoot,
+      "for-each-ref",
+      "--format=%(refname)",
+      ...wanted,
+    ]);
+    if (workingRefs.split("\n").some(ref => wanted.includes(ref))) {
+      return { branch: WORKING_BRANCH, reason: "target:working-branch" };
+    }
+  } catch {
+    workingRefsFailed = true;
+  }
+  try {
+    if (workingRefsFailed) {
+      throw new Error("working-branch lookup failed");
+    }
+    const originHead = await runResolverGit([
+      "-C",
+      repoRoot,
+      "symbolic-ref",
+      "--short",
+      "refs/remotes/origin/HEAD",
+    ]);
+    const branch = originHead.replace(/^origin\//, "");
+    if (branch) {
+      return { branch, reason: "target:origin-default" };
+    }
+  } catch {
+    // origin/HEAD unset (or no origin) — fall back to the parent's branch.
+  }
+  try {
+    const head = await runResolverGit([
       "-C",
       repoRoot,
       "symbolic-ref",
       "--short",
       "HEAD",
     ]);
-    return stdout.trim() || "ms-dev";
+    if (head) {
+      return { branch: head, reason: "fallback:head" };
+    }
   } catch {
-    return "ms-dev";
+    // Detached HEAD, not a repo, or a timeout.
   }
+  return { branch: WORKING_BRANCH, reason: "fallback:constant" };
+}
+
+/**
+ * Issue #4370: true when `name` is a valid branch name per
+ * `git check-ref-format --branch`, the daemon-side check on an explicit
+ * `sourceBranch` (the server schema is the first check). Bounded and
+ * env-scrubbed like the resolver; a timeout reads as invalid.
+ */
+export async function isValidBranchName(name: string): Promise<boolean> {
+  if (!name || name.startsWith("-")) {
+    return false;
+  }
+  try {
+    await runResolverGit(["check-ref-format", "--branch", name]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function detectSourceBranch(repoRoot: string): Promise<string> {
+  return (await resolveSourceBranch(repoRoot)).branch;
 }
 
 export async function writeWorktreeMeta(

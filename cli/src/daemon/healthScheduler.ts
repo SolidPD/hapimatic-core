@@ -199,7 +199,7 @@ export function createHealthScheduler(
             //    retain; gone, or a recycled `@N` now held by another session
             //    → deregister; a tmux fault → skip this tick (#1329). It
             //    probes `display-message -t @N`, not `list-windows`, so it is
-            //    not vacuous on tmux 3.4 (#1841).
+            //    not vacuous on tmux 3.4+ (#1841).
             //  - A legacy session with only an index keeps the name compare at
             //    that index (#1316 — list-windows is stale on tmux 3.4+).
             //  - A legacy session with only a name keeps the listing check.

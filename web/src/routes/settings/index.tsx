@@ -35,6 +35,7 @@ import { useVersion } from "@/hooks/useVersion";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
 import { useVmPreflight } from "@/hooks/queries/useVmInventory";
+import { useFeedbackPreflight } from "@/hooks/queries/useFeedbackPreflight";
 import {
   isPorterExposed,
   usePorterStatus,
@@ -412,12 +413,15 @@ export default function SettingsLandingPage() {
       rows: { ...prev.rows, [key]: !prev.rows[key] },
     }));
 
-  // The ADMIN group (VMs, Feedback) is gated FAIL-CLOSED on the admin-VM preflight
-  // verdict: it shows only when the capability gate is open. On a user-VM binary
-  // the preflight route 404s, so `data` stays undefined and the group is hidden — a
-  // non-operator instance never advertises it (issue #2470 R1, #4906 R6). The VMs
-  // row keeps its own check too, and the VMs page gates again as defense-in-depth.
+  // The ADMIN group (VMs, Feedback) is gated FAIL-CLOSED, one gate per row: VMs on
+  // the admin-VM preflight (issue #2470 R1, #4906 R6), Feedback on the operator-
+  // instance preflight (#2910 — HAPI_OPERATOR_INSTANCE, deliberately not the
+  // RP1-only VM capability, so the inbox shows on every operator device). On a
+  // closed instance each preflight route 404s, `data` stays undefined, and the row
+  // is hidden; with both closed the group is hidden — a non-operator instance never
+  // advertises it. Each page gates again as defense-in-depth.
   const vmEnabled = useVmPreflight(api).data?.enabled === true;
+  const feedbackEnabled = useFeedbackPreflight(api).data?.enabled === true;
 
   // #4533 / #5165: the Configuration (Porter) row is gated FAIL-CLOSED on the
   // Porter exposure probe — Porter is exposed by default, but a node withheld by
@@ -430,13 +434,20 @@ export default function SettingsLandingPage() {
   return (
     <div data-testid="settings-landing-root" className="flex flex-col pb-2">
       {ADMIN_SECTIONS.map(group => {
-        if (group.heading === ADMIN_GROUP_HEADING && !vmEnabled) return null;
+        if (
+          group.heading === ADMIN_GROUP_HEADING &&
+          !vmEnabled &&
+          !feedbackEnabled
+        )
+          return null;
         const visibleItems = group.items.filter(item =>
           item.key === "vms"
             ? vmEnabled
-            : item.key === "configuration"
-              ? porterExposed
-              : true
+            : item.key === "feedback"
+              ? feedbackEnabled
+              : item.key === "configuration"
+                ? porterExposed
+                : true
         );
         if (visibleItems.length === 0) return null;
         const groupCollapsed = Boolean(collapse.groups[group.heading]);

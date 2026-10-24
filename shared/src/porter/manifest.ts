@@ -769,7 +769,8 @@ export const ARCHIVE_EXCLUSIONS = [
 
 /**
  * File and folder names that carry credentials, so no archive may carry them
- * (issue #4172). The exporters prune them after staging and record an omission;
+ * (issue #4172) outside CLAUDE.md and its `@`-includes, which are exempt: an
+ * `@.env.md` include ships and imports, by the Gate-1 ruling. The exporters prune them after staging and record an omission;
  * the importer skips a section member whose path has such a part, and refuses a
  * planned file of any other kind that has one.
  *

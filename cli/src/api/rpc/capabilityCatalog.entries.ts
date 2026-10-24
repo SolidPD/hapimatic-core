@@ -419,6 +419,18 @@ export const rpcCatalogEntries = [
     availability: { scope: "operator" },
   }),
   defineCapability({
+    id: "machine-daemon.cleanup-idle-worktree",
+    domain: "machine-daemon",
+    surface: "rpc",
+    description:
+      "Move an idle, owner-verified git worktree to .trash; refuses a live, claimed or protected one.",
+    whenToUse: "To remove a spawned peer's idle worktree (operator tool).",
+    invocation: { kind: "rpc", method: "cleanup-idle-worktree" },
+    auth: "cli-token",
+    riskTier: "destructive",
+    availability: { scope: "operator" },
+  }),
+  defineCapability({
     id: "machine-daemon.get-session-claude-id",
     domain: "machine-daemon",
     surface: "rpc",

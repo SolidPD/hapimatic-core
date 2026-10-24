@@ -25,6 +25,7 @@ import {
   renameSync,
   statSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { configuration } from "@/configuration";
 import { isProcessAlive } from "@/utils/process";
 import type { AmbientOnboardingTokenState } from "@hapi/protocol/accounts";
@@ -247,7 +248,10 @@ export async function updateSettings(
   }
 
   const lockFile = configuration.settingsFile + ".lock";
-  const tmpFile = configuration.settingsFile + ".tmp";
+  // #4510: a per-write unique temp (the server's #2623 name). A fixed
+  // `settings.json.tmp` was shared with provision's --federate seed, so one
+  // writer's rename could take the other's file (ms1, 2026-10-02).
+  const tmpFile = `${configuration.settingsFile}.tmp.${process.pid}.${randomUUID()}`;
   let fileHandle;
   let attempts = 0;
 
@@ -287,17 +291,41 @@ export async function updateSettings(
   try {
     // Read current settings with defaults
     const current = (await readSettings()) || { ...defaultSettings };
+    // #4510 (D-4510-2): snapshot BEFORE the updater — an updater may mutate
+    // `current` in place, so a later comparison would miss its change.
+    const before = JSON.stringify(current, null, 2);
 
     // Apply update
     const updated = await updater(current);
+    const after = JSON.stringify(updated, null, 2);
+
+    // #4510 (D-4510-2): an update that changes nothing writes nothing, so a
+    // steady-state daemon start no longer rewrites settings.json. 0600 is still
+    // enforced on the existing file; when that chmod fails (e.g. a file owned
+    // by another user), fall through to the write below, whose rename installs
+    // a fresh 0600 file. A corrupt file reads as defaults, so a no-op update
+    // now leaves it in place rather than overwriting it with defaults.
+    if (after === before && existsSync(configuration.settingsFile)) {
+      try {
+        await chmod(configuration.settingsFile, 0o600);
+        return updated;
+      } catch {
+        // fall through to the write
+      }
+    }
 
     // Write atomically using rename. Issue #1733 (R9): 0600 — settings.json
-    // holds secrets; chmod after write is umask-defense.
-    await writeFile(tmpFile, JSON.stringify(updated, null, 2), {
-      mode: 0o600,
-    });
-    await chmod(tmpFile, 0o600).catch(() => {});
-    await rename(tmpFile, configuration.settingsFile); // Atomic on POSIX
+    // holds secrets; chmod after write is umask-defense. #4510: the temp is
+    // unique per write and removed when the write or rename fails, so no
+    // secret-bearing copy is left behind.
+    try {
+      await writeFile(tmpFile, after, { mode: 0o600 });
+      await chmod(tmpFile, 0o600).catch(() => {});
+      await rename(tmpFile, configuration.settingsFile); // Atomic on POSIX
+    } catch (err) {
+      await unlink(tmpFile).catch(() => {});
+      throw err;
+    }
 
     return updated;
   } finally {

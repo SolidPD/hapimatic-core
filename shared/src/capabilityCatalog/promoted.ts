@@ -14,22 +14,31 @@
  * for `mutating`, and is IGNORED for `destructive`. `capabilityPolicy.ts`'s
  * `isEntryInvocable` is the sole reader.
  *
- * 🌱 SEEDED EMPTY (R4 / ER 2026-09-16 3751-17). The scheduler CRUD ids are added in
- * a FOLLOW-UP PR: their `scheduler.*` rest entries are produced by #3746 (K only
- * `coordinates_with` it), so seeding them now would either resolve to nothing
- * (until F's scheduler PR lands) or couple K's merge to F's tier decisions. An
- * empty seed keeps the guard sound (it runs over real data + synthetic bad ids in
- * `promoted.test.ts`) and decouples K from F.
+ * 🌱 SEEDED EMPTY by #3751 (R4 / ER 2026-09-16 3751-17); FIRST PROMOTIONS by #3842
+ * (operator ruling 4403 T2, 2026-09-30, authorization path (i)): the eight
+ * `mutating` entries the injected hapi MCP's typed session / worktree / schedule
+ * tools wrap (they also wrap the readonly `session-introspection.list`). Each id
+ * is a reviewed edit with its own comment below.
+ *
+ * ⚠️ WHAT A PROMOTION WIDENS (#3842 Key Decision 1): the promotion is per ENTRY,
+ * not per tool, so it opens RAW `hapi_call` to every agent as well — for example
+ * `{POST, /api/sessions/<peer>/messages}`. The ruling accepts this. The refusals the
+ * ruling demands therefore live in the ROUTES, where raw `hapi_call` cannot step
+ * around them (`server/src/web/routes/agentEscalation.ts`): a session cannot answer
+ * its own permission request (R6), and a session that is not in a bypass mode
+ * cannot spawn a `yolo` peer, write a schedule, or answer any permission request
+ * (R8, ruling NEW-3842-1 = b).
  *
  * Bundle note (ER 2026-09-16 3751-21): this module is re-exported through the
- * `capabilityCatalog` barrel → `shared/src/index.ts` (the `"."` export), so it
- * ships in the pre-auth web bundle. That is required for `server/`'s
- * `isEntryInvocable` to import it across the package boundary (there is no
- * `./capabilityCatalog` subpath in `shared/package.json`). The EMPTY seed
- * discloses nothing. When the follow-up PR promotes ids, reconsider homing the
- * constant under `server/` if #3752's web panel does not consume it — a non-empty
- * list would otherwise publish "which mutating capabilities an agent may invoke on
- * this build" to the browser.
+ * `capabilityCatalog` barrel → `shared/src/index.ts` (the `"."` export), which
+ * `server/`'s `isEntryInvocable` needs to import it across the package boundary
+ * (there is no `./capabilityCatalog` subpath in `shared/package.json`).
+ *
+ * Home reconsidered when the list became non-empty (#3842 decision D2 = A): it
+ * STAYS in `@hapi/protocol`. `web/src` imports neither this list nor the catalog
+ * index, and `@hapi/protocol` is `sideEffects: false`, so the web bundle does not
+ * ship it today (verified: the built `web/dist` carries no catalog entry ids). If
+ * #3752's web panel ever imports it, reconsider homing it under `server/`.
  */
 
 /**
@@ -38,4 +47,13 @@
  * `riskTier: "mutating"`, `trusted !== false`, user-scope entry — enforced by the
  * guard in `promoted.test.ts`, not by review alone.
  */
-export const PROMOTED_ENTRY_IDS: readonly string[] = [];
+export const PROMOTED_ENTRY_IDS: readonly string[] = [
+  "machine-daemon.machine-spawn", // [RULING 2026-09-30: 4403 T2] #3842 spawn_session
+  "messaging.send-message", // [RULING 2026-09-30: 4403 T2] #3842 send_message
+  "messaging.list-messages", // [RULING 2026-09-30: 4403 T2] #3842 read_session_messages
+  "session-lifecycle.archive", // [RULING 2026-09-30: 4403 T2] #3842 archive_session
+  "scheduler.create", // [RULING 2026-09-30: 4403 T2] #3842 create_schedule
+  "scheduler.update", // [RULING 2026-09-30: 4403 T2] #3842 update_schedule
+  "model-permission.approve-permission", // [RULING 2026-09-30: 4403 T2] #3842 respond_to_permission
+  "model-permission.deny-permission", // [RULING 2026-09-30: 4403 T2] #3842 respond_to_permission
+];

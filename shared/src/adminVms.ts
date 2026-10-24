@@ -324,13 +324,17 @@ export type PreflightResponse = z.infer<typeof PreflightResponseSchema>;
 /**
  * `POST /admin-vms/deprovision/dry-run` body. `subdomain` is re-validated by
  * `buildJob`'s `deprovision` positional pattern (`^[a-z0-9][a-z0-9-]*$`).
- * `email` (optional) becomes `--email`; it has no server-side source, so
- * gateway-mapping removal that needs it is a documented limitation when the
- * inventory record carries no `gateway_host`.
+ * `email` (optional) becomes `--email`, the fallback for a gateway whose mappings
+ * cannot be listed. `serviceEnd` (optional, #5257 F9) becomes `--service-end`, the
+ * effective service end E that dates the backup retention record; `buildJob`
+ * validates it (a real calendar date, not more than 30 days ago). Without it the
+ * teardown keeps the bucket in service and ends INCOMPLETE RETENTION. The dialog
+ * always sends it; the API keeps it optional.
  */
 export const DeprovisionDryRunRequestSchema = z.object({
   subdomain: z.string().min(1),
   email: z.string().optional(),
+  serviceEnd: z.string().optional(),
 });
 export type DeprovisionDryRunRequest = z.infer<
   typeof DeprovisionDryRunRequestSchema
@@ -340,7 +344,14 @@ export type DeprovisionDryRunRequest = z.infer<
  * `POST /admin-vms/deprovision/dry-run` response. The transcript is the (default
  * dry-run) deprovision job's log; `confirmationToken` is a fresh, short-lived,
  * single-use, server-side token BOUND to the exact validated argv previewed
- * here — the apply step replays that argv + `--apply`.
+ * here — the apply step replays that argv + `--apply`, so the service end and
+ * gateway host below are the ones the apply uses (#5257 F9).
+ *
+ * `serviceEnd` echoes the request's E; `deleteEligibleAt` is E + 30 days (ISO),
+ * the earliest date of the dated purge; both are null without a service end.
+ * `gatewayHost` is the `--gateway-host` passed (the inventory record's
+ * `gateway_host`, else the server's `HAPI_VM_GATEWAY_HOST`), or null when there
+ * is none — the teardown then cannot write the retention record.
  */
 export const DeprovisionDryRunResponseSchema = z.object({
   jobId: z.string(),
@@ -348,6 +359,9 @@ export const DeprovisionDryRunResponseSchema = z.object({
   state: JobStateSchema,
   transcript: z.string(),
   confirmationToken: z.string(),
+  serviceEnd: z.string().nullable(),
+  deleteEligibleAt: z.string().nullable(),
+  gatewayHost: z.string().nullable(),
 });
 export type DeprovisionDryRunResponse = z.infer<
   typeof DeprovisionDryRunResponseSchema

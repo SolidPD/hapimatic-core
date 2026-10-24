@@ -10,6 +10,11 @@ import {
   notifyOriginatingHub,
 } from "./shared";
 import { logAndJson } from "../routeErrorHelper";
+import {
+  dismissPendingSpawn,
+  getFederationPendingSpawn,
+  markSpawnFailed,
+} from "../../../sync/pendingSpawns";
 import { isSafeMachinePath } from "../../../utils/pathSecurity";
 import { expandTilde } from "../../../utils/expandTilde";
 import {
@@ -1066,6 +1071,7 @@ export function createSessionLifecycleRoutes(
         sessionType,
         worktreeName,
         existingBranch,
+        sourceBranch,
         name,
         emoji,
         originatingNodeId,
@@ -1133,6 +1139,8 @@ export function createSessionLifecycleRoutes(
           // hapimatic-private#4481: forward the existing-branch pick on the
           // peer-incoming hop (#1262 trap).
           existingBranch,
+          // hapimatic-private#4370: forward the explicit base branch (#1262 trap).
+          sourceBranch,
           originatingNodeId,
           accountUuid,
           // Issue #2822 (epic #2478 D2a): forward the managed-peer attribution on
@@ -1178,6 +1186,18 @@ export function createSessionLifecycleRoutes(
           nativeModelSelection,
           claudePath,
         })
+        // Issue #2150: a REJECTED spawn takes the same failure branch below (log
+        // + hub callback) instead of becoming an unhandled rejection that tells
+        // the caller nothing — the local early-return path's `.catch`
+        // (routes/machines.ts) is the precedent.
+        .catch(
+          (
+            err: unknown
+          ): { type: "error"; message: string; code?: string } => ({
+            type: "error",
+            message: err instanceof Error ? err.message : String(err),
+          })
+        )
         .then(async result => {
           // [perf] issue #2147 stage (b): the node's own raw-spawn duration
           // (accept → daemon RPC resolved), joinable with the hub stamps on dir.
@@ -1186,12 +1206,15 @@ export function createSessionLifecycleRoutes(
             { category: "perf" }
           );
           if (result.type === "error") {
+            // Issue #2150 (R2): name the correlation id and the refusal code so
+            // a rejected federation spawn is findable in this node's journal.
             console.error(
-              `[Federation] Background spawn failed: ${result.message}`
+              `[Federation] Background spawn failed (spawnCorrelationId=${spawnCorrelationId ?? "none"}${result.code ? `, code=${result.code}` : ""}): ${result.message}`
             );
 
             // Notify the originating hub of the failure so it can surface
-            // the error to the client immediately (issue #933).
+            // the error to the client immediately (issue #933). Issue #2150:
+            // forward the refusal code too (K-4497-1 §3).
             void notifyOriginatingHub({
               originatingNodeId,
               nodeId: deps.federationConfig?.nodeId ?? "",
@@ -1199,6 +1222,7 @@ export function createSessionLifecycleRoutes(
               spawnCorrelationId,
               success: false,
               error: result.message,
+              code: result.code,
               deps,
             });
             return;
@@ -1290,25 +1314,59 @@ export function createSessionLifecycleRoutes(
         success,
         sessionId,
         error,
+        code,
       } = parsed.data;
 
+      // Issue #2150: the placeholder this hub registered when it proxied the
+      // spawn (webClient.ts). It is the ONLY source of the caller's namespace —
+      // this route is federation-token-authed and has none — and of the node the
+      // hub proxied to, which is stamped in preference to the peer's self-report
+      // (#4461's hub-canonical identity rule; a hub `nodes[].id` can differ from
+      // the peer's own nodeId, e.g. "sl7" vs "SL7").
+      const pending = spawnCorrelationId
+        ? getFederationPendingSpawn(spawnCorrelationId)
+        : undefined;
+      const registry = deps.getNodeRegistry();
+      const hubNodeId = pending?.nodeId ?? nodeId;
+      const nodeLabel =
+        registry?.getNodeIdentity(hubNodeId)?.nodeLabel ?? pending?.nodeLabel;
+
       if (!success && error) {
-        // Emit SSE event to all connected clients so the web UI can
-        // call markSpawnFailed() on the matching pending-spawn stub.
+        // R1: flip the hub-side placeholder so CLI pollers of
+        // /federation/all-sessions read the peer's error + code.
+        if (pending && spawnCorrelationId) {
+          markSpawnFailed(spawnCorrelationId, error, code);
+        }
+
+        // Emit SSE event so the web UI can call markSpawnFailed() on the
+        // matching pending-spawn stub. Issue #2150 (K-4497-1 §1): stamped with
+        // the CALLER's namespace — without one `SSEManager.shouldSend` drops it
+        // for every connection. With no placeholder there is no namespace to
+        // stamp, and DEFAULT_NAMESPACE is never substituted (it would leak the
+        // directory and error text across namespaces): the event is broadcast
+        // as before and the log below records why no browser gets it.
         const sseManager = deps.getSseManager();
         if (sseManager) {
           sseManager.broadcast({
             type: "federation-spawn-failed",
-            nodeId,
+            nodeId: hubNodeId,
             directory,
             spawnCorrelationId: spawnCorrelationId ?? null,
             error,
+            ...(code ? { code } : {}),
+            ...(nodeLabel ? { nodeLabel } : {}),
+            ...(pending ? { namespace: pending.namespace } : {}),
           });
         }
 
         console.warn(
-          `[Federation] Spawn failed on node ${nodeId}: ${error} (dir: ${directory})`
+          `[Federation] Spawn failed on node ${nodeId}${code ? ` (${code})` : ""}: ${error} (dir: ${directory}, spawnCorrelationId: ${spawnCorrelationId ?? "none"})`
         );
+        if (!pending) {
+          console.warn(
+            `[Federation] spawn-status failure from ${nodeId} has no hub placeholder (spawnCorrelationId: ${spawnCorrelationId ?? "none"}) — no caller namespace, so no browser receives it`
+          );
+        }
       } else if (success && sessionId) {
         // [#2147 Quick Win #1] Act on the SUCCESS callback the remote already
         // sends (notifyOriginatingHub POSTs {success:true, sessionId, ...}). Trigger
@@ -1320,14 +1378,44 @@ export function createSessionLifecycleRoutes(
         // the periodic loop — Fallback Preservation Rule (saga #293→#370→#494).
         // pollNode then emits the session-added nudge that carries discovery to the
         // browser.
-        const registry = deps.getNodeRegistry();
-        if (registry?.hasNode(nodeId)) {
-          void registry.pollNodeById(nodeId, "spawn-status").catch(err => {
-            console.warn(
-              `[Federation] spawn-status success poll failed for ${nodeId}:`,
-              err
-            );
+        //
+        // Issue #2150 (K-4497-1 §2): once that poll SETTLES, drop the hub-side
+        // placeholder and broadcast `federation-spawn-succeeded` to the caller,
+        // so a consumer that acts on it finds the session in the hub cache. The
+        // dismiss is the settle: without it the placeholder would sit in
+        // /federation/all-sessions as a stale "spawning" row until its TTL. The
+        // poll is chained, never awaited — the peer's callback aborts at 5s
+        // (shared.ts). No placeholder → no caller namespace → no success event.
+        const settle = () => {
+          if (!pending || !spawnCorrelationId) return;
+          dismissPendingSpawn(spawnCorrelationId);
+          deps.getSseManager()?.broadcast({
+            type: "federation-spawn-succeeded",
+            nodeId: hubNodeId,
+            directory,
+            spawnCorrelationId,
+            sessionId,
+            ...(nodeLabel ? { nodeLabel } : {}),
+            namespace: pending.namespace,
           });
+        };
+        // The peer's self-reported id first (the pre-#2150 poll target), then
+        // the node the hub proxied to.
+        const pollNodeId = [nodeId, hubNodeId].find(id =>
+          registry?.hasNode(id)
+        );
+        if (registry && pollNodeId) {
+          void registry
+            .pollNodeById(pollNodeId, "spawn-status")
+            .catch(err => {
+              console.warn(
+                `[Federation] spawn-status success poll failed for ${pollNodeId}:`,
+                err
+              );
+            })
+            .finally(settle);
+        } else {
+          settle();
         }
       }
 

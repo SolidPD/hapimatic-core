@@ -96,12 +96,6 @@ export function createCompanionHelperRoutes(
 
   app.post(
     "/companion/helper/pair-requests",
-    createRateLimiter({
-      name: "companion-pair-request",
-      limit: 10,
-      windowMs: 60_000,
-      keyFn: clientAddrKey,
-    }),
     cataloged(
       defineCapability({
         id: "machine-daemon.companion-pair-request",
@@ -121,6 +115,12 @@ export function createCompanionHelperRoutes(
         probe: "skip",
       })
     ),
+    createRateLimiter({
+      name: "companion-pair-request",
+      limit: 10,
+      windowMs: 60_000,
+      keyFn: clientAddrKey,
+    }),
     async c => {
       const service = opts.getService();
       if (!service) return disabled(c);
@@ -136,12 +136,6 @@ export function createCompanionHelperRoutes(
 
   app.post(
     "/companion/helper/pair-requests/:requestId/claim",
-    createRateLimiter({
-      name: "companion-pair-claim",
-      limit: 60,
-      windowMs: 60_000,
-      keyFn: clientAddrKey,
-    }),
     cataloged(
       defineCapability({
         id: "machine-daemon.companion-pair-claim",
@@ -162,6 +156,12 @@ export function createCompanionHelperRoutes(
         probe: "skip",
       })
     ),
+    createRateLimiter({
+      name: "companion-pair-claim",
+      limit: 60,
+      windowMs: 60_000,
+      keyFn: clientAddrKey,
+    }),
     async c => {
       const service = opts.getService();
       if (!service) return disabled(c);
@@ -293,7 +293,6 @@ export function createCompanionRoutes(
 
   app.post(
     "/companion/pair-requests/lookup",
-    codeLimiter(),
     cataloged(
       defineCapability({
         id: "machine-daemon.companion-code-lookup",
@@ -314,6 +313,7 @@ export function createCompanionRoutes(
         probe: "skip",
       })
     ),
+    codeLimiter(),
     async c => {
       const service = opts.getService();
       if (!service) return disabled(c);
@@ -329,7 +329,6 @@ export function createCompanionRoutes(
 
   app.post(
     "/companion/pair-requests/confirm",
-    codeLimiter(),
     cataloged(
       defineCapability({
         id: "machine-daemon.companion-code-confirm",
@@ -349,6 +348,7 @@ export function createCompanionRoutes(
         probe: "skip",
       })
     ),
+    codeLimiter(),
     async c => {
       const service = opts.getService();
       if (!service) return disabled(c);

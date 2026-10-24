@@ -4,7 +4,7 @@ import type {
   McpReviewValue,
   McpServerEntry,
 } from "@hapi/protocol/porter";
-import { buildMcpServerConfig } from "./mcpImport";
+import { buildMcpServerConfig, reviewedMcpCommand } from "./mcpImport";
 import { declaredSlotNames } from "./mcpRebuild";
 import type { ImportPlan, PlannedMcpServer } from "./importArchive";
 
@@ -20,7 +20,8 @@ import type { ImportPlan, PlannedMcpServer } from "./importArchive";
  * matches the commit by construction — `url` from its slot when `urlName` is
  * set, every `argsNames` index replaced, `type` only off stdio, `disabled` on
  * any transport. The command is then the plan's own `commandTranslation.to`
- * when the plan translated it, which is what the builder writes at commit.
+ * when the plan translated it ({@link reviewedMcpCommand}), which is what the
+ * commit writes, or the commit excludes the server (#5192, `./mcpRebuild`).
  *
  * Projected from `plan.manifest`, never `plan.mcpItems` (which holds decrypted
  * secret values in memory): the `Pick` below leaves `mcpItems` out of the type.
@@ -75,7 +76,7 @@ export function mcpReviewDefinition(
 
   const definition: McpReviewDefinition = { transport: entry.transport };
   if (typeof built.command === "string") {
-    definition.command = translatedCommand ?? built.command;
+    definition.command = reviewedMcpCommand(entry, translatedCommand);
   }
   if (Array.isArray(built.args)) {
     const slotAt = new Map(

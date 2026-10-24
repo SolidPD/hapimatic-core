@@ -105,11 +105,129 @@ export const mcpCatalogEntries = [
     domain: "mcp",
     surface: "mcp",
     description:
-      "Invoke a catalogued REST capability by method+path through the tier-gated generic invoker.",
+      "Invoke a catalogued REST capability by method+path (+ optional query object) through the tier-gated generic invoker.",
     whenToUse: "To invoke a catalogued REST capability.",
     invocation: { kind: "mcp", tool: "hapi_call" },
     auth: "cli-token",
     riskTier: "mutating",
     availability: { scope: "user" },
+  }),
+  // Issue #3842 (epic #4403 member C): typed session / worktree / schedule tools.
+  // Each wraps REST entries through hapi_call, so its tier equals the wrapped
+  // route's: list_sessions wraps the readonly session-introspection.list, and
+  // respond_to_permission wraps both approve and deny (nine entries, eight of
+  // them promoted). Short `whenToUse` text
+  // keeps the Tier-0 block small (epic #4403 OD-1).
+  defineCapability({
+    id: "mcp.spawn-session",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "Spawn a peer session on a machine (sessionType worktree creates a git worktree) through the tier-gated invoker.",
+    whenToUse: "To spawn a peer.",
+    invocation: { kind: "mcp", tool: "spawn_session" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user" },
+  }),
+  defineCapability({
+    id: "mcp.send-message",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "Send a message to a peer session, stamped as sent by this session, through the tier-gated invoker.",
+    whenToUse: "To message peers.",
+    invocation: { kind: "mcp", tool: "send_message" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user" },
+  }),
+  defineCapability({
+    id: "mcp.list-sessions",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "List the sessions in this namespace with their ids, state, and metadata.",
+    whenToUse: "To list sessions.",
+    invocation: { kind: "mcp", tool: "list_sessions" },
+    auth: "cli-token",
+    riskTier: "readonly",
+    availability: { scope: "user" },
+  }),
+  defineCapability({
+    id: "mcp.read-session-messages",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "Read a session's message history page by page through the tier-gated invoker.",
+    whenToUse: "To read messages.",
+    invocation: { kind: "mcp", tool: "read_session_messages" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user" },
+  }),
+  defineCapability({
+    id: "mcp.archive-session",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "Archive (disconnect) a live peer session you are finished with; its record stays.",
+    whenToUse: "To archive peers.",
+    invocation: { kind: "mcp", tool: "archive_session" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user" },
+  }),
+  defineCapability({
+    id: "mcp.create-schedule",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "Create a scheduled task that runs a prompt on a cron, interval, or one-shot timer; bypass-mode sessions only.",
+    whenToUse: "To schedule work.",
+    invocation: { kind: "mcp", tool: "create_schedule" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user" },
+  }),
+  defineCapability({
+    id: "mcp.update-schedule",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "Update a scheduled task's timing, prompt, or enablement; bypass-mode sessions only.",
+    whenToUse: "To reschedule.",
+    invocation: { kind: "mcp", tool: "update_schedule" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user" },
+  }),
+  defineCapability({
+    id: "mcp.respond-to-permission",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "Approve or deny another session's pending permission request; bypass-mode sessions only, never your own.",
+    whenToUse: "To grant or deny.",
+    invocation: { kind: "mcp", tool: "respond_to_permission" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user" },
+  }),
+  // Issue #4450: the one operator-scope tool. Destructive and operator-only, so
+  // it is never Tier-0 and never on the stdio bridge; the server lists it only
+  // to a caller that derives operator scope, and the Claude launchers register it
+  // only after seeing it here (`HAPY_MCP_OPERATOR_TOOL_NAMES`).
+  defineCapability({
+    id: "mcp.remove-worktree",
+    domain: "mcp",
+    surface: "mcp",
+    description:
+      "Move the idle worktree of a session you spawned to .trash (recoverable); operator hosts only.",
+    whenToUse: "To remove a spawned peer's idle worktree.",
+    invocation: { kind: "mcp", tool: "remove_worktree" },
+    auth: "cli-token",
+    riskTier: "destructive",
+    availability: { scope: "operator" },
   }),
 ];

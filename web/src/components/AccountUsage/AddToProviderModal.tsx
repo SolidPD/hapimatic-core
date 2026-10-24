@@ -24,11 +24,11 @@ import {
 import {
   NodeLoginList,
   useAnthropicLoginStep,
-  useFederationNodesInfo,
   useInvalidateAfterAdd,
   useLoginNodes,
   useOpenAiLoginStep,
 } from "@/components/AccountUsage/NodeLoginList";
+import { useFederationNodesInfo } from "@/hooks/queries/useFederationHealthAvailable";
 
 export type AddToProviderModalProps = {
   isOpen: boolean;

@@ -44,6 +44,35 @@ export function federationReadSignal(
   return requestSignal ? AbortSignal.any([requestSignal, timeout]) : timeout;
 }
 
+/**
+ * Headers-only variant of {@link federationReadSignal} for a proxy that STREAMS
+ * a binary body back to the browser (issue #5410). `federationReadSignal` stays
+ * attached to the response body, so on Bun 1.4 it also aborts a body still being
+ * read: a fixture streaming 10 chunks at 100 ms was cut off at 300 ms. Uploads go
+ * up to 200 MB, so a whole-request timeout would truncate a slow or large
+ * download. Here the timer bounds everything until `disarm()`: disarm as soon as
+ * headers arrive when the body must stream unbounded (and on every exit). A
+ * caller may keep it armed to also bound a small body, such as an error body.
+ * The inbound request signal still cancels the fetch if the browser leaves.
+ *
+ * READ-ONLY GETs ONLY, for the same reason as `federationReadSignal`.
+ */
+export function federationHeadersSignal(
+  requestSignal?: AbortSignal,
+  timeoutMs: number = FEDERATION_READ_TIMEOUT_MS
+): { signal: AbortSignal; disarm: () => void } {
+  const ctl = new AbortController();
+  const timer = setTimeout(
+    () =>
+      ctl.abort(new DOMException("The operation timed out.", "TimeoutError")),
+    timeoutMs
+  );
+  const signal = requestSignal
+    ? AbortSignal.any([requestSignal, ctl.signal])
+    : ctl.signal;
+  return { signal, disarm: () => clearTimeout(timer) };
+}
+
 /** True for a fetch or body read cut off by an abort signal (timeout or disconnect). */
 export function isAbortError(error: unknown): boolean {
   const name = (error as { name?: unknown } | null)?.name;
@@ -95,4 +124,21 @@ export async function readProxyJson(resp: Response): Promise<unknown> {
     if (resp.ok) throw error;
     return null;
   }
+}
+
+/**
+ * `readProxyJson` for a hub→peer call that is not a request proxy, so it has
+ * no route Context (#5487). Returns the body as an object: an empty body, an
+ * unparseable non-OK body, or a JSON value that is not an object (null, an
+ * array, a string, a number) reads as {}. A transport failure during the read
+ * (a body cut off mid-read, an abort/timeout), or an unparseable OK body,
+ * rethrows exactly as readProxyJson does, so the caller classifies it.
+ */
+export async function readPeerJsonObject(
+  resp: Response
+): Promise<Record<string, unknown>> {
+  const body = await readProxyJson(resp);
+  return body !== null && typeof body === "object" && !Array.isArray(body)
+    ? (body as Record<string, unknown>)
+    : {};
 }

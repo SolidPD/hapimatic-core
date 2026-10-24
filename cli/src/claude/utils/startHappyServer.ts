@@ -13,7 +13,24 @@ import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import { configuration } from "@/configuration";
 import { API_KEY_PROVIDERS } from "@hapi/protocol/schemas";
-import { DOMAIN_SLUGS, trimTrailingChars } from "@hapi/protocol";
+import {
+  DOMAIN_SLUGS,
+  isUnsafePathSegment,
+  trimTrailingChars,
+} from "@hapi/protocol";
+import {
+  archiveSessionTool,
+  createScheduleTool,
+  listSessionsTool,
+  readSessionMessagesTool,
+  removeWorktreeTool,
+  respondToPermissionTool,
+  sendMessageTool,
+  spawnSessionTool,
+  updateScheduleTool,
+  type OrchestrationToolSpec,
+  type TypedCallRequest,
+} from "./hapiOrchestrationTools";
 
 // Constants for image fetching
 const IMAGE_FETCH_TIMEOUT_MS = 10000; // 10 seconds
@@ -254,6 +271,9 @@ function markUntrustedEntry(entry: unknown): unknown {
   return marked;
 }
 
+/** The one route `postDirect` may send to (#4450 `remove_worktree`). */
+const DIRECT_ROUTE = /^\/api\/machines\/[^/]+\/worktrees\/remove$/;
+
 /** Apply {@link markUntrustedEntry} to every `CatalogEntry`-bearing section of a
  *  catalog response. Defensive: a non-object (an error envelope) passes through. */
 function markUntrustedCatalog(body: unknown): unknown {
@@ -314,21 +334,33 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
    * re-auths ONCE, and retries ONCE. Any other status (403 `tier_not_invocable`,
    * 404 `session_not_found`, …) is returned as-is — the tool forwards the server
    * envelope verbatim (single-enforcement-point; no retry, no masking).
+   * `init.headers` (#3842) is merged after `Content-Type` but can never override
+   * `Authorization`, which this function owns (the 401 retry rewrites it).
    */
   async function authedFetch(
     path: string,
-    init?: { method?: string; body?: string }
+    init?: { method?: string; body?: string; headers?: Record<string, string> }
   ) {
     const jwt = await getJwt();
+    // Drop any caller key that differs only in case from `Authorization`: fetch
+    // merges header names case-insensitively, so a lower-case duplicate would be
+    // joined into the bearer value instead of replaced (PR #5615 review).
+    const extra = Object.fromEntries(
+      Object.entries(init?.headers ?? {}).filter(
+        ([name]) => name.toLowerCase() !== "authorization"
+      )
+    );
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${jwt}`,
       "Content-Type": "application/json",
+      ...extra,
+      Authorization: `Bearer ${jwt}`,
     };
-    let resp = await doFetch(`${base}${path}`, { ...init, headers });
+    const request = { method: init?.method, body: init?.body, headers };
+    let resp = await doFetch(`${base}${path}`, request);
     if (resp.status === 401) {
       cachedJwt = null;
       headers.Authorization = `Bearer ${await authenticate()}`;
-      resp = await doFetch(`${base}${path}`, { ...init, headers });
+      resp = await doFetch(`${base}${path}`, request);
     }
     return resp;
   }
@@ -429,46 +461,203 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
 
   /**
    * `hapi_call` (#3751 R2/R3): invoke a catalogued REST capability by
-   * `{method, path, body?}` through the server's tier-gated generic invoker. The
+   * `{method, path, body?, query?}` through the server's tier-gated generic
+   * invoker (`query`, #4011: string values the server appends after it gates the
+   * bare path). The
    * SERVER enforces the gate (readonly runs; mutating runs only if promoted;
    * destructive / uncatalogued / out-of-scope refuse). The server envelope
    * (`tier_not_invocable`, `not_invocable`, …) is forwarded verbatim — no retry,
    * no masking, no local execution.
+   *
+   * Provenance (#3842 R5): every request carries `X-Hapi-Session-Id: <self>`,
+   * stamped HERE rather than per tool because the wrapper, not the agent, owns
+   * this header — so raw `hapi_call` and every typed tool carry the same
+   * provenance, and the invoker forwards it to the target route.
+   *
+   * `isError` (PR #5615 review): many routes the invoker relays answer success
+   * with a bare body that has no `ok` field (`{ sessions }`, `{ schedule }`, the
+   * spawn route's `{ type: "success", sessionId }`), so `ok !== true` would flag a
+   * success as an error and invite a retry (a duplicate spawn or schedule). A
+   * result is an error when the HTTP status is not 2xx, the body says
+   * `ok: false`, or it carries the spawn route's `type: "error"` (which it can
+   * return with status 200). Also closes #5590 S1.
    */
-  async function call(args: {
-    method: string;
-    path: string;
-    body?: unknown;
-  }): Promise<CapabilityToolResult> {
+  async function call(args: TypedCallRequest): Promise<CapabilityToolResult> {
+    return postWithProvenance(`/api/capabilities/call`, {
+      method: args.method,
+      path: args.path,
+      body: args.body,
+      query: args.query,
+    });
+  }
+
+  /**
+   * POST `body` to `path` with this session's `X-Hapi-Session-Id` and relay the
+   * server envelope verbatim. The one place the `isError` rule lives, shared by
+   * `call()` and `postDirect()` so the two cannot drift (#4450).
+   */
+  async function postWithProvenance(
+    path: string,
+    body: unknown
+  ): Promise<CapabilityToolResult> {
     try {
-      const resp = await authedFetch(`/api/capabilities/call`, {
+      const resp = await authedFetch(path, {
         method: "POST",
-        body: JSON.stringify({
-          method: args.method,
-          path: args.path,
-          body: args.body,
-        }),
+        headers: { "X-Hapi-Session-Id": deps.selfSessionId },
+        body: JSON.stringify(body),
       });
-      const body = (await resp.json()) as { ok?: unknown };
+      const result = (await resp.json()) as { ok?: unknown; type?: unknown };
       return {
-        content: [{ type: "text", text: JSON.stringify(body) }],
-        isError: body?.ok !== true,
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        isError: !resp.ok || result?.ok === false || result?.type === "error",
       };
     } catch (err) {
       return toolTransportError(err);
     }
   }
 
-  return { capabilities, invoke, catalog, call };
+  /**
+   * The sender of the one operator tool, `remove_worktree` (#4450). Its route is
+   * `destructive` and operator-only, which the invoker behind `call()` always
+   * refuses, so this posts to the route itself, through the same
+   * `postWithProvenance` as `call()` (same header, same `isError` rule).
+   *
+   * It sends ONLY to the remove-worktree route: any other request is refused
+   * before a fetch, so this sender can never become a way around the invoker's
+   * tier gate for another route. The route checks operator scope, the caller and
+   * ownership itself.
+   */
+  async function postDirect(
+    req: TypedCallRequest
+  ): Promise<CapabilityToolResult> {
+    if (req.method !== "POST" || !DIRECT_ROUTE.test(req.path) || req.query) {
+      return inputRefusal(
+        "invalid_input",
+        "path",
+        "postDirect only sends POST /api/machines/:id/worktrees/remove"
+      );
+    }
+    return postWithProvenance(req.path, req.body ?? {});
+  }
+
+  /**
+   * Whether this session's catalog lists the `mcp` entry `id` (#4450 R7). The
+   * server hard-filters operator entries out for a user caller, so this is the
+   * operator probe `startHappyServer` runs once before registering an operator
+   * tool. Fails closed: any error, non-2xx status or odd body answers `false`.
+   * Reads the raw body on purpose — `catalog()` wraps it for the model.
+   */
+  async function listsMcpEntry(id: string): Promise<boolean> {
+    try {
+      const params = new URLSearchParams({
+        domain: "mcp",
+        surface: "mcp",
+        sessionId: deps.selfSessionId,
+      });
+      const resp = await authedFetch(
+        `/api/capabilities/catalog?${params.toString()}`
+      );
+      if (!resp.ok) return false;
+      const body = (await resp.json()) as { mcp?: unknown };
+      return (
+        Array.isArray(body?.mcp) &&
+        body.mcp.some(
+          e => !!e && typeof e === "object" && (e as { id?: unknown }).id === id
+        )
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** A locally refused typed-tool input: a structured, field-named error and
+   *  no request at all (#3842 R2). */
+  function inputRefusal(
+    code: "invalid_input" | "self_permission_refused",
+    field: string,
+    error: string
+  ): CapabilityToolResult {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ ok: false, code, field, error }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  /**
+   * The structured-error harness for the typed orchestration tools (#3842 Task 5).
+   * Re-validates `args` against the tool's schema, refuses an unsafe path
+   * segment (`isUnsafePathSegment`, the client mirror of the invoker's #4316
+   * rules) or a self-session target before any fetch, then sends the built
+   * request through `send` (default `call()`) and forwards the server envelope
+   * verbatim. A caller may pass another `send` with the same result shape.
+   */
+  async function typedCall<A>(
+    args: unknown,
+    spec: OrchestrationToolSpec<A>,
+    send: (req: TypedCallRequest) => Promise<CapabilityToolResult> = call
+  ): Promise<CapabilityToolResult> {
+    const parsed = spec.inputSchema.safeParse(args ?? {});
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      return inputRefusal(
+        "invalid_input",
+        issue?.path.map(String).join(".") || "(input)",
+        issue?.message ?? "Invalid input"
+      );
+    }
+    const input = parsed.data;
+    const fields = input as Record<string, unknown>;
+    for (const field of spec.segments) {
+      const value = fields[field];
+      if (typeof value !== "string" || isUnsafePathSegment(value)) {
+        return inputRefusal(
+          "invalid_input",
+          field,
+          `${field} must be a plain id: no '/', '%', spaces or '..'`
+        );
+      }
+    }
+    if (
+      spec.refuseSelfField &&
+      fields[spec.refuseSelfField] === deps.selfSessionId
+    ) {
+      return inputRefusal(
+        "self_permission_refused",
+        spec.refuseSelfField,
+        "A session cannot respond to its own permission request"
+      );
+    }
+    const semantic = spec.check?.(input);
+    if (semantic) {
+      return inputRefusal("invalid_input", semantic.field, semantic.error);
+    }
+    return send(spec.build(input, deps.selfSessionId));
+  }
+
+  return {
+    capabilities,
+    invoke,
+    catalog,
+    call,
+    typedCall,
+    postDirect,
+    listsMcpEntry,
+  };
 }
 
 /**
  * The MCP tool names `startHappyServer` registers — the surface a CLAUDE session
- * sees (issue #3744, Sub-Issue D / R2, Task 1). The SINGLE source of truth AND the
- * type that constrains the `registerHapyTool` wrapper below, so a tool cannot be
+ * sees (issue #3744, Sub-Issue D / R2, Task 1). Together with
+ * `HAPY_MCP_OPERATOR_TOOL_NAMES` (#4450) it is the source of truth AND the type
+ * that constrains the `registerHapyTool` wrapper below, so a tool cannot be
  * registered without being listed: the wrapper's `name` parameter is
- * `HapyMcpToolName`, making a registration whose name is absent from this tuple a
- * COMPILE error. The returned `toolNames` is the ACTUAL registered set, never a
+ * `HapyMcpToolName` (the union of both tuples), making a registration whose name
+ * is absent from both a COMPILE error. The returned `toolNames` is the ACTUAL registered set, never a
  * second hand-list — a hand-authored parallel list is the exact unaudited-drift
  * class the capability-catalog epic exists to kill.
  *
@@ -488,12 +677,60 @@ export const HAPY_MCP_TOOL_NAMES = [
   // transparent proxy, so these reach every harness automatically — no bridge edit.
   "hapi_catalog",
   "hapi_call",
+  // Issue #3842 (epic #4403 member C): typed session / worktree / schedule tools,
+  // each a thin wrapper over hapi_call through the tier gate (path (i)).
+  "spawn_session",
+  "send_message",
+  "list_sessions",
+  "read_session_messages",
+  "archive_session",
+  "create_schedule",
+  "update_schedule",
+  "respond_to_permission",
 ] as const;
 
-/** One of the tool names `startHappyServer` registers (issue #3744, R2). */
-export type HapyMcpToolName = (typeof HAPY_MCP_TOOL_NAMES)[number];
+/**
+ * Tools `startHappyServer` registers ONLY on an operator host and only for a
+ * launcher that passes `operatorTools: true` (issue #4450). Kept out of
+ * {@link HAPY_MCP_TOOL_NAMES}, which is the user-scope surface every harness
+ * sees and the stdio bridge mirrors. A launcher never auto-approves these
+ * (`autoApprovedHapiToolNames`, ruling 4450-D2 = A): the human answers the
+ * permission prompt unless the session runs in a bypass mode.
+ */
+export const HAPY_MCP_OPERATOR_TOOL_NAMES = ["remove_worktree"] as const;
 
-export async function startHappyServer(client: ApiSessionClient) {
+/** One of the tool names `startHappyServer` registers (issue #3744, R2). */
+export type HapyMcpToolName =
+  | (typeof HAPY_MCP_TOOL_NAMES)[number]
+  | (typeof HAPY_MCP_OPERATOR_TOOL_NAMES)[number];
+
+/**
+ * The registered tools a launcher may put in `allowedTools` (#4450 D2 = A):
+ * every tool except the operator ones, which keep Claude Code's permission
+ * prompt. Both launchers that own an `allowedTools` list call this.
+ */
+export function autoApprovedHapiToolNames(
+  toolNames: readonly string[]
+): string[] {
+  const operator = new Set<string>(HAPY_MCP_OPERATOR_TOOL_NAMES);
+  return toolNames.filter(name => !operator.has(name));
+}
+
+export async function startHappyServer(
+  client: ApiSessionClient,
+  options: {
+    /**
+     * Register the operator tools when this host grants operator scope (#4450
+     * R7). Only a launcher that owns an `allowedTools` list sets it: the stdio
+     * bridge forwards every registered tool to a harness with no such gate.
+     */
+    operatorTools?: boolean;
+    /** Test seam: overrides for the capability tools' server, token and fetch. */
+    capabilityDeps?: Partial<
+      Pick<CapabilityToolDeps, "serverUrl" | "getCliApiToken" | "fetchFn">
+    >;
+  } = {}
+) {
   // Handler that sends title updates via the client
   const handler = async (title: string) => {
     logger.debug("[hapiMCP] Changing title to:", title);
@@ -524,8 +761,9 @@ export async function startHappyServer(client: ApiSessionClient) {
   });
 
   // Constant-drives-registration (#3744 R2 / Task 1): every tool registers through
-  // this wrapper, whose `name` is constrained to `HAPY_MCP_TOOL_NAMES`, so a name
-  // outside the exported tuple is a COMPILE error — the constant cannot silently
+  // this wrapper, whose `name` is constrained to `HapyMcpToolName` (the
+  // `HAPY_MCP_TOOL_NAMES` and `HAPY_MCP_OPERATOR_TOOL_NAMES` tuples), so a name
+  // outside both exported tuples is a COMPILE error — the constant cannot silently
   // drift from the registrations. `registeredToolNames` is the ACTUAL set the
   // server exposes and is returned as `toolNames` below (never a second hand-list).
   // The `<any, any>` widening mirrors the existing `registerTool` calls (the SDK's
@@ -741,6 +979,7 @@ export async function startHappyServer(client: ApiSessionClient) {
     selfSessionId: client.sessionId,
     serverUrl: configuration.serverUrl,
     getCliApiToken: () => configuration.cliApiToken,
+    ...options.capabilityDeps,
   });
 
   const hapiCapabilitiesInputSchema: z.ZodTypeAny = z.object({
@@ -854,13 +1093,20 @@ export async function startHappyServer(client: ApiSessionClient) {
       .record(z.string(), z.unknown())
       .optional()
       .describe("Optional JSON request body for the dispatched call."),
+    query: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe(
+        'Query parameters for GET capabilities, e.g. { pmSessionId: "<tag>" }; string values only, never put ? in path.'
+      ),
   });
 
   registerHapyTool(
     "hapi_call",
     {
       description:
-        "Invoke a catalogued REST capability by {method, path, body?}. The SERVER " +
+        "Invoke a catalogued REST capability by {method, path, body?, query?}; pass " +
+        "query parameters in query, never in path. The SERVER " +
         "enforces the tier gate: readonly capabilities run; mutating ones run ONLY " +
         "if promoted; destructive, uncatalogued, or out-of-scope requests return a " +
         "refusal verbatim (tier_not_invocable / not_invocable). Do NOT retry a " +
@@ -872,8 +1118,92 @@ export async function startHappyServer(client: ApiSessionClient) {
       method: string;
       path: string;
       body?: Record<string, unknown>;
+      query?: Record<string, string>;
     }) => capabilityTools.call(args)
   );
+
+  //
+  // Typed orchestration tools (issue #3842, epic #4403 member C). Each is a thin
+  // wrapper over hapi_call through the server's tier gate; the schemas, the
+  // request builders and the refusals live in `hapiOrchestrationTools.ts`. Each
+  // registration stays a literal call here because `mcpTools.test.ts` scans this
+  // file's source for them.
+  //
+  const orchestrationTool = <A>(spec: OrchestrationToolSpec<A>) => ({
+    config: {
+      description: spec.description,
+      title: spec.title,
+      inputSchema: spec.inputSchema as z.ZodTypeAny,
+    },
+    handler: (args: unknown) => capabilityTools.typedCall(args, spec),
+  });
+
+  {
+    const tool = orchestrationTool(spawnSessionTool);
+    registerHapyTool("spawn_session", tool.config, tool.handler);
+  }
+
+  {
+    const tool = orchestrationTool(sendMessageTool);
+    registerHapyTool("send_message", tool.config, tool.handler);
+  }
+
+  {
+    const tool = orchestrationTool(listSessionsTool);
+    registerHapyTool("list_sessions", tool.config, tool.handler);
+  }
+
+  {
+    const tool = orchestrationTool(readSessionMessagesTool);
+    registerHapyTool("read_session_messages", tool.config, tool.handler);
+  }
+
+  {
+    const tool = orchestrationTool(archiveSessionTool);
+    registerHapyTool("archive_session", tool.config, tool.handler);
+  }
+
+  {
+    const tool = orchestrationTool(createScheduleTool);
+    registerHapyTool("create_schedule", tool.config, tool.handler);
+  }
+
+  {
+    const tool = orchestrationTool(updateScheduleTool);
+    registerHapyTool("update_schedule", tool.config, tool.handler);
+  }
+
+  {
+    const tool = orchestrationTool(respondToPermissionTool);
+    registerHapyTool("respond_to_permission", tool.config, tool.handler);
+  }
+
+  //
+  // Operator tools (issue #4450). Registered BEFORE `mcp.connect` (no reliance on
+  // `tools/list_changed`), and only when the launcher asks for them AND this
+  // session's catalog lists the entry — the server lists an operator entry only
+  // for a caller that derives operator scope, so a user host or a customer VM
+  // never sees the tool. The route re-checks the scope on every call.
+  //
+  if (
+    options.operatorTools === true &&
+    (await capabilityTools.listsMcpEntry("mcp.remove-worktree"))
+  ) {
+    registerHapyTool(
+      "remove_worktree",
+      {
+        description: removeWorktreeTool.description,
+        title: removeWorktreeTool.title,
+        inputSchema: removeWorktreeTool.inputSchema as z.ZodTypeAny,
+      },
+      (args: unknown) =>
+        capabilityTools.typedCall(
+          args,
+          removeWorktreeTool,
+          capabilityTools.postDirect
+        )
+    );
+  }
 
   const transport = new StreamableHTTPServerTransport({
     // NOTE: Returning session id here will result in claude

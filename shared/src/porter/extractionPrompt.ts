@@ -55,6 +55,7 @@ import { buildExportShellFragment, EXPORT_DIR_ENV } from "./exportNaming";
 // interpolated so this prompt cannot drift from the script exporters.
 import {
   ARCHIVE_CREDENTIAL_OMISSION_REASON,
+  ARCHIVE_HOOK_SLOT_TAKEN_OMISSION_REASON,
   CLAUDE_MD_INCLUDE_GREP,
   CLAUDE_MD_INCLUDE_NOT_FOUND_REASON_PREFIX,
   CLAUDE_MD_INCLUDE_NOT_FOUND_SURFACE,
@@ -65,6 +66,7 @@ import {
 } from "./exportShared";
 import {
   buildIncludeCheckShellFragment,
+  CREDENTIAL_DIRS,
   INCLUDE_CHECK_PACKAGED,
   INCLUDE_CHECK_SUMMARY_PREFIX,
   PORTER_STAGING_MARKER,
@@ -250,16 +252,18 @@ export function buildExtractionPrompt(input: ExtractionPromptInput): string {
   ).join("\n");
   const junkExclusions = ARCHIVE_EXCLUSIONS.map(p => `\`${p}\``).join(", ");
   // #4172: the credential-bearing names, and the folders the rule covers (the
-  // section folders and hooks — the ones the exporters and Step 11 prune).
+  // section folders and hooks): the exporters prune them, and Step 11 lists the
+  // names it finds there and leaves them out of its copy (it never prunes in
+  // place). One list, CREDENTIAL_DIRS, shared with the Step 11 block (#4321).
   const credentialNames = ARCHIVE_CREDENTIAL_NAMES.map(n => `\`${n}\``).join(
     ", "
   );
   const credentialPrefixes = ARCHIVE_CREDENTIAL_PREFIXES.map(
     p => `\`${p}\``
   ).join(", ");
-  const credentialDirs = [...DIMENSION_DIRS, "hooks"]
-    .map(d => `\`~/.claude/${d}\``)
-    .join(", ");
+  const credentialDirs = CREDENTIAL_DIRS.map(d => `\`~/.claude/${d}\``).join(
+    ", "
+  );
   const settingsAllowlist = PORTABLE_SETTINGS_KEYS.map(k => `\`${k}\``).join(
     ", "
   );
@@ -580,8 +584,16 @@ empty-matcher registrations are exactly the ones a careless filter drops.
    \`~/.claude/hooks/\`) and copy that FILE into \`hooks/\` in the archive. A script
    under \`~/.claude/hooks/\` keeps its path relative to \`~/.claude/\`, subfolders
    included (\`~/.claude/hooks/a/run.py\` is archived as \`hooks/a/run.py\`); any
-   other script goes into \`hooks/\` under its own name. Set the entry's
-   \`file.path\` (sub-step 4) to that archive path.
+   other script goes into \`hooks/\` under its own name. Never let such a script
+   replace another hook: if \`hooks/\` in the archive, or \`~/.claude/hooks/\`,
+   already holds an entry with that name in any letter case whose bytes differ
+   from the script, the name is already taken. Do not copy the script,
+   keep its registration (its command still names the script's own path), and
+   record an omission (Step 10) for it with the reason
+   \`${ARCHIVE_HOOK_SLOT_TAKEN_OMISSION_REASON}\`, unless the script already
+   ships at its own path in a carried section folder with the same bytes. The
+   same bytes (one script registered for several events) are no conflict. Set
+   the entry's \`file.path\` (sub-step 4) to that archive path.
 3. Normalize each \`command\` path to the portable form: rewrite the source home
    prefix (\`/home/<user>/.claude\` or \`~/.claude\`) to
    \`${PORTABLE_HOME_TOKEN}/.claude\` so the command is not dead-on-arrival where
@@ -827,7 +839,9 @@ re-applies the Step 3 include rule with
 the bash exporter's own code: it builds \`CLAUDE.md\` and \`claude-includes/\` from
 the config root in a temp directory and archives those, so a \`CLAUDE.md\` or
 \`claude-includes\` you staged is left where it is and is not archived, and it
-rewrites \`claudeMd\` and the include omissions in \`manifest.json\` to match.
+rewrites \`claudeMd\` and the include omissions in \`manifest.json\` to match (the
+block always archives the config root's \`CLAUDE.md\` when it is a file, so a
+\`CLAUDE.md\` omission you staged is then dropped).
 In the same way it builds \`${SETTINGS_SCRIPTS_DIR}/\` from \`$HOME/.claude\`: the
 top-level script that \`statusLine\` or \`apiKeyHelper\` runs, by the exporters'
 rule, so a \`${SETTINGS_SCRIPTS_DIR}\` folder you staged is never archived; and

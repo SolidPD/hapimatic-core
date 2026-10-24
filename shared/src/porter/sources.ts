@@ -4,7 +4,7 @@
  * issue #3448, K7/K10).
  *
  * The one-paste export probes the GLOBAL MCP config of every supported source —
- * Claude Code, Cursor, Claude Desktop — and records what it found. This module
+ * Claude Code, Cursor, Claude Desktop, Codex (#5169) — and records what it found. This module
  * is the SINGLE table both emitters (`exportScript.ts` bash, its
  * `exportScriptPowerShell.ts` twin), the server grouping (`commitSelection.ts`),
  * and the web review panel (via `@hapi/protocol`) read from, so the source id
@@ -30,9 +30,11 @@ export const PORTER_SOURCE_IDS = [
   "claude-code",
   "cursor",
   "claude-desktop",
+  // #5169 (D5): appended LAST, so no existing dedupe outcome changes.
+  "codex",
 ] as const;
 
-/** One discoverable configuration source (`"claude-code" | "cursor" | "claude-desktop"`). */
+/** One discoverable configuration source (`"claude-code" | "cursor" | "claude-desktop" | "codex"`). */
 export type PorterSourceId = (typeof PORTER_SOURCE_IDS)[number];
 
 /** Human-facing label per source — the caption the review cards render. */
@@ -40,6 +42,7 @@ export const PORTER_SOURCE_LABELS: Record<PorterSourceId, string> = {
   "claude-code": "Claude Code",
   cursor: "Cursor",
   "claude-desktop": "Claude Desktop",
+  codex: "Codex",
 };
 
 /**
@@ -73,7 +76,10 @@ export interface SourceConfigPath {
  * can seed a macOS-style path to exercise the found branch [1B#38]. `claude-code`
  * is intentionally absent: its MCP definitions come from the host `~/.claude.json`
  * (each emitter's Step 5), and its `found` flag tracks the `~/.claude` config
- * root, not a file here [1B#34].
+ * root, not a file here [1B#34]. `codex` is absent for the same kind of reason
+ * (#5169): its home is a folder (`$CODEX_HOME`, else `~/.codex`) that its own
+ * block in each emitter probes, and its `config.toml` is read by a TOML subset
+ * reader, not by the JSON projection a file here feeds (`codexSource.ts`).
  *
  * Desktop order — Windows `%APPDATA%\Claude` first, then the macOS
  * `~/Library/Application Support/Claude` location, then the Linux community XDG
@@ -83,7 +89,7 @@ export interface SourceConfigPath {
  * Linux-pwsh) [1B#40].
  */
 export const SOURCE_CONFIG_PATHS: Record<
-  Exclude<PorterSourceId, "claude-code">,
+  Exclude<PorterSourceId, "claude-code" | "codex">,
   readonly SourceConfigPath[]
 > = {
   cursor: [{ base: "home", segments: ".cursor/mcp.json" }],

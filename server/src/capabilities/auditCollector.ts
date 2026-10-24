@@ -32,9 +32,10 @@ import {
 /**
  * Hono stores the original handler on a COMPOSED one under this well-known key
  * (`hono/utils/constants` `COMPOSED_HANDLER`, verified for hono 4.11.2). Read the
- * literal to avoid a deep import; `cataloged()` sets its tag by reference and there
- * is no `app.onError` in `server/src`, so this is a DEFENSIVE second hop only
- * (mirrors `catalogCollector`).
+ * literal to avoid a deep import; `cataloged()` sets its tag by reference and no
+ * sub-app mounted via `app.route()` sets a custom `errorHandler` (the only
+ * `app.onError` is the root's, `buildWebApp.ts`), so this is a DEFENSIVE second
+ * hop only (mirrors `catalogCollector`).
  */
 const COMPOSED_HANDLER_KEY = "__COMPOSED_HANDLER";
 const AUDIT_LOG_CATEGORY = "capability-audit";

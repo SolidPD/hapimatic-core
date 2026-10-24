@@ -488,9 +488,21 @@ export function PorterExtractionPrompt({
                   >
                     {PORTER_TRUST_COPY}
                   </p>
-                  <p className="text-[length:var(--text-body-dense)] text-[var(--app-hint)]">
-                    Review the plan below and commit when you&apos;re ready.
-                  </p>
+                  {/* #5202 (U14): the archive arrived but its review could not
+                      be built (the detail is in the server log). */}
+                  {status.data?.planError ? (
+                    <p
+                      data-testid="porter-plan-error"
+                      className="text-[length:var(--text-body-dense)] text-hot"
+                    >
+                      The review of this configuration could not be built.
+                      Generate a new link and run the command again.
+                    </p>
+                  ) : (
+                    <p className="text-[length:var(--text-body-dense)] text-[var(--app-hint)]">
+                      Review the plan below and commit when you&apos;re ready.
+                    </p>
+                  )}
                 </div>
               )}
             </>

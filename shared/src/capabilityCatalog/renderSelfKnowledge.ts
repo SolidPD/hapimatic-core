@@ -74,7 +74,13 @@ export const SELF_KNOWLEDGE_CEILING: Record<SelfKnowledgeScope, number> = {
   // "Third-party software (SBOM)" section pointing every session — customer VMs
   // included — at the published bill of materials, so license and dependency
   // questions are answered from it, not from memory (render: ~10,700 B).
-  user: 11000,
+  // RAISED to 12,000 B by #3842 (epic #4403 OD-1 = A, operator 2026-10-02; this
+  // PR is expert-review gated): the eight typed orchestration tools
+  // (spawn_session … respond_to_permission) are genuine user-scope MCP tools and
+  // each renders one line here (585 B for the eight). Measured render 11,449 B;
+  // the 551 B margin fits about seven more such lines before the next reviewed
+  // raise.
+  user: 12000,
   // Greenfield: no replaced-doc anchor. Fits the current full user∪operator
   // render (~16 KB) with headroom for the catalog to fill as #3745 lands more
   // RPC entries, and catches the ~64–80 KB REST-inclusion runaway (R3). A

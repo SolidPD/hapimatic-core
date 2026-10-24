@@ -166,7 +166,11 @@ function defaultWhich(cmd: string, pathEnv?: string): string | null {
  *    the runtime is absent (the runtime is only NAMED, never provisioned — R4);
  *  - a `/home/<srcuser>/…` absolute path → PREFIX-REPLACE `/home/<srcuser>` →
  *    `destHome` (F14): translated when the rewritten path EXISTS, otherwise
- *    flagged `nonPortable` (never written verbatim without a flag — R3);
+ *    flagged `nonPortable` (never written verbatim without a flag — R3). A
+ *    source-home command with any path segment exactly `..` is never
+ *    translated: it is flagged `nonPortable` (#5192), because `join`
+ *    normalizes `..` (which can carry the result out of `destHome`) and
+ *    `/home/..` is not a source home at all;
  *  - any other path → existence check (a source-home path is the only rewrite).
  *
  * Operates on `command` ONLY — never inspects or mutates a secret value.
@@ -193,6 +197,17 @@ export function resolveMcpCommand(
   // (b) Source-home absolute path — prefix-replace to destHome (F14).
   const srcHome = sourceHomePrefix(command);
   if (srcHome) {
+    // #5192 (SINK-2): `join` normalizes `..`, so a `..` segment can carry the
+    // translation out of destHome (`/home/a/../../bin/sh` → `/bin/sh`), and
+    // `/home/../x` is not a source home at all (`..` sits in the user slot).
+    // Refuse every `..` segment, checking the WHOLE command.
+    if (command.split("/").includes("..")) {
+      return {
+        resolvable: false,
+        nonPortable: true,
+        reason: `source-home command path contains a ".." segment and is not translated: "${command}"`,
+      };
+    }
     const rest = command.slice(srcHome.length).replace(/^\/+/, "");
     const translated = join(opts.destHome, rest);
     if (existsSync(translated)) {
@@ -215,6 +230,24 @@ export function resolveMcpCommand(
 }
 
 /**
+ * The command the import review shows for `entry` (#5172) and the one the
+ * commit must write (#5192): the plan's source-home translation
+ * (`commandTranslation.to`) when it recorded one, else the manifest command
+ * verbatim. `undefined` for a server with no command (url/http/sse). One
+ * function for both sides, so the review and the commit cannot drift apart. It
+ * lives here, not in `mcpReviewDefinition`, because `mcpRebuild` would then
+ * import `mcpReviewDefinition`, which already imports `mcpRebuild` (a runtime
+ * cycle); this module is the lowest one both already import.
+ */
+export function reviewedMcpCommand(
+  entry: McpServerEntry,
+  translatedCommand?: string
+): string | undefined {
+  if (entry.command === undefined) return undefined;
+  return translatedCommand ?? entry.command;
+}
+
+/**
  * Build the `~/.claude.json` `mcpServers[name]` config from a manifest
  * {@link McpServerEntry} plus its decrypted secret map (`keyName → value`).
  *
@@ -229,6 +262,9 @@ export function resolveMcpCommand(
  * when commit rebuilds configs from the raw manifest, re-writing the broken path
  * (F14) while the plan summary showed it fixed. With no `opts` (legacy callers),
  * the command is copied verbatim — byte-identical to the pre-#2640 behavior.
+ * At commit, `rebuildMcpItems` writes the result only when its command equals
+ * {@link reviewedMcpCommand} for the plan's translation, and excludes the server
+ * otherwise (#5192).
  */
 export function buildMcpServerConfig(
   entry: McpServerEntry,

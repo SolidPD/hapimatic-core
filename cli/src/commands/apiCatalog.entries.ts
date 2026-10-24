@@ -337,6 +337,19 @@ export const cliCatalogEntries = [
     availability: { scope: "operator" },
   }),
   defineCapability({
+    id: "session-introspection.api-sessions-wait-until",
+    domain: "session-introspection",
+    surface: "cli",
+    description:
+      "Block until a session reaches a named state, or a timeout of at most 25 s.",
+    whenToUse:
+      "To wait for a peer session via `hapi api sessions wait-until` instead of polling it.",
+    invocation: { kind: "cli", command: "api sessions wait-until" },
+    auth: "cli-token",
+    riskTier: "readonly",
+    availability: { scope: "operator" },
+  }),
+  defineCapability({
     id: "session-lifecycle.api-sessions-delete",
     domain: "session-lifecycle",
     surface: "cli",

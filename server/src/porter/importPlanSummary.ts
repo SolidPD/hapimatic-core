@@ -108,18 +108,24 @@ export interface ImportPlanSummary {
   /** #5172: each server with the definition the commit writes (slots by name). */
   mcpServers: PlannedMcpServerReview[];
   plugins: { descriptorPresent: boolean; remediation: string[] };
-  /** The exporter's omissions plus any importer notice that is not a policy refusal. */
+  /**
+   * #5202 (U8): everything the plan recorded, refusals included —
+   * `policySkips` is the refusal subset. Kept complete so a client that
+   * renders only `omissions` (one that predates #4156) still shows every
+   * refusal; the current panel subtracts `policySkips` before rendering it.
+   */
   omissions: Omission[];
   /** #4156: the importer's policy refusals ("Refused by import policy"). */
   policySkips: Omission[];
+  /**
+   * #5202 (U10): the importer's notices ("Imported with a note"), also in
+   * `omissions`; the panel subtracts them from "Deliberately omitted".
+   */
+  notices: Omission[];
   expiresAt: number;
 }
 
 export function toPlanSummary(plan: ImportPlan): ImportPlanSummary {
-  // #4156 (K-A): split by identity — `policySkips` holds the same objects as
-  // `omissions`. Never derive this from `manifest.omissions`: an importer
-  // notice that is not a refusal must stay in `omissions`.
-  const policy = new Set(plan.policySkips);
   return {
     stagingHandle: plan.stagingHandle,
     claudeDir: plan.claudeDir,
@@ -179,8 +185,12 @@ export function toPlanSummary(plan: ImportPlan): ImportPlanSummary {
       descriptorPresent: plan.pluginDescriptorPresent,
       remediation: plan.pluginRemediation,
     },
-    omissions: plan.omissions.filter(o => !policy.has(o)),
+    // #5202 (U8): the complete list. Never derive either list from
+    // `manifest.omissions`: the importer's own notices and refusals live only
+    // on the plan.
+    omissions: plan.omissions,
     policySkips: plan.policySkips,
+    notices: plan.notices,
     expiresAt: plan.createdAt + plan.ttlMs,
   };
 }

@@ -7,7 +7,7 @@
  * commit-time logic — the same decomposition that produced `importPlanSummary.ts`
  * (#2565) and `commitSelection.ts` (#3247).
  */
-import { basename, join, resolve } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 import { HOOK_SUPPORT_DIRS } from "@hapi/protocol/porter";
 import {
   validateHookRegistration,
@@ -32,9 +32,10 @@ export interface DimensionParity {
   skippedConflicts: number;
   /**
    * The non-tautological gap: for `hooks`, registry-referenced modules absent at
-   * the destination post-commit (Task 4); for `hookSupport`, per-file entries
-   * that did not land at their own path and carry no plan-time omission (#4185
-   * reports an entry whose tar member is absent at plan time instead). Empty
+   * the destination post-commit (Task 4); for `hookSupport`, entries none of
+   * whose files the plan writes at or under their path and that carry no
+   * plan-time omission (#4185 reports an entry whose tar member is absent at
+   * plan time instead; #5188 counts a folder entry whose files land). Empty
    * otherwise.
    */
   missing: string[];
@@ -63,8 +64,8 @@ const KIND_TO_DIM: Record<PlannedItemKind, string> = {
  * finalized commit. `runCommit` is all-or-nothing (rollback on any error), so for
  * file dimensions `written`/`alreadyPresent`/`skippedConflicts` are a function of
  * the selected plan — the two `missing` sources are the only non-tautological
- * signals (a registry that points at an absent hook; a hookSupport entry that
- * did not land at its path). Deselected items (#3247) are excluded from every
+ * signals (a registry that points at an absent hook; a hookSupport entry none
+ * of whose files the plan writes at or under its path). Deselected items (#3247) are excluded from every
  * count.
  */
 export function computeParity(
@@ -102,20 +103,26 @@ export function computeParity(
     ensure("hooks").missing = [...hookValidation.registryMissing];
   }
 
-  // hookSupport: a per-file entry that did not land at its own path and has no
-  // plan-time omission — the directory entries (lib/_shared) are excluded.
+  // hookSupport: an entry none of whose files landed at or under its path and
+  // that has no plan-time omission — the directory entries (lib/_shared) are
+  // excluded.
   const isDirEntry = (path: string): boolean =>
     HOOK_SUPPORT_DIRS.some(d => path === join("hooks", d));
   // #4185: a hookSupport file a registered hook claims lands as a `hook-file`
   // (./planSections leaves it to the hook-file loop), so it counts as landed.
-  const plannedHookPaths = new Set(
-    plan.files
-      .filter(f => f.kind === "hook-lib" || f.kind === "hook-file")
-      .map(f => f.destPath)
-  );
+  const plannedHookPaths = plan.files
+    .filter(f => f.kind === "hook-lib" || f.kind === "hook-file")
+    .map(f => f.destPath);
+  // #5188 (OOS-1): an entry landed when the plan writes its own path or a file
+  // under it, so a folder entry such as `hooks/sub` is not reported missing.
+  // An entry that reaches no file always carries a plan-time omission (#4185),
+  // which `policySkipped` filters below, so this cannot hide a real miss.
+  const landed = (dest: string): boolean =>
+    plannedHookPaths.some(p => p === dest || p.startsWith(dest + sep));
   // #4160: skip an entry only when the plan actually reports it under its
   // section surface (./planSections emits one omission per entry). #4185: that
-  // includes an entry that matched no file or has an invalid path, so one
+  // includes an entry that matched no file (an invalid-path entry is reported
+  // only then, #5188; a `null` path is skipped below either way), so one
   // already reported at plan time is not ALSO reported here as missing.
   // 🔴 #4185 / #4156: this dedupe RELIES on reading EVERY `plan.omissions`
   // surface (policy skips ∪ unmatched). If #4156 adds a policy-only list
@@ -126,14 +133,15 @@ export function computeParity(
   const missingSupport = plan.manifest.hookSupport
     .filter(e => {
       // The planner's spelling: `hooks/x.sh/` planned `<claudeDir>/hooks/x.sh`,
-      // and `hooks/lib/` is the `hooks/lib` directory entry. `null` was
-      // reported at plan time as an invalid entry path.
+      // and `hooks/lib/` is the `hooks/lib` directory entry. `null` is an
+      // entry `planDimension` matched as written (#5188 F4); it is reported at
+      // plan time when that matched no file.
       const path = normalizeEntryPath(e.path);
       return (
         path !== null &&
         !isDirEntry(path) &&
         !policySkipped.has(sectionSkipSurface("hookSupport", e.path)) &&
-        !plannedHookPaths.has(join(plan.claudeDir, path))
+        !landed(join(plan.claudeDir, path))
       );
     })
     .map(e => e.path);

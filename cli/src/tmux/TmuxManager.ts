@@ -158,7 +158,7 @@ export function buildServerGlobalScrubSet(sandboxOn: boolean): Set<string> {
  * tmux emits `<index> <id>` on one line (e.g. `2 @1`). Both tokens are
  * space-free (a non-negative integer and `@<digits>`), so a plain space is the
  * safe delimiter — unlike the `\x1f` separator `listWindows()` uses, which tmux
- * 3.4 vis-escapes to the literal `\037` (the #1841 trap). Defensive: an
+ * 3.4+ vis-escapes to the literal `\037` (the #1841 trap). Defensive: an
  * unparseable index → null (callers fall back to name lookup, #1315), an id not
  * matching `/^@\d+$/` → null (callers fall back to the identity query then the
  * name, #3734). Pure + exported for a CI unit test.
@@ -251,13 +251,13 @@ export const LIST_WINDOWS_SEP = "\x1f";
  * `pane_start_command` LAST (free text; any separator-split remainder is
  * rejoined, #2683).
  *
- * tmux 3.3a prints the 0x1f separator as a raw byte. tmux 3.4 vis-escapes
+ * tmux 3.3a prints the 0x1f separator as a raw byte. tmux 3.4+ vis-escapes
  * control bytes below 0x20 in `-F` output, so the same row arrives with the
  * literal four characters `\037` between fields: a plain `split("\x1f")` saw
  * one field per line and every row was dropped, so `listWindows()` returned
  * `[]` on every tmux-3.4 host. Option C′: a line that carries the raw byte is
  * split as is (3.3a output parses byte-identically), and only a line without
- * it has `\037` decoded back to the separator. tmux 3.4 does not double a
+ * it has `\037` decoded back to the separator. tmux 3.4+ does not double a
  * literal backslash, so a window name holding the literal text `\037` is
  * split there — an accepted edge.
  *
@@ -265,45 +265,61 @@ export const LIST_WINDOWS_SEP = "\x1f";
  * are dropped (#1609). Pure + exported for a CI unit test.
  */
 export function parseWindowListOutput(output: string): TmuxWindow[] {
-  const SEP = LIST_WINDOWS_SEP;
-  return (
-    output
-      .trim()
-      .split("\n")
-      .filter(line => line.trim())
-      .map(line => {
-        const normalized = line.includes(SEP)
-          ? line
-          : line.replace(/\\037/g, SEP);
-        const parts = normalized.split(SEP);
-        const [index, name, active, panes, paneDead, panePidStr, archiveTag] =
-          parts;
-        const parsedPid = parseInt(panePidStr, 10);
-        return {
-          index: parseInt(index, 10),
-          name,
-          active: active === "1",
-          paneCount: parseInt(panes, 10),
-          paneDead: paneDead === "1",
-          panePid: isNaN(parsedPid) ? undefined : parsedPid,
-          // #2683: unset ("") on death-orphans, "1" on deliberate
-          // archive-for-reconnect windows.
-          archiveTag: archiveTag === "1",
-          // #2683: pane_start_command is the final field; rejoin any
-          // SEP-split remainder defensively.
-          paneStartCommand: parts.slice(7).join(SEP) || undefined,
-        };
-      })
-      // #1609: drop rows that did not parse (missing separator → undefined
-      // name / NaN index). On SL7 (tmux 3.4, daemon process context) a
-      // malformed row crashed the #1600 remote-window reaper with
-      // `undefined is not an object (window.name.startsWith)`, aborting the
-      // whole reap and orphaning live claude processes. A dropped row only
-      // degrades name-based lookup for that window — consumers holding the
-      // captured index are unaffected.
-      .filter(w => typeof w.name === "string" && !isNaN(w.index))
-  );
+  return parseWindowListOutputDetailed(output).windows;
 }
+
+/**
+ * Issue #5202 (U1): {@link parseWindowListOutput} plus the raw rows it
+ * dropped. A dropped row is invisible to every non-strict caller (they get a
+ * short list), which is the signature that hid the tmux 3.4+ `\037` bug across
+ * #1315, #1609 and #1628 — so {@link TmuxManager.listWindows} logs the count.
+ */
+export function parseWindowListOutputDetailed(output: string): {
+  windows: TmuxWindow[];
+  dropped: string[];
+} {
+  const SEP = LIST_WINDOWS_SEP;
+  const windows: TmuxWindow[] = [];
+  const dropped: string[] = [];
+  for (const line of output.trim().split("\n")) {
+    if (!line.trim()) continue;
+    const normalized = line.includes(SEP) ? line : line.replace(/\\037/g, SEP);
+    const parts = normalized.split(SEP);
+    const [index, name, active, panes, paneDead, panePidStr, archiveTag] =
+      parts;
+    const parsedPid = parseInt(panePidStr, 10);
+    const window: TmuxWindow = {
+      index: parseInt(index, 10),
+      name,
+      active: active === "1",
+      paneCount: parseInt(panes, 10),
+      paneDead: paneDead === "1",
+      panePid: isNaN(parsedPid) ? undefined : parsedPid,
+      // #2683: unset ("") on death-orphans, "1" on deliberate
+      // archive-for-reconnect windows.
+      archiveTag: archiveTag === "1",
+      // #2683: pane_start_command is the final field; rejoin any
+      // SEP-split remainder defensively.
+      paneStartCommand: parts.slice(7).join(SEP) || undefined,
+    };
+    // #1609: drop rows that did not parse (missing separator → undefined
+    // name / NaN index). On SL7 (tmux 3.4, daemon process context) a
+    // malformed row crashed the #1600 remote-window reaper with
+    // `undefined is not an object (window.name.startsWith)`, aborting the
+    // whole reap and orphaning live claude processes. A dropped row only
+    // degrades name-based lookup for that window — consumers holding the
+    // captured index are unaffected.
+    if (typeof window.name === "string" && !isNaN(window.index)) {
+      windows.push(window);
+    } else {
+      dropped.push(line);
+    }
+  }
+  return { windows, dropped };
+}
+
+/** #5202 (U1): at most one dropped-row warning per manager per 60 s. */
+export const LIST_WINDOWS_DROP_WARN_INTERVAL_MS = 60_000;
 
 /**
  * Issue #4218: parse the exact-name pane-pid probe
@@ -719,7 +735,7 @@ export class TmuxManager {
    * Returns `{ created, index }` — surfacing the window index captured race-free
    * from `new-window -P -F #{window_index}` (#945) lets callers use index-based
    * targeting for follow-up operations, bypassing `list-windows -F`, which read
-   * as stale/empty on tmux 3.4 (#1315; the mechanism was the escaped `\x1f`
+   * as stale/empty on tmux 3.4+ (#1315; the mechanism was the escaped `\x1f`
    * separator, fixed by #1841). `index` may be null on parse failure even
    * when `created` is true; callers should fall back to name-based lookup in
    * that case.
@@ -1227,7 +1243,7 @@ export class TmuxManager {
    * `[]` ({@link isAbsentTmuxSessionError}); any other tmux fault THROWS, so a
    * caller guarding a destructive or resurrecting action can tell "no windows"
    * from "could not list them". Rows are parsed by
-   * {@link parseWindowListOutput}, which handles tmux 3.4's `\037`-escaped
+   * {@link parseWindowListOutput}, which handles tmux 3.4+'s `\037`-escaped
    * separator (#1841).
    */
   async listWindows(strict = false): Promise<TmuxWindow[]> {
@@ -1255,7 +1271,8 @@ export class TmuxManager {
       return [];
     }
 
-    const windows = parseWindowListOutput(output);
+    const { windows, dropped } = parseWindowListOutputDetailed(output);
+    if (dropped.length > 0) this.warnDroppedWindowRows(dropped, windows.length);
     // #1841 / #4443: tmux exited 0 and printed rows, yet none parsed — an
     // output format this parser does not understand. A strict caller must not
     // read that as "no windows" (the dedup would hand out a name a live window
@@ -1273,6 +1290,30 @@ export class TmuxManager {
     return windows;
   }
 
+  /** #5202 (U1): epoch ms of the last dropped-row warning (0 = never). */
+  private lastDropWarnAt = 0;
+
+  /**
+   * Issue #5202 (U1): make a partial parse visible. Rate-limited to one line
+   * per {@link LIST_WINDOWS_DROP_WARN_INTERVAL_MS} per manager. The heartbeat
+   * and capacity callers build a fresh manager per call, so for them the
+   * limit does not apply: they log at most one line per call, about one per
+   * heartbeat.
+   */
+  private warnDroppedWindowRows(dropped: string[], parsed: number): void {
+    const now = Date.now();
+    if (
+      this.lastDropWarnAt !== 0 &&
+      now - this.lastDropWarnAt < LIST_WINDOWS_DROP_WARN_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.lastDropWarnAt = now;
+    logger.warn(
+      `[TmuxManager] list-windows: dropped ${dropped.length} of ${dropped.length + parsed} row(s) that did not parse (#5202): ${JSON.stringify(dropped[0].slice(0, 80))}`
+    );
+  }
+
   /**
    * Issue #3732 (ruling D1, Option C′): enumerate windows by IDENTITY via a
    * DEDICATED query that returns `#{window_index} #{window_id} #{@hapi_identity}`
@@ -1282,7 +1323,7 @@ export class TmuxManager {
    *
    * 🔴 Deliberately NOT an extension of `listWindows()` (the 8-column
    * `\x1f`-delimited `-F` row at its `TMUX_ARCHIVE_USER_OPTION` line): (a) the
-   * `\x1f` separator is vis-escaped to the literal `\037` on tmux 3.4 (the #1841
+   * `\x1f` separator is vis-escaped to the literal `\037` on tmux 3.4+ (the #1841
    * bug) whereas a SPACE survives, and all three tokens here are space-free by
    * construction; (b) keeping this query separate means #1841's parser fix and
    * #2245's field-7 `archiveTag` contract are untouched — #1841 gates nothing.

@@ -7,6 +7,14 @@
 
 import type { OwnedWindowTarget } from "./windowOwnership";
 
+/**
+ * The daemon's default tmux session and socket name (`HAPI_TMUX_SESSION_NAME`
+ * unset). Lives in this dependency-free module so a pure reader (the capacity
+ * module) can share it without importing the `configuration` singleton
+ * (#5202 U30).
+ */
+export const DEFAULT_TMUX_SESSION_NAME = "hapimatic";
+
 export interface TmuxWindow {
   /** Window index within the session */
   index: number;

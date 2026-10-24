@@ -1,0 +1,4 @@
+# Issue #5194: shared/ tests run under vitest (`bun run test`); refuse `bun test` run from
+# shared/ itself. bun reads bunfig.toml from the cwd only, so subdirectories are not covered.
+[test]
+preload = ["./scripts/refuse-bun-test-v1.ts"]

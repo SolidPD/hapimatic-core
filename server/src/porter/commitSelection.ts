@@ -34,6 +34,8 @@ import type {
   PlannedItemKind,
 } from "./importArchive";
 import { hookFileDest } from "./planHooks";
+import { relative, sep } from "node:path";
+import { SECTION_FOLDER, normalizeEntryPath } from "./plannedDestinations";
 
 /** One skill and its EXACT membership (files) + the hooks that serve it. */
 export interface SkillGroup {
@@ -79,9 +81,11 @@ export interface ImportGroups {
    * cards. Each source id maps to `found` (manifest `sources[]` metadata — TRUE
    * even for a found-but-empty source) and its EXCLUSION keys, so a card is an
    * honest whole-source toggle. claude-code owns every file + hook dimension
-   * (they come only from `~/.claude`) plus its MCP names; Cursor / Claude Desktop
-   * carry MCP server names only. A card cascades over its keys inside the ONE
-   * existing `excluded` set — no parallel selection path.
+   * it brought (from `~/.claude`) plus its MCP names; Cursor / Claude Desktop
+   * carry MCP server names only; Codex (#5169) carries its MCP names plus the
+   * files of its tagged skill and instructions-rule entries, and the hooks that
+   * serve a Codex skill. A card cascades over its keys inside the ONE existing
+   * `excluded` set — no parallel selection path.
    */
   bySource: Record<PorterSourceId, { found: boolean; keys: string[] }>;
 }
@@ -120,6 +124,41 @@ function servingSkillOf(
     if (command.includes(`skills/${s}/`)) return s;
   }
   return null;
+}
+
+/**
+ * #5169 (R9): the destPaths of every planned file a `source: "codex"` section
+ * entry brought — a file at or under the entry's normalized path (the
+ * planner's own spelling rule, `normalizeEntryPath`), so the Codex card holds
+ * exactly the files those entries plan. An entry with an empty, `.` or `..`
+ * part, which `planDimension` matches as written (#5188), is not on the card:
+ * a planned file does not record which entry spelling matched it, and the
+ * Codex exporter writes canonical entries.
+ */
+function codexFileKeys(
+  files: readonly PlannedFileItem[],
+  claudeDir: string,
+  manifest: PlanForSelection["manifest"]
+): Set<string> {
+  const prefixes: string[] = [];
+  for (const field of Object.keys(
+    SECTION_FOLDER
+  ) as (keyof typeof SECTION_FOLDER)[]) {
+    for (const e of manifest[field] ?? []) {
+      if (e.source !== "codex") continue;
+      const n = normalizeEntryPath(e.path);
+      if (n !== null) prefixes.push(n);
+    }
+  }
+  const keys = new Set<string>();
+  if (prefixes.length === 0) return keys;
+  for (const f of files) {
+    const rel = relative(claudeDir, f.destPath).split(sep).join("/");
+    if (prefixes.some(p => rel === p || rel.startsWith(p + "/"))) {
+      keys.add(f.destPath);
+    }
+  }
+  return keys;
 }
 
 /** Append `value` to the array stored at `key`, creating it on first use. */
@@ -185,14 +224,23 @@ export function computeGroups(plan: PlanForSelection): ImportGroups {
   // manifest `sources[]` metadata (TRUE even for a found-but-empty source; a
   // legacy archive with no `sources` collapses to claude-code found + others
   // not). The keys are that source's EXCLUSION keys, so a card is an honest
-  // whole-source toggle. Every file + hook dimension comes ONLY from ~/.claude,
-  // so they all belong to claude-code; Cursor / Claude Desktop bring MCP servers
-  // only. A card's toggle cascades over these keys in the ONE `excluded` set.
+  // whole-source toggle. Every file + hook dimension comes from ~/.claude and
+  // belongs to claude-code, except what a Codex-tagged entry brought (#5169):
+  // those files, and the hooks serving a skill made only of them, are Codex's.
+  // Cursor / Claude Desktop bring MCP servers only. A card's toggle cascades
+  // over these keys in the ONE `excluded` set.
   const sourcesMeta = manifest.sources ?? [];
   const mcpNamesFor = (id: PorterSourceId): string[] =>
     manifest.mcpServers
       .filter(s => (s.source ?? "claude-code") === id)
       .map(s => s.name);
+  const codexFiles = codexFileKeys(files, claudeDir, manifest);
+  const codexKeys = new Set<string>(codexFiles);
+  for (const s of skills) {
+    if (s.files.length > 0 && s.files.every(f => codexFiles.has(f))) {
+      for (const h of s.servingHooks) codexKeys.add(h);
+    }
+  }
   const claudeCodeKeys = [
     ...skills.flatMap(s => [...s.files, ...s.servingHooks]),
     ...independentHooks.map(h => h.id),
@@ -202,8 +250,8 @@ export function computeGroups(plan: PlanForSelection): ImportGroups {
     ...outputStyles,
     ...claudeMd,
     ...memory,
-    ...mcpNamesFor("claude-code"),
-  ];
+  ].filter(k => !codexKeys.has(k));
+  claudeCodeKeys.push(...mcpNamesFor("claude-code"));
   const bySource = {} as Record<
     PorterSourceId,
     { found: boolean; keys: string[] }
@@ -212,7 +260,12 @@ export function computeGroups(plan: PlanForSelection): ImportGroups {
     const meta = sourcesMeta.find(s => s.id === id);
     bySource[id] = {
       found: meta ? meta.found : id === "claude-code",
-      keys: id === "claude-code" ? claudeCodeKeys : mcpNamesFor(id),
+      keys:
+        id === "claude-code"
+          ? claudeCodeKeys
+          : id === "codex"
+            ? [...codexKeys, ...mcpNamesFor("codex")]
+            : mcpNamesFor(id),
     };
   }
 

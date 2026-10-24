@@ -34,9 +34,11 @@ export function SplitPaneSessionView(props: {
     session,
     messageCount,
     isLoading: sessionLoading,
-    error: sessionError,
+    errorMessage: sessionErrorMessage,
+    reconnectEscalated,
     loadFailure: sessionLoadFailure,
     refetch: refetchSession,
+    retry: retrySession,
   } = useSession(api, sessionId, true);
   const { localNode } = useFederatedSessions(api);
   const {
@@ -112,11 +114,14 @@ export function SplitPaneSessionView(props: {
       );
     }
     // #5375: only a definite 404 says "Session not found"; a restarting node
-    // shows "Reconnecting…" while the 5 s poll recovers it.
+    // shows "Reconnecting…" while the poll recovers it, bounded by #5409
+    // (then the error and a Retry).
     return (
       <SessionUnavailableView
         loadFailure={sessionLoadFailure}
-        errorMessage={sessionError}
+        errorMessage={sessionErrorMessage}
+        escalated={reconnectEscalated}
+        onRetry={() => void retrySession()}
         onBack={onBack}
       />
     );

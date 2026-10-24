@@ -19,8 +19,10 @@
  * extended by #4156, reused). Every reserved config file
  * (`settings.json`, `settings.local.json`, `.claude.json`, `.config.json`,
  * `.credentials.json`) is top-level and non-markdown, so none is reachable — and
- * a name denylist could not be applied at depth anyway, because an honest skill
- * may carry its own `skills/<name>/settings.json` data file.
+ * a reserved-NAME denylist could not be applied at depth anyway, because an
+ * honest skill may carry its own `skills/<name>/settings.json` data file. (The
+ * #4172 credential-name rule is a different list and does apply at depth, per
+ * path part: see `credentialPathPart` and {@link assertPlannedDestinations}.)
  *
  * Classification uses the RESOLVED destination (the absolute path
  * `assertSafeEntry` returned), never the raw archive string, because tar member
@@ -249,8 +251,8 @@ export function assertPlannedDestinations(
 
 /**
  * The `omissions` surface a skipped section entry is reported under. The one
- * spelling shared by the emitters ({@link sectionSkipOmission},
- * {@link sectionEntryOmission}, {@link sectionUnmatchedOmission}) and the
+ * spelling shared by the emitters ({@link sectionEntryOmission},
+ * {@link sectionUnmatchedOmission}) and the
  * parity report (./commitHooks), which skips an entry only when the plan
  * actually carries this omission for it.
  */
@@ -282,8 +284,10 @@ export function stripEntrySpelling(p: string): string {
  * The spelling a section ENTRY path is matched by (#4185):
  * {@link stripEntrySpelling}, so `skills/foo/`, `./skills/foo` and `skills/foo`
  * plan the same members. `null` when nothing is left, or the path has an empty
- * (`//`, a leading `/`), `.` or `..` part: such an entry is reported as an
- * invalid entry path and never used as a prefix. An omission still names the
+ * (`//`, a leading `/`), `.` or `..` part: such an entry is never used as a
+ * NORMALIZED prefix; `planDimension` (./planSections) matches it as written,
+ * as before #4185 (#5188), and reports it as an invalid entry path only when
+ * that reaches no file. An omission still names the
  * RAW entry spelling. Parts are split on `/` only, the tar separator, so a `\`
  * path is matched as it is, and `assertSafeEntry` (which also splits on `\`)
  * still refuses a member with a `..` part.
@@ -295,22 +299,6 @@ export function normalizeEntryPath(p: string): string | null {
   if (parts.some(part => part === "" || part === "." || part === ".."))
     return null;
   return s;
-}
-
-/**
- * The operator-facing plan warning for a section entry whose members were
- * skipped: one per `(section, entry path)`, naming the first destination.
- */
-export function sectionSkipOmission(
-  field: SectionField,
-  entryPath: string,
-  firstDestRel: string,
-  count: number
-): Omission {
-  return {
-    surface: sectionSkipSurface(field, entryPath),
-    reason: outsideFolderReason(field, firstDestRel, count),
-  };
 }
 
 function moreFiles(count: number): string {
@@ -377,7 +365,8 @@ export function sectionEntryOmission(
 /**
  * The plan warning for a section entry that planned nothing because it matched
  * no FILE member (#4185), or because its path is not a valid entry path
- * ({@link normalizeEntryPath} returned `null`). It carries the same surface as
+ * ({@link normalizeEntryPath} returned `null`) and its as-written match
+ * reached no file (#5188). It carries the same surface as
  * {@link sectionEntryOmission}, so an entry still gets ONE omission, and the
  * post-commit parity (./commitHooks) drops a "missing" result for an entry
  * already reported here. At most one of the two fires per entry: a member

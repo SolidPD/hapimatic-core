@@ -19,7 +19,7 @@
 import {
   CeilingGuardConfigSchema,
   type CeilingGuardConfig,
-  type CeilingGuardConfigPatch,
+  type CeilingGuardPreferencePatch,
 } from "@hapi/protocol/schemas";
 
 import { readSettings, writeSettings } from "./settings";
@@ -48,9 +48,9 @@ function envEnabledOverride(): boolean | null {
 /**
  * Load the ceiling-guard config from settings.json, merged with defaults. A
  * stored partial has its missing fields filled by the schema's `.default(...)`;
- * a malformed stored value falls back wholesale to the generous defaults (the
- * config is only written via the validated PUT, so this is a conservative
- * belt-and-braces).
+ * an invalid `roleOverrides` map alone is dropped (logged); any other malformed
+ * value falls back wholesale to the generous defaults, also logged
+ * ({@link parseStoredConfig}).
  */
 export async function loadCeilingGuardConfig(
   settingsFile: string
@@ -60,10 +60,9 @@ export async function loadCeilingGuardConfig(
     settings && typeof settings === "object"
       ? (settings as Record<string, unknown>).ceilingGuard
       : undefined;
-  const parsed = CeilingGuardConfigSchema.safeParse(
-    raw && typeof raw === "object" ? raw : {}
-  );
-  const config = parsed.success ? parsed.data : getCeilingGuardDefaults();
+  const input: Record<string, unknown> =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const config = parseStoredConfig(input);
 
   const envOverride = envEnabledOverride();
   // The env override wins in BOTH directions — a force-off must beat a settings
@@ -72,14 +71,46 @@ export async function loadCeilingGuardConfig(
 }
 
 /**
+ * Parse the stored `ceilingGuard` block. A failure is LOGGED, never silent
+ * (#5254 SF-1): before `roleOverrides`, a bad block was hard to produce, but one
+ * mistyped role key or a non-positive ceiling inside a role profile (a hand
+ * edit, or a rollback to a build without a newer role) would otherwise throw
+ * away the operator's whole config. When only `roleOverrides` is invalid, drop
+ * that map (the default role profiles apply) and keep every other field.
+ */
+function parseStoredConfig(input: Record<string, unknown>): CeilingGuardConfig {
+  const parsed = CeilingGuardConfigSchema.safeParse(input);
+  if (parsed.success) return parsed.data;
+  const issues = parsed.error.issues
+    .map(i => `${i.path.join(".") || "(root)"}: ${i.message}`)
+    .join("; ");
+  if (parsed.error.issues.every(i => i.path[0] === "roleOverrides")) {
+    const { roleOverrides: _invalid, ...rest } = input;
+    const retry = CeilingGuardConfigSchema.safeParse(rest);
+    if (retry.success) {
+      console.error(
+        `[ceilingGuard] ignoring invalid roleOverrides in settings.json (default role profiles apply; the rest of the config is kept): ${issues}`
+      );
+      return retry.data;
+    }
+  }
+  console.error(
+    `[ceilingGuard] invalid ceilingGuard block in settings.json — using the defaults: ${issues}`
+  );
+  return getCeilingGuardDefaults();
+}
+
+/**
  * Persist a partial ceiling-guard config update to settings.json, merging over
  * the stored value (an omitted key means "unchanged"; an explicit `null` clears
  * that ceiling dimension). Returns the freshly re-loaded config (env override
- * re-applied, validated).
+ * re-applied, validated). The merge is SHALLOW: a supplied `roleOverrides`
+ * (#5254) replaces the stored map wholesale, so a PUT must carry every role
+ * profile it wants to keep.
  */
 export async function saveCeilingGuardConfig(
   settingsFile: string,
-  updates: CeilingGuardConfigPatch
+  updates: CeilingGuardPreferencePatch
 ): Promise<CeilingGuardConfig> {
   const settings = (await readSettings(settingsFile)) ?? {};
   const raw = (settings as Record<string, unknown>).ceilingGuard;

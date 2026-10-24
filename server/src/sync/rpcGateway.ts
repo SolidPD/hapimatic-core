@@ -269,6 +269,8 @@ export class RpcGateway {
           worktreeName: opts.worktreeName,
           // hapimatic-private#4481: existing-branch worktree (#1262 trap).
           existingBranch: opts.existingBranch,
+          // hapimatic-private#4370: explicit worktree base branch (#1262 trap).
+          sourceBranch: opts.sourceBranch,
           resumeSessionId: opts.resumeSessionId,
           hapiSessionId: opts.hapiSessionId,
           name: opts.name,
@@ -1016,6 +1018,43 @@ export class RpcGateway {
         console.warn(`[RPC Gateway] cleanup-worktree failed: ${originalError}`);
       }
       return { success: false, message: "Daemon not available" };
+    }
+  }
+
+  /**
+   * #4450: the guarded removal behind the operator `remove_worktree` tool. Only
+   * a daemon answer of `success: true` is a removal. A daemon without the
+   * method never registered it, so `rpcCall` throws and this returns
+   * `daemon_unavailable` (as for an offline daemon or a timeout); an error
+   * envelope with no message is `daemon_refused`. Both are refusals.
+   */
+  async cleanupIdleWorktree(
+    machineId: string,
+    info: {
+      basePath: string;
+      worktreePath: string;
+      branch: string;
+      expectedOwnerTag: string;
+      sessionId: string;
+    }
+  ): Promise<{ success: boolean; message: string; holdingPath?: string }> {
+    try {
+      const r = (await this.machineRpc(
+        machineId,
+        "cleanup-idle-worktree",
+        info
+      )) as Record<string, unknown> | null;
+      const text = r?.message ?? r?.errorMessage;
+      return {
+        success: r?.success === true,
+        message: typeof text === "string" ? text : "daemon_refused",
+        ...(typeof r?.holdingPath === "string"
+          ? { holdingPath: r.holdingPath }
+          : {}),
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return { success: false, message: `daemon_unavailable: ${detail}` };
     }
   }
 

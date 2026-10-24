@@ -5,7 +5,8 @@ import { writeStdout } from "@/utils/stdout";
 import { authenticateCli } from "./cliAuth";
 
 /**
- * `hapi api call <METHOD> <path> [--json <body>] [--node <id>]` (issue #3751,
+ * `hapi api call <METHOD> <path> [--json <body>] [--query k=v]... [--node <id>]`
+ * (issue #3751,
  * epic #3740 Sub-Issue K / R2). A thin client over the server's tier-gated generic
  * REST invoker (`POST /api/capabilities/call`): the SERVER is the single
  * enforcement point (the tier gate, the resolution, the credential rule all live
@@ -17,6 +18,10 @@ import { authenticateCli } from "./cliAuth";
  * not yet written, so it returns `{ok:false, code:"node_unsupported"}` rather than
  * silently executing locally.
  *
+ * `--query k=v` (repeatable, #4011) builds the invoker's `query` object, which the
+ * server appends to the dispatch URL only after gating the bare path — so a GET
+ * capability's query parameters never go in `<path>` (a `?` there is refused).
+ *
  * `hapi api call` is registered as an ACTIONLESS resource in `API_RESOURCE_ACTIONS`
  * (like `auth`/`version`), so `<METHOD> <path>` are positional args, not an
  * `<action>` — this keeps the `hapi api <resource> <action>` grammar (#3745 R8 /
@@ -26,15 +31,22 @@ import { authenticateCli } from "./cliAuth";
 /** The parsed result of `hapi api call` args — pure, exported for unit tests. */
 export type ResolvedApiCall =
   | { error: string }
-  | { method: string; path: string; body?: unknown; node?: string };
+  | {
+      method: string;
+      path: string;
+      body?: unknown;
+      query?: Record<string, string>;
+      node?: string;
+    };
 
 /**
- * Parse `<METHOD> <path> [--json <body>] [--node <id>]` into a request descriptor.
- * Flags may interleave with the two positionals. No I/O.
+ * Parse `<METHOD> <path> [--json <body>] [--query k=v]... [--node <id>]` into a
+ * request descriptor. Flags may interleave with the two positionals. No I/O.
  */
 export function resolveApiCall(args: string[]): ResolvedApiCall {
   let jsonBody: string | undefined;
   let node: string | undefined;
+  let query: Record<string, string> | undefined;
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -42,6 +54,16 @@ export function resolveApiCall(args: string[]): ResolvedApiCall {
       jsonBody = args[++i];
     } else if (a === "--node") {
       node = args[++i];
+    } else if (a === "--query") {
+      const pair = args[++i];
+      const eq = pair === undefined ? -1 : pair.indexOf("=");
+      if (eq < 1) return { error: "--query must be key=value" };
+      const key = pair.slice(0, eq);
+      query ??= {};
+      if (Object.hasOwn(query, key)) {
+        return { error: `--query ${key} given more than once` };
+      }
+      query[key] = pair.slice(eq + 1);
     } else {
       positional.push(a);
     }
@@ -51,7 +73,7 @@ export function resolveApiCall(args: string[]): ResolvedApiCall {
   if (!method || !path) {
     return {
       error:
-        "Usage: hapi api call <METHOD> <path> [--json <body>] [--node <id>]",
+        "Usage: hapi api call <METHOD> <path> [--json <body>] [--query k=v]... [--node <id>]",
     };
   }
   let body: unknown;
@@ -62,7 +84,7 @@ export function resolveApiCall(args: string[]): ResolvedApiCall {
       return { error: "--json must be valid JSON" };
     }
   }
-  return { method: method.toUpperCase(), path, body, node };
+  return { method: method.toUpperCase(), path, body, query, node };
 }
 
 /** The `{ok:false, code:"node_unsupported"}` envelope for a HELD federation call
@@ -94,7 +116,12 @@ export async function handleApiCall(args: string[]): Promise<void> {
   const jwt = await authenticateCli();
   const resp = await axios.post(
     `${configuration.serverUrl}/api/capabilities/call`,
-    { method: resolved.method, path: resolved.path, body: resolved.body },
+    {
+      method: resolved.method,
+      path: resolved.path,
+      body: resolved.body,
+      query: resolved.query,
+    },
     {
       headers: {
         Authorization: `Bearer ${jwt}`,

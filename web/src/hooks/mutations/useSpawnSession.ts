@@ -87,6 +87,14 @@ export type SpawnInput = {
    *  before the daemon spawn resolves. Ignored by the federated `spawnOnNode`
    *  branch (remote parity is descoped — ruling D4). */
   earlyReturn?: boolean;
+  /** #3818: link the new session to this parent (uuid or tag). Both branches
+   *  forward it (#4497: the federated branch, for remote fan-out peers). */
+  parentSessionId?: string;
+  /** #3818: "spawn" for a fan-out peer. Both branches forward it (#4497). */
+  parentRelationship?: "branch" | "spawn";
+  /** #3818 / #4370: cut the worktree from exactly this branch. Both branches
+   *  forward it (#4497). */
+  sourceBranch?: string;
 };
 
 export function useSpawnSession(api: ApiClient | null): {
@@ -101,6 +109,17 @@ export function useSpawnSession(api: ApiClient | null): {
       if (!api) {
         throw new Error("API unavailable");
       }
+
+      // #3818 / #4497: parent link + cut point, as ONE trailing object (T26),
+      // forwarded by both the federated and the local branch.
+      const parent =
+        input.parentSessionId || input.parentRelationship || input.sourceBranch
+          ? {
+              parentSessionId: input.parentSessionId,
+              parentRelationship: input.parentRelationship,
+              sourceBranch: input.sourceBranch,
+            }
+          : undefined;
 
       if (input.nodeId) {
         return await api.spawnOnNode(
@@ -128,7 +147,9 @@ export function useSpawnSession(api: ApiClient | null): {
           // Issue #3348: bundled gemini/codex native model selection.
           input.nativeModelSelection,
           // hapimatic-private#4481: existing-branch worktree.
-          input.existingBranch
+          input.existingBranch,
+          // #4497: parent link + cut point of a remote fan-out peer.
+          parent
         );
       }
 
@@ -168,7 +189,9 @@ export function useSpawnSession(api: ApiClient | null): {
         // hapimatic-private#4481: existing-branch worktree.
         input.existingBranch,
         // Issue #4568: the API-key binding (local only — see SpawnInput).
-        input.apiKeyId
+        input.apiKeyId,
+        // #3818: parent link + cut point, as ONE trailing object (T26).
+        parent
       );
     },
     onSuccess: (data, input) => {

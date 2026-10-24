@@ -124,6 +124,28 @@ export default tseslint.config(
     },
   },
   {
+    // #5202 (U20): the Porter test fixtures live under `__tests__/`, which the
+    // public-core export drops (`!*/__tests__/*` in
+    // scripts/public-core-allowlist-v1.txt). A production module that imported
+    // one would ship a dependency the exported tree does not contain, so only
+    // tests and other fixtures may import from a `__tests__/` folder.
+    files: ["server/src/**/*.ts"],
+    ignores: ["**/*.test.ts", "**/__tests__/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: ["**/__tests__/**"],
+              message: "test fixtures are test-only (#5202 U20)",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
     files: ["web/src/**/*.{ts,tsx}"],
     plugins: {
       "react-hooks": reactHooks,

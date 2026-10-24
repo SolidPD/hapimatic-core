@@ -8,9 +8,11 @@ export const queryClient = new QueryClient({
       staleTime: 5_000,
       refetchOnWindowFocus: false,
       // #5375: a node_offline / node_unreachable error (the session's
-      // federation node is restarting) retries quietly — up to ~105 s offline,
-      // ~30 s unreachable. TanStack keeps `error` null and the previous data
-      // while it retries; every other error keeps the previous single retry.
+      // federation node is restarting or not answering) retries quietly — up
+      // to ~105 s offline, ~130 s unreachable at worst (each attempt can wait
+      // the hub's 25 s timeout, #5410). TanStack keeps `error` null and the
+      // previous data while it retries; every other error keeps the previous
+      // single retry.
       retry: queryRetry,
       retryDelay: queryRetryDelay,
     },

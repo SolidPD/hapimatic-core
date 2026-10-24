@@ -100,11 +100,25 @@ registerRoute(
   })
 );
 
+/**
+ * Session detail waits longer than the other API routes before falling back to
+ * its own cache (#5410). For a session on a hung federation peer the hub gives
+ * up after its 25 s read budget (`FEDERATION_READ_TIMEOUT_MS`,
+ * server/src/federation/proxyFetchSignal.ts) and falls back to its own cached
+ * session summary (`GET /api/sessions/:id` in server/src/web/routes/
+ * sessions.ts). A shorter timeout served this worker's older (up to 5 min)
+ * copy before the hub's answer could arrive. 28 s stays below the browser's
+ * 30 s request timeout (`ApiClient` `DEFAULT_TIMEOUT_MS`,
+ * web/src/api/client.ts). Offline use still gets the cache: an offline fetch
+ * fails at once, without waiting for this timeout.
+ */
+const SESSION_DETAIL_NETWORK_TIMEOUT_SECONDS = 28;
+
 registerRoute(
   ({ url }) => /^\/api\/sessions\/[^/]+$/.test(url.pathname),
   new NetworkFirst({
     cacheName: "api-session-detail",
-    networkTimeoutSeconds: 10,
+    networkTimeoutSeconds: SESSION_DETAIL_NETWORK_TIMEOUT_SECONDS,
     plugins: [
       new ExpirationPlugin({
         maxEntries: 20,

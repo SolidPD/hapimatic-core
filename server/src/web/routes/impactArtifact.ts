@@ -94,7 +94,6 @@ export function createImpactArtifactRoutes(
 
   app.post(
     "/impact-artifact",
-    limiter,
     cataloged(
       defineCapability({
         id: "session-introspection.cli-impact-artifact",
@@ -114,6 +113,7 @@ export function createImpactArtifactRoutes(
         probe: "skip",
       })
     ),
+    limiter,
     async c => {
       const engine = getSyncEngine();
       const store = opts.getStore();

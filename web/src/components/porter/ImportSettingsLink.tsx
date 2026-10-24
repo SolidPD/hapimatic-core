@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useState } from "react";
 import { AlertTriangle } from "lucide-react";
+import {
+  SETTINGS_LINK_REASON_TEXT,
+  SYMLINKED_SETTINGS_REASONS,
+  settingsLinkConsequence,
+  type SymlinkedSettingsReason,
+} from "@hapi/protocol/porter";
 import { ApiError } from "@/api/client";
 import type {
   ImportPlanSummary,
@@ -14,28 +20,9 @@ import type {
  * from design tokens (never hardcoded), matching the panel's existing usage.
  */
 
-type LinkReason = SymlinkedSettingsRefusal["reason"];
-
-const LINK_REASONS: readonly LinkReason[] = [
-  "outside-root",
-  "dangling",
-  "loop",
-  "not-regular",
-];
-
-/**
- * Why a settings.json link cannot be written through, in BOTH vocabularies: the
- * plan's `settingsLink.state` says `outside`, the 409's `reason` says
- * `outside-root`. MIRROR of `SYMLINK_REASON_TEXT` in
- * `server/src/porter/importArchiveErrors.ts`.
- */
-const LINK_REASON_TEXT: Record<LinkReason | "outside", string> = {
-  outside: "it points outside the config root",
-  "outside-root": "it points outside the config root",
-  dangling: "it does not resolve to a file",
-  loop: "it is part of a symlink loop",
-  "not-regular": "it does not point at a regular file",
-};
+// #4288: the reasons, states and their text come from ONE source the server's
+// refusal also reads (`@hapi/protocol/porter` settingsLink), never a hand copy.
+const LINK_REASONS: readonly string[] = SYMLINKED_SETTINGS_REASONS;
 
 /**
  * The `symlinkedSettings` echo of a commit refused with 409, or `null` for any
@@ -63,8 +50,9 @@ export function parseSymlinkedSettingsRefusal(
   const { linkPath, target, reason } = link as Record<string, unknown>;
   if (typeof linkPath !== "string" || linkPath === "") return null;
   if (typeof target !== "string" || target === "") return null;
-  if (!LINK_REASONS.includes(reason as LinkReason)) return null;
-  return { linkPath, target, reason: reason as LinkReason };
+  // Fails closed on a reason this build does not know (#4288 R6).
+  if (typeof reason !== "string" || !LINK_REASONS.includes(reason)) return null;
+  return { linkPath, target, reason: reason as SymlinkedSettingsReason };
 }
 
 /**
@@ -72,13 +60,15 @@ export function parseSymlinkedSettingsRefusal(
  * received for. `capture` records a failed commit: a well-formed echo opens the
  * gate unticked, any other error closes it. A refusal from another plan (another
  * staging handle) is never shown and never sent. `reset()` runs on every new plan
- * and on "Import another".
+ * and on "Import another"; `clearLive()` on a Step-1 selection change (#4289).
  */
 export function useSettingsLinkAck(): {
   acked: boolean;
   capture: (err: unknown, stagingHandle: string) => void;
   toggle: () => void;
   reset: () => void;
+  /** #4289 (R8): drop this plan's live refusal and its tick; `true` if there was one. */
+  clearLive: (stagingHandle?: string) => boolean;
   /** The refusal to show for the plan under review, or `null`. */
   liveFor: (stagingHandle?: string) => SymlinkedSettingsRefusal | null;
   /** `acknowledgeSymlinkedSettings` for this plan: the echoed target, only once ticked. */
@@ -104,6 +94,12 @@ export function useSettingsLinkAck(): {
     reset: () => {
       setRefusal(null);
       setAcked(false);
+    },
+    clearLive: stagingHandle => {
+      if (liveFor(stagingHandle) === null) return false;
+      setRefusal(null);
+      setAcked(false);
+      return true;
     },
     liveFor,
     ackFor: stagingHandle => {
@@ -147,10 +143,9 @@ export function SymlinkedSettingsGate({
         data-testid="symlinked-settings-reason"
       >
         Nothing was imported: settings.json is a symlink, and{" "}
-        {LINK_REASON_TEXT[link.reason]}. Importing now replaces the link with a
-        regular file, and <span className="font-mono">{link.target}</span> stops
-        receiving changes. To keep the link, import into the config root that
-        holds its target instead.
+        {SETTINGS_LINK_REASON_TEXT[link.reason]}. Importing now replaces the
+        link with a regular file, and <Consequence link={link} />. To keep the
+        link, import into the config root that holds its target instead.
       </p>
       <label className="flex cursor-pointer items-center gap-2 text-[length:var(--text-body-dense)] text-[var(--app-fg)]">
         <input
@@ -162,6 +157,72 @@ export function SymlinkedSettingsGate({
         Replace this link with a regular file
       </label>
     </section>
+  );
+}
+
+/**
+ * #4288 (R5): what replacing the link does to its target, per reason (shared with
+ * the server's refusal). A clause that names the target shows it in mono.
+ */
+function Consequence({ link }: { link: SymlinkedSettingsRefusal }) {
+  const text = settingsLinkConsequence(link.reason, link.target);
+  // Only these clauses lead with the target; key on the reason, never on a
+  // prefix match (a dangling target "no" would otherwise mono-split "nothing").
+  const namesTarget =
+    link.reason === "outside-root" || link.reason === "not-regular";
+  if (!namesTarget || !text.startsWith(link.target)) return <>{text}</>;
+  return (
+    <>
+      <span className="font-mono">{link.target}</span>
+      {text.slice(link.target.length)}
+    </>
+  );
+}
+
+/**
+ * #4289 (R7): the select phase's one-line reminder that the last import was
+ * refused. The gate itself (and its tick) waits in the resolve phase.
+ */
+export function SymlinkedSettingsNotice({
+  link,
+}: {
+  link: SymlinkedSettingsRefusal;
+}) {
+  return (
+    <p
+      className="text-[length:var(--text-body-dense)] text-warn"
+      data-testid="symlinked-settings-notice"
+    >
+      The last import was refused: settings.json is a symlink, and{" "}
+      {SETTINGS_LINK_REASON_TEXT[link.reason]}. Continue to review it.
+    </p>
+  );
+}
+
+/**
+ * The commit's live 409 refusal, by review phase: the acknowledgement gate in
+ * the resolve phase, the one-line notice in the select phase (#4289). Continue
+ * shows the gate again with the tick it had, because the tick lives in
+ * {@link useSettingsLinkAck}, not here.
+ */
+export function SymlinkedSettingsRefusalView({
+  link,
+  phase,
+  acknowledged,
+  onToggle,
+}: {
+  link: SymlinkedSettingsRefusal;
+  phase: "select" | "resolve";
+  acknowledged: boolean;
+  onToggle: () => void;
+}) {
+  if (phase === "select") return <SymlinkedSettingsNotice link={link} />;
+  return (
+    <SymlinkedSettingsGate
+      link={link}
+      acknowledged={acknowledged}
+      onToggle={onToggle}
+    />
   );
 }
 
@@ -181,7 +242,7 @@ function SettingsLinkRow({
   const note =
     link.state === "inside"
       ? "A link inside the config root: the merge writes through it and keeps the link."
-      : `The merge cannot write through this link, because ${LINK_REASON_TEXT[link.state]}. If the import writes settings.json, it asks before replacing the link.`;
+      : `The merge cannot write through this link, because ${SETTINGS_LINK_REASON_TEXT[link.state]}. If the import writes settings.json, it asks before replacing the link.`;
   return (
     <div className="flex items-baseline gap-2">
       <dt className="w-24 shrink-0 text-[length:var(--text-caption)] uppercase text-[var(--app-hint)]">

@@ -389,6 +389,13 @@ export class Store {
     );
     this.backfillUserMessageCount();
 
+    // Denormalized last-operator-message timestamp (#5254 R2): the runaway
+    // ceiling guard's inactivity gate reads it at every turn finalize, where a
+    // json_extract scan of `messages` took 6.7 s cold. Maintained by
+    // MessageStore.addMessage. Deliberately NOT in CREATE TABLE so every DB
+    // takes this path and the grace seed below is its only bulk writer.
+    this.migrateAddLastOperatorMessageAt();
+
     // Issue #1120: provenance, timezone, reset-epoch columns on timelog_entries.
     // event_type carries a CHECK constraint inline — SQLite supports CHECK in
     // ALTER TABLE ADD COLUMN, and the constraint only applies to values written
@@ -1755,6 +1762,37 @@ export class Store {
     } catch (error) {
       console.error(
         "[Store] Migration failed: timelog orphan cleanup #1508 (v2):",
+        error
+      );
+    }
+  }
+
+  /**
+   * Add `sessions.last_operator_message_at` (#5254) and, only on the run that
+   * adds it, seed every existing row with the migration time. That gives each
+   * pre-existing session one 60-minute grace window after deploy instead of a
+   * NULL that the ceiling guard would read as "no operator present". Rows
+   * created later start NULL (no operator message has ever arrived).
+   * Idempotent: a second boot finds the column and seeds nothing.
+   */
+  private migrateAddLastOperatorMessageAt(): void {
+    try {
+      const columns = this.db
+        .prepare("PRAGMA table_info(sessions)")
+        .all() as Array<{ name: string }>;
+      const existed = columns.some(
+        col => col.name === "last_operator_message_at"
+      );
+      this.migrateAddColumn("sessions", "last_operator_message_at", "INTEGER");
+      if (existed) return;
+      this.db
+        .prepare(
+          "UPDATE sessions SET last_operator_message_at = ? WHERE last_operator_message_at IS NULL"
+        )
+        .run(Date.now());
+    } catch (error) {
+      console.error(
+        "[Store] Migration failed: sessions.last_operator_message_at (#5254):",
         error
       );
     }

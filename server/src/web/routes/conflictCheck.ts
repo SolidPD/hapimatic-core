@@ -50,7 +50,6 @@ export function createConflictCheckRoutes(options?: {
   // POST /conflict-check : pure overlap + severity-hint computation. No persistence.
   app.post(
     "/conflict-check",
-    limiter,
     cataloged(
       defineCapability({
         id: "files-git.conflict-check",
@@ -70,6 +69,7 @@ export function createConflictCheckRoutes(options?: {
         availability: { scope: "user" },
       })
     ),
+    limiter,
     async c => {
       const parsed = ConflictCheckRequestSchema.safeParse(
         await c.req.json().catch(() => null)

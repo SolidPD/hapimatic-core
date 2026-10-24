@@ -152,6 +152,7 @@ export function initProvisioner(
 // ── Barrel: public surface of the provisioner module ────────────────────────
 export * from "./types";
 export * from "./jobModel";
+export * from "./deprovisionGatewayHost";
 export * from "./jobStore";
 export * from "./capability";
 export * from "./fleetLock";

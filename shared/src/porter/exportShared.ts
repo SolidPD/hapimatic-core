@@ -262,6 +262,19 @@ export const CLAUDE_MD_INCLUDE_LINE_PATTERN = "^@[A-Za-z0-9._/-]+";
 export const CLAUDE_MD_INCLUDE_GREP = `LC_ALL=C grep -a -oE '${CLAUDE_MD_INCLUDE_LINE_PATTERN}'`;
 
 /**
+ * #4164 / #5201: the bash lines that clear the operator's tar and gzip
+ * environment before a script's first `tar`. GNU tar reads `TAR_OPTIONS`,
+ * bsdtar reads `TAR_READER_OPTIONS` and `TAR_WRITER_OPTIONS`, and gzip reads
+ * `GZIP`; any of them changes what the tars write, extract or print. The bash
+ * exporter and the extraction prompt's check block both spread these lines, so
+ * the two clears cannot drift apart. Safe under `set -eu` when none is set.
+ */
+export const TAR_ENV_SCRUB_SHELL_LINES: readonly string[] = [
+  'for _v in "${!TAR_@}"; do unset "$_v"; done',
+  "unset GZIP",
+];
+
+/**
  * #4172: the omission reason every export surface records for a file or folder
  * it did not package because its name is credential-bearing
  * (`ARCHIVE_CREDENTIAL_NAMES` / `ARCHIVE_CREDENTIAL_PREFIXES`). The surface is
@@ -289,6 +302,17 @@ export const ARCHIVE_CREDENTIAL_OMISSION_REASON =
  */
 export const ARCHIVE_LINK_UNCHECKED_OMISSION_REASON =
   "not exported: a link whose target could not be checked for a credential store";
+
+/**
+ * #4321 (Item 5): the omission reason both exporters record for a folder link,
+ * inside a linked folder, whose target is a folder on its own path or a folder
+ * that holds it (`loop -> .`, `up -> ..`). The copy that dereferences the linked folder leaves it out:
+ * GNU tar's `-h` would follow it without end (the export hung), and bsdtar
+ * would keep it as a link. ASCII, with no quote, `$`, backslash or backtick,
+ * like the reasons above.
+ */
+export const ARCHIVE_LINK_LOOP_OMISSION_REASON =
+  "link loop: not exported, its target is a folder that contains it";
 
 /**
  * #4172: the omission reason the PowerShell exporter records, off Windows, for

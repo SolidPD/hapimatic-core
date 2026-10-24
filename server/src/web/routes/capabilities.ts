@@ -8,12 +8,19 @@ import type { NodeRegistry } from "../../federation/nodeRegistry";
 import {
   federationReadSignal,
   isAbortError,
+  readProxyJson,
 } from "../../federation/proxyFetchSignal";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { proxyTransportFailure } from "./routeErrorHelper";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { cataloged } from "../../capabilities/cataloged";
 import { auditInvoke, runCapabilityInvoke } from "./capabilityPolicy";
+import {
+  clampWaitTimeout,
+  isWaitState,
+  waitForSessionState,
+  WAIT_STATES,
+} from "../../sync/sessionStateWaiter";
 
 /**
  * The 404 envelope for an unknown / socketless / cross-namespace session.
@@ -61,6 +68,9 @@ export function createCapabilitiesRoutes(
   const capabilityInvokeLimiter = createRateLimiter({
     name: "capability-invoke",
   });
+  // Issue #3816: the wait holds a request open for up to 25 s, so it gets its
+  // own bucket rather than sharing the invoke limiter's.
+  const sessionWaitLimiter = createRateLimiter({ name: "session-wait" });
 
   app.get(
     "/sessions/:id/capabilities",
@@ -282,9 +292,10 @@ export function createCapabilitiesRoutes(
               )}/capabilities/${encodeURIComponent(method)}`,
               { method: "POST", headers, body: JSON.stringify(body ?? {}) }
             );
-            const relayed = (await resp
-              .json()
-              .catch(() => SESSION_NOT_FOUND)) as Record<string, unknown>;
+            // #5487: a cut body rethrows into the catch (logged 502); an
+            // empty or unparseable error body keeps SESSION_NOT_FOUND.
+            const relayed = ((await readProxyJson(resp)) ??
+              SESSION_NOT_FOUND) as Record<string, unknown>;
             return c.json(relayed, resp.status as ContentfulStatusCode);
           } catch (error) {
             // #5375/#5404: a transport failure is a 502 the remote-session
@@ -300,6 +311,120 @@ export function createCapabilitiesRoutes(
       }
 
       // Unknown / unreachable session → envelope 404 (mirrors the GET).
+      return c.json(SESSION_NOT_FOUND, 404);
+    }
+  );
+
+  /**
+   * Wait-until-state (issue #3816, decision 3816-D1 = A). Blocks until the
+   * TARGET session `:id` reaches `:state`, or the timeout expires, and answers
+   * `{ ok:true, data:{ result:"matched"|"timeout", state, sessionId } }`.
+   *
+   * A `readonly` GET so `hapi_call` admits it: a non-GET REST entry can never be
+   * `readonly` (`never-readonly.test.ts`). Agents pass no query (`hapi_call`
+   * refuses `?`), so the server default applies; `?timeoutMs=` is for direct
+   * REST and CLI callers, must be a whole number (else 400), and is clamped to
+   * `[0, 25 000]`; below the 3 s idle settle window an `idle` wait can only
+   * time out. A `hapi_call`
+   * dispatch re-enters `app.fetch` with a fresh Request carrying no caller
+   * signal, so on that path the clamp is the only exit besides a match.
+   *
+   * Same-node only (R5): a target another node owns answers 409
+   * `federation_unsupported` and the caller falls back to polling. That lookup
+   * is namespace-blind, so the 409 reveals that a remote session exists — the
+   * same disclosure the `GET /sessions/:id` federation fallback already makes.
+   */
+  app.get(
+    "/sessions/:id/wait-until/:state",
+    cataloged(
+      defineCapability({
+        id: "session-introspection.session-wait-until",
+        domain: "session-introspection",
+        surface: "rest",
+        description:
+          "Block until a session reaches a named state (idle, busy, blocked, rate-limited, completed, errored) or 25 s pass, then return matched or timeout with its current state.",
+        whenToUse:
+          "When waiting for a peer session to finish or change state instead of polling it. Wait busy then idle after sending work.",
+        invocation: {
+          kind: "rest",
+          method: "GET",
+          path: "/api/sessions/:id/wait-until/:state",
+        },
+        auth: "jwt",
+        riskTier: "readonly",
+        availability: { scope: "user" },
+      })
+    ),
+    sessionWaitLimiter,
+    async c => {
+      const engine = getSyncEngine();
+      if (!engine) {
+        return c.json(
+          { ok: false, error: "Sync engine unavailable", code: "unknown" },
+          503
+        );
+      }
+
+      const state = c.req.param("state");
+      if (!isWaitState(state)) {
+        return c.json(
+          {
+            ok: false,
+            error: `Unknown state "${state}". Expected one of: ${WAIT_STATES.join(", ")}`,
+            code: "invalid_input",
+          },
+          400
+        );
+      }
+
+      // An absent query means the 25 s default; a present one must be a whole
+      // number of ms (clamped below), never silently coerced from "5s" or "".
+      const rawTimeout = c.req.query("timeoutMs");
+      if (rawTimeout !== undefined && !/^\d+$/.test(rawTimeout)) {
+        return c.json(
+          {
+            ok: false,
+            error: `timeoutMs must be a whole number of milliseconds, got "${rawTimeout}"`,
+            code: "invalid_input",
+          },
+          400
+        );
+      }
+      const timeoutMs = clampWaitTimeout(
+        rawTimeout === undefined ? undefined : Number(rawTimeout)
+      );
+      const sessionId = c.req.param("id");
+      const namespace = c.get("namespace");
+
+      const localSession = engine.getSession(sessionId);
+      if (localSession) {
+        // Cross-namespace → 404 without proxying (no existence leak, #1097).
+        if (localSession.namespace !== namespace) {
+          return c.json(SESSION_NOT_FOUND, 404);
+        }
+        const result = await waitForSessionState(engine, {
+          sessionId,
+          namespace,
+          state,
+          timeoutMs,
+          signal: c.req.raw.signal,
+        });
+        return c.json({ ok: true, data: result });
+      }
+
+      const registry = options?.getNodeRegistry?.();
+      if (registry?.findNodeForSession(sessionId)) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              "Waiting on a session owned by another node is not supported; poll it instead.",
+            code: "federation_unsupported",
+          },
+          409
+        );
+      }
+
       return c.json(SESSION_NOT_FOUND, 404);
     }
   );

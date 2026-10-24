@@ -204,11 +204,57 @@ export type RepoIdentity = z.infer<typeof RepoIdentitySchema>;
 // ── Per-session token + iteration ceiling with hard abort (#1905) ──
 
 /**
- * Runaway-session guard config (issue #1905). A server-side, launcher-agnostic
- * ceiling on a session's cumulative UNCACHED token spend (`total_tok_in +
- * total_tok_out`, cache-read/write EXCLUDED — they are not spend-equivalent) and
- * iteration (turn) count; on breach the guard hard-stops the session at the next
- * turn boundary and surfaces an out-of-band notice.
+ * PARTIAL body accepted by the per-session override
+ * `PUT /sessions/:id/ceiling-override`; the global `PUT /preferences/ceiling-guard`
+ * takes {@link CeilingGuardPreferencePatchSchema} (this plus `roleOverrides`). Unlike
+ * {@link CeilingGuardConfigSchema}, NO field carries a default here (the #2268
+ * z.infer trap) — so a `{enabled}`-only PUT does not fabricate the other fields
+ * and a `{}` body does not clobber stored values. The server MERGES this partial
+ * over the stored/global config: an omitted key means "unchanged". Mirrors
+ * {@link AutoRecoverPreferencePatchSchema}. Declared before
+ * {@link CeilingGuardConfigSchema}, whose role profiles derive from it (#5254).
+ */
+export const CeilingGuardConfigPatchSchema = z.object({
+  enabled: z.boolean().optional(),
+  uncachedTokenCeiling: z.number().int().positive().nullable().optional(),
+  iterationCeiling: z.number().int().positive().nullable().optional(),
+  costUsdCeiling: z.number().positive().nullable().optional(),
+  hardStop: z.boolean().optional(),
+  /** #5254 R1 rate ceilings (optional additions; older bodies are unchanged). */
+  turnsPerHourCeiling: z.number().int().positive().nullable().optional(),
+  uncachedTokensPerHourCeiling: z
+    .number()
+    .int()
+    .positive()
+    .nullable()
+    .optional(),
+});
+
+export type CeilingGuardConfigPatch = z.infer<
+  typeof CeilingGuardConfigPatchSchema
+>;
+
+/**
+ * #5254: one `roleOverrides` profile — the ceiling fields of the patch, minus
+ * `enabled` (the guard reads only the global `enabled`, so a per-role one would
+ * be accepted and silently ignored). `.strict()` so an unknown key is rejected
+ * by the PUT rather than stored and dropped.
+ */
+export const CeilingGuardRoleProfileSchema = CeilingGuardConfigPatchSchema.omit(
+  {
+    enabled: true,
+  }
+).strict();
+
+/**
+ * Runaway-session guard config (issues #1905, #5254). A server-side,
+ * launcher-agnostic set of ceilings: cumulative UNCACHED token spend
+ * (`total_tok_in + total_tok_out`, cache-read/write EXCLUDED — they are not
+ * spend-equivalent), cumulative turn count and cost, plus (#5254) turns and
+ * uncached tokens over the trailing 60 minutes. A breach hard-stops the session
+ * at the next turn boundary and surfaces an out-of-band notice ONLY when no
+ * operator message arrived in that window; otherwise it is recorded as
+ * suppressed. `roleOverrides` overlays a per-`sessionRole` profile.
  *
  * Defaults are DELIBERATELY GENEROUS (R5 — a false-positive hard stop of a
  * legitimate long session is the harm this guard exists to prevent). They were
@@ -217,11 +263,13 @@ export type RepoIdentity = z.infer<typeof RepoIdentitySchema>;
  * p99-sum ≈ 2.23M. The chosen ceilings clear the observed MAX with margin, so no
  * historical legitimate session would have tripped, while a true (unbounded)
  * runaway still crosses them (ships effectively log-only until tuned — K2/OR-2).
+ * These figures calibrate the cumulative defaults; the rate defaults are
+ * documented on their own fields (ms1 ledger, 2026-10-22).
  *
  * `.default(...)` is CORRECT here (a DEDICATED preference object, like
  * {@link AutoRecoverPreferenceSchema}) so `parse({})` yields the effective
  * defaults — the #2268 `.optional()` rule is for the PARTIAL PUT body only, which
- * is {@link CeilingGuardConfigPatchSchema} below.
+ * is {@link CeilingGuardConfigPatchSchema} above.
  *
  * A `null` ceiling = "that dimension disabled". `enabled:false` (or the
  * `HAPI_CEILING_GUARD_ENABLED` env kill-switch) disables the whole guard;
@@ -238,29 +286,50 @@ export const CeilingGuardConfigSchema = z.object({
   iterationCeiling: z.number().int().positive().nullable().default(3000),
   costUsdCeiling: z.number().positive().nullable().default(null),
   hardStop: z.boolean().default(true),
+  /** #5254 R1: turns started in the trailing 60 minutes. Calibrated from the
+   *  ms1 ledger (2026-10-22, 344 sessions: max 75/h, p99 27/h) — 1.6× the max. */
+  turnsPerHourCeiling: z.number().int().positive().nullable().default(120),
+  /** #5254 R1: uncached (`tok_in + tok_out`) tokens in the trailing 60 minutes,
+   *  background-agent usage included. ms1 max 663,630/h — 3× margin. */
+  uncachedTokensPerHourCeiling: z
+    .number()
+    .int()
+    .positive()
+    .nullable()
+    .default(2_000_000),
+  /** #5254 R3: per-`metadata.sessionRole` overlay, applied between the global
+   *  config and a session's own `ceilingOverride`. The default lifts the
+   *  cumulative ceilings for PM sessions (long engagements) while keeping the
+   *  rate ceilings, so a runaway PM is still caught. `partialRecord` because a
+   *  zod 4 enum-keyed `record` requires every role key. */
+  roleOverrides: z
+    .partialRecord(SessionRoleSchema, CeilingGuardRoleProfileSchema)
+    .default({
+      pm: {
+        iterationCeiling: null,
+        uncachedTokenCeiling: null,
+        costUsdCeiling: null,
+      },
+    }),
 });
 
 export type CeilingGuardConfig = z.infer<typeof CeilingGuardConfigSchema>;
 
 /**
- * PARTIAL body accepted by `PUT /preferences/ceiling-guard` AND the per-session
- * override `PUT /sessions/:id/ceiling-override`. Unlike
- * {@link CeilingGuardConfigSchema}, NO field carries a default here (the #2268
- * z.infer trap) — so a `{enabled}`-only PUT does not fabricate the other fields
- * and a `{}` body does not clobber stored values. The server MERGES this partial
- * over the stored/global config: an omitted key means "unchanged". Mirrors
- * {@link AutoRecoverPreferencePatchSchema}.
+ * #5254: the GLOBAL `PUT /preferences/ceiling-guard` body — the per-session
+ * patch plus `roleOverrides`. Kept separate so the per-session override route
+ * (which uses {@link CeilingGuardConfigPatchSchema}) never accepts
+ * `roleOverrides`. A supplied `roleOverrides` REPLACES the stored map wholesale.
  */
-export const CeilingGuardConfigPatchSchema = z.object({
-  enabled: z.boolean().optional(),
-  uncachedTokenCeiling: z.number().int().positive().nullable().optional(),
-  iterationCeiling: z.number().int().positive().nullable().optional(),
-  costUsdCeiling: z.number().positive().nullable().optional(),
-  hardStop: z.boolean().optional(),
-});
+export const CeilingGuardPreferencePatchSchema =
+  CeilingGuardConfigPatchSchema.extend({
+    roleOverrides: z
+      .partialRecord(SessionRoleSchema, CeilingGuardRoleProfileSchema)
+      .optional(),
+  });
 
-export type CeilingGuardConfigPatch = z.infer<
-  typeof CeilingGuardConfigPatchSchema
+export type CeilingGuardPreferencePatch = z.infer<
+  typeof CeilingGuardPreferencePatchSchema
 >;
 
 export const MetadataSchema = z
@@ -950,13 +1019,33 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
     type: z.literal("mcp-batch-progress"),
     data: McpBatchSnapshotSchema,
   }),
-  // Issue #933: Federation spawn failure notification
+  // Issue #933: Federation spawn failure notification. Issue #2150 (K-4497-1):
+  // the hub stamps the CALLER's `namespace` (read from the placeholder it
+  // registered when it proxied the spawn) — without it `SSEManager.shouldSend`
+  // drops the event for every browser — plus the peer's refusal `code` and the
+  // hub-canonical `nodeLabel` so the toast names the node. All additive.
   z.object({
     type: z.literal("federation-spawn-failed"),
     nodeId: z.string(),
     directory: z.string(),
     spawnCorrelationId: z.string().nullable().optional(),
     error: z.string(),
+    code: z.string().optional(),
+    nodeLabel: z.string().optional(),
+    namespace: z.string().optional(),
+  }),
+  // Issue #2150 (K-4497-1 §2): a federation spawn this hub proxied succeeded.
+  // Broadcast AFTER the hub's targeted poll of that node settles, so a consumer
+  // that enqueues a prompt or PUTs a parent finds the session in the hub cache.
+  // Sent only when the hub holds the spawn's placeholder (it carries the
+  // caller's namespace); never host-global.
+  z.object({
+    type: z.literal("federation-spawn-succeeded"),
+    nodeId: z.string(),
+    directory: z.string(),
+    spawnCorrelationId: z.string(),
+    sessionId: z.string(),
+    nodeLabel: z.string().optional(),
     namespace: z.string().optional(),
   }),
   // Issue #1449: manual-login account auto-capture (live dropdown update).
@@ -2199,6 +2288,35 @@ export type RelaunchRequest = z.infer<typeof RelaunchRequestSchema>;
 // fields are nullable because SQLite SUM/MAX over NULL token/cost columns is
 // NULL until Sub B/C/E have populated a turn.
 
+/** Issue #5254 R4/R5: one persisted runaway-ceiling-guard breach record. */
+export const CEILING_BREACH_KINDS = ["cumulative", "rate"] as const;
+export const CEILING_BREACH_DIMENSIONS = [
+  "tokens",
+  "iterations",
+  "cost",
+  "turnsPerHour",
+  "uncachedTokensPerHour",
+] as const;
+export const CEILING_BREACH_ACTIONS = [
+  "hard-stop",
+  "notify",
+  "suppressed-operator-active",
+] as const;
+export const CeilingBreachSummarySchema = z
+  .object({
+    dimension: z.enum(CEILING_BREACH_DIMENSIONS),
+    kind: z.enum(CEILING_BREACH_KINDS),
+    value: z.number().nullable(),
+    ceiling: z.number().nullable(),
+    action: z.enum(CEILING_BREACH_ACTIONS),
+    occurredAtMs: z.number(),
+  })
+  .passthrough();
+export type CeilingBreachSummary = z.infer<typeof CeilingBreachSummarySchema>;
+export type CeilingBreachDimension = CeilingBreachSummary["dimension"];
+export type CeilingBreachKind = CeilingBreachSummary["kind"];
+export type CeilingBreachAction = CeilingBreachSummary["action"];
+
 /** Session-level token + cost totals, derived from the `v_session_totals` view. */
 export const SessionTokenTotalsSchema = z
   .object({
@@ -2230,6 +2348,20 @@ export const SessionTokenTotalsSchema = z
      *  or an `inherited` one. The three parts sum to `totalCost`. All three are
      *  optional: an older federation peer does not send them. */
     unattributedCost: z.number().nullable().optional(),
+    /** Issue #5254 R5: turns started in the trailing 60 minutes. Optional: an
+     *  older federation peer does not send the rate fields. Aggregate-only
+     *  (never on the per-session `getSessionTotals` hot path). */
+    turnsLastHour: z.number().nullable().optional(),
+    /** Issue #5254 R5: uncached tokens in the trailing 60 minutes (turns plus
+     *  background agents — the value the ceiling guard meters). */
+    uncachedTokensLastHour: z.number().nullable().optional(),
+    /** Issue #5254 R5: the session's peak turns in any rolling 60 minutes. */
+    peakTurnsPerHour: z.number().nullable().optional(),
+    /** Issue #5254 R5: the peak uncached tokens in any rolling 60 minutes —
+     *  TURN tokens only (background agents carry no per-turn timestamp). */
+    peakUncachedTokensPerHour: z.number().nullable().optional(),
+    /** Issue #5254 R5: the session's most recent ceiling-guard breach. */
+    lastCeilingBreach: CeilingBreachSummarySchema.nullable().optional(),
   })
   .passthrough();
 export type SessionTokenTotals = z.infer<typeof SessionTokenTotalsSchema>;

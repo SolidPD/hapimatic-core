@@ -971,9 +971,11 @@ function SessionPage() {
     session,
     messageCount,
     isLoading: sessionLoading,
-    error: sessionError,
+    errorMessage: sessionErrorMessage,
+    reconnectEscalated,
     loadFailure: sessionLoadFailure,
     refetch: refetchSession,
+    retry: retrySession,
   } = useSession(api, sessionId, true); // isActiveSession=true enables polling fallback for timer
   const { localNode } = useFederatedSessions(api);
   const {
@@ -1105,12 +1107,15 @@ function SessionPage() {
       );
     }
     // #5375: only a definite 404 says "Session not found" (and clears the saved
-    // route above); a restarting node shows "Reconnecting…" while the 5 s poll
-    // recovers it; any other error is shown with a way back.
+    // route above); a restarting node shows "Reconnecting…" while the poll
+    // recovers it — bounded by #5409, after which the error and a Retry show;
+    // any other error is shown with a Retry and a way back.
     return (
       <SessionUnavailableView
         loadFailure={sessionLoadFailure}
-        errorMessage={sessionError}
+        errorMessage={sessionErrorMessage}
+        escalated={reconnectEscalated}
+        onRetry={() => void retrySession()}
         onBack={goBack}
       />
     );
@@ -1191,8 +1196,10 @@ function NewSessionPage() {
       // session exists, so sessionId is empty.  Navigate to the session
       // list where the pending spawn stub provides instant visual feedback.
       if (!sessionId) {
+        // Issue #2150: an in-progress notice, not a success — the node can still
+        // refuse the spawn, and that failure raises its own error toast.
         showToast("Session is being created on the remote node…", {
-          type: "success",
+          type: "info",
         });
         navigate({ to: "/sessions", replace: true });
         return;

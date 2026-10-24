@@ -7,7 +7,7 @@
  * the #4160 rule that a section entry may only write inside its own folder
  * (./plannedDestinations).
  */
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 import {
   credentialPathPart,
   type ConfigEntry,
@@ -15,6 +15,7 @@ import {
 } from "@hapi/protocol/porter";
 import { assertSafeEntry } from "./archiveContainment";
 import { hashContent } from "./conflictDetection";
+import { ManifestValidationError } from "./importArchiveErrors";
 import {
   classifyPlannedDestination,
   normalizeEntryPath,
@@ -72,9 +73,11 @@ export interface StagedPlan {
  * #4185: an entry path is compared by {@link normalizeEntryPath} and a member
  * path by {@link stripEntrySpelling}, so `skills/foo/`, `./skills/foo` and
  * `skills/foo` plan the same members, however the members are spelled. An
- * entry that matches no FILE member, or whose path is not a valid entry path,
- * is reported once in `unmatched`, a separate array because it is not an import
- * policy refusal.
+ * entry that matches no FILE member is reported once in `unmatched`, a
+ * separate array because it is not an import policy refusal. #5188: an entry
+ * whose path is not a valid entry path (an empty, `.` or `..` part) matches
+ * its members as written, as before #4185, and is reported as an invalid entry
+ * path only when that match reaches no file.
  *
  * #4331: `claimed` maps each destination a registered hook stages to the
  * archive path it stages from (./planHooks `claimedHookPaths`). A `hookSupport`
@@ -112,46 +115,73 @@ export function planDimension(
   const claimedOwners = new Set(claimed?.values() ?? []);
   // #4331: per-MEMBER omissions, kept apart from the per-entry render below.
   const spellingSkips: Omission[] = [];
-  // The entry and member path that first planned each destination of a
-  // normalized entry. Two spellings of one entry (`skills/foo` and
-  // `skills/foo/`) now reach the same members, and a member can be spelled two
-  // ways (`skills/foo/x`, `./skills/foo/x`), so a member that matches only once
-  // stripped is skipped when another spelling or entry already planned its
-  // destination. Distinct entries that overlap (`skills` and `skills/foo`) each
-  // still plan theirs.
-  const plannedDest = new Map<string, { entry: ConfigEntry; path: string }>();
+  // The entry and member path that first planned each destination of an
+  // entry. Two spellings of one entry (`skills/foo` and `skills/foo/`) now
+  // reach the same members, so two spellings of one entry plan each file once;
+  // a member can also be spelled two ways (`skills/foo/x`, `./skills/foo/x`).
+  // Distinct entries that overlap (`skills` and `skills/foo`) each still plan
+  // theirs; a member they match only once stripped adds no second byte source
+  // (`destOwner` below). #5202 (U15): a member skipped that way is compared,
+  // not dropped: the same bytes collapse, and different bytes refuse the
+  // archive, as #4331 does for hooks.
+  const plannedDest = new Map<
+    string,
+    { entry: ConfigEntry; path: string; hash: string }
+  >();
+  // #5188 (F2): the first member an entry matches as written for each
+  // destination, across EVERY entry of this section, with its bytes' hash
+  // (#5202 U15). Two plans of one destination stage to ONE file
+  // (`stagedPath` below) and the commit writes that file for every plan of it,
+  // so a second member there would replace the first's bytes. A member an
+  // entry matches as written always plans (the pre-#4185 rule), so two
+  // DIFFERENT as-written members of one destination still both plan and the
+  // last staged lands, as before #4185; a member that matches only once
+  // stripped plans a destination only when it is that destination's owner.
+  // `resolve` gives the path `assertSafeEntry` returns for the same member.
+  const destOwner = new Map<string, { path: string; hash: string }>();
+  for (const ce of configEntries) {
+    for (const e of entries) {
+      if (e.kind !== "file" || !isAtOrUnder(e.path, ce.path)) continue;
+      const d = resolve(claudeDir, e.path);
+      if (!destOwner.has(d))
+        destOwner.set(d, { path: e.path, hash: hashContent(e.data) });
+    }
+  }
   // A manifest that lists an entry path twice is planned and reported once.
   const seenEntries = new Set<string>();
   for (const ce of configEntries) {
     if (seenEntries.has(ce.path)) continue;
     seenEntries.add(ce.path);
     const prefix = normalizeEntryPath(ce.path);
-    if (prefix === null) {
-      // 🔴 #4185: an invalid entry plans nothing and is reported, but every
-      // member it matched before #4185 still passes containment, so a `..`
-      // member still refuses the whole archive (#4160 R7).
-      for (const entry of entries) {
-        if (!isAtOrUnder(entry.path, ce.path) || claimedOwners.has(entry.path))
-          continue;
-        assertSafeEntry(claudeDir, { path: entry.path, kind: entry.kind });
-      }
-      unmatched.push(sectionUnmatchedOmission(dimKey, ce.path, "invalid-path"));
-      continue;
-    }
     // FILE members this entry reached. A directory member never counts: a real
     // export carries `skills/foo/` as a directory member, which an entry
     // `skills/foo/` matched exactly before #4185 and then planned nothing.
     let fileMatches = 0;
-    // The members this entry matched before #4185 go first, so a member that
-    // matches only once stripped never replaces one planned before.
-    const candidates = entries
-      .filter(e => isAtOrUnder(matchPath.get(e) ?? e.path, prefix))
-      .sort(
-        (a, b) =>
-          Number(!isAtOrUnder(a.path, ce.path)) -
-          Number(!isAtOrUnder(b.path, ce.path))
-      );
+    // #5188 (F4): an entry with an empty, "." or ".." part matches its members
+    // as written, exactly as before #4185, so a plan it had is kept; it is
+    // reported only when that matches no file. The tar reader refuses a `//`
+    // member and containment a leading `/` (absolute) or a `..` one, so in
+    // practice only a "." part plans.
+    // A valid entry's as-written matches go first, so a member that matches
+    // only once stripped never replaces one planned before.
+    const candidates =
+      prefix === null
+        ? entries.filter(e => isAtOrUnder(e.path, ce.path))
+        : entries
+            .filter(e => isAtOrUnder(matchPath.get(e) ?? e.path, prefix))
+            .sort(
+              (a, b) =>
+                Number(!isAtOrUnder(a.path, ce.path)) -
+                Number(!isAtOrUnder(b.path, ce.path))
+            );
     for (const entry of candidates) {
+      // 🔴 #4185: an invalid entry leaves a claimed member, containment
+      // included, to the hook-file loop (./planHooks `planHookFiles` checks
+      // the member it stages), as before #4185.
+      if (prefix === null && claimedOwners.has(entry.path)) {
+        if (entry.kind === "file") fileMatches++;
+        continue;
+      }
       // The archive path IS the config-root-relative destination path (the layout
       // mirrors `~/.claude`), so containment validates the actual archive path
       // rather than one reconstructed from name+rel.
@@ -211,19 +241,38 @@ export function planDimension(
         continue;
       }
       // A member the raw entry path matched plans exactly as before #4185. A
-      // member that matches only once stripped is skipped when another
-      // spelling or entry planned this destination first. A repeat of the same
-      // member path within one entry plans again, so a duplicated tar member
-      // lands its last copy, as tar extraction does.
-      const planKey = `${prefix}\0${destPath}`;
+      // member that matches only once stripped is skipped when another member
+      // owns this destination, or when another spelling of this entry planned
+      // it first, and only with the same bytes: different bytes refuse the
+      // archive (#5202 U15).
+      const planKey = `${prefix ?? ce.path}\0${destPath}`;
       const by = plannedDest.get(planKey);
-      if (
-        by &&
-        !isAtOrUnder(entry.path, ce.path) &&
-        (by.entry !== ce || by.path !== entry.path)
-      )
-        continue;
-      if (!by) plannedDest.set(planKey, { entry: ce, path: entry.path });
+      const hash = hashContent(entry.data);
+      // 🔴 #5202 (U15): a skipped spelling with different bytes is never
+      // dropped silently (zero bytes written: planImport removes the staging
+      // dir on any throw).
+      const differentContent = (other: string): ManifestValidationError =>
+        new ManifestValidationError(
+          "invalid",
+          `${dimKey} members ${JSON.stringify(other)} and ` +
+            `${JSON.stringify(entry.path)} both import to ` +
+            `${JSON.stringify(v.destRel)} with different content`
+        );
+      if (!isAtOrUnder(entry.path, ce.path)) {
+        // #5188 (F2): never a second byte source, from a member that matches
+        // only once stripped, for a destination another member owns.
+        const owner = destOwner.get(destPath);
+        if (owner !== undefined && owner.path !== entry.path) {
+          if (owner.hash === hash) continue;
+          throw differentContent(owner.path);
+        }
+        destOwner.set(destPath, { path: entry.path, hash });
+        if (by && (by.entry !== ce || by.path !== entry.path)) {
+          if (by.hash === hash) continue;
+          throw differentContent(by.path);
+        }
+      }
+      if (!by) plannedDest.set(planKey, { entry: ce, path: entry.path, hash });
       plans.push({
         item: {
           kind,
@@ -232,7 +281,7 @@ export function planDimension(
           // Stage by the NORMALIZED destination (#4143 precedent): a raw path
           // with a trailing slash would otherwise stage to a directory.
           stagedPath: join(stagingDir, "tree", v.destRel),
-          incomingHash: hashContent(entry.data),
+          incomingHash: hash,
           mode: entry.mode,
         },
         content: entry.data,
@@ -242,7 +291,13 @@ export function planDimension(
     // That includes an existing-but-empty `hooks/lib` or `hooks/_shared`
     // directory entry: nothing in it to import, so it is reported on purpose.
     if (fileMatches === 0)
-      unmatched.push(sectionUnmatchedOmission(dimKey, ce.path));
+      unmatched.push(
+        sectionUnmatchedOmission(
+          dimKey,
+          ce.path,
+          prefix === null ? "invalid-path" : "no-file"
+        )
+      );
   }
   const skipped = skippedEntries.map(path =>
     sectionEntryOmission(dimKey, path, {

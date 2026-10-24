@@ -56,6 +56,7 @@ import {
   ARCHIVE_HOOK_PATH_ESCAPE_OMISSION_REASON,
   ARCHIVE_HOOK_SLOT_TAKEN_OMISSION_REASON,
   ARCHIVE_HOOK_SLOT_UNLISTABLE_OMISSION_REASON,
+  ARCHIVE_LINK_LOOP_OMISSION_REASON,
   ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
   ARCHIVE_EXCLUSION_PATTERNS,
   DEFINITIONS_ARCHIVE_MEMBERS,
@@ -69,6 +70,7 @@ import {
   SECRET_URL_QUERYFRAG_PATTERN,
   SECRET_URL_USERINFO_PATTERN,
   SETTINGS_KEYS_NO_ENV,
+  TAR_ENV_SCRUB_SHELL_LINES,
   bashSingleQuote,
   headerCommentLabel,
   toJqRegex,
@@ -103,6 +105,13 @@ import {
   profileDetectionShellLines,
 } from "./tenantProfileShell";
 import { archiveHygieneShellLines } from "./archiveHygiene";
+// #5169: the Codex source's bash lines (a sibling module, like the tenant
+// profile's), so this file grows only by its call sites.
+import {
+  codexDiscoveryShellLines,
+  codexMcpShellLines,
+  codexStagingShellLines,
+} from "./codexSourceShell";
 
 /**
  * Input to {@link buildExportScript}. Mirrors the relevant subset of
@@ -280,7 +289,7 @@ export function mcpExtractionJq(): string {
  * expansion is emitted verbatim, not evaluated as JS interpolation.
  */
 function posixSourcePaths(
-  id: Exclude<PorterSourceId, "claude-code">
+  id: Exclude<PorterSourceId, "claude-code" | "codex">
 ): string[] {
   const prefixByBase: Record<PorterPathBase, string | null> = {
     home: "$HOME",
@@ -303,7 +312,7 @@ function posixSourcePaths(
  * with `--arg source <id>`. Sets `<VAR>_MCP` (tagged entries) and `<VAR>_FOUND`.
  */
 function posixProbeBlock(
-  id: Exclude<PorterSourceId, "claude-code">,
+  id: Exclude<PorterSourceId, "claude-code" | "codex">,
   varName: string,
   label: string
 ): string[] {
@@ -333,19 +342,21 @@ function posixProbeBlock(
 }
 
 /**
- * #3448 (Sub C, D4(a)/K10): the `jq -n` program that dedupes the three sources'
+ * #3448 (Sub C, D4(a)/K10): the `jq -n` program that dedupes the sources'
  * server arrays by name in precedence order (Claude Code → Cursor → Claude
- * Desktop — `unique_by` keeps the FIRST) and builds the `sources[]` metadata.
+ * Desktop → Codex — `unique_by` keeps the FIRST) and builds the `sources[]`
+ * metadata.
  * Emits `{ mcpServers: <deduped, tagged>, sources: [{id, found, counts}] }` where
  * `counts.mcpServers` is the source's LANDED count and `counts.duplicates` is
- * what it LOST to a higher-precedence source. Args: `$cc/$cur/$dt` (per-source
- * arrays) + `$ccf/$curf/$dtf` (found booleans).
+ * what it LOST to a higher-precedence source. Args: `$cc/$cur/$dt/$cdx`
+ * (per-source arrays) + `$ccf/$curf/$dtf/$cdxf` (found booleans).
  */
 function mcpDedupeAndSourcesJq(): string {
   const arg: Record<PorterSourceId, { arr: string; found: string }> = {
     "claude-code": { arr: "$cc", found: "$ccf" },
     cursor: { arr: "$cur", found: "$curf" },
     "claude-desktop": { arr: "$dt", found: "$dtf" },
+    codex: { arr: "$cdx", found: "$cdxf" },
   };
   const entry = (id: PorterSourceId): string => {
     const { arr, found } = arg[id];
@@ -357,7 +368,7 @@ function mcpDedupeAndSourcesJq(): string {
     ].join("\n");
   };
   return [
-    "(($cc + $cur + $dt) | unique_by(.name)) as $landed",
+    "(($cc + $cur + $dt + $cdx) | unique_by(.name)) as $landed",
     "| { mcpServers: $landed,",
     "    sources: [",
     PORTER_SOURCE_IDS.map(entry).join(",\n"),
@@ -468,6 +479,12 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "# #4172: no cd searches CDPATH: a relative path names one folder, and a cd",
     "# that found it through CDPATH would print it into a captured value.",
     "unset CDPATH",
+    "# #5201: every copy below pipes a creating tar into an extracting one, and",
+    "# both sides inherit the operator's TAR_OPTIONS (bsdtar: TAR_READER_OPTIONS and",
+    "# TAR_WRITER_OPTIONS; gzip: GZIP). --incremental made the hooks-tree copy",
+    "# delete a hook staged from outside hooks/ and wrote GNU incremental headers;",
+    "# -v printed member names onto stdout. Every one of them is cleared.",
+    ...TAR_ENV_SCRUB_SHELL_LINES,
     "# #4172: under a UTF-8 locale, bash's read takes a trailing byte that is not",
     "# UTF-8 (a Latin-1 caf<0xE9>) as the start of a character and swallows the",
     "# newline or NUL after it, so a listed path is lost or merged with the next:",
@@ -550,6 +567,7 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "# moves to Step 5, after every source is probed.",
     "CLAUDE_CODE_FOUND=false",
     'if [ -d "$CONFIG_ROOT" ]; then CLAUDE_CODE_FOUND=true; fi',
+    ...codexDiscoveryShellLines(),
     "# #4172: read the config root once, as one physical path, so every later",
     "# check and copy (cd, find, tar, physical_path) names the same folder. A '..'",
     "# in CLAUDE_CONFIG_DIR is taken as text first (a plain cd, as the PowerShell",
@@ -581,7 +599,20 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "# are made absolute, so every read, removal and the cleanup name the same ones.",
     'case "$STAGING" in /*) ;; *) STAGING="$PWD/$STAGING" ;; esac',
     'case "$WORK" in /*) ;; *) WORK="$PWD/$WORK" ;; esac',
-    'cleanup() { rm -rf "$STAGING" "$WORK"; }',
+    // #4328: a read-only source folder stays read-only in staging, so rm alone
+    // cannot empty it. The cleanup makes its own two folders owner-writable
+    // first (chmod -R never follows a link met in the walk, and a root that is
+    // a link is skipped), reports a removal that still fails, and returns the
+    // export's own status, so a leftover never turns a finished export into 1.
+    "cleanup() {",
+    "  _rc=$?",
+    '  for _d in "$STAGING" "$WORK"; do',
+    '    [ -n "$_d" ] && [ -d "$_d" ] && [ ! -L "$_d" ] || continue',
+    '    chmod -R u+w -- "$_d" 2>/dev/null || :',
+    '    rm -rf -- "$_d" 2>/dev/null || echo "porter: warning: could not remove $_d - remove it by hand" >&2',
+    "  done",
+    '  return "$_rc"',
+    "}",
     "trap cleanup EXIT INT TERM",
     'OMISSIONS="$WORK/omissions.jsonl"; : > "$OMISSIONS"',
     "record_omission() {",
@@ -598,12 +629,24 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "# targets are copied dereferenced; unresolvable targets are dropped and recorded",
     "# as omissions. Residual (documented): a broken link NESTED inside a linked",
     "# directory is skipped by tar with a stderr warning, not an omission entry.",
+    "# #4321: a loop inside a linked folder (a folder link to a folder on its own",
+    "# path) is left out of the -h copy, with one omission: GNU tar -h follows one",
+    "# without end. bsdtar matches an --exclude pattern at any depth, so its",
+    "# pattern is anchored with a leading ^; GNU tar (and BusyBox) match one only",
+    "# from a part boundary, where ./ cannot occur again, so theirs needs none.",
+    "case \"$(tar --version 2>/dev/null || :)\" in *bsdtar*) _tanchor='^' ;; *) _tanchor='' ;; esac",
+    "tar_pattern_escape() { # $1 = a path; prints it with each glob character escaped",
+    "  printf '%s' \"$1\" | sed 's/[][*?\\\\]/\\\\&/g'",
+    "}",
     "materialize_links() {",
     "  # NUL-delimited, so a name with a newline stays one name. Before #4172 the",
     "  # list was read one per line: each piece after a newline became a path of",
     "  # its own (relative to the current folder, or absolute when it began with",
     "  # /), and the rm below removed it.",
-    '  find "$STAGING" -type l -print0 > "$WORK/links.txt" 2>/dev/null || : > "$WORK/links.txt"',
+    '  find "$STAGING" -type l -print0 > "$WORK/links-found.txt" 2>/dev/null || : > "$WORK/links-found.txt"',
+    "  # #4321: in byte order, so both exporters record the omissions in one order",
+    "  # whatever order the filesystem lists the links in.",
+    '  LC_ALL=C sort -z < "$WORK/links-found.txt" > "$WORK/links.txt"',
     "  while IFS= read -r -d '' _lnk; do",
     '    case "$_lnk" in "$STAGING"/*) ;; *) continue ;; esac',
     '    [ -L "$_lnk" ] || continue',
@@ -638,7 +681,16 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     '      mkdir -p "$_lnk"',
     '      : > "$WORK/credential-links.txt"',
     '      credential_links "$_lsrc" "$_lrel" "$WORK/credential-links.txt"',
-    `      if ( cd "$_lsrc" && tar -cf - -h ${tarExcludeFlags()} . ) \\`,
+    "      # #4321: in byte order (the PowerShell twin sorts ordinally), and each",
+    "      # loop left out of the copy below.",
+    '      LC_ALL=C sort < "$WORK/credential-links.txt" > "$WORK/credential-links-sorted.txt"',
+    '      mv -f "$WORK/credential-links-sorted.txt" "$WORK/credential-links.txt"',
+    "      _lex=()",
+    '      while IFS= read -r _eline; do _ek="${_eline%%"$_ctab"*}"; _el="${_eline#*"$_ctab"}"',
+    '        [ "$_ek" = l ] || continue',
+    '        _lex+=("--exclude=$_tanchor./$(tar_pattern_escape "${_el#"$_lrel"/}")")',
+    '      done < "$WORK/credential-links.txt"',
+    `      if ( cd "$_lsrc" && tar -cf - -h ${tarExcludeFlags()} \${_lex[@]+"\${_lex[@]}"} . ) \\`,
     '        | ( cd "$_lnk" && tar -xpf - ); then',
     "        # tar -h followed the links under it too: take out each one that",
     "        # credential_links refused, with one omission per path it staged. A",
@@ -648,6 +700,10 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     '        : > "$WORK/credential-links-staged.txt"',
     '        while IFS= read -r _cline; do _ck="${_cline%%"$_ctab"*}"; _cl="${_cline#*"$_ctab"}"',
     '          if under_link "$STAGING" "$_cl"; then continue; fi',
+    '          if [ "$_ck" = l ]; then',
+    `            record_omission "$_cl" '${ARCHIVE_LINK_LOOP_OMISSION_REASON}'`,
+    "            continue",
+    "          fi",
     '          if [ -e "$STAGING/$_cl" ] || [ -L "$STAGING/$_cl" ]; then',
     `            if [ "$_ck" = u ]; then _cwhy='${ARCHIVE_LINK_UNCHECKED_OMISSION_REASON}'; else _cwhy='${ARCHIVE_CREDENTIAL_OMISSION_REASON}'; fi`,
     '            record_omission "$_cl" "$_cwhy"',
@@ -749,6 +805,16 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     '      "~/.claude"*)     _resolved="$CONFIG_ROOT${_resolved#\\~/.claude}" ;;',
     '      */.claude/*)      _resolved="$CONFIG_ROOT/${_resolved#*/.claude/}" ;;',
     "    esac",
+    "    # #5183: a script outside ~/.claude spelled with a leading $HOME/, ${HOME}/",
+    "    # or ~/ is read where the shell running the hook finds it (this $HOME). The",
+    "    # .claude arms above run first, so $HOME/.claude/... still maps to the root.",
+    '    if [ -n "${HOME:-}" ]; then',
+    '      case "$_resolved" in',
+    "        '$HOME/'*)   _resolved=\"$HOME/${_resolved#'$HOME/'}\" ;;",
+    "        '${HOME}/'*) _resolved=\"$HOME/${_resolved#'${HOME}/'}\" ;;",
+    "        '~/'*)       _resolved=\"$HOME/${_resolved#'~/'}\" ;;",
+    "      esac",
+    "    fi",
     "    # A registration spelled <root>//hooks/... leaves a leading / after the root:",
     "    # drop it, as the PowerShell twin's Join-Path does, so it still reads as hooks/.",
     '    case "$_resolved" in "$CONFIG_ROOT"/*) _rr="${_resolved#"$CONFIG_ROOT"/}"; while [ "${_rr#/}" != "$_rr" ]; do _rr="${_rr#/}"; done; _resolved="$CONFIG_ROOT/$_rr" ;; esac',
@@ -757,9 +823,12 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "      continue",
     "    fi",
     "    # Archive-relative path under hooks/ (mirrors the source hooks/ subtree).",
+    "    # _hext marks a script registered from outside hooks/ (#5183): it is staged",
+    "    # as hooks/<name>, so that name's slot is checked below.",
+    "    _hext=0",
     '    case "$_resolved" in',
     '      "$CONFIG_ROOT/hooks/"*) _rel="hooks/${_resolved#"$CONFIG_ROOT"/hooks/}" ;;',
-    '      *) _rel="hooks/$(basename "$_resolved")" ;;',
+    '      *) _rel="hooks/$(basename "$_resolved")"; _hext=1 ;;',
     "    esac",
     "    # #4172 (OOS-6): a registered script whose physical path is in a credential",
     "    # store (or cannot be checked) is refused, registration and all (except",
@@ -770,6 +839,9 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "    # never see the script.",
     '    _hrc=0; _hphys="$(physical_path "$_resolved")" || _hrc=$?',
     "    _hwhy=''",
+    "    # The last arm (the physical end path) is a backstop after L1: the PM's",
+    "    # re-gate 4 found it equivalent by behaviour (mutants M17/M18; a link",
+    "    # that reaches a store is refused by the arms before it). Kept: fail-closed.",
     `    if [ "$_hrc" -eq 3 ]; then _hwhy='${ARCHIVE_CREDENTIAL_OMISSION_REASON}'; elif [ -z "$_hphys" ]; then _hwhy='${ARCHIVE_LINK_UNCHECKED_OMISSION_REASON}'; elif has_credential_part "$_hphys"; then _hwhy='${ARCHIVE_CREDENTIAL_OMISSION_REASON}'; fi`,
     '    if [ -n "$_hwhy" ]; then',
     '      case "$_resolved" in',
@@ -805,7 +877,7 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "    done",
     '    _hreg="$_rel"; _hfb=0',
     '    case "$_cclimb:$_cout" in',
-    '      0:hooks/?*) _rel="$_cout" ;;',
+    '      0:hooks/?*) _rel="$_cout"; _hfb="$_hext" ;;',
     '      0:?*) _rel="hooks/$(basename "$_resolved")"; _hfb=1 ;;',
     `      *) record_omission "$_rel" '${ARCHIVE_HOOK_PATH_ESCAPE_OMISSION_REASON}'; continue ;;`,
     "    esac",
@@ -946,9 +1018,9 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "materialize_links",
     "# #4172 (P3): the last materialization, so prune the section folders and",
     "# hooks again: a linked folder inside hooks/ was just copied in with",
-    "# junk-only exclusions, and a link a tar kept in a section folder (bsdtar",
-    "# keeps a loop) has just been turned into content. CLAUDE.md and its",
-    "# includes follow Step 3's rule, not this one.",
+    "# junk-only exclusions, and a link a tar kept in a section folder has just",
+    "# been turned into content. CLAUDE.md and its includes follow Step 3's rule,",
+    "# not this one.",
     `for _dim in ${DIMENSION_DIRS.join(" ")} hooks; do prune_credential_names "$_dim"; done`,
     "# #4172: record each refused hook under hooks/ that the passes above did not.",
     "# One in an excluded folder was never staged, so nothing else records it. An",
@@ -965,6 +1037,8 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "",
     ...memoryStagingShellLines(tarExcludeFlags()),
     "",
+    ...codexStagingShellLines(tarExcludeFlags()),
+    "",
     "# ── Step 5 — MCP server DEFINITIONS from EVERY source (key names only, NO values) ──",
     'step "Extracting MCP server definitions (names only — no secret values)"',
     "# Claude Code — the host ~/.claude.json (definitions-only). Its found flag is the",
@@ -978,16 +1052,19 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "fi",
     ...posixProbeBlock("cursor", "CURSOR", "Cursor (~/.cursor/mcp.json)"),
     ...posixProbeBlock("claude-desktop", "DESKTOP", "Claude Desktop"),
+    ...codexMcpShellLines(mcpExtractionJq()),
     "# No supported source found at all → error (preflight no longer hard-exits, 1B#34).",
-    'if [ "$CLAUDE_CODE_FOUND" != true ] && [ "$CURSOR_FOUND" != true ] && [ "$DESKTOP_FOUND" != true ]; then',
+    'if [ "$CLAUDE_CODE_FOUND" != true ] && [ "$CURSOR_FOUND" != true ] && [ "$DESKTOP_FOUND" != true ] && [ "$CODEX_FOUND" != true ]; then',
     "  printf 'error: no supported configuration found\\n' >&2",
     "  exit 1",
     "fi",
     "# Cross-source dedupe by name in precedence order + build sources[] metadata.",
     '_MSRC="$(jq -cn --argjson cc "$CC_MCP" --argjson cur "$CURSOR_MCP" \\',
-    '  --argjson dt "$DESKTOP_MCP" \\',
+    '  --argjson dt "$DESKTOP_MCP" --argjson cdx "$CODEX_MCP" \\',
     '  --argjson ccf "$CLAUDE_CODE_FOUND" --argjson curf "$CURSOR_FOUND" \\',
-    '  --argjson dtf "$DESKTOP_FOUND" \'' + mcpDedupeAndSourcesJq() + "')\"",
+    '  --argjson dtf "$DESKTOP_FOUND" --argjson cdxf "$CODEX_FOUND" \'' +
+      mcpDedupeAndSourcesJq() +
+      "')\"",
     '[ -n "$_MSRC" ] || _MSRC=\'{"mcpServers":[],"sources":[]}\'',
     "MCP_JSON=\"$(printf '%s' \"$_MSRC\" | jq -c '.mcpServers')\"",
     '  [ -n "$MCP_JSON" ] || MCP_JSON="[]"',
@@ -1012,7 +1089,9 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     )}' 'keys - $keep' "$SETTINGS_SRC" 2>/dev/null || echo '[]')"`,
     '  [ -n "$SKIPPED_JSON" ] || SKIPPED_JSON="[]"',
     "  # env is deliberately omitted: record it as skipped + a distinct omission.",
-    '  if jq -e \'has("env")\' "$SETTINGS_SRC" >/dev/null 2>&1; then',
+    "  # The output is compared, never `-e`'s exit status: jq 1.6 exits 0 when it",
+    "  # prints nothing (a 0-byte settings.json), which read as env present (#5558).",
+    '  if [ "$(jq -r \'has("env")\' "$SETTINGS_SRC" 2>/dev/null)" = true ]; then',
     '    SKIPPED_JSON="$(printf \'%s\' "$SKIPPED_JSON" | jq -c \'. + ["env"] | unique\')"',
     '    record_omission "settings.env" "definitions-only: env values omitted (re-supply at destination)"',
     "  fi",
@@ -1107,10 +1186,18 @@ export function buildExportScript(input: ExportScriptInput = {}): string {
     "# rewrite every multi-linked staged file as its own independent copy.",
     "# NUL-delimited and staging-only, as materialize_links: a split name must",
     "# never make the cp/mv below touch a file outside staging.",
-    'find "$STAGING" -type f -links +1 -print0 > "$WORK/hardlinks.txt" 2>/dev/null || : > "$WORK/hardlinks.txt"',
+    "# #4321: a failed listing or copy stops the export. It used to pass: a partial",
+    "# list was replaced by an empty one, and set -e ignores a failed cp before &&,",
+    "# so a hard-link member stayed (the import refuses the archive) and a partial",
+    "# .__unlink_tmp copy could ship. The PowerShell twin throws.",
+    'if ! find "$STAGING" -type f -links +1 -print0 > "$WORK/hardlinks.txt"; then',
+    '  echo "porter: could not list the staged files to normalize hard links" >&2',
+    "  exit 1",
+    "fi",
     "while IFS= read -r -d '' _hf; do",
     '  case "$_hf" in "$STAGING"/*) ;; *) continue ;; esac',
-    '  cp -p "$_hf" "$_hf.__unlink_tmp" && mv -f "$_hf.__unlink_tmp" "$_hf"',
+    '  cp -p "$_hf" "$_hf.__unlink_tmp" || { echo "porter: could not normalize the hard link ${_hf#"$STAGING"/} (copy failed; is its folder read-only?)" >&2; exit 1; }',
+    '  mv -f "$_hf.__unlink_tmp" "$_hf" || { echo "porter: could not normalize the hard link ${_hf#"$STAGING"/} (rename failed)" >&2; exit 1; }',
     'done < "$WORK/hardlinks.txt"',
     "",
     "# ── Step 11 — build the archive, then write it to the stable export directory ──",

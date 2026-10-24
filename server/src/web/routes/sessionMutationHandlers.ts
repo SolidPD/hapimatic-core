@@ -659,8 +659,11 @@ export const CEILING_OVERRIDE_MUTATION = defineFieldMutation({
   method: "PUT",
   schema: CeilingGuardConfigPatchSchema.nullable(),
   extractValue: p => p,
-  applyLocal: (engine, id, value) =>
-    engine.updateSessionCeilingOverride(id, value),
+  // The writer's boolean (#5254) is for the ceiling guard's seed step; the
+  // route keeps its void contract.
+  applyLocal: async (engine, id, value) => {
+    await engine.updateSessionCeilingOverride(id, value);
+  },
   proxyBody: value => value,
   applyCache: (registry, id, value) =>
     registry.updateCachedSessionCeilingOverride(id, value),

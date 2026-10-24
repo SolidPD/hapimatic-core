@@ -29,6 +29,7 @@ import {
   DEFINITIONS_ARCHIVE_MEMBERS,
   DIMENSION_DIRS,
   DIMENSION_FIELD,
+  TAR_ENV_SCRUB_SHELL_LINES,
 } from "./exportShared";
 import {
   credentialPathsFunctionLines,
@@ -190,7 +191,9 @@ export const INCLUDE_CHECK_SUMMARY_PREFIX = "CLAUDE.md include check:";
  * a link to one, a dangling link, a link cycle). The block drops only an
  * omission with this surface AND {@link CLAUDE_MD_NOT_A_FILE_REASON} before it
  * records its own, so a second run does not repeat it; an omission the model
- * staged under this surface with any other reason is kept.
+ * staged under this surface with any other reason is kept — unless the block
+ * packages `CLAUDE.md`, when every staged omission under this surface is
+ * dropped (#5260), so the manifest and the archive agree.
  */
 export const CLAUDE_MD_NOT_A_FILE_SURFACE = "CLAUDE.md";
 
@@ -231,17 +234,20 @@ export const INCLUDE_CHECK_PACKAGED = "include(s) packaged,";
 /**
  * #4172: the words after the third count in the success summary: how many
  * credential-bearing paths the block kept out of the archive (each is also a
- * `manifest.json` omission). One constant for the block's `echo` and the prompt.
+ * `manifest.json` omission). Used only by the block's `echo` (and the tests that
+ * read its summary); the prompt never names these words (#4321).
  */
 export const INCLUDE_CHECK_CREDENTIALS_REMOVED =
   "credential-bearing path(s) removed";
 
 /**
- * #4172: the staged folders the block's credential prune covers — the section
- * folders and `hooks`, as in the bash exporter — and the manifest fields whose
- * entries can name a pruned path (each section field and `hookSupport`).
+ * #4172: the staged folders the credential-name rule covers — the section
+ * folders and `hooks`, as in both exporters. The one list (#4321): this block's
+ * scan and the extraction prompt's Step 2 rule both read it. Also the manifest
+ * fields whose entries can name a pruned path (each section field and
+ * `hookSupport`).
  */
-const CREDENTIAL_DIRS: readonly string[] = [...DIMENSION_DIRS, "hooks"];
+export const CREDENTIAL_DIRS: readonly string[] = [...DIMENSION_DIRS, "hooks"];
 const CREDENTIAL_ENTRY_FIELDS: readonly string[] = [
   ...DIMENSION_DIRS.map(dir => DIMENSION_FIELD[dir]),
   "hookSupport",
@@ -261,6 +267,30 @@ export const INCLUDE_CHECK_END_LINE = "# end of the #4164 include check";
  * lacks the marker (e.g. a project the model's shell drifted into).
  */
 export const PORTER_STAGING_MARKER = ".hapi-porter-staging";
+
+/**
+ * The Step 11 lines that read the staged `manifest.json`'s permission bits
+ * into `_mmode` as three octal digits, for the `chmod` that gives the rewritten
+ * manifest the same bits (#4235). setuid, setgid and sticky are not kept.
+ * GNU, BusyBox and BSD `stat` print a mode under 0100 without leading zeros
+ * (`44` for 0044, `0` for 0000), so 1 to 4 octal digits are accepted and
+ * left-padded (#5260); anything else is refused, fail-closed. Exported so the
+ * unit test runs the exact served lines; `cleared` is the fragment's note of
+ * what was already cleared.
+ */
+export function manifestModeLines(cleared: string): string[] {
+  return [
+    "# #4235: the new manifest.json keeps the permission bits the staged one has",
+    "# (the temp file it is written to is 0600); setuid, setgid and sticky are not kept.",
+    "# #5260: stat prints a mode under 0100 without leading zeros (44, 0), so it is",
+    "# padded to three digits; the last three are kept.",
+    `_mmode="$( (stat -L -c %a manifest.json || stat -L -f %Lp manifest.json) 2>/dev/null)" || _mmode=''`,
+    'case "$_mmode" in',
+    '  [0-7]|[0-7][0-7]|[0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) _mmode="00$_mmode"; _mmode="${_mmode#"${_mmode%???}"}" ;;',
+    `  *) echo "${INCLUDE_CHECK_SUMMARY_PREFIX} could not read the permission bits of manifest.json here (stat), so nothing else was changed (${cleared})" >&2; exit 1 ;;`,
+    "esac",
+  ];
+}
 
 /**
  * #4164: the extraction prompt's Step 11 block.
@@ -313,7 +343,9 @@ export const PORTER_STAGING_MARKER = ".hapi-porter-staging";
  * exporter's own lines, {@link credentialPathsFunctionLines}), (2) rewrites
  * `manifest.json`'s `claudeMd` (dropped when the config root has no CLAUDE.md,
  * as the exporter does), replaces its include omissions (surfaces starting
- * `CLAUDE.md include @`, or `claudeMd.include`) with the rebuilt set, adds one
+ * `CLAUDE.md include @`, or `claudeMd.include`) with the rebuilt set (#5260: a
+ * staged `CLAUDE.md` omission is dropped when the block packages `CLAUDE.md`,
+ * so the manifest and the archive agree), adds one
  * omission per listed credential path (one already staged, identical, is not
  * repeated) and drops any section or `hookSupport` entry at or under a listed
  * path, writing a temp file here and renaming it over `manifest.json` with the
@@ -430,8 +462,7 @@ export function buildIncludeCheckShellFragment(
     "# reads it and, when set, warns 'GZIP environment variable is deprecated' to",
     "# stderr on every decompression (including the listing read below), which the",
     "# listing check would otherwise read as tar's own output — clear it too.",
-    'for _v in "${!TAR_@}"; do unset "$_v"; done',
-    "unset GZIP",
+    ...TAR_ENV_SCRUB_SHELL_LINES,
     'CONFIG_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"',
     "# This directory's physical path, kept whole even when its name ends in a",
     "# newline (a bare $(pwd -P) would strip it, naming another directory). A",
@@ -496,7 +527,7 @@ export function buildIncludeCheckShellFragment(
     "# the name-strip rule below runs grep to catch tar's warning; proving grep present",
     "# here refuses an absent grep with a clean message before the rewrite. (The rule",
     "# also refuses on grep's own exit 2+/127 at run time, but this is the clean signal.)",
-    "for _t in find sed sort cmp grep; do",
+    "for _t in find sed sort cmp grep tr wc; do",
     '  if ! command -v "$_t" >/dev/null 2>&1; then',
     `    echo "${INCLUDE_CHECK_SUMMARY_PREFIX} $_t is not installed and the archive check needs it (${cleared}); it must be installed before this block can run" >&2`,
     "    exit 1",
@@ -577,13 +608,7 @@ export function buildIncludeCheckShellFragment(
     `  echo "${INCLUDE_CHECK_SUMMARY_PREFIX} refusing $_links staged link(s)$_more: the archive would carry each as a link, which the importer does not import, so nothing else was changed (${cleared}); ${LINK_REFUSAL_REMEDY}; replace a file with a second hard link by a copy of it; then run this block again" >&2`,
     "  exit 1",
     "fi",
-    "# #4235: the new manifest.json keeps the permission bits the staged one has",
-    "# (the temp file it is written to is 0600); setuid, setgid and sticky are not kept.",
-    `_mmode="$( (stat -L -c %a manifest.json || stat -L -f %Lp manifest.json) 2>/dev/null)" || _mmode=''`,
-    'case "$_mmode" in',
-    '  [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) _mmode="${_mmode#"${_mmode%???}"}" ;;',
-    `  *) echo "${INCLUDE_CHECK_SUMMARY_PREFIX} could not read the permission bits of manifest.json here (stat), so nothing else was changed (${cleared})" >&2; exit 1 ;;`,
-    "esac",
+    ...manifestModeLines(cleared),
     "WORK=''",
     "TMP_MANIFEST=''",
     "TMP_ARCHIVE=''",
@@ -671,12 +696,13 @@ export function buildIncludeCheckShellFragment(
     "# repeated), and a section or hookSupport entry at or under a listed path is",
     "# dropped, so the manifest names no member the archive leaves out. The",
     "# new manifest is written to a temp file here and renamed over manifest.json.",
+    "# #5260 (TC-1): a CLAUDE.md omission is dropped when CLAUDE.md is packaged.",
     "_step='rewriting manifest.json'",
     `TMP_MANIFEST="$(mktemp "$HERE/.hapi-porter-manifest.XXXXXX")"`,
     `jq --argjson cm "$CLAUDE_MD_JSON" --slurpfile om "$OMISSIONS" --slurpfile co "$WORK/credential-omissions.jsonl" --arg pre '${CLAUDE_MD_INCLUDE_SURFACE_PREFIX}' --arg nf '${CLAUDE_MD_INCLUDE_NOT_FOUND_SURFACE}' --arg cms '${CLAUDE_MD_NOT_A_FILE_SURFACE}' --arg cmr '${CLAUDE_MD_NOT_A_FILE_REASON}' --argjson st "$SETTINGS_JSON" --argjson ss "$SETTINGS_SCRIPTS_JSON" --arg spre '${SETTINGS_SCRIPT_SURFACE_PREFIX}' '`,
     "  (if $cm == null then del(.claudeMd) else .claudeMd = $cm end)",
     "  | .settings = $st | .settingsScripts = $ss",
-    "  | .omissions = ([(.omissions // [])[] | select(((.surface | tostring) | startswith($pre) | not) and (.surface != $nf) and ((.surface != $cms) or (.reason != $cmr))) | select(((.surface | tostring) | startswith($spre)) | not) | select(. as $o | any($co[]; . == $o) | not)] + $om + $co)",
+    "  | .omissions = ([(.omissions // [])[] | select(((.surface | tostring) | startswith($pre) | not) and (.surface != $nf) and ((.surface != $cms) or (.reason != $cmr))) | select(($cm == null) or ((.surface | tostring) != $cms)) | select(((.surface | tostring) | startswith($spre)) | not) | select(. as $o | any($co[]; . == $o) | not)] + $om + $co)",
     "  | ($co | map(.surface)) as $cut",
     `  | reduce (${CREDENTIAL_ENTRY_FIELDS.map(f => `"${f}"`).join(", ")}) as $f (.;`,
     '      if (.[$f] | type) == "array"',
@@ -833,8 +859,10 @@ export function buildIncludeCheckShellFragment(
     "    while IFS= read -r _r; do",
     '      case "$_r" in x) _ocompared=$((_ocompared + 1)) ;; n) return 1 ;; esac',
     '    done <<< "$_ocmp"',
-    '    _ocount="$(cd "$CHK" && find "${_o[@]}" -type f -exec printf \'x\\n\' \\;)" || return 1',
-    '    while IFS= read -r _r; do if [ -n "$_r" ]; then _ofiles=$((_ofiles + 1)); fi; done <<< "$_ocount"',
+    "    # #5260: counted apart from the cmp loop, so a batch find drops cannot",
+    "    # drop here too (see the _fcount note below).",
+    '    _ocount="$(cd "$CHK" && find "${_o[@]}" -type f -print0 | LC_ALL=C tr -cd \'\\000\' | wc -c)" || return 1',
+    "    _ofiles=$((_ocount + 0))",
     '    [ "$_ocompared" -eq "$_ofiles" ] || return 1',
     "  fi",
     "  _m=()",
@@ -865,10 +893,13 @@ export function buildIncludeCheckShellFragment(
     '  [ "$_gotd" = "$_wantd" ] || return 1',
     '  _files="$(cd "$BUILD" && find "${_m[@]}" -type f -print)" || return 1',
     "  # #4235: every regular file in the build is compared: the count comes from",
-    "  # find, apart from the loop, so a file the loop skips cannot pass.",
+    "  # find, apart from the loop, so a file the loop skips cannot pass. #5260:",
+    "  # one NUL per regular file (a newline in a name counts once), with no",
+    "  # process per file and no -exec batching: BusyBox find exits 0 when an",
+    "  # -exec {} + batch fails, which would drop files from the count unseen.",
     "  _nfiles=0",
-    '  _fcount="$(cd "$BUILD" && find "${_m[@]}" -type f -exec printf \'x\\n\' \\;)" || return 1',
-    '  while IFS= read -r _r; do if [ -n "$_r" ]; then _nfiles=$((_nfiles + 1)); fi; done <<< "$_fcount"',
+    '  _fcount="$(cd "$BUILD" && find "${_m[@]}" -type f -print0 | LC_ALL=C tr -cd \'\\000\' | wc -c)" || return 1',
+    "  _nfiles=$((_fcount + 0))",
     "  _compared=0",
     "  while IFS= read -r _f; do",
     '    [ -n "$_f" ] || continue',

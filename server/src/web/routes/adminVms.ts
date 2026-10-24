@@ -37,7 +37,9 @@ import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
 import {
   buildJob,
+  deleteEligibleIso,
   isTerminalState,
+  lookupDeprovisionGatewayHost,
   JobValidationError,
   maskSecretLine,
   maskSecretText,
@@ -114,6 +116,12 @@ export interface AdminVmRoutesOptions {
   inventoryPath: string;
   /** Inventory-file reader (default `node:fs`). Tests inject a fixture. */
   readInventory?: (path: string) => Promise<string>;
+  /**
+   * The deprovision dry-run's `--gateway-host` when the VM's inventory record
+   * has none — see {@link lookupDeprovisionGatewayHost} (#5257 F9, D3). Wired
+   * from `HAPI_VM_GATEWAY_HOST` (buildWebApp.ts).
+   */
+  defaultGatewayHost?: string;
   /**
    * Inventory-file mtime source for the #2552 STALE verdict (default `node:fs`
    * `stat`). Tests inject a fixture mtime. Only consulted when
@@ -495,6 +503,7 @@ export function createAdminVmRoutes(
     inventoryPath,
     auditLog,
     readInventory = defaultReadInventory,
+    defaultGatewayHost,
     statInventory = defaultStatInventory,
     inventoryStaleAfterMs,
     vmParityLedgerPath,
@@ -613,31 +622,6 @@ export function createAdminVmRoutes(
       if (rec.state === "running") rec = await prov.runner.finalize(id);
       if (isTerminalState(rec.state) || now() >= deadline) return rec;
       await sleep(logPollIntervalMs);
-    }
-  }
-
-  /**
-   * Best-effort server-side `--gateway-host`: the inventory record whose `name`
-   * equals the subdomain (that is how `inventory_upsert` keys records) may carry
-   * a `gateway_host`. Absence is fine (the script has its own default); any read
-   * error yields undefined — this must never block a deprovision.
-   */
-  async function lookupGatewayHost(
-    subdomain: string
-  ): Promise<string | undefined> {
-    try {
-      const arr = JSON.parse(await readInventory(inventoryPath)) as unknown;
-      if (!Array.isArray(arr)) return undefined;
-      const rec = arr.find(
-        r =>
-          r != null &&
-          typeof r === "object" &&
-          (r as Record<string, unknown>).name === subdomain
-      ) as Record<string, unknown> | undefined;
-      const gh = rec?.gateway_host;
-      return typeof gh === "string" && gh.length > 0 ? gh : undefined;
-    } catch {
-      return undefined;
     }
   }
 
@@ -901,10 +885,14 @@ export function createAdminVmRoutes(
 
       let built: BuiltJob;
       try {
-        built = buildJob(body.data.kind, {
-          positionals: body.data.positionals,
-          flags: body.data.flags,
-        });
+        built = buildJob(
+          body.data.kind,
+          {
+            positionals: body.data.positionals,
+            flags: body.data.flags,
+          },
+          { now: now() }
+        );
       } catch (err) {
         // The allowlist rejection (AC-2): 400 with no job record created.
         if (err instanceof JobValidationError) {
@@ -1157,7 +1145,8 @@ export function createAdminVmRoutes(
         auth: "jwt",
         riskTier: "mutating",
         availability: { scope: "operator" },
-        example: '{"subdomain":"ms2","email":"ops@example.com"}',
+        example:
+          '{"subdomain":"ms2","email":"ops@example.com","serviceEnd":"2026-10-31"}',
       })
     ),
     jobCreationLimiter,
@@ -1166,18 +1155,31 @@ export function createAdminVmRoutes(
       const prov = provisioner;
       const body = await readValidatedBody(c, DeprovisionDryRunRequestSchema);
       if (!body.ok) return body.res;
-      const { subdomain, email } = body.data;
+      const { subdomain, email, serviceEnd } = body.data;
 
-      const gatewayHost = await lookupGatewayHost(subdomain);
+      const gatewayHost = await lookupDeprovisionGatewayHost({
+        subdomain,
+        inventoryPath,
+        readInventory,
+        defaultGatewayHost,
+      });
       const flags: Record<string, string> = {};
       if (email) flags["--email"] = email;
       if (gatewayHost) flags["--gateway-host"] = gatewayHost;
+      // #5257 F9: E dates the retention record. It joins the argv the token binds,
+      // so the apply replays it with no change to the apply body.
+      if (serviceEnd) flags["--service-end"] = serviceEnd;
 
       // DEFAULT dry-run: no --apply, no --dry-run (so apply replays argv + --apply
-      // cleanly). `buildJob` re-validates the subdomain + flags — the security seam.
+      // cleanly). `buildJob` re-validates the subdomain + flags — the security seam —
+      // including the service end's calendar check and its 30-day past bound.
       let built: BuiltJob;
       try {
-        built = buildJob("deprovision", { positionals: [subdomain], flags });
+        built = buildJob(
+          "deprovision",
+          { positionals: [subdomain], flags },
+          { now: now() }
+        );
       } catch (err) {
         if (err instanceof JobValidationError) {
           return c.json({ error: err.message, code: err.code }, 400);
@@ -1212,6 +1214,9 @@ export function createAdminVmRoutes(
         state: finalRec.state,
         transcript,
         confirmationToken: token,
+        serviceEnd: serviceEnd ?? null,
+        deleteEligibleAt: deleteEligibleIso(serviceEnd),
+        gatewayHost: gatewayHost ?? null,
       });
     }
   );

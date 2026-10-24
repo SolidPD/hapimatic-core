@@ -27,9 +27,11 @@ import { generateSessionId } from "@/utils/id";
 import { readSettings } from "@/persistence";
 import { MAX_CONCURRENCY_DEFAULT } from "@hapi/protocol/schemas";
 import {
+  computeMachineInputs,
   resolveCeiling,
   resolveDerivedCapacity,
   type CapSource,
+  type MemInputSource,
 } from "./sessionCapacity";
 import type { Metadata } from "@/api/types";
 import type { TrackedSession } from "./types";
@@ -171,6 +173,8 @@ export interface EffectiveCountResult {
   recommended: number;
   /** Which resolver layer decided the cap. */
   source: CapSource;
+  /** #5202 (U3): which memory figure fed the formula (shown by `hapi daemon status`). */
+  memInputSource: MemInputSource;
 }
 
 /**
@@ -287,6 +291,7 @@ export function createSessionTracker(ctx: DaemonContext) {
       max: cap.max,
       recommended: cap.recommended,
       source: cap.source,
+      memInputSource: computeMachineInputs().memInputSource,
     };
   };
 

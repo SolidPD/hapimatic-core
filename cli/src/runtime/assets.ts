@@ -52,6 +52,19 @@ const defaultLog: RuntimeLog = (message, error) => {
   }
 };
 
+/**
+ * #5202 (U5): the move-aside of a published runtime directory is logged at
+ * warn. It re-extracts on every start while the cause persists and can pull
+ * `rg`/`difft` out from under running sessions, so it must not hide at debug.
+ */
+const defaultWarn: RuntimeLog = (message, error) => {
+  if (error === undefined) {
+    logger.warn(message);
+  } else {
+    logger.warn(message, error);
+  }
+};
+
 function ensureDirectory(path: string): void {
   mkdirSync(path, { recursive: true });
 }
@@ -120,7 +133,7 @@ function publishRuntimeDir(
   finalDir: string,
   baseDir: string,
   key: string,
-  log: RuntimeLog
+  warn: RuntimeLog
 ): void {
   if (existsSync(finalDir)) {
     if (isRuntimeDirReady(finalDir, key)) {
@@ -131,7 +144,7 @@ function publishRuntimeDir(
     const reason = runtimeDirProblem(finalDir) ?? "wrong or missing marker";
     try {
       renameSync(finalDir, aside);
-      log(
+      warn(
         `[RUNTIME] moved a torn runtime directory aside (${reason}): ${aside}`
       );
     } catch (error) {
@@ -238,6 +251,8 @@ export interface EnsureRuntimeDirOptions {
   populate: (dir: string) => Promise<void>;
   now?: () => number;
   log?: RuntimeLog;
+  /** Warn-level sink for the move-aside line (#5202 U5); defaults to `log` when one is injected, else `logger.warn`. */
+  warn?: RuntimeLog;
 }
 
 /**
@@ -255,6 +270,7 @@ export async function ensureRuntimeDir(
 ): Promise<string> {
   const { baseDir, key, populate } = options;
   const log = options.log ?? defaultLog;
+  const warn = options.warn ?? options.log ?? defaultWarn;
   const finalDir = join(baseDir, key);
   if (isRuntimeDirReady(finalDir, key)) {
     return finalDir;
@@ -278,7 +294,7 @@ export async function ensureRuntimeDir(
       );
     }
     writeFileSync(join(tempDir, RUNTIME_MARKER), key, "utf-8");
-    publishRuntimeDir(tempDir, finalDir, baseDir, key, log);
+    publishRuntimeDir(tempDir, finalDir, baseDir, key, warn);
   } catch (error) {
     rmSync(tempDir, { recursive: true, force: true });
     throw error;

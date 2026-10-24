@@ -608,6 +608,23 @@ export async function runDoctorDaemon(): Promise<void> {
   return runDoctorCommand("daemon");
 }
 
+/**
+ * Heading and footer for `hapi doctor` vs `hapi daemon status` (#5180 F11):
+ * status is not a doctor run, so it gets its own heading and no footer.
+ */
+export function doctorTitles(filter: "all" | "daemon"): {
+  heading: string;
+  footer: string | null;
+} {
+  if (filter === "daemon") {
+    return { heading: "🤖 Hapimatic daemon status", footer: null };
+  }
+  return {
+    heading: "🩺 hapi CLI Doctor",
+    footer: "✅ Doctor diagnosis complete!",
+  };
+}
+
 export async function runDoctorCommand(
   filter?: "all" | "daemon"
 ): Promise<void> {
@@ -616,7 +633,8 @@ export async function runDoctorCommand(
     filter = "all";
   }
 
-  console.log(chalk.bold.cyan("\n🩺 hapi CLI Doctor\n"));
+  const titles = doctorTitles(filter);
+  console.log(chalk.bold.cyan(`\n${titles.heading}\n`));
 
   // For 'all' filter, show everything. For 'daemon', only show daemon-related info
   if (filter === "all") {
@@ -756,8 +774,14 @@ export async function runDoctorCommand(
         typeof cap.max === "number"
       ) {
         const headroom = cap.max - cap.effectiveCount;
+        // #5202 (U3): name the memory input, so a cap set from the wrong
+        // figure (e.g. an unreadable slice limit) is visible here.
+        const memInput =
+          typeof cap.memInputSource === "string"
+            ? `; memory input: ${cap.memInputSource}`
+            : "";
         console.log(
-          `  Capacity: ${cap.effectiveCount}/${cap.max} live sessions (${headroom} slot${headroom === 1 ? "" : "s"} free)`
+          `  Capacity: ${cap.effectiveCount}/${cap.max} live sessions (${headroom} slot${headroom === 1 ? "" : "s"} free${memInput})`
         );
         console.log(
           `    tracked PIDs: ${cap.trackedPids}, active tmux windows: ${cap.activeTmuxWindows}`
@@ -942,5 +966,7 @@ export async function runDoctorCommand(
     );
   }
 
-  console.log(chalk.green("\n✅ Doctor diagnosis complete!\n"));
+  if (titles.footer) {
+    console.log(chalk.green(`\n${titles.footer}\n`));
+  }
 }

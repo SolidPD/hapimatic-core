@@ -36,6 +36,65 @@ const SURFACE = /^[a-z0-9][a-z0-9-]*$/;
 // traversal (security review 2026-08-01).
 const FS_PATH = /^(?!.*\.\.)[A-Za-z0-9._/][A-Za-z0-9._/-]*$/;
 const RELEASE_TAG = /^v\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$/;
+// deprovision.sh's --service-end grammar (`YYYY-MM-DD`, or with `THH:MM[:SS]` and an
+// optional `Z` / `±HH[:]MM` offset) minus its space separator: a value is one argv
+// token and never starts with '-'. The pattern is the shape only; serviceEndToMs is
+// the calendar check (#5257 F9).
+const SERVICE_END =
+  /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?(Z|([+-])(\d{2}):?(\d{2}))?)?$/;
+
+/**
+ * The backup retention window after the effective service end E, in days. One
+ * parameter with scripts/deprovision.sh (RETENTION_WINDOW_DAYS) and
+ * gateway/src/store/userMap.ts (RETENTION_WINDOW_DAYS) — change all three together
+ * (contract K15).
+ */
+export const RETENTION_WINDOW_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A `--service-end` value as epoch ms, or null when it is not a real date and time.
+ * Every component is range-checked and the date part round-trips through
+ * `Date.UTC`, because `Date.parse("2026-02-31")` returns a timestamp (it rolls over
+ * to 3 March). A value without an offset is UTC, as `date -u -d` reads it in
+ * deprovision.sh — so the dates shown here equal the ones the retention record gets.
+ * Everything accepted here, GNU `date` accepts too (offset hours stop at 23).
+ */
+export function serviceEndToMs(value: string): number | null {
+  const m = value.match(SERVICE_END);
+  if (!m) return null;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const [h, mi, s] = [Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0)];
+  if (h > 23 || mi > 59 || s > 59) return null;
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  if (
+    day.getUTCFullYear() !== y ||
+    day.getUTCMonth() !== mo - 1 ||
+    day.getUTCDate() !== d
+  ) {
+    return null;
+  }
+  let offsetMin = 0;
+  if (m[8] !== undefined) {
+    const [oh, om] = [Number(m[9]), Number(m[10])];
+    if (oh > 23 || om > 59) return null;
+    offsetMin = (m[8] === "-" ? -1 : 1) * (oh * 60 + om);
+  }
+  return day.getTime() + ((h * 60 + mi) * 60 + s) * 1000 - offsetMin * 60_000;
+}
+
+/** E + the retention window, as epoch ms: when the dated purge becomes allowed. */
+export function deleteEligibleMs(serviceEndMs: number): number {
+  return serviceEndMs + RETENTION_WINDOW_DAYS * DAY_MS;
+}
+
+/** E + the retention window as an ISO string, or null without a valid E. */
+export function deleteEligibleIso(
+  serviceEnd: string | undefined
+): string | null {
+  const ms = serviceEnd ? serviceEndToMs(serviceEnd) : null;
+  return ms === null ? null : new Date(deleteEligibleMs(ms)).toISOString();
+}
 
 /** VM tier enum — the SINGLE SOURCE OF TRUTH is scripts/lib/vm-tiers.json. */
 export const VM_TIERS = ["ultra", "pro", "standard", "lite"] as const;
@@ -120,12 +179,16 @@ export const SCRIPT_SPECS: Record<JobKind, ScriptSpec> = {
   },
 
   // scripts/deprovision.sh — dry-run by default; --apply flips it (mutating).
+  // --service-end dates the retention record (#5257 F9); applyGuards checks the
+  // calendar and refuses an E whose window has already ended. --purge-backups is
+  // deliberately omitted: the purge is irreversible and CLI-only (#3058 D3).
   deprovision: {
     scriptRelPath: "scripts/deprovision.sh",
     positionals: [{ name: "subdomain", required: true, pattern: SUBDOMAIN }],
     flags: {
       "--email": { value: "string", pattern: EMAIL },
       "--gateway-host": { value: "string", pattern: SSH_HOST },
+      "--service-end": { value: "string", pattern: SERVICE_END },
       "--apply": { value: "none" },
       "--dry-run": { value: "none" },
     },
@@ -338,12 +401,22 @@ function appendFlag(
   appendValued(kind, name, spec, input as string | number, out);
 }
 
+/** Options for {@link buildJob}. */
+export interface BuildJobOptions {
+  /** The clock for time-relative guards (the deprovision service-end bound). */
+  now?: number;
+}
+
 /**
  * Validate `inputs` for `kind` and produce a spawnable {@link BuiltJob}. Throws
  * {@link JobValidationError} (no spawn) on any allowlist / value / guard
  * violation.
  */
-export function buildJob(kind: JobKind, inputs: JobInputs = {}): BuiltJob {
+export function buildJob(
+  kind: JobKind,
+  inputs: JobInputs = {},
+  opts: BuildJobOptions = {}
+): BuiltJob {
   // hasOwnProperty guard (NOT `SCRIPT_SPECS[kind]` truthiness): a bracket lookup
   // for an inherited key like `toString`/`constructor`/`__proto__` returns a
   // truthy prototype member, which would slip past a `!spec` check and later
@@ -403,7 +476,7 @@ export function buildJob(kind: JobKind, inputs: JobInputs = {}): BuiltJob {
   }
 
   // Kind-specific guards.
-  applyGuards(kind, argvFlags);
+  applyGuards(kind, argvFlags, opts.now ?? Date.now());
 
   // health-check is always a read-only, machine-readable probe.
   if (kind === "health-check") {
@@ -420,7 +493,33 @@ export function buildJob(kind: JobKind, inputs: JobInputs = {}): BuiltJob {
   };
 }
 
-function applyGuards(kind: JobKind, argvFlags: string[]): void {
+function applyGuards(kind: JobKind, argvFlags: string[], now: number): void {
+  if (kind === "deprovision") {
+    const at = argvFlags.indexOf("--service-end");
+    if (at !== -1) {
+      const value = argvFlags[at + 1];
+      const ms = serviceEndToMs(value);
+      if (ms === null) {
+        throw new JobValidationError(
+          "bad-value",
+          kind,
+          `--service-end '${value}' is not a real calendar date and time`
+        );
+      }
+      // #5257 D1: an E whose retention window has already ended makes the retained
+      // backups purge-eligible the moment the teardown finishes. A typo of the year
+      // does exactly that, so the dashboard refuses it; the CLI stays the path for a
+      // teardown that is really that late.
+      if (deleteEligibleMs(ms) <= now) {
+        throw new JobValidationError(
+          "guard-violation",
+          kind,
+          `--service-end '${value}' is more than ${RETENTION_WINDOW_DAYS} days ago, so its backups would be purge-eligible at teardown — run scripts/deprovision.sh from the CLI for that case`
+        );
+      }
+    }
+  }
+
   if (kind === "reconcile-repair") {
     if (!argvFlags.includes("--apply")) {
       throw new JobValidationError(

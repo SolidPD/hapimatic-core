@@ -13,6 +13,7 @@ import type {
 import type { Store } from "../../store";
 import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
+import { operatorOnly } from "../middleware/operatorOnly";
 import { cataloged } from "../../capabilities/cataloged";
 import { scrubString } from "../../sentry";
 import { isFileTypeAllowed } from "./upload";
@@ -120,6 +121,17 @@ export async function persistAndSendFeedback(
   return { id: entry.id, delivery: result.status };
 }
 
+/** Options for {@link createFeedbackRoutes} (issue #2910 K2 contract). */
+export interface FeedbackRoutesOptions {
+  senderConfig: FeedbackSenderConfig;
+  /**
+   * The operator-instance capability (`resolveOperatorInstanceEnabled`,
+   * `HAPI_OPERATOR_INSTANCE`). Only a literal `true` opens the read routes;
+   * absent means closed.
+   */
+  operatorInstanceEnabled?: boolean;
+}
+
 /**
  * `POST /api/feedback` (issue #2664, epic #2663). Zod-validated + rate-limited
  * with parity to `POST /api/error-reports` (10/60s). The invariants:
@@ -136,14 +148,22 @@ export async function persistAndSendFeedback(
  * a 10 MB total cap and rejected 400 on violation (never trust the client);
  * valid attachment refs persist in the row's `attachments_json` and the bytes
  * are delivered as native AgentMail attachments. A failed send still 201s.
+ *
+ * Issue #2910 (epic #2909 Sub A): the READ routes (`GET /feedback`,
+ * `GET /feedback/preflight`) are operator-only — each takes the `operatorOnly`
+ * gate as a method-scoped route argument and 404s unless
+ * `operatorInstanceEnabled === true`. `POST /feedback` is never gated.
  */
 export function createFeedbackRoutes(
   store: Store,
-  senderConfig: FeedbackSenderConfig
+  options: FeedbackRoutesOptions
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
+  const { senderConfig } = options;
 
   const limiter = createRateLimiter({ name: "feedback", limit: 10 });
+  // Method-scoped, never `app.use("/feedback", …)`: the POST shares the path.
+  const operatorGate = operatorOnly(options.operatorInstanceEnabled === true);
 
   app.post(
     "/feedback",
@@ -237,13 +257,17 @@ export function createFeedbackRoutes(
   // (attachments) edits to this file rebase cleanly. `GET /api/feedback` is a
   // read-only admin surface: it inherits its auth from mount position — the
   // factory mounts at `/api` AFTER the global JWT middleware
-  // (`app.use("/api/*", createAuthMiddleware(...))`, server.ts), exactly like
-  // `sessionMetadata` / `errorLogs`, so an unauthenticated request is rejected
-  // (401) before it reaches this handler. The list is node-global (no namespace
-  // filter) — the documented permissive bulk-read tier (server/CLAUDE.md:213):
-  // any authenticated user of the node reads all rows; role-gated reads are a
-  // future hardening (cf. epic #2494). Rows carry `emailed`/`email_error`, so a
-  // persist-only (`emailed=0`) row is visibly the durable safety net (R3).
+  // (`app.use("/api/*", createAuthMiddleware(...))`, buildWebApp.ts), exactly
+  // like `sessionMetadata` / `errorLogs`, so an unauthenticated request is
+  // rejected (401) before it reaches this handler, on open and closed instances
+  // alike. Issue #2910: it is also OPERATOR-ONLY — `operatorGate` 404s it unless
+  // `HAPI_OPERATOR_INSTANCE` is truthy (`1`/`true`/`yes`), so a customer instance never
+  // advertises the route. That gate is a visibility gate, not an authorization
+  // boundary (an instance owner can read the SQLite directly); the central
+  // inbox's boundary is #2912's gateway operator credential. On an operator
+  // instance the list is node-global (no namespace filter). Rows carry
+  // `emailed`/`email_error`, so a persist-only (`emailed=0`) row is visibly the
+  // durable safety net (R3).
   app.get(
     "/feedback",
     cataloged(
@@ -260,6 +284,7 @@ export function createFeedbackRoutes(
         availability: { scope: "user" },
       })
     ),
+    operatorGate,
     c => {
       const url = new URL(c.req.url);
 
@@ -286,6 +311,36 @@ export function createFeedbackRoutes(
       const total = store.feedback.countEntries();
       return c.json({ items, total });
     }
+  );
+
+  // ── Operator-instance preflight (issue #2910) ─────────────────────────────
+  // Mirrors `/admin-vms/preflight`: a closed instance answers 404 (the gate),
+  // which the web treats as "closed" — only `{ enabled: true }` opens the
+  // settings Feedback row and page. A distinct exact path from `/feedback`, so
+  // it never collides with the POST/GET routes.
+  app.get(
+    "/feedback/preflight",
+    cataloged(
+      defineCapability({
+        id: "harness-admin.feedback-preflight",
+        domain: "harness-admin",
+        surface: "rest",
+        description:
+          "Report whether this instance is an operator instance that shows the feedback inbox; a non-operator instance answers 404.",
+        whenToUse:
+          "When deciding whether to show the feedback viewer on this instance.",
+        invocation: {
+          kind: "rest",
+          method: "GET",
+          path: "/api/feedback/preflight",
+        },
+        auth: "jwt",
+        riskTier: "readonly",
+        availability: { scope: "operator" },
+      })
+    ),
+    operatorGate,
+    c => c.json({ enabled: true })
   );
 
   return app;

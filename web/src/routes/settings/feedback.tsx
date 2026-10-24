@@ -6,6 +6,7 @@ import { useAppContext } from "@/lib/app-context";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
 import { useFeedbackList } from "@/hooks/queries/useFeedbackList";
+import { useFeedbackPreflight } from "@/hooks/queries/useFeedbackPreflight";
 import {
   SettingsSectionHeader,
   TitleChip,
@@ -28,10 +29,14 @@ import { Button } from "@/components/ui/button";
  * a persist-only row (`emailed=false`) is visibly flagged "Not emailed", proving
  * feedback survives even when the email send is off / fails.
  *
- * Auth: `GET /api/feedback` mounts behind the JWT gate (server.ts) — the page is
- * reachable only inside the authenticated app, and the fetch is JWT-bearing.
- * The list is node-global (the documented permissive bulk-read tier); role-gated
- * reads are future hardening (cf. epic #2494).
+ * Auth: `GET /api/feedback` mounts behind the JWT gate (buildWebApp.ts) — the
+ * page is reachable only inside the authenticated app, and the fetch is
+ * JWT-bearing. Issue #2910: the read surface is also OPERATOR-ONLY. On an
+ * instance where `HAPI_OPERATOR_INSTANCE` is not truthy the preflight 404s and this page
+ * renders a gated state without ever requesting rows — defense-in-depth beyond
+ * the hidden settings row, so a direct visit (including the legacy
+ * `/admin/feedback` redirect) shows no feedback. On an operator instance the
+ * list is node-global.
  */
 
 const PAGE_SIZE = 50;
@@ -156,10 +161,16 @@ export default function AdminFeedbackPage() {
   const [offset, setOffset] = useState(0);
   const [openKeys, setOpenKeys] = useState<Set<string>>(new Set());
 
-  const { items, total, isLoading, isError } = useFeedbackList(api, {
-    limit: PAGE_SIZE,
-    offset,
-  });
+  // #2910: fail-closed — loading, error, and 404 all keep the gate closed, and
+  // the list query never fires until the gate is open.
+  const preflight = useFeedbackPreflight(api);
+  const enabled = preflight.data?.enabled === true;
+
+  const { items, total, isLoading, isError } = useFeedbackList(
+    api,
+    { limit: PAGE_SIZE, offset },
+    { enabled }
+  );
 
   const makeToggle = (key: string) => (next: boolean) =>
     setOpenKeys(prev => {
@@ -185,7 +196,16 @@ export default function AdminFeedbackPage() {
       />
 
       <div className="mx-auto min-h-0 w-full max-w-content flex-1 px-4 pb-4">
-        {isLoading ? (
+        {/* #2910: the gate is checked FIRST — a disabled list query reports
+            isLoading=false, so a closed instance must never fall through. */}
+        {!enabled ? (
+          <p
+            data-testid="feedback-disabled"
+            className="py-8 text-center text-[length:var(--text-body)] text-[var(--app-hint)]"
+          >
+            The feedback inbox is not available on this instance.
+          </p>
+        ) : isLoading ? (
           <p
             data-testid="feedback-loading"
             className="py-8 text-center text-[length:var(--text-body)] text-[var(--app-hint)]"

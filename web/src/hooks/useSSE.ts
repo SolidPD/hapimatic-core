@@ -224,17 +224,66 @@ export function useSSE(options: {
         });
       }
 
-      // Issue #933: Surface federation spawn failures immediately
+      // Issue #933: Surface federation spawn failures immediately. Issue #2150:
+      // the hub now stamps the caller's namespace, so this actually arrives;
+      // the stub store path stays, and the outcome is ALSO re-emitted as a
+      // window CustomEvent (K-4497-1 §4, the `hapi:spawnFailed` pattern below).
       if (event.type === "federation-spawn-failed") {
-        const { nodeId, directory, spawnCorrelationId, error } = event as {
-          nodeId: string;
-          directory: string;
-          spawnCorrelationId?: string | null;
-          error: string;
-        };
+        const {
+          nodeId,
+          nodeLabel,
+          directory,
+          spawnCorrelationId,
+          error,
+          code,
+        } = event;
         // Dynamically import to avoid circular dependency
         import("@/lib/pending-spawns").then(({ handleSpawnFailed }) => {
-          handleSpawnFailed({ nodeId, directory, spawnCorrelationId, error });
+          handleSpawnFailed({
+            nodeId,
+            directory,
+            spawnCorrelationId,
+            error,
+            code,
+            nodeLabel,
+          });
+        });
+        window.dispatchEvent(
+          new CustomEvent("hapi:federationSpawnFailed", {
+            detail: {
+              nodeId,
+              spawnCorrelationId: spawnCorrelationId ?? undefined,
+              error,
+              code,
+            },
+          })
+        );
+        void queryClient.invalidateQueries({
+          queryKey: queryKeys.federationAllSessions,
+        });
+      }
+
+      // Issue #2150 (K-4497-1 §2/§4): a federation spawn this hub proxied
+      // succeeded and the hub's cache already holds the session.
+      if (event.type === "federation-spawn-succeeded") {
+        const { spawnCorrelationId } = event;
+        // Clear the stub by correlation id: a worktree or clone spawn runs in
+        // another directory than the stub recorded, so the poll would never
+        // match it and its TTL would raise a false failure toast.
+        import("@/lib/pending-spawns").then(({ handleSpawnSucceeded }) => {
+          handleSpawnSucceeded({ spawnCorrelationId });
+        });
+        window.dispatchEvent(
+          new CustomEvent("hapi:federationSpawnSucceeded", {
+            detail: {
+              nodeId: event.nodeId,
+              spawnCorrelationId: event.spawnCorrelationId,
+              sessionId: event.sessionId,
+            },
+          })
+        );
+        void queryClient.invalidateQueries({
+          queryKey: queryKeys.federationAllSessions,
         });
       }
 

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -210,6 +211,30 @@ export function commitFailureOf(err: unknown): unknown {
   return err instanceof CommitRollbackError && !err.partial ? err.cause : err;
 }
 
+/**
+ * #4315 (item 1, operator ruling 2026-09-28): how a failed commit is logged. A
+ * 5xx, or ANY rolled-back failure (a CommitRollbackError, clean or PARTIAL),
+ * logs at `error` with the ORIGINAL failure's stack — the wrap's `cause`, or the
+ * thrown error itself when it has none (#4242) — so it reaches Sentry. A 4xx
+ * refusal raised before runCommit's try logs at `warn` with no stack. Reads
+ * `err`, not {@link commitFailureOf}(err): the unwrap would hide the rollback.
+ * The status is not changed here (#4246).
+ */
+export function commitFailureLog(
+  err: unknown,
+  status: number
+): { severity: "error" | "warn"; stack: string | null } {
+  if (status < 500 && !(err instanceof CommitRollbackError)) {
+    return { severity: "warn", stack: null };
+  }
+  const cause = err instanceof Error ? err.cause : undefined;
+  const source = cause instanceof Error ? cause : err;
+  return {
+    severity: "error",
+    stack: source instanceof Error ? (source.stack ?? null) : null,
+  };
+}
+
 /** #4237: at most this many names go into a refusal's human-readable text. */
 const ERROR_NAME_LIMIT = 20;
 
@@ -275,10 +300,12 @@ export type StageAndPlanOutcome =
  * authenticated `POST /porter/import/plan` route and the public tokenized upload
  * leg (`POST /p/:token/archive`), so neither forks the plan logic (K6, #3446).
  *
- * Cheap guards first (size, then MIME/extension) → `planImport` → `store.set`.
- * `planImport`'s typed throws are NOT caught here (the caller owns error→status
- * mapping, including the plan route's #3299 SameFilesystemError provenance
- * branch).
+ * Cheap guards first (size, then MIME/extension) → `planImport` → summary →
+ * `store.set`. `planImport`'s typed throws are NOT caught here (the caller owns
+ * error→status mapping, including the plan route's #3299 SameFilesystemError
+ * provenance branch). #5202 (U14): the summary is built BEFORE the plan is
+ * stored, and a summary that throws removes the staging dir, so a failed plan
+ * leaves no stored handle and no staged bytes.
  */
 export async function stageAndPlan(
   buf: Uint8Array,
@@ -308,8 +335,22 @@ export async function stageAndPlan(
     accountConfigBases: input.accountConfigBases,
     statDev: input.statDev,
   });
+  let summary: ReturnType<typeof toPlanSummary>;
+  try {
+    summary = toPlanSummary(plan);
+  } catch (err) {
+    await rm(plan.stagingDir, { recursive: true, force: true }).catch(
+      (cleanupErr: unknown) =>
+        input.errorLogger?.log(
+          "warn",
+          `[porter-import] staging cleanup failed: ${plan.stagingDir}: ${String(cleanupErr)}`,
+          { category: "porter-import", source: "server" }
+        )
+    );
+    throw err;
+  }
   store.set(plan.stagingHandle, plan);
-  return { ok: true, plan, summary: toPlanSummary(plan) };
+  return { ok: true, plan, summary };
 }
 
 export function createPorterImportRoutes(opts: {
@@ -535,7 +576,6 @@ export function createPorterImportRoutes(opts: {
    */
   app.post(
     "/porter/import/commit",
-    commitLimiter,
     cataloged(
       defineCapability({
         id: "porter.import-commit",
@@ -556,6 +596,7 @@ export function createPorterImportRoutes(opts: {
         probe: "skip",
       })
     ),
+    commitLimiter,
     async c => {
       let raw: unknown;
       try {
@@ -585,14 +626,16 @@ export function createPorterImportRoutes(opts: {
       }
 
       // #3546 (R9): validate the overlay against the plan's manifest ALL UP FRONT,
-      // before any write — unknown server / unknown slot / incomplete slot coverage
-      // each → 400 with nothing written. The returned string carries no overlay VALUE.
+      // before any write — unknown server / a server that is unresolvable or already
+      // restored (#4247) / unknown slot / incomplete slot coverage each → 400 with
+      // nothing written. The returned string carries no overlay VALUE.
       const secretOverlay: SecretOverlay | undefined =
         parsed.data.secretOverlay;
       if (secretOverlay) {
         const overlayError = validateSecretOverlay(
           secretOverlay,
-          plan.manifest.mcpServers
+          plan.manifest.mcpServers,
+          plan.mcpServers
         );
         if (overlayError) return c.json({ error: overlayError }, 400);
       }
@@ -652,8 +695,9 @@ export function createPorterImportRoutes(opts: {
         return c.json(result);
       } catch (err) {
         // #4246: classify a CLEAN rollback by the typed failure it rolled back.
-        // Every instanceof check below reads `failure`; the body keeps the outer
-        // (rollback) message, so the operator still learns it was rolled back.
+        // Every typed-error check below reads `failure`; the message and cause
+        // reads use `err` on purpose — the body keeps the outer (rollback)
+        // message, so the operator still learns it was rolled back.
         const failure = commitFailureOf(err);
         if (failure instanceof StagingExpiredError) {
           planStore.delete(plan.stagingHandle);
@@ -667,22 +711,16 @@ export function createPorterImportRoutes(opts: {
         // config. Overlay validation errors (returned 400 above) carry names too.
         const message =
           err instanceof Error ? err.message : "Import commit failed";
-        // #4177 (L4) + #4242: for a 5xx, log the original failure's stack — the
-        // rollback wrap's `cause`, or the thrown error itself when it was raised
-        // before runCommit's try (the lock, mkdir(backupDir), setup). 4xx refusals,
-        // including one a clean rollback unwrapped (#4246), log no stack.
-        const cause = err instanceof Error ? err.cause : undefined;
-        const stackSource =
-          status >= 500 ? (cause instanceof Error ? cause : err) : undefined;
+        // #4177 (L4) + #4242 + #4315: a 5xx or a rolled-back failure (clean or
+        // PARTIAL) logs the original failure's stack at `error` — the rollback
+        // wrap's `cause`, or the thrown error itself when it was raised before
+        // runCommit's try (the lock, mkdir(backupDir), setup). A 4xx refusal
+        // raised before runCommit's try logs at `warn`, with no stack.
+        const { severity, stack } = commitFailureLog(err, status);
         opts.errorLogger?.log(
-          status >= 500 ? "error" : "warn",
+          severity,
           `[porter-import] commit failed: ${message}`,
-          {
-            category: "porter-import",
-            source: "server",
-            stack:
-              stackSource instanceof Error ? (stackSource.stack ?? null) : null,
-          }
+          { category: "porter-import", source: "server", stack }
         );
         // #3590 (K4/D9): a registry-drift refusal echoes the unacknowledged names so
         // the client can render one acknowledgement control per name (the plan stays

@@ -12,11 +12,15 @@ import {
 } from "@hapi/protocol/schemas";
 import { isModelModeAllowedForFlavor } from "@hapi/protocol/modes";
 import { ClaudeRemoteLauncherKindSchema } from "@hapi/protocol/launcherResolver";
-import { ExistingBranchSchema } from "@hapi/protocol/gitBranches";
+import {
+  ExistingBranchSchema,
+  SourceBranchSchema,
+} from "@hapi/protocol/gitBranches";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { requireMachine } from "./guards";
+import { refuseAgentEscalation } from "./agentEscalation";
 import { logAndJson } from "./routeErrorHelper";
 import { cataloged } from "../../capabilities/cataloged";
 import { createRateLimiter } from "../middleware/rateLimit";
@@ -40,6 +44,9 @@ export const spawnBodySchema = z.object({
   worktreeName: z.string().optional(),
   /** hapimatic-private#4481: open the worktree on this EXISTING branch. */
   existingBranch: ExistingBranchSchema.optional(),
+  /** hapimatic-private#4370: cut a new worktree from exactly this branch;
+   *  absent → the daemon resolves the repo's target branch. */
+  sourceBranch: SourceBranchSchema.optional(),
   name: optionalSessionNameSchema,
   /** Multi-account (#1455): bind the new session to this stored account.
    *  Optional — omitted spawns use the host/node-default credential. */
@@ -282,6 +289,17 @@ export function createMachinesRoutes(
         return c.json({ error: message }, 400);
       }
 
+      // #3842 R8 (ruling NEW-3842-1 = b): a session that is not in a bypass
+      // mode cannot start a permission-bypassing peer through this route. Gate on
+      // the daemon's OWN predicate: it spawns in YOLO mode unless `yolo` is
+      // exactly `false` (`cli/src/daemon/sessionSpawner.ts` `options.yolo !==
+      // false`), so an OMITTED `yolo` is a YOLO spawn and must be floored too.
+      // A non-bypass caller therefore has to send `yolo: false` explicitly.
+      if (parsed.data.yolo !== false) {
+        const refusal = refuseAgentEscalation(c, engine);
+        if (refusal) return refusal;
+      }
+
       // Issue #2434: reject a model-mode that the requested agent flavor does not
       // support (e.g. `fable` on a Codex spawn) BEFORE any spawn work. Mirrors the
       // post-spawn route's guard (`routes/sessions.ts` POST /sessions/:id/model)
@@ -356,6 +374,8 @@ export function createMachinesRoutes(
         worktreeName: parsed.data.worktreeName,
         // hapimatic-private#4481: thread the existing-branch pick (#1262 trap).
         existingBranch: parsed.data.existingBranch,
+        // hapimatic-private#4370: explicit worktree base branch (#1262 trap).
+        sourceBranch: parsed.data.sourceBranch,
         name: parsed.data.name,
         accountUuid: parsed.data.accountUuid,
         // Issue #4568: thread the API-key binding (#1262 trap — un-enumerated here,

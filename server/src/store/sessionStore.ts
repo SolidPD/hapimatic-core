@@ -7,6 +7,7 @@ import {
   deleteSession,
   deleteSessions,
   getMessageCountForSession,
+  getLastOperatorMessageAt,
   getMessageCountsByNamespace,
   getOrCreateSession,
   getSession,
@@ -240,6 +241,11 @@ export class SessionStore {
 
   getMessageCountForSession(sessionId: string): number {
     return getMessageCountForSession(this.db, sessionId);
+  }
+
+  /** #5254: last operator (human) message time for the ceiling guard, or null. */
+  getLastOperatorMessageAt(sessionId: string): number | null {
+    return getLastOperatorMessageAt(this.db, sessionId);
   }
 
   getMessageCountsByNamespace(namespace: string): Map<string, number> {

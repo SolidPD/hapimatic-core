@@ -9,6 +9,113 @@
 import psList from "ps-list";
 import { killProcess } from "@/utils/process";
 
+const SHELL_EXECUTABLES = new Set(["bash", "sh", "zsh", "dash"]);
+const HAPI_EXECUTABLES = new Set(["hapi", "hapi.exe"]);
+const DEV_RUNTIMES = new Set(["bun", "bun.exe", "node", "node.exe"]);
+
+function executableName(token: string): string {
+  const parts = token.split(/[\\/]/);
+  return parts[parts.length - 1] ?? "";
+}
+
+/**
+ * Locate a process's hapi arguments, or null when it is not a hapi process.
+ *
+ * #5180 F11: the arguments are read from the executable token onwards, never
+ * from a substring of the whole command line. A shell wrapper such as
+ * `bash -c "cd /x && hapi daemon start"` merely contains those words; it is
+ * not the daemon, and `hapi doctor clean` must never kill it.
+ */
+function locateHapiArgs(
+  tokens: string[],
+  name: string,
+  cmd: string
+): { args: string[]; isDevMode: boolean } | null {
+  const exe = executableName(tokens[0] ?? "");
+  if (HAPI_EXECUTABLES.has(exe)) {
+    return { args: tokens.slice(1), isDevMode: false };
+  }
+  if (HAPI_EXECUTABLES.has(name)) {
+    // The process IS hapi, but its path contains a space ("/home/John Doe/
+    // .local/bin/hapi"), so splitting on whitespace broke the path in two.
+    // Start the arguments after the token that ends in the hapi binary, or
+    // after argv[0] when the process rewrote its own argv[0].
+    const binary = tokens.findIndex(token =>
+      HAPI_EXECUTABLES.has(executableName(token))
+    );
+    return {
+      args: tokens.slice(binary >= 0 ? binary + 1 : 1),
+      isDevMode: false,
+    };
+  }
+  if (DEV_RUNTIMES.has(exe)) {
+    // Dev mode: bun/node running src/index.ts (production is the binary).
+    const entry = tokens.findIndex(
+      (token, index) => index > 0 && token.endsWith("src/index.ts")
+    );
+    if (entry > 0) {
+      return { args: tokens.slice(entry + 1), isDevMode: true };
+    }
+  }
+  if (SHELL_EXECUTABLES.has(exe)) {
+    return null;
+  }
+  const isLegacyHappy =
+    name.includes("happy") ||
+    (name === "node" && cmd.includes("happy-cli")) ||
+    cmd.includes("happy-coder");
+  if (!isLegacyHappy) {
+    return null;
+  }
+  const entry = tokens.findIndex(token => token.includes("happy"));
+  return { args: tokens.slice(entry >= 0 ? entry + 1 : 1), isDevMode: false };
+}
+
+/**
+ * Classify one process for `hapi doctor` / `hapi daemon status`. Returns null
+ * when the process is not a hapi process.
+ */
+export function classifyHappyProcess(
+  proc: { pid: number; cmd: string; name: string },
+  selfPid: number
+): string | null {
+  const cmd = proc.cmd || "";
+  const name = proc.name || "";
+  const tokens = cmd.trim().split(/\s+/).filter(Boolean);
+  const located = locateHapiArgs(tokens, name, cmd);
+  if (!located) {
+    return null;
+  }
+  const { args, isDevMode } = located;
+  const startedBy = args.indexOf("--started-by");
+
+  if (proc.pid === selfPid) {
+    return "current";
+  }
+  if (args.includes("--version")) {
+    return isDevMode ? "dev-daemon-version-check" : "daemon-version-check";
+  }
+  if (
+    args[0] === "daemon" &&
+    (args[1] === "start-sync" || args[1] === "start")
+  ) {
+    return isDevMode ? "dev-daemon" : "daemon";
+  }
+  if (
+    (startedBy >= 0 && args[startedBy + 1] === "daemon") ||
+    args.includes("--started-by=daemon")
+  ) {
+    return isDevMode ? "dev-daemon-spawned" : "daemon-spawned-session";
+  }
+  if (args.includes("doctor")) {
+    return isDevMode ? "dev-doctor" : "doctor";
+  }
+  if (args.includes("--yolo")) {
+    return "dev-session";
+  }
+  return isDevMode ? "dev-related" : "user-session";
+}
+
 /**
  * Find all HAPI CLI processes (including current process)
  */
@@ -23,42 +130,11 @@ export async function findAllHappyProcesses(): Promise<
     for (const proc of processes) {
       const cmd = proc.cmd || "";
       const name = proc.name || "";
-
-      // Check if it's a HAPI process
-      const isHappyBinary =
-        name === "hapi" || name === "hapi.exe" || /\bhapi(\.exe)?\b/.test(cmd);
-      // Dev mode: running via bun/node with src/index.ts (production uses compiled binary)
-      const isDevMode = cmd.includes("src/index.ts");
-      const isHappy =
-        name.includes("happy") ||
-        (name === "node" && cmd.includes("happy-cli")) ||
-        cmd.includes("happy-coder") ||
-        isHappyBinary ||
-        isDevMode;
-
-      if (!isHappy) continue;
-
-      // Classify process type
-      let type = "unknown";
-      if (proc.pid === process.pid) {
-        type = "current";
-      } else if (cmd.includes("--version")) {
-        type = isDevMode ? "dev-daemon-version-check" : "daemon-version-check";
-      } else if (
-        cmd.includes("daemon start-sync") ||
-        cmd.includes("daemon start")
-      ) {
-        type = isDevMode ? "dev-daemon" : "daemon";
-      } else if (cmd.includes("--started-by daemon")) {
-        type = isDevMode ? "dev-daemon-spawned" : "daemon-spawned-session";
-      } else if (cmd.includes("doctor")) {
-        type = isDevMode ? "dev-doctor" : "doctor";
-      } else if (cmd.includes("--yolo")) {
-        type = "dev-session";
-      } else {
-        type = isDevMode ? "dev-related" : "user-session";
-      }
-
+      const type = classifyHappyProcess(
+        { pid: proc.pid, cmd, name },
+        process.pid
+      );
+      if (type === null) continue;
       allProcesses.push({ pid: proc.pid, command: cmd || name, type });
     }
 

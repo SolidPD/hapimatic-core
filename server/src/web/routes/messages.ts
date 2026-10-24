@@ -144,7 +144,9 @@ export function createMessagesRoutes(
               signal: federationReadSignal(c.req.raw.signal),
             });
             if (resp.ok) {
-              const body = await resp.json();
+              // #5433: an empty OK body reads as {} on every Bun version; a
+              // cut or unparseable one rethrows into the catch below.
+              const body = (await readProxyJson(resp)) ?? {};
               return c.json(body as Record<string, unknown>);
             }
             const body = (await readProxyJson(resp)) ?? {};
@@ -302,7 +304,9 @@ export function createMessagesRoutes(
               const okBody = await resp.json().catch(() => ({ ok: true }));
               return c.json(okBody as Record<string, unknown>);
             }
-            const respBody = await resp.json().catch(() => ({}));
+            // #5433: a body cut off mid-read rethrows into the catch below
+            // (logged 502); an empty or unparseable error body keeps {}.
+            const respBody = (await readProxyJson(resp)) ?? {};
             return c.json(
               respBody as Record<string, unknown>,
               resp.status as 400 | 404 | 409 | 500 | 503

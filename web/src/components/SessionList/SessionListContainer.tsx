@@ -931,6 +931,12 @@ export function SessionList(props: {
             const showSessions = filterView !== "schedules";
             const hasScheduleContent =
               showHeartbeat || groupSchedules.length > 0;
+            // Pending remote-spawn stubs for this group. Issue #2150: rendered in
+            // BOTH branches below — groups default to collapsed, and a stub hidden
+            // behind a collapsed header is a spawn the user never sees fail.
+            const groupSpawns = showSessions
+              ? (spawnsByGroupKey.get(group.groupKey) ?? [])
+              : [];
 
             // In "schedules" filter, skip groups with no schedule content
             if (filterView === "schedules" && !hasScheduleContent) return null;
@@ -1061,12 +1067,9 @@ export function SessionList(props: {
                         );
                       })()}
                     {/* Pending spawn stubs matched to this group */}
-                    {showSessions &&
-                      (spawnsByGroupKey.get(group.groupKey) ?? []).map(
-                        spawn => (
-                          <PendingSpawnItem key={spawn.id} spawn={spawn} />
-                        )
-                      )}
+                    {groupSpawns.map(spawn => (
+                      <PendingSpawnItem key={spawn.id} spawn={spawn} />
+                    ))}
                     {/* Session entries within this group */}
                     {showSessions &&
                       (() => {
@@ -1332,6 +1335,17 @@ export function SessionList(props: {
                           </>
                         );
                       })()}
+                  </div>
+                ) : groupSpawns.length > 0 ? (
+                  // Issue #2150: a collapsed group still shows its pending and
+                  // failed remote-spawn rows (the sessions stay collapsed).
+                  <div
+                    className="flex flex-col divide-y divide-[var(--app-divider)] border-b border-[var(--app-divider)]"
+                    data-testid="collapsed-group-pending-spawns"
+                  >
+                    {groupSpawns.map(spawn => (
+                      <PendingSpawnItem key={spawn.id} spawn={spawn} />
+                    ))}
                   </div>
                 ) : null}
               </div>

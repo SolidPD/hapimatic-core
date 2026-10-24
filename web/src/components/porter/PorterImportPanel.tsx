@@ -8,11 +8,7 @@ import {
   ArrowLeft,
   ArrowRight,
 } from "lucide-react";
-import {
-  CLAUDE_INCLUDES_DIR,
-  PORTER_SOURCE_IDS,
-  PORTER_SOURCE_LABELS,
-} from "@hapi/protocol/porter";
+import { CLAUDE_INCLUDES_DIR } from "@hapi/protocol/porter";
 import { useAppContext } from "@/lib/app-context";
 import { usePorterImport } from "@/hooks/mutations/usePorterImport";
 import type {
@@ -21,11 +17,11 @@ import type {
   ImportPlanSummary,
   ImportResult,
   McpFileMergeResult,
-  PlannedMcpServer,
   SecretOverlay,
 } from "@/types/porter";
 import { Button } from "@/components/ui/button";
 import {
+  HookCommandsReview,
   ResolveNotices,
   ImportParityReport,
   toggledIn,
@@ -36,15 +32,20 @@ import {
   ExecutableSettingsReview,
   SettingsScriptsHeldList,
 } from "./ExecutableSettingsReview";
-import { ImportOmissions } from "./ImportOmissions";
+import { ImportOmissions, ImportResultNotices } from "./ImportOmissions";
 import { conflictExcludedBy, resolvableConflicts } from "./importConflicts";
 import { hookRowLabels } from "./hookRowLabels";
 import {
   ImportDestination,
-  SymlinkedSettingsGate,
+  SymlinkedSettingsRefusalView,
   useSettingsLinkAck,
 } from "./ImportSettingsLink";
+import { porterErrorText } from "./porterErrors";
 import { McpServerDefinition } from "./McpServerDefinition";
+import { SettingValue, VisibleText } from "./VisibleText";
+import { buildCommitOverlay, reAuthCandidates, ReAuthStep } from "./ReAuthStep";
+// #5169: the per-source review cards (and the tri-state the tree shares).
+import { SourceCards, skillCheckState } from "./PorterSourceCards";
 
 /**
  * PorterImportPanel — the upload → review → commit surface of the Admin →
@@ -159,6 +160,8 @@ function ResultView({
       </ul>
 
       <ImportParityReport result={result} />
+
+      <ImportResultNotices notices={result.notices ?? []} />
 
       {/* F1 — per-account MCP write status, not a single host-level truth. */}
       <div>
@@ -335,16 +338,6 @@ function memoryLabel(key: string): string {
   return m ? `${m[1]}/${m[2]}` : leafLabel(key);
 }
 
-/** Tri-state of a skill's parent checkbox, derived from its leaves' exclusion. */
-function skillCheckState(
-  leaves: readonly string[],
-  excluded: ReadonlySet<string>
-): { checked: boolean; indeterminate: boolean } {
-  if (leaves.length === 0) return { checked: true, indeterminate: false };
-  const ex = leaves.filter(k => excluded.has(k)).length;
-  return { checked: ex === 0, indeterminate: ex > 0 && ex < leaves.length };
-}
-
 /** One selectable leaf row (a file / hook / MCP server). Checked = will import. */
 function LeafRow({
   keyId,
@@ -419,111 +412,6 @@ function DimGroup({
         />
       ))}
     </div>
-  );
-}
-
-/**
- * #3448 (Sub C, R3): a one-line summary of what a source contributes. claude-code
- * spans its file dimensions plus MCP; Cursor / Claude Desktop are MCP-only. The
- * MCP count comes from the manifest `sources[]` metadata when present (which
- * distinguishes found-but-empty), else falls back to the source's grouped keys.
- */
-function sourceSummary(
-  id: (typeof PORTER_SOURCE_IDS)[number],
-  groups: ImportGroups,
-  sources: ImportPlanSummary["sources"]
-): string {
-  const rec = sources?.find(s => s.id === id);
-  const plural = (n: number, w: string): string =>
-    `${n} ${w}${n === 1 ? "" : "s"}`;
-  if (id === "claude-code") {
-    const mcpCount = rec?.counts.mcpServers ?? groups.mcpServers.length; // legacy: all MCP is claude-code
-    const hookCount =
-      groups.independentHooks.length +
-      groups.skills.reduce((n, s) => n + s.servingHooks.length, 0);
-    const parts = (
-      [
-        [groups.skills.length, "skill"],
-        [hookCount, "hook"],
-        [groups.commands.length, "command"],
-        [groups.agents.length, "agent"],
-        [groups.rules.length, "rule"],
-        [(groups.memory ?? []).length, "memory file"],
-        [mcpCount, "MCP server"],
-      ] as [number, string][]
-    )
-      .filter(([n]) => n > 0)
-      .map(([n, w]) => plural(n, w));
-    return parts.length > 0 ? parts.join(" · ") : "no importable items";
-  }
-  const mcpCount = rec?.counts.mcpServers ?? groups.bySource[id].keys.length;
-  return plural(mcpCount, "MCP server");
-}
-
-/**
- * #3448 (Sub C, R3): the per-source review cards, above {@link SelectionTree}.
- * One card per {@link PORTER_SOURCE_IDS}: a found source is checked while ANY of
- * its keys are selected and its checkbox cascades over that source's keys (via
- * {@link onToggleSource}, the same all-or-nothing toggle skills use); a not-found
- * source is disabled with a "Not found" caption. The cascade drives the ONE
- * existing `excluded` set — no parallel selection state (D3(a)).
- */
-function SourceCards({
-  groups,
-  sources,
-  excluded,
-  onToggleSource,
-}: {
-  groups: ImportGroups;
-  sources: ImportPlanSummary["sources"];
-  excluded: Set<string>;
-  onToggleSource: (keys: string[]) => void;
-}) {
-  return (
-    <section data-testid="source-cards" className="flex flex-col gap-2">
-      <h3 className="text-[length:var(--text-caption)] font-semibold uppercase tracking-wide text-[var(--app-hint)]">
-        Choose what to bring over
-      </h3>
-      {PORTER_SOURCE_IDS.map(id => {
-        const { found, keys } = groups.bySource[id];
-        const st = skillCheckState(keys, excluded);
-        return (
-          <label
-            key={id}
-            data-testid={`source-card-${id}`}
-            className={`flex items-start gap-3 rounded-lg border p-3 ${
-              found
-                ? "cursor-pointer border-[var(--app-border)]"
-                : "cursor-not-allowed border-[var(--app-border)] opacity-60"
-            } ${
-              found && st.checked
-                ? "border-l-2 border-l-[var(--app-success)]"
-                : ""
-            }`}
-          >
-            <input
-              type="checkbox"
-              checked={found && st.checked}
-              disabled={!found}
-              ref={el => {
-                if (el) el.indeterminate = found && st.indeterminate;
-              }}
-              onChange={() => onToggleSource(keys)}
-              data-testid={`source-toggle-${id}`}
-              className="mt-0.5 h-4 w-4 flex-shrink-0 accent-[var(--app-link)]"
-            />
-            <div className="min-w-0 flex-1">
-              <div className="text-[length:var(--text-body)] font-medium text-[var(--app-fg)]">
-                {PORTER_SOURCE_LABELS[id]}
-              </div>
-              <div className="text-[length:var(--text-body-dense)] text-[var(--app-hint)]">
-                {found ? sourceSummary(id, groups, sources) : "Not found"}
-              </div>
-            </div>
-          </label>
-        );
-      })}
-    </section>
   );
 }
 
@@ -701,141 +589,6 @@ function SelectionTree({
   );
 }
 
-/**
- * #3546 (ADR-0006 Fork A): the declared re-auth slots for a server as
- * `{ synthetic slotKey, human label }`. `slotKey` is the SYNTHETIC bundle key the
- * overlay is keyed by (`__args_<i>__`, `__url__`, an env key, a header key); the
- * label is display-only. The classifier over-detects (every env key / header is a
- * slot, e.g. `NODE_ENV`), which is why the wording is "values to supply".
- */
-export function reAuthSlots(
-  s: PlannedMcpServer
-): { slotKey: string; label: string }[] {
-  const out: { slotKey: string; label: string }[] = [];
-  for (const a of s.argsNames ?? [])
-    out.push({ slotKey: a.name, label: `args[${a.index}]` });
-  if (s.urlName !== undefined) out.push({ slotKey: s.urlName, label: "url" });
-  for (const e of s.envNames ?? []) out.push({ slotKey: e, label: `env.${e}` });
-  for (const h of s.headerNames ?? [])
-    out.push({ slotKey: h, label: `headers.${h}` });
-  return out;
-}
-
-/**
- * #3546: build the commit-body overlay from the collected inputs. Includes a
- * server ONLY when it is `secretRestorable: false`, NOT deselected, and EVERY
- * declared slot has a non-blank value — so a partial fill is simply not re-authed
- * (stays excluded, exactly as today) rather than triggering the server's up-front
- * 400. Returns undefined when nothing is complete, so the commit body is
- * byte-identical to a no-re-auth import.
- */
-export function buildCommitOverlay(
-  servers: PlannedMcpServer[],
-  overlay: SecretOverlay,
-  excluded: Set<string>
-): SecretOverlay | undefined {
-  const out: SecretOverlay = {};
-  for (const s of servers) {
-    if (s.secretRestorable || excluded.has(s.name)) continue;
-    const slots = reAuthSlots(s);
-    if (slots.length === 0) continue;
-    const entered = overlay[s.name] ?? {};
-    const complete = slots.every(
-      sl => (entered[sl.slotKey] ?? "").trim().length > 0
-    );
-    if (!complete) continue;
-    out[s.name] = Object.fromEntries(
-      slots.map(sl => [sl.slotKey, entered[sl.slotKey]])
-    );
-  }
-  return Object.keys(out).length > 0 ? out : undefined;
-}
-
-/**
- * #3546 (R2/R4): the pre-commit re-authentication step (ADR-0006 Fork A). Renders
- * one password input per declared secret slot for every `secretRestorable: false`
- * server that is still selected, keyed by the human label. Values feed the
- * `secretOverlay` carried ONCE in the commit body; they are never echoed to logs
- * and never placed in a URL. A deselected server's card disappears (its overlay
- * is dropped, matching the server's deselect-wins rule).
- */
-function ReAuthStep({
-  servers,
-  overlay,
-  onChange,
-}: {
-  servers: PlannedMcpServer[];
-  overlay: SecretOverlay;
-  onChange: (server: string, slotKey: string, value: string) => void;
-}) {
-  if (servers.length === 0) return null;
-  return (
-    <section data-testid="reauth-step">
-      <h3 className="pb-1 text-[length:var(--text-caption)] font-semibold uppercase tracking-wide text-[var(--app-hint)]">
-        Re-authenticate MCP servers ({servers.length})
-      </h3>
-      <p className="pb-2 text-[length:var(--text-body-dense)] text-[var(--app-hint)]">
-        These servers were imported without their secrets. Enter the values to
-        supply so they connect on this machine. Values are sent once with the
-        import and are never stored or logged. Leave a server blank to skip it.
-      </p>
-      <div className="flex flex-col gap-3">
-        {servers.map(s => {
-          const slots = reAuthSlots(s);
-          const entered = overlay[s.name] ?? {};
-          const complete = slots.every(
-            sl => (entered[sl.slotKey] ?? "").trim().length > 0
-          );
-          return (
-            <div
-              key={s.name}
-              data-testid={`reauth-server-${s.name}`}
-              className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] p-2"
-            >
-              <div className="flex items-center justify-between pb-1">
-                <span className="text-[length:var(--text-body)] font-medium text-[var(--app-fg)]">
-                  {s.name}
-                </span>
-                <span
-                  className={`text-[length:var(--text-caption)] ${
-                    complete ? "text-ok" : "text-[var(--app-hint)]"
-                  }`}
-                  data-testid={`reauth-status-${s.name}`}
-                >
-                  {complete
-                    ? "ready to re-auth"
-                    : "supply all values to re-auth"}
-                </span>
-              </div>
-              <div className="flex flex-col gap-1.5">
-                {slots.map(sl => (
-                  <label key={sl.slotKey} className="flex flex-col gap-0.5">
-                    <span className="font-mono text-[length:var(--text-caption)] text-[var(--app-hint)]">
-                      {sl.label}
-                    </span>
-                    <input
-                      type="password"
-                      autoComplete="off"
-                      spellCheck={false}
-                      value={entered[sl.slotKey] ?? ""}
-                      onChange={e =>
-                        onChange(s.name, sl.slotKey, e.target.value)
-                      }
-                      placeholder="value to supply"
-                      data-testid={`reauth-input-${s.name}-${sl.slotKey}`}
-                      className="w-full rounded border border-[var(--app-border)] bg-[var(--app-bg)] px-2 py-1 text-[length:var(--text-body-dense)] text-[var(--app-fg)]"
-                    />
-                  </label>
-                ))}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
 export function PorterImportPanel({
   receivedSummary,
 }: { receivedSummary?: ImportPlanSummary } = {}) {
@@ -900,9 +653,12 @@ export function PorterImportPanel({
     if (!receivedSummary) return;
     if (receivedSummary.stagingHandle !== summary?.stagingHandle) clearReview();
     setSummary(receivedSummary);
-    // Keyed on the received plan alone. Do NOT add clearReview/ack/keep/linkAck:
-    // those hooks return new objects every render, so they would re-fire this
-    // effect in a loop. `summary` is read from this render's closure.
+    // Keyed on the received plan alone. Do NOT add clearReview/ack/keep/linkAck
+    // (new objects every render) or `summary`: the effect would then re-run
+    // after reset() (summary → null) or a manual handlePlan(), see a handle
+    // mismatch, and RE-ADOPT the stale received plan. (setSummary with the same
+    // reference bails out, so this is not a render loop.) `summary` is read
+    // from this render's closure.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receivedSummary]);
 
@@ -939,10 +695,16 @@ export function PorterImportPanel({
 
   // #3247: Step-1 selection. A leaf toggle flips one key; a skill toggle cascades
   // to all its files + serving hooks (uncheck-all when any selected, else check-all).
-  const toggleExcludedLeaf = (key: string) => setExcluded(toggledIn(key));
+  // #4289 (R8): a selection change drops a live link refusal (the server re-checks).
+  const changeExcluded: typeof setExcluded = next => {
+    if (linkAck.clearLive(summary?.stagingHandle) && !commitRunning.current)
+      commit.reset();
+    setExcluded(next);
+  };
+  const toggleExcludedLeaf = (key: string) => changeExcluded(toggledIn(key));
 
   const toggleSkill = (leaves: string[]) => {
-    setExcluded(prev => {
+    changeExcluded(prev => {
       const next = new Set(prev);
       const anySelected = leaves.some(k => !next.has(k));
       for (const k of leaves) {
@@ -1119,7 +881,7 @@ export function PorterImportPanel({
               className="text-[length:var(--text-body)] text-hot"
               data-testid="plan-error"
             >
-              {plan.error?.message ?? "Failed to plan the import."}
+              {porterErrorText(plan.error, "Failed to plan the import.")}
             </p>
           )}
 
@@ -1156,9 +918,7 @@ export function PorterImportPanel({
                       secrets could not be carried — one input per declared slot,
                       only for still-selected servers. */}
                   <ReAuthStep
-                    servers={summary.mcpServers.filter(
-                      s => !s.secretRestorable && !excluded.has(s.name)
-                    )}
+                    servers={reAuthCandidates(summary.mcpServers, excluded)}
                     overlay={secretOverlay}
                     onChange={onOverlayChange}
                   />
@@ -1257,10 +1017,12 @@ export function PorterImportPanel({
                       <ul className="flex flex-col gap-0.5 text-[length:var(--text-body-dense)] text-warn">
                         {summary.settings.envValues.map(e => (
                           <li key={e.key}>
-                            <span className="font-mono">{e.key}</span>
+                            <span className="font-mono">
+                              <VisibleText text={e.key} />
+                            </span>
                             {" = "}
                             <span className="font-mono break-all">
-                              {e.value}
+                              <VisibleText text={e.value} />
                             </span>
                           </li>
                         ))}
@@ -1275,12 +1037,12 @@ export function PorterImportPanel({
                       <ul className="flex flex-col gap-0.5 text-[length:var(--text-body-dense)] text-warn">
                         {summary.settings.permissionsValues.map(p => (
                           <li key={p.key}>
-                            <span className="font-mono">{p.key}</span>
+                            <span className="font-mono">
+                              <VisibleText text={p.key} />
+                            </span>
                             {" = "}
                             <span className="font-mono break-all whitespace-pre-wrap">
-                              {typeof p.value === "string"
-                                ? p.value
-                                : JSON.stringify(p.value, null, 2)}
+                              <SettingValue value={p.value} />
                             </span>
                           </li>
                         ))}
@@ -1304,43 +1066,7 @@ export function PorterImportPanel({
                   <h3 className="pb-1 text-[length:var(--text-caption)] font-semibold uppercase tracking-wide text-[var(--app-hint)]">
                     Hooks ({summary.hooks.count})
                   </h3>
-                  {summary.hooks.unknownEvents.length > 0 && (
-                    <p className="text-[length:var(--text-body-dense)] text-warn">
-                      Unknown events: {summary.hooks.unknownEvents.join(", ")}
-                    </p>
-                  )}
-                  {summary.hooks.commandWarnings.length > 0 && (
-                    <ul className="flex flex-col gap-0.5 text-[length:var(--text-body-dense)] text-warn">
-                      {summary.hooks.commandWarnings.map(w => (
-                        <li key={w}>⚠️ {w}</li>
-                      ))}
-                    </ul>
-                  )}
-                  {/*
-                #2600: each hook command string surfaced VERBATIM for review — an
-                unshown command is the threat (a `curl … | sh` pipeline the
-                path-lint cannot catch), so this is warning-styled. Index keys:
-                two hooks can legitimately share a command string, so a
-                content-keyed list would collide.
-              */}
-                  {summary.hooks.commands.length > 0 && (
-                    <ul
-                      className="mt-1 flex flex-col gap-1 text-[length:var(--text-body-dense)] text-warn"
-                      data-testid="hook-commands"
-                    >
-                      {summary.hooks.commands.map((h, i) => (
-                        <li key={i}>
-                          <span className="text-[var(--app-hint)]">
-                            {h.events.join(", ")}
-                            {h.matcher ? ` · ${h.matcher}` : ""}:
-                          </span>{" "}
-                          <span className="font-mono break-all">
-                            {h.command}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
+                  <HookCommandsReview hooks={summary.hooks} />
                 </section>
               )}
 
@@ -1358,7 +1084,7 @@ export function PorterImportPanel({
                       >
                         <div className="flex items-center gap-2">
                           <span className="min-w-0 flex-1 truncate">
-                            {s.name}
+                            <VisibleText text={s.name} />
                           </span>
                           {s.hasSecrets && (
                             <span className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
@@ -1386,13 +1112,13 @@ export function PorterImportPanel({
                         </div>
                         {!s.resolvable && s.unresolvedReason && (
                           <span className="text-[length:var(--text-caption)] text-hot">
-                            {s.unresolvedReason}
+                            <VisibleText text={s.unresolvedReason} />
                           </span>
                         )}
                         {s.commandTranslation && (
                           <span className="font-mono break-all text-[length:var(--text-caption)] text-[var(--app-hint)]">
-                            {s.commandTranslation.from} →{" "}
-                            {s.commandTranslation.to}
+                            <VisibleText text={s.commandTranslation.from} /> →{" "}
+                            <VisibleText text={s.commandTranslation.to} />
                           </span>
                         )}
                         <McpServerDefinition server={s} />
@@ -1402,10 +1128,11 @@ export function PorterImportPanel({
                 </section>
               )}
 
-              {/* #4156: policy refusals, then the other omissions. */}
+              {/* #4156: policy refusals, notices (#5202), then the rest. */}
               <ImportOmissions
                 omissions={summary.omissions}
                 policySkips={summary.policySkips ?? []}
+                notices={summary.notices ?? []}
               />
             </div>
           )}
@@ -1416,7 +1143,7 @@ export function PorterImportPanel({
               className="text-[length:var(--text-body)] text-hot"
               data-testid="commit-error"
             >
-              {commit.error?.message ?? "Failed to commit the import."}
+              {porterErrorText(commit.error, "Failed to commit the import.")}
             </p>
           )}
 
@@ -1432,10 +1159,11 @@ export function PorterImportPanel({
             />
           )}
           {/* #4277: the commit's symlinked settings.json 409, beside (not inside)
-              ResolveNotices, which holds the plan-time notices. */}
-          {linkRefusal && phase === "resolve" && (
-            <SymlinkedSettingsGate
+              ResolveNotices; #4289: a one-line notice in the select phase. */}
+          {linkRefusal && (
+            <SymlinkedSettingsRefusalView
               link={linkRefusal}
+              phase={phase}
               acknowledged={linkAck.acked}
               onToggle={linkAck.toggle}
             />

@@ -13,6 +13,7 @@ import { NodeHealthModal } from "@/components/NodeHealthModal";
 import { useAppContext } from "@/lib/app-context";
 import { getStorageKey } from "@/lib/storage-keys";
 import { useFederationHealthNodes } from "@/hooks/queries/useFederationHealth";
+import { useFederationHealthAvailable } from "@/hooks/queries/useFederationHealthAvailable";
 import {
   severityToColor,
   severityToLabel,
@@ -291,7 +292,11 @@ export function useNodeTone(
   nodeStatus: "online" | "degraded" | "offline" | undefined
 ): NodeTone | null {
   const { api } = useAppContext();
-  const health = useFederationHealthNodes(nodeId ? api : null);
+  // #5180 F12: no aggregator (standalone or spoke) → no poll, so no 503.
+  const healthAvailable = useFederationHealthAvailable(api);
+  const health = useFederationHealthNodes(
+    nodeId && healthAvailable ? api : null
+  );
   const knownNodeIds = useKnownNodeIds(health);
   if (!nodeId) return null;
   return resolveNodeTone(nodeId, nodeStatus, knownNodeIds);
@@ -347,8 +352,10 @@ export function NodeBadge({
   // top of the aggregate already polled elsewhere (enabled: Boolean(api)). These
   // hooks sit ABOVE the `!nodeId` early return for rules-of-hooks.
   const { api } = useAppContext();
+  // #5180 F12: `resourceHealth` is the caller's switch; this is the install's.
+  const healthAvailable = useFederationHealthAvailable(api);
   const health = useFederationHealthNodes(
-    nodeId && resourceHealth ? api : null
+    nodeId && resourceHealth && healthAvailable ? api : null
   );
   const { nodes, isError } = health;
   // #4538: the ids to rank against (live list, else the remembered one).

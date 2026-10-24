@@ -103,6 +103,7 @@ import { createCliRoutes } from "./routes/cli";
 import { createPushRoutes } from "./routes/push";
 import { createTimeLogRoutes } from "./routes/timeLog";
 import { createGitBranchesRoutes } from "./routes/gitBranches";
+import { createWorktreeRemovalRoutes } from "./routes/worktreeRemoval";
 import { createSessionMetadataRoutes } from "./routes/sessionMetadata";
 import { createTranscriptRoutes } from "./routes/transcripts";
 import { createBackgroundAgentsRoutes } from "./routes/backgroundAgents";
@@ -130,6 +131,7 @@ import { getKnownSecretLiterals } from "../services/knownSecretLiterals";
 import {
   readSupportEscalationSettings,
   resolveFeedbackSenderConfig,
+  resolveOperatorInstanceEnabled,
   resolveSupportChannel,
 } from "../config/serverSettings";
 import { createFileClaimsRoutes } from "./routes/fileClaims";
@@ -1018,6 +1020,12 @@ export function buildWebApp(options: {
           homedir(),
           ".local/state/hapimatic-provision/cloud-instances.json"
         ),
+      // #5257 F9 (D3): the deprovision job's `--gateway-host` when the VM's
+      // inventory record carries none (no writer sets `gateway_host`). Without one
+      // a dashboard teardown cannot write the backup retention record and ends
+      // INCOMPLETE RETENTION. The operator sets it on the unit that serves
+      // /admin/vms (docs/cloud-operator-onboarding.md §6).
+      defaultGatewayHost: process.env.HAPI_VM_GATEWAY_HOST || undefined,
       // #2552: OPT-IN staleness bound (ms) for the read-path divergence verdict.
       // Unset ⇒ the endpoint never emits a `stale` verdict, so a quiet-but-healthy
       // fleet is never false-flagged (OR-1). Tune to the provisioning cadence.
@@ -1252,6 +1260,14 @@ export function buildWebApp(options: {
       errorLogger: options.errorLogger,
     })
   );
+  // Issue #4450: the operator-only `remove_worktree` route (destructive; the
+  // route itself checks operator scope, the caller session and ownership).
+  app.route(
+    "/api",
+    createWorktreeRemovalRoutes(options.getSyncEngine, {
+      errorLogger: options.errorLogger ?? undefined,
+    })
+  );
   app.route("/api", createPushRoutes(options.store, options.vapidPublicKey));
   app.route(
     "/api",
@@ -1312,8 +1328,16 @@ export function buildWebApp(options: {
   app.route("/api", createErrorReportRoutes(options.store));
   // Issue #2664 (epic #2663): in-app user feedback → persist-first + best-effort
   // AgentMail email. Sender config resolved from env (off when unconfigured).
+  // Issue #2910: the feedback READ routes are operator-only (HAPI_OPERATOR_INSTANCE,
+  // resolved once here); POST stays open to every authenticated user.
   const feedbackSender = resolveFeedbackSenderConfig();
-  app.route("/api", createFeedbackRoutes(options.store, feedbackSender));
+  app.route(
+    "/api",
+    createFeedbackRoutes(options.store, {
+      senderConfig: feedbackSender,
+      operatorInstanceEnabled: resolveOperatorInstanceEnabled(),
+    })
+  );
   // Issue #4371 (E6 Sub F): in-app self-help support — the support session,
   // its channel info, and the previewed "Contact a human" escalation, which
   // rides the feedback pipeline above. The channel honours decision 2: a

@@ -53,11 +53,18 @@ import type {
   AuthBinding,
   BackgroundAgentEntry,
   ClaudeAccountInfo,
+  CeilingBreachAction,
   CeilingGuardConfig,
   CeilingGuardConfigPatch,
 } from "@hapi/protocol/schemas";
 import type { PushService } from "../push/pushService";
 import { getCeilingGuardDefaults } from "../config/ceilingGuardConfig";
+import {
+  CEILING_RATE_WINDOW_MS,
+  evaluateCeilings,
+  resolveEffectiveCeilings,
+  type CeilingBreach,
+} from "./ceilingGuardEvaluator";
 import type { TurnLifecycle } from "./turnLifecycle";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { EffortLevel } from "@hapi/protocol/effort";
@@ -154,6 +161,9 @@ import {
 
 export type { Session, SyncEvent } from "@hapi/protocol/types";
 
+/** #5254 R4: breach actions that count as "already fired" for the de-dupe. */
+const CEILING_FIRED_ACTIONS = ["hard-stop", "notify"] as const;
+
 /** #2700: derived from the shared `schedule-changed` union member — never hand-copied. */
 export type ScheduleChangeKind = Extract<
   SyncEvent,
@@ -191,6 +201,8 @@ export interface SpawnSessionOptions {
   worktreeName?: string;
   /** hapimatic-private#4481: open the worktree on this existing branch. */
   existingBranch?: { name: string; remote: boolean };
+  /** hapimatic-private#4370: cut a new worktree from exactly this branch. */
+  sourceBranch?: string;
   resumeSessionId?: string;
   hapiSessionId?: string;
   name?: string;
@@ -505,13 +517,14 @@ export class SyncEngine {
   private sessionFatalAutoAbortEnabled = false;
 
   /**
-   * Issue #1905: per-session de-dupe for the runaway-guard ceiling breach — the
-   * G1 log, the out-of-band notice, AND the hard-stop each fire exactly ONCE per
-   * session (R4). In-memory (resets on server restart — a resurrected runaway
-   * re-trips on its next finalize, which is self-healing). Pruned on session
-   * delete alongside `downgradeNotified` (see the SessionDeletion wiring).
+   * Issue #5254 R3: sessions whose `roleOverrides` profile this process has
+   * already written into `metadata.ceilingOverride` — one write attempt per
+   * session per process. The breach de-dupe itself is NOT in memory any more:
+   * the #1905 `ceilingBreached` Set emptied on restart and re-fired the stop
+   * on a session the operator had already sanctioned (2026-10-15), so breaches
+   * now live in the persisted `ceiling_breaches` ledger (R4).
    */
-  private readonly ceilingBreached = new Set<string>();
+  private readonly roleOverrideSeeded = new Set<string>();
 
   /**
    * Issue #1905: the effective ceiling-guard config, cached in memory because the
@@ -782,12 +795,21 @@ export class SyncEngine {
       errorLogger,
       // #2453 (Task 7): purge this session's bound loops on delete (D1).
       getLoopCronCoupler: () => this.loopCronCoupler,
-      // #1905 (1905-4): prune the in-memory ceiling-breach dedupe Set on delete
-      // — and, an in-path fix, the sibling `downgradeNotified` Set, which leaked
-      // one entry per session (it was never pruned anywhere). Best-effort.
+      // #1905 (1905-4): drop the session's persisted ceiling breaches (#5254)
+      // on delete so a recreated id re-arms — and, an in-path fix, the sibling
+      // `downgradeNotified` Set, which leaked one entry per session (it was
+      // never pruned anywhere). Best-effort.
       onSessionDeleted: sid => {
-        this.ceilingBreached.delete(sid);
+        this.roleOverrideSeeded.delete(sid);
         this.downgradeNotified.delete(sid);
+        try {
+          this.store.turns.deleteCeilingBreaches(sid);
+        } catch (err) {
+          this.errorLogger?.warn(
+            `Ceiling guard: could not drop breach records for ${sid}: ${err instanceof Error ? err.message : String(err)}`,
+            { category: "ceiling-breach", sessionId: sid }
+          );
+        }
       },
     });
     // Issue #2080: session lifecycle-ops delegate (archive / config-apply /
@@ -1811,96 +1833,175 @@ export class SyncEngine {
   }
 
   /**
-   * Issue #1905: the runaway-session ceiling guard — the direct sibling of
-   * {@link checkModelDowngrade}. Fired at the turn-finalize seam via the
+   * Issue #1905 / #5254: the runaway-session ceiling guard — the direct sibling
+   * of {@link checkModelDowngrade}. Fired at the turn-finalize seam via the
    * `ceilingGuardStep` FinalizeStep (PUBLIC because the step invokes it from
-   * outside the class). Meters cumulative facts from the existing #1662
-   * `v_session_totals` view (no new telemetry, R8), compares to the effective
-   * ceilings (a per-session override takes precedence over the global config,
-   * R7), and on breach — ONCE per session (R4) — records the anomaly (G1),
-   * surfaces an out-of-band notice (G2, Path B), and hard-stops the session (G3).
+   * outside the class). A thin gather → evaluate → de-dupe → act orchestrator;
+   * the decision is the pure `ceilingGuardEvaluator`.
    *
-   * FULLY FAIL-OPEN (R9): the whole body is wrapped so a config/query/escalation/
-   * kill fault can NEVER block, stall, or crash a session (the step wraps it too,
-   * belt-and-braces). Lag semantics (K4 / 1905-9): the check runs before
-   * `enqueueFinalizeTurn`, so uncached tokens reflect turns through N−1 (matching
-   * the AC's "hard-stopped at the NEXT turn boundary"); `turn_count` has NO lag
-   * (its row is inserted at turn:open).
+   *   - Gather: cumulative totals (`v_session_totals`), trailing-60-minute turns
+   *     and uncached tokens (`turns.started_at_ms`, R1), and the denormalized
+   *     `sessions.last_operator_message_at` (R2 — never a `messages` scan, R7).
+   *   - Ceilings: global config < `roleOverrides[metadata.sessionRole]` <
+   *     `metadata.ceilingOverride`. A role profile is also written durably into
+   *     the session's override on first sight (R3) so `GET /api/sessions/:id`
+   *     shows it.
+   *   - Gate (R2): with an operator message inside the window a breach is
+   *     recorded as `suppressed-operator-active` — no stop, no page.
+   *   - De-dupe (R4): persisted in `ceiling_breaches`, so a hub restart cannot
+   *     re-fire. A cumulative dimension fires once per (session, dimension,
+   *     ceiling value) — raising the ceiling, or reconnecting a stopped session,
+   *     is sanction; a rate dimension fires once per window.
+   *   - Act: G1 log, G2/G3 surfacing, hard stop — exactly as #1905.
+   *
+   * FULLY FAIL-OPEN (R9 of #1905): the whole body is wrapped so a config/query/
+   * escalation/kill fault can NEVER block, stall, or crash a session (the step
+   * wraps it too). Lag semantics (K4 / 1905-9): the check runs before
+   * `enqueueFinalizeTurn`, so token figures reflect turns through N−1;
+   * `turn_count` and the rolling turn count have NO lag (the row is inserted at
+   * turn:open).
    */
   checkSessionCeilings(sessionId: string): void {
     try {
-      if (this.ceilingBreached.has(sessionId)) return; // R4 dedupe
-
       const config = this.ceilingGuardConfig;
       if (!config.enabled) return;
+
+      const session = this.sessionCache.getSession(sessionId);
+      const role = session?.metadata?.sessionRole;
+      const roleOverride = role ? config.roleOverrides[role] : undefined;
+      const sessionOverride = session?.metadata?.ceilingOverride;
+      if (roleOverride && sessionOverride === undefined) {
+        this.seedRoleCeilingOverride(sessionId, roleOverride);
+      }
 
       const totals = this.store.turns.getSessionTotals(sessionId);
       if (!totals) return; // no turns yet → nothing to meter
 
-      const session = this.sessionCache.getSession(sessionId);
-      // R7: a per-session override takes precedence over the global config,
-      // merged field-by-field (an omitted override field falls back to global;
-      // `!== undefined` so an explicit `null` disables that dimension).
-      const override = session?.metadata?.ceilingOverride;
-      const ceilTok =
-        override?.uncachedTokenCeiling !== undefined
-          ? override.uncachedTokenCeiling
-          : config.uncachedTokenCeiling;
-      const ceilIter =
-        override?.iterationCeiling !== undefined
-          ? override.iterationCeiling
-          : config.iterationCeiling;
-      const ceilCost =
-        override?.costUsdCeiling !== undefined
-          ? override.costUsdCeiling
-          : config.costUsdCeiling;
-      const hardStop =
-        override?.hardStop !== undefined ? override.hardStop : config.hardStop;
-
-      // R1: uncached = non-cache input + output ONLY. Cache reads/writes are NOT
-      // spend-equivalent and are DELIBERATELY excluded (the R5 no-false-positive
-      // property). R2: iterations = turn_count. R8: read-only, no new telemetry.
+      const now = Date.now();
+      const windowStart = now - CEILING_RATE_WINDOW_MS;
+      const effective = resolveEffectiveCeilings(
+        config,
+        roleOverride,
+        sessionOverride
+      );
+      // #1905 R1: uncached = non-cache input + output ONLY; cache reads/writes
+      // are not spend-equivalent and are excluded (no false positive, R5).
       const uncached = (totals.totalTokIn ?? 0) + (totals.totalTokOut ?? 0);
-      const iterations = totals.turnCount;
-      const cost = totals.totalCost;
+      const rolling = this.store.turns.getRollingUsage(sessionId, windowStart);
+      const lastOperatorAt =
+        this.store.sessions.getLastOperatorMessageAt(sessionId);
 
-      const tokenBreach = ceilTok != null && uncached >= ceilTok;
-      const iterBreach = ceilIter != null && iterations >= ceilIter;
-      // OR-5: a null `total_cost` (subscription/PTY billing, or no rate card) is
-      // never a breach — never a false positive from missing cost data.
-      const costBreach = ceilCost != null && cost != null && cost >= ceilCost;
+      const { breaches, operatorActive } = evaluateCeilings({
+        now,
+        effective,
+        totals: {
+          uncached,
+          turnCount: totals.turnCount,
+          totalCost: totals.totalCost,
+        },
+        rolling,
+        lastOperatorAt,
+      });
+      if (breaches.length === 0) return;
 
-      if (!tokenBreach && !iterBreach && !costBreach) return;
+      // R4: the first breached dimension (fixed order) not already acted on.
+      const dedupeKey = (b: CeilingBreach) =>
+        b.kind === "cumulative"
+          ? { ceiling: b.ceiling }
+          : { sinceMs: windowStart };
+      const breach = breaches.find(
+        b =>
+          !this.store.turns.findCeilingBreach(sessionId, b.dimension, {
+            ...dedupeKey(b),
+            actions: CEILING_FIRED_ACTIONS,
+          })
+      );
+      if (!breach) return;
 
-      // Mark BEFORE side effects (mirror `downgradeNotified`) so a throwing side
-      // effect below cannot cause a re-notify / re-archive loop (R4).
-      this.ceilingBreached.add(sessionId);
+      const { dimension, value, ceiling } = breach;
+      const context = {
+        dimension,
+        kind: breach.kind,
+        uncached,
+        iterations: totals.turnCount,
+        cost: totals.totalCost,
+        turnsLastHour: rolling.turns,
+        uncachedTokensLastHour: rolling.uncached,
+        lastOperatorAt,
+        ceilTok: effective.uncachedTokenCeiling,
+        ceilIter: effective.iterationCeiling,
+        ceilCost: effective.costUsdCeiling,
+        ceilTurnsPerHour: effective.turnsPerHourCeiling,
+        ceilUncachedPerHour: effective.uncachedTokensPerHourCeiling,
+        hardStop: effective.hardStop,
+      };
+      const record = (
+        action: CeilingBreachAction,
+        b: CeilingBreach = breach
+      ): void => {
+        this.store.turns.recordCeilingBreach({
+          hapiSessionId: sessionId,
+          kind: b.kind,
+          dimension: b.dimension,
+          value: b.value,
+          ceiling: b.ceiling,
+          action,
+          occurredAtMs: now,
+        });
+      };
 
-      const dimension = tokenBreach
-        ? "tokens"
-        : iterBreach
-          ? "iterations"
-          : "cost";
-      const value = tokenBreach ? uncached : iterBreach ? iterations : cost;
-      const ceiling = tokenBreach ? ceilTok : iterBreach ? ceilIter : ceilCost;
+      // R2: an operator message inside the window sanctions the session —
+      // record it once (same de-dupe keys) and do nothing else.
+      if (operatorActive) {
+        const alreadySuppressed = this.store.turns.findCeilingBreach(
+          sessionId,
+          dimension,
+          { ...dedupeKey(breach), actions: ["suppressed-operator-active"] }
+        );
+        if (alreadySuppressed) return;
+        record("suppressed-operator-active");
+        this.errorLogger?.info(
+          `Ceiling guard: session ${sessionId} crossed its ${dimension} ceiling ` +
+            `(${value}/${ceiling}) with an operator active in the last hour — ` +
+            `not stopping (issue #5254).`,
+          {
+            category: "ceiling-breach",
+            sessionId,
+            context: { ...context, operatorActive: true },
+          }
+        );
+        return;
+      }
+
+      // Record BEFORE side effects (the #1905 "mark first" rule) so a throwing
+      // side effect below cannot cause a re-notify / re-archive loop. A failed
+      // write throws into the catch — fail-open, the next turn retries.
+      const hardStop = effective.hardStop;
+      const fired: CeilingBreachAction = hardStop ? "hard-stop" : "notify";
+      record(fired);
+      // #5254 AC3: one stop sanctions EVERY dimension breached at that moment.
+      // Recording only the first would let a session past two ceilings be
+      // stopped again on the second one after the operator reconnects it and
+      // goes idle for an hour.
+      for (const other of breaches) {
+        if (other === breach) continue;
+        const alreadyFired = this.store.turns.findCeilingBreach(
+          sessionId,
+          other.dimension,
+          { ...dedupeKey(other), actions: CEILING_FIRED_ACTIONS }
+        );
+        if (!alreadyFired) record(fired, other);
+      }
 
       // G1 — record the anomaly once in error_logs (category "ceiling-breach").
       this.errorLogger?.warn(
         `Ceiling guard: session ${sessionId} crossed its ${dimension} ceiling ` +
-          `(${value}/${ceiling}) — hard-stopping (issue #1905).`,
+          `(${value}/${ceiling}) — ${hardStop ? "hard-stopping" : "notifying (hardStop off)"} ` +
+          `(issue #1905).`,
         {
           category: "ceiling-breach",
           sessionId,
-          context: {
-            dimension,
-            uncached,
-            iterations,
-            cost,
-            ceilTok,
-            ceilIter,
-            ceilCost,
-            hardStop,
-          },
+          context: { ...context, operatorActive: false },
         }
       );
 
@@ -1912,7 +2013,8 @@ export class SyncEngine {
         sessionId,
         dimension,
         value,
-        ceiling
+        ceiling,
+        hardStop
       );
 
       // G3 — terminal hard-stop (K3, 1905-1): reap window B so the tmux-launcher
@@ -1940,6 +2042,36 @@ export class SyncEngine {
   }
 
   /**
+   * Issue #5254 R3: write a role's ceiling profile into the session's own
+   * `metadata.ceilingOverride` (the same version-checked writer as the PUT
+   * route) so the override is durable and visible on `GET /api/sessions/:id`.
+   * One attempt per session per process while it succeeds; a failed write
+   * (a throw, or the writer returning `false`) is logged and un-marked so the
+   * next check retries, and the in-memory overlay still applies meanwhile.
+   */
+  private seedRoleCeilingOverride(
+    sessionId: string,
+    profile: CeilingGuardConfigPatch
+  ): void {
+    if (this.roleOverrideSeeded.has(sessionId)) return;
+    this.roleOverrideSeeded.add(sessionId);
+    const failed = (why: string): void => {
+      // Un-mark so the next check retries the write.
+      this.roleOverrideSeeded.delete(sessionId);
+      this.errorLogger?.warn(
+        `Ceiling guard: could not write the role ceiling override for ${sessionId}: ${why}`,
+        { category: "ceiling-breach", sessionId }
+      );
+    };
+    void this.updateSessionCeilingOverride(sessionId, { ...profile })
+      .then(ok => {
+        if (!ok)
+          failed("metadata write refused (session gone or version conflict)");
+      })
+      .catch(err => failed(err instanceof Error ? err.message : String(err)));
+  }
+
+  /**
    * Issue #1905: surface a ceiling breach — G2 a web push to the session's
    * namespace (the StallWatchdog precedent) PLUS G3 an out-of-band operator page
    * through the shared #1883 `Notifier` (the notify-pm cascade). Both fail-open.
@@ -1949,18 +2081,26 @@ export class SyncEngine {
     sessionId: string,
     dimension: string,
     value: number | null,
-    ceiling: number | null
+    ceiling: number | null,
+    hardStop: boolean
   ): void {
     const name = session?.metadata?.name ?? sessionId.slice(0, 8);
     const ns = session?.namespace ?? "default";
     const emoji = session?.emoji ? `${session.emoji} ` : "";
-    const body =
-      `${name} crossed its ${dimension} ceiling (${value}/${ceiling}) and was ` +
-      `hard-stopped by the runaway guard.`;
+    // #5254: word the notice by the action — a notify-only breach (hardStop
+    // off) leaves the session running, so it must not claim a stop.
+    const title = hardStop
+      ? "Runaway guard: session hard-stopped"
+      : "Runaway guard: session over its ceiling (still running)";
+    const body = hardStop
+      ? `${name} crossed its ${dimension} ceiling (${value}/${ceiling}) and was ` +
+        `hard-stopped by the runaway guard.`
+      : `${name} crossed its ${dimension} ceiling (${value}/${ceiling}). hardStop ` +
+        `is off, so the runaway guard did not stop it.`;
 
     void this.ceilingGuardPushService
       ?.sendToNamespace(ns, {
-        title: `${emoji}Runaway guard: session hard-stopped`,
+        title: `${emoji}${title}`,
         body,
         tag: `ceiling-${sessionId}`,
         data: {
@@ -1981,7 +2121,7 @@ export class SyncEngine {
     // surface. The Notifier is fail-open (never rejects — R4) and no-ops when
     // unset (G1+G2 still cover); the `.catch` is belt-and-braces.
     void this.notifier
-      ?.notify("Runaway guard: session hard-stopped", body)
+      ?.notify(title, body)
       .catch(err =>
         this.errorLogger?.warn(
           `Ceiling guard: notifier escalation failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
@@ -2088,6 +2228,17 @@ export class SyncEngine {
     originalPath: string
   ): Promise<RecoverWorktreeRpcResult> {
     return this.rpcGateway.recoverWorktree(machineId, originalPath);
+  }
+
+  /**
+   * Issue #4450: the guarded `cleanup-idle-worktree` machine RPC behind the
+   * operator `remove_worktree` route. Thin facade, like `recoverWorktree`.
+   */
+  cleanupIdleWorktree(
+    machineId: string,
+    info: Parameters<RpcGateway["cleanupIdleWorktree"]>[1]
+  ): ReturnType<RpcGateway["cleanupIdleWorktree"]> {
+    return this.rpcGateway.cleanupIdleWorktree(machineId, info);
   }
 
   /**
@@ -2977,8 +3128,10 @@ export class SyncEngine {
   async updateSessionCeilingOverride(
     sessionId: string,
     value: CeilingGuardConfigPatch | null
-  ): Promise<void> {
-    await this.sessionCache.updateSessionMetadataFields(sessionId, m => ({
+  ): Promise<boolean> {
+    // #5254 SF-2: return the writer's result — it reports a gone session or an
+    // exhausted version-conflict retry as `false`, never as a throw.
+    return this.sessionCache.updateSessionMetadataFields(sessionId, m => ({
       ...m,
       ceilingOverride: value ?? undefined,
     }));

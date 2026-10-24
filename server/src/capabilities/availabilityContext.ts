@@ -99,6 +99,30 @@ export function deriveScope(
   return "operator";
 }
 
+/** The two JWT context keys {@link isOperatorCaller} reads (structural, so a
+ *  Hono `Context<WebAppEnv>` and a test double both fit). */
+export interface CallerContext {
+  get(key: "userId" | "namespace"): unknown;
+}
+
+/**
+ * The route-level operator check (#4450 R1): true only when the request's own
+ * JWT identity derives `operator` scope at THIS moment. A missing or wrong-typed
+ * `userId` / `namespace` is never operator (fail closed). The catalog hard filter
+ * hides an operator entry; a route that acts must still check the caller itself.
+ */
+export function isOperatorCaller(
+  c: CallerContext,
+  deps: ScopeDeps = {}
+): boolean {
+  const userId = c.get("userId");
+  const namespace = c.get("namespace");
+  if (typeof userId !== "number" || typeof namespace !== "string") {
+    return false;
+  }
+  return deriveScope({ userId, namespace }, deps) === "operator";
+}
+
 /** The subset of a session record this builder reads (structural, decoupled). */
 export interface SessionLike {
   readonly metadata?: {

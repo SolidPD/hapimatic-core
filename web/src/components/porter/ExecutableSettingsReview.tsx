@@ -6,6 +6,12 @@ import type {
   ImportResult,
 } from "@/types/porter";
 import { isModeRowExcluded, isSettingsScriptHeld } from "./ImportHooksReview";
+import {
+  HiddenCharsNotice,
+  SettingValue,
+  settingValueText,
+  VisibleText,
+} from "./VisibleText";
 
 /**
  * #2565 (F5) + #4173 — the executable-settings review, split out of
@@ -14,11 +20,19 @@ import { isModeRowExcluded, isSettingsScriptHeld } from "./ImportHooksReview";
  * commands) are surfaced verbatim, and under each value the files it runs: the
  * path, the full sha256, what the import does with it, and a content preview.
  * Every value and preview is inert text, never executed or rendered as HTML.
+ *
+ * #5195: every key, value, path, and preview renders through `VisibleText`, so
+ * a hidden or direction-changing code point (the Trojan Source pattern in a
+ * script preview) shows in place as a `U+XXXX` token, and the list carries one
+ * notice when any value contains one.
  */
 
 /** A destPath relative to the config root when it lives under it. */
 const relTo = (claudeDir: string, p: string): string =>
   p.startsWith(`${claudeDir}/`) ? p.slice(claudeDir.length + 1) : p;
+
+/** A non-string setting value renders as multi-line JSON (#5195). */
+const isMultiline = (v: unknown): boolean => typeof v !== "string";
 
 /** `<settings.json>#statusLine` → `statusLine`. */
 const keyOf = (gate: string): string => gate.split("#").pop() ?? gate;
@@ -42,7 +56,10 @@ function ScriptRow({
   return (
     <li data-testid={testId} className="flex flex-col gap-0.5 pl-3">
       <span>
-        runs <span className="font-mono break-all">{path}</span>
+        runs{" "}
+        <span className="font-mono break-all">
+          <VisibleText text={path} />
+        </span>
         {row.status === "carried" &&
           row.kind &&
           row.kind !== "settings-script" && (
@@ -108,7 +125,7 @@ function ScriptRow({
                   data-testid={`${testId}-preview`}
                   className="max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-[var(--app-fg)]"
                 >
-                  {row.preview.text}
+                  <VisibleText text={row.preview.text} multiline />
                 </pre>
               )}
             </details>
@@ -159,17 +176,39 @@ export function ExecutableSettingsReview({
       <p className="text-[length:var(--text-body-dense)] font-medium text-warn">
         ⚠ Executable — Claude Code runs these:
       </p>
+      <HiddenCharsNotice
+        testId="executable-settings-hidden-chars"
+        values={[
+          ...settings.executableValues
+            .filter(ev => !isMultiline(ev.value))
+            .map(ev => settingValueText(ev.value)),
+          ...settings.executableScripts.flatMap(r => [
+            r.reference,
+            r.destPath ?? "",
+          ]),
+        ]}
+        multilineValues={[
+          ...settings.executableValues
+            .filter(ev => isMultiline(ev.value))
+            .map(ev => settingValueText(ev.value)),
+          // The preview sits in a collapsed <details>, so the notice is the
+          // only signal of a hidden code point there until it is opened.
+          ...settings.executableScripts.map(r =>
+            r.preview && !r.preview.binary ? r.preview.text : ""
+          ),
+        ]}
+      />
       <ul className="flex flex-col gap-0.5 text-[length:var(--text-body-dense)] text-warn">
         {settings.executableValues.map(ev => {
           const rows = settings.executableScripts.filter(r => r.key === ev.key);
           return (
             <li key={ev.key}>
-              <span className="font-mono">{ev.key}</span>
+              <span className="font-mono">
+                <VisibleText text={ev.key} />
+              </span>
               {" = "}
               <span className="font-mono break-all whitespace-pre-wrap">
-                {typeof ev.value === "string"
-                  ? ev.value
-                  : JSON.stringify(ev.value, null, 2)}
+                <SettingValue value={ev.value} />
               </span>
               {rows.length > 0 && (
                 <ul className="flex flex-col gap-1 pt-0.5">

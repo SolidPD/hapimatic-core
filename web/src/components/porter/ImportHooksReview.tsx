@@ -11,6 +11,7 @@ import type {
   ModeSkip,
   PlannedItemKind,
 } from "@/types/porter";
+import { HiddenCharsNotice, VisibleText } from "./VisibleText";
 
 /**
  * #3590 — the whole-tree hooks review surfaces, split out of PorterImportPanel.tsx
@@ -430,5 +431,84 @@ export function ImportParityReport({ result }: { result: ImportResult }) {
         </p>
       )}
     </section>
+  );
+}
+
+/**
+ * The hook commands an import writes, moved out of PorterImportPanel.tsx
+ * (#5195) so it can be tested on its own: the unknown events, the command
+ * warnings, and each hook's events, matcher, and command.
+ *
+ * #2600: each hook command string is surfaced VERBATIM for review. An unshown
+ * command is the threat (a `curl … | sh` pipeline the path-lint cannot catch),
+ * so this is warning-styled. Index keys: two hooks can legitimately share a
+ * command string, so a content-keyed list would collide.
+ *
+ * #5195: every value renders through `VisibleText`, so a hidden or
+ * direction-changing code point shows in place as a `U+XXXX` token, and the
+ * list carries one notice when any command, matcher, or event contains one.
+ */
+export function HookCommandsReview({
+  hooks,
+}: {
+  hooks: Pick<
+    ImportPlanSummary["hooks"],
+    "unknownEvents" | "commandWarnings" | "commands"
+  >;
+}) {
+  return (
+    <>
+      {hooks.unknownEvents.length > 0 && (
+        <p className="text-[length:var(--text-body-dense)] text-warn">
+          Unknown events: <VisibleText text={hooks.unknownEvents.join(", ")} />
+        </p>
+      )}
+      {hooks.commandWarnings.length > 0 && (
+        <ul
+          data-testid="hook-command-warnings"
+          className="flex flex-col gap-0.5 text-[length:var(--text-body-dense)] text-warn"
+        >
+          {hooks.commandWarnings.map(w => (
+            <li key={w}>
+              ⚠️ <VisibleText text={w} />
+            </li>
+          ))}
+        </ul>
+      )}
+      {hooks.commands.length > 0 && (
+        <>
+          <HiddenCharsNotice
+            testId="hook-commands-hidden-chars"
+            values={hooks.commands.flatMap(h => [
+              h.command,
+              h.matcher ?? "",
+              ...h.events,
+            ])}
+          />
+          <ul
+            className="mt-1 flex flex-col gap-1 text-[length:var(--text-body-dense)] text-warn"
+            data-testid="hook-commands"
+          >
+            {hooks.commands.map((h, i) => (
+              <li key={i}>
+                <span className="text-[var(--app-hint)]">
+                  <VisibleText text={h.events.join(", ")} />
+                  {h.matcher ? (
+                    <>
+                      {" · "}
+                      <VisibleText text={h.matcher} />
+                    </>
+                  ) : null}
+                  :
+                </span>{" "}
+                <span className="font-mono break-all whitespace-pre-wrap">
+                  <VisibleText text={h.command} />
+                </span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </>
   );
 }

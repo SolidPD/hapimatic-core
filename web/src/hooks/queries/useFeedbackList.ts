@@ -25,7 +25,10 @@ const EMPTY_FEEDBACK_ITEMS: FeedbackListResponse["items"] = [];
  */
 export function useFeedbackList(
   api: ApiClient | null,
-  params: { limit: number; offset: number }
+  params: { limit: number; offset: number },
+  // #2910: the page passes the operator-instance preflight verdict here, so a
+  // closed instance never requests rows (hooks cannot be called conditionally).
+  options?: { enabled?: boolean }
 ) {
   const query = useQuery<FeedbackListResponse | null>({
     queryKey: queryKeys.feedbackList(params.limit, params.offset),
@@ -36,7 +39,7 @@ export function useFeedbackList(
         offset: params.offset,
       });
     },
-    enabled: Boolean(api),
+    enabled: (options?.enabled ?? true) && Boolean(api),
     retry: false,
     placeholderData: keepPreviousData,
   });

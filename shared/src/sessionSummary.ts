@@ -128,6 +128,14 @@ export type SessionSummaryMetadata = {
    *  modal can mark the session's current key (#4823's current-key marker)
    *  without the detail-path record. Absent for every non-key session. */
   apiKeyId?: string;
+  /** Issue #2150: set ONLY on a hub-side federation spawn placeholder row in
+   *  `/federation/all-sessions` — the caller-generated correlation id the row is
+   *  keyed by, so a poller (CLI or web) can match the row to its own spawn. */
+  spawnCorrelationId?: string;
+  /** Issue #2150: the peer's refusal code on a FAILED federation spawn
+   *  placeholder (e.g. `account_unrefreshable`); the message rides in
+   *  `summary.text`. Absent on a message-only failure. */
+  spawnErrorCode?: string;
 };
 
 /**

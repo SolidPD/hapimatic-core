@@ -92,6 +92,9 @@ export function applyTurnsMigrations(db: Database): void {
       CREATE INDEX IF NOT EXISTS idx_turns_node         ON turns(node_id);
       CREATE INDEX IF NOT EXISTS idx_turns_started      ON turns(started_at_ms);
       CREATE INDEX IF NOT EXISTS idx_turns_linked_issue ON turns(linked_issue);
+      -- #5254: the ceiling guard's trailing-hour meter is a range seek per session.
+      CREATE INDEX IF NOT EXISTS idx_turns_session_started
+        ON turns(hapi_session_id, started_at_ms);
     `);
   } catch (error) {
     console.error(`[Store] Migration failed: CREATE TABLE turns:`, error);
@@ -395,6 +398,37 @@ export function applyTurnsMigrations(db: Database): void {
   } catch (error) {
     console.error(
       `[Store] Migration failed: CREATE TABLE background_agent_usage:`,
+      error
+    );
+  }
+
+  // ───────────────────────── ceiling_breaches ─────────────────────────
+  // Issue #5254 R4. One row per runaway-ceiling-guard breach the guard acted on
+  // (hard-stop / notify) or deliberately suppressed because an operator was
+  // active. It replaces the in-memory `ceilingBreached` Set, which a hub restart
+  // emptied (the 2026-10-15 re-fire). Dedupe keys: a cumulative dimension fires
+  // once per (session, dimension, ceiling value); a rate dimension once per
+  // 60-minute window. `kind` / `action` are TS unions (K1 house rule: no CHECK).
+  // Fail-open DDL hoisted to a const (the pm_spawn_roster exec() note).
+  const CEILING_BREACHES_DDL = `
+    CREATE TABLE IF NOT EXISTS ceiling_breaches (
+      id              TEXT PRIMARY KEY,
+      hapi_session_id TEXT NOT NULL,
+      kind            TEXT NOT NULL,
+      dimension       TEXT NOT NULL,
+      value           REAL,
+      ceiling         REAL,
+      action          TEXT NOT NULL,
+      occurred_at_ms  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ceiling_breaches_session
+      ON ceiling_breaches(hapi_session_id, dimension, occurred_at_ms);
+  `;
+  try {
+    db.exec(CEILING_BREACHES_DDL);
+  } catch (error) {
+    console.error(
+      `[Store] Migration failed: CREATE TABLE ceiling_breaches:`,
       error
     );
   }

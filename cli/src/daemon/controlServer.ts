@@ -54,6 +54,8 @@ export function startDaemonControlServer({
     max: number;
     recommended: number;
     source: DaemonCapSource;
+    /** #5202 (U3): which memory figure fed the cap formula. */
+    memInputSource: "session-slice" | "process-cgroup" | "machine";
   }>;
   /** #1964 (Sub-D): snapshot of this daemon process's runtime job registry. */
   getJobs: () => JobStatus[];
@@ -189,6 +191,10 @@ export function startDaemonControlServer({
             existingBranch: z
               .object({ name: z.string().min(1).max(255), remote: z.boolean() })
               .optional(),
+            // hapimatic-private#4370: cut a new worktree from exactly this
+            // branch. Listed here because zod strips an un-enumerated key; the
+            // spawner re-checks the name with `git check-ref-format --branch`.
+            sourceBranch: z.string().min(1).max(255).optional(),
             name: z.string().max(255).optional(),
           }),
           response: {
@@ -218,6 +224,7 @@ export function startDaemonControlServer({
           sessionType,
           worktreeName,
           existingBranch,
+          sourceBranch,
           name,
         } = request.body;
 
@@ -234,6 +241,7 @@ export function startDaemonControlServer({
             sessionType,
             worktreeName,
             existingBranch,
+            sourceBranch,
             name,
           });
         } catch (error) {
@@ -330,6 +338,11 @@ export function startDaemonControlServer({
               max: z.number(),
               recommended: z.number(),
               source: DaemonCapSourceSchema,
+              memInputSource: z.enum([
+                "session-slice",
+                "process-cgroup",
+                "machine",
+              ]),
             }),
           },
         },

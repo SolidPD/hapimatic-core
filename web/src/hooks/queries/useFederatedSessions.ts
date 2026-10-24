@@ -6,7 +6,10 @@ import type { DaemonCapSource } from "@hapi/protocol/schemas";
 import type { SessionSummary } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 import { applyFederationOverrides } from "@/lib/federation-mutation-overrides";
-import { reconcilePendingSpawns } from "@/lib/pending-spawns";
+import {
+  isFederationSpawnPlaceholder,
+  reconcilePendingSpawns,
+} from "@/lib/pending-spawns";
 import { withoutDeletePending } from "@/lib/session-action-pending";
 
 export type FederationRemoteNode = {
@@ -58,11 +61,16 @@ export function useFederatedSessions(api: ApiClient | null): {
       // reverting optimistic UI updates.
       // #3516 follow-up: then drop rows whose delete is in flight, so a poll or
       // SSE-driven refetch mid-delete cannot resurrect the removed row.
-      const sessions = withoutDeletePending(
+      const polled = withoutDeletePending(
         applyFederationOverrides(data.sessions)
       );
-      // Auto-remove pending spawn stubs that now have a matching real session
-      reconcilePendingSpawns(sessions);
+      // Auto-remove pending spawn stubs that now have a matching real session.
+      // Issue #2150: the hub's federation spawn placeholders ride in the same
+      // array — the reconciler reads them (a failed one flips its stub), then
+      // they are dropped: the client stub is the one row the list renders for a
+      // remote spawn, and a placeholder has no session behind it to open.
+      reconcilePendingSpawns(polled);
+      const sessions = polled.filter(s => !isFederationSpawnPlaceholder(s));
       return { ...data, sessions };
     },
     enabled: Boolean(api),

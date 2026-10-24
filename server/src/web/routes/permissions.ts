@@ -9,10 +9,11 @@ import { z } from "zod";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
+import { refusePermissionResponse } from "./agentEscalation";
 import { cataloged } from "../../capabilities/cataloged";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
-import { proxyTransportFailure } from "./routeErrorHelper";
+import { proxyTransportFailure, readProxyBodyOr502 } from "./routeErrorHelper";
 
 const decisionSchema = z.enum([
   "approved",
@@ -77,6 +78,11 @@ export function createPermissionsRoutes(
       if (!parsed.success) {
         return c.json({ error: "Invalid body" }, 400);
       }
+
+      // #3842 R6/R8: both refusals precede the local/federation split below,
+      // so a proxied (remote-node) request is refused on this hub too.
+      const refusal = refusePermissionResponse(c, engine);
+      if (refusal) return refusal;
 
       const sessionResult = requireSessionFromParam(c, engine, {
         requireActive: true,
@@ -144,11 +150,13 @@ export function createPermissionsRoutes(
           if (resp.ok) {
             return c.json({ ok: true });
           }
-          const body = await resp.json().catch(() => ({}));
-          return c.json(
-            body as Record<string, unknown>,
-            resp.status as 400 | 404 | 409 | 500 | 503
-          );
+          // #5433: a cut body is a logged 502 (readProxyBodyOr502).
+          const read = await readProxyBodyOr502(c, resp, {
+            errorLogger: options?.errorLogger,
+            nodeId: node.nodeId,
+          });
+          if (read.failure) return read.failure;
+          return c.json(read.body, resp.status as 400 | 404 | 409 | 500 | 503);
         }
       }
 
@@ -190,6 +198,11 @@ export function createPermissionsRoutes(
       if (!parsed.success) {
         return c.json({ error: "Invalid body" }, 400);
       }
+
+      // #3842 R6/R8: both refusals precede the local/federation split below,
+      // so a proxied (remote-node) request is refused on this hub too.
+      const refusal = refusePermissionResponse(c, engine);
+      if (refusal) return refusal;
 
       const sessionResult = requireSessionFromParam(c, engine, {
         requireActive: true,
@@ -237,11 +250,13 @@ export function createPermissionsRoutes(
           if (resp.ok) {
             return c.json({ ok: true });
           }
-          const body = await resp.json().catch(() => ({}));
-          return c.json(
-            body as Record<string, unknown>,
-            resp.status as 400 | 404 | 409 | 500 | 503
-          );
+          // #5433: a cut body is a logged 502 (readProxyBodyOr502).
+          const read = await readProxyBodyOr502(c, resp, {
+            errorLogger: options?.errorLogger,
+            nodeId: node.nodeId,
+          });
+          if (read.failure) return read.failure;
+          return c.json(read.body, resp.status as 400 | 404 | 409 | 500 | 503);
         }
       }
 

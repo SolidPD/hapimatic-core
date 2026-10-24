@@ -10,6 +10,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getCliArgs } from "@/utils/cliArgs";
+import { DEFAULT_TMUX_SESSION_NAME } from "@/tmux/types";
 
 /**
  * Issue #1643: resolve the per-account isolated-config base dir AND whether the
@@ -392,7 +393,8 @@ class Configuration {
     this.tmuxPersistenceEnabled = ["true", "1", "yes"].includes(
       process.env.HAPI_TMUX_PERSISTENCE?.toLowerCase() || ""
     );
-    this.tmuxSessionName = process.env.HAPI_TMUX_SESSION_NAME || "hapimatic";
+    this.tmuxSessionName =
+      process.env.HAPI_TMUX_SESSION_NAME || DEFAULT_TMUX_SESSION_NAME;
     this.tmuxRemoteSessionName = resolveTmuxRemoteSessionName({
       localSessionName: this.tmuxSessionName,
       envOverride: process.env.HAPI_TMUX_REMOTE_SESSION_NAME,

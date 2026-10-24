@@ -78,12 +78,25 @@ export async function isHapimaticPrivateCwd(cwd: string): Promise<boolean> {
   }
 }
 
-async function pathExists(path: string): Promise<boolean> {
+/**
+ * Whether `path` is still there. Only ENOENT reads as gone (#5202 U6): an
+ * EACCES or EIO path is still there, so the job proceeds and git reports the
+ * real error instead of the record being skipped as a removed worktree.
+ */
+export async function pathExists(
+  path: string,
+  accessPath: (path: string) => Promise<void> = access
+): Promise<boolean> {
   try {
-    await access(path);
+    await accessPath(path);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return false;
+    logger.debug(
+      `[resume-resync] could not check ${path} (${code ?? String(err)}); treating it as present`
+    );
+    return true;
   }
 }
 

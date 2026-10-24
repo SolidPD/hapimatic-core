@@ -55,6 +55,8 @@ export const queryKeys = {
   // Admin VM provisioning control plane — Admin → VMs (issue #2470, epic #2467)
   vmInventory: ["vm-inventory"] as const,
   vmPreflight: ["vm-preflight"] as const,
+  // #2910: the operator-instance feedback-inbox gate (`GET /api/feedback/preflight`).
+  feedbackPreflight: ["feedback-preflight"] as const,
   vmJobs: ["vm-jobs"] as const,
   vmJob: (jobId: string) => ["vm-job", jobId] as const,
   // Binary auto-update status (issue #1006, D999-10 control-plane push)

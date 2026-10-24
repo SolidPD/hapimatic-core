@@ -22,8 +22,10 @@ import type { WebAppEnv } from "../web/middleware/auth";
  * 3-argument registration produces TWO entries for the same METHOD+PATH — the
  * tagged middleware entry and the untagged route handler entry. And
  * `app.route("/api", sub)` only re-wraps handlers when the sub-app has a
- * non-default `errorHandler`; there is no `app.onError(...)` anywhere in
- * `server/src`, so the tag survives prefixing by reference. Register like:
+ * non-default `errorHandler`; no sub-app mounted via `app.route()` sets one (the
+ * only `app.onError(...)` is the root's, `buildWebApp.ts`), so the tag survives
+ * prefixing by reference. Register the tag FIRST, ahead of any limiter or gate —
+ * the invoker refuses a route whose first handler is untagged (#5596):
  *
  *   sub.get("/x", cataloged(entry), handler);
  *   // → app.routes has { method:"GET", path:"/x", handler: <mw> } whose

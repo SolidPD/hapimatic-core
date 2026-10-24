@@ -49,9 +49,11 @@ import {
   type Omission,
 } from "@hapi/protocol/porter";
 
-/** Why a CLAUDE.md include is not imported (#4143, #4156). */
+/** Why a CLAUDE.md include is not imported (#4143, #4156, #5202). */
 export type IncludeSkipReason =
   | "not-regular-file"
+  | "absolute-or-home"
+  | "dot-segment"
   | "outside-include-area"
   | "not-markdown"
   | "shadows-claude-md"
@@ -86,12 +88,26 @@ function inIncludeArea(destRel: string): boolean {
 }
 
 /**
+ * #5202 (U11): the first dot-leading segment of a path under
+ * `claude-includes/`, or `undefined`. Top-level names are not checked here:
+ * a top-level `.md` sibling may start with a dot.
+ */
+function dotLeadingSegment(destRel: string): string | undefined {
+  if (!destRel.startsWith(NAMESPACE)) return undefined;
+  return destRel
+    .slice(NAMESPACE.length)
+    .split("/")
+    .find(s => s.startsWith("."));
+}
+
+/**
  * Classify an include by its RESOLVED destination — the absolute path
  * `assertSafeEntry` returned — never by the raw archive string, because
  * `resolve()` has already collapsed spellings such as `settings.json/` to
  * `settings.json`.
  *
- * The checks run in a fixed order, so the reason stays specific: the area
+ * The checks run in a fixed order, so the reason stays specific: a dot-leading
+ * name under `claude-includes/` (`dot-segment`, #5202), the area
  * (`outside-include-area`), then `.md` (so `claude-includes/hooks/x.sh` is
  * `not-markdown`), then a basename of `CLAUDE.md` at any depth, then a
  * duplicate of a destination already claimed.
@@ -107,6 +123,9 @@ export function classifyClaudeMdInclude(
   | { ok: true; destRel: string }
   | { ok: false; destRel: string; reason: IncludeSkipReason } {
   const destRel = relative(claudeDir, destPath);
+  if (!destRel.includes("\\") && dotLeadingSegment(destRel) !== undefined) {
+    return { ok: false, destRel, reason: "dot-segment" };
+  }
   if (!inIncludeArea(destRel)) {
     return { ok: false, destRel, reason: "outside-include-area" };
   }
@@ -177,7 +196,7 @@ function rewriteText(
   text: string,
   rewrites: ReadonlyMap<string, string>,
   hits: Hits
-) {
+): string {
   return text.replace(INCLUDE_TOKEN, token => {
     const to = rewrites.get(token.slice(1));
     if (to === undefined) return token;
@@ -203,7 +222,7 @@ function rewriteLine(
   line: string,
   rewrites: ReadonlyMap<string, string>,
   hits: Hits
-) {
+): string {
   const runs: Array<[start: number, length: number]> = [];
   for (let i = 0; i < line.length; ) {
     const n = line[i] === "`" ? backtickRun(line, i) : 0;
@@ -276,6 +295,28 @@ export function rewriteIncludeRefs(
     .join("\n");
 }
 
+/**
+ * #5202 (U16): the largest CLAUDE.md whose include references the import
+ * rewrites. The rewrite is synchronous and linear (about 0.1 s per MiB on an
+ * ms1-class host); a real CLAUDE.md is a few KiB, so anything past 1 MiB gets a
+ * notice with the edits to make by hand instead of a request-blocking scan.
+ */
+export const CLAUDE_MD_REWRITE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * #5202 (U16): CLAUDE.md is over {@link CLAUDE_MD_REWRITE_MAX_BYTES}, so its
+ * nested include references were left as written; the notice lists each edit.
+ */
+export function claudeMdTooLargeNotice(
+  rewrites: ReadonlyMap<string, string>
+): Omission {
+  const edits = [...rewrites].map(([ref, to]) => `@${ref} → @${to}`);
+  return {
+    surface: "CLAUDE.md",
+    reason: `CLAUDE.md is larger than 1 MiB, so its include references were not rewritten: point each one at claude-includes/ by hand (${edits.join(", ")})`,
+  };
+}
+
 /** A UTF-8 byte order mark as it reads through a `latin1` view. */
 const LATIN1_BOM = "\u00ef\u00bb\u00bf";
 
@@ -310,7 +351,7 @@ export function rewriteClaudeMd(
  * #4156: a nested include the plan lands under `claude-includes/` whose
  * CLAUDE.md reference the rewrite did not change (it sits in a code block, or
  * in a form the scanner skips). It is a notice, not a policy refusal: the file
- * is imported, and the operator is told to check that CLAUDE.md still finds it.
+ * is imported, and (#5202 U10) the operator is told the exact edit to make.
  */
 export function includeUnrewrittenNotice(
   archivePath: string,
@@ -319,7 +360,23 @@ export function includeUnrewrittenNotice(
 ): Omission {
   return {
     surface: `CLAUDE.md include ${archivePath}`,
-    reason: `imported to ${destRel}, but CLAUDE.md has no @${ref} reference outside a code block for the import to point there, so check that CLAUDE.md still finds it`,
+    reason: `imported to ${destRel}, but CLAUDE.md has no @${ref} reference outside a code block for the import to point there: add "@${destRel}" to CLAUDE.md where it referenced @${ref}`,
+  };
+}
+
+/**
+ * #5202 (U12): a nested include the commit wrote under `claude-includes/`
+ * while it did not write the rewritten CLAUDE.md (the operator kept their own,
+ * or left CLAUDE.md out), so nothing yet references the file where it landed.
+ */
+export function includeUnreferencedNotice(
+  archivePath: string,
+  ref: string,
+  destRel: string
+): Omission {
+  return {
+    surface: `CLAUDE.md include ${archivePath}`,
+    reason: `imported to ${destRel}, but CLAUDE.md was not replaced: add "@${destRel}" to your CLAUDE.md where it referenced @${ref}`,
   };
 }
 
@@ -337,9 +394,14 @@ export function includeSkipOmission(
   reason: IncludeSkipReason
 ): Omission {
   const area = `not imported: a CLAUDE.md include may only write a top-level .md file or a .md file under ${NAMESPACE} (this one would write ${destRel})`;
+  const dot = dotLeadingSegment(destRel) ?? "";
+  const dotKind = destRel.endsWith(`/${dot}`) ? "file name" : "folder";
   const text: Record<IncludeSkipReason, string> = {
     "not-regular-file":
       "not imported: the archive member is not a regular file (a link, directory, or special entry)",
+    "absolute-or-home":
+      'not imported: an include path starting with "/" or "~" is not a path inside the config folder',
+    "dot-segment": `not imported: a CLAUDE.md include may not write a dot-leading ${dotKind} (${dot} in ${destRel})`,
     "outside-include-area": area,
     "not-markdown": area,
     "shadows-claude-md":

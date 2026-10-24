@@ -146,6 +146,10 @@ export function referencedScriptRels(
  * DESTINATION name (a link member refuses the whole archive, as for every
  * producer); not a regular file; another script already claims the same
  * case/NFC-folded name. A planned script is owner-executable (R13).
+ *
+ * #5202 (U13): `skipped` holds the refusals; an entry whose member the archive
+ * lacks is a notice (the review's "Imported with a note"), in `notices`, so the
+ * caller never has to tell them apart by reason text.
  */
 export function planSettingsScripts(
   entries: TarEntry[],
@@ -154,9 +158,10 @@ export function planSettingsScripts(
   claudeDir: string,
   homeDir: string,
   stagingDir: string
-): { plans: StagedPlan[]; skipped: Omission[] } {
+): { plans: StagedPlan[]; skipped: Omission[]; notices: Omission[] } {
   const plans: StagedPlan[] = [];
   const skipped: Omission[] = [];
+  const notices: Omission[] = [];
   const referenced = referencedScriptRels(settings, claudeDir, homeDir);
   const named = okRels(settings);
   const claimed = new Set<string>();
@@ -176,7 +181,10 @@ export function planSettingsScripts(
     }
     const member = findEntry(entries, path);
     if (!member) {
-      skip(path, r.missing);
+      notices.push({
+        surface: settingsScriptEntrySurface(path),
+        reason: r.missing,
+      });
       continue;
     }
     const destPath = assertSafeEntry(claudeDir, {
@@ -205,7 +213,7 @@ export function planSettingsScripts(
       content: member.data,
     });
   }
-  return { plans, skipped };
+  return { plans, skipped, notices };
 }
 
 /**

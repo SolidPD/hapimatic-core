@@ -19,6 +19,7 @@
 import { readFileSync } from "node:fs";
 import { getSettingsFile, readSettings, writeSettings } from "./settings";
 import type { FeedbackSenderConfig } from "../feedback/feedbackSender";
+import { isEnvFlagTruthy } from "../provisioner/capability";
 
 export interface ServerSettings {
   telegramBotToken: string | null;
@@ -259,6 +260,34 @@ export function resolveFeedbackSenderConfig(): FeedbackSenderConfig {
     relayUrl,
     relayToken,
   };
+}
+
+/** The operator-instance capability env flag (issue #2910, epic #2909 Sub A). */
+export const OPERATOR_INSTANCE_ENV = "HAPI_OPERATOR_INSTANCE";
+
+/**
+ * Resolve the operator-instance capability (issue #2910, epic #2909 Sub A):
+ * whether this instance shows the feedback READ surface (`GET /api/feedback`,
+ * `GET /api/feedback/preflight`, the settings Feedback row and page). Default
+ * OFF — fail-closed — and env-only, parsed with the house `isEnvFlagTruthy`
+ * idiom (`1` / `true` / `yes`, case-insensitive, untrimmed), the same parse as
+ * the sibling operator flag `HAPI_VM_ADMIN`. Customer-VM provisioning never
+ * sets it, so a customer instance is closed by construction.
+ *
+ * `provisioner.enabled` is deliberately NOT reused: it is true only where the
+ * operator's provisioning infra env exists (RP1), but the universal inbox must
+ * be readable from any operator device (RP1, RP2, SL7, operator cloud VMs).
+ *
+ * Trust model: this is a VISIBILITY gate (non-advertisement, and the
+ * precondition for #2912's inbox proxy routes), not an authorization boundary —
+ * an instance owner controls the unit environment and can read the instance's
+ * SQLite directly. The central inbox's real boundary is #2912's gateway
+ * operator credential, which is never provisioned to customer VMs.
+ */
+export function resolveOperatorInstanceEnabled(
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  return isEnvFlagTruthy(env[OPERATOR_INSTANCE_ENV]);
 }
 
 /**

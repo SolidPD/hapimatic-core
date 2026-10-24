@@ -49,9 +49,11 @@ import type { ErrorLogger } from "../logging/errorLogger";
  * Hono stores the original handler on a COMPOSED one under this well-known key
  * (`hono/utils/constants` `COMPOSED_HANDLER = "__COMPOSED_HANDLER"`, verified for
  * hono 4.11.2). We read the literal to avoid a deep-import outside hono's exports
- * map. `cataloged()` sets its tag by reference and there is no `app.onError` in
- * `server/src`, so the tag survives prefixing directly — this is a DEFENSIVE
- * second hop only (3743-18).
+ * map. `cataloged()` sets its tag by reference, and no sub-app mounted via
+ * `app.route()` sets a custom `errorHandler` (the only `app.onError` is the
+ * root's, `buildWebApp.ts`), so the tag survives prefixing directly and ONE
+ * unwrap suffices — this is a DEFENSIVE second hop only (3743-18). The invoker's
+ * tag walk (#5596) reads tags through this, so the claim is gate-bearing.
  */
 const COMPOSED_HANDLER_KEY = "__COMPOSED_HANDLER";
 
@@ -112,9 +114,11 @@ function emptyStatic(): StaticCatalog {
 /**
  * Read the `CatalogEntry` off a (possibly composed) Hono handler, or null when
  * the handler carries no `cataloged()` tag. Defensive against the COMPOSED
- * wrapper (3743-18).
+ * wrapper (3743-18). The ONE tag reader: the collector and the invoker's tag walk
+ * (`capabilityCall.ts`, #5596) both use it, so they cannot disagree about what
+ * is catalogued.
  */
-function readCapabilityTag(handler: unknown): CatalogEntry | null {
+export function readCapabilityTag(handler: unknown): CatalogEntry | null {
   if (typeof handler !== "function") return null;
   const asRecord = handler as unknown as Record<PropertyKey, unknown>;
   const direct = asRecord[CAPABILITY_TAG];

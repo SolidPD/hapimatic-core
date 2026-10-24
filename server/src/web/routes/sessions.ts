@@ -17,6 +17,7 @@ import {
   SetPermissionModeRequestSchema,
 } from "@hapi/protocol/schemas";
 import { Hono, type Context } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { resolveLocalNodeIdentity } from "../../config/nodeLabel";
 import { z } from "zod";
 import type { SyncEngine, Session } from "../../sync/syncEngine";
@@ -25,9 +26,16 @@ import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
-import { logAndJson, proxyTransportFailure } from "./routeErrorHelper";
+import {
+  logAndJson,
+  proxyTransportFailure,
+  readProxyBodyOr502,
+} from "./routeErrorHelper";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
-import { federationReadSignal } from "../../federation/proxyFetchSignal";
+import {
+  federationReadSignal,
+  readProxyJson,
+} from "../../federation/proxyFetchSignal";
 import type { SessionService } from "../../services/sessionService";
 import {
   BULK_SESSION_MAX_IDS,
@@ -349,6 +357,22 @@ export function createSessionsRoutes(
             if (options?.federationApiToken) {
               headers["Authorization"] = `Bearer ${options.federationApiToken}`;
             }
+            // #5410 / #5483: one warning shape for every way the proxy degrades
+            // to the cached summary (a thrown fetch or a non-OK peer reply).
+            const logFallback = (
+              detail: string,
+              extra: Record<string, unknown>
+            ): void => {
+              errorLogger?.warn(
+                `federation proxy: session detail fell back to cached summary (${detail})`,
+                {
+                  category: "federation",
+                  requestPath: c.req.path,
+                  requestMethod: c.req.method,
+                  context: { sessionId, nodeId: node.nodeId, ...extra },
+                }
+              );
+            };
             try {
               // #5375: bounded read — a hung peer falls through to the cached
               // summary below instead of holding the request past the browser's
@@ -383,8 +407,34 @@ export function createSessionsRoutes(
                 }
                 return c.json(body as Record<string, unknown>);
               }
-            } catch {
-              // Proxy failed — fall through to cached summary below
+              // #5483: the peer answered, but not OK (a peer 500, a 502 from a
+              // proxy in front of a restarting peer, a 404 for a session it no
+              // longer has). Same fallback as a thrown fetch: say so, and
+              // release the unread body. The cancel is not awaited and its
+              // rejection is swallowed, so a stalled stream cannot delay or
+              // fail the cached response.
+              logFallback(`peer status ${resp.status}`, {
+                status: resp.status,
+              });
+              void resp.body?.cancel().catch(() => {});
+            } catch (error) {
+              // Proxy failed — fall through to cached summary below. #5410:
+              // log it (session, node, error) so the degradation is visible;
+              // a browser that navigated away is not the peer's fault.
+              const clientLeft =
+                (error as { name?: unknown } | null)?.name === "AbortError" &&
+                c.req.raw.signal?.aborted === true;
+              if (!clientLeft) {
+                const detail =
+                  error instanceof Error ? error.message : String(error);
+                const rawCode = (error as { code?: unknown } | null)?.code;
+                logFallback(detail, {
+                  code:
+                    typeof rawCode === "string"
+                      ? rawCode
+                      : ((error as { name?: unknown } | null)?.name ?? null),
+                });
+              }
             }
           }
 
@@ -485,11 +535,13 @@ export function createSessionsRoutes(
           if (resp.ok) {
             return c.json({ ok: true });
           }
-          const body = await resp.json().catch(() => ({}));
-          return c.json(
-            body as Record<string, unknown>,
-            resp.status as 400 | 404 | 409 | 500 | 503
-          );
+          // #5433: a cut body is a logged 502 (readProxyBodyOr502).
+          const read = await readProxyBodyOr502(c, resp, {
+            errorLogger: errorLogger,
+            nodeId: node.nodeId,
+          });
+          if (read.failure) return read.failure;
+          return c.json(read.body, resp.status as 400 | 404 | 409 | 500 | 503);
         }
       }
 
@@ -579,11 +631,13 @@ export function createSessionsRoutes(
             registry.markSessionInactive(sessionId);
             return c.json({ ok: true });
           }
-          const body = await resp.json().catch(() => ({}));
-          return c.json(
-            body as Record<string, unknown>,
-            resp.status as 400 | 404 | 409 | 500 | 503
-          );
+          // #5433: a cut body is a logged 502 (readProxyBodyOr502).
+          const read = await readProxyBodyOr502(c, resp, {
+            errorLogger: errorLogger,
+            nodeId: node.nodeId,
+          });
+          if (read.failure) return read.failure;
+          return c.json(read.body, resp.status as 400 | 404 | 409 | 500 | 503);
         }
       }
 
@@ -2294,11 +2348,13 @@ export function createSessionsRoutes(
             registry.evictSessionFromCache(sessionId);
             return c.json({ ok: true });
           }
-          const body = await resp.json().catch(() => ({}));
-          return c.json(
-            body as Record<string, unknown>,
-            resp.status as 400 | 404 | 409 | 500 | 503
-          );
+          // #5433: a cut body is a logged 502 (readProxyBodyOr502).
+          const read = await readProxyBodyOr502(c, resp, {
+            errorLogger: errorLogger,
+            nodeId: node.nodeId,
+          });
+          if (read.failure) return read.failure;
+          return c.json(read.body, resp.status as 400 | 404 | 409 | 500 | 503);
         }
       }
 
@@ -3131,26 +3187,41 @@ export function createSessionsRoutes(
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
           }
+          // #5410: a transport failure is a logged 502 (was a 200
+          // {success:false}) and a non-OK peer keeps its status; any other
+          // error is rethrown so app.onError logs it as a 500 (#5404).
+          const unreachable = (error: unknown): Response =>
+            proxyTransportFailure(c, error, {
+              errorLogger,
+              nodeId: node.nodeId,
+              body: { success: false, error: "Remote node unreachable" },
+            });
+          let resp: Response;
           try {
-            const resp = await fetch(
+            resp = await fetch(
               `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/slash-commands`,
               // #5375: bounded read-only proxy fetch.
               { headers, signal: federationReadSignal(c.req.raw.signal) }
             );
-            if (resp.ok) {
-              const body = await resp.json();
-              return c.json(body as Record<string, unknown>);
-            }
-            return c.json({
+          } catch (error) {
+            return unreachable(error);
+          }
+          let body: unknown;
+          try {
+            body = await readProxyJson(resp);
+          } catch (error) {
+            return unreachable(error);
+          }
+          if (resp.ok) {
+            return c.json((body ?? {}) as Record<string, unknown>);
+          }
+          return c.json(
+            (body ?? {
               success: false,
               error: `Remote node returned ${resp.status}`,
-            });
-          } catch (err) {
-            console.warn(
-              `[sessions] Federation proxy for slash commands failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-            return c.json({ success: false, error: "Remote node unreachable" });
-          }
+            }) as Record<string, unknown>,
+            resp.status as ContentfulStatusCode
+          );
         }
       }
 

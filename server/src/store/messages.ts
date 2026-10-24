@@ -6,6 +6,7 @@ import { scrubSecretTokens } from "@hapi/protocol";
 
 import type { StoredMessage } from "./types";
 import { safeJsonParse } from "./json";
+import { isOperatorUserMessage } from "../sync/sentFrom";
 
 type DbMessageRow = {
   id: string;
@@ -149,6 +150,26 @@ export function addMessage(
       db.prepare(
         "UPDATE sessions SET user_message_count = user_message_count + 1 WHERE id = ?"
       ).run(sessionId);
+    }
+
+    // Denormalized last-operator-message timestamp (#5254 R2): the ceiling
+    // guard's inactivity gate. MAX keeps a late arrival (an older createdAt,
+    // #952) from moving it backwards.
+    // Fail-open: if the column migration ever failed, a missing column throws
+    // at prepare (before any write) and must not stop the message itself from
+    // being saved. (The guard's own read of the column then throws too and the
+    // guard degrades through its fail-open catch, so nothing is stopped.)
+    if (isOperatorUserMessage(content)) {
+      try {
+        db.prepare(
+          "UPDATE sessions SET last_operator_message_at = MAX(IFNULL(last_operator_message_at, 0), ?) WHERE id = ?"
+        ).run(createdAt, sessionId);
+      } catch (error) {
+        console.error(
+          "[Store] could not update sessions.last_operator_message_at (#5254):",
+          error
+        );
+      }
     }
 
     const row = db.prepare("SELECT * FROM messages WHERE id = ?").get(id) as

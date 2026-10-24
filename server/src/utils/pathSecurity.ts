@@ -70,6 +70,25 @@ export function machinePathDenial(
     return { kind: "component", match: component };
   }
 
+  return machinePathPrefixDenial(targetPath);
+}
+
+/**
+ * The denylisted system PREFIX `targetPath` resolves under, or `null` — the
+ * prefix half of {@link machinePathDenial} on its own, checked whatever path
+ * parts the path holds. The import gate needs it: there a component inside the
+ * destination root is allowed, so a component match must not hide a prefix
+ * (root `/var`, member `log/.config/x` resolves under `/var/log`; issue #4321).
+ */
+export function machinePathPrefixDenial(
+  targetPath: string
+): { kind: "prefix"; match: string } | null {
+  const resolvedTarget = resolve(targetPath);
+  const normalizedTarget =
+    process.platform === "win32"
+      ? resolvedTarget.toLowerCase()
+      : resolvedTarget;
+
   for (const prefix of MACHINE_DENY_PREFIXES) {
     const normalizedPrefix =
       process.platform === "win32" ? prefix.toLowerCase() : prefix;

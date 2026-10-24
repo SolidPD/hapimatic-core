@@ -4,6 +4,7 @@ import type {
   FeedbackSenderConfig,
   FeedbackSendResult,
 } from "./feedbackSender";
+import { readPeerJsonObject } from "../federation/proxyFetchSignal";
 
 /**
  * The category the relay accepts on the wire (issue #4371). The gateway's relay
@@ -87,14 +88,26 @@ export async function sendViaRelay(
     // Tolerant of the relay's success-body shape: accept either `messageId`
     // (camelCase, the natural relay response) or `message_id` (AgentMail's raw
     // field, if the relay passes it through). Absent → empty string (still sent).
-    const json = (await res.json().catch(() => ({}))) as {
-      messageId?: string;
-      message_id?: string;
-    };
-    return {
-      status: "sent",
-      messageId: json.messageId ?? json.message_id ?? "",
-    };
+    let json: Record<string, unknown>;
+    try {
+      json = await readPeerJsonObject(res);
+    } catch (error) {
+      // #5487: the 2xx status means the relay accepted the send; only the
+      // reply (the message id) was lost or unreadable. Report sent, so the
+      // support modal does not ask the user to resend, and log the lost reply.
+      console.warn(
+        `[feedback] relay accepted the send (HTTP ${res.status}) but the reply could not be read:`,
+        error instanceof Error ? error.message : error
+      );
+      json = {};
+    }
+    const messageId =
+      typeof json.messageId === "string"
+        ? json.messageId
+        : typeof json.message_id === "string"
+          ? json.message_id
+          : "";
+    return { status: "sent", messageId };
   } catch (err) {
     return {
       status: "error",

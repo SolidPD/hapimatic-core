@@ -192,7 +192,6 @@ export function createGitHubWebhookRoutes(
   // POST /github/webhook — HMAC-verified GitHub delivery ingest (pre-JWT).
   app.post(
     "/github/webhook",
-    limiter,
     cataloged(
       defineCapability({
         id: "harness-admin.github-webhook",
@@ -212,6 +211,7 @@ export function createGitHubWebhookRoutes(
         probe: "skip",
       })
     ),
+    limiter,
     async c => {
       // 1. Feature off ⇒ the endpoint does not exist (R7).
       if (!config.enabled) {

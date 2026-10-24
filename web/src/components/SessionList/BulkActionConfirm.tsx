@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Dialog,
   DialogContent,
@@ -44,6 +44,10 @@ type BulkActionConfirmProps = {
   onConfirm: () => Promise<void>;
   isPending: boolean;
   destructive?: boolean;
+  /** Step-1 content (e.g. #3818 Send's prompt field); hidden on step 2. */
+  children?: ReactNode;
+  /** Keep the confirm disabled (e.g. an empty prompt). */
+  confirmDisabled?: boolean;
 };
 
 export function BulkActionConfirm({
@@ -57,6 +61,8 @@ export function BulkActionConfirm({
   onConfirm,
   isPending,
   destructive = false,
+  children,
+  confirmDisabled = false,
 }: BulkActionConfirmProps) {
   const [step, setStep] = useState<1 | 2>(1);
   const [armed, setArmed] = useState(true);
@@ -90,7 +96,7 @@ export function BulkActionConfirm({
   const copy = step === 2 ? second : first;
 
   const handleConfirm = async () => {
-    if (!armedRef.current) return;
+    if (!armedRef.current || confirmDisabled) return;
     if (step === 1 && twoStep) {
       armedRef.current = false;
       setStep(2);
@@ -118,6 +124,8 @@ export function BulkActionConfirm({
             {copy.description}
           </DialogDescription>
         </DialogHeader>
+
+        {step === 1 && children ? <div className="mt-3">{children}</div> : null}
 
         {note ? (
           <p
@@ -166,7 +174,7 @@ export function BulkActionConfirm({
                   : ""
             }
             onClick={handleConfirm}
-            disabled={isPending || !armed}
+            disabled={isPending || !armed || confirmDisabled}
           >
             {isPending ? (
               <span className="inline-flex items-center gap-1.5">

@@ -104,6 +104,7 @@ export function mountPorterOnelinerRoutes(
       tokenStore: opts.tokenStore,
       planStore: opts.planStore,
       settingsFile: opts.settingsFile,
+      errorLogger: opts.errorLogger,
     })
   );
   app.route("/", createPorterOnelinerPublicRoutes(opts));
@@ -113,6 +114,8 @@ export function createPorterOnelinerApiRoutes(opts: {
   tokenStore: PorterTokenStore;
   planStore: PlanStore;
   settingsFile: string;
+  /** #5202 (U14): where a status read's failed plan summary is logged. */
+  errorLogger?: ErrorLogger | null;
 }): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
 
@@ -121,7 +124,6 @@ export function createPorterOnelinerApiRoutes(opts: {
   // caller's namespace/user so the upload broadcast passes the SSE namespace gate.
   app.post(
     "/porter/token",
-    createRateLimiter({ name: "porter-token-mint" }),
     cataloged(
       defineCapability({
         id: "porter.mint-oneliner-token",
@@ -137,6 +139,7 @@ export function createPorterOnelinerApiRoutes(opts: {
         probe: "skip",
       })
     ),
+    createRateLimiter({ name: "porter-token-mint" }),
     async c => {
       const namespace = c.get("namespace");
       const userId = c.get("userId");
@@ -197,12 +200,25 @@ export function createPorterOnelinerApiRoutes(opts: {
       const plan = st.stagingHandle
         ? opts.planStore.get(st.stagingHandle)
         : undefined;
-      return c.json({
+      const base = {
         state: st.state,
         expiresAt: st.expiresAt,
         fetchCount: st.fetchCount,
-        ...(plan ? { plan: toPlanSummary(plan) } : {}),
-      });
+      };
+      if (!plan) return c.json(base);
+      // #5202 (U14): a summary that throws is reported in the body, not as a
+      // 500 — the poller stops on `received` and shows `planError` instead of
+      // retrying a transport fault forever.
+      try {
+        return c.json({ ...base, plan: toPlanSummary(plan) });
+      } catch (err) {
+        opts.errorLogger?.log(
+          "error",
+          `[porter-oneliner] plan summary failed: ${err instanceof Error ? err.message : String(err)}`,
+          { category: "porter-oneliner", source: "server" }
+        );
+        return c.json({ ...base, planError: "summary failed" });
+      }
     }
   );
 
@@ -249,7 +265,6 @@ export function createPorterOnelinerPublicRoutes(opts: {
   // it): a `.ps1` suffix OR a `PowerShell/` User-Agent selects powershell.
   app.get(
     "/p/:token",
-    createRateLimiter({ name: "porter-oneliner-fetch", keyFn: clientAddrKey }),
     cataloged(
       defineCapability({
         id: "porter.oneliner-fetch-script",
@@ -266,6 +281,7 @@ export function createPorterOnelinerPublicRoutes(opts: {
         probe: "skip",
       })
     ),
+    createRateLimiter({ name: "porter-oneliner-fetch", keyFn: clientAddrKey }),
     async c => {
       const rawParam = c.req.param("token");
       let token = rawParam;
@@ -332,7 +348,6 @@ export function createPorterOnelinerPublicRoutes(opts: {
   // (token → Content-Length) so a bad/oversize upload never buffers the body.
   app.post(
     "/p/:token/archive",
-    createRateLimiter({ name: "porter-oneliner-upload", keyFn: clientAddrKey }),
     cataloged(
       defineCapability({
         id: "porter.oneliner-upload-archive",
@@ -353,6 +368,7 @@ export function createPorterOnelinerPublicRoutes(opts: {
         probe: "skip",
       })
     ),
+    createRateLimiter({ name: "porter-oneliner-upload", keyFn: clientAddrKey }),
     async c => {
       const token = c.req.param("token");
 

@@ -28,7 +28,10 @@ import {
   bootstrapSession,
   type SessionStartedBy,
 } from "@/agent/sessionFactory";
-import { startHappyServer } from "@/claude/utils/startHappyServer";
+import {
+  autoApprovedHapiToolNames,
+  startHappyServer,
+} from "@/claude/utils/startHappyServer";
 import { startHookServer } from "@/claude/utils/startHookServer";
 import {
   generateHookSettingsFile,
@@ -199,7 +202,10 @@ export class AcpIngressServer {
 
     // Reconstruct the exact governed-session scaffolding the PWA launcher builds
     // (runClaude.ts:807-844): HAPI MCP server + hook server + hook-settings file.
-    const happyServer = await startHappyServer(apiSession);
+    // #4450 R7: this launcher owns an `allowedTools` list, like runClaude.
+    const happyServer = await startHappyServer(apiSession, {
+      operatorTools: true,
+    });
     const hookServer = await startHookServer({ onSessionHook: () => {} });
     const hookSettingsPath = generateHookSettingsFile(
       hookServer.port,
@@ -208,7 +214,8 @@ export class AcpIngressServer {
     const mcpServers: Record<string, unknown> = {
       [HAPI_MCP_SERVER_NAME]: { type: "http", url: happyServer.url },
     };
-    const allowedTools = happyServer.toolNames.map(
+    // #4450 D2 = A: an operator tool keeps its permission prompt.
+    const allowedTools = autoApprovedHapiToolNames(happyServer.toolNames).map(
       toolName => `mcp__${HAPI_MCP_SERVER_NAME}__${toolName}`
     );
 
