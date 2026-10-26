@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { RedactedApiKey } from "@hapi/protocol/schemas";
+import type {
+  AvailableApiKeysUnavailableReason,
+  RedactedApiKey,
+} from "@hapi/protocol/schemas";
 
 /**
  * B3 (#1956): per-key validation status → indicator color + label.
@@ -29,4 +32,39 @@ export function apiKeyDisplayName(
   key: Pick<RedactedApiKey, "label" | "maskedKey">
 ): string {
   return key.label?.trim() || key.maskedKey;
+}
+
+/**
+ * Issue #5127: a key's name with its home node when it is stored on another
+ * node ("Work key · RP1"), so the picker, the summary and the preview say
+ * where the key lives. A key on this node reads exactly as
+ * {@link apiKeyDisplayName}.
+ */
+export function apiKeyDisplayNameWithHome(
+  key: Pick<RedactedApiKey, "label" | "maskedKey"> & {
+    local?: boolean;
+    homeNodeLabel?: string;
+  }
+): string {
+  const name = apiKeyDisplayName(key);
+  return key.local === false && key.homeNodeLabel
+    ? `${name} · ${key.homeNodeLabel}`
+    : name;
+}
+
+/** Issue #5127: one hint line for a node whose shared keys could not be listed. */
+export function sharedKeysUnavailableHint(node: {
+  nodeLabel: string;
+  reason: AvailableApiKeysUnavailableReason;
+}): string {
+  switch (node.reason) {
+    case "offline":
+      return `${node.nodeLabel}'s shared keys are unavailable (offline)`;
+    case "unsupported":
+      return `${node.nodeLabel} needs updating before its keys can be shared`;
+    case "transport":
+      return `${node.nodeLabel}'s keys can be shared only over Tailscale`;
+    default:
+      return `${node.nodeLabel}'s shared keys are unavailable`;
+  }
 }

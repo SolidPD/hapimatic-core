@@ -185,6 +185,29 @@ export function isPendingSpawnTimeout(spawn: PendingSpawn): boolean {
   return spawn.state === "failed" && spawn.error === TIMEOUT_ERROR;
 }
 
+/**
+ * #5696: true when this tab holds a stub, not timed out, for the remote spawn
+ * with this correlation id. Normally that stub is still spawning or failed
+ * with the node's error, and `RemoteSpawnFailedToastListener` announces both,
+ * so `NotificationListener` leaves the pop-up to that listener and the
+ * hub-written `spawn-failed` row is not toasted twice here. A stub the Create
+ * page or fan-out failed synchronously (`markSpawnFailed`) also returns true,
+ * although nothing announced the node's error; the row is still in the inbox.
+ * Deliberately state-agnostic beyond the timeout check: the `notification`
+ * SSE can be handled before or after `handleSpawnFailed` (behind a dynamic
+ * import in useSSE) flips the stub.
+ */
+export function remoteSpawnStubAnnouncesFailure(
+  spawnCorrelationId: string
+): boolean {
+  for (const spawn of spawns.values()) {
+    if (spawn.spawnCorrelationId === spawnCorrelationId) {
+      return !isPendingSpawnTimeout(spawn);
+    }
+  }
+  return false;
+}
+
 export function markSpawnFailed(id: string, rawError: string): void {
   failStub(id, rawError);
 }

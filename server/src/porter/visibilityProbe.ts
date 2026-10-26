@@ -5,6 +5,9 @@ import {
   REPAIRABLE_FILE_DIMS,
   USER_SCOPE_CONFIG_DIMS,
 } from "@hapi/protocol/accountConfigDims";
+import type { AccountVisibility } from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type { AccountVisibility } from "@hapi/protocol/porter";
 
 /**
  * Post-import visibility verification (#3246) — a READ-ONLY server-side probe
@@ -45,30 +48,6 @@ import {
  * `symlink`/`unlink`/`mkdir`. Probing must NEVER clobber a real skills dir (that guard is data-loss
  * protection; the fix VERIFIES + SURFACES the orphan, it does not "fix" it).
  */
-
-/** Per-account visibility snapshot: which imported dims are visible/pending/orphaned/absent. */
-export interface AccountVisibility {
-  /** The account UUID (the `<uuid>` directory name under `base`). */
-  account: string;
-  /** The account-config BASE dir this account was enumerated from. */
-  base: string;
-  /** Dims correctly symlinked to `<hostClaudeDir>/<dim>` — visible in the account's sessions. */
-  visible: string[];
-  /**
-   * Dims not yet linked but that the bridge WILL link on the next spawn (dst
-   * absent, or a wrong-target symlink it re-points). Informational — the normal
-   * first-import state — NEVER a warning.
-   */
-  pending: string[];
-  /**
-   * Dims blocked by a REAL file/dir at the account path (the clobber-refusal
-   * case): the bridge refuses to clobber, so the session falls back to the host
-   * dir — isolation degraded for this account/dim.
-   */
-  orphaned: string[];
-  /** Dims whose host source is absent — nothing to link (not an error). */
-  absent: string[];
-}
 
 /**
  * Classify one dim for one account dir, mirroring `provisionUserScopeConfigDir`'s

@@ -19,6 +19,10 @@
 // browser permission stays `granted` after Disable, so without a persisted
 // opt-out the app re-subscribed on its next load and notifications resumed.
 import { getStorageKey, getCacheName } from "@/lib/storage-keys";
+import {
+  NEW_KIND_PREFERENCE_KEYS,
+  type NewKindPreferenceKey,
+} from "@/lib/notificationKindPrefs";
 
 // Local storage keys for the per-type notification toggles (instance-specific).
 export const STORAGE_KEYS = {
@@ -28,7 +32,30 @@ export const STORAGE_KEYS = {
   errors: getStorageKey("hapi:notify:errors"),
   stalls: getStorageKey("hapi:notify:stalls"),
   usage: getStorageKey("hapi:notify:usage"),
-} as const;
+  // Issue #4915: the global "Show pop-ups" switch (Lane 2 toasts only) and one
+  // toggle per non-push notification kind. A kind toggle gates that kind's
+  // pop-up (the inbox row is always stored); `showPopups` never affects push.
+  showPopups: getStorageKey("hapi:notify:showPopups"),
+  toolErrors: getStorageKey("hapi:notify:toolErrors"),
+  promptBlocked: getStorageKey("hapi:notify:promptBlocked"),
+  apiErrors: getStorageKey("hapi:notify:apiErrors"),
+  accountUnrefreshable: getStorageKey("hapi:notify:accountUnrefreshable"),
+  sessionRestartFailed: getStorageKey("hapi:notify:sessionRestartFailed"),
+  spawnFailed: getStorageKey("hapi:notify:spawnFailed"),
+  waitingForSlot: getStorageKey("hapi:notify:waitingForSlot"),
+  loopsResuming: getStorageKey("hapi:notify:loopsResuming"),
+  modelReverted: getStorageKey("hapi:notify:modelReverted"),
+} as const satisfies Record<
+  | "permissions"
+  | "questions"
+  | "ready"
+  | "errors"
+  | "stalls"
+  | "usage"
+  | "showPopups"
+  | NewKindPreferenceKey,
+  string
+>;
 
 // Issue #87: per-session mute set. Port-scoped to match the `hapi:notify:*`
 // family — the raw key is NOT used anywhere else, so this constant is the single
@@ -58,13 +85,15 @@ export type NotificationPreferences = {
   errors: boolean;
   stalls: boolean;
   usage: boolean;
+  // Issue #4915: the global "Show pop-ups" switch (Lane 2 toasts only).
+  showPopups: boolean;
   // Issue #87: session IDs the user has muted. A muted id suppresses that
   // session's push in the service worker even when its type toggle is on.
   mutedSessions: string[];
   // Issue #4836: true after the user pressed Disable. The service worker shows
   // nothing and unsubscribes while this is set.
   globalOptOut: boolean;
-};
+} & Record<NewKindPreferenceKey, boolean>; // Issue #4915: one toggle per non-push kind
 
 export function getStoredPreference(key: string): boolean {
   if (typeof window === "undefined") return true;
@@ -157,6 +186,34 @@ export function pruneMutedSessions(validIds: Set<string>): boolean {
   return true;
 }
 
+/**
+ * The current preference snapshot from localStorage: every toggle (default on),
+ * the muted set and the global opt-out. The service-worker cache mirrors this
+ * object, and `NotificationListener` reads it at decision time (issue #4915), so
+ * a toggle applies to the next notification without a re-render. A storage
+ * error propagates to the caller.
+ */
+export function readNotificationPreferences(): NotificationPreferences {
+  const kinds = Object.fromEntries(
+    NEW_KIND_PREFERENCE_KEYS.map(key => [
+      key,
+      getStoredPreference(STORAGE_KEYS[key]),
+    ])
+  ) as Record<NewKindPreferenceKey, boolean>;
+  return {
+    permissions: getStoredPreference(STORAGE_KEYS.permissions),
+    questions: getStoredPreference(STORAGE_KEYS.questions),
+    ready: getStoredPreference(STORAGE_KEYS.ready),
+    errors: getStoredPreference(STORAGE_KEYS.errors),
+    stalls: getStoredPreference(STORAGE_KEYS.stalls),
+    usage: getStoredPreference(STORAGE_KEYS.usage),
+    showPopups: getStoredPreference(STORAGE_KEYS.showPopups),
+    ...kinds,
+    mutedSessions: [...readMutedSessions()],
+    globalOptOut: readGlobalOptOut(),
+  };
+}
+
 /** Resolves false only when a write was attempted and failed. */
 async function writePreferencesToCache(): Promise<boolean> {
   if (typeof window === "undefined" || !("caches" in window)) return true;
@@ -166,16 +223,7 @@ async function writePreferencesToCache(): Promise<boolean> {
   // which every later sync — including the one Disable awaits before it
   // unsubscribes — rejected without running.
   try {
-    const prefs: NotificationPreferences = {
-      permissions: getStoredPreference(STORAGE_KEYS.permissions),
-      questions: getStoredPreference(STORAGE_KEYS.questions),
-      ready: getStoredPreference(STORAGE_KEYS.ready),
-      errors: getStoredPreference(STORAGE_KEYS.errors),
-      stalls: getStoredPreference(STORAGE_KEYS.stalls),
-      usage: getStoredPreference(STORAGE_KEYS.usage),
-      mutedSessions: [...readMutedSessions()],
-      globalOptOut: readGlobalOptOut(),
-    };
+    const prefs = readNotificationPreferences();
 
     const cache = await caches.open(PREFERENCES_CACHE_NAME);
     const response = new Response(JSON.stringify(prefs), {

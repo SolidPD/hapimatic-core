@@ -3,12 +3,15 @@ import { z } from "zod";
 import { ExistingBranchSchema, SourceBranchSchema } from "./gitBranches";
 import { optionalSessionNameSchema } from "./sessionName";
 import { ClaudeRemoteLauncherKindSchema } from "./launcherResolver";
+import { isQualifiedApiKeyRef, isUsableNodeIdForSharing } from "./apiKeyRef";
 import {
+  ApiKeyStatusSchema,
   DaemonCapSourceSchema,
   EffortLevelSchema,
   ModelModeSchema,
   ModelRoutingSchema,
   NativeModelSelectionSchema,
+  RedactedApiKeySchema,
   SessionRoleSchema,
 } from "./schemas";
 
@@ -41,6 +44,16 @@ export const LOCAL_NODE_LABEL = "This node";
  * without the tag is refused before any proxy call (`node_login_unsupported`).
  */
 export const ANTHROPIC_LOGIN_CAPABILITY = "accounts:anthropic-login";
+
+/**
+ * Issue #5127: advertised by every node whose binary serves the shared-API-key
+ * receivers (`/api/federation/api-keys/{shared,resolve,secret}`) and the
+ * key-bound spawn path (`/api/federation/spawn-api-key`). A node only asks a
+ * peer for a key, lists a peer's shared keys, or sends a key-bound spawn to a
+ * peer that advertises it; an older peer is refused before any call, so it can
+ * never strip the key and bill its default account instead.
+ */
+export const SHARED_API_KEYS_CAPABILITY = "api-keys:shared";
 
 /**
  * The DNS suffix every cloud-provisioned Hapimatic VM lives under
@@ -276,6 +289,100 @@ export const FederationSpawnBodySchema = z.object({
 });
 
 export type FederationSpawnBody = z.infer<typeof FederationSpawnBodySchema>;
+
+// ─── Shared API keys across nodes (#5127) ────────────────────
+//
+// A key stays in its home node's vault. Another node reads its non-secret view
+// (`shared`, `resolve`) and fetches its secret (`secret`) from the home over the
+// federation link, each time a session there needs it. Every body names the
+// key by vault id and the home by its own node id; `requestingNodeId` is the
+// caller's claimed id, used for the home's audit trail and rate limit (it is not
+// authentication — the mesh token is).
+
+/** Body of the three home-node receivers. */
+export const FederationApiKeyRequestSchema = z.object({
+  id: z.string().uuid(),
+  homeNodeId: z.string().min(1).max(64),
+  /** The masked form the requester holds. A mismatch means the key was replaced
+   *  since it was picked, and the home refuses rather than serve a new key. */
+  expectedMasked: z.string().max(64).optional(),
+  // #5127 (security review F5): a node id, so the audit log and report never
+  // carry control characters a peer chose.
+  requestingNodeId: z.string().min(1).max(64).refine(isUsableNodeIdForSharing),
+  /** The requester's session, for the audit trail only. */
+  sessionId: z.string().max(128).optional(),
+});
+export type FederationApiKeyRequest = z.infer<
+  typeof FederationApiKeyRequestSchema
+>;
+
+/** Body of `POST /federation/api-keys/shared`. */
+export const FederationSharedApiKeysRequestSchema = z.object({
+  // #5127 (security review F5): a node id, so the audit log and report never
+  // carry control characters a peer chose.
+  requestingNodeId: z.string().min(1).max(64).refine(isUsableNodeIdForSharing),
+});
+export type FederationSharedApiKeysRequest = z.infer<
+  typeof FederationSharedApiKeysRequestSchema
+>;
+
+/** A refusal from a home receiver. Answered as HTTP 200 so the code survives
+ *  every proxy hop (the `anthropicLogin.ts` convention). */
+export const FederationApiKeyRefusalSchema = z.object({
+  ok: z.literal(false),
+  code: z.string().min(1).max(64),
+  message: z.string().max(400),
+});
+export type FederationApiKeyRefusal = z.infer<
+  typeof FederationApiKeyRefusalSchema
+>;
+
+/** `shared`: the home's shared Anthropic keys, redacted. */
+export const FederationSharedApiKeysSchema = z.object({
+  ok: z.literal(true),
+  homeNodeId: z.string(),
+  keys: z.array(RedactedApiKeySchema),
+});
+export type FederationSharedApiKeys = z.infer<
+  typeof FederationSharedApiKeysSchema
+>;
+
+/** `resolve`: one shared key's non-secret identity. */
+export const FederationApiKeyResolvedSchema = z.object({
+  ok: z.literal(true),
+  id: z.string(),
+  provider: z.literal("anthropic"),
+  label: z.string().optional(),
+  maskedKey: z.string(),
+  status: ApiKeyStatusSchema,
+});
+export type FederationApiKeyResolved = z.infer<
+  typeof FederationApiKeyResolvedSchema
+>;
+
+/** `secret`: the key itself. The field is `apiKey` (not `key`) so the Sentry
+ *  scrubber's sensitive-name rule masks it if this body is ever captured. */
+export const FederationApiKeySecretSchema = z.object({
+  ok: z.literal(true),
+  apiKey: z.string().min(1).max(4096),
+});
+export type FederationApiKeySecret = z.infer<
+  typeof FederationApiKeySecretSchema
+>;
+
+/** Body of `POST /federation/spawn-api-key`: a spawn bound to a key homed on
+ *  another node. `apiKeyId` must be a qualified `<uuid>@<homeNodeId>` ref; a
+ *  bare id is refused (a local key spawns locally, never through this path). */
+export const FederationApiKeySpawnBodySchema = FederationSpawnBodySchema.extend(
+  {
+    apiKeyId: z.string().refine(isQualifiedApiKeyRef, {
+      message: "apiKeyId must be a qualified <uuid>@<homeNodeId> reference",
+    }),
+  }
+);
+export type FederationApiKeySpawnBody = z.infer<
+  typeof FederationApiKeySpawnBodySchema
+>;
 
 // ─── Spawn status callback (node → hub) ─────────────────────
 

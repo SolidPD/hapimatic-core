@@ -12,6 +12,7 @@ import {
 import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import { cataloged } from "../../../capabilities/cataloged";
 import { checkFederationToken, type FederationDeps } from "./shared";
+import { createDegradedLog, LOCAL_DEGRADED_LOG_KEY } from "./degradedLog";
 
 /**
  * Node-to-node active-account receivers (issue #1452, Sub-Issue F of epic #1446).
@@ -36,6 +37,8 @@ export function createFederationAccountRoutes(
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   const jwtAuth = createAuthMiddleware(deps.jwtSecret);
+  // #5417: logs degraded provider-auth-state reads, throttled per node.
+  const logOnce = createDegradedLog(deps);
 
   const setActiveAccountSchema = z.object({
     accountUuid: z.string().uuid(),
@@ -97,6 +100,17 @@ export function createFederationAccountRoutes(
       );
       if (result.ok) {
         return c.json({ type: "success" });
+      }
+      // #3982: the hub's setActiveAccountOnNode reads this code and answers 400.
+      if (result.code === "provider_mismatch") {
+        return c.json(
+          {
+            type: "error",
+            error: "Account belongs to a different provider",
+            code: "provider_mismatch",
+          },
+          400
+        );
       }
       return c.json(
         {
@@ -225,9 +239,10 @@ export function createFederationAccountRoutes(
 
   // ─── Web client endpoint: GET /federation/provider-auth-state (JWT, HUB aggregation) ──
   // Non-Anthropic provider auth state across the mesh (issue #3806, epic #3345).
-  // Mirrors the /federation/accounts/usage aggregator byte-for-byte: serves THIS
-  // node locally (the hub is itself a node, not in getNodeSummaries()) + fans out
-  // to every peer via NodeRegistry.getProviderAuthStateOnNode, one row per node.
+  // Follows the /federation/accounts/usage aggregator's shape: serves THIS node
+  // locally (the hub is itself a node, not in getNodeSummaries()) + fans out to
+  // every peer via NodeRegistry.getProviderAuthStateOnNode, one row per node.
+  // Unlike usage, a local reader failure keeps this node's row as `error` (#5739).
   // Only DERIVED fields cross the wire; the envelope is parse'd on egress (R6).
   // GET/POST share the path and differ by method (Hono dispatches by method): the
   // GET carries jwtAuth (end-user), the POST does its own checkFederationToken.
@@ -262,22 +277,39 @@ export function createFederationAccountRoutes(
 
       // Local node first (the hub is itself a node; NOT in getNodeSummaries()).
       // On a non-federated install this is the only row (LOCAL_NODE_ID sentinel).
+      const localNodeId = deps.federationConfig?.nodeId ?? LOCAL_NODE_ID;
       if (reader) {
         try {
           const facts = await reader();
           nodes.push({
-            nodeId: deps.federationConfig?.nodeId ?? LOCAL_NODE_ID,
+            nodeId: localNodeId,
             status: "ok",
             openai: facts.openai,
             google: facts.google,
           });
-        } catch {
-          // Local failure is non-fatal — degrade to remote-only (mirror usage.ts).
+          logOnce.ok(LOCAL_DEGRADED_LOG_KEY);
+        } catch (err) {
+          // Local failure is non-fatal: report this node as `error` (it
+          // answered; its reader failed, the #5420 account-health rule), and
+          // never silently (#5417, #5739).
+          logOnce.warn(
+            LOCAL_DEGRADED_LOG_KEY,
+            "local_read_failed",
+            `[Federation] provider-auth-state: this node's reader failed: ${err instanceof Error ? err.message : String(err)}`,
+            { nodeId: localNodeId }
+          );
+          nodes.push({ nodeId: localNodeId, status: "error", openai: [] });
         }
       }
 
-      // Remote peers — concurrent, partial-success. An unreachable peer becomes a
-      // degraded `unreachable` row, NEVER silently dropped (3806-12).
+      // Remote peers — concurrent, partial-success. An unreachable or malformed
+      // peer becomes a degraded `unreachable` row, NEVER silently dropped
+      // (3806-12), and every degradation except `offline` is logged with its
+      // reason, once per node until the reason changes (#5417). The failure
+      // class is one of a fixed set (the registry's outcome, or `malformed`
+      // from the row validation below), so a peer's body can decide which
+      // class applies but never supplies the log text or the throttle key
+      // (#5739).
       if (registry) {
         const summaries = registry.getNodeSummaries();
         const results = await Promise.allSettled(
@@ -285,19 +317,97 @@ export function createFederationAccountRoutes(
         );
         results.forEach((r, i) => {
           const s = summaries[i]!;
-          if (r.status === "fulfilled" && r.value && !("type" in r.value)) {
-            const v = r.value;
-            nodes.push({
-              // Stamp the hub's canonical id for the peer (correlates with the
-              // web's node list), not whatever the peer reported for itself.
-              nodeId: s.nodeId,
-              status: v.status ?? "ok",
-              openai: v.openai ?? [],
-              google: v.google,
-            });
-          } else {
-            nodes.push({ nodeId: s.nodeId, status: "unreachable", openai: [] });
+          const degraded: NodeProviderAuthState = {
+            nodeId: s.nodeId,
+            status: "unreachable",
+            openai: [],
+          };
+          if (r.status === "rejected") {
+            // A rejection is a hub-side bug (the registry's readPeerRoute
+            // catches every fetch failure itself), so only the log names it.
+            logOnce.warn(
+              s.nodeId,
+              "rejected",
+              `[Federation] provider-auth-state read of ${s.nodeId} threw: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
+              { nodeId: s.nodeId }
+            );
+            nodes.push(degraded);
+            return;
           }
+          const outcome = r.value;
+          // `offline` is an expected state, not a failure.
+          if (outcome.kind === "offline") {
+            nodes.push(degraded);
+            return;
+          }
+          if (outcome.kind === "unsupported") {
+            logOnce.warn(
+              s.nodeId,
+              "unsupported",
+              `[Federation] provider-auth-state read of ${s.nodeId} failed (unsupported): the node runs a build without this read; update it`,
+              { nodeId: s.nodeId, reason: "unsupported" }
+            );
+            nodes.push(degraded);
+            return;
+          }
+          if (outcome.kind === "unreachable") {
+            // Status-only or fixed text: a peer cannot vary the throttle key.
+            const detail = outcome.message.slice(0, 200) || "request failed";
+            logOnce.warn(
+              s.nodeId,
+              `${outcome.reason}:${detail}`,
+              `[Federation] provider-auth-state read of ${s.nodeId} failed (${outcome.reason}): ${detail}`,
+              { nodeId: s.nodeId, reason: outcome.reason }
+            );
+            nodes.push(degraded);
+            return;
+          }
+          // The peer body is untrusted JSON: a primitive must never reach `in`.
+          const v: unknown = outcome.body;
+          const isObject = v !== null && typeof v === "object";
+          const peer = isObject ? (v as Partial<NodeProviderAuthState>) : null;
+          // Validate what the peer SENT; only the node id is the hub's own. A
+          // body missing `status` or `openai` is malformed, not an empty healthy
+          // node: every receiver build sends both fields.
+          const parsed = peer
+            ? NodeProviderAuthStateSchema.safeParse({
+                ...peer,
+                nodeId: s.nodeId,
+              })
+            : null;
+          // One row this build cannot read degrades that node only; before
+          // #5417 it failed the envelope parse and the whole response.
+          if (!peer || !parsed?.success) {
+            // Name what failed by schema path and issue code only: a Zod
+            // message or received value can echo the peer's data.
+            const issues =
+              parsed && !parsed.success
+                ? parsed.error.issues
+                    .slice(0, 5)
+                    .map(i => `${i.path.join(".") || "(row)"}: ${i.code}`)
+                : ["(body): not an object"];
+            logOnce.warn(
+              s.nodeId,
+              "malformed",
+              `[Federation] provider-auth-state: ${s.nodeId} sent a malformed row; reported unreachable (${issues.join(", ")})`,
+              { nodeId: s.nodeId, reason: "malformed", issues }
+            );
+            nodes.push(degraded);
+            return;
+          }
+          logOnce.ok(s.nodeId);
+          // The row as the hub always built it, not the parse result: the
+          // envelope parse below sees the same input as before #5417, so a
+          // healthy response is unchanged.
+          nodes.push({
+            // Stamp the hub's canonical id for the peer (correlates with the
+            // web's node list), not whatever the peer reported for itself.
+            nodeId: s.nodeId,
+            status: parsed.data.status,
+            // Present: the parse above passed.
+            openai: peer.openai!,
+            google: peer.google,
+          });
         });
       }
 
@@ -307,8 +417,9 @@ export function createFederationAccountRoutes(
 
   // ─── Node-to-node endpoint: POST /federation/provider-auth-state (peer fan-in) ──
   // Returns THIS node's provider auth state for the hub aggregator. POST (not GET)
-  // because the generic proxyToNode only issues POST (same convention as the
-  // active-account /current + usage receivers). Parse-on-egress strips any
+  // because the hub's peer reads only issue POST (NodeRegistry.readPeerRoute, like
+  // the generic proxyToNode; same convention as the active-account /current +
+  // usage receivers). Parse-on-egress strips any
   // token/key (structural guarantee). [ER 2026-09-19: 3806-5]
   app.post(
     "/federation/provider-auth-state",

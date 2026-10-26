@@ -45,6 +45,7 @@ import type {
 } from "@hapi/protocol";
 import {
   JOB_KIND_IN_PROCESS_LOOP,
+  formatReloginMessage,
   isEnvTokenAccount,
   generateSessionId,
   type JobRegistry,
@@ -58,6 +59,8 @@ import type {
   CeilingGuardConfigPatch,
 } from "@hapi/protocol/schemas";
 import type { PushService } from "../push/pushService";
+import { buildSessionPushPayload } from "../push/sessionPushPayload";
+import { getSessionName } from "../notifications/sessionInfo";
 import { getCeilingGuardDefaults } from "../config/ceilingGuardConfig";
 import {
   CEILING_RATE_WINDOW_MS,
@@ -124,6 +127,7 @@ import {
   type RpcWriteFileResponse,
   type RecoverWorktreeRpcResult,
 } from "./rpcGateway";
+import type { SpawnSuccess } from "./spawnSuccess";
 import { notifySessionEnded as notifyTranscriptSessionEnded } from "../services/transcriptIndexer";
 import { resolveTranscriptPaths } from "./transcript/transcriptPath";
 import {
@@ -153,6 +157,11 @@ import type {
 } from "@hapi/protocol";
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { Notifier } from "../notifications/notifier";
+import type { NotificationService } from "../notifications/notificationService";
+import {
+  loopsResumingNotification,
+  type ProducerNotification,
+} from "../notifications/producerNotifications";
 import {
   buildEscalationPayload,
   SESSION_FATAL_ESCALATION_CATEGORY,
@@ -492,6 +501,21 @@ export class SyncEngine {
   private notifier: Notifier | null = null;
 
   /**
+   * Issue #4914 — the user-notification service (`notify()`, epic #4912), and
+   * this node's identity for the `account-unrefreshable` "Log in" action.
+   * Injected via `setNotificationService` from `index.ts` (the `setNotifier`
+   * convention). Unset ⇒ `notifyUser` no-ops; the legacy SyncEvents still fire.
+   */
+  private notificationService: Pick<NotificationService, "notify"> | null =
+    null;
+  private getLocalNodeIdentity:
+    | (() => {
+        nodeId: string;
+        nodeLabel: string;
+      })
+    | null = null;
+
+  /**
    * Issue #3611 — the server-side `autoSelectOptimalAccount` preference reader,
    * injected via `setAutoSelectOptimalAccountReader` post-construction from
    * `index.ts` (no construction-order dependency; keeps the constructor + every
@@ -638,6 +662,8 @@ export class SyncEngine {
       getSessionMetadata: sid =>
         this.sessionCache.getSession(sid)?.metadata ?? undefined,
       log: (message, context) => this.errorLogger?.info(message, context),
+      // #4914: a gate denial also raises a prompt-blocked notification.
+      notifyUser: input => this.notifyUser(input),
     });
     // #3331 (Task 9): register the USER-APPROVAL token-verify gate on the
     // #3124 message-hook stage. This is the FIRST production registration of a
@@ -748,6 +774,8 @@ export class SyncEngine {
       spawnSession: opts => this.spawnSession(opts),
       // #2453 (Task 7): auto-resume this session's ledgered loops on reconnect.
       getLoopCronCoupler: () => this.loopCronCoupler,
+      // #4914: waiting-for-slot / account-unrefreshable notifications.
+      notifyUser: input => this.notifyUser(input),
     });
     // Issue #2080: account-keyed restart delegate (switchAccount +
     // tokenRefreshRestart). archiveSession + spawnSession stay facade methods
@@ -783,6 +811,8 @@ export class SyncEngine {
           return null;
         }
       },
+      // #4914: waiting-for-slot / account-unrefreshable / session-restart-failed.
+      notifyUser: input => this.notifyUser(input),
     });
     // Issue #2080: session-deletion delegate (single + bulk). All
     // collaborators are the same facade objects (test spies on
@@ -2086,7 +2116,6 @@ export class SyncEngine {
   ): void {
     const name = session?.metadata?.name ?? sessionId.slice(0, 8);
     const ns = session?.namespace ?? "default";
-    const emoji = session?.emoji ? `${session.emoji} ` : "";
     // #5254: word the notice by the action — a notify-only breach (hardStop
     // off) leaves the session running, so it must not claim a stop.
     const title = hardStop
@@ -2098,17 +2127,19 @@ export class SyncEngine {
       : `${name} crossed its ${dimension} ceiling (${value}/${ceiling}). hardStop ` +
         `is off, so the runaway guard did not stop it.`;
 
+    // #4921: the push is titled by the session; the breach is the body.
     void this.ceilingGuardPushService
-      ?.sendToNamespace(ns, {
-        title: `${emoji}${title}`,
-        body,
-        tag: `ceiling-${sessionId}`,
-        data: {
+      ?.sendToNamespace(
+        ns,
+        buildSessionPushPayload({
+          kind: "ceiling-breach",
           type: "ceiling-breach",
           sessionId,
-          url: `/sessions/${sessionId}`,
-        },
-      })
+          sessionTitle: session ? getSessionName(session) : null,
+          sessionEmoji: session?.emoji,
+          body: `${title}: ${dimension} ${value}/${ceiling}`,
+        })
+      )
       .catch(err =>
         this.errorLogger?.warn(
           `Ceiling guard: push surfacing failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
@@ -3178,11 +3209,9 @@ export class SyncEngine {
     return this.sessionRelaunch.relaunchSession(sessionId, overrides);
   }
 
-  async spawnSession(
-    opts: SpawnSessionOptions
-  ): Promise<
-    | { type: "success"; sessionId: string; resolvedName?: string }
-    | { type: "error"; message: string; code?: string }
+  async spawnSession(opts: SpawnSessionOptions): Promise<
+    // Issue #5614: SpawnSuccess carries the daemon's sessionTypeDowngrade.
+    SpawnSuccess | { type: "error"; message: string; code?: string }
   > {
     // Issue #1698 (G1, linchpin): server-side pre-spawn account-health gate.
     // spawnSession is the universal spawn choke point — create (machines.ts),
@@ -3446,12 +3475,16 @@ export class SyncEngine {
     count: number;
     pausedAtMs: number;
   }): void {
+    // TODO(#4912): legacy loops-resuming SyncEvent, kept for one release so a
+    // pre-#4915 web client still toasts. Remove its SSE/web delivery once Sub C
+    // (#4915) has shipped for a release.
     this.eventPublisher.emit({
       type: "loops-resuming",
       sessionId: signal.sessionId,
       count: signal.count,
       pausedAtMs: signal.pausedAtMs,
     });
+    this.notifyUser(loopsResumingNotification(signal));
   }
 
   /**
@@ -3481,6 +3514,78 @@ export class SyncEngine {
    */
   setNotifier(notifier: Notifier): void {
     this.notifier = notifier;
+  }
+
+  /**
+   * Issue #4914 — wire the user-notification service post-construction (the
+   * `setNotifier` convention). `getLocalNode` names this node on an
+   * `account-unrefreshable` row, the value `GET /api/events` stamps on the legacy
+   * event (#4461), so the web keeps its "Log in" action.
+   */
+  setNotificationService(
+    service: Pick<NotificationService, "notify">,
+    options?: { getLocalNode?: () => { nodeId: string; nodeLabel: string } }
+  ): void {
+    this.notificationService = service;
+    this.getLocalNodeIdentity = options?.getLocalNode ?? null;
+  }
+
+  /**
+   * Issue #4914 — raise a user notification for a server producer. Resolves the
+   * namespace from the session when the producer does not pass one, and skips
+   * when it cannot (there is no owner to scope the row to). Never throws: a
+   * notification must never break the flow that raised it.
+   */
+  notifyUser(input: ProducerNotification): void {
+    const service = this.notificationService;
+    if (!service) return;
+    try {
+      const namespace =
+        input.namespace ??
+        (input.sessionId
+          ? this.sessionCache.getSession(input.sessionId)?.namespace
+          : undefined);
+      if (!namespace) {
+        // No owner to scope the row to: skip, but leave a trace naming it.
+        console.warn(
+          `[SyncEngine] notifyUser skipped ${input.kind}: no namespace for session ${input.sessionId ?? "(none)"}`
+        );
+        return;
+      }
+      let context = input.context;
+      let title = input.title;
+      if (input.kind === "account-unrefreshable") {
+        if (this.getLocalNodeIdentity && context?.nodeId === undefined) {
+          const node = this.getLocalNodeIdentity();
+          context = {
+            ...context,
+            nodeId: node.nodeId,
+            nodeLabel: node.nodeLabel,
+          };
+        }
+        // The title must be the text the node-stamped HTTP 409 and SSE event
+        // show (web `buildReloginToast`), or the toast layer's exact-text dedup
+        // splits one refusal into two toasts. Same rule as the web: a node with
+        // both an id and a label gets the node-named text; otherwise the
+        // builder's unnamed message stays.
+        const nodeId = context?.nodeId;
+        const nodeLabel = context?.nodeLabel;
+        if (
+          typeof nodeId === "string" &&
+          nodeId.length > 0 &&
+          typeof nodeLabel === "string" &&
+          nodeLabel.length > 0
+        ) {
+          title = formatReloginMessage({ nodeLabel });
+        }
+      }
+      service.notify({ ...input, namespace, context, title });
+    } catch (err) {
+      console.error(
+        `[SyncEngine] notifyUser failed for ${input.kind} (session ${input.sessionId ?? "(none)"}):`,
+        err instanceof Error ? (err.stack ?? err.message) : String(err)
+      );
+    }
   }
 
   /**

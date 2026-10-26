@@ -19,10 +19,14 @@ import {
   type StoredApiKey,
 } from "@hapi/protocol/schemas";
 import {
+  isUsableNodeIdForSharing,
   normalizeAccountMonogram,
   type AccountMonogram,
+  type FederationConfig,
   type GoogleStoredAccount,
 } from "@hapi/protocol";
+import { isTenantVm } from "@hapi/protocol/tenantMode";
+import type { SharedApiKeyService } from "../../services/sharedApiKeyService";
 import {
   probeProvider,
   toLastValidation,
@@ -33,6 +37,7 @@ import type { AccountService } from "../../services/accountService";
 import { uuidV5 } from "../../services/providerAccountImport";
 import type { NicknameStore } from "../../accounts/nicknameStore";
 import type { MonogramStore } from "../../accounts/monogramStore";
+import type { ErrorLogger, ErrorLogOptions } from "../../logging/errorLogger";
 
 /**
  * API Keys routes (issue #1955, epic #1954 — the secrets-vault management UI).
@@ -60,6 +65,14 @@ import type { MonogramStore } from "../../accounts/monogramStore";
  * first and stored only when the provider accepts it — a rejected or unverifiable
  * key stores nothing. Every write goes through `updateSettings` (X5).
  *
+ * A Gemini mint whose account write and vault rollback both fail answers 500
+ * `mint_rollback_failed` and is logged with the vault id (#5429): the entry is
+ * left stored, so the user has to remove it before adding the key again. A
+ * mint whose rollback works, and a name or monogram that cannot be copied to
+ * the key's Google account, are logged as warnings (#5646). Every line names the
+ * vault id, the error class (two for the double fault) and, for a mirror, which
+ * sidecar failed; no line carries the key or an error message.
+ *
  * SEAM (#1733): a `provider:"openrouter"` add/remove is written through to the flat
  * `openRouterApiKey` setting so the already-merged Codex/OpenRouter gateway consumer
  * works end-to-end with no daemon change (R9/KD-3).
@@ -77,7 +90,7 @@ export { maskApiKey };
  * (NEVER a spread) is the structural guarantee the secret cannot leak — adding a
  * secret-bearing field to StoredApiKey cannot accidentally surface it here.
  */
-function toRedactedApiKey(entry: StoredApiKey): RedactedApiKey {
+export function toRedactedApiKey(entry: StoredApiKey): RedactedApiKey {
   return {
     id: entry.id,
     provider: entry.provider,
@@ -101,6 +114,9 @@ function toRedactedApiKey(entry: StoredApiKey): RedactedApiKey {
     // config + provenance. Added field-by-field (NEVER a spread) so the
     // structural no-leak guarantee holds: the secret cannot ride this path.
     ...(entry.descriptor ? { descriptor: entry.descriptor } : {}),
+    // #5127: whether other federation nodes may use the key. Always set, so the
+    // Settings switch reads an explicit value; only `true` in the vault shares.
+    shareAcrossNodes: entry.shareAcrossNodes === true,
   };
 }
 
@@ -158,6 +174,30 @@ function findDuplicate(
   );
 }
 
+/** A non-secret label for an error (#5429). In order: its errno-style `code`
+ *  when that matches the pattern (ENOSPC, EACCES …); else, for an Error, its
+ *  `name` when that matches ("Error" otherwise, and for a subclass that sets
+ *  no name); else `typeof error`; "unknown" when reading either property
+ *  throws. Never the message text, which can quote paths or file content, so
+ *  an error carrying free text in `code` or `name` still yields a fixed label. */
+export function errorClass(error: unknown): string {
+  try {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (typeof code === "string" && /^[A-Z][A-Z0-9_]{1,31}$/.test(code)) {
+      return code;
+    }
+    if (error instanceof Error) {
+      return /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(error.name)
+        ? error.name
+        : "Error";
+    }
+    return typeof error;
+  } catch {
+    // A throwing `code` or `name` getter must not escape the catch it labels.
+    return "unknown";
+  }
+}
+
 /** The flat `openRouterApiKey` mirrors the first remaining openrouter entry
  *  (R9/KD-3); with none left it is removed. */
 function withOpenRouterFlat(settings: Settings): Settings {
@@ -174,8 +214,17 @@ export interface ApiKeysRoutesOptions {
   /** #4463 R6: a Gemini key's name and monogram mirror onto its Google account. */
   getNicknameStore?: () => NicknameStore | null;
   getMonogramStore?: () => MonogramStore | null;
+  /** #5429/#5646: mint faults and failed sidecar mirrors are logged here
+   *  (console fallback). */
+  errorLogger?: ErrorLogger | null;
   /** Test seam: the provider probe's fetch. */
   fetchImpl?: FetchLike;
+  /** #5127: this node's federation config, for whether a key can be shared. */
+  getFederationConfig?: () => FederationConfig | null;
+  /** #5127: true on a hosted customer VM (defaults to `isTenantVm`). */
+  isTenantVm?: () => boolean;
+  /** #5127: the picker's cross-node key list (`GET /api-keys/available`). */
+  getSharedApiKeyService?: () => SharedApiKeyService | null;
 }
 
 export function createApiKeysRoutes(
@@ -187,23 +236,81 @@ export function createApiKeysRoutes(
   // B3 (#1956): the validate probe hits an external provider endpoint — rate-limit
   // it (defense-in-depth; the per-key TTL cache is the primary anti-hammering control).
   const validateLimiter = createRateLimiter({ name: "api-keys-validate" });
+  // #5127: the picker reads every node's shared keys on each Create-page open.
+  const availableLimiter = createRateLimiter({ name: "api-keys-available" });
+
+  /** #5127: why this node cannot share a key, or null when it can. */
+  function shareUnavailableReason(): string | null {
+    if ((opts.isTenantVm ?? (() => isTenantVm()))()) {
+      return "A hosted VM does not share API keys with other nodes";
+    }
+    const cfg = opts.getFederationConfig?.();
+    if (!cfg?.enabled) {
+      return "Federation is off on this node, so its keys cannot be shared";
+    }
+    if (!isUsableNodeIdForSharing(cfg.nodeId)) {
+      return "This node has no federation node id its keys can be shared under";
+    }
+    return null;
+  }
+
+  /** One non-secret api-keys log line (#5429, #5646): the ErrorLogger when
+   *  wired, else the console with the same `[category] message` text. The
+   *  console prints only the message, so every id goes in the message. */
+  function logFault(
+    severity: "error" | "warn",
+    message: string,
+    options: ErrorLogOptions & { category: string }
+  ): void {
+    if (opts.errorLogger) {
+      opts.errorLogger[severity](message, options);
+    } else if (severity === "error") {
+      console.error(`[${options.category}]`, message);
+    } else {
+      console.warn(`[${options.category}]`, message);
+    }
+  }
 
   /** Mirror a Gemini key's name and/or monogram onto its Google account's
-   *  sidecar stores (#4463 R6). Best-effort: the vault entry is the record. */
+   *  sidecar stores (#4463 R6). Best-effort: the vault entry is the record. A
+   *  failed write leaves the account showing its old identity until the next
+   *  edit retries it; it is logged, and the other write is still tried
+   *  (#5646 F3). */
   function syncAccountIdentity(
+    vaultId: string,
     accountUuid: string,
     change: { label?: string; monogram?: AccountMonogram }
   ): void {
-    try {
-      if (change.label !== undefined) {
-        opts.getNicknameStore?.()?.set(accountUuid, change.label);
+    const mirror = (
+      sidecar: "nickname" | "monogram",
+      write: () => void
+    ): void => {
+      try {
+        write();
+      } catch (error) {
+        const what = sidecar === "nickname" ? "name" : "monogram";
+        const failure = errorClass(error);
+        logFault(
+          "warn",
+          `Gemini key ${vaultId}: its ${what} could not be copied to its Google account (${failure})`,
+          {
+            category: "api-keys-mirror",
+            context: { vaultId, sidecar, error: failure },
+          }
+        );
       }
-      if (change.monogram !== undefined) {
-        opts.getMonogramStore?.()?.set(accountUuid, change.monogram);
-      }
-    } catch {
-      // A sidecar write failure leaves the account showing its old identity;
-      // the key itself is stored and the next edit retries the mirror.
+    };
+    if (change.label !== undefined) {
+      const label = change.label;
+      mirror("nickname", () =>
+        opts.getNicknameStore?.()?.set(accountUuid, label)
+      );
+    }
+    if (change.monogram !== undefined) {
+      const monogram = change.monogram;
+      mirror("monogram", () =>
+        opts.getMonogramStore?.()?.set(accountUuid, monogram)
+      );
     }
   }
 
@@ -231,6 +338,43 @@ export function createApiKeysRoutes(
       const settings = await readSettings(settingsFile);
       const entries = settings?.apiKeys ?? [];
       return c.json(entries.map(toRedactedApiKey));
+    }
+  );
+
+  // GET /api-keys/available — the keys the Create-page picker may bind for a
+  // spawn target, from every node of the federation (#5127). Redacted; each
+  // entry carries the exact `apiKeyId` the spawn must send (`bindingRef`).
+  app.get(
+    "/api-keys/available",
+    cataloged(
+      defineCapability({
+        id: "accounts.list-available-api-keys",
+        domain: "accounts",
+        surface: "rest",
+        description:
+          "List the Anthropic keys a spawn on a given node may use: this node's keys and every federation node's shared keys, redacted, each with the reference the spawn must send.",
+        whenToUse:
+          "When the Create page offers API keys for a local or remote target.",
+        invocation: {
+          kind: "rest",
+          method: "GET",
+          path: "/api/api-keys/available",
+        },
+        auth: "jwt",
+        // #3837 R12 (never-readonly class): reveals which providers and nodes
+        // hold keys, so it is not generically invocable.
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    availableLimiter,
+    async c => {
+      const service = opts.getSharedApiKeyService?.();
+      if (!service) {
+        return c.json({ error: "Shared API keys are unavailable" }, 503);
+      }
+      const target = c.req.query("targetNodeId")?.trim() || null;
+      return c.json(await service.listAvailable(target));
     }
   );
 
@@ -269,6 +413,28 @@ export function createApiKeysRoutes(
       }
       const { provider, accountUuid, label, key, descriptor } = parsed.data;
       const mode = parsed.data.mode ?? "upsert";
+      // #5127: only an Anthropic key can be shared with the other nodes (only
+      // Claude Code binds a key by id). Absent ⇒ not shared, even when this
+      // upsert replaces a shared entry (the replacement is a new entry).
+      const share = parsed.data.shareAcrossNodes === true;
+      if (share && provider !== "anthropic") {
+        return c.json(
+          {
+            error: "Only Anthropic keys can be made available to all nodes",
+            code: "share_unsupported",
+          },
+          400
+        );
+      }
+      // Refused on add exactly as on edit (security review F6, code review
+      // F8): a hosted VM, federation off, or no usable node id — so no flag
+      // waits there to go live later.
+      if (share) {
+        const unavailable = shareUnavailableReason();
+        if (unavailable) {
+          return c.json({ error: unavailable, code: "share_unavailable" }, 400);
+        }
+      }
       if (mode === "append" && SINGLE_KEY_PROVIDERS.has(provider)) {
         return c.json(
           {
@@ -374,6 +540,7 @@ export function createApiKeysRoutes(
         ...(descriptor ? { descriptor } : {}),
         ...(monogram ? { monogram } : {}),
         ...validated,
+        ...(share ? { shareAcrossNodes: true } : {}),
       };
 
       const outcome: { duplicate: boolean } = { duplicate: false };
@@ -441,15 +608,64 @@ export function createApiKeysRoutes(
         };
         try {
           accountService.add(record);
-        } catch {
+        } catch (addError) {
+          const addClass = errorClass(addError);
           // Undo the vault write so neither half survives alone.
-          await updateSettings(settingsFile, fresh => ({
-            ...fresh,
-            apiKeys: (fresh.apiKeys ?? []).filter(e => e.id !== id),
-          })).catch(() => {});
+          try {
+            await updateSettings(settingsFile, fresh => ({
+              ...fresh,
+              apiKeys: (fresh.apiKeys ?? []).filter(e => e.id !== id),
+            }));
+          } catch (rollbackError) {
+            // #5429 S1: both halves failed (e.g. a full disk). The vault entry
+            // is left bound to an account that was never written, so a retry of
+            // the same key answers 409 duplicate_key until the user removes it.
+            // Log the vault id only — never the key, an error message or a
+            // stack. The id goes in the message text: ErrorLogger prints only
+            // `[category] message` to the console, never its context.
+            const rollbackClass = errorClass(rollbackError);
+            logFault(
+              "error",
+              `Gemini key ${id}: its account could not be created and the vault rollback failed, so the vault entry is orphaned (add: ${addClass}, rollback: ${rollbackClass})`,
+              {
+                category: "api-keys",
+                requestPath: c.req.path,
+                requestMethod: c.req.method,
+                statusCode: 500,
+                context: {
+                  vaultId: id,
+                  addError: addClass,
+                  rollbackError: rollbackClass,
+                },
+              }
+            );
+            return c.json(
+              {
+                error:
+                  "The key was saved but its account could not be created, and the save could not be undone. Remove the key, then add it again",
+                code: "mint_rollback_failed",
+              },
+              500
+            );
+          }
+          // #5646 F2: the rollback worked, so no entry is left, but say why the
+          // account write failed: the client's report carries only the answer.
+          // Its own category, so a burst of these never rate-drops the double
+          // fault's `api-keys` line.
+          logFault(
+            "warn",
+            `Gemini key ${id}: its account could not be created, so the vault entry was rolled back (add: ${addClass})`,
+            {
+              category: "api-keys-mint",
+              requestPath: c.req.path,
+              requestMethod: c.req.method,
+              statusCode: 500,
+              context: { vaultId: id, addError: addClass },
+            }
+          );
           return c.json({ error: "Failed to create the key's account" }, 500);
         }
-        if (monogram) syncAccountIdentity(boundUuid, { monogram });
+        if (monogram) syncAccountIdentity(id, boundUuid, { monogram });
       }
       return c.json(toRedactedApiKey(entry), 201);
     }
@@ -500,8 +716,20 @@ export function createApiKeysRoutes(
       }
       const label =
         parsed.data.label !== undefined ? parsed.data.label.trim() : undefined;
+      // #5127: turning sharing ON needs a node that can share under its own
+      // federation id; turning it OFF always works.
+      const share = parsed.data.shareAcrossNodes;
+      if (share === true) {
+        const unavailable = shareUnavailableReason();
+        if (unavailable) {
+          return c.json({ error: unavailable, code: "share_unavailable" }, 400);
+        }
+      }
 
-      const applied: { entry: StoredApiKey | null } = { entry: null };
+      const applied: {
+        entry: StoredApiKey | null;
+        refused: "share_unsupported" | null;
+      } = { entry: null, refused: null };
       try {
         await updateSettings(settingsFile, fresh => {
           const entries = fresh.apiKeys ?? [];
@@ -516,6 +744,12 @@ export function createApiKeysRoutes(
             if (Object.keys(monogram).length > 0) next.monogram = monogram;
             else delete next.monogram;
           }
+          if (share === true && next.provider !== "anthropic") {
+            applied.refused = "share_unsupported";
+            return fresh;
+          }
+          if (share === true) next.shareAcrossNodes = true;
+          else if (share === false) delete next.shareAcrossNodes;
           applied.entry = next;
           return {
             ...fresh,
@@ -528,10 +762,22 @@ export function createApiKeysRoutes(
         }
         throw error;
       }
+      if (applied.refused === "share_unsupported") {
+        return c.json(
+          {
+            error: "Only Anthropic keys can be made available to all nodes",
+            code: "share_unsupported",
+          },
+          400
+        );
+      }
       const updated = applied.entry;
       if (!updated) return c.json({ error: "API key not found" }, 404);
       if (updated.accountUuid && isGoogleProvider(updated.provider)) {
-        syncAccountIdentity(updated.accountUuid, { label, monogram });
+        syncAccountIdentity(updated.id, updated.accountUuid, {
+          label,
+          monogram,
+        });
       }
       return c.json(toRedactedApiKey(updated));
     }

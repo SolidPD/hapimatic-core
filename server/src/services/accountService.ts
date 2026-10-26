@@ -184,9 +184,12 @@ export type DeleteAccountResult =
   | { ok: true }
   | { ok: false; code: "last_account" | "not_found" };
 
+/** #3982: `provider_mismatch` refuses a default write whose record belongs to a
+ *  different provider than the pointer being set (a Google uuid as the Anthropic
+ *  default, an Anthropic uuid as `byProvider.openai`). */
 export type SetActiveAccountResult =
   | { ok: true }
-  | { ok: false; code: "not_found" };
+  | { ok: false; code: "not_found" | "provider_mismatch" };
 
 /** Shape of the per-node active-account pointer file (`active.json`).
  *  #3808 Task 4b: `activeAccountUuid` stays the ANTHROPIC pointer (byte-identical
@@ -247,7 +250,12 @@ export class AccountService {
         readGeminiVaultEntries: () => geminiEntries,
         stampGeminiVaultAccountUuid: (entryId, accountUuid) =>
           stamps.push({ entryId, accountUuid }),
-        hasRecord: uuid => this.getRawAny(uuid) !== null,
+        // #3982 (D1-A): a removed account counts as present, so neither OpenAI
+        // gate (account dirs, host login) re-creates it from the codex dir the
+        // operator still owns. Google needs no tombstone: a stamped vault entry
+        // is never re-imported.
+        hasRecord: uuid =>
+          this.getRawAny(uuid) !== null || this.isTombstoned(uuid),
         addAccount: account => this.add(account),
       });
       if (stamps.length > 0) await deps.applyVaultStamps(stamps);
@@ -371,9 +379,15 @@ export class AccountService {
    * Gemini key together with its Google mirror record. It is honoured ONLY for a
    * record carrying a `vaultKeyRef` (the record holds no credential — a key card's
    * "Remove Key" must not be refused because it is the node's only Google
-   * account). On that path a per-node default pointer naming the removed uuid is
-   * cleared too, so no default points at a deleted account (#3982 Task 1 shape;
-   * #3982 extends the cleanup to every delete and adds its tombstone).
+   * account).
+   *
+   * #3982: this is the one choke point behind every account delete (the accounts
+   * route, the node route's local branch, the federation receiver and the key
+   * delete). A successful delete clears any per-node default pointer naming the
+   * uuid, and records the uuid in the node-local removal tombstone
+   * (`accounts/removed.json`) so the provider importer never re-creates the
+   * record from the codex dir or vault entry the operator still owns (D1-A: the
+   * artifact itself is never deleted, and a Gemini vault stamp is never removed).
    */
   delete(
     accountUuid: string,
@@ -412,8 +426,77 @@ export class AccountService {
     // index-based list() does not surface a phantom entry. Non-fatal — the
     // per-account file (source of truth) is already gone.
     this.removeFromIndex(accountUuid);
-    if (vaultMirror) this.clearActivePointerTo(accountUuid);
+    this.clearActivePointerTo(accountUuid);
+    this.addTombstone(accountUuid);
     return { ok: true };
+  }
+
+  /**
+   * #3982 (D1-A): true when `accountUuid` was removed on this node and must not be
+   * re-imported. An absent or unreadable tombstone file reads as "not removed".
+   */
+  isTombstoned(accountUuid: string): boolean {
+    return this.readTombstones().includes(accountUuid);
+  }
+
+  /**
+   * #3982 (D1-A): forget a removal, so the importer may create the record again —
+   * called when the same login is deliberately re-added (`add()`, and the device-
+   * auth re-add in CodexLoginService). Best-effort.
+   */
+  clearTombstone(accountUuid: string): void {
+    try {
+      const removed = this.readTombstones();
+      if (!removed.includes(accountUuid)) return;
+      this.writeTombstones(removed.filter(uuid => uuid !== accountUuid));
+    } catch {
+      // Non-fatal: a stale tombstone only keeps an account hidden; deleting
+      // accounts/removed.json restores it.
+    }
+  }
+
+  private get tombstonePath(): string {
+    return join(this.accountsDir, "removed.json");
+  }
+
+  /** Read the removal tombstone (`{ schema_version, removed: string[] }`). */
+  private readTombstones(): string[] {
+    let raw: string;
+    try {
+      raw = readFileSync(this.tombstonePath, "utf-8");
+    } catch {
+      return [];
+    }
+    try {
+      const parsed = JSON.parse(raw) as { removed?: unknown };
+      return Array.isArray(parsed.removed)
+        ? parsed.removed.filter(
+            (uuid): uuid is string =>
+              typeof uuid === "string" && UUID_REGEX.test(uuid)
+          )
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private writeTombstones(removed: string[]): void {
+    this.atomicWrite(
+      this.tombstonePath,
+      JSON.stringify({ schema_version: 1, removed }, null, 2)
+    );
+  }
+
+  /** #3982: record a removed uuid (deduped). Best-effort — the record is already
+   *  gone, so a failed write only lets the importer re-create it later. */
+  private addTombstone(accountUuid: string): void {
+    try {
+      const removed = this.readTombstones();
+      if (removed.includes(accountUuid)) return;
+      this.writeTombstones([...removed, accountUuid]);
+    } catch {
+      // Non-fatal (see above).
+    }
   }
 
   /** #4463: drop any per-node default (`activeAccountUuid` or a `byProvider`
@@ -484,6 +567,9 @@ export class AccountService {
       account.lastUsedAt,
       accountProviderOf(account)
     );
+    // #3982: writing a record IS a deliberate re-add — the importer never reaches
+    // here for a tombstoned uuid (its hasRecord seam treats a tombstone as present).
+    this.clearTombstone(account.accountUuid);
   }
 
   /** Add/replace an entry in index.json (best-effort, never throws). */
@@ -571,7 +657,8 @@ export class AccountService {
    * Task 4b: an optional `provider` sets the PER-PROVIDER default (merged into
    * `byProvider`, leaving `activeAccountUuid` and the sibling providers untouched);
    * absent / "anthropic" sets `activeAccountUuid` (today's behaviour, preserving
-   * any existing `byProvider`).
+   * any existing `byProvider`). #3982: a record of another provider than the one
+   * whose pointer is being set returns `provider_mismatch` and writes nothing.
    */
   setActiveAccount(
     accountUuid: string,
@@ -579,7 +666,11 @@ export class AccountService {
   ): SetActiveAccountResult {
     // Provider-aware existence check so an OpenAI/Google account can be set as its
     // provider's default (getRaw is Anthropic-only).
-    if (!this.getRawAny(accountUuid)) return { ok: false, code: "not_found" };
+    const record = this.getRawAny(accountUuid);
+    if (!record) return { ok: false, code: "not_found" };
+    if (accountProviderOf(record) !== (provider ?? "anthropic")) {
+      return { ok: false, code: "provider_mismatch" };
+    }
     const existing = this.readActivePointer();
     const next: ActivePointer =
       provider && provider !== "anthropic"

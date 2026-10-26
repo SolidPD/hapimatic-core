@@ -74,8 +74,8 @@ export function useSendMessage(
       // and carry the server-resolved outcome as the bubble's copy carrier.
       // mergeMessages only auto-drops "sent" bubbles, so a "blocked" bubble
       // persists client-side until reload (the durable in-thread notice is the
-      // other half). Fire the ERROR haptic HERE — not in PromptBlockToastListener,
-      // which fires on EVERY connected client and would buzz a second client for
+      // other half). Fire the ERROR haptic HERE — not in NotificationListener's
+      // prompt-blocked toast, which fires on EVERY connected client and would buzz a second client for
       // someone else's denial.
       if (result?.ok === false) {
         queryClient.setQueryData<DecryptedMessage[]>(

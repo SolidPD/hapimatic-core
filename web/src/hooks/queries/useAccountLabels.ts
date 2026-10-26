@@ -29,10 +29,8 @@ export type AccountLabelSource = {
   monogram?: AccountMonogram;
 };
 
-export function useAccountLabels(
-  api: ApiClient | null,
-  enabled = true
-): Map<string, AccountLabelSource> {
+/** The ONE labels query both maps below read (same key → one request). */
+function useLabelAccounts(api: ApiClient | null, enabled: boolean) {
   const query = useQuery({
     queryKey: [...queryKeys.accounts, "labels"] as const,
     queryFn: async () => {
@@ -44,21 +42,81 @@ export function useAccountLabels(
     refetchOnWindowFocus: false,
     retry: false,
   });
-  const accounts = query.data?.accounts;
+  return query.data?.accounts;
+}
+
+function toLabelSource(account: {
+  nickname?: string;
+  displayName?: string;
+  monogram?: AccountMonogram;
+}): AccountLabelSource {
+  return {
+    nickname: account.nickname,
+    displayName: account.displayName,
+    monogram: account.monogram,
+  };
+}
+
+export function useAccountLabels(
+  api: ApiClient | null,
+  enabled = true
+): Map<string, AccountLabelSource> {
+  const accounts = useLabelAccounts(api, enabled);
   return useMemo(() => {
     const map = new Map<string, AccountLabelSource>();
     // #3508 (Task 2, non-target): this empty-array fallback is only a loop
     // ITERABLE inside this useMemo, not a returned array identity. The memo keys on `accounts`
     // (stays `undefined` while pending), so the returned Map is already stable.
     for (const account of accounts ?? []) {
-      map.set(account.emailAddress.toLowerCase(), {
-        nickname: account.nickname,
-        displayName: account.displayName,
-        monogram: account.monogram,
-      });
+      const email = account.emailAddress.toLowerCase();
+      // #3982: email-less records (Google, API-key OpenAI) all carry "" — keying
+      // them here would collide; they resolve by uuid (useAccountLabelsByUuid).
+      if (!email) continue;
+      map.set(email, toLabelSource(account));
     }
     return map;
   }, [accounts]);
+}
+
+/**
+ * #3982: the same label sources keyed by `accountUuid` — the only identity an
+ * email-less provider account has. Reads the SAME query as `useAccountLabels`.
+ */
+export function useAccountLabelsByUuid(
+  api: ApiClient | null,
+  enabled = true
+): Map<string, AccountLabelSource> {
+  const accounts = useLabelAccounts(api, enabled);
+  return useMemo(() => {
+    const map = new Map<string, AccountLabelSource>();
+    for (const account of accounts ?? []) {
+      map.set(account.accountUuid, toLabelSource(account));
+    }
+    return map;
+  }, [accounts]);
+}
+
+/** #3982: nickname → displayName → `fallback` for an account named by uuid. */
+export function resolveAccountLabelByUuid(
+  accountUuid: string,
+  fallback: string,
+  labels: Map<string, AccountLabelSource>
+): string {
+  const source = labels.get(accountUuid);
+  const nickname = source?.nickname?.trim();
+  if (nickname) return nickname;
+  const displayName = source?.displayName?.trim();
+  if (displayName) return displayName;
+  return fallback;
+}
+
+/** #3982: the monogram override for an account named by uuid. */
+export function useAccountMonogramByUuid(
+  api: ApiClient | null,
+  accountUuid: string | undefined
+): AccountMonogram | undefined {
+  const labels = useAccountLabelsByUuid(api, Boolean(accountUuid));
+  return accountUuid ? labels.get(accountUuid)?.monogram : undefined;
 }
 
 /** nickname → displayName → email local part (never the full email). */

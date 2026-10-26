@@ -156,7 +156,9 @@ export const sendMessageTool: OrchestrationToolSpec<SendMessageArgs> = {
   description:
     "Send a user message to a peer session. The server stamps it as sent by " +
     "THIS session (cli-api). Wraps messaging.send-message " +
-    "(POST /api/sessions/:id/messages, mutating).",
+    "(POST /api/sessions/:id/messages, mutating). Unless THIS session runs in " +
+    "a bypass permission mode, a message to a session in a bypass mode (or one " +
+    "whose mode the server cannot read) is refused (agent_escalation_refused).",
   inputSchema: z.object({
     sessionId: sessionIdField,
     text: z.string().describe("Message text."),
@@ -239,7 +241,9 @@ export const archiveSessionTool: OrchestrationToolSpec<ArchiveSessionArgs> = {
   description:
     "Archive (disconnect) a live session you are finished with; its record " +
     "stays. Wraps session-lifecycle.archive " +
-    "(POST /api/sessions/:id/archive, mutating).",
+    "(POST /api/sessions/:id/archive, mutating). Unless THIS session runs in a " +
+    "bypass permission mode, you can archive only this session or one it " +
+    "spawned; anything else is refused (agent_escalation_refused).",
   inputSchema: z.object({
     sessionId: sessionIdField,
   }) as z.ZodType<ArchiveSessionArgs>,

@@ -4,24 +4,22 @@ import { streamSSE } from "hono/streaming";
 import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { z, type ZodType } from "zod";
+import { type ZodType } from "zod";
 
 import {
   CreateJobRequestSchema,
   DeprovisionApplyRequestSchema,
   DeprovisionDryRunRequestSchema,
   ReconcileRepairRequestSchema,
-  VM_PARITY_SOURCES,
-  VM_PARITY_STALE_AFTER_MS,
+  VM_PARITY_HUB_ID,
   VmInventoryResponseSchema,
   VmParityHistoryResponseSchema,
-  VmParityVerdictSchema,
+  VmParityHubSchema,
   type JobStatusResponse,
   type PreflightResponse,
   type VmInventoryEntry,
   type VmInventoryVerdict,
   type VmParityHistoryEntry,
-  type VmParitySummary,
 } from "@hapi/protocol/adminVms";
 
 import type { WebAppEnv } from "../middleware/auth";
@@ -33,6 +31,7 @@ import {
   serializeFailureMeta,
   type ParityHistoryLogMeta,
 } from "./adminVmsParityLedger";
+import { readVmParitySummary } from "./adminVmsParityStatus";
 import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
 import {
@@ -274,98 +273,6 @@ function toSanitizedEntry(record: unknown): VmInventoryEntry {
     entry.diskThresholdPct = r.disk_threshold_pct;
   }
   return entry;
-}
-
-// ── #3557: Sub F's per-VM parity status file → the row's `vmParity` ──────────
-/** Sub F's subdomain grammar (provision.sh's own shape) — also the file name. */
-const VM_PARITY_SUBDOMAIN = /^[a-z0-9][a-z0-9-]{0,62}$/;
-
-/**
- * INPUT schema for ONE `<subdomain>.json` — Sub F's twelve schema-v1 fields
- * (`docs/internal/architecture/vm-parity.md` § "Status file"). Deliberately NOT
- * `.strict()`: F's contract lets a field be ADDED without bumping
- * `schema_version`, so unknown keys are stripped, never fatal. A rename, retype
- * or removal bumps the version, which `z.literal(1)` rejects.
- */
-const VmParityStatusRecordSchema = z.object({
-  schema_version: z.literal(1),
-  subdomain: z.string().regex(VM_PARITY_SUBDOMAIN),
-  target: z.string(),
-  compliant: z.boolean(),
-  verdict: VmParityVerdictSchema,
-  drift: z.number().int().nonnegative(),
-  excluded: z.number().int().nonnegative(),
-  manifest_version: z.string().min(1),
-  checked_at: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/),
-  checked_by: z.string(),
-  checker_exit: z.number().int().min(-1).max(255),
-  source: z.enum(VM_PARITY_SOURCES),
-});
-
-const VM_PARITY_UNREADABLE: VmParitySummary = { state: "unreadable" };
-
-/**
- * Project one status-file body onto the row summary. Pure. Anything that is not
- * a self-consistent schema-v1 record for THIS subdomain is `unreadable` — shown
- * as such, never passed off as "never checked" or as compliant. Only the
- * rendered fields survive the projection.
- */
-function toVmParitySummary(
-  text: string,
-  subdomain: string,
-  nowMs: number
-): VmParitySummary {
-  let json: unknown;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    return VM_PARITY_UNREADABLE;
-  }
-  const parsed = VmParityStatusRecordSchema.safeParse(json);
-  if (!parsed.success) return VM_PARITY_UNREADABLE;
-  const rec = parsed.data;
-  const checkedMs = Date.parse(rec.checked_at);
-  if (
-    rec.subdomain !== subdomain ||
-    rec.compliant !== (rec.verdict === "pass") ||
-    !Number.isFinite(checkedMs)
-  ) {
-    return VM_PARITY_UNREADABLE;
-  }
-  return {
-    state: "recorded",
-    verdict: rec.verdict,
-    compliant: rec.compliant,
-    drift: rec.drift,
-    manifestVersion: rec.manifest_version,
-    checkedAt: rec.checked_at,
-    stale: nowMs - checkedMs > VM_PARITY_STALE_AFTER_MS,
-  };
-}
-
-/**
- * Read + project one VM's status file. `undefined` = no file (ENOENT: never
- * checked) or a name outside the subdomain grammar (no path is built from it).
- * Never throws: any other read failure is `unreadable`, so one bad file can
- * never 500 the whole inventory.
- */
-async function readVmParitySummary(deps: {
-  stateDir: string;
-  subdomain: string;
-  readVmParityStatus: (path: string) => Promise<string>;
-  nowMs: number;
-}): Promise<VmParitySummary | undefined> {
-  if (!VM_PARITY_SUBDOMAIN.test(deps.subdomain)) return undefined;
-  let text: string;
-  try {
-    text = await deps.readVmParityStatus(
-      join(deps.stateDir, `${deps.subdomain}.json`)
-    );
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    return VM_PARITY_UNREADABLE;
-  }
-  return toVmParitySummary(text, deps.subdomain, deps.nowMs);
 }
 
 const sleep = (ms: number): Promise<void> =>
@@ -730,6 +637,74 @@ export function createAdminVmRoutes(
           } catch {
             return c.json({ error: "inventory serialization failed" }, 500);
           }
+      }
+    }
+  );
+
+  // ── #3996: RP1's own parity record (the hub row) ───────────────────────────
+  // RP1 checks ITSELF against the declared profile on the first step of its
+  // vm-parity.service and Sub F's writer records `rp1.json` beside the VM
+  // records. RP1 is not a fleet VM, so the record is served here, OUTSIDE the
+  // inventory array and its `.strict()` entry schema (no `url`, no inventory
+  // record). One status-file read, the same summary projection as the #3557
+  // column; no file → no `vmParity` key (the hub step is not installed or never
+  // ran); a fleet VM named like the hub → `unreadable` (the file is that VM's).
+  app.get(
+    "/admin-vms/parity-hub",
+    cataloged(
+      defineCapability({
+        id: "harness-admin.api-admin-vms-parity-hub",
+        domain: "harness-admin",
+        surface: "rest",
+        description:
+          "Return RP1's own parity summary (the hub row): RP1 checks itself against the declared operator profile nightly, recorded beside the VM parity records.",
+        whenToUse:
+          "When the operator wants to see whether RP1 itself still matches the declared profile.",
+        invocation: {
+          kind: "rest",
+          method: "GET",
+          path: "/api/admin-vms/parity-hub",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "operator" },
+      })
+    ),
+    async c => {
+      if (!provisioner.enabled) return c.notFound();
+      // A fleet VM with the hub's name writes its OWN `rp1.json` through the
+      // sweep (the hub writer refuses that name), so the file is not RP1's:
+      // report it unreadable rather than show a VM's parity as RP1's.
+      const inventory = await classifyInventory({
+        inventoryPath,
+        readInventory,
+        statInventory,
+        inventoryStaleAfterMs,
+        now,
+      });
+      const collides =
+        inventory.kind === "ok" &&
+        inventory.raw.some(
+          rec => (rec as { name?: unknown }).name === VM_PARITY_HUB_ID
+        );
+      const summary = collides
+        ? ({ state: "unreadable" } as const)
+        : await readVmParitySummary({
+            stateDir: dirname(vmParityLedgerPath),
+            subdomain: VM_PARITY_HUB_ID,
+            readVmParityStatus,
+            nowMs: now(),
+          });
+      try {
+        // OUTPUT allowlist enforcement, as on /inventory: a stray field 500s.
+        return c.json(
+          VmParityHubSchema.parse({
+            name: VM_PARITY_HUB_ID,
+            ...(summary ? { vmParity: summary } : {}),
+          })
+        );
+      } catch {
+        return c.json({ error: "parity hub serialization failed" }, 500);
       }
     }
   );

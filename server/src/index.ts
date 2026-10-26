@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+/* eslint-disable max-lines -- The server composition root (init order + graceful
+   shutdown); it was exactly at the 1500-line ceiling when #4913 wired the notify()
+   service and its purge loop. The loop body lives in notifications/notificationPurge.ts
+   to keep the growth to the wiring itself. Same #2077 convention as
+   web/buildWebApp.ts; splitting the maintenance loops into a sibling module is the
+   candidate follow-up. */
 /**
  * HAPI Server - Main Entry Point
  *
@@ -37,6 +43,9 @@ import { SpendLimitNoticeObserver } from "./sync/spendLimitNoticeObserver";
 import { createOrphanGrantStep } from "./sync/orphanGrantStep";
 import { createCostStep } from "./sync/costStep";
 import { NotificationHub } from "./notifications/notificationHub";
+import { NotificationService } from "./notifications/notificationService";
+import { resolveLocalNodeIdentity } from "./config/nodeLabel";
+import { createNotificationPurgeLoop } from "./notifications/notificationPurge";
 import { NotifyPmNotifier } from "./notifications/notifier";
 import { loadSessionFatalConfig } from "./config/sessionFatalConfig";
 import { startWebServer } from "./web/server";
@@ -139,6 +148,9 @@ import {
 } from "./systemJobs/daemonJobsReader";
 import type { Server as BunServer } from "bun";
 import { ErrorLogger } from "./logging/errorLogger";
+import { createErrorLogCleanupLoop } from "./logging/errorLogCleanupLoop";
+import { startSinkReconciler } from "./feedback/sinkForward";
+import { resolveFeedbackSinkConfig } from "./config/serverSettings";
 import { initSentry } from "./sentry";
 import { VERSION } from "./version.generated"; // eslint-disable-line -- generated file
 
@@ -222,6 +234,9 @@ let remoteTerminalProxy: RemoteTerminalProxy | null = null;
 // #1963: index.ts maintenance loops are supervised (self-heal + registry rows).
 let cleanupLoop: SupervisedLoop | null = null;
 let walCheckpointLoop: SupervisedLoop | null = null;
+let notificationPurgeLoop: SupervisedLoop | null = null; // #4913
+let feedbackSinkLoop: SupervisedLoop | null = null; // #2911
+let notificationService: NotificationService | null = null;
 
 async function main() {
   console.log("HAPI Server starting...");
@@ -602,6 +617,17 @@ async function main() {
     { errorLogger }
   );
 
+  // #4913 (epic #4912): the single notify() service. Producers migrate in #4914.
+  notificationService = new NotificationService({
+    store: store.notifications,
+    getSyncEngine: () => syncEngine,
+    getPushService: () => pushService,
+    errorLogger,
+  });
+  // #4921: every push carries the sending node's unread count (app badge).
+  const unreadCountSource = notificationService;
+  pushService.setUnreadCountProvider(ns => unreadCountSource.countUnread(ns));
+
   // #1275: HeartbeatService is constructed and started by the
   // `builtin.heartbeat` extension's onStartup hook (drained further down), not
   // here — mirroring #1274's scheduler migration. Its SystemEventQueue is the
@@ -650,6 +676,17 @@ async function main() {
   );
   const federationConfig = loadFederationConfig(settings);
   const federationApiToken = getFederationApiToken(settings);
+
+  // #4914 (epic #4912): server producers raise user notifications through
+  // syncEngine.notifyUser. Wired here, after federationConfig, so an
+  // account-unrefreshable row names this node (the #4461 egress-stamp value).
+  // Before this line producers raise no notification; their legacy SyncEvents
+  // still fire.
+  if (notificationService) {
+    syncEngine.setNotificationService(notificationService, {
+      getLocalNode: () => resolveLocalNodeIdentity(federationConfig),
+    });
+  }
 
   // Server-authoritative fresh-usage substrate (#1909). ONE shared UsageService
   // (push-to-cache): the sampler is its sole scheduled upstream caller via
@@ -1214,6 +1251,7 @@ async function main() {
       loadedExtensions?.getService<SchedulerService>("scheduler") ?? null,
     getContextWatermarkService: () => contextWatermarkService,
     getNodeRegistry: () => nodeRegistry,
+    getNotificationService: () => notificationService,
     getHealthAggregator: () => healthAggregator,
     getPeerAnnouncer: () => peerAnnouncer,
     // #1969 (R5): the /file-claims cross-node union reads this replica.
@@ -1263,31 +1301,35 @@ async function main() {
   // `host.lifecycle.onStartup` hook, drained by the loader below.
 
   // Error log cleanup loop — every 24 hours, delete entries older than 30 days
-  const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-  cleanupLoop = new SupervisedLoop({
-    name: "error-log-cleanup",
+  cleanupLoop = createErrorLogCleanupLoop({
+    store,
+    errorLogger,
     node: jobNodeId,
-    intervalMs: CLEANUP_INTERVAL_MS,
-    immediate: false,
     registry: jobRegistry,
-    tick: () => {
-      try {
-        const deleted = store.errorLogs.deleteEntriesOlderThan(30);
-        if (deleted > 0) {
-          errorLogger.info(
-            `Cleaned up ${deleted} error log entries older than 30 days`,
-            {
-              category: "error-log-cleanup",
-            }
-          );
-        }
-      } catch (err) {
-        console.error("[ErrorLog] Cleanup failed:", err);
-        throw err;
-      }
-    },
   });
   cleanupLoop.start();
+
+  // #2911: retry feedback rows not yet in the gateway's central sink. Resolved
+  // from the same federation identity buildWebApp's POST kick uses.
+  feedbackSinkLoop = startSinkReconciler({
+    store,
+    sinkConfig: resolveFeedbackSinkConfig({
+      nodeId: federationConfig?.nodeId ?? null,
+      nodeLabel: federationConfig?.nodeLabel ?? null,
+    }),
+    node: jobNodeId,
+    registry: jobRegistry,
+  });
+  feedbackSinkLoop?.start();
+
+  // #4913: hourly 48-hour notification purge (see notificationPurge.ts).
+  notificationPurgeLoop = createNotificationPurgeLoop({
+    service: notificationService,
+    node: jobNodeId,
+    registry: jobRegistry,
+    errorLogger,
+  });
+  notificationPurgeLoop.start();
 
   // WAL checkpoint loop — weekly passive checkpoint
   const WAL_CHECKPOINT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1429,6 +1471,8 @@ async function main() {
   const shutdown = async () => {
     console.log("\nShutting down...");
     cleanupLoop?.stop();
+    feedbackSinkLoop?.stop();
+    notificationPurgeLoop?.stop();
     walCheckpointLoop?.stop();
     transcriptIndexer.stop();
     turnMirrorWiring.stopTurnMirrorPull(); // issue #4614

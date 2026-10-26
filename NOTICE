@@ -8,6 +8,7 @@ Based on hapi, Copyright (C) 2024-2025 weishu, https://github.com/tiann/hapi,
 AGPL-3.0-only.
 
 The cli package contains MIT-licensed happy-cli code — see cli/NOTICE.
+THIRD-PARTY-NOTICES.md reproduces that notice, including the MIT license text.
 
 The program also includes third-party open-source software, including the
 embedded Bun runtime. THIRD-PARTY-NOTICES.md reproduces each component's

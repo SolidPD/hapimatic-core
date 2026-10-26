@@ -14,6 +14,7 @@ import type { OutputStyleSyncService } from "../services/outputStyleSyncService"
 import type { SettingsSyncService } from "../services/settingsSyncService";
 import type { HarnessPollService } from "../harness/harnessPollService";
 import type { NodeRegistry } from "../federation/nodeRegistry";
+import type { NotificationService } from "../notifications/notificationService";
 import type { FileClaimSync } from "../federation/fileClaimSync";
 import type { HealthAggregator } from "../federation/healthAggregator";
 import type { PeerAnnouncer } from "../federation/peerAnnouncer";
@@ -81,6 +82,8 @@ export async function startWebServer(options: {
   /** Issue #2158: context-watermark successor-handoff status/override service. */
   getContextWatermarkService: () => ContextWatermarkService | null;
   getNodeRegistry: () => NodeRegistry | null;
+  /** Issue #4913: the notify() service behind /api/notifications. */
+  getNotificationService?: () => NotificationService | null;
   getHealthAggregator: () => HealthAggregator | null;
   getPeerAnnouncer: () => PeerAnnouncer | null;
   /** #1969 (R5): the federation claim-sync replica for the /file-claims union. */
@@ -145,6 +148,7 @@ export async function startWebServer(options: {
     getSchedulerService: options.getSchedulerService,
     getContextWatermarkService: options.getContextWatermarkService,
     getNodeRegistry: options.getNodeRegistry,
+    getNotificationService: options.getNotificationService,
     getHealthAggregator: options.getHealthAggregator,
     getPeerAnnouncer: options.getPeerAnnouncer,
     getFileClaimSync: options.getFileClaimSync,

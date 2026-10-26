@@ -209,6 +209,36 @@ export type AccountUnrefreshableError = z.infer<
   typeof AccountUnrefreshableErrorSchema
 >;
 
+/**
+ * The re-login text for an `account_unrefreshable` refusal, ONE copy for every
+ * surface that shows it (issue #4914). A reconnect refusal reaches the browser as
+ * an HTTP 409 and as the `account-unrefreshable` notification, and the toast
+ * layer deduplicates by exact text only, so the server's notification title and
+ * the web's toast must be byte-identical or one refusal shows two toasts. The web
+ * keeps its own copies (`web/src/lib/reconnectError.ts`,
+ * `web/src/lib/reloginLink.ts`); `web/src/lib/reloginParity.test.ts` pins them to
+ * these.
+ *
+ * {@link ACCOUNT_UNREFRESHABLE_MESSAGE} is the text when no node is named (a
+ * pre-#4461 node); {@link formatReloginMessage} is the text when one is.
+ */
+export const ACCOUNT_UNREFRESHABLE_MESSAGE =
+  "An account's login expired and the session couldn't refresh. " +
+  "Re-login via the account menu in the session header.";
+
+/** "Re-login required on <node>" / "Re-login required for <account> on <node>". */
+export function formatReloginMessage({
+  nodeLabel,
+  accountLabel,
+}: {
+  nodeLabel: string;
+  accountLabel?: string;
+}): string {
+  return accountLabel
+    ? `Re-login required for ${accountLabel} on ${nodeLabel}`
+    : `Re-login required on ${nodeLabel}`;
+}
+
 /** The record facts {@link deriveAccountHealth} reads — never a token. */
 export type AccountHealthRecordInput = {
   provider: ProviderId;

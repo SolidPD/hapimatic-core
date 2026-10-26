@@ -229,7 +229,7 @@ export function RemoveAccountsModal(props: RemoveAccountsModalProps) {
           <DialogDescription className="mt-2">
             {phase === "select"
               ? "Select the accounts to remove. Each defaults to removing everywhere — expand “Choose nodes…” to remove from only some nodes."
-              : `Remove ${nAccounts} from ${mNodes}? Your Claude Code login on the host machine is NOT affected — you can log back in to restore an account in Hapimatic at any time.`}
+              : `Remove ${nAccounts} from ${mNodes}? The provider login on the host machine is NOT affected — you can log back in to restore an account in Hapimatic at any time.`}
           </DialogDescription>
         </DialogHeader>
 

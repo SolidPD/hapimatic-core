@@ -5,6 +5,16 @@ import type {
   FeedbackSendResult,
 } from "./feedbackSender";
 import { readPeerJsonObject } from "../federation/proxyFetchSignal";
+import { clampText } from "./clampText";
+
+/**
+ * The gateway relay's text limits (`RelayFeedbackPayloadSchema` in
+ * `gateway/src/lib/feedbackEmail.ts`; the server cannot import the gateway
+ * package). A longer value is answered 400 and the email is never sent (#5744).
+ */
+export const RELAY_DESCRIPTION_MAX = 5000;
+export const RELAY_FILENAME_MAX = 255;
+export const RELAY_MIME_TYPE_MAX = 255;
 
 /**
  * The category the relay accepts on the wire (issue #4371). The gateway's relay
@@ -66,13 +76,21 @@ export async function sendViaRelay(
       },
       body: JSON.stringify({
         category: relayWireCategory(input.category),
-        description: input.description,
+        // #5744: the route scrubs after its own caps and the redaction marker can
+        // lengthen text, so clamp to the gateway's limits instead of a 400.
+        description: clampText(input.description, RELAY_DESCRIPTION_MAX),
         submitterEmail: input.submitterEmail,
         metadata: input.metadata,
         // Omit `attachments` entirely when there are none so the plain-feedback
         // request body stays minimal (parity with the AgentMail sender).
         ...(input.attachments && input.attachments.length > 0
-          ? { attachments: input.attachments }
+          ? {
+              attachments: input.attachments.map(att => ({
+                ...att,
+                filename: clampText(att.filename, RELAY_FILENAME_MAX),
+                mimeType: clampText(att.mimeType, RELAY_MIME_TYPE_MAX),
+              })),
+            }
           : {}),
       }),
     });

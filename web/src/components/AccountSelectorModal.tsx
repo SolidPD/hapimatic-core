@@ -76,7 +76,10 @@ import {
   type ProviderId,
 } from "@hapi/protocol";
 import type { RedactedApiKey } from "@hapi/protocol/schemas";
-import { API_KEY_STATUS_META, apiKeyDisplayName } from "@/lib/apiKeyStatus";
+import {
+  API_KEY_STATUS_META,
+  apiKeyDisplayNameWithHome,
+} from "@/lib/apiKeyStatus";
 
 export type AccountSelectorModalProps = {
   isOpen: boolean;
@@ -132,8 +135,9 @@ export type AccountSelectorModalProps = {
    * keys are ignored. Keys never join the account list, so no account sort,
    * filter, score or auto-pick can ever reach one.
    */
-  apiKeys?: RedactedApiKey[];
-  /** Issue #4568: the key currently chosen as the credential ("Current" row). */
+  apiKeys?: ApiKeyRowItem[];
+  /** Issue #4568: the key currently chosen as the credential ("Current" row).
+   *  #5127: compared against each row's `bindingRef` when it has one. */
   selectedApiKeyId?: string | null;
   /**
    * Issue #4568: fired with the chosen key's vault id (never the key). Selection
@@ -149,11 +153,41 @@ export type AccountSelectorModalProps = {
    */
   apiKeysDisabledReason?: string;
   /**
+   * Issue #5127: one hint line per node whose shared keys could not be listed
+   * (offline, needs updating, not over Tailscale), shown in the keys section.
+   */
+  apiKeysUnavailableHints?: string[];
+  /**
+   * Issue #5127 (D9): a remote spawn target. The modal lists no accounts (the
+   * target's node default is used; remote accounts are #4425's) — only a "Node
+   * default account" row, which fires `onSelectNodeDefault`, and the API keys
+   * shared to that target.
+   */
+  keysOnly?: boolean;
+  onSelectNodeDefault?: () => void;
+  /**
    * Issue #4464: the node an add should store the login on, for the spawn and
    * stage scopes (the per-node scope uses `nodeId`). Absent ⇒ the UI host.
    */
   addTargetNodeId?: string;
 };
+
+/**
+ * Issue #5127: a key row — a vault key (redacted view), optionally with where
+ * it is stored. A key from `GET /api/api-keys/available` carries the
+ * `bindingRef` the spawn sends and, for a key on another node, its home's
+ * label; a row selects by `bindingRef ?? id`.
+ */
+export type ApiKeyRowItem = RedactedApiKey & {
+  bindingRef?: string;
+  local?: boolean;
+  homeNodeLabel?: string;
+};
+
+/** Issue #5127: the value a key row selects by. */
+function apiKeyRowRef(key: ApiKeyRowItem): string {
+  return key.bindingRef ?? key.id;
+}
 
 /**
  * Issue #4568: the "API keys" section — one row per Anthropic vault key, named by
@@ -166,12 +200,15 @@ function ApiKeyRows({
   selectedApiKeyId,
   onSelect,
   disabledReason,
+  unavailableHints,
 }: {
-  apiKeys: RedactedApiKey[];
+  apiKeys: ApiKeyRowItem[];
   selectedApiKeyId: string | null;
   onSelect: (apiKeyId: string) => void;
   /** #4823: every row unselectable, with this reason as the section note. */
   disabledReason?: string;
+  /** #5127: nodes whose shared keys could not be listed. */
+  unavailableHints?: string[];
 }) {
   return (
     <section
@@ -197,16 +234,18 @@ function ApiKeyRows({
           API_KEY_STATUS_META[key.status] ?? API_KEY_STATUS_META.none;
         const unselectable =
           key.status === "invalid" || Boolean(disabledReason);
-        const isCurrent = key.id === selectedApiKeyId;
-        const name = apiKeyDisplayName(key);
+        const ref = apiKeyRowRef(key);
+        const isCurrent = ref === selectedApiKeyId;
+        // #5127: a key stored on another node names its home ("· RP1").
+        const name = apiKeyDisplayNameWithHome(key);
         return (
           <BareButton
-            key={key.id}
+            key={ref}
             type="button"
             data-testid="account-selector-api-key-row"
-            data-api-key-id={key.id}
+            data-api-key-id={ref}
             disabled={unselectable}
-            onClick={() => onSelect(key.id)}
+            onClick={() => onSelect(ref)}
             aria-label={`API key ${name} (${key.maskedKey}) — ${status.label}${isCurrent ? " — current" : ""}`}
             className={`flex w-full min-w-0 items-center gap-2 rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2 text-left text-sm text-[var(--app-fg)] hover:bg-[var(--app-hover)] disabled:cursor-not-allowed ${unselectable ? "opacity-50" : ""}`}
           >
@@ -230,6 +269,15 @@ function ApiKeyRows({
           </BareButton>
         );
       })}
+      {(unavailableHints ?? []).map(hint => (
+        <p
+          key={hint}
+          data-testid="account-selector-api-keys-unavailable"
+          className="text-[length:var(--text-caption-xs)] leading-snug text-[var(--app-hint)]"
+        >
+          {hint}
+        </p>
+      ))}
     </section>
   );
 }
@@ -275,9 +323,18 @@ export function AccountSelectorModal({
   selectedApiKeyId,
   onSelectApiKey,
   apiKeysDisabledReason,
+  apiKeysUnavailableHints,
+  keysOnly = false,
+  onSelectNodeDefault,
   addTargetNodeId,
 }: AccountSelectorModalProps) {
-  const { accounts: allAccounts, isLoading, error } = useAccounts(api, isOpen);
+  // #5127: a keys-only (remote-target) picker lists no accounts, so it asks
+  // for none.
+  const {
+    accounts: allAccounts,
+    isLoading,
+    error,
+  } = useAccounts(api, isOpen && !keysOnly);
 
   // #3808 (R7): restrict the list to the target provider (default anthropic).
   // Every derived value below (the sorted list, the empty state, hasCards, the
@@ -323,7 +380,7 @@ export function AccountSelectorModal({
   // #1896: per-account usage (epic #1855), joined to the account list by
   // accountUuid. `enabled = isOpen` mirrors useAccounts; a loading/errored
   // usage fetch is decorative and never blocks the select action below.
-  const { usage, dataUpdatedAt } = useAccountUsage(api, isOpen);
+  const { usage, dataUpdatedAt } = useAccountUsage(api, isOpen && !keysOnly);
   const usageByUuid = useMemo(() => {
     const m = new Map<string, AccountUsage>();
     for (const u of usage) m.set(u.accountUuid, u);
@@ -366,6 +423,9 @@ export function AccountSelectorModal({
         accountUuid: account.accountUuid,
         email: account.emailAddress,
         displayLabel: account.displayName || account.emailAddress,
+        // #3982: an OpenAI/Google account has no usage[] envelope, so its
+        // nickname rides the synthesized one.
+        nickname: account.nickname,
         machines: [],
         utilization: {},
         status: "error",
@@ -388,8 +448,15 @@ export function AccountSelectorModal({
   const [sortDirection, setSortDirection] = useState<SortDirection>(() =>
     getStoredSortDirection()
   );
+  // #3982: each provider scope reads its own drag order — the OpenAI cards keep
+  // a sibling key; Google has none (its key cards list in vault order).
+  const readCustomOrder = useCallback(
+    (): string[] =>
+      targetProvider === "google" ? [] : getStoredCustomOrder(targetProvider),
+    [targetProvider]
+  );
   const [customOrder, setCustomOrder] = useState<string[]>(() =>
-    getStoredCustomOrder()
+    readCustomOrder()
   );
   // #3537: the shared device-local Manual flag. Read-only here (no dragging in the
   // modal) — when set, apply the page's stored drag order. Re-read on every open (this
@@ -409,11 +476,11 @@ export function AccountSelectorModal({
     if (isOpen) {
       setSortMode(getStoredSortMode());
       setSortDirection(getStoredSortDirection());
-      setCustomOrder(getStoredCustomOrder());
+      setCustomOrder(readCustomOrder());
       setManualActive(getStoredManualActive());
       setFilters(getStoredFilters());
     }
-  }, [isOpen]);
+  }, [isOpen, readCustomOrder]);
 
   const onSortChange = useCallback((mode: SortMode) => {
     // #3537: picking a mode in the modal EXITS Manual on both surfaces (R8), so the
@@ -450,7 +517,9 @@ export function AccountSelectorModal({
     const filtered = accounts.filter(a =>
       matchesFilters(buildCardUsage(a), filters)
     );
-    if (manualActive) {
+    // #3982: the OpenAI cards have no sort modes on the Accounts page — they
+    // always follow their drag order — so an OpenAI-scoped list does too.
+    if (manualActive || targetProvider === "openai") {
       return orderByCustom(filtered, customOrder, a => a.accountUuid);
     }
     const cmp = compareByMode(sortMode, sortDirection);
@@ -460,6 +529,7 @@ export function AccountSelectorModal({
   }, [
     accounts,
     manualActive,
+    targetProvider,
     sortMode,
     sortDirection,
     customOrder,
@@ -490,14 +560,19 @@ export function AccountSelectorModal({
 
   // R12 (per-node): resolve the node's active account. The endpoint is owned by
   // Sub-Issue F (#1452) and 404s/501s until it ships — degrade to "none".
+  // #3982: a provider-scoped selector reads that provider's node default.
+  const nodeActiveProvider =
+    targetProvider === "anthropic" ? undefined : targetProvider;
   const nodeActiveQuery = useQuery({
-    queryKey: queryKeys.nodeActiveAccount(nodeId ?? "none"),
+    queryKey: queryKeys.nodeActiveAccount(nodeId ?? "none", nodeActiveProvider),
     queryFn: async () => {
       if (!api || !nodeId) {
         return { activeAccount: null };
       }
       try {
-        return await api.getNodeActiveAccount(nodeId);
+        return nodeActiveProvider
+          ? await api.getNodeActiveAccount(nodeId, nodeActiveProvider)
+          : await api.getNodeActiveAccount(nodeId);
       } catch {
         return { activeAccount: null };
       }
@@ -546,13 +621,18 @@ export function AccountSelectorModal({
   // The chevron is meaningful only when account cards are actually on screen.
   const hasCards = !isLoading && !error && !showHelp && accounts.length > 0;
 
-  const activeEmail =
+  // #3982: the current/default marker matches by accountUuid — email-less
+  // OpenAI/Google accounts all share "" and would mark each other. A session
+  // scope knows only its email, so resolve that to the uuid it names.
+  const activeUuid =
     scope === "per-node"
-      ? (nodeActiveQuery.data?.activeAccount?.emailAddress ?? null)
+      ? (nodeActiveQuery.data?.activeAccount?.accountUuid ?? null)
       : scope === "spawn"
-        ? (accounts.find(a => a.accountUuid === selectedAccountUuid)
-            ?.emailAddress ?? null)
-        : (currentAccountEmail ?? null);
+        ? (selectedAccountUuid ?? null)
+        : currentAccountEmail
+          ? (accounts.find(a => a.emailAddress === currentAccountEmail)
+              ?.accountUuid ?? null)
+          : null;
 
   const handleClose = () => {
     setPendingAction(null);
@@ -569,7 +649,13 @@ export function AccountSelectorModal({
     // badge (SessionHeader) until the switch settles. selectMutation.onError
     // surfaces failures via Toast.
     handleClose();
-    await selectAccount(accountUuid);
+    // #3982: a provider-scoped per-node pick writes THAT provider's default
+    // (its read above is provider-scoped too); other scopes are unchanged.
+    if (scope === "per-node" && nodeActiveProvider) {
+      await selectAccount(accountUuid, { provider: nodeActiveProvider });
+    } else {
+      await selectAccount(accountUuid);
+    }
   };
 
   // #1707: spawn-scope stale-account confirm. Synchronous — spawn selection
@@ -634,17 +720,48 @@ export function AccountSelectorModal({
     handleClose();
   };
 
+  const unavailableHints =
+    onSelectApiKey && targetProvider === "anthropic"
+      ? (apiKeysUnavailableHints ?? [])
+      : [];
   const apiKeySection =
-    offeredKeys.length > 0 && !showHelp ? (
+    (offeredKeys.length > 0 || unavailableHints.length > 0) && !showHelp ? (
       <ApiKeyRows
         apiKeys={offeredKeys}
         selectedApiKeyId={selectedApiKeyId ?? null}
         onSelect={handleApiKeySelect}
         disabledReason={apiKeysDisabledReason}
+        unavailableHints={unavailableHints}
       />
     ) : null;
 
+  // #5127 (D9): the remote-target body — the node default, then the shared keys.
+  const nodeDefaultCurrent = !selectedApiKeyId;
+  const keysOnlyBody = (
+    <div className="min-h-0 flex-1 overflow-y-auto">
+      <BareButton
+        type="button"
+        data-testid="account-selector-node-default"
+        onClick={() => {
+          onSelectNodeDefault?.();
+          handleClose();
+        }}
+        aria-label={`Node default account${nodeDefaultCurrent ? " — current" : ""}`}
+        className="flex w-full min-w-0 items-center gap-2 rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2 text-left text-sm text-[var(--app-fg)] hover:bg-[var(--app-hover)]"
+      >
+        <span className="min-w-0 flex-1 truncate">Node default account</span>
+        {nodeDefaultCurrent && (
+          <span className="shrink-0 text-[length:var(--text-caption-xs)] font-medium text-[var(--app-accent)]">
+            Current
+          </span>
+        )}
+      </BareButton>
+      {apiKeySection}
+    </div>
+  );
+
   const renderBody = () => {
+    if (keysOnly) return keysOnlyBody;
     if (showHelp) {
       return (
         <AccountSelectorEmptyState
@@ -717,9 +834,9 @@ export function AccountSelectorModal({
                   defaultExpanded={allExpanded}
                   disableSetActive
                   currentMarker={
-                    Boolean(activeEmail) &&
+                    activeUuid != null &&
                     !selectedApiKeyId &&
-                    account.emailAddress === activeEmail
+                    account.accountUuid === activeUuid
                   }
                   onSelect={
                     isUnselectable ? undefined : () => handleRowSelect(account)
@@ -789,21 +906,24 @@ export function AccountSelectorModal({
                     Updated {relUpdated}
                   </span>
                 )}
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  onClick={handleRefreshUsage}
-                  disabled={isRefreshing}
-                  aria-label="Refresh usage"
-                  data-testid="account-selector-refresh"
-                  className="h-7 w-7 text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)] disabled:opacity-60"
-                >
-                  <RefreshCw
-                    className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
-                    aria-hidden="true"
-                  />
-                </Button>
+                {/* #5127: a keys-only picker shows no usage to refresh. */}
+                {!keysOnly && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={handleRefreshUsage}
+                    disabled={isRefreshing}
+                    aria-label="Refresh usage"
+                    data-testid="account-selector-refresh"
+                    className="h-7 w-7 text-[var(--app-hint)] hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)] disabled:opacity-60"
+                  >
+                    <RefreshCw
+                      className={`h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`}
+                      aria-hidden="true"
+                    />
+                  </Button>
+                )}
                 {/* #3880: Filter menu — four independent, "all"-defaulted radio
                     dimensions (remaining 5h / weekly / Fable capacity + node), backed by
                     the AccountUsage envelope the modal already fetches. Built on the
@@ -980,15 +1100,24 @@ export function AccountSelectorModal({
                 scope keeps its line — pre-spawn context is genuinely ambiguous. */}
             {scope === "spawn" && (
               <DialogDescription>
-                Choose which stored{" "}
-                {targetProvider === "openai"
-                  ? "OpenAI"
-                  : targetProvider === "google"
-                    ? "Google"
-                    : "Anthropic"}{" "}
-                account
-                {offeredKeys.length > 0 ? " or API key" : ""} the new session
-                will use.
+                {keysOnly ? (
+                  <>
+                    Use the target node&apos;s default account, or an API key
+                    another node shares.
+                  </>
+                ) : (
+                  <>
+                    Choose which stored{" "}
+                    {targetProvider === "openai"
+                      ? "OpenAI"
+                      : targetProvider === "google"
+                        ? "Google"
+                        : "Anthropic"}{" "}
+                    account
+                    {offeredKeys.length > 0 ? " or API key" : ""} the new
+                    session will use.
+                  </>
+                )}
               </DialogDescription>
             )}
           </DialogHeader>

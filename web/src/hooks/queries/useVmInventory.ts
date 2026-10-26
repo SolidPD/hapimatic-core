@@ -2,9 +2,11 @@
 import { useQuery, type UseQueryOptions } from "@tanstack/react-query";
 import {
   VmInventoryResponseSchema,
+  VmParityHubSchema,
   type JobStatusResponse,
   type PreflightResponse,
   type VmInventoryResponse,
+  type VmParityHub,
 } from "@hapi/protocol/adminVms";
 
 /** TanStack's own `refetchInterval` shape (number | false | (query) => …). */
@@ -42,8 +44,13 @@ export function useVmPreflight(
     queryKey: queryKeys.vmPreflight,
     queryFn: async (): Promise<PreflightResponse> => {
       if (!api) throw new Error("API unavailable");
+      // #5571: the 404 of a capability-closed instance (no VM-admin capability,
+      // e.g. a customer VM) is the designed "closed" answer — declare it so it is
+      // not filed as a client error report.
       return await api.extensionRequest<PreflightResponse>(
-        "/api/admin-vms/preflight"
+        "/api/admin-vms/preflight",
+        undefined,
+        { expectedStatuses: [404] }
       );
     },
     enabled: (options?.enabled ?? true) && Boolean(api),
@@ -66,6 +73,28 @@ export function useVmInventory(
       // here → the query `isError`s → the panel's error branch (fail-loud).
       return VmInventoryResponseSchema.parse(
         await api.extensionRequest<unknown>("/api/admin-vms/inventory")
+      );
+    },
+    enabled: (options?.enabled ?? true) && Boolean(api),
+    retry: false,
+  });
+}
+
+/**
+ * RP1's own parity summary (#3996): the hub row above the fleet table. Served
+ * OUTSIDE the inventory (RP1 is not a fleet VM). Runtime-parsed like the
+ * inventory, so a malformed payload errors instead of rendering a guess.
+ */
+export function useVmParityHub(
+  api: ApiClient | null,
+  options?: { enabled?: boolean }
+) {
+  return useQuery({
+    queryKey: queryKeys.vmParityHub,
+    queryFn: async (): Promise<VmParityHub> => {
+      if (!api) throw new Error("API unavailable");
+      return VmParityHubSchema.parse(
+        await api.extensionRequest<unknown>("/api/admin-vms/parity-hub")
       );
     },
     enabled: (options?.enabled ?? true) && Boolean(api),

@@ -15,6 +15,7 @@ import type { MessageOrigin } from "../../sync/sentFrom";
 import { defineCapability } from "@hapi/protocol";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
+import { refuseAgentMessage } from "./agentEscalation";
 
 const querySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
@@ -193,6 +194,14 @@ export function createMessagesRoutes(
       if (engine instanceof Response) {
         return engine;
       }
+
+      // #5616: the send floor precedes the local/federation split below, so a
+      // message to a remote session is refused on this hub too.
+      const refusal = refuseAgentMessage(c, engine, {
+        engine,
+        registry: options?.getNodeRegistry?.() ?? null,
+      });
+      if (refusal) return refusal;
 
       const sessionResult = requireSessionFromParam(c, engine, {
         requireActive: true,

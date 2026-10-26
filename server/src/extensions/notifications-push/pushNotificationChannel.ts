@@ -1,28 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Session } from "../../sync/syncEngine";
 import type { NotificationChannel } from "@hapi/protocol/ext";
-import { getAgentName, getSessionName } from "../../notifications/sessionInfo";
-import type { PushPayload, PushService } from "../../push/pushService";
+import { getAgentName } from "../../notifications/sessionInfo";
+import type { PushService } from "../../push/pushService";
+import { buildSessionPushPayloadFromSession } from "../../push/sessionPushPayload";
 
-/**
- * Extract the project directory name from the session's working path.
- * e.g. "/home/matt/projects/hapimatic-private-dev" → "hapimatic-private-dev"
- */
-function getProjectName(session: Session): string | null {
-  const path = session.metadata?.path;
-  if (!path) return null;
-  const parts = path.split("/").filter(Boolean);
-  return parts.length > 0 ? parts[parts.length - 1] : null;
-}
-
-/**
- * Build a display prefix from session emoji (if set).
- * e.g. session.emoji = "🚀" → "🚀 "
- */
-function getEmojiPrefix(session: Session): string {
-  return session.emoji ? `${session.emoji} ` : "";
-}
-
+// Issue #4921: every push from this channel is titled by its session (emoji +
+// name) with the event as the body, tagged `<kind>:<sessionId>`, and opens the
+// session when tapped. The `data.type` strings stay the service worker's
+// per-type toggle vocabulary.
 export class PushNotificationChannel implements NotificationChannel {
   constructor(
     private readonly pushService: PushService,
@@ -34,26 +20,20 @@ export class PushNotificationChannel implements NotificationChannel {
       return;
     }
 
-    const name = getSessionName(session);
-    const prefix = getEmojiPrefix(session);
-    const project = getProjectName(session);
     const request = session.agentState?.requests
       ? Object.values(session.agentState.requests)[0]
       : null;
     const toolName = request?.tool ?? "Tool";
 
-    const payload: PushPayload = {
-      title: `${prefix}Permission: ${toolName}`,
-      body: project ? `${name} · ${project}` : name,
-      tag: `permission-${session.id}`,
-      data: {
-        type: "permission-request",
-        sessionId: session.id,
-        url: this.buildSessionPath(session.id),
-      },
-    };
-
-    await this.pushService.sendToNamespace(session.namespace, payload);
+    await this.pushService.sendToNamespace(
+      session.namespace,
+      buildSessionPushPayloadFromSession(
+        session,
+        "permission",
+        "permission-request",
+        `Permission: ${toolName}`
+      )
+    );
   }
 
   async sendReady(session: Session): Promise<void> {
@@ -61,23 +41,15 @@ export class PushNotificationChannel implements NotificationChannel {
       return;
     }
 
-    const agentName = getAgentName(session);
-    const name = getSessionName(session);
-    const prefix = getEmojiPrefix(session);
-    const project = getProjectName(session);
-
-    const payload: PushPayload = {
-      title: `${prefix}${agentName} Ready`,
-      body: project ? `${name} · ${project}` : name,
-      tag: `ready-${session.id}`,
-      data: {
-        type: "ready",
-        sessionId: session.id,
-        url: this.buildSessionPath(session.id),
-      },
-    };
-
-    await this.pushService.sendToNamespace(session.namespace, payload);
+    await this.pushService.sendToNamespace(
+      session.namespace,
+      buildSessionPushPayloadFromSession(
+        session,
+        "ready",
+        "ready",
+        `${getAgentName(session)} ready`
+      )
+    );
   }
 
   async sendQuestion(session: Session, questionSummary: string): Promise<void> {
@@ -85,25 +57,15 @@ export class PushNotificationChannel implements NotificationChannel {
       return;
     }
 
-    const name = getSessionName(session);
-    const prefix = getEmojiPrefix(session);
-    const project = getProjectName(session);
-    const contextSuffix = project ? ` · ${project}` : "";
-
-    const payload: PushPayload = {
-      title: `${prefix}Question`,
-      body: questionSummary
-        ? `${questionSummary}${contextSuffix}`
-        : `Claude has a question in ${name}${contextSuffix}`,
-      tag: `question-${session.id}`,
-      data: {
-        type: "question",
-        sessionId: session.id,
-        url: this.buildSessionPath(session.id),
-      },
-    };
-
-    await this.pushService.sendToNamespace(session.namespace, payload);
+    await this.pushService.sendToNamespace(
+      session.namespace,
+      buildSessionPushPayloadFromSession(
+        session,
+        "question",
+        "question",
+        questionSummary || `${getAgentName(session)} has a question`
+      )
+    );
   }
 
   async sendError(session: Session, errorMessage: string): Promise<void> {
@@ -111,28 +73,14 @@ export class PushNotificationChannel implements NotificationChannel {
       return;
     }
 
-    const name = getSessionName(session);
-    const prefix = getEmojiPrefix(session);
-    const project = getProjectName(session);
-    const contextSuffix = project ? ` · ${project}` : "";
-
-    const payload: PushPayload = {
-      title: `${prefix}Error`,
-      body: errorMessage
-        ? `${errorMessage}${contextSuffix}`
-        : `Error in ${name}${contextSuffix}`,
-      tag: `error-${session.id}`,
-      data: {
-        type: "error",
-        sessionId: session.id,
-        url: this.buildSessionPath(session.id),
-      },
-    };
-
-    await this.pushService.sendToNamespace(session.namespace, payload);
-  }
-
-  private buildSessionPath(sessionId: string): string {
-    return `/sessions/${sessionId}`;
+    await this.pushService.sendToNamespace(
+      session.namespace,
+      buildSessionPushPayloadFromSession(
+        session,
+        "error",
+        "error",
+        errorMessage || "Error"
+      )
+    );
   }
 }

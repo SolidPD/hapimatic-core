@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { PlannedMcpServer, SecretOverlay } from "@/types/porter";
+import type { PlannedMcpServerReview, SecretOverlay } from "@/types/porter";
 
 /**
  * The import review's MCP re-authentication step (#3546, ADR-0006 Fork A) and
@@ -15,7 +15,7 @@ import type { PlannedMcpServer, SecretOverlay } from "@/types/porter";
  * the commit overlay and the row's secret-source line all read this one rule.
  */
 export function offersReAuth(
-  s: Pick<PlannedMcpServer, "resolvable" | "secretRestorable">
+  s: Pick<PlannedMcpServerReview, "resolvable" | "secretRestorable">
 ): boolean {
   return s.resolvable && !s.secretRestorable;
 }
@@ -26,9 +26,9 @@ export function offersReAuth(
  * the commit refuses. A deselected server is dropped (deselect wins, #3546).
  */
 export function reAuthCandidates(
-  servers: PlannedMcpServer[],
+  servers: PlannedMcpServerReview[],
   excluded: ReadonlySet<string>
-): PlannedMcpServer[] {
+): PlannedMcpServerReview[] {
   return servers.filter(s => offersReAuth(s) && !excluded.has(s.name));
 }
 
@@ -40,7 +40,7 @@ export function reAuthCandidates(
  * slot, e.g. `NODE_ENV`), which is why the wording is "values to supply".
  */
 export function reAuthSlots(
-  s: PlannedMcpServer
+  s: PlannedMcpServerReview
 ): { slotKey: string; label: string }[] {
   const out: { slotKey: string; label: string }[] = [];
   for (const a of s.argsNames ?? [])
@@ -61,7 +61,7 @@ export function reAuthSlots(
  * byte-identical to a no-re-auth import.
  */
 export function buildCommitOverlay(
-  servers: PlannedMcpServer[],
+  servers: PlannedMcpServerReview[],
   overlay: SecretOverlay,
   excluded: Set<string>
 ): SecretOverlay | undefined {
@@ -94,7 +94,7 @@ export function ReAuthStep({
   overlay,
   onChange,
 }: {
-  servers: PlannedMcpServer[];
+  servers: PlannedMcpServerReview[];
   overlay: SecretOverlay;
   onChange: (server: string, slotKey: string, value: string) => void;
 }) {

@@ -28,6 +28,7 @@ import { useAccountUsage } from "@/hooks/queries/useAccountUsage";
 import { useRecentPaths } from "@/hooks/useRecentPaths";
 import { useVersion } from "@/hooks/useVersion";
 import { addPendingSpawn, markSpawnFailed } from "@/lib/pending-spawns";
+import { apiErrorMessage } from "@/lib/apiErrorMessage";
 import { beginSpawnHandover, takeRetryForm } from "@/lib/spawn-draft";
 import { buildClaimedIssueIndex } from "@/lib/claimedIssues";
 import { selectOptimalAccountUuid } from "@/lib/selectOptimalAccount";
@@ -55,7 +56,11 @@ import {
 } from "./formState";
 import { useAdminPreferences } from "@/hooks/useAdminPreferences";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
-import { apiKeyDisplayName } from "@/lib/apiKeyStatus";
+import { useAvailableApiKeys } from "@/hooks/queries/useAvailableApiKeys";
+import {
+  apiKeyDisplayNameWithHome,
+  sharedKeysUnavailableHint,
+} from "@/lib/apiKeyStatus";
 import {
   resolveSpawnPermissionMode,
   getSpawnPermissionModeOptionsForFlavor,
@@ -297,6 +302,13 @@ export const NewSession = forwardRef<
   const [apiKeyId, setApiKeyId] = useState<string | null>(
     () => retryForm?.apiKeyId ?? null
   );
+  // #5127: read by the target-change handler without re-creating it.
+  const apiKeyIdRef = useRef(apiKeyId);
+  apiKeyIdRef.current = apiKeyId;
+  // #5127 (code review F5): bumped when a target change hands the account
+  // default back, so the default effect re-runs even when none of its other
+  // inputs changed (local machine A → local machine B).
+  const [accountDefaultEpoch, setAccountDefaultEpoch] = useState(0);
   // #1496: the create-page account picker now opens the shared modal.
   const [accountModalOpen, setAccountModalOpen] = useState(false);
   // #2019: GitHub account + repo pickers now open selection modals.
@@ -428,24 +440,37 @@ export const NewSession = forwardRef<
   const [selectedOpencodeProvider, setSelectedOpencodeProvider] = useState("");
   const [selectedOpencodeModel, setSelectedOpencodeModel] = useState("");
   // Issue #3349: the node's redacted API-key vault feeds the opencode native
-  // provider selector (provider names/labels only — never the secret). Issue
-  // #4568: it also feeds the Claude credential picker's "API keys" section on a
-  // LOCAL target (a node's keys never bind a remote session). Fetched only for
-  // those consumers to avoid a needless request otherwise.
+  // provider selector (provider names/labels only — never the secret). Fetched
+  // only for that consumer (D13).
   const { data: vaultKeys } = useApiKeys(props.api, {
-    enabled: agent === "opencode" || (agent === "claude" && !isRemoteTarget),
+    enabled: agent === "opencode",
+  });
+  // Issue #5127: the Claude credential picker's "API keys" — this node's own
+  // keys and the keys other nodes share, for the selected target (a remote
+  // target lists only shared keys). Each carries the `bindingRef` the spawn
+  // sends; a ref is target-relative, so the list is keyed by target.
+  const { data: availableKeys } = useAvailableApiKeys(props.api, remoteNodeId, {
+    enabled: agent === "claude",
   });
   // Issue #4568: the Anthropic keys a Claude session can bill, and the picked
-  // one's vault entry (its label). A key deleted mid-form has no entry here, but
-  // its id is still sent (SF-2) so the daemon refuses with api_key_not_found
-  // instead of the spawn falling back to the node's default account.
+  // one's entry (its label). A key deleted mid-form has no entry here, but on a
+  // local target its id is still sent (SF-2) so the daemon refuses with
+  // api_key_not_found instead of the spawn falling back to the node's default
+  // account. #5127: entries are matched by `bindingRef`.
   const anthropicKeys = useMemo(
-    () => (vaultKeys ?? []).filter(k => k.provider === "anthropic"),
-    [vaultKeys]
+    () => (availableKeys?.keys ?? []).filter(k => k.provider === "anthropic"),
+    [availableKeys]
   );
   const pickedApiKey = useMemo(
-    () => (apiKeyId ? anthropicKeys.find(k => k.id === apiKeyId) : undefined),
+    () =>
+      apiKeyId ? anthropicKeys.find(k => k.bindingRef === apiKeyId) : undefined,
     [apiKeyId, anthropicKeys]
+  );
+  // #5127: one hint line per node whose shared keys could not be listed.
+  const apiKeysUnavailableHints = useMemo(
+    () =>
+      (availableKeys?.unavailableNodes ?? []).map(sharedKeysUnavailableHint),
+    [availableKeys]
   );
   // Issue #1633: Safe Mode spawn toggle (default OFF) — claude --safe-mode
   const [safeMode, setSafeMode] = useState(false);
@@ -643,6 +668,7 @@ export const NewSession = forwardRef<
     adminPrefs.autoSelectOptimalAccount,
     accountUsageLoading,
     accountUsage,
+    accountDefaultEpoch,
   ]);
 
   // #3808 Task 5: when the spawn's PROVIDER changes (an agent switch), reset the
@@ -730,6 +756,9 @@ export const NewSession = forwardRef<
         // vault — the daemon then refuses with api_key_not_found instead of the
         // spawn silently falling back to the node default.
         apiKeyId: apiKeysOffered ? apiKeyId : null,
+        // #5127 (D9): a remote target binds a key another node shares.
+        remoteSharedKeysAvailable:
+          isRemoteTarget && apiKeysOffered && anthropicKeys.length > 0,
         agentSupportsOpenRouter: supportsOpenRouter,
         selectedModelMode: modelMode,
         selectedEffort: effort,
@@ -769,6 +798,7 @@ export const NewSession = forwardRef<
       accounts.length,
       apiKeysOffered,
       apiKeyId,
+      anthropicKeys.length,
       supportsOpenRouter,
       modelMode,
       selectedModel,
@@ -860,7 +890,9 @@ export const NewSession = forwardRef<
         accounts.find(a => a.accountUuid === accountUuid)?.emailAddress ??
         undefined,
       // #4568: name the bound key by label / mask in the preview — never the key.
-      apiKeyLabel: pickedApiKey ? apiKeyDisplayName(pickedApiKey) : undefined,
+      apiKeyLabel: pickedApiKey
+        ? apiKeyDisplayNameWithHome(pickedApiKey)
+        : undefined,
     }),
     [isRemoteTarget, meterTargetLabel, accounts, accountUuid, pickedApiKey]
   );
@@ -1010,6 +1042,14 @@ export const NewSession = forwardRef<
       setSessionTypeUserSelected(false);
       // Reset session mode to standard (scheduled not supported on remote targets)
       applySessionMode("standard");
+      // #5127: a picked key's ref is relative to the target, so a target change
+      // drops it — and hands the account default back (the key pick had locked
+      // it out). An explicit account pick is left alone.
+      if (apiKeyIdRef.current !== null) {
+        setApiKeyId(null);
+        accountInitializedRef.current = false;
+        setAccountDefaultEpoch(e => e + 1);
+      }
     },
     [markTouched, applyCloneRepo, applySessionMode]
   );
@@ -1194,7 +1234,11 @@ export const NewSession = forwardRef<
       }
     } catch (e) {
       haptic.notification("error");
-      const msg = e instanceof Error ? e.message : "Failed to create session";
+      // A pre-dispatch refusal (e.g. #5127: the node storing a shared key is
+      // offline) is a non-2xx `{ error, code }`; show its message, not the
+      // `HTTP <status>: <body>` composite.
+      const msg =
+        e instanceof Error ? apiErrorMessage(e) : "Failed to create session";
       setError(msg);
       // Mark stub as failed on network/unexpected errors
       if (pendingSpawnId) {
@@ -1562,9 +1606,10 @@ export const NewSession = forwardRef<
                     setOutputStyle(value);
                   }}
                 />
-                {/* Account — Claude-only (R8); remote spawns use the node default,
-                so the selector is hidden for remote targets. */}
-                {!isRemoteTarget && (
+                {/* Account — Claude-only (R8). A remote target uses its node
+                default; #5127 (D9) shows the selector there only for the API
+                keys other nodes share (formState.fields.account.visible). */}
+                {formState.fields.account.visible && (
                   <AccountSelector
                     accounts={accounts}
                     selectedUuid={accountUuid}
@@ -1577,7 +1622,16 @@ export const NewSession = forwardRef<
                     // Anthropic API keys.
                     apiKeys={apiKeysOffered ? anthropicKeys : undefined}
                     selectedApiKeyId={
-                      apiKeysOffered ? (pickedApiKey?.id ?? null) : null
+                      apiKeysOffered ? (pickedApiKey?.bindingRef ?? null) : null
+                    }
+                    remoteTarget={isRemoteTarget}
+                    // #5127: a picked ref the list no longer offers still binds
+                    // (the target refuses it, naming the home).
+                    unlistedApiKeyPicked={
+                      apiKeysOffered &&
+                      isRemoteTarget &&
+                      Boolean(apiKeyId) &&
+                      !pickedApiKey
                     }
                     onOpen={() => setAccountModalOpen(true)}
                   />
@@ -1921,19 +1975,31 @@ export const NewSession = forwardRef<
             handleAccountChange(uuid);
             setAccountModalOpen(false);
           }}
-          // #4568: the "API keys" section — a Standard Claude session on a local
-          // target only (the modal also renders it only for the anthropic scope).
+          // #4568: the "API keys" section — a Standard Claude session (the modal
+          // also renders it only for the anthropic scope). #5127: this node's
+          // keys and the keys other nodes share, selected by `bindingRef`; a
+          // remote target lists only the shared keys beside its node default.
           apiKeys={apiKeysOffered ? anthropicKeys : undefined}
-          selectedApiKeyId={apiKeysOffered ? (pickedApiKey?.id ?? null) : null}
+          selectedApiKeyId={
+            apiKeysOffered ? (pickedApiKey?.bindingRef ?? null) : null
+          }
           onSelectApiKey={
-            apiKeysOffered && !isRemoteTarget
-              ? id => {
+            apiKeysOffered
+              ? ref => {
                   markTouched("account");
-                  handleApiKeyChange(id);
+                  handleApiKeyChange(ref);
                   setAccountModalOpen(false);
                 }
               : undefined
           }
+          apiKeysUnavailableHints={
+            apiKeysOffered ? apiKeysUnavailableHints : undefined
+          }
+          keysOnly={isRemoteTarget}
+          onSelectNodeDefault={() => {
+            markTouched("account");
+            setApiKeyId(null);
+          }}
         />
 
         {/* #2019: GitHub account + repo selection modals (selection-only, mirror

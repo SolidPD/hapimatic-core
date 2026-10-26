@@ -36,6 +36,15 @@ export function useSetAccountNickname(api: ApiClient | null): {
               usage: old.usage.map((a: AccountUsage) =>
                 a.accountUuid === vars.uuid ? { ...a, nickname: next } : a
               ),
+              // #3982: an OpenAI/Google account's label lives on its
+              // providerUsage[] row — patch it the same way.
+              ...(old.providerUsage
+                ? {
+                    providerUsage: old.providerUsage.map(p =>
+                      p.accountUuid === vars.uuid ? { ...p, nickname: next } : p
+                    ),
+                  }
+                : {}),
             }
           : old
       );

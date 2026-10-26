@@ -15,10 +15,18 @@
 import { Hono } from "hono";
 import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
-import { defineCapability } from "@hapi/protocol";
+import {
+  defineCapability,
+  FEDERATION_HEALTH_DISABLED_CODE,
+} from "@hapi/protocol";
 import { cataloged } from "../../../capabilities/cataloged";
 
-const HEALTH_DISABLED = { error: "Federation health not enabled" } as const;
+// The `code` lets a client tell health monitoring that is turned off from a
+// broken route; the `error` string is unchanged for existing clients (#5212).
+const HEALTH_DISABLED = {
+  error: "Federation health not enabled",
+  code: FEDERATION_HEALTH_DISABLED_CODE,
+} as const;
 
 function parseWindowMinutes(raw: string | undefined): number {
   if (!raw) return 30;

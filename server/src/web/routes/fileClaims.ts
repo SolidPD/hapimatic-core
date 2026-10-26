@@ -325,6 +325,8 @@ export function createFileClaimsRoutes(
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?repo= or ?sessionId= (#5212)
+        probe: "skip",
       })
     ),
     c => {

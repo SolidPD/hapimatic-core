@@ -318,8 +318,24 @@ export function parseWindowListOutputDetailed(output: string): {
   return { windows, dropped };
 }
 
-/** #5202 (U1): at most one dropped-row warning per manager per 60 s. */
+/**
+ * #5202 (U1) / #5614: at most one dropped-row warning per tmux socket per 60 s,
+ * shared by every manager in this process on that socket.
+ */
 export const LIST_WINDOWS_DROP_WARN_INTERVAL_MS = 60_000;
+
+/**
+ * #5614: epoch ms of the last dropped-row warning, by socket. Module-level,
+ * because the heartbeat (`healthScheduler.ts`) and the capacity paths
+ * (`sessionTracker.ts`) build a new manager per call, so an instance field
+ * never held the limit for them.
+ */
+const lastDropWarnAtBySocket = new Map<string, number>();
+
+/** Test-only: forget when each socket last logged a dropped row. */
+export function resetDroppedRowWarnLimitForTest(): void {
+  lastDropWarnAtBySocket.clear();
+}
 
 /**
  * Issue #4218: parse the exact-name pane-pid probe
@@ -1290,25 +1306,22 @@ export class TmuxManager {
     return windows;
   }
 
-  /** #5202 (U1): epoch ms of the last dropped-row warning (0 = never). */
-  private lastDropWarnAt = 0;
-
   /**
    * Issue #5202 (U1): make a partial parse visible. Rate-limited to one line
-   * per {@link LIST_WINDOWS_DROP_WARN_INTERVAL_MS} per manager. The heartbeat
-   * and capacity callers build a fresh manager per call, so for them the
-   * limit does not apply: they log at most one line per call, about one per
-   * heartbeat.
+   * per {@link LIST_WINDOWS_DROP_WARN_INTERVAL_MS} per tmux socket, shared by
+   * every manager in this process on that socket (#5614), so the per-call managers of the
+   * heartbeat and capacity paths log about one line a minute, not one per call.
    */
   private warnDroppedWindowRows(dropped: string[], parsed: number): void {
+    const key = this.socketPath
+      ? `-S ${this.socketPath}`
+      : `-L ${this.socketName ?? "default"}`;
     const now = Date.now();
-    if (
-      this.lastDropWarnAt !== 0 &&
-      now - this.lastDropWarnAt < LIST_WINDOWS_DROP_WARN_INTERVAL_MS
-    ) {
+    const last = lastDropWarnAtBySocket.get(key);
+    if (last !== undefined && now - last < LIST_WINDOWS_DROP_WARN_INTERVAL_MS) {
       return;
     }
-    this.lastDropWarnAt = now;
+    lastDropWarnAtBySocket.set(key, now);
     logger.warn(
       `[TmuxManager] list-windows: dropped ${dropped.length} of ${dropped.length + parsed} row(s) that did not parse (#5202): ${JSON.stringify(dropped[0].slice(0, 80))}`
     );

@@ -185,6 +185,17 @@ export function orderByCustom<T>(
 const SORT_MODE_KEY = "hapi:accountUsage:sortMode:v1";
 const SORT_DIRECTION_KEY = "hapi:accountUsage:sortDirection:v1";
 const CUSTOM_ORDER_KEY = "hapi:accountUsage:customOrder:v1";
+/** #3982: the OpenAI section's own drag order (a sibling key — the Anthropic key
+ *  above stays byte-unchanged). Google has no key: #4466 lists key cards in vault
+ *  order. */
+const OPENAI_CUSTOM_ORDER_KEY = "hapi:accountUsage:customOrder:openai:v1";
+
+/** #3982: which provider's custom order a reader/writer addresses. */
+export type CustomOrderProvider = "anthropic" | "openai";
+
+function customOrderKey(provider: CustomOrderProvider): string {
+  return provider === "openai" ? OPENAI_CUSTOM_ORDER_KEY : CUSTOM_ORDER_KEY;
+}
 const MANUAL_ACTIVE_KEY = "hapi:accountUsage:manualActive:v1";
 
 /** Read the persisted sort mode, or {@link DEFAULT_SORT_MODE} when absent/invalid. */
@@ -266,10 +277,13 @@ export function persistSortDirection(direction: SortDirection): void {
   }
 }
 
-/** Read the persisted custom order (accountUuid array), or `[]` when absent/invalid. */
-export function getStoredCustomOrder(): string[] {
+/** Read the persisted custom order (accountUuid array), or `[]` when absent/invalid.
+ *  #3982: `provider` selects that provider's order (default anthropic). */
+export function getStoredCustomOrder(
+  provider: CustomOrderProvider = "anthropic"
+): string[] {
   try {
-    const raw = localStorage.getItem(getStorageKey(CUSTOM_ORDER_KEY));
+    const raw = localStorage.getItem(getStorageKey(customOrderKey(provider)));
     if (raw == null) return [];
     const parsed: unknown = JSON.parse(raw);
     if (Array.isArray(parsed) && parsed.every(x => typeof x === "string")) {
@@ -281,11 +295,15 @@ export function getStoredCustomOrder(): string[] {
   return [];
 }
 
-/** Persist the custom order (accountUuid array). Swallows storage errors. */
-export function persistCustomOrder(uuids: string[]): void {
+/** Persist the custom order (accountUuid array). Swallows storage errors.
+ *  #3982: `provider` selects that provider's order (default anthropic). */
+export function persistCustomOrder(
+  uuids: string[],
+  provider: CustomOrderProvider = "anthropic"
+): void {
   try {
     localStorage.setItem(
-      getStorageKey(CUSTOM_ORDER_KEY),
+      getStorageKey(customOrderKey(provider)),
       JSON.stringify(uuids)
     );
   } catch {

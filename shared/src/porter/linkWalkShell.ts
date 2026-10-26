@@ -9,10 +9,10 @@
  * the details that make it safe; one copy drifting from the other would package
  * a file the other refuses. (`physical_path` in `./credentialNamesShell` reads
  * links part by part for a different question, the physical path the #4172
- * credential check needs.) The PowerShell exporter's twin for CLAUDE.md and its
- * includes is `walkLink` (`./exportScriptPowerShell`), pinned to this one by the
- * #3447 equivalence harness; the PowerShell settings-script lines
- * (`./settingsScriptPowerShell`) still carry their own copy.
+ * credential check needs.) The PowerShell exporter's twin is `walkLink`
+ * (`./exportScriptPowerShell`), pinned to this one by the #3447 equivalence
+ * harness; its CLAUDE.md, include and settings-script lines
+ * (`./settingsScriptPowerShell`, since #4928) all call it.
  *
  * NODE-FREE (R7): like every non-test module under `shared/src/porter`, this
  * file only builds strings.
@@ -49,8 +49,13 @@ export const PORTER_WALK_LINK_FUNCTION = "porter_walk_link";
  *   the walk stops on it rather than guess (PowerShell agrees);
  * - at most 40 links, Linux's own bound (`MAXSYMLINKS`), so there a chain the
  *   walk refuses is one `[ -f ]` and `[ -e ]` also fail on (ELOOP). A kernel
- *   with a lower bound makes `-f` skip a shorter CLAUDE.md chain than the walk
- *   would accept; both exporters let the OS decide that, so they still agree.
+ *   with a lower bound (macOS is believed to use 32) makes `-f` skip a shorter
+ *   CLAUDE.md chain than the walk would accept. Both exporters let the OS
+ *   decide whether CLAUDE.md is a file: bash with `[ -f ]` and `cp -p`, and
+ *   PowerShell with `[IO.File]::Copy` and then, off Windows, the same
+ *   `test -f` (#4928), so they agree by construction. Only the Linux bound is
+ *   runtime-tested; no macOS host or CI leg runs the lower one, so that case
+ *   is unverified.
  *
  * It reads only link names and link targets; it never opens a file.
  */

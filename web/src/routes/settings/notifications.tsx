@@ -6,19 +6,21 @@ import {
 } from "@/components/settings/SettingsSectionHeader";
 import { IconSectionHeading } from "@/components/settings/IconSectionHeading";
 import { NotificationsSection } from "@/components/settings/sections/NotificationsSection";
+import { NotificationInbox } from "@/components/notifications/NotificationInbox";
 import { SettingsPage } from "@/components/layouts/SettingsPage";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
 import { useScrollToLocationHash } from "@/hooks/useScrollToLocationHash";
 
 /**
- * NotificationsPage — the `/settings/notifications` route (#4906).
+ * NotificationsPage — the `/settings/notifications` route (#4906, #4916).
  *
- * The Settings menu's top-level Notifications row lands here. Today the page holds
- * one section, the notification settings that used to sit on Preferences under
- * `#notifications` (that old link redirects here, see `router.tsx`). Epic #4912's
- * Sub D (#4916) adds the Inbox beside it: the 48-hour notification list and its
- * detail view.
+ * The Settings menu's top-level Notifications row lands here. The page holds two
+ * sections: Preferences, the notification settings that used to sit on Preferences
+ * under `#notifications` (that old link redirects here, see `router.tsx`), and the
+ * Inbox (epic #4912 Sub D, #4916) — the undismissed notifications from the last
+ * 48 hours (up to the 200 most recent), unread first, each expanding in place to
+ * its detail.
  *
  * Registered in BOTH `router.tsx` (route) and `settings/index.tsx` (menu row) — an
  * unregistered route is an invisible page (#2344).
@@ -54,8 +56,7 @@ export default function NotificationsPage() {
           <NotificationsSection />
         </section>
 
-        {/* #4916 (epic #4912 Sub D) adds the Inbox section here: the list of the
-            last 48 hours' notifications and the detail view a row opens. */}
+        <NotificationInbox />
       </div>
     </SettingsPage>
   );

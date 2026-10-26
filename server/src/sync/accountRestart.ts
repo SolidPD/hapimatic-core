@@ -43,6 +43,12 @@ import { spawnWithRetry, CAPACITY_TAIL_DEADLINE_MS } from "./rpcGateway";
 import type { EventPublisher } from "./eventPublisher";
 import type { TurnLifecycle } from "./turnLifecycle";
 import type { ErrorLogger } from "../logging/errorLogger";
+import {
+  accountUnrefreshableNotification,
+  type ProducerNotification,
+  sessionRestartFailedNotification,
+  waitingForSlotNotification,
+} from "../notifications/producerNotifications";
 
 type SpawnSessionResult =
   | { type: "success"; sessionId: string; resolvedName?: string }
@@ -103,6 +109,11 @@ export interface AccountRestartDeps {
    * it could not check.
    */
   getApiKeyById?: (id: string) => Promise<RedactedApiKey | null>;
+  /**
+   * Issue #4914: raise a user notification (`SyncEngine.notifyUser`). Optional,
+   * so a construction without it raises none; the legacy events still fire.
+   */
+  notifyUser?: (input: ProducerNotification) => void;
 }
 
 /**
@@ -208,6 +219,7 @@ export class AccountRestart {
   private readonly getApiKeyById: (
     id: string
   ) => Promise<RedactedApiKey | null>;
+  private readonly notifyUser: (input: ProducerNotification) => void;
 
   constructor(deps: AccountRestartDeps) {
     this.sessionCache = deps.sessionCache;
@@ -220,6 +232,7 @@ export class AccountRestart {
     this.getTurnLifecycle = deps.getTurnLifecycle;
     // Issue #4823: fail closed when no vault reader was wired.
     this.getApiKeyById = deps.getApiKeyById ?? (async () => null);
+    this.notifyUser = deps.notifyUser ?? (() => {});
   }
 
   /**
@@ -602,13 +615,25 @@ export class AccountRestart {
       signal,
       // #2301 (Task 5, R4): emit the shared "waiting for a slot…" status keyed by
       // the session UUID (waitForCapacityBeforeKill only holds the tag).
-      () =>
+      () => {
+        // TODO(#4912): legacy waiting-for-slot SyncEvent, kept for one release
+        // so a pre-#4915 web client still toasts. Remove its SSE/web delivery
+        // once Sub C (#4915) has shipped for a release.
         this.eventPublisher.emit({
           type: "waiting-for-slot",
           sessionId,
           context: "account-switch",
           deadlineMs: ACCOUNT_SWITCH_SLOT_WAIT_DEADLINE_MS,
-        })
+        });
+        this.notifyUser({
+          ...waitingForSlotNotification({
+            sessionId,
+            context: "account-switch",
+            deadlineMs: ACCOUNT_SWITCH_SLOT_WAIT_DEADLINE_MS,
+          }),
+          namespace: session.namespace,
+        });
+      }
     );
     if (capacityGate === "at_capacity") {
       this.errorLogger?.warn(
@@ -712,13 +737,26 @@ export class AccountRestart {
       {
         capacityMode: "tail",
         signal,
-        onWaitingForSlot: () =>
+        onWaitingForSlot: info => {
+          // TODO(#4912): legacy waiting-for-slot SyncEvent, kept for one
+          // release so a pre-#4915 web client still toasts. Remove its SSE/web
+          // delivery once Sub C (#4915) has shipped for a release.
           this.eventPublisher.emit({
             type: "waiting-for-slot",
             sessionId,
             context: "account-switch",
             deadlineMs: CAPACITY_TAIL_DEADLINE_MS,
-          }),
+          });
+          this.notifyUser({
+            ...waitingForSlotNotification({
+              sessionId,
+              context: "account-switch",
+              deadlineMs: CAPACITY_TAIL_DEADLINE_MS,
+              elapsedMs: info.elapsedMs,
+            }),
+            namespace: session.namespace,
+          });
+        },
       }
     );
 
@@ -1052,10 +1090,23 @@ export class AccountRestart {
     // required" rather than letting the respawn fail opaquely.
     const acc = this.getAccountService()?.getRaw(accountUuid);
     if (acc?.unrefreshable) {
+      // TODO(#4912): legacy account-unrefreshable SyncEvent, kept for one
+      // release so a pre-#4915 web client still toasts. Remove its SSE/web
+      // delivery once Sub C (#4915) has shipped for a release. Server
+      // consumers: InitiativeEventObserver — keep the internal event or migrate
+      // it first.
       this.eventPublisher.emit({
         type: "account-unrefreshable",
         sessionId,
         accountUuid,
+      });
+      this.notifyUser({
+        ...accountUnrefreshableNotification({
+          sessionId,
+          accountUuid,
+          source: "token-refresh",
+        }),
+        namespace: session.namespace,
       });
       return {
         type: "error",
@@ -1249,11 +1300,26 @@ export class AccountRestart {
       `tokenRefreshRestart ${sessionId}: rollback respawn ALSO failed (${rollback.message}); session left disconnected (reconnectable)`,
       { category: "sync", sessionId, context: { accountUuid } }
     );
+    // TODO(#4912): legacy session-restart-failed SyncEvent, kept for one
+    // release so a pre-#4915 web client still toasts. Remove its SSE/web
+    // delivery once Sub C (#4915) has shipped for a release. Server consumers:
+    // InitiativeEventObserver + sessionStateWaiter — keep the internal event or
+    // migrate them first.
     this.eventPublisher.emit({
       type: "session-restart-failed",
       sessionId,
       accountUuid,
       error: rollback.message,
+    });
+    // The session captured at the top of the flow: the respawn above can await
+    // for a long time, and the cache entry may be gone by now.
+    this.notifyUser({
+      ...sessionRestartFailedNotification({
+        sessionId,
+        accountUuid,
+        error: rollback.message,
+      }),
+      namespace: session.namespace,
     });
     return {
       type: "error",

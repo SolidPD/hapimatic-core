@@ -4,7 +4,14 @@
 # this workflow, which builds the binaries from THIS public tree and creates the GitHub Release, so
 # every published binary is built from the public source tagged alongside it (AGPL-3.0 §13).
 #
-# Actions are pinned to immutable commit SHAs.
+# Two jobs (#5074). `build` runs the dependency install and the build with a read-only token and no
+# persisted checkout credential, then hands the release files over as a workflow artifact. `publish`
+# runs no repository or dependency code: it attests every release file (SLSA build provenance, signed
+# by this workflow through GitHub's OIDC token) and then creates the Release, so dependency code never
+# holds a write token or the OIDC token, and no Release exists without its attestations. Users verify
+# a downloaded file with `gh attestation verify` (docs/guide/installation.md, "Verify the download").
+#
+# Actions are pinned to immutable commit SHAs (the repository requires it).
 # Injection-safe: the only ${{ }} is secrets.GITHUB_TOKEN; the tag is read via the trusted
 # $GITHUB_REF env var with quoted expansion (no github.event.* untrusted input).
 name: Release
@@ -26,14 +33,30 @@ concurrency:
   queue: max
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    # A hung run would hold the one-at-a-time public-release queue for GitHub's 6-hour default; a
+    # normal run takes under two minutes (#5101 F4b).
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      # #5138: the Bun every binary below is built with, the version sbom/hapimatic-core.cdx.json
+      # declares as the embedded runtime. The release tooling that generates this repository fails
+      # when the two differ. A quoted literal, not an expression: this file's only expression is
+      # secrets.GITHUB_TOKEN. no-cache because pinning turns setup-bun's tool cache on: its post step
+      # would save ~/.bun/bin/bun after this job's dependency code ran, and a re-run of this tag's
+      # release would restore that binary.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+          no-cache: true
       # Frozen install proves the build reproduces from the committed lock with no re-resolution.
       - run: bun install --frozen-lockfile
       - run: bun run build:single-exe:all
@@ -98,6 +121,11 @@ jobs:
               echo "::error title=install-hapimatic-v1.sh missing::scripts/install-hapimatic-v1.sh is not in this source tree, so no Release is created (the public one-liner downloads releases/latest/download/install-hapimatic-v1.sh)."
               exit 1
           fi
+          # A symlink would ship whatever it points at, so the source must be the file itself (#5101 F4c).
+          if [ -L "$INSTALLER" ]; then
+              echo "::error title=install-hapimatic-v1.sh is a symlink::scripts/install-hapimatic-v1.sh is a symbolic link, so no Release is created (the Release ships the file itself, never a link's target)."
+              exit 1
+          fi
           cp "$INSTALLER" ../release-artifacts/install-hapimatic-v1.sh
           # --- INSTALLER-SHIP-END ---
 
@@ -105,15 +133,53 @@ jobs:
           # `--` ends options (SC2035) while keeping bare filenames, so consumers can match
           # lines by asset name (e.g. grep " hapi-linux-arm64.tar.gz$" checksums.txt).
           sha256sum -- * > checksums.txt
+      # Kept 7 days so "Re-run failed jobs" can repeat the publish job on these same files; after that
+      # only "Re-run all jobs" works, which rebuilds them.
+      - name: Hand the release files to the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-artifacts
+          path: cli/release-artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # same reason as build (#5101 F4b)
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # No checkout and no dependency install in this job: it holds the write token and the OIDC token.
+      - name: Receive the release files from the build job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-artifacts
+          path: cli/release-artifacts
+      # Every release file gets an attestation before the Release exists, so a failed attestation
+      # creates no Release.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: cli/release-artifacts/*
       - name: Create Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # This job has no checkout, so gh is told the repository (gh help environment: GH_REPO).
+          export GH_REPO="$GITHUB_REPOSITORY"
           TAG="${GITHUB_REF#refs/tags/}"
           if gh release view "$TAG" &>/dev/null; then
-            # A re-run for the same tag: refresh the assets on the existing Release.
-            echo "Release $TAG already exists — uploading artifacts to it"
-            gh release upload "$TAG" --clobber cli/release-artifacts/*
+            # A re-run for the same tag. An immutable Release's assets cannot change (#5074), so its
+            # published, already-attested assets stand; a mutable one gets this run's files.
+            if [ "$(gh release view "$TAG" --json isImmutable -q .isImmutable)" = true ]; then
+              echo "Release $TAG is immutable: its assets cannot change, so the published assets stand"
+            else
+              echo "Release $TAG already exists — uploading artifacts to it"
+              gh release upload "$TAG" --clobber cli/release-artifacts/*
+            fi
           else
             # Never Latest on creation; the block below decides Latest for every run (#5069).
             gh release create "$TAG" \

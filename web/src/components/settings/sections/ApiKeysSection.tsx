@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { KeyRound, Trash2 } from "lucide-react";
 import {
   API_KEY_PROVIDERS,
@@ -11,7 +11,34 @@ import { useAppContext } from "@/lib/app-context";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { useApiKeyActions } from "@/hooks/mutations/useApiKeyActions";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/Checkbox";
 import { API_KEY_STATUS_META as STATUS_META } from "@/lib/apiKeyStatus";
+import { ApiError } from "@/api/client";
+import { useShareApiKeysByDefault } from "@/hooks/useShareApiKeysByDefault";
+import { ShareAcrossNodesCheckbox } from "@/components/ShareAcrossNodesCheckbox";
+
+/** Issue #5127: the confirm copy for turning a key's sharing off. */
+export const UNSHARE_CONFIRM_TEXT =
+  "Other nodes can no longer start or restart sessions on this key. Sessions already running there keep it until they stop.";
+
+/** Issue #5127: the server's reason for refusing a sharing change, else a retry line. */
+function shareErrorMessage(err: unknown): string {
+  if (
+    err instanceof ApiError &&
+    (err.code === "share_unavailable" || err.code === "share_unsupported") &&
+    err.body
+  ) {
+    try {
+      const parsed = JSON.parse(err.body) as { error?: unknown };
+      if (typeof parsed.error === "string" && parsed.error.length <= 300) {
+        return parsed.error;
+      }
+    } catch {
+      // fall through to the generic line
+    }
+  }
+  return "Could not change sharing — please try again.";
+}
 
 const INPUT_CLASS =
   "rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2 text-[var(--app-fg)]";
@@ -38,7 +65,7 @@ export function ApiKeysSection() {
   const { api } = useAppContext();
 
   const { data: keys = [], isLoading } = useApiKeys(api);
-  const { add, remove, validate } = useApiKeyActions(api);
+  const { add, update, remove, validate } = useApiKeyActions(api);
 
   const [provider, setProvider] = useState<string>(API_KEY_PROVIDERS[0]);
   const [keyValue, setKeyValue] = useState("");
@@ -46,9 +73,42 @@ export function ApiKeysSection() {
   const [pendingDelete, setPendingDelete] = useState<RedactedApiKey | null>(
     null
   );
+  // Issue #5127: the add form's "Make available to all nodes" box (Anthropic
+  // only) starts from the preference until touched; the per-key switch below
+  // confirms before it stops sharing, and shows the server's refusal reason.
+  const shareDefault = useShareApiKeysByDefault(api);
+  const [shareNew, setShareNew] = useState(shareDefault.enabled);
+  const shareTouchedRef = useRef(false);
+  useEffect(() => {
+    if (!shareTouchedRef.current) setShareNew(shareDefault.enabled);
+  }, [shareDefault.enabled]);
+  const [pendingUnshare, setPendingUnshare] = useState<RedactedApiKey | null>(
+    null
+  );
+  const [shareErrors, setShareErrors] = useState<Record<string, string>>({});
+  const setShared = async (key: RedactedApiKey, next: boolean) => {
+    setShareErrors(prev => {
+      const { [key.id]: _drop, ...rest } = prev;
+      return rest;
+    });
+    try {
+      await update.mutateAsync({
+        id: key.id,
+        body: { shareAcrossNodes: next },
+      });
+    } catch (err) {
+      setShareErrors(prev => ({ ...prev, [key.id]: shareErrorMessage(err) }));
+    }
+  };
 
   const trimmedKey = keyValue.trim();
-  const canSubmit = trimmedKey.length > 0 && !add.isPending;
+  // #5127 (code review F7): an Anthropic add waits for the share preference.
+  const canSubmit =
+    trimmedKey.length > 0 &&
+    !add.isPending &&
+    (provider !== "anthropic" ||
+      shareDefault.loaded ||
+      shareTouchedRef.current);
 
   // #3812: per-provider "Get your key" link, sourced from the shared registry.
   // `custom` (and any unknown id) yields `undefined` → no link renders.
@@ -64,6 +124,8 @@ export function ApiKeysSection() {
         provider: provider as (typeof API_KEY_PROVIDERS)[number],
         key: trimmedKey,
         ...(label.trim() ? { label: label.trim() } : {}),
+        // #5127 (D7): an Anthropic add always says whether to share it.
+        ...(provider === "anthropic" ? { shareAcrossNodes: shareNew } : {}),
       },
       {
         onSuccess: () => {
@@ -143,6 +205,15 @@ export function ApiKeysSection() {
                 data-testid="api-key-label"
               />
             </label>
+            {provider === "anthropic" && (
+              <ShareAcrossNodesCheckbox
+                checked={shareNew}
+                onChange={next => {
+                  shareTouchedRef.current = true;
+                  setShareNew(next);
+                }}
+              />
+            )}
             <Button
               variant="accent"
               type="button"
@@ -154,7 +225,9 @@ export function ApiKeysSection() {
               {add.isPending ? "Adding…" : "Add key"}
             </Button>
             <p className="text-[length:var(--text-body-dense)] text-[var(--app-hint)]">
-              Stored on this node only and masked after entry. Adding a key for
+              Stored on this node and masked after entry. An Anthropic key made
+              available to all nodes can be used by sessions on your other
+              nodes; every other key is used on this node only. Adding a key for
               a provider that already has one replaces it (Gemini keys are added
               as separate accounts).
             </p>
@@ -164,7 +237,12 @@ export function ApiKeysSection() {
                 style={{ color: "var(--status-hot)" }}
                 data-testid="api-key-error"
               >
-                Failed to add key — please try again.
+                {/* #5127: a sharing refusal says why (e.g. federation off). */}
+                {add.error instanceof ApiError &&
+                (add.error.code === "share_unavailable" ||
+                  add.error.code === "share_unsupported")
+                  ? shareErrorMessage(add.error)
+                  : "Failed to add key — please try again."}
               </p>
             )}
           </div>
@@ -237,6 +315,30 @@ export function ApiKeysSection() {
                         />
                         {meta.label}
                       </span>
+                      {k.provider === "anthropic" && (
+                        <label className="mt-1 flex cursor-pointer items-center gap-1.5 text-[length:var(--text-body-dense)] text-[var(--app-fg)]">
+                          <Checkbox
+                            checked={k.shareAcrossNodes === true}
+                            disabled={update.isPending}
+                            aria-label={`Make ${k.label || k.maskedKey} available to all nodes`}
+                            data-testid={`api-key-share-${k.id}`}
+                            onChange={e => {
+                              if (e.target.checked) void setShared(k, true);
+                              else setPendingUnshare(k);
+                            }}
+                          />
+                          All nodes
+                        </label>
+                      )}
+                      {shareErrors[k.id] && (
+                        <span
+                          className="mt-0.5 text-[length:var(--text-body-dense)]"
+                          style={{ color: "var(--status-hot)" }}
+                          data-testid={`api-key-share-error-${k.id}`}
+                        >
+                          {shareErrors[k.id]}
+                        </span>
+                      )}
                     </div>
                     <Button
                       variant="outline"
@@ -288,6 +390,22 @@ export function ApiKeysSection() {
         }}
         isPending={remove.isPending}
         destructive
+      />
+
+      <ConfirmDialog
+        isOpen={pendingUnshare !== null}
+        onClose={() => setPendingUnshare(null)}
+        title="Stop sharing this key?"
+        description={UNSHARE_CONFIRM_TEXT}
+        confirmLabel="Stop sharing"
+        confirmingLabel="Saving…"
+        onConfirm={async () => {
+          if (!pendingUnshare) return;
+          const key = pendingUnshare;
+          setPendingUnshare(null);
+          await setShared(key, false);
+        }}
+        isPending={update.isPending}
       />
     </div>
   );

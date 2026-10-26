@@ -4,24 +4,16 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
-import {
-  checkCallerNamespace,
-  checkFederationToken,
-  notifyOriginatingHub,
-} from "./shared";
+import { checkCallerNamespace, checkFederationToken } from "./shared";
 import { logAndJson } from "../routeErrorHelper";
+import { spawnForPeer } from "./peerSpawn";
 import {
   dismissPendingSpawn,
   getFederationPendingSpawn,
   markSpawnFailed,
 } from "../../../sync/pendingSpawns";
-import { isSafeMachinePath } from "../../../utils/pathSecurity";
-import { expandTilde } from "../../../utils/expandTilde";
-import {
-  defineCapability,
-  FederationSpawnBodySchema,
-  FederationSpawnStatusSchema,
-} from "@hapi/protocol";
+import { spawnFailedNotification } from "../../../notifications/producerNotifications";
+import { defineCapability, FederationSpawnStatusSchema } from "@hapi/protocol";
 import { cataloged } from "../../../capabilities/cataloged";
 import {
   isFileTypeAllowed,
@@ -1036,239 +1028,39 @@ export function createSessionLifecycleRoutes(
         probe: "skip",
       })
     ),
-    async c => {
-      if (!checkFederationToken(deps, c.req.header("authorization"))) {
-        return c.json({ error: "Unauthorized" }, 401);
-      }
+    c => spawnForPeer(c, deps, "plain")
+  );
 
-      const engine = deps.getSyncEngine();
-      if (!engine) {
-        return c.json({ type: "error", message: "Not connected" }, 503);
-      }
-
-      const body = await c.req.json().catch(() => null);
-      const parsed = FederationSpawnBodySchema.safeParse(body);
-      if (!parsed.success) {
-        const message = parsed.error.issues[0]?.message ?? "Invalid body";
-        return c.json({ type: "error", message }, 400);
-      }
-
-      // Pick the first online machine (nodes typically have one daemon)
-      const machines = engine.getOnlineMachines();
-      if (machines.length === 0) {
-        return c.json(
-          { type: "error", message: "No machines available on this node" },
-          503
-        );
-      }
-
-      const machineId = machines[0].id;
-      const {
-        directory,
-        agent,
-        yolo,
-        claimPort,
-        sessionType,
-        worktreeName,
-        existingBranch,
-        sourceBranch,
-        name,
-        emoji,
-        originatingNodeId,
-        accountUuid,
-        parentSessionId,
-        parentRelationship,
-        safeMode,
-        launcher,
-        model,
-        modelRouting,
-        modelMode,
-        effort,
-        rawModel,
-        cloneRepo,
-        sessionRole,
-        outputStyle,
-        nativeModelSelection,
-        spawnCorrelationId,
-      } = parsed.data;
-
-      // H-4: validate the directory against the path-security blacklist BEFORE
-      // spawning a session in it. Without this, any federation-authorized caller
-      // could spawn in /etc, /root/.ssh, /proc/*, etc. Mirrors the check applied
-      // in /federation/list-directory and /federation/paths/exists.
-      {
-        const expanded = expandTilde(directory.trim());
-        if (!isSafeMachinePath(expanded)) {
-          return c.json(
-            {
-              type: "error",
-              message: "Access denied: directory is not allowed",
-            },
-            403
-          );
-        }
-      }
-
-      // Read claudePath from this node's own federation config (issue #933).
-      // Falls back to auto-detection in the daemon if not configured.
-      const claudePath = deps.federationConfig?.claudePath;
-
-      // Kick off spawn in the background — don't await.
-      // Note: name is intentionally omitted here and applied post-spawn
-      // to avoid a race condition between spawn completion and the next poll cycle.
-      //
-      // Issue #1262/#1683 (claim-at-deploy): the peer's `claimPort` intent now
-      // defaults to `false` when omitted, so a peer-incoming worktree spawn does
-      // not consume a 3010-3019 slot until it deploys an instance. Older peers
-      // that omit the field therefore no longer claim at spawn (deploys are
-      // lockstep via deploy-federation-nodes.sh; a deploy claims anyway). A peer
-      // that genuinely wants a spawn-time claim must send `claimPort: true`.
-      // [perf] issue #2147 stage (b): remote background-spawn timer — accept →
-      // spawnSession resolved (the node's own view of the raw spawn cost).
-      // Additive; grep `[perf][spawn]`.
-      const perfRemoteSpawnT0 = Date.now();
-      void engine
-        .spawnSession({
-          machineId,
-          directory,
-          agent,
-          yolo,
-          claimPort: claimPort ?? false,
-          sessionType,
-          worktreeName,
-          // hapimatic-private#4481: forward the existing-branch pick on the
-          // peer-incoming hop (#1262 trap).
-          existingBranch,
-          // hapimatic-private#4370: forward the explicit base branch (#1262 trap).
-          sourceBranch,
-          originatingNodeId,
-          accountUuid,
-          // Issue #2822 (epic #2478 D2a): forward the managed-peer attribution on
-          // the peer-incoming hop (#1262 trap — un-enumerated here, a cross-node
-          // PM spawn comes up unattributed and ungrouped). Passed RAW: the sending
-          // hub already resolved the parent to its store uuid (webClient.ts); the
-          // parent lives on that hub, so re-resolving against THIS node's store
-          // would drop every cross-node link. The syncEngine.spawnSession choke
-          // point persists it when parentRelationship === "spawn". Spawn-time
-          // options — NOT a post-spawn `.then()` apply like name/emoji.
-          parentSessionId,
-          parentRelationship,
-          safeMode,
-          launcher,
-          // Issue #1733: forward the OpenRouter model on the peer-incoming hop.
-          model,
-          // Issue #3349 (D4(a)): forward the native-vs-OpenRouter routing
-          // discriminator on the peer-incoming hop (#1262 trap — un-enumerated
-          // here, a federated native opencode spawn silently strips the routing
-          // and the receiving daemon misroutes it to OpenRouter; this IS the
-          // "worst hop" the directive flags).
-          modelRouting,
-          // Issue #2434: forward the Claude model-mode pin on the peer-incoming
-          // hop (#1262 trap — un-enumerated here, a federated spawn silently
-          // ignores the peer's pin and starts on the default model).
-          modelMode,
-          // Issue #2456: forward the reasoning-effort + pinned raw model on the
-          // peer-incoming hop (#1262 trap — un-enumerated here, a federated spawn
-          // silently drops the peer's effort/model selection).
-          effort,
-          rawModel,
-          // Issue #1953 (A6): forward the clone-on-spawn repo on the peer-incoming hop.
-          cloneRepo,
-          // Issue #2155: forward the role-scoped profile on the peer-incoming hop.
-          sessionRole,
-          // Issue #2626 (D): forward the per-session output style on the
-          // peer-incoming hop (#1262 trap — un-enumerated here, a federated spawn
-          // silently drops the peer's style selection and R1-remote fails).
-          outputStyle,
-          // Issue #3348: forward the bundled non-claude native model selection on
-          // the peer-incoming hop (#1262 trap — un-enumerated here, a federated
-          // gemini/codex spawn silently drops the peer's model + effort selection).
-          nativeModelSelection,
-          claudePath,
-        })
-        // Issue #2150: a REJECTED spawn takes the same failure branch below (log
-        // + hub callback) instead of becoming an unhandled rejection that tells
-        // the caller nothing — the local early-return path's `.catch`
-        // (routes/machines.ts) is the precedent.
-        .catch(
-          (
-            err: unknown
-          ): { type: "error"; message: string; code?: string } => ({
-            type: "error",
-            message: err instanceof Error ? err.message : String(err),
-          })
-        )
-        .then(async result => {
-          // [perf] issue #2147 stage (b): the node's own raw-spawn duration
-          // (accept → daemon RPC resolved), joinable with the hub stamps on dir.
-          deps.errorLogger?.info(
-            `[perf][spawn] stage=remote-bg-spawn dir=${directory} node=${originatingNodeId ?? ""} result=${result.type} ms=${Date.now() - perfRemoteSpawnT0}`,
-            { category: "perf" }
-          );
-          if (result.type === "error") {
-            // Issue #2150 (R2): name the correlation id and the refusal code so
-            // a rejected federation spawn is findable in this node's journal.
-            console.error(
-              `[Federation] Background spawn failed (spawnCorrelationId=${spawnCorrelationId ?? "none"}${result.code ? `, code=${result.code}` : ""}): ${result.message}`
-            );
-
-            // Notify the originating hub of the failure so it can surface
-            // the error to the client immediately (issue #933). Issue #2150:
-            // forward the refusal code too (K-4497-1 §3).
-            void notifyOriginatingHub({
-              originatingNodeId,
-              nodeId: deps.federationConfig?.nodeId ?? "",
-              directory,
-              spawnCorrelationId,
-              success: false,
-              error: result.message,
-              code: result.code,
-              deps,
-            });
-            return;
-          }
-
-          // Apply optional session identity after successful spawn
-          if (name) {
-            await engine.renameSession(result.sessionId, name).catch(err => {
-              console.warn(
-                `[Federation] Failed to rename session ${result.sessionId}:`,
-                err
-              );
-            });
-          }
-          if (emoji) {
-            await engine
-              .updateSessionEmoji(result.sessionId, emoji)
-              .catch(err => {
-                console.warn(
-                  `[Federation] Failed to update session emoji ${result.sessionId}:`,
-                  err
-                );
-              });
-          }
-
-          // Notify the originating hub of success
-          void notifyOriginatingHub({
-            originatingNodeId,
-            nodeId: deps.federationConfig?.nodeId ?? "",
-            directory,
-            spawnCorrelationId,
-            success: true,
-            sessionId: result.sessionId,
-            deps,
-          });
-        });
-
-      // [perf] issue #2147 stage (b): remote accept — the hub's dispatch RTT ends
-      // here; the raw spawn runs in the background above. grep `[perf][spawn]`.
-      deps.errorLogger?.info(
-        `[perf][spawn] stage=remote-accept dir=${directory} node=${originatingNodeId ?? ""}`,
-        { category: "perf" }
-      );
-      // Return immediately — the hub polls for the new session.
-      return c.json({ type: "accepted" });
-    }
+  // ─── Node-to-node endpoint: POST /federation/spawn-api-key (issue #5127) ──
+  // The same peer spawn for a session bound to an API key stored on another
+  // node (D21). It confirms the key with its home BEFORE it accepts, so a
+  // refusal reaches the hub's caller at once; after that it is
+  // /federation/spawn. An older node has no such path and answers 404, which
+  // the hub reports as "needs updating" rather than retrying on
+  // /federation/spawn (that would drop the key and bill the default).
+  app.post(
+    "/federation/spawn-api-key",
+    cataloged(
+      defineCapability({
+        id: "federation.spawn-api-key",
+        domain: "federation",
+        surface: "rest",
+        description:
+          "Spawn a Claude session on this node bound to an API key stored on another node; the key is confirmed with its home before the spawn is accepted.",
+        whenToUse:
+          "When a user creates a session on this node that bills an API key kept in another node's vault.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/federation/spawn-api-key",
+        },
+        auth: "federation-token",
+        riskTier: "mutating",
+        availability: { scope: "operator" },
+        probe: "skip",
+      })
+    ),
+    c => spawnForPeer(c, deps, "api-key")
   );
 
   // ─── Node-to-node endpoint: POST /federation/spawn-status (issue #933) ─
@@ -1333,10 +1125,12 @@ export function createSessionLifecycleRoutes(
 
       if (!success && error) {
         // R1: flip the hub-side placeholder so CLI pollers of
-        // /federation/all-sessions read the peer's error + code.
-        if (pending && spawnCorrelationId) {
-          markSpawnFailed(spawnCorrelationId, error, code);
-        }
+        // /federation/all-sessions read the peer's error + code. Issue #5696:
+        // `flipped` is true only on the spawning→failed transition.
+        const flipped =
+          pending && spawnCorrelationId
+            ? markSpawnFailed(spawnCorrelationId, error, code)
+            : false;
 
         // Emit SSE event so the web UI can call markSpawnFailed() on the
         // matching pending-spawn stub. Issue #2150 (K-4497-1 §1): stamped with
@@ -1356,6 +1150,28 @@ export function createSessionLifecycleRoutes(
             ...(code ? { code } : {}),
             ...(nodeLabel ? { nodeLabel } : {}),
             ...(pending ? { namespace: pending.namespace } : {}),
+          });
+        }
+
+        // Issue #5696: the inbox row, written HERE on the hub. The peer raises
+        // none: it has no caller namespace, and its row would reach this hub's
+        // browser a second time through the event bridge
+        // (`shouldForwardBridgeEvent` in federation/nodeRegistry.ts). Only on
+        // the transition, so a repeated callback adds no second row
+        // (`spawn-failed` never coalesces). After the broadcast, so a
+        // notification fault never suppresses the SSE.
+        if (pending && spawnCorrelationId && flipped) {
+          deps.getSyncEngine()?.notifyUser({
+            ...spawnFailedNotification({
+              placeholderId: spawnCorrelationId,
+              directory,
+              error,
+              code,
+              spawnCorrelationId,
+              nodeId: hubNodeId,
+              nodeLabel,
+            }),
+            namespace: pending.namespace,
           });
         }
 

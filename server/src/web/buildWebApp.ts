@@ -131,6 +131,7 @@ import { getKnownSecretLiterals } from "../services/knownSecretLiterals";
 import {
   readSupportEscalationSettings,
   resolveFeedbackSenderConfig,
+  resolveFeedbackSinkConfig,
   resolveOperatorInstanceEnabled,
   resolveSupportChannel,
 } from "../config/serverSettings";
@@ -158,11 +159,13 @@ import type { HarnessPollService } from "../harness/harnessPollService";
 import { harnessRegistry } from "../harness/registry";
 import { ClaudeModelCatalogService } from "../services/claudeModelCatalog";
 import { createApiKeysRoutes } from "./routes/apiKeys";
+import { SharedApiKeyService } from "../services/sharedApiKeyService";
 import { createPorterKeyRoutes } from "./routes/porterKey";
 import { createPorterStatusRoutes } from "./routes/porterStatus";
 import { createPorterExposureGate } from "./middleware/porterExposure";
 import { createRemoteSessionAvailabilityGuard } from "./middleware/remoteSessionAvailability";
 import { createBackupIdentityRoutes } from "./routes/backupIdentity";
+import { createBackupPromptPreferenceRoutes } from "./routes/backupPromptPreference";
 import {
   createPorterImportRoutes,
   type PlanStore,
@@ -185,6 +188,8 @@ import { createFederationRoutes } from "./routes/federation";
 import { readNodeAccountHealth } from "../services/accountHealth";
 import { resolveLocalNodeIdentity } from "../config/nodeLabel";
 import type { NodeRegistry } from "../federation/nodeRegistry";
+import type { NotificationService } from "../notifications/notificationService";
+import { createNotificationsRoutes } from "./routes/notifications";
 import type { FileClaimSync } from "../federation/fileClaimSync";
 import type { HealthAggregator } from "../federation/healthAggregator";
 import type { PeerAnnouncer } from "../federation/peerAnnouncer";
@@ -267,6 +272,8 @@ export function buildWebApp(options: {
   /** Issue #2158: context-watermark successor-handoff status/override service. */
   getContextWatermarkService: () => ContextWatermarkService | null;
   getNodeRegistry: () => NodeRegistry | null;
+  /** Issue #4913: the notify() service behind /api/notifications. */
+  getNotificationService?: () => NotificationService | null;
   getHealthAggregator: () => HealthAggregator | null;
   getPeerAnnouncer: () => PeerAnnouncer | null;
   /** #1969 (R5): the federation claim-sync replica for the /file-claims union. */
@@ -461,12 +468,23 @@ export function buildWebApp(options: {
     ttlMs: rotationLeaseTtlMs,
   });
 
+  // Issue #5127: one requesting-side service for API keys homed on other
+  // federation nodes — the /cli routes (daemon, launcher, apiKeyHelper), the
+  // local spawn pre-check, the remote key-bound spawn receiver and the picker.
+  const sharedApiKeyService = new SharedApiKeyService({
+    getSettingsFile: () => configuration.settingsFile,
+    getFederationConfig: () => options.federationConfig,
+    getNodeRegistry: options.getNodeRegistry,
+    errorLogger: options.errorLogger,
+  });
+
   app.route(
     "/cli",
     createCliRoutes(options.getSyncEngine, {
       store: options.store,
       errorLogger: options.errorLogger,
       rotationLeaseService,
+      sharedApiKeyService,
     })
   );
 
@@ -687,6 +705,11 @@ export function buildWebApp(options: {
   const codexLoginService = new CodexLoginService({
     hapiHome: configuration.dataDir,
     log: msg => console.log(`[codex-login] ${msg}`),
+    // #3982 (K-R4): a device-auth login of a removed account re-adds it.
+    removedAccounts: {
+      isTombstoned: pk => accountService.isTombstoned(pk),
+      clearTombstone: pk => accountService.clearTombstone(pk),
+    },
   });
 
   // Federation routes — mounted before JWT middleware.
@@ -731,6 +754,8 @@ export function buildWebApp(options: {
       // Issue #1536: per-node system-jobs engine for the peer-incoming
       // /federation/system-jobs/* receivers.
       getSystemJobsService: () => systemJobsService,
+      // Issue #4913: the peer-incoming /federation/notifications/* receivers.
+      getNotificationService: options.getNotificationService,
       // #2627 (Sub-Issue E): the peer-incoming output-style-sync receiver +
       // digest read this store.
       getOutputStyleSyncService: options.getOutputStyleSyncService,
@@ -747,6 +772,13 @@ export function buildWebApp(options: {
       // /federation/capabilities/catalog receiver annotates + hard-filters with
       // the owning binary's context (never relays a raw catalog).
       getAvailabilityContext: availabilityContextFactory,
+      // #5127: the shared-API-key receivers read THIS node's vault and audit
+      // every cross-node request in its hapi.db.
+      getSettingsFile: () => configuration.settingsFile,
+      getApiKeyShareAudit: () => options.store.apiKeyShareAudit,
+      // #5127: the /federation/spawn-api-key receiver confirms the key with
+      // its home through this node's requesting-side service.
+      getSharedApiKeyService: () => sharedApiKeyService,
       federationConfig: options.federationConfig,
       apiToken: options.federationApiToken,
       jwtSecret: options.jwtSecret,
@@ -894,15 +926,19 @@ export function buildWebApp(options: {
   );
 
   // Harness self-update APPLY routes (#1774, Sub E, epic #1769): POST
-  // /api/harness/:id/update + /rollback. 🔴 The MOUNT POSITION *IS* the auth for
-  // these PRIVILEGED, host-mutating routes and MUST stay BELOW the global JWT
-  // gate above — a pre-gate mount ships an unauthenticated host-mutating route
-  // (the v1.0.644 precedent). The command is resolved server-side from the
-  // code-defined registry and NEVER echoed to the client (R11). Per-node dispatch
-  // returns 501 for a remote node in v1 (the KD-4 seam).
+  // /api/harness/:id/update + /rollback. 🔴 These PRIVILEGED, host-mutating
+  // routes authenticate themselves: the factory applies createAuthMiddleware on
+  // each exact path with this jwtSecret (#3261), so they reject an
+  // unauthenticated request wherever they are mounted. Keep them BELOW the
+  // global JWT gate above anyway, as defense-in-depth (cf. the v1.0.644
+  // precedent: a pre-gate mount shipped GET /api/jobs unauthenticated). The
+  // command is resolved server-side from the code-defined registry and NEVER
+  // echoed to the client (R11). Per-node dispatch returns 501 for a remote node
+  // in v1 (the KD-4 seam).
   app.route(
     "/api",
     createHarnessUpdateRoutes({
+      jwtSecret: options.jwtSecret,
       getUpdateService: options.getUpdateService,
       getLocalNodeId: () => options.federationConfig?.nodeId ?? null,
       getNodeRegistry: options.getNodeRegistry,
@@ -948,6 +984,19 @@ export function buildWebApp(options: {
   // re-asserts caller-namespace ownership (#1097). Node-local (RULING D2=A) — no
   // federation proxy. Guarded by the auth-differential test in routes/bookmarks.test.ts.
   app.route("/api", createBookmarksRoutes(options.store));
+
+  // Notifications inbox (#4913, epic #4912): list / unread-count / read /
+  // dismiss / dismiss-all under /api/notifications. 🔴 The MOUNT POSITION *IS*
+  // the auth — these include MUTATION routes and MUST stay BELOW the global JWT
+  // gate above (beside createBookmarksRoutes). Each handler scopes to the
+  // caller's namespace; with a NodeRegistry they also fan out to peers.
+  app.route(
+    "/api",
+    createNotificationsRoutes({
+      getNotificationService: () => options.getNotificationService?.() ?? null,
+      getNodeRegistry: options.getNodeRegistry,
+    })
+  );
 
   // Admin VM provisioning control plane (#2469, epic #2467 Sub B). 🔴 The MOUNT
   // POSITION *IS* the auth — this MUST stay BELOW the global JWT gate above,
@@ -1250,6 +1299,8 @@ export function buildWebApp(options: {
       getSseManager: options.getSseManager,
       // Issue #4461 (R6): names this node on an account_unrefreshable create.
       getLocalNode: localNode,
+      // Issue #5127: a spawn bound to a key on another node is confirmed first.
+      getSharedApiKeyService: () => sharedApiKeyService,
     })
   );
   // hapimatic-private#4481: Create-page Branch control listing (local + federated).
@@ -1336,6 +1387,11 @@ export function buildWebApp(options: {
     createFeedbackRoutes(options.store, {
       senderConfig: feedbackSender,
       operatorInstanceEnabled: resolveOperatorInstanceEnabled(),
+      // Issue #2911: forward each new row to the gateway's central sink.
+      sinkConfig: resolveFeedbackSinkConfig({
+        nodeId: options.federationConfig?.nodeId ?? null,
+        nodeLabel: options.federationConfig?.nodeLabel ?? null,
+      }),
     })
   );
   // Issue #4371 (E6 Sub F): in-app self-help support — the support session,
@@ -1478,6 +1534,12 @@ export function buildWebApp(options: {
       getAccountService: () => accountService,
       getNicknameStore: () => nicknameStore,
       getMonogramStore: () => monogramStore,
+      // #5429: a mint whose rollback also fails is logged to error_logs.
+      errorLogger: options.errorLogger,
+      // #5127: the share flag needs this node's federation id; the picker lists
+      // every node's shared keys.
+      getFederationConfig: () => options.federationConfig,
+      getSharedApiKeyService: () => sharedApiKeyService,
     })
   );
   // Issues #4533 and #5165: the Porter exposure gate — exposed by default;
@@ -1501,6 +1563,12 @@ export function buildWebApp(options: {
   // inline middleware). The SECRET identity never touches settings.json; it lives
   // transiently at ~/.config/hapimatic/age-identity.pending.txt and is shredded on ack.
   app.route("/api", createBackupIdentityRoutes(configuration.settingsFile));
+  // Issue #4791: the node-local skip marker of the first-run backup-key step
+  // (its own file — preferences.ts is at its line ceiling). After the JWT gate.
+  app.route(
+    "/api",
+    createBackupPromptPreferenceRoutes(configuration.settingsFile)
+  );
   // Porter import + installed routes (auth by mount position after the JWT gate).
   // #3446 shared PlanStore + token store (K6); #3590 last-import box (K6/D7).
   const porterPlanStore: PlanStore = new Map();

@@ -52,6 +52,9 @@ export * from "./token";
 export * from "./exposure";
 // #5172: the import review's view of an MCP server definition + field roles.
 export * from "./mcpReview";
+// #5601: the import review's wire contract (plan summary + commit result) the
+// server produces and the web renders — one declaration, no hand copy.
+export * from "./importWire";
 // #4373: the tenant export profile (premium predicate, memory section) and the
 // archive hygiene gate both exporters and the standalone verifier run.
 export * from "./tenantProfile";

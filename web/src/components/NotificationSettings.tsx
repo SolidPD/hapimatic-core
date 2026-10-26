@@ -6,12 +6,13 @@ import { usePushNotifications } from "@/hooks/usePushNotifications";
 import { safeSetItem } from "@/lib/localStorageCleanup";
 import {
   STORAGE_KEYS,
-  getStoredPreference,
   setStoredPreference,
+  readNotificationPreferences,
   syncPreferencesToCache,
   writeGlobalOptOut,
   writeMutedSessions,
 } from "@/lib/notificationPreferences";
+import { NEW_KIND_PREFERENCE_KEYS } from "@/lib/notificationKindPrefs";
 
 // Storage keys, the per-type helpers, and the SW cache-sync (which now also
 // carries the per-session mute set, issue #87) live in @/lib/notificationPreferences
@@ -55,7 +56,7 @@ function Toggle(props: {
       aria-checked={checked}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`h-auto w-full items-start justify-start gap-3 rounded-lg p-3 text-left ${
+      className={`h-auto w-full items-start justify-start gap-3 whitespace-normal rounded-lg p-3 text-left ${
         disabled
           ? "cursor-not-allowed opacity-50"
           : "hover:bg-[var(--app-bg-hover)]"
@@ -84,6 +85,90 @@ function Toggle(props: {
   );
 }
 
+type PreferenceKey = keyof typeof STORAGE_KEYS;
+
+// The push-and-pop-up rows that existed before #4915, unchanged.
+const PUSH_KIND_ROWS: Array<{
+  key: PreferenceKey;
+  label: string;
+  description: string;
+}> = [
+  {
+    key: "permissions",
+    label: "Permission Requests",
+    description: "When Claude needs approval for an action",
+  },
+  {
+    key: "questions",
+    label: "Questions",
+    description: "When Claude asks you a question",
+  },
+  {
+    key: "ready",
+    label: "Ready for Input",
+    description: "When Claude finishes and is waiting",
+  },
+  {
+    key: "errors",
+    label: "Errors",
+    description: "When something goes wrong",
+  },
+  {
+    key: "stalls",
+    label: "Stall Detection",
+    description: "When a session appears stuck with no progress",
+  },
+  {
+    key: "usage",
+    label: "Usage Alerts",
+    description: "When an account crosses a usage threshold",
+  },
+];
+
+// Issue #4915: one row per non-push notification kind. Each gates that kind's
+// pop-up; the inbox entry is always stored (epic decision D3).
+const EVENT_KIND_ROWS: Record<
+  (typeof NEW_KIND_PREFERENCE_KEYS)[number],
+  { label: string; description: string }
+> = {
+  toolErrors: {
+    label: "Tool Errors",
+    description: "When a tool call in a session fails",
+  },
+  promptBlocked: {
+    label: "Blocked Prompts",
+    description: "When a hook blocks a prompt you sent",
+  },
+  apiErrors: {
+    label: "API Errors",
+    description: "When the API retries, overloads or recovers",
+  },
+  accountUnrefreshable: {
+    label: "Account Needs Re-login",
+    description: "When an account's login expires and cannot refresh",
+  },
+  sessionRestartFailed: {
+    label: "Session Restart Failed",
+    description: "When a session cannot restart after a token refresh",
+  },
+  spawnFailed: {
+    label: "Session Creation Failed",
+    description: "When a new session fails to start",
+  },
+  waitingForSlot: {
+    label: "Waiting for a Session Slot",
+    description: "When a reconnect waits for a free slot",
+  },
+  loopsResuming: {
+    label: "Scheduled Jobs Resuming",
+    description: "When paused jobs resume after a reconnect",
+  },
+  modelReverted: {
+    label: "Model Reverted",
+    description: "When a session falls back to a different model",
+  },
+};
+
 export type NotificationSettingsBodyProps = {
   api: ApiClient | null;
 };
@@ -102,24 +187,10 @@ export function NotificationSettingsBody(props: NotificationSettingsBodyProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Per-type notification preferences
-  const [permissionsEnabled, setPermissionsEnabled] = useState(() =>
-    getStoredPreference(STORAGE_KEYS.permissions)
-  );
-  const [questionsEnabled, setQuestionsEnabled] = useState(() =>
-    getStoredPreference(STORAGE_KEYS.questions)
-  );
-  const [readyEnabled, setReadyEnabled] = useState(() =>
-    getStoredPreference(STORAGE_KEYS.ready)
-  );
-  const [errorsEnabled, setErrorsEnabled] = useState(() =>
-    getStoredPreference(STORAGE_KEYS.errors)
-  );
-  const [stallsEnabled, setStallsEnabled] = useState(() =>
-    getStoredPreference(STORAGE_KEYS.stalls)
-  );
-  const [usageEnabled, setUsageEnabled] = useState(() =>
-    getStoredPreference(STORAGE_KEYS.usage)
+  // Per-kind notification preferences + the "Show pop-ups" switch (#4915).
+  // One reader for every toggle (the same snapshot the service worker gets).
+  const [prefs, setPrefs] = useState<Record<PreferenceKey, boolean>>(
+    readNotificationPreferences
   );
 
   // Sync preferences to cache on mount
@@ -225,28 +296,9 @@ export function NotificationSettingsBody(props: NotificationSettingsBodyProps) {
   }, [unsubscribe]);
 
   const handleTogglePreference = useCallback(
-    (key: keyof typeof STORAGE_KEYS, value: boolean) => {
+    (key: PreferenceKey, value: boolean) => {
       setStoredPreference(STORAGE_KEYS[key], value);
-      switch (key) {
-        case "permissions":
-          setPermissionsEnabled(value);
-          break;
-        case "questions":
-          setQuestionsEnabled(value);
-          break;
-        case "ready":
-          setReadyEnabled(value);
-          break;
-        case "errors":
-          setErrorsEnabled(value);
-          break;
-        case "stalls":
-          setStallsEnabled(value);
-          break;
-        case "usage":
-          setUsageEnabled(value);
-          break;
-      }
+      setPrefs(current => ({ ...current, [key]: value }));
       // Sync to cache for service worker access
       void syncPreferencesToCache();
     },
@@ -363,57 +415,50 @@ export function NotificationSettingsBody(props: NotificationSettingsBodyProps) {
             {isLoading ? "Disabling..." : "Disable"}
           </Button>
         </div>
-
-        <div className="border-t border-[var(--app-border)] pt-4">
-          <div className="text-xs font-medium text-[var(--app-hint)] uppercase tracking-wide px-3 mb-2">
-            Notification Types
-          </div>
-          <div className="flex flex-col">
-            <Toggle
-              checked={permissionsEnabled}
-              onChange={v => handleTogglePreference("permissions", v)}
-              label="Permission Requests"
-              description="When Claude needs approval for an action"
-            />
-            <Toggle
-              checked={questionsEnabled}
-              onChange={v => handleTogglePreference("questions", v)}
-              label="Questions"
-              description="When Claude asks you a question"
-            />
-            <Toggle
-              checked={readyEnabled}
-              onChange={v => handleTogglePreference("ready", v)}
-              label="Ready for Input"
-              description="When Claude finishes and is waiting"
-            />
-            <Toggle
-              checked={errorsEnabled}
-              onChange={v => handleTogglePreference("errors", v)}
-              label="Errors"
-              description="When something goes wrong"
-            />
-            <Toggle
-              checked={stallsEnabled}
-              onChange={v => handleTogglePreference("stalls", v)}
-              label="Stall Detection"
-              description="When a session appears stuck with no progress"
-            />
-            <Toggle
-              checked={usageEnabled}
-              onChange={v => handleTogglePreference("usage", v)}
-              label="Usage Alerts"
-              description="When an account crosses a usage threshold"
-            />
-          </div>
-        </div>
       </div>
     );
   };
 
+  // Issue #4915: the pop-up switch and the per-kind list render whether or not
+  // push is supported or subscribed — a pop-up needs no push subscription.
+  const renderPreferences = () => (
+    <div className="mt-4 border-t border-[var(--app-border)] pt-4">
+      <Toggle
+        checked={prefs.showPopups}
+        onChange={v => handleTogglePreference("showPopups", v)}
+        label="Show Pop-ups"
+        description="Show a pop-up when a notification arrives. Notifications still appear in the inbox and the badge."
+      />
+      <div className="mt-2 text-xs font-medium text-[var(--app-hint)] uppercase tracking-wide px-3 mb-2">
+        Notification Types
+      </div>
+      <div className="flex flex-col">
+        {PUSH_KIND_ROWS.map(row => (
+          <Toggle
+            key={row.key}
+            checked={prefs[row.key]}
+            onChange={v => handleTogglePreference(row.key, v)}
+            label={row.label}
+            description={row.description}
+          />
+        ))}
+        {NEW_KIND_PREFERENCE_KEYS.map(key => (
+          <Toggle
+            key={key}
+            checked={prefs[key]}
+            onChange={v => handleTogglePreference(key, v)}
+            label={EVENT_KIND_ROWS[key].label}
+            description={EVENT_KIND_ROWS[key].description}
+          />
+        ))}
+      </div>
+    </div>
+  );
+
   return (
     <div className="mt-4">
       {renderContent()}
+      {renderPreferences()}
       {error && (
         <div className="mt-4 rounded-md bg-red-900/20 p-3 text-sm text-red-400">
           {error}

@@ -19,30 +19,9 @@ import { normalizeEntryPath, sectionSkipSurface } from "./plannedDestinations";
 import type { Conflict } from "./conflictDetection";
 import type { ImportPlan, PlannedItemKind } from "./importArchive";
 import type { CommitExclusions } from "./commitSelection";
-
-/** Per-dimension parity: what the selected plan promised vs what the commit did. */
-export interface DimensionParity {
-  /** Selected planned items in this dimension. */
-  expected: number;
-  /** Items actually written (new content). */
-  written: number;
-  /** Selected items skipped as byte-identical no-ops (already present). */
-  alreadyPresent: number;
-  /** Selected items skipped because they differ and overwrite was not chosen. */
-  skippedConflicts: number;
-  /**
-   * The non-tautological gap: for `hooks`, registry-referenced modules absent at
-   * the destination post-commit (Task 4); for `hookSupport`, entries none of
-   * whose files the plan writes at or under their path and that carry no
-   * plan-time omission (#4185 reports an entry whose tar member is absent at
-   * plan time instead; #5188 counts a folder entry whose files land). Empty
-   * otherwise.
-   */
-  missing: string[];
-}
-
-/** #3590 (K6/D7): per-dimension parity report carried on `ImportResult`. */
-export type ImportParity = Record<string, DimensionParity>;
+import type { DimensionParity, ImportParity } from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type { DimensionParity, ImportParity } from "@hapi/protocol/porter";
 
 /** The dimension a planned file item belongs to (for the parity report). */
 const KIND_TO_DIM: Record<PlannedItemKind, string> = {
@@ -120,10 +99,12 @@ export function computeParity(
   const landed = (dest: string): boolean =>
     plannedHookPaths.some(p => p === dest || p.startsWith(dest + sep));
   // #4160: skip an entry only when the plan actually reports it under its
-  // section surface (./planSections emits one omission per entry). #4185: that
-  // includes an entry that matched no file (an invalid-path entry is reported
-  // only then, #5188; a `null` path is skipped below either way), so one
-  // already reported at plan time is not ALSO reported here as missing.
+  // section surface (./planSections can emit more than one row for one entry
+  // since #5598; this Set dedupes by surface). #4185: that includes an entry
+  // that matched no file (an invalid-path entry is reported then, #5188, or
+  // when it leaves files behind, #5598; a `null` path is skipped below either
+  // way), so one already reported at plan time is not ALSO reported here as
+  // missing.
   // 🔴 #4185 / #4156: this dedupe RELIES on reading EVERY `plan.omissions`
   // surface (policy skips ∪ unmatched). If #4156 adds a policy-only list
   // (`plan.policySkips`) and narrows this set to it, the unmatched notices must
@@ -135,7 +116,8 @@ export function computeParity(
       // The planner's spelling: `hooks/x.sh/` planned `<claudeDir>/hooks/x.sh`,
       // and `hooks/lib/` is the `hooks/lib` directory entry. `null` is an
       // entry `planDimension` matched as written (#5188 F4); it is reported at
-      // plan time when that matched no file.
+      // plan time when that matched no file, or when it left behind a file it
+      // would match without its `.` parts (#5598), so skipping it hides no miss.
       const path = normalizeEntryPath(e.path);
       return (
         path !== null &&

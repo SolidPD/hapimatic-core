@@ -4,19 +4,21 @@
  * refusal (issue #4461, epic #4460 A — R8, R9).
  *
  * ONE builder for both toasts of one refusal. A reconnect refusal reaches the
- * browser twice — the HTTP 409 and the `account-unrefreshable` SSE event — and
+ * browser twice — the HTTP 409 and the `account-unrefreshable` notification — and
  * ToastProvider deduplicates by exact text only (`Toast.tsx`, `DEDUP_WINDOW_MS`).
  * If the two sides built their text differently the user would get two toasts; if
  * only one side attached the action, the action would vanish whenever the other
- * side fired first. So both sides call {@link buildReloginToast} with the
- * server-stamped `nodeId` / `nodeLabel` alone, and get identical text AND the same
- * action. Only the switch path (which has no SSE twin) may add an account name.
+ * side fired first. So the 409 toast is {@link buildReloginToast} with the
+ * server-stamped `nodeId` / `nodeLabel` alone; the notification's title is the
+ * same text, written by the server with the shared `formatReloginMessage`
+ * (#4914), and `formatNotificationToast` attaches this builder's action (#4915).
+ * Only the switch path (which has no notification twin) may add an account name.
  *
  * The action dispatches the `hapi:relogin` window event (the `hapi:spawnFailed`
- * precedent); `ReloginLinkListener` (App.tsx) turns it into a navigation to
- * `/settings/account-usage?relogin=anthropic&node=<id>`, which opens the add flow
- * when this UI can store a login on that node and otherwise explains why not
- * (D-A1 = A: never a login on the wrong node's store).
+ * precedent); `ReloginLinkListener` (`components/ReloginLinkListener.tsx`) turns
+ * it into a navigation to `/settings/account-usage?relogin=anthropic&node=<id>`,
+ * which opens the add flow when this UI can store a login on that node and
+ * otherwise explains why not (D-A1 = A: never a login on the wrong node's store).
  */
 import { AccountUnrefreshableErrorSchema } from "@hapi/protocol";
 import { ApiError } from "@/api/client";
@@ -90,23 +92,27 @@ export function buildReloginToast({
 
 /**
  * Validate the deep-link keys from a raw search object. An unknown provider or a
- * missing / empty / oversized node yields `{}` for that key, so a hand-edited URL
- * never opens a flow for a node it did not name.
+ * missing / empty / oversized node yields `undefined` for that key, so a
+ * hand-edited URL never opens a flow for a node it did not name.
+ *
+ * Both keys are ALWAYS present, as `undefined` when invalid, never omitted: as the
+ * route's `validateSearch`, this result is merged over the raw search
+ * (`{...raw, ...validated}`), so an omitted key would let the raw value through to
+ * `useSearch({ strict: false })` readers (#5417; the system-jobs route's pattern).
  */
 export function parseReloginSearch(
   search: Record<string, unknown>
 ): ReloginSearch {
-  const out: ReloginSearch = {};
-  if (search.relogin === "anthropic") out.relogin = "anthropic";
   const node = search.node;
-  if (
-    typeof node === "string" &&
-    node.trim().length > 0 &&
-    node.length <= MAX_NODE_ID_LENGTH
-  ) {
-    out.node = node;
-  }
-  return out;
+  return {
+    relogin: search.relogin === "anthropic" ? "anthropic" : undefined,
+    node:
+      typeof node === "string" &&
+      node.trim().length > 0 &&
+      node.length <= MAX_NODE_ID_LENGTH
+        ? node
+        : undefined,
+  };
 }
 
 /** The search object for a re-login request (the inverse of the parser). */

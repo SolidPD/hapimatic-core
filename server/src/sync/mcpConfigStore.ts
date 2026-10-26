@@ -27,6 +27,8 @@ import type { SessionCache } from "./sessionCache";
 export interface McpConfigStoreDeps {
   sessionCache: SessionCache;
   getMcpStatus: (projectDir?: string) => McpStatusUpdate | null;
+  /** DI seam (#5676): defaults to `~/.claude.json`; tests pass a temp file. */
+  claudeConfigPath?: string;
 }
 
 export class McpConfigStore {
@@ -34,10 +36,13 @@ export class McpConfigStore {
   private readonly getMcpStatus: (
     projectDir?: string
   ) => McpStatusUpdate | null;
+  private readonly claudeConfigPath: string;
 
   constructor(deps: McpConfigStoreDeps) {
     this.sessionCache = deps.sessionCache;
     this.getMcpStatus = deps.getMcpStatus;
+    this.claudeConfigPath =
+      deps.claudeConfigPath ?? join(homedir(), ".claude.json");
   }
 
   /**
@@ -103,7 +108,7 @@ export class McpConfigStore {
    */
   readDisabledServersFromConfig(projectDir: string): string[] {
     try {
-      const cfgPath = join(homedir(), ".claude.json");
+      const cfgPath = this.claudeConfigPath;
       const raw = readFileSync(cfgPath, "utf-8");
       const config = JSON.parse(raw);
       const projects = config?.projects;
@@ -146,7 +151,7 @@ export class McpConfigStore {
         code: "unsafe_path",
       };
     }
-    const cfgPath = join(homedir(), ".claude.json");
+    const cfgPath = this.claudeConfigPath;
     let raw: string;
     try {
       raw = readFileSync(cfgPath, "utf-8");
@@ -168,12 +173,13 @@ export class McpConfigStore {
     let config: { projects?: Record<string, unknown> };
     try {
       config = JSON.parse(raw);
-    } catch (err) {
+    } catch {
+      // #5676: a fixed reason, never the parser's text — Bun's JSON.parse
+      // names an unquoted value verbatim, and this result reaches web clients
+      // through the mcp-batch-progress event.
       return {
         ok: false,
-        error: `Claude config at ${cfgPath} is not valid JSON: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        error: `Claude config at ${cfgPath} is not valid JSON.`,
         code: "config_corrupt",
       };
     }

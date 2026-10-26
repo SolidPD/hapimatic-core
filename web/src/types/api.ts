@@ -45,6 +45,16 @@ export type {
   WorktreeMetadata,
 } from "@hapi/protocol/types";
 
+// Notifications inbox (#4913): the stored row the REST routes and the
+// `notification` SyncEvent carry. Sub C (#4915) consumes these.
+export type {
+  NotificationKind,
+  NotificationListResponse,
+  NotificationSeverity,
+  NotificationUnreadCountResponse,
+  StoredNotification,
+} from "@hapi/protocol";
+
 export type SessionMetadataSummary = {
   path: string;
   host: string;

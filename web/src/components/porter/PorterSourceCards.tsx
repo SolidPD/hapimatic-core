@@ -30,7 +30,10 @@ export function skillCheckState(
  * Codex instructions rule reads as an instructions file). The MCP count comes
  * from the manifest `sources[]` metadata when present (which distinguishes
  * found-but-empty), else from the source's grouped keys (a legacy archive
- * without `sources` counts every MCP server as Claude Code's).
+ * without `sources` counts every MCP server as Claude Code's). #5614: output
+ * styles and CLAUDE.md with its includes ("instructions file", the #5169 Codex
+ * wording) are counted too, so a card holding only them is not "no importable
+ * items".
  */
 export function sourceSummary(
   id: PorterSourceId,
@@ -61,6 +64,8 @@ export function sourceSummary(
       [mine(groups.commands), "command"],
       [mine(groups.agents), "agent"],
       [mine(groups.rules), id === "codex" ? "instructions file" : "rule"],
+      [mine(groups.outputStyles), "output style"],
+      [mine(groups.claudeMd), "instructions file"],
       [mine(groups.memory ?? []), "memory file"],
       [mcpCount, "MCP server"],
     ] as [number, string][]

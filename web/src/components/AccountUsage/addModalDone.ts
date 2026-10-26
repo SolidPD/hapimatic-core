@@ -14,7 +14,10 @@ import { ApiError } from "@/api/client";
  */
 
 /** One API-key row's lifecycle. Under #4463 D-1 A a key is stored only after it
- *  validates, so `passed` is the only state with a stored id. */
+ *  validates, so `passed` is the only state with a stored id. A `failed` row
+ *  with `keyStored` is the exception: its add failed, but the server kept the
+ *  key (`mint_rollback_failed`, #5429), so the row is final for this modal and
+ *  is never sent again (#5646 F1). */
 export type KeyRowStatus =
   | { kind: "draft" }
   | { kind: "testing" }
@@ -25,7 +28,7 @@ export type KeyRowStatus =
       modelCount?: number;
       modelCountCapped?: boolean;
     }
-  | { kind: "failed"; message: string };
+  | { kind: "failed"; message: string; keyStored?: true };
 
 export type KeyRow = {
   /** Row-local id; also the monogram's colour seed while the row is a draft. */
@@ -58,12 +61,21 @@ export function parseKeyLines(text: string): string[] {
   return out;
 }
 
-/** True when a row still has work for Done: a key, and no pass yet. */
+/** True for a row whose add failed but whose key the server kept
+ *  (`mint_rollback_failed`, #5429): the row is final for this modal (#5646 F1). */
+export function keyKeptByServer(status: KeyRowStatus): boolean {
+  return status.kind === "failed" && status.keyStored === true;
+}
+
+/** True when a row still has work for Done: a key, no pass yet, no test in
+ *  flight, and no key the server kept after a failed add (#5646 F1: sending it
+ *  again only answers 409 `duplicate_key`). */
 export function rowNeedsAdd(row: KeyRow): boolean {
   return (
     row.key.trim() !== "" &&
     row.status.kind !== "passed" &&
-    row.status.kind !== "testing"
+    row.status.kind !== "testing" &&
+    !keyKeptByServer(row.status)
   );
 }
 
@@ -171,9 +183,21 @@ function upstreamStatusOf(err: ApiError): number | undefined {
 }
 
 /**
+ * Did a failed add still leave the key stored (#5429)? Only when its Google
+ * account could not be created AND the server could not undo the vault write
+ * (`mint_rollback_failed`): the user must remove that key before adding it again.
+ */
+export function addErrorLeftKeyStored(err: unknown): boolean {
+  return err instanceof ApiError && err.code === "mint_rollback_failed";
+}
+
+/**
  * Map a failed add (validate, then store) to the row text (R6). `uiNode` names
  * the vault the key would have gone to. A row becomes `passed` only on success,
- * so every path here leaves it unsaved.
+ * so the row stays unsaved. Every server answer but a failed mint rollback
+ * (#5429), where the server kept the key, left the vault unchanged; a request
+ * that got no complete answer (a dropped connection or a client timeout) may or
+ * may not have stored the key.
  */
 export function describeAddKeyError(err: unknown, uiNode: string): string {
   if (err instanceof ApiError) {
@@ -192,6 +216,10 @@ export function describeAddKeyError(err: unknown, uiNode: string): string {
         why = `${upstream} provider unavailable`;
       else if (upstream !== undefined) why = String(upstream);
       return `Could not verify (${why}) · not saved · try again`;
+    }
+    // #5429: the key IS stored (its rollback failed), so never say "not saved".
+    if (addErrorLeftKeyStored(err)) {
+      return "Saved without its account · remove the key, then add it again";
     }
     // The server answered with something else: say what it said.
     const message = serverMessageOf(err);

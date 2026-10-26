@@ -3,7 +3,11 @@ import { existsSync, type Dirent } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { denormalizeHookCommand } from "@hapi/protocol/porter";
+import {
+  denormalizeHookCommand,
+  type HookRegistrationValidationResult,
+} from "@hapi/protocol/porter";
+import { readDestination } from "./regularFile";
 
 /**
  * The bidirectional hook registration validator (issue #2343, epic #2339 Sub D,
@@ -38,32 +42,8 @@ import { denormalizeHookCommand } from "@hapi/protocol/porter";
  * canonical `$HOME`/`~` expander; foreign-home rewriting is layered on top.
  */
 
-export interface HookRegistrationValidationResult {
-  /** Hook script files on disk with no matching registration (dead code). */
-  orphanFiles: string[];
-  /** Registration commands whose referenced script path does not exist. */
-  orphanRegistrations: string[];
-  /**
-   * #2639 (F9): the THIRD drift direction — a hook whose `from lib.X` import does
-   * NOT resolve against the landed `hooks/lib/`. Absent presence+registration are
-   * both clean, but the hook crashes (unguarded import) or silently degrades
-   * (try/except availability flag) at runtime. `hook` is the on-disk script path
-   * (like {@link orphanFiles}); `module` is the missing `lib` module NAME (a code
-   * path, never a secret). One entry per (hook, unresolved module) pair.
-   */
-  unresolvedImports: { hook: string; module: string }[];
-  /**
-   * #3590 (K5, rule 4): dynamic-loader registry names (from the DESTINATION
-   * `hooks/lib/detector_registry.py` + `hooks/lib/hook_registry.py`) that resolve
-   * to NO `hooks/<name>.<ext>` file at the destination — a registry references a
-   * hook that never landed. The post-commit half of the fail-loud belt (R2): a
-   * missing registry-referenced module here is the drift a `settings.json`-only
-   * orphan check could never see (a dispatcher-form host registers no such name in
-   * settings.json). Empty when every registry name resolves, or when the
-   * destination carries no registry (never a false positive on a clean tree).
-   */
-  registryMissing: string[];
-}
+// #5601: the wire shape lives in @hapi/protocol/porter (importWire.ts).
+export type { HookRegistrationValidationResult } from "@hapi/protocol/porter";
 
 /**
  * #3590 (K4/K5): the two dynamic-loader registries a dispatcher-form host uses to
@@ -142,16 +122,22 @@ const NON_HOOK_DIRS = new Set([
 ]);
 
 /**
- * Tolerant `settings.json` read — a missing or unparseable file yields `{}`
- * (no registrations), never a throw. Mirrors `claudeSettings.readClaudeSettings`.
+ * Tolerant `settings.json` read — a missing, unparseable or special (FIFO,
+ * socket, device) file yields `{}` (no registrations), never a throw. The
+ * missing/unparseable tolerance mirrors the CLI's
+ * `claudeSettings.readClaudeSettings`; that reader has no special-file case.
  */
 async function readSettingsHooks(
   claudeDir: string
 ): Promise<Record<string, unknown>> {
   const settingsPath = join(claudeDir, "settings.json");
-  if (!existsSync(settingsPath)) return {};
   try {
-    const parsed = JSON.parse(await readFile(settingsPath, "utf-8"));
+    // #5759: a FIFO, socket or device reads as absent and is never read. This
+    // runs post-commit under the import lock and from the installed-config
+    // route, and a FIFO's open blocks until a writer appears.
+    const r = await readDestination(settingsPath);
+    if (r.kind !== "file") return {};
+    const parsed = JSON.parse(r.content.toString("utf-8"));
     const hooks = parsed?.hooks;
     return hooks && typeof hooks === "object" ? hooks : {};
   } catch {
@@ -208,8 +194,175 @@ function toDestPath(token: string, claudeDir: string): string {
  * and `"${HOME}"` all name the home directory at run time; a single-quoted
  * `'$HOME'` is literal in the shell and is deliberately left alone (R4).
  * Used for path resolution only, never written back to settings.json.
+ *
+ * #5612: applied through {@link readHomeSpellings} (which writes `${HOME}`
+ * before a name character), on a {@link readShellLiterals} copy, so a spelling
+ * inside single quotes (`'${HOME}/…'`) or after a backslash is not rewritten
+ * either, unless the command runs a nested shell.
  */
 const SHELL_HOME_SPELLING_RE = /"\$\{HOME\}"|"\$HOME"|\$\{HOME\}/g;
+
+/**
+ * #5612: rewrite each home spelling to `$HOME`, or to `${HOME}` when a name
+ * character follows, so the rewrite never joins the next word into another
+ * variable (`${HOME}_bin` must not become `$HOME_bin`).
+ */
+function readHomeSpellings(text: string): string {
+  return text.replace(
+    SHELL_HOME_SPELLING_RE,
+    (match: string, offset: number, whole: string) =>
+      /[A-Za-z0-9_]/.test(whole.charAt(offset + match.length))
+        ? "${HOME}"
+        : "$HOME"
+  );
+}
+
+// #5612: stand-ins for a `$` / `~` the shell reads literally, so neither the
+// home-spelling rewrite nor the shared denormaliser can match them. NUL-led: a
+// command holding a NUL cannot be run by a shell, so protect + restore is the
+// identity on every runnable command.
+const LITERAL_DOLLAR = "\u0000d";
+const LITERAL_TILDE = "\u0000t";
+
+// #5612: the words of a nested-shell command (see runsNestedShell).
+const SHELL_NAME_RE = /^(?:ba|z|da|k|a)?sh$/;
+/** An option cluster holding `c`: the shell runs its next argument. */
+const COMMAND_OPTION_RE = /^-[A-Zabd-z]*c[A-Za-z]*$/;
+/** An option whose argument is the next word (`-o X`, `+O X`, `--rcfile F`). */
+const ARG_OPTION_RE = /^(?:[-+][A-NP-Za-np-z]*[oO]|--(?:rcfile|init-file))$/;
+const PLAIN_OPTION_RE = /^--?[A-Za-z][\w-]*$/;
+
+/**
+ * #5612: true when the command hands text to a nested shell (`bash -c '…'`,
+ * `sh -ec "…"`, `bash -euo pipefail -c '…'`, `eval …`). The inner shell reads
+ * the quoted text again and expands what the outer quotes kept literal, so
+ * such a command is read without literal protection. The test covers the
+ * whole command: a nested shell anywhere turns protection off for every token.
+ * Options may carry an argument (`-o X`, `+o X`, `-O X`, `--rcfile F`,
+ * `--init-file F`).
+ *
+ * One pass over the words, holding only the current one: a walk over a
+ * shell's options resumes the outer pass at the word where it stopped, so a
+ * crafted command of any length takes linear time. (A regex form backtracked
+ * quadratically, and on a long enough command returned no match.)
+ */
+function runsNestedShell(command: string): boolean {
+  const wordRe = /[^\s;&|()]+/g;
+  const nextWord = (from: number): RegExpExecArray | null => {
+    wordRe.lastIndex = from;
+    return wordRe.exec(command);
+  };
+  const spacedTo = (end: number, word: RegExpExecArray): boolean =>
+    /^\s+$/.test(command.slice(end, word.index));
+  const spaceAfter = (end: number): boolean => /\s/.test(command.charAt(end));
+  const endOf = (word: RegExpExecArray): number => word.index + word[0].length;
+
+  let word = nextWord(0);
+  while (word) {
+    const text = word[0];
+    if (text === "eval" && spaceAfter(endOf(word))) return true;
+    if (!SHELL_NAME_RE.test(text.slice(text.lastIndexOf("/") + 1))) {
+      word = nextWord(endOf(word));
+      continue;
+    }
+    let end = endOf(word);
+    let option = nextWord(end);
+    while (option && spacedTo(end, option)) {
+      const flag = option[0];
+      const flagEnd = endOf(option);
+      const last = flagEnd === command.length;
+      if (COMMAND_OPTION_RE.test(flag) && (last || spaceAfter(flagEnd))) {
+        return true;
+      }
+      if (!spaceAfter(flagEnd)) break;
+      const arg = ARG_OPTION_RE.test(flag) ? nextWord(flagEnd) : null;
+      if (
+        arg &&
+        spacedTo(flagEnd, arg) &&
+        !arg[0].startsWith("-") &&
+        spaceAfter(endOf(arg))
+      ) {
+        // An `eval` here starts a nested shell of its own.
+        if (arg[0] === "eval") return true;
+        end = endOf(arg);
+      } else if (PLAIN_OPTION_RE.test(flag)) {
+        end = flagEnd;
+      } else {
+        break;
+      }
+      option = nextWord(end);
+    }
+    // Resume at the word that ended the walk: the words before it were this
+    // shell's options and their arguments, and a walk from an argument would
+    // see the same options again.
+    word = option;
+  }
+  return false;
+}
+
+/**
+ * #5612 (S3): replace each `$` and `~` the shell reads literally with a
+ * placeholder: a `$` inside single quotes, a `~` inside single or double
+ * quotes, and either one after a backslash outside single quotes. A `#`
+ * comment runs to the end of its line and holds no quotes. An unterminated
+ * quote keeps its state to the end of the string.
+ */
+function protectShellLiterals(command: string): string {
+  const literal = (c: string): string =>
+    c === "$" ? LITERAL_DOLLAR : c === "~" ? LITERAL_TILDE : c;
+  let out = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const c = command.charAt(i);
+    if (quote === "'") {
+      if (c === "'") quote = null;
+      out += literal(c);
+    } else if (c === "\\" && i + 1 < command.length) {
+      out += c + literal(command.charAt(i + 1));
+      i++;
+    } else if (
+      c === "#" &&
+      quote === null &&
+      (i === 0 || /[\s;&|()]/.test(command.charAt(i - 1)))
+    ) {
+      const eol = command.indexOf("\n", i);
+      const end = eol === -1 ? command.length : eol;
+      out += command.slice(i, end);
+      i = end - 1;
+    } else if (c === "'" && quote === null) {
+      quote = "'";
+      out += c;
+    } else if (c === '"') {
+      quote = quote === '"' ? null : '"';
+      out += c;
+    } else {
+      out += quote === '"' && c === "~" ? LITERAL_TILDE : c;
+    }
+  }
+  return out;
+}
+
+/** {@link protectShellLiterals}, unless the command runs a nested shell. */
+function readShellLiterals(command: string): string {
+  return runsNestedShell(command) ? command : protectShellLiterals(command);
+}
+
+/** Undo {@link protectShellLiterals}. */
+function restoreShellLiterals(text: string): string {
+  return text.replaceAll(LITERAL_DOLLAR, "$").replaceAll(LITERAL_TILDE, "~");
+}
+
+/**
+ * #5612 (S2): an expansion the destination cannot resolve: any variable but
+ * HOME, a braced form other than a plain `${HOME}` (another variable, or HOME
+ * with a modifier), a special or positional parameter (`$#`, `$?`, `$1`…), or
+ * a `$(` inside the token. The path it names is unknowable here (Claude Code
+ * sets `CLAUDE_PROJECT_DIR` per project when it runs the hook), so the token
+ * is not checked at all. A plain `${HOME}` is not skipped: before a name
+ * character (`${HOME}_bin/…`) it is checked as written.
+ */
+const UNRESOLVED_EXPANSION_RE =
+  /\$(?:\{(?!HOME\})|[(0-9#?*@!$-]|(?!HOME(?![A-Za-z0-9_]))[A-Za-z_])/;
 
 /**
  * Extract path-like tokens from a command and resolve each to a destination path
@@ -224,13 +377,24 @@ const SHELL_HOME_SPELLING_RE = /"\$\{HOME\}"|"\$HOME"|\$\{HOME\}/g;
  * #5199: the shell-expanded home spellings `${HOME}`, `"$HOME"` and `"${HOME}"`
  * are read as `$HOME` (see SHELL_HOME_SPELLING_RE); a single-quoted `'$HOME'`
  * is not.
+ *
+ * #5612: single quotes, a quoted `~` and backslash escapes are honored (S3),
+ * so `'${HOME}/…'`, `'$HOME/…'` and `"~/…"` resolve to their literal text,
+ * unless the command hands its text to a nested shell. A token holding any
+ * other unresolved expansion (UNRESOLVED_EXPANSION_RE, e.g.
+ * `$CLAUDE_PROJECT_DIR/…`) is skipped (S2). Tokens are still split on
+ * whitespace, so a `$(…)` holding a space is split too, and the part after
+ * the space (`~/.x)/…` in `$(cat ~/.x)/…`) is checked on its own.
  */
 export function referencedPaths(command: string, claudeDir: string): string[] {
   // Apply the canonical `$HOME/.claude` / `~/.claude` denormaliser first, then
-  // token-level rewriting handles foreign-home and bare-home forms.
+  // token-level rewriting handles foreign-home and bare-home forms. Outside a
+  // nested shell, literal `$` / `~` stay protected through the rewrite, the
+  // denormaliser, the skip test and `toDestPath`; `looksLikePath` reads the
+  // restored text.
   const destHome = dirname(claudeDir);
   const normalised = denormalizeHookCommand(
-    command.replace(SHELL_HOME_SPELLING_RE, () => "$HOME"),
+    readHomeSpellings(readShellLiterals(command)),
     destHome
   );
   const tokens = normalised
@@ -240,14 +404,19 @@ export function referencedPaths(command: string, claudeDir: string): string[] {
 
   const paths: string[] = [];
   for (const token of tokens) {
+    const literal = restoreShellLiterals(token);
+    // A `${HOME}/` prefix here is single-quoted text: every expandable
+    // spelling was already rewritten to `$HOME` above.
     const looksLikePath =
-      token.includes("/") &&
-      (token.startsWith("/") ||
-        token.startsWith("~/") ||
-        token.startsWith("$HOME/") ||
-        token.includes(".claude/"));
+      literal.includes("/") &&
+      (literal.startsWith("/") ||
+        literal.startsWith("~/") ||
+        literal.startsWith("$HOME/") ||
+        literal.startsWith("${HOME}/") ||
+        literal.includes(".claude/"));
     if (!looksLikePath) continue;
-    paths.push(toDestPath(token, claudeDir));
+    if (UNRESOLVED_EXPANSION_RE.test(token)) continue;
+    paths.push(restoreShellLiterals(toDestPath(token, claudeDir)));
   }
   return paths;
 }
@@ -265,12 +434,22 @@ export function referencedPaths(command: string, claudeDir: string): string[] {
  * incoming (import-normalized) command and a stored `$HOME`-form command both map
  * to one canonical string. Used to build the dedupe key at the settings merge
  * site; NEVER written back — surviving entries keep their stored form (KD-3).
+ *
+ * #5612 (S1): `${HOME}`, `"$HOME"` and `"${HOME}"` outside single quotes and
+ * not after a backslash (anywhere, in a command that runs a nested shell) are
+ * read as `$HOME` first (as `${HOME}` before a name character), so a hook
+ * stored as `$HOME/…` and imported as `${HOME}/…` gets one key. Only that
+ * spelling rewrite honors quoting; the expansion itself stays the shared,
+ * quote-unaware denormaliser (KD-1).
  */
 export function canonicalHookCommand(
   command: string,
   destHome: string
 ): string {
-  return denormalizeHookCommand(command, destHome).trim().replace(/\s+/g, " ");
+  const spelled = restoreShellLiterals(
+    readHomeSpellings(readShellLiterals(command))
+  );
+  return denormalizeHookCommand(spelled, destHome).trim().replace(/\s+/g, " ");
 }
 
 /** One registered hook, flattened to (event, command) for the read surface. */
@@ -415,7 +594,9 @@ export async function validateHookRegistration(
   // an absent/unreadable registry contributes no names, never a throw.
   const readRegistry = async (name: string): Promise<string | null> => {
     try {
-      return await readFile(join(libDir, name), "utf-8");
+      // #5759: a FIFO, socket or device is an absent registry, never read.
+      const r = await readDestination(join(libDir, name));
+      return r.kind === "file" ? r.content.toString("utf-8") : null;
     } catch {
       return null;
     }

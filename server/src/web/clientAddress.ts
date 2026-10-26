@@ -57,8 +57,9 @@ export function clientAddress(
   return peer;
 }
 
-/** The eight 16-bit groups of an IPv6 address, or `null` when it does not expand. */
-function ipv6Groups(address: string): string[] | null {
+/** The eight 16-bit groups of an IPv6 address, or `null` when it does not expand.
+ *  Also used by `federation/secretTransport.ts` (#5127) for the tailnet range. */
+export function ipv6Groups(address: string): string[] | null {
   const bare = address.split("%")[0] ?? address;
   const [head = "", tail] = bare.split("::");
   const headGroups = head ? head.split(":") : [];

@@ -34,6 +34,27 @@ import type { WebAppEnv } from "../web/middleware/auth";
 export const CAPABILITY_TAG: unique symbol = Symbol("hapi.capability");
 
 /**
+ * Well-known symbol marking a route-argument middleware as a CLOSED gate (issue
+ * #5571): on this instance the route answers 404 and must not be advertised. The
+ * boot-time collector omits any METHOD+PATH group containing a marked handler from
+ * the served catalog (`rest` AND `uncatalogedRest`), and `hapi_call`'s allowlist
+ * is built from that catalog, so a closed route is neither listed nor callable.
+ * Only a mark on a ROUTE-ARGUMENT handler is seen: the collector skips `ALL`
+ * (`app.use`) registrations, and extension-contributed catalog entries are not
+ * filtered. Set it with {@link markClosedGate}; `operatorOnly(false)` is the
+ * in-tree user.
+ */
+export const CLOSED_GATE_TAG: unique symbol = Symbol("hapi.closedGate");
+
+/** Mark `handler` as a closed gate (see {@link CLOSED_GATE_TAG}) and return it. */
+export function markClosedGate<T extends MiddlewareHandler<WebAppEnv>>(
+  handler: T
+): T {
+  (handler as unknown as Record<PropertyKey, unknown>)[CLOSED_GATE_TAG] = true;
+  return handler;
+}
+
+/**
  * The capability-invocation telemetry event `cataloged()` emits. Entry-derived
  * ONLY (issue #3742, finding 3742-21): NEVER request path params, query strings,
  * or bodies — the event's fields are persisted as JSON and surfaced through

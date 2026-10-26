@@ -2,7 +2,11 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { McpStatusUpdateSchema, MetadataSchema } from "@hapi/protocol/schemas";
-import { sessionNameSchema, defineCapability } from "@hapi/protocol";
+import {
+  sessionNameSchema,
+  defineCapability,
+  type NotificationKind,
+} from "@hapi/protocol";
 import {
   SPEND_LIMIT_VARIANTS,
   canonicalizeErrorType,
@@ -17,8 +21,16 @@ import type { Machine, Session, SyncEngine } from "../../sync/syncEngine";
 import type { Store } from "../../store";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { RotationLeaseService } from "../../services/rotationLeaseService";
+import type { SharedApiKeyService } from "../../services/sharedApiKeyService";
+import type { Context } from "hono";
+import { createCliApiKeyRoutes } from "./cliApiKeys";
 import { logAndJson } from "./routeErrorHelper";
 import { cataloged } from "../../capabilities/cataloged";
+import {
+  apiErrorNotification,
+  promptBlockedNotification,
+  toolErrorNotification,
+} from "../../notifications/producerNotifications";
 
 const bearerSchema = z.string().regex(/^Bearer\s+(.+)$/i);
 
@@ -99,26 +111,28 @@ const getMessagesQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
-// Issue #1107: Categories that should produce a real-time toast in addition to
-// landing in error_logs. Originally just "tool-error" (#1078); extended to
-// surface MCP toggle config-write failures so a reverted toggle is visible
-// to the user instead of buried in /admin/error-logs.
-const TOAST_BROADCAST_CATEGORIES = new Set<string>([
-  "tool-error",
-  "mcp-toggle-config-write",
-  "mcp-toggle-config-corrupt",
-  "mcp-toggle-config-lock-timeout",
-  // Issue #1348: UserPromptSubmit hook block visibility
-  "prompt-blocked",
-  // Issue #1460: in-session cron usage reliability warning
-  "cron-usage-warning",
-  // Issue #1488 (Gap 3): PTY submit-Enter cancelled on teardown with an
-  // already-written, unsubmitted body — surfaced instead of silently dropped.
-  "pty-submit-dropped",
-  // Issue #1233 (Epic #1231): Anthropic API error visibility (overloaded_error
-  // retry/exhausted/recovered/give-up phases) — phase-aware warning toast.
-  "api-error",
-]);
+// Issue #4914 (epic #4912): the CLI report categories that raise a user
+// notification (and, for one release, their legacy toast SyncEvent) in addition
+// to landing in error_logs, each mapped to its notification kind. Every other
+// category is error-log only (Lane 3). Lineage: "tool-error" (#1078), the MCP
+// toggle config failures (#1107) so a reverted toggle is visible instead of
+// buried in /admin/error-logs, UserPromptSubmit hook blocks (#1348), the
+// in-session cron usage warning (#1460), a PTY submit-Enter cancelled on
+// teardown with an unsubmitted body (#1488 Gap 3), and Anthropic API error
+// phases (#1233). The non-"tool-error" tool-style categories render as
+// `tool-error` rows; the original category rides `context.category`.
+const ERROR_REPORT_NOTIFICATION_KINDS: Readonly<
+  Record<string, NotificationKind>
+> = {
+  "tool-error": "tool-error",
+  "mcp-toggle-config-write": "tool-error",
+  "mcp-toggle-config-corrupt": "tool-error",
+  "mcp-toggle-config-lock-timeout": "tool-error",
+  "cron-usage-warning": "tool-error",
+  "pty-submit-dropped": "tool-error",
+  "prompt-blocked": "prompt-blocked",
+  "api-error": "api-error",
+};
 
 // Issue #1772: exported so the sibling `/cli`-mounted impact-artifact route
 // factory can share the same namespace-typed Hono env.
@@ -211,9 +225,19 @@ export function createCliRoutes(
     store?: Store;
     errorLogger?: ErrorLogger | null;
     rotationLeaseService?: RotationLeaseService;
+    /** #5127: resolves and fetches API keys homed on other federation nodes. */
+    sharedApiKeyService?: SharedApiKeyService;
+    /** #5127 test seam: the TCP peer of a request (Bun's getConnInfo). */
+    getPeerAddress?: (c: Context) => string | undefined;
   }
 ): Hono<CliEnv> {
-  const { store, errorLogger = null, rotationLeaseService } = options ?? {};
+  const {
+    store,
+    errorLogger = null,
+    rotationLeaseService,
+    sharedApiKeyService,
+    getPeerAddress,
+  } = options ?? {};
   const app = new Hono<CliEnv>();
 
   app.use("*", async (c, next) => {
@@ -913,12 +937,16 @@ export function createCliRoutes(
           context: data.context ?? null,
         });
 
-        // Issue #1078 (extended in #1107): For toast-eligible categories tied
-        // to a session, broadcast a SyncEvent so the web UI can surface the
-        // failure as a real-time toast. Persistence is unchanged (the entry
-        // above goes to error_logs); this adds the live notification path.
-        // See TOAST_BROADCAST_CATEGORIES above for the eligible set.
-        if (TOAST_BROADCAST_CATEGORIES.has(data.category) && data.sessionId) {
+        // Issue #1078 (extended in #1107, #4914): for a notification category
+        // tied to a session, raise a user notification (#4914) and broadcast the
+        // legacy toast SyncEvent. Persistence is unchanged (the entry above goes
+        // to error_logs, so every notify() below passes mirror:false to avoid a
+        // second row). See ERROR_REPORT_NOTIFICATION_KINDS above for the set.
+        // Object.hasOwn: a category such as "toString" must never match.
+        if (
+          Object.hasOwn(ERROR_REPORT_NOTIFICATION_KINDS, data.category) &&
+          data.sessionId
+        ) {
           const engine = getSyncEngine();
           if (!engine) {
             console.warn(
@@ -993,6 +1021,9 @@ export function createCliRoutes(
                 }
               }
 
+              // TODO(#4912): legacy prompt-blocked SyncEvent, kept for one
+              // release so a pre-#4915 web client still toasts. Remove its
+              // SSE/web delivery once Sub C (#4915) has shipped for a release.
               engine.handleRealtimeEvent({
                 type: "prompt-blocked",
                 sessionId: resolved.session.id,
@@ -1002,6 +1033,17 @@ export function createCliRoutes(
                   blockedReason: blockedReason.slice(0, 2000),
                   originalPrompt: originalPrompt?.slice(0, 500),
                 },
+              });
+              // #4914: AFTER the namespace check above (the #1107 rule) and
+              // keyed by the resolved session UUID, never the raw report id.
+              engine.notifyUser({
+                ...promptBlockedNotification({
+                  sessionId: resolved.session.id,
+                  blockedReason,
+                  originalPrompt,
+                }),
+                namespace,
+                mirror: false,
               });
             } else if (data.category === "api-error") {
               // Issue #1233 (Epic #1231): Anthropic API error visibility. The
@@ -1118,6 +1160,12 @@ export function createCliRoutes(
                 }
               }
 
+              // TODO(#4912): legacy api-error SyncEvent, kept for one release
+              // so a pre-#4915 web client still toasts. Remove its SSE/web
+              // delivery once Sub C (#4915) has shipped for a release. Server
+              // consumers: AutoRecoveryService + OrphanGrantObserver +
+              // SpendLimitNoticeObserver + sessionStateWaiter — keep the
+              // internal event or migrate them first.
               engine.handleRealtimeEvent({
                 type: "api-error",
                 sessionId: resolved.session.id,
@@ -1131,6 +1179,20 @@ export function createCliRoutes(
                   ...(limitVariant !== undefined ? { limitVariant } : {}),
                   ...(resumesAt !== undefined ? { resumesAt } : {}),
                 },
+              });
+              engine.notifyUser({
+                ...apiErrorNotification({
+                  sessionId: resolved.session.id,
+                  phase,
+                  errorType,
+                  retryAttempt,
+                  maxRetries,
+                  requestId,
+                  limitVariant,
+                  resumesAt,
+                }),
+                namespace,
+                mirror: false,
               });
             } else {
               let toolName = "unknown";
@@ -1185,6 +1247,11 @@ export function createCliRoutes(
                 }
               }
 
+              // TODO(#4912): legacy tool-error SyncEvent, kept for one release
+              // so a pre-#4915 web client still toasts. Remove its SSE/web
+              // delivery once Sub C (#4915) has shipped for a release. Server
+              // consumers: InitiativeEventObserver — keep the internal event or
+              // migrate it first.
               engine.handleRealtimeEvent({
                 type: "tool-error",
                 sessionId: resolved.session.id,
@@ -1194,6 +1261,19 @@ export function createCliRoutes(
                   toolUseId,
                   errorContent: errorContent.slice(0, 2000),
                 },
+              });
+              // A known-benign class (#1612 R5) is dropped by notify()'s
+              // kind-level suppression rule; the legacy event above still fires.
+              engine.notifyUser({
+                ...toolErrorNotification({
+                  sessionId: resolved.session.id,
+                  category: data.category,
+                  toolName,
+                  toolUseId,
+                  errorContent,
+                }),
+                namespace,
+                mirror: false,
               });
             }
           }
@@ -1276,6 +1356,19 @@ export function createCliRoutes(
   // holder (federationConfig.nodeId) inside RotationLeaseService, so the CLI
   // stays node-agnostic. When the service is not wired (e.g. a minimal test
   // harness), fail open — granting machine-local rotation preserves #1635.
+  // #5127: shared API keys across federation nodes — the identity and secret
+  // routes a session's daemon, launcher and apiKeyHelper call (./cliApiKeys.ts).
+  // Mounted here so the CLI-token middleware above runs first.
+  app.route(
+    "/",
+    createCliApiKeyRoutes(getSyncEngine, {
+      errorLogger,
+      sharedApiKeyService,
+      getPeerAddress,
+      resolveSession: resolveSessionForNamespace,
+    })
+  );
+
   const accountLeaseSchema = z.object({ accountUuid: z.string().uuid() });
 
   app.post(

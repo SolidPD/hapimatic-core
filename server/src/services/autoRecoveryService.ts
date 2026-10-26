@@ -28,6 +28,7 @@
 import type { SyncEngine, Session, SyncEvent } from "../sync/syncEngine";
 import type { NodeRegistry } from "../federation/nodeRegistry";
 import type { ErrorLogger } from "../logging/errorLogger";
+import { apiErrorNotification } from "../notifications/producerNotifications";
 import type { AutoRecoveryConfig } from "../config/autoRecoveryConfig";
 import { readAutoRecoverPreferences } from "../web/routes/preferences";
 import { PROGRAMMATIC_SENT_FROM } from "../sync/sentFrom";
@@ -667,17 +668,35 @@ export class AutoRecoveryService {
    * Broadcast a `give-up` / `recovered` phase using B's nested LC-1 shape with a
    * synthesized `errorType`. Routed through the public handleRealtimeEvent so
    * the Toast pipeline surfaces it exactly like B's own api-error events.
+   *
+   * Issue #4914: also raise the user notification — `give-up` at `error` (never
+   * coalesced, mirrored to error_logs as `notification:api-error`), `recovered`
+   * at `info`. `notifyUser` resolves the namespace from the session when the
+   * triggering event carried none.
    */
   private broadcastPhase(
     sessionId: string,
     namespace: string | undefined,
     phase: "give-up" | "recovered"
   ): void {
+    // TODO(#4912): legacy api-error SyncEvent, kept for one release so a
+    // pre-#4915 web client still toasts. Remove its SSE/web delivery once Sub C
+    // (#4915) has shipped for a release. Server consumers: this service's own
+    // handleEvent (ignores these phases) + sessionStateWaiter (give-up is an
+    // error edge) — keep the internal event or migrate them first.
     this.syncEngine.handleRealtimeEvent({
       type: "api-error",
       sessionId,
       namespace,
       data: { phase, errorType: "overloaded_error" },
+    });
+    this.syncEngine.notifyUser({
+      ...apiErrorNotification({
+        sessionId,
+        phase,
+        errorType: "overloaded_error",
+      }),
+      namespace: namespace ?? null,
     });
   }
 }

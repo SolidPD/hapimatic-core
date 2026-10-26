@@ -27,7 +27,11 @@
  * around them (`server/src/web/routes/agentEscalation.ts`): a session cannot answer
  * its own permission request (R6), and a session that is not in a bypass mode
  * cannot spawn a `yolo` peer, write a schedule, or answer any permission request
- * (R8, ruling NEW-3842-1 = b).
+ * (R8, ruling NEW-3842-1 = b). #5616 (ruling CK1) adds the same caller's send
+ * and archive floors: it cannot message a session that counts as bypass, and can
+ * archive only itself or a session it spawned. Every id below must have a floor
+ * disposition in `server/src/web/routes/agentEscalation.coverage.test.ts`, which
+ * fails when one is added without it (#5616 D8).
  *
  * Bundle note (ER 2026-09-16 3751-21): this module is re-exported through the
  * `capabilityCatalog` barrel → `shared/src/index.ts` (the `"."` export), which

@@ -4,20 +4,25 @@ import { CONTROL_BASE, ControlChevron } from "./controls";
 import { Button } from "@/components/ui/button";
 import type { RedactedAccount } from "@/types/api";
 import type { RedactedApiKey } from "@hapi/protocol/schemas";
-import { apiKeyDisplayName } from "@/lib/apiKeyStatus";
+import { apiKeyDisplayNameWithHome } from "@/lib/apiKeyStatus";
 import { apiKeyCredentialLabel } from "@/hooks/queries/useSessionAccountEmail";
+import type { ApiKeyRowItem } from "@/components/AccountSelectorModal";
 
 /**
  * Issue #4568: how an API-key credential is named on the create page —
  * "Anthropic API · <label>", else the masked key. Composes the session view's
  * format ({@link apiKeyCredentialLabel}) with the shared key-name rule, so the
  * create page and the running session name a key identically. Label-only by
- * construction: the redacted view carries no key material.
+ * construction: the redacted view carries no key material. #5127: a key stored
+ * on another node also names its home ("Anthropic API · Work key · RP1").
  */
 export function apiKeySessionLabel(
-  key: Pick<RedactedApiKey, "label" | "maskedKey">
+  key: Pick<RedactedApiKey, "label" | "maskedKey"> & {
+    local?: boolean;
+    homeNodeLabel?: string;
+  }
 ): string {
-  return apiKeyCredentialLabel(apiKeyDisplayName(key));
+  return apiKeyCredentialLabel(apiKeyDisplayNameWithHome(key));
 }
 
 /**
@@ -72,8 +77,16 @@ export function AccountSelector(props: {
    * (Claude, local target) — the redacted view only — and the one picked as the
    * session's credential, if any. A picked key wins the summary.
    */
-  apiKeys?: RedactedApiKey[];
+  apiKeys?: ApiKeyRowItem[];
+  /** #5127: matched against each key's `bindingRef` when it has one. */
   selectedApiKeyId?: string | null;
+  /**
+   * Issue #5127 (D9): a remote target — no accounts are offered (its node
+   * default is used), so with no key picked the summary names the default.
+   */
+  remoteTarget?: boolean;
+  /** #5127: a key was picked but the target's list no longer offers it. */
+  unlistedApiKeyPicked?: boolean;
   onOpen: () => void;
 }) {
   const {
@@ -86,13 +99,17 @@ export function AccountSelector(props: {
     envCredentialFallback,
     apiKeys,
     selectedApiKeyId,
+    remoteTarget,
+    unlistedApiKeyPicked,
     onOpen,
   } = props;
 
   const selected = accounts.find(a => a.accountUuid === selectedUuid) ?? null;
   const noAccounts = accounts.length === 0;
   const selectedKey =
-    (selectedApiKeyId && apiKeys?.find(k => k.id === selectedApiKeyId)) || null;
+    (selectedApiKeyId &&
+      apiKeys?.find(k => (k.bindingRef ?? k.id) === selectedApiKeyId)) ||
+    null;
   // A key-only node (no stored account, ≥1 vault key) still opens the picker.
   const hasKeys = (apiKeys?.length ?? 0) > 0;
 
@@ -100,6 +117,10 @@ export function AccountSelector(props: {
   let summary: string;
   if (selectedKey) {
     summary = apiKeySessionLabel(selectedKey);
+  } else if (unlistedApiKeyPicked) {
+    summary = "API key from another node (unavailable)";
+  } else if (remoteTarget) {
+    summary = "Node default account";
   } else if (isLoading && noAccounts) {
     summary = "Loading accounts…";
   } else if (noAccounts && envCredentialFallback) {
@@ -144,7 +165,10 @@ export function AccountSelector(props: {
         type="button"
         variant="ghost"
         onClick={onOpen}
-        disabled={isDisabled || (noAccounts && !hasKeys && !isLoading)}
+        // #5127: a remote target always opens (its node default is a choice).
+        disabled={
+          isDisabled || (!remoteTarget && noAccounts && !hasKeys && !isLoading)
+        }
         className={`${CONTROL_BASE} flex items-center justify-between gap-2 px-2.5 text-left font-normal hover:bg-[var(--app-bg)]`}
       >
         <span className="truncate">{summary}</span>

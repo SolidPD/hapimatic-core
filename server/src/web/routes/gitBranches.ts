@@ -52,6 +52,8 @@ export function createGitBranchesRoutes(options?: {
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?dir= (#5212)
+        probe: "skip",
       })
     ),
     async c => {

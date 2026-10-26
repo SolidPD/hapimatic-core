@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { useState } from "react";
 import { FolderCog } from "lucide-react";
 import {
   SettingsSectionHeader,
@@ -53,6 +54,8 @@ import {
  * instance withholds Porter; and only `exposed` renders the full page. The
  * verdict reads the query status before its data, so a tab that cached
  * `exposed` falls back to the notice when a refetch answers `porter_withheld`.
+ * #5212: any other failed refetch keeps a cached `exposed`, so a 502 during a
+ * deploy does not unmount an import review in progress.
  */
 export default function ConfigurationAdminPage() {
   useDocumentTitle("Configuration - Hapimatic");
@@ -63,8 +66,12 @@ export default function ConfigurationAdminPage() {
   // A Retry after a failed first probe sends the query back to `pending` (no
   // data is cached), which would swap the couldn't-check block — and the
   // focused Retry button — for the loading line. Keep the block mounted while
-  // that retry is in flight.
-  const retrying = exposure === "loading" && status.errorUpdateCount > 0;
+  // a Retry the user clicked is in flight. #5212: this is a local flag, not
+  // TanStack's `errorUpdateCount`, which never resets for the cached query, so
+  // a remount, a second probe observer (the Settings drawer) or a reconnect
+  // refetch read as a Retry and flashed "Couldn't check…".
+  const [retryClicked, setRetryClicked] = useState(false);
+  const retrying = retryClicked && exposure === "loading";
 
   const header = (
     <SettingsSectionHeader
@@ -99,7 +106,9 @@ export default function ConfigurationAdminPage() {
                 size="sm"
                 aria-disabled={status.isFetching}
                 onClick={() => {
-                  if (!status.isFetching) void status.refetch();
+                  if (status.isFetching) return;
+                  setRetryClicked(true);
+                  void status.refetch().finally(() => setRetryClicked(false));
                 }}
                 data-testid="configuration-check-retry"
               >

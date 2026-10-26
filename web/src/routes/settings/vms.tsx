@@ -17,9 +17,13 @@ import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
 import {
   useVmInventory,
   useVmJobs,
+  useVmParityHub,
   useVmPreflight,
 } from "@/hooks/queries/useVmInventory";
-import { InventoryTable } from "@/components/vms/InventoryTable";
+import {
+  InventoryTable,
+  ParityHubTable,
+} from "@/components/vms/InventoryTable";
 import { JobLogViewer } from "@/components/vms/JobLogViewer";
 import { NewVmForm } from "@/components/vms/NewVmForm";
 import { HealthCard } from "@/components/vms/HealthCard";
@@ -52,6 +56,8 @@ export default function AdminVmsPage() {
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
 
   const inventory = useVmInventory(api, { enabled });
+  // #3996: RP1's own parity record, rendered above the fleet (never a fleet row).
+  const parityHub = useVmParityHub(api, { enabled });
   const jobs = useVmJobs(api, { enabled, refetchInterval: 5000 });
 
   if (!enabled) {
@@ -148,6 +154,12 @@ export default function AdminVmsPage() {
             </ul>
           </section>
         )}
+
+        <ParityHubTable
+          hub={parityHub.data}
+          isLoading={parityHub.isLoading}
+          isError={parityHub.isError}
+        />
 
         <InventoryTable
           api={api}

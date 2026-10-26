@@ -22,6 +22,14 @@ const setActiveAccountSchema = z.object({
   provider: ProviderIdSchema.optional(),
 });
 
+/** #3982: the 400 for a default write whose account belongs to another provider
+ *  (local branch and the remote branch's structured receiver code). */
+const PROVIDER_MISMATCH_BODY = {
+  ok: false,
+  error: "Account belongs to a different provider",
+  code: "provider_mismatch",
+} as const;
+
 /**
  * Per-node active-account HTTP routes (issue #1451, Sub-Issue E of epic #1446).
  *
@@ -240,6 +248,21 @@ export function createNodesRoutes(opts: {
           parsed.data.provider
         );
         if (result.type === "error") {
+          // #3982: surface the receiver's structured code; a code-less transport
+          // failure stays 502.
+          if (result.code === "provider_mismatch") {
+            return c.json(PROVIDER_MISMATCH_BODY, 400);
+          }
+          if (result.code === "account_not_found") {
+            return c.json(
+              {
+                ok: false,
+                error: "Account not found",
+                code: "account_not_found",
+              },
+              404
+            );
+          }
           return c.json(
             {
               ok: false,
@@ -270,6 +293,10 @@ export function createNodesRoutes(opts: {
         );
         if (result.ok) {
           return c.json({ ok: true });
+        }
+        // #3982: a record of another provider than the pointer being set.
+        if (result.code === "provider_mismatch") {
+          return c.json(PROVIDER_MISMATCH_BODY, 400);
         }
         return c.json(
           { ok: false, error: "Account not found", code: "account_not_found" },

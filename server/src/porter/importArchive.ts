@@ -9,7 +9,6 @@ import {
   PORTABLE_SETTINGS_KEYS,
   SECRETS_MEMBER_ENCRYPTED,
   SECRETS_MEMBER_PLAINTEXT,
-  McpSecretBundleSchema,
   type PorterManifest,
   type HookEntry,
   type McpSecretBundle,
@@ -17,7 +16,8 @@ import {
   type ConfigEntry,
 } from "@hapi/protocol/porter";
 import { decryptPorterArchive } from "../config/porterAgeKeys";
-import { parseTarGz } from "./tarArchive";
+import { parseTarGzAsync } from "./tarArchive";
+import { assertNoLinkMembers } from "./archiveContainment";
 import {
   claudeMdCommitBytes,
   claudeMdUnreferencedNotices,
@@ -55,17 +55,11 @@ import {
   importMcpServers,
   resolveAccountConfigBases,
   enumerateAccountConfigFiles,
-  type McpImportResult,
   type McpMergeItem,
 } from "./mcpImport";
-import type { HookRegistrationValidationResult } from "./hookRegistrationValidator";
 import { withFileLock } from "./fileLock";
 import { porterPluginInstallEnabled } from "../config/porterPluginInstallConfig";
-import {
-  executePluginInstall,
-  type ClaudeRunner,
-  type PluginInstallResult,
-} from "./pluginInstall";
+import { executePluginInstall, type ClaudeRunner } from "./pluginInstall";
 import { resolveTrustAllowlist } from "./pluginTrust";
 import {
   ManifestValidationError,
@@ -85,10 +79,10 @@ import {
 import {
   deriveImportedBridgeDims,
   probeAccountVisibility,
-  type AccountVisibility,
 } from "./visibilityProbe";
 import { resolveCommitExclusions } from "./commitSelection";
 import { tolerateMissingSecrets } from "./definitionsOnly";
+import { decryptFailureReason, parseSecretBundle } from "./secretBundle";
 import { buildPluginRemediation, planTenant } from "./planTenant";
 import { rebuildMcpItemsWithOverlay, type SecretOverlay } from "./mcpRebuild";
 import {
@@ -102,7 +96,6 @@ import {
   attributeHookValidation,
   assertRegistryAcknowledged,
   computeParity,
-  type ImportParity,
 } from "./commitHooks";
 import {
   atomicWriteFile,
@@ -110,9 +103,12 @@ import {
   checkSettingsLink,
   classifySettingsLink,
   importFileMode,
+  isLinkWithoutSettingsFile,
   isRegularFile,
   markTouched,
+  onSettingsResolution,
   restoreBackups,
+  settingsResolutionNotice,
   settleMcpTouched,
   writeMergedSettings,
   type BackupRecord,
@@ -124,10 +120,29 @@ import {
   reconcileExistingModes,
   restoreModes,
   type AppliedModeFix,
-  type ModeCorrection,
   type ModeReconcilePreview,
-  type ModeSkip,
 } from "./modeReconcile";
+import type {
+  ImportResult,
+  MergedHookRegistration,
+  PlannedItemKind,
+  PlannedMcpServer,
+} from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type {
+  PlannedItemKind,
+  PlannedMcpServer,
+  McpExclusion,
+  MergedHookRegistration,
+  ImportResult,
+} from "@hapi/protocol/porter";
+
+/**
+ * #5601 (D4): what this server's commit returns. The wire type keeps `notices`
+ * optional because a server that predates #5202 omitted it; this one always
+ * sends it.
+ */
+export type EmittedImportResult = ImportResult & { notices: Omission[] };
 
 /**
  * The two-phase Configuration Porter import core (issue #2343, epic #2339 Sub D).
@@ -178,26 +193,6 @@ export {
 
 /* ── Types ── */
 
-export type PlannedItemKind =
-  | "skill"
-  | "agent"
-  | "command"
-  | "rule"
-  | "output-style"
-  | "claude-md"
-  | "claude-md-include"
-  | "hook-file"
-  // #2639 (F9): a shared hook-support module (e.g. `hooks/lib/header_match.py`)
-  // that a hook IMPORTS but that carries no registration. Landed PATH-PRESERVED
-  // via the manifest `hookSupport` dimension so the imported hook resolves.
-  | "hook-lib"
-  // #4173: the top-level script an imported statusLine/apiKeyHelper runs
-  // (./planSettingsScripts), written only at the exact path the value names.
-  | "settings-script"
-  // #4373: a tenant archive's auto-memory file, remapped into an existing
-  // project's `projects/<key>/memory/` folder (./planTenant).
-  | "memory";
-
 /** A single file staged for import. `stagedPath` is server-internal (never wired). */
 export interface PlannedFileItem {
   kind: PlannedItemKind;
@@ -211,68 +206,6 @@ export interface PlannedFileItem {
   incomingHash: string;
   /** POSIX mode from the archive entry, unmasked; masked at write time by `importFileMode`. */
   mode?: number;
-}
-
-/** One MCP server in the plan — reported WITHOUT any secret value. */
-export interface PlannedMcpServer {
-  name: string;
-  /** Whether the server declares secret env/header/url fields (#2638: incl. url). */
-  hasSecrets: boolean;
-  /** Conflict against the host ~/.claude.json, if any. */
-  conflict: Conflict | null;
-  /**
-   * #2638 (F15, R3/R4): whether EVERY declared secret slot (env / header / url)
-   * restored from the decrypted bundle. `false` ⇒ the server is NAMED in the
-   * plan/commit summary (key name only) and EXCLUDED from the import success
-   * count — the husk F15 fixed (a `{type}`-only entry that can never connect).
-   */
-  secretRestorable: boolean;
-  /**
-   * The KEY NAME of the first secret slot that could not be restored — never the
-   * VALUE (R2 hygiene). Populated only when `secretRestorable` is `false`.
-   */
-  secretFailureKey?: string;
-  /**
-   * #3546 (R3): the server's declared secret SLOT NAMES — never values. Mirrors
-   * the heterogeneous {@link McpServerEntry} shapes VERBATIM (`shared/src/porter/
-   * manifest.ts`) so the recipient-side re-auth form (ADR-0006 Fork A) can render
-   * one input per slot for a `secretRestorable: false` server, keyed by the
-   * SYNTHETIC slot name. `argsNames` stays `{index,name}[]` — the `name` is the
-   * `__args_<i>__` bundle key; do NOT flatten to `string[]`.
-   */
-  argsNames?: { index: number; name: string }[];
-  /** The `__url__` synthetic slot name when `url` is credential-bearing (#3546). */
-  urlName?: string;
-  /** Credential-bearing `env` key names (#3546). */
-  envNames?: string[];
-  /** Credential-bearing `headers` key names (#3546). */
-  headerNames?: string[];
-  /**
-   * #2640 (F13/F14): whether the server's `command` resolves on the destination.
-   * `false` ⇒ the server is NAMED in the plan/commit summary and EXCLUDED from
-   * the import success count (never silently imported dead-on-arrival).
-   */
-  resolvable: boolean;
-  /** Why the command is unresolvable (missing runtime, or non-portable path). */
-  unresolvedReason?: string;
-  /** A source-home command path rewritten to the destination home (F14). */
-  commandTranslation?: { from: string; to: string };
-  /** A `/home/<srcuser>/…` command with no destination-home equivalent (F14). */
-  nonPortable?: boolean;
-}
-
-/**
- * A manifest MCP server EXCLUDED from the import success set because its command
- * is unresolvable on the destination. Shared exclusion-record contract [1B-7]:
- * issue #2640 OWNS this definition (it lands first in the import wave) and emits
- * `kind: "runtime" | "path"`; #2638 R3 emits `kind: "secret"`; #5192 emits a
- * commit-time `kind: "path"` when a reviewed command changed. Secret-free by
- * construction — `name` and `detail` carry no credential material.
- */
-export interface McpExclusion {
-  name: string;
-  kind: "secret" | "runtime" | "path";
-  detail: string;
 }
 
 /**
@@ -343,101 +276,6 @@ export interface ImportPlan {
 /* ── ImportPlanSummary + toPlanSummary extracted to ./importPlanSummary
    (#3590, #2077 max-lines) so the summary type sits beside its projection.
    `ImportPlanSummary` is imported (for {@link} doc refs) + re-exported below. ── */
-
-/**
- * A hook registration that was DEDUPED during the settings merge (#2641, F12 /
- * Sub D). `incoming-skip` = an incoming archive registration whose canonical
- * command matched an entry already on the destination (or one appended earlier
- * this import). `preexisting-collapse` = a path-equivalent duplicate PAIR that
- * was already stored on the destination (the MS1 damaged-destination shape) and
- * was collapsed to one. `command` is the canonical (destHome-expanded) command.
- */
-export interface MergedHookRegistration {
-  event: string;
-  command: string;
-  source: "incoming-skip" | "preexisting-collapse";
-}
-
-export interface ImportResult {
-  committedAt: number;
-  filesWritten: string[];
-  settingsMerged: boolean;
-  mcp: McpImportResult;
-  hookValidation: HookRegistrationValidationResult;
-  /** Conflicts left unresolved (skipped — the pre-existing config was preserved). */
-  skippedConflicts: Conflict[];
-  /** #4129: byte-identical files given the archive's execute bit (still `alreadyPresent`). */
-  modesCorrected: ModeCorrection[];
-  /** #4129: byte-identical files whose mode was left alone, with the reason. */
-  modesSkipped: ModeSkip[];
-  /**
-   * #2640 (F13/F14): MCP servers EXCLUDED from the import because their command
-   * was unresolvable on the destination (missing runtime / non-portable path),
-   * a secret could not be restored (#2638), or the reviewed command changed
-   * before the commit (#5192).
-   * They are NOT in the `mcp` success counts — listed separately so a
-   * dead-on-arrival server is never silently reported as imported-functional.
-   */
-  mcpExclusions: McpExclusion[];
-  /**
-   * #2639 (F9): hook import-resolvability outcome for THIS import. `imported` is
-   * the count of this archive's hooks that landed with EVERY `from lib.X` import
-   * resolvable; `excluded` NAMES the imported hooks (basename) + the specific
-   * missing `lib` module that kept each out of the count (R2/R3). Mirrors the
-   * `mcpExclusions` "named-and-excluded-from-success-count" contract [1B-8]. A
-   * hook ALREADY present at the destination (not part of this import) with an
-   * unresolved import is reported via `hookValidation.unresolvedImports` but
-   * NEVER decrements `imported` — attribution intersects with the plan's hooks.
-   */
-  hooks: {
-    imported: number;
-    excluded: { hook: string; module: string }[];
-  };
-  /**
-   * #2641 (F12 / Sub D): path-equivalent hook registrations DEDUPED during the
-   * settings merge — an incoming `$HOME`-form command that matched an existing
-   * expanded-form entry (`incoming-skip`), or a pre-existing duplicate pair
-   * already stored on the destination that was collapsed to one
-   * (`preexisting-collapse`, the MS1 damaged-destination heal). Every dedupe
-   * decision is reported so a merged registration is never silently dropped
-   * (R4/R6). Empty when the merge deduped nothing.
-   */
-  mergedHookRegistrations: MergedHookRegistration[];
-  /**
-   * Plugin install-execution outcome (#2465 Sub G). Present ONLY when the
-   * install-execution gate ({@link porterPluginInstallEnabled}) is ON AND the
-   * archive carried a plugin descriptor. When the gate is OFF the field is
-   * ABSENT (not present-empty) — this preserves R6 byte-identity with the
-   * #2343-alone result (the deterministic remediation command list is still
-   * emitted at plan time via {@link ImportPlanSummary} `plugins.remediation`).
-   */
-  pluginInstall?: PluginInstallResult;
-  /**
-   * #3246: resolved destination config root this import wrote to (mirrors
-   * {@link ImportPlanSummary} `claudeDir` — plan/result destinations agree, R3).
-   */
-  claudeDir: string;
-  /**
-   * #3246: post-commit per-account visibility of the imported bridge dims via the
-   * #1562 symlink bridge (see {@link probeAccountVisibility}). `orphaned` = the
-   * session falls back to the host dir (isolation degraded), NOT "skills invisible".
-   */
-  visibility: AccountVisibility[];
-  /** #3246: `false` iff any imported dim is `orphaned` for any account (`pending` never demotes). */
-  isolationIntact: boolean;
-  /**
-   * #3590 (K6/D7): per-dimension expected-vs-written parity (see `computeParity`).
-   * Surfaced in the UI + on `GET /porter/installed.lastImport` until restart.
-   */
-  parity: ImportParity;
-  /** #4173 (D4): carried scripts not written because every setting that runs them was kept. */
-  settingsScriptsHeld: { destPath: string; keys: string[] }[];
-  /**
-   * #5202 (U12): notes the commit's own choices produced — a rewritten include
-   * written while CLAUDE.md was not, with the `@claude-includes/…` line to add.
-   */
-  notices: Omission[];
-}
 
 export interface PlanImportOptions {
   dataDir: string;
@@ -560,8 +398,9 @@ export async function planImport(
   // section (step 9) reuses the same value.
   const destHome = dirname(claudeDir);
 
-  // 1. Decompress + parse (F9 caps enforced inside parseTarGz). Nothing on disk.
-  const entries = parseTarGz(archiveBuf);
+  // 1. Decompress + parse (F9 caps enforced inside parseTarGzAsync, inflated
+  //    off the event loop one archive at a time, #5228). Nothing on disk.
+  const entries = await parseTarGzAsync(archiveBuf);
 
   // 2. Manifest: version-before-shape (R1). Zero bytes written on failure.
   const manifestEntry = findEntry(entries, "manifest.json");
@@ -571,13 +410,17 @@ export async function planImport(
       "Archive has no manifest.json."
     );
   }
+  // #4294: a linked manifest.json has no bytes to parse; name it as a link.
+  assertNoLinkMembers(claudeDir, [manifestEntry]);
   let manifestRaw: unknown;
   try {
     manifestRaw = JSON.parse(manifestEntry.data.toString("utf-8"));
-  } catch (err) {
+  } catch {
+    // #5676: a fixed reason, never the parser's text — Bun's JSON.parse names
+    // an unquoted value verbatim, and the manifest is foreign input.
     throw new ManifestValidationError(
       "invalid",
-      `manifest.json is not valid JSON: ${err instanceof Error ? err.message : String(err)}`
+      "manifest.json is not valid JSON."
     );
   }
   const parsed = parsePorterManifest(manifestRaw);
@@ -585,6 +428,10 @@ export async function planImport(
     throw new ManifestValidationError(parsed.kind, parsed.error);
   }
   const manifest = parsed.manifest;
+  // #4294 (ruling A): any link member refuses the archive, referenced or not —
+  // after manifest validation, so a version or shape error is reported first
+  // (R1), and before any planning or staging.
+  assertNoLinkMembers(claudeDir, entries);
 
   // 3. F4 — refuse plaintext secrets. Only an encrypted secrets.age is allowed.
   if (findEntry(entries, SECRETS_MEMBER_PLAINTEXT)) {
@@ -635,21 +482,14 @@ export async function planImport(
         secretsEntry.data
       );
     } catch (err) {
-      // Never re-wrap with secret context — the underlying error carries no key
-      // material and we must not add any.
-      throw new SecretDecryptionError(
-        err instanceof Error ? err.message : "wrong recipient or corrupt member"
-      );
+      // #5543: a fixed reason, never the decrypter's message — a member that is
+      // not age-encrypted fails with `invalid version <its first line>`.
+      throw new SecretDecryptionError(decryptFailureReason(err));
     }
-    try {
-      secretBundle = McpSecretBundleSchema.parse(
-        JSON.parse(Buffer.from(plaintext).toString("utf-8"))
-      );
-    } catch (err) {
-      throw new SecretDecryptionError(
-        `decrypted secret bundle is malformed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
+    // #5543: a fixed reason — the parser's own text can echo bundle content.
+    const parsed = parseSecretBundle(plaintext);
+    if (!parsed.ok) throw new SecretDecryptionError(parsed.reason);
+    secretBundle = parsed.bundle;
   }
 
   // 5. Build MCP merge items (validates blank-secret refusal via buildMcpServerConfig).
@@ -1026,7 +866,11 @@ async function readMcpServers(
  * #2077 max-lines guardrail. Re-exported here so existing import sites that
  * resolve it from `./importArchive` (the route + tests) are unaffected.
  */
-export { toPlanSummary, type ImportPlanSummary } from "./importPlanSummary";
+export {
+  toPlanSummary,
+  type EmittedPlanSummary,
+  type ImportPlanSummary,
+} from "./importPlanSummary";
 
 /* ── Commit (backup-then-swap under the import mutex) ── */
 /* BackupRecord + the commit fs primitives live in ./commitFs (#3553, #2077 max-lines). */
@@ -1034,7 +878,7 @@ export { toPlanSummary, type ImportPlanSummary } from "./importPlanSummary";
 export async function commitImport(
   plan: ImportPlan,
   opts: CommitImportOptions = {}
-): Promise<ImportResult> {
+): Promise<EmittedImportResult> {
   const overwrite = opts.overwrite ?? new Set<string>();
   const excluded = opts.selection?.excluded ?? new Set<string>();
   if (!existsSync(plan.stagingDir)) {
@@ -1075,7 +919,7 @@ async function runCommit(
   acknowledgeMissingHooks: readonly string[] = [],
   keepModes: ReadonlySet<string> = new Set<string>(),
   acknowledgeSymlinkedSettings?: string
-): Promise<ImportResult> {
+): Promise<EmittedImportResult> {
   // #3247: resolve the operator's selection ONCE — drives the writable filter,
   // the settings-backup precondition + merge, the hooks.imported count, validator
   // attribution, and MCP exclusion (folded in from the #2640/#2638 loop).
@@ -1098,6 +942,14 @@ async function runCommit(
         acknowledgeSymlinkedSettings
       )
     : undefined;
+  // #5760: a file item at a path an inside/outside settings.json link resolves
+  // through would replace the settings the merge reads (./commitFs). Hold it.
+  const heldBySettings = await onSettingsResolution(
+    settingsPath,
+    settingsLink,
+    plan.files.map(item => item.destPath)
+  );
+  const heldNotices: Omission[] = [];
   const backupDir = join(plan.dataDir, "porter-backup", plan.stagingHandle);
   await mkdir(backupDir, { recursive: true, mode: 0o700 });
 
@@ -1115,6 +967,15 @@ async function runCommit(
     // conflict-skip), so it never lands in `skippedConflicts`.
     if (sel.isItemExcluded(item)) return false;
     const c = conflictByPath.get(item.destPath);
+    if (heldBySettings.has(item.destPath)) {
+      if (c && c.kind !== "exists") skippedConflicts.push(c);
+      if (!c || c.kind === "exists" || overwrite.has(item.destPath)) {
+        heldNotices.push(
+          settingsResolutionNotice(plan.claudeDir, item.destPath)
+        );
+      }
+      return false;
+    }
     if (!c) return true;
     if (c.kind === "exists") {
       existing.push(item); // byte-identical: content no-op; exec bits reconciled below (#4129)
@@ -1181,9 +1042,10 @@ async function runCommit(
             settingsPath,
             content,
             settingsLink,
-            settingsBackup
+            settingsBackup,
+            filesWritten // #5759: what this import wrote, for the race guard
           ),
-        settingsLink?.state === "dangling" // #4281: an empty base
+        isLinkWithoutSettingsFile(settingsLink) // #4281, #5534: an empty base
       );
       settingsMerged = merge.changed;
       mergedHookRegistrations = merge.mergedHookRegistrations;
@@ -1253,7 +1115,7 @@ async function runCommit(
       warnStagingCleanup(plan.stagingDir)
     );
 
-    const result: ImportResult = {
+    const result: EmittedImportResult = {
       committedAt: Date.now(),
       filesWritten,
       settingsMerged,
@@ -1273,11 +1135,14 @@ async function runCommit(
         destPath,
         keys,
       })),
-      notices: claudeMdUnreferencedNotices(
-        plan.claudeMdRewrite,
-        p => filesWritten.includes(p),
-        p => conflictByPath.get(p)?.kind === "exists"
-      ),
+      notices: [
+        ...claudeMdUnreferencedNotices(
+          plan.claudeMdRewrite,
+          p => filesWritten.includes(p),
+          p => conflictByPath.get(p)?.kind === "exists"
+        ),
+        ...heldNotices,
+      ],
     };
 
     // #2465 (Sub G) — gated plugin install execution. Runs strictly AFTER commit
@@ -1328,7 +1193,8 @@ async function runCommit(
     // R6 — restore every backed-up destination to its pre-import state, COLLECTING
     // any per-file restore failures (#2563) so the thrown message reports the
     // rollback honestly: a clean full rollback vs a PARTIAL one that names the
-    // file(s) left inconsistent — never mislabeling a partial rollback as clean.
+    // file(s) left inconsistent and why (#3022) — never mislabeling a partial
+    // rollback as clean.
     const restoreFailures = await restoreBackups(backups, restoreFileOps);
     restoreFailures.push(...(await restoreModes(appliedModes)));
     const reason = err instanceof Error ? err.message : String(err);
@@ -1337,7 +1203,8 @@ async function runCommit(
       throw new CommitRollbackError(
         `Import failed and rollback was PARTIAL — ${restoreFailures.length} file(s) ` +
           `could not be restored and may be in an inconsistent state: ` +
-          `${restoreFailures.join(", ")}. Original failure: ${reason}`,
+          `${restoreFailures.map(f => `${f.path} (${f.cause})`).join(", ")}. ` +
+          `Original failure: ${reason}`,
         { cause: err, partial: true }
       );
     }

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { KeyRound } from "lucide-react";
 import type { ApiClient } from "@/api/client";
 import type { ApiKeyProvider } from "@hapi/protocol/schemas";
 import { Button } from "@/components/ui/button";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { useApiKeyActions } from "@/hooks/mutations/useApiKeyActions";
+import { useShareApiKeysByDefault } from "@/hooks/useShareApiKeysByDefault";
+import { ShareAcrossNodesCheckbox } from "@/components/ShareAcrossNodesCheckbox";
 
 const INPUT_CLASS =
   "rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2 text-[var(--app-fg)]";
@@ -52,11 +54,24 @@ export function ApiKeyRegistrationCard({
   const [secret, setSecret] = useState("");
   const [maskedResult, setMaskedResult] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
+  // Issue #5127: "Make available to all nodes" for an Anthropic key — starts
+  // from the preference until touched, sent explicitly with the add (D7).
+  const isAnthropic = descriptor.provider === "anthropic";
+  const shareDefault = useShareApiKeysByDefault(api);
+  const [share, setShare] = useState(shareDefault.enabled);
+  const shareTouchedRef = useRef(false);
+  useEffect(() => {
+    if (!shareTouchedRef.current) setShare(shareDefault.enabled);
+  }, [shareDefault.enabled]);
 
   const existing = keys.find(k => k.provider === descriptor.provider);
   const trimmed = secret.trim();
+  // #5127 (code review F7): an Anthropic add waits for the share preference.
   const canSubmit =
-    trimmed.length > 0 && !add.isPending && maskedResult === null;
+    trimmed.length > 0 &&
+    !add.isPending &&
+    maskedResult === null &&
+    (!isAnthropic || shareDefault.loaded || shareTouchedRef.current);
 
   const handleSubmit = () => {
     if (!canSubmit) return;
@@ -65,6 +80,7 @@ export function ApiKeyRegistrationCard({
         provider: descriptor.provider as ApiKeyProvider,
         key: trimmed,
         ...(descriptor.label ? { label: descriptor.label } : {}),
+        ...(isAnthropic ? { shareAcrossNodes: share } : {}),
         descriptor: {
           source: "conversational",
           ...(descriptor.baseUrl ? { baseUrl: descriptor.baseUrl } : {}),
@@ -154,6 +170,16 @@ export function ApiKeyRegistrationCard({
           data-testid="api-key-registration-secret"
         />
       </label>
+
+      {isAnthropic && (
+        <ShareAcrossNodesCheckbox
+          checked={share}
+          onChange={next => {
+            shareTouchedRef.current = true;
+            setShare(next);
+          }}
+        />
+      )}
 
       <p className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
         Sent directly to this node's vault and masked after entry — never shared

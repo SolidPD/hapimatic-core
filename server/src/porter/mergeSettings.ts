@@ -4,7 +4,9 @@
  * epic #4290 T24 move; #2077 max-lines), the same decomposition that produced
  * `./planClaudeMd` (#4173). Homes `mergeSettings` and its strict reader so the
  * import core stays under the 1,500-line `max-lines` guardrail. The move is
- * verbatim; #4281 then gave `mergeSettings` its empty-base flag.
+ * verbatim; #4281 then gave `mergeSettings` its empty-base flag, which #5534
+ * widened from a dangling link to any link that did not resolve to a regular
+ * file when checked.
  */
 import { readFile } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -16,7 +18,8 @@ import { differingSettingsKeys, settingsKeyLands } from "./planSettingsScripts";
 import type { MergedHookRegistration } from "./importArchive";
 
 // #2564 (F4): strict variant of readJsonObject — a present-yet-unparseable file
-// THROWS (mirrors mcpImport) instead of silently {}; used only by mergeSettings.
+// THROWS (mirrors mcpImport) instead of silently {}, and so does valid JSON
+// that is not an object (#3022); used only by mergeSettings.
 export async function readJsonObjectStrict(
   path: string
 ): Promise<Record<string, unknown>> {
@@ -25,16 +28,35 @@ export async function readJsonObjectStrict(
   if (!(await isRegularFile(path))) return {};
   const raw = await readFile(path, "utf-8");
   if (raw.trim() === "") return {};
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch (err) {
+    parsed = JSON.parse(raw);
+  } catch {
+    // #5676: a fixed reason, never the parser's text — Bun's JSON.parse names
+    // an unquoted value verbatim, and settings.json can hold secret values.
     throw new Error(
-      `Refusing to merge settings: ${path} is not valid JSON ` +
-        `(${err instanceof Error ? err.message : String(err)}). ` +
+      `Refusing to merge settings: ${path} is not valid JSON. ` +
         `Preserving the original.`
     );
   }
+  // #3022 (F3): valid JSON that is not a plain object (null, a number, string,
+  // boolean or array) is refused, not coerced to {} and overwritten. An array
+  // would take the merged keys as properties that JSON.stringify drops, so the
+  // commit would write [] while reporting settingsMerged (#5178). Outside the
+  // try, so the catch above cannot relabel it as invalid JSON. Names the kind,
+  // never the value: a top-level JSON string can be a secret (#5676).
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const kind = Array.isArray(parsed)
+      ? "an array"
+      : parsed === null
+        ? "null"
+        : `a ${typeof parsed}`;
+    throw new Error(
+      `Refusing to merge settings: ${path} is not a JSON object (it is ${kind}). ` +
+        `Preserving the original.`
+    );
+  }
+  return parsed as Record<string, unknown>;
 }
 
 /** Key-wise settings.json merge — F5 allowlist + additive hooks block. */
@@ -52,8 +74,9 @@ export async function mergeSettings(
 }> {
   // #2564 (F4): strict read — a malformed settings.json throws before any write
   // and is preserved by runCommit's rollback (not parsed as {} and overwritten).
-  // #4281: a link that was dangling when checked had no settings to merge into,
-  // even if a file item of this import has since created its target.
+  // #4281, #5534: a link that was dangling, looping or not a regular file when
+  // checked had no settings to merge into, even if a file item of this import
+  // has since created its target or replaced a link in its chain.
   const existing = baseAbsent ? {} : await readJsonObjectStrict(settingsPath);
   const conflictKeys = differingSettingsKeys(settingsConflicts);
 

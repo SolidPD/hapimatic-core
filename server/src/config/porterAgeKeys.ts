@@ -163,6 +163,10 @@ export async function getPorterRecipient(
   return keys.recipient;
 }
 
+/** {@link decryptPorterArchive}'s error when this instance has no keypair. */
+export const PORTER_KEY_MISSING =
+  "This instance has no Configuration Porter key; restart the server to generate it.";
+
 /**
  * Decrypt a porter secrets archive (`secrets.age`) that was encrypted TO this
  * instance's recipient, returning the plaintext bytes IN-PROCESS.
@@ -172,9 +176,12 @@ export async function getPorterRecipient(
  * identity — must happen here. The plaintext exists only as an in-process
  * buffer; it is NEVER written to disk, and no secret value (identity or
  * plaintext) is ever logged, added to a Sentry breadcrumb, or interpolated into
- * an error message. On a malformed or wrong-recipient archive the underlying
- * `Decrypter` throws a message that contains no key material — callers must not
- * re-wrap that error with secret context.
+ * an error message by this function. The underlying `Decrypter`'s errors carry
+ * no key material, but they CAN carry archive content: a member that is not
+ * age-encrypted fails with `invalid version <its first line>`, which for a
+ * plaintext bundle is the secret text itself (#5543). Callers must therefore
+ * never surface a thrown message — map it to a fixed reason with
+ * `decryptFailureReason` (`../porter/secretBundle`).
  *
  * R4 note: the ENCRYPTION side is a local shell command on the SOURCE machine
  * (`age -r <recipient> -o secrets.age secrets.json`; see
@@ -192,9 +199,7 @@ export async function decryptPorterArchive(
 ): Promise<Uint8Array> {
   const keys = await readPorterAgeKeys(settingsFile);
   if (!keys) {
-    throw new Error(
-      "This instance has no Configuration Porter key; restart the server to generate it."
-    );
+    throw new Error(PORTER_KEY_MISSING);
   }
   const decrypter = new Decrypter();
   decrypter.addIdentity(keys.identity);

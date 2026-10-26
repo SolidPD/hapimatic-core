@@ -36,6 +36,17 @@ const MIRROR_SKIP_CATEGORIES = new Set([
 ]);
 
 /**
+ * Issue #4914 (epic #4912): every `notification:<kind>` row is skipped. It is the
+ * warn-plus mirror of a user notification — a user-surface copy of an event. Most
+ * already reach turn telemetry through their own row or the transcript (a CLI
+ * report's own `tool-error` row, a restart's `sync` diagnostic, the transcript's
+ * `api_error` events), so mirroring them would add a duplicate `error` turn
+ * event for every give-up and restart failure. A message-gate denial has no turn
+ * event of its own, before or after #4914; skipping its mirror keeps it that way.
+ */
+const NOTIFICATION_MIRROR_CATEGORY_PREFIX = "notification:";
+
+/**
  * Fail-open error-log → `turn_events` dual-writer (issue #1673, Sub K — epic #1662).
  *
  * Every `error_logs` insert — from any of the three producers (`ErrorLogger`,
@@ -67,6 +78,9 @@ export class TurnErrorMirrorService implements TurnErrorMirror {
       const sessionId = entry.sessionId;
       if (!sessionId) return; // no session → no turn to attribute against (R2)
       if (MIRROR_SKIP_CATEGORIES.has(entry.category)) return; // R4 loop guard
+      if (entry.category.startsWith(NOTIFICATION_MIRROR_CATEGORY_PREFIX)) {
+        return; // #4914: a notification mirror is not a turn error
+      }
 
       const turn = this.turnStore.getOpenTurnForSession(sessionId);
       if (!turn) return; // no open turn → error_logs-only (R2)

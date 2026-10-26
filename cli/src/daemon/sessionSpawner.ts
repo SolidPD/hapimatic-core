@@ -24,6 +24,8 @@ import { logger } from "@/ui/logger";
 import { configuration } from "@/configuration";
 import { spawnHappyCLI } from "@/utils/spawnHappyCLI";
 import { readSettings } from "@/persistence";
+import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
+import { resolveSharedApiKey } from "@/apiKeys/sharedKeyClient";
 import {
   writeOpenRouterCodexHome,
   writeChatGptCodexHome,
@@ -80,6 +82,7 @@ import { TmuxManager } from "@/tmux";
 import { globalEnvNamesOrNull } from "@/tmux/TmuxManager";
 import { buildSdkSpawnEnv } from "@/claude/launcherShared";
 import {
+  API_KEY_AGENT_UNSUPPORTED_MESSAGE,
   computeAuthBinding,
   resolveApiKeyBinding,
   resolveProviderBinding,
@@ -324,31 +327,79 @@ export function createSessionSpawner(
           code: "api_key_with_account",
         };
       }
-      const keySettings = await readSettings();
-      const resolution = resolveApiKeyBinding({
-        agent,
-        apiKeyId,
-        expectedMasked: expectedApiKeyMasked,
-        apiKeys: keySettings.apiKeys,
-      });
-      if (!resolution.ok) {
-        logger.warn(
-          `[DAEMON RUN] API-key spawn refused (${resolution.code}): ${resolution.message} (#4568)`
-        );
-        return {
-          type: "error",
-          errorMessage: resolution.message,
-          code: resolution.code,
-        };
+      // Issue #5127: a key homed on another node (`<uuid>@<home>`) is checked
+      // with its home through this node's server, before anything else runs.
+      // The key itself never reaches this process; only its label, mask and
+      // home do. A ref whose home turns out to be THIS node comes back as its
+      // bare vault id and takes the vault path below (D16, D17).
+      let vaultKeyId: string | null = apiKeyId;
+      if (isQualifiedApiKeyRef(apiKeyId)) {
+        if (agent !== "claude") {
+          return {
+            type: "error",
+            errorMessage: API_KEY_AGENT_UNSUPPORTED_MESSAGE,
+            code: "api_key_agent_unsupported",
+          };
+        }
+        const shared = await resolveSharedApiKey({
+          ref: apiKeyId,
+          ...(expectedApiKeyMasked !== undefined
+            ? { expectedMasked: expectedApiKeyMasked }
+            : {}),
+          // The home's audit row names the session this spawn will become.
+          sessionId: hapiSessionId,
+        });
+        if (!shared.ok) {
+          logger.warn(
+            `[DAEMON RUN] API-key spawn refused (${shared.code}): ${shared.message} (#5127)`
+          );
+          return {
+            type: "error",
+            errorMessage: shared.message,
+            code: shared.code,
+          };
+        }
+        if (isQualifiedApiKeyRef(shared.canonicalRef)) {
+          apiKeyBinding = {
+            id: shared.canonicalRef,
+            masked: shared.maskedKey,
+            label: `${shared.label?.trim() || shared.maskedKey} (${shared.homeNodeLabel})`,
+          };
+          vaultKeyId = null;
+          logger.info(
+            `[DAEMON RUN] API-key spawn: bills key "${apiKeyBinding.label}" (${shared.maskedKey}) stored on ${shared.homeNodeLabel} — no account, no instance token, SDK launcher (#5127)`
+          );
+        } else {
+          vaultKeyId = shared.canonicalRef;
+        }
       }
-      apiKeyBinding = {
-        id: apiKeyId,
-        masked: resolution.masked,
-        label: resolution.label,
-      };
-      logger.info(
-        `[DAEMON RUN] API-key spawn: bills vault key "${resolution.label}" (${resolution.masked}) — no account, no instance token, SDK launcher (#4568)`
-      );
+      if (vaultKeyId !== null) {
+        const keySettings = await readSettings();
+        const resolution = resolveApiKeyBinding({
+          agent,
+          apiKeyId: vaultKeyId,
+          expectedMasked: expectedApiKeyMasked,
+          apiKeys: keySettings.apiKeys,
+        });
+        if (!resolution.ok) {
+          logger.warn(
+            `[DAEMON RUN] API-key spawn refused (${resolution.code}): ${resolution.message} (#4568)`
+          );
+          return {
+            type: "error",
+            errorMessage: resolution.message,
+            code: resolution.code,
+          };
+        }
+        apiKeyBinding = {
+          id: vaultKeyId,
+          masked: resolution.masked,
+          label: resolution.label,
+        };
+        logger.info(
+          `[DAEMON RUN] API-key spawn: bills vault key "${resolution.label}" (${resolution.masked}) — no account, no instance token, SDK launcher (#4568)`
+        );
+      }
     }
 
     // Issue #1507 regression-shrink: if the bound account IS the host's native
@@ -1630,6 +1681,9 @@ export function createSessionSpawner(
           openRouterUsedKey: tmuxAuthSettings.openRouterApiKey,
           // Issue #4568: a key-bound Claude spawn → api-key / anthropic.
           claudeApiKeyId: apiKeyBinding?.id,
+          // Issue #5127: the label resolved at spawn ("Label (RP1)" for a key
+          // stored on another node, which this vault cannot see).
+          claudeApiKeyLabel: apiKeyBinding?.label,
         })
       );
 
@@ -2591,6 +2645,8 @@ export function createSessionSpawner(
           openRouterUsedKey: authBindingSettings.openRouterApiKey,
           // Issue #4568: a key-bound Claude spawn → api-key / anthropic.
           claudeApiKeyId: apiKeyBinding?.id,
+          // Issue #5127: the label resolved at spawn (see the tmux site).
+          claudeApiKeyLabel: apiKeyBinding?.label,
         });
         extraEnv = {
           ...extraEnv,

@@ -16,10 +16,14 @@ import { queryKeys } from "@/lib/query-keys";
  *      invalidated so the page re-renders in the "saved / no longer retrievable"
  *      state.
  *
- * 🔴 The revealed identity is returned to the caller but is DELIBERATELY NOT
- * written into the query cache — it is fire-once render-only data. Persisting it
- * in TanStack Query would leave the secret sitting in client memory after the
- * page unmounts and defeat the reveal-once/delete contract.
+ * 🔴 The revealed identity is never written into the QUERY cache, but like every
+ * mutation result it IS held in TanStack's MutationCache (`mutation.state.data`)
+ * while the mutation's observer is attached — clearing component state does not
+ * remove it. `gcTime: 0` evicts the entry on the next macrotask once the observer
+ * detaches, so every caller MUST detach on close: call `reveal.reset()` after
+ * acknowledge, skip or dismissal (unmounting also detaches). Without `gcTime: 0`
+ * the secret would stay in client memory for the default 5 minutes after close
+ * (#4791 R9, expert-review finding 4791-2).
  */
 export function useRevealBackupIdentity(api: ApiClient | null) {
   const queryClient = useQueryClient();
@@ -29,6 +33,7 @@ export function useRevealBackupIdentity(api: ApiClient | null) {
       if (!api) throw new Error("No API client");
       return await api.revealBackupIdentity();
     },
+    gcTime: 0,
   });
 
   const acknowledge = useMutation<{ ok: boolean }, Error, void>({

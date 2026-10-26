@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import type { AgentType, SessionMode, SessionType } from "./types";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import {
@@ -107,11 +108,18 @@ export type FormStateInput = {
   accountsCount: number;
   /**
    * Issue #4568: the node-vault Anthropic API key picked as the session's
-   * credential, or null/absent. Honored only for Claude on a local target; it
-   * replaces the account binding and locks the launcher to SDK. Absent (the edit
+   * credential, or null/absent. Honored only for Claude — on a local target,
+   * or on a remote one when it is a listed shared key (#5127); it replaces the
+   * account binding and locks the launcher to SDK. Absent (the edit
    * modal, every pre-#4568 caller) ⇒ byte-identical derivation.
    */
   apiKeyId?: string | null;
+  /**
+   * Issue #5127 (D9): a remote target can bill an API key another node shares.
+   * `remoteSharedKeysAvailable` — the target has ≥1 such key, so the selector
+   * shows on a remote target.
+   */
+  remoteSharedKeysAvailable?: boolean;
   /** True when the selected target advertises `gateway:openrouter` (#1733). */
   agentSupportsOpenRouter: boolean;
   /** Selected OpenRouter model id (`""` = none); only meaningful for codex + openrouter. */
@@ -383,14 +391,28 @@ export function deriveFormState(input: FormStateInput): FormState {
   // Issue #4568: an API key bound as the session's credential (Claude, local
   // target). It replaces the account binding and LOCKS the launcher to SDK — the
   // only launcher that bills a key (D-4568-2 A) — with the note shown under it.
-  const keyBound = isClaude && !input.isRemoteTarget && Boolean(input.apiKeyId);
+  // #5127 (D9): a remote target binds a key shared from another node — any
+  // picked QUALIFIED ref, listed or not: a ref that dropped out of the list (its
+  // home went offline, the key was unticked) is still sent, so the target
+  // refuses naming the home instead of the spawn billing its default account
+  // (R8; the local SF-2 rule). A bare id never binds a remote session.
+  const keyBound =
+    isClaude &&
+    Boolean(input.apiKeyId) &&
+    (!input.isRemoteTarget || isQualifiedApiKeyRef(input.apiKeyId));
 
   return {
     fields: {
       // SEAM-2: relabel + disable for non-Claude is a STATIC placeholder — no real
       // stored-key wiring (that lands with Epic #1954 / B2-B3).
       account: {
-        visible: !input.isRemoteTarget,
+        // #5127 (D9): a remote target shows the selector only for its shared
+        // keys (remote accounts are #4425's; the node default is used).
+        // (and while a key is picked, so the pick stays visible).
+        visible:
+          !input.isRemoteTarget ||
+          input.remoteSharedKeysAvailable === true ||
+          keyBound,
         // #3808 Task 5: enabled for every account-binding agent (claude/codex/gemini),
         // not just Claude; opencode (gateway keys) stays disabled + "API Key".
         disabled: busy || !agentBindsAccount,

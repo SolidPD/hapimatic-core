@@ -3,6 +3,7 @@ import { Fragment, type ReactNode, useState } from "react";
 import type {
   VmInventoryEntry,
   VmInventoryVerdict,
+  VmParityHub,
   VmParitySummary,
 } from "@hapi/protocol/adminVms";
 import type { ApiClient } from "@/api/client";
@@ -115,6 +116,76 @@ function VmParityCell(props: {
         </div>
       )}
     </td>
+  );
+}
+
+/**
+ * ParityHubTable — RP1's own parity row (#3996). RP1 is the declared profile's
+ * verify-only source node: it checks itself nightly and the record is served by
+ * `/api/admin-vms/parity-hub`, OUTSIDE the fleet inventory, so this row has no
+ * URL, health card, reconcile panel or deprovision action. It renders on its
+ * own, above the fleet table, so an empty or failed inventory never hides it,
+ * and a failed hub read never hides the fleet.
+ */
+export function ParityHubTable(props: {
+  hub: VmParityHub | undefined;
+  isLoading: boolean;
+  isError: boolean;
+}) {
+  const { hub, isLoading, isError } = props;
+  return (
+    <div data-testid="parity-hub" className="pb-3">
+      <h2 className="flex items-center gap-2 pb-1 text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]">
+        RP1 (hub)
+      </h2>
+      {isError && (
+        <p
+          className="py-2 text-sm text-[var(--app-hint)]"
+          data-testid="parity-hub-error"
+        >
+          RP1 hub parity is unavailable.
+        </p>
+      )}
+      {isLoading && !isError && (
+        <p
+          className="py-2 text-sm text-[var(--app-hint)]"
+          data-testid="parity-hub-loading"
+        >
+          Loading RP1 hub parity…
+        </p>
+      )}
+      {hub && !isLoading && !isError && (
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse text-sm">
+            <thead>
+              <tr className="border-b border-[var(--app-border)] text-left text-xs text-[var(--app-hint)]">
+                <th className="py-1.5 pr-3 font-medium">Name</th>
+                <th className="py-1.5 pr-3 font-medium">Role</th>
+                <th className="py-1.5 pr-3 font-medium">Parity</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                className="align-top"
+                data-testid={`parity-hub-row-${hub.name}`}
+              >
+                <td className="py-2 pr-3 font-medium text-[var(--app-fg)]">
+                  {hub.name}
+                </td>
+                <td className="py-2 pr-3 text-[var(--app-hint)]">
+                  Profile source node, checked against the declared profile
+                  (never repaired)
+                </td>
+                <VmParityCell
+                  name={`hub-${hub.name}`}
+                  vmParity={hub.vmParity}
+                />
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
 

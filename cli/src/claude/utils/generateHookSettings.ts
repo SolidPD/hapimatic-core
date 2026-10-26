@@ -8,6 +8,7 @@
 
 import { join } from "node:path";
 import { writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { parseApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { configuration } from "@/configuration";
 import { logger } from "@/ui/logger";
 import { getHappyCliCommand } from "@/utils/spawnHappyCLI";
@@ -33,6 +34,11 @@ export interface ApiKeyHelperBinding {
   apiKeyId: string;
   /** The mask recorded at spawn; the helper refuses a key that no longer matches. */
   masked?: string;
+  /**
+   * Issue #5127: the session tag (`HAPI_SESSION_ID`) a key homed on another
+   * node is fetched for. Set only for a qualified ref.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -55,22 +61,36 @@ export const API_KEY_SESSION_PROMPT_CACHE_TTL = "1h";
  * key is in no process environment. `HAPI_HOME` is pinned to THIS instance's
  * home so the helper reads the same vault the launcher checked, whatever the
  * child's environment holds. The string carries only the vault id and mask.
+ *
+ * Issue #5127: for a key homed on another node (a qualified ref) the helper
+ * asks this instance's server for the key, so the string also pins
+ * `HAPI_SERVER_URL` (the child's environment may name another server, and the
+ * CLI default is `:3006`) and names the session (`--session`). A bare id builds
+ * exactly the string above.
  */
 export function buildApiKeyHelperCommand(
   binding: ApiKeyHelperBinding,
   deps: {
     happyHomeDir?: string;
+    serverUrl?: string;
     cli?: { command: string; args: string[] };
   } = {}
 ): string {
+  const shared = parseApiKeyRef(binding.apiKeyId)?.homeNodeId != null;
   const helperArgs = ["api-key-helper", "--id", binding.apiKeyId];
   if (binding.masked) helperArgs.push("--mask", binding.masked);
+  if (shared && binding.sessionId) {
+    helperArgs.push("--session", binding.sessionId);
+  }
   const cli = deps.cli
     ? { command: deps.cli.command, args: [...deps.cli.args, ...helperArgs] }
     : getHappyCliCommand(helperArgs);
   const home = deps.happyHomeDir ?? configuration.happyHomeDir;
-  // The assignment name must stay unquoted for sh to treat it as an assignment.
-  return `HAPI_HOME=${shellQuote(home)} ${shellJoin([cli.command, ...cli.args])}`;
+  // The assignment names must stay unquoted for sh to treat them as assignments.
+  const serverPin = shared
+    ? ` HAPI_SERVER_URL=${shellQuote(deps.serverUrl ?? configuration.serverUrl)}`
+    : "";
+  return `HAPI_HOME=${shellQuote(home)}${serverPin} ${shellJoin([cli.command, ...cli.args])}`;
 }
 
 /**

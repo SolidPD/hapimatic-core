@@ -6,7 +6,12 @@ import { CacheFirst, NetworkFirst } from "workbox-strategies";
 import { ExpirationPlugin } from "workbox-expiration";
 import { getCacheNameForServiceWorker } from "@/lib/storage-keys";
 import { decidePushAction } from "@/lib/pushDisplayGate";
+import { applyBadge, decidePushBadge } from "@/lib/pushBadge";
 import { withoutWebManifest } from "@/lib/precacheEntries";
+import {
+  boundedFetchPlugin,
+  unlessReplacementWaiting,
+} from "@/lib/swRouteGuards";
 // Type-only (erased at build): the app module itself is window-bound and must
 // never be bundled into the service worker — see pushDisplayGate.ts.
 import type { NotificationPreferences } from "@/lib/notificationPreferences";
@@ -46,6 +51,9 @@ type PushPayload = {
     sessionId?: string;
     url?: string;
   };
+  // Issue #4921: the server's unread count at send time (PushBadgeFields in
+  // shared/src/notifications.ts); absent from an older server.
+  unreadCount?: number;
 };
 
 // Instance-specific cache name to prevent cross-contamination between instances
@@ -65,6 +73,18 @@ async function getNotificationPreferences(): Promise<NotificationPreferences> {
     errors: true,
     stalls: true,
     usage: true,
+    // Issue #4915: the pop-up switch and the per-kind toggles default on, so an
+    // older cached snapshot that lacks them never silences a push.
+    showPopups: true,
+    toolErrors: true,
+    promptBlocked: true,
+    apiErrors: true,
+    accountUnrefreshable: true,
+    sessionRestartFailed: true,
+    spawnFailed: true,
+    waitingForSlot: true,
+    loopsResuming: true,
+    modelReverted: true,
     mutedSessions: [],
     globalOptOut: false,
   };
@@ -84,14 +104,34 @@ async function getNotificationPreferences(): Promise<NotificationPreferences> {
 
 // #4797: the manifest always goes to the network — the server picks its identity
 // per instance, and a precached copy would pin an existing client to production.
+// #4924: the precache route is NOT wrapped in `whileCurrent` below. It answers
+// from Cache Storage (nothing for the swap to wait on), and it is the only place
+// the running bundle's lazily loaded chunks still exist once the server has
+// moved on to a newer build.
 precacheAndRoute(withoutWebManifest(self.__WB_MANIFEST));
 
+// #4924: while a newer worker waits, this (outgoing) worker hands every runtime
+// request straight to the network. Chromium swaps workers only once the outgoing
+// one has no event in flight (or after 5 minutes), so without this a busy hub
+// kept the "A new version of the app is ready" bar on screen for 5 minutes after
+// the tap. Separately, and at all times, every API-route fetch gives up after
+// 30 s (the page's own ApiClient timeout), so an API request already in flight
+// when the replacement installed still finishes first, within the bound. The
+// asset routes (CDN, /ext-assets/) take only the guard: the bound also cuts the
+// response body, and nothing on the page gives up on a slow asset at 30 s.
+// Every registerRoute below must use `whileCurrent`, and every /api/ route must
+// also carry `boundedFetch` (src/lib/swRouteGuards.test.ts checks this file).
+const whileCurrent = <A>(match: (arg: A) => boolean) =>
+  unlessReplacementWaiting(match, () => self.registration);
+const boundedFetch = boundedFetchPlugin();
+
 registerRoute(
-  ({ url }) => url.pathname === "/api/sessions",
+  whileCurrent(({ url }: { url: URL }) => url.pathname === "/api/sessions"),
   new NetworkFirst({
     cacheName: "api-sessions",
     networkTimeoutSeconds: 10,
     plugins: [
+      boundedFetch,
       new ExpirationPlugin({
         maxEntries: 10,
         maxAgeSeconds: 60 * 5,
@@ -115,11 +155,14 @@ registerRoute(
 const SESSION_DETAIL_NETWORK_TIMEOUT_SECONDS = 28;
 
 registerRoute(
-  ({ url }) => /^\/api\/sessions\/[^/]+$/.test(url.pathname),
+  whileCurrent(({ url }: { url: URL }) =>
+    /^\/api\/sessions\/[^/]+$/.test(url.pathname)
+  ),
   new NetworkFirst({
     cacheName: "api-session-detail",
     networkTimeoutSeconds: SESSION_DETAIL_NETWORK_TIMEOUT_SECONDS,
     plugins: [
+      boundedFetch,
       new ExpirationPlugin({
         maxEntries: 20,
         maxAgeSeconds: 60 * 5,
@@ -129,11 +172,12 @@ registerRoute(
 );
 
 registerRoute(
-  ({ url }) => url.pathname === "/api/machines",
+  whileCurrent(({ url }: { url: URL }) => url.pathname === "/api/machines"),
   new NetworkFirst({
     cacheName: "api-machines",
     networkTimeoutSeconds: 10,
     plugins: [
+      boundedFetch,
       new ExpirationPlugin({
         maxEntries: 5,
         maxAgeSeconds: 60 * 10,
@@ -142,8 +186,13 @@ registerRoute(
   })
 );
 
+// The two CDN routes were `RegExp` captures. Workbox matches a cross-origin URL
+// against a RegExp only from index 0; the `^` anchors keep that semantics in the
+// function form the guard needs.
 registerRoute(
-  /^https:\/\/cdn\.socket\.io\/.*/,
+  whileCurrent(({ url }: { url: URL }) =>
+    /^https:\/\/cdn\.socket\.io\//.test(url.href)
+  ),
   new CacheFirst({
     cacheName: "cdn-socketio",
     plugins: [
@@ -156,7 +205,9 @@ registerRoute(
 );
 
 registerRoute(
-  /^https:\/\/telegram\.org\/.*/,
+  whileCurrent(({ url }: { url: URL }) =>
+    /^https:\/\/telegram\.org\//.test(url.href)
+  ),
   new CacheFirst({
     cacheName: "cdn-telegram",
     plugins: [
@@ -176,7 +227,9 @@ registerRoute(
 // runtime extension is loaded (HAPI_FS_EXTENSIONS on) — no /ext-assets/* traffic
 // otherwise.
 registerRoute(
-  ({ url }) => url.pathname.startsWith("/ext-assets/"),
+  whileCurrent(({ url }: { url: URL }) =>
+    url.pathname.startsWith("/ext-assets/")
+  ),
   new NetworkFirst({
     cacheName: "ext-assets",
     plugins: [
@@ -253,16 +306,11 @@ self.addEventListener("push", event => {
         tag,
       });
 
-      // Set app badge on iOS home screen (supported since iOS 16.4)
-      // Must pass a positive integer — setAppBadge() with no args shows
-      // an empty/invisible badge on iOS Safari.
-      if ("setAppBadge" in self.navigator) {
-        try {
-          await self.navigator.setAppBadge(1);
-        } catch {
-          // Silently ignore - badge API may not be available in all contexts
-        }
-      }
+      // Set the iOS home-screen badge (iOS 16.4+) from the server's unread
+      // count (issue #4921): max(count, 1), or 1 from an older server. Always a
+      // positive integer — setAppBadge() with no args shows an empty badge on
+      // iOS Safari. The open app's mirror is the only thing that clears it.
+      await applyBadge(self.navigator, decidePushBadge(payload.unreadCount));
     })()
   );
 });
@@ -274,14 +322,8 @@ self.addEventListener("notificationclick", event => {
 
   event.waitUntil(
     (async () => {
-      // Clear app badge when user interacts with notification
-      if ("clearAppBadge" in self.navigator) {
-        try {
-          await self.navigator.clearAppBadge();
-        } catch {
-          // Silently ignore
-        }
-      }
+      // Issue #4921: a tap does not clear the badge — it opens the session,
+      // and the page's unread-count mirror then writes the true count.
 
       // Try to navigate an existing window instead of opening a new one
       const clients = await self.clients.matchAll({

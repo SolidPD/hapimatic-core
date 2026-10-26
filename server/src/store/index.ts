@@ -15,10 +15,15 @@ import { AuditStore } from "./auditStore";
 import { UpdateStatusStore } from "./updateStatusStore";
 import { SessionStore } from "./sessionStore";
 import { ErrorLogStore } from "./errorLogStore";
+import { NotificationStore } from "./notificationStore";
 import { FeedbackStore } from "./feedbackStore";
 import { TimeLogStore } from "./timeLogStore";
 import { PeerStore } from "./peerStore";
 import { LeaseStore } from "./leaseStore";
+import {
+  API_KEY_SHARE_AUDIT_DDL,
+  ApiKeyShareAuditStore,
+} from "./apiKeyShareAuditStore";
 import { FileClaimsStore } from "./fileClaimsStore";
 import { InitiativeStore } from "./initiativeStore";
 import { WatermarkStore } from "./watermarkStore";
@@ -70,6 +75,7 @@ export type {
   StoredQueuedMessage,
 } from "./queuedMessages";
 export { ErrorLogStore } from "./errorLogStore";
+export { NotificationStore } from "./notificationStore";
 export { FeedbackStore } from "./feedbackStore";
 export { MachineStore } from "./machineStore";
 export { MessageStore } from "./messageStore";
@@ -89,6 +95,12 @@ export { PeerStore } from "./peerStore";
 export { ExtensionPrefsStore } from "./extensionPrefsStore";
 export { BookmarkStore } from "./bookmarkStore";
 export { LeaseStore } from "./leaseStore";
+export { ApiKeyShareAuditStore } from "./apiKeyShareAuditStore";
+export type {
+  ApiKeySharePurpose,
+  ApiKeyShareAuditRow,
+  ApiKeyShareAuditSummaryRow,
+} from "./apiKeyShareAuditStore";
 export type { LeaseAcquireResult, LeaseHolder } from "./leaseStore";
 export { FileClaimsStore } from "./fileClaimsStore";
 export type {
@@ -180,9 +192,12 @@ export class Store {
   readonly updateStatus: UpdateStatusStore;
   readonly timeLogs: TimeLogStore;
   readonly errorLogs: ErrorLogStore;
+  readonly notifications: NotificationStore;
   readonly feedback: FeedbackStore;
   readonly peers: PeerStore;
   readonly leases: LeaseStore;
+  /** Issue #5127: durable audit of cross-node shared-API-key requests. */
+  readonly apiKeyShareAudit: ApiKeyShareAuditStore;
   readonly fileClaims: FileClaimsStore;
   readonly initiatives: InitiativeStore;
   readonly watermark: WatermarkStore;
@@ -277,9 +292,11 @@ export class Store {
     this.updateStatus = new UpdateStatusStore(this.db);
     this.timeLogs = new TimeLogStore(this.db);
     this.errorLogs = new ErrorLogStore(this.db);
+    this.notifications = new NotificationStore(this.db);
     this.feedback = new FeedbackStore(this.db);
     this.peers = new PeerStore(this.db);
     this.leases = new LeaseStore(this.db);
+    this.apiKeyShareAudit = new ApiKeyShareAuditStore(this.db);
     this.fileClaims = new FileClaimsStore(this.db);
     this.initiatives = new InitiativeStore(this.db);
     this.watermark = new WatermarkStore(this.db);
@@ -667,6 +684,39 @@ export class Store {
       );
     }
 
+    // Create notifications table (issue #4913, epic #4912): the 48-hour user
+    // inbox behind `notify()`. Every statement is IF NOT EXISTS, so it runs
+    // unconditionally. No CHECK on `kind` — a later sub-issue adds kinds without
+    // a migration. `idx_notifications_namespace_dedupe` serves the coalesce probe.
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS notifications (
+          id TEXT PRIMARY KEY,
+          namespace TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          severity TEXT NOT NULL CHECK (severity IN ('info','warn','error')),
+          title TEXT NOT NULL,
+          body TEXT,
+          session_id TEXT,
+          session_title TEXT,
+          context TEXT,
+          dedupe_key TEXT,
+          count INTEGER NOT NULL DEFAULT 1,
+          first_at INTEGER NOT NULL,
+          last_at INTEGER NOT NULL,
+          read_at INTEGER,
+          dismissed_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_notifications_namespace_last_at ON notifications(namespace, last_at);
+        CREATE INDEX IF NOT EXISTS idx_notifications_namespace_dedupe ON notifications(namespace, dedupe_key, last_at);
+      `);
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: CREATE TABLE notifications:`,
+        error
+      );
+    }
+
     // Create feedback table if it doesn't exist (issue #2664, epic #2663).
     // Persist-first record for in-app user feedback: the row survives even when
     // the email send fails (R7/R10). Mirrors the error_logs create block above.
@@ -706,6 +756,22 @@ export class Store {
       // (PRAGMA-guarded, idempotent) so a pre-existing #2664 feedback table
       // gains the column too — NOT only brand-new DBs.
       this.migrateAddColumn("feedback", "attachments_json", "TEXT");
+      // Issue #2911: forward state for the gateway sink. `forwarded` is 0 pending,
+      // 1 forwarded, 2 legacy, 3 rejected. The DEFAULT 2 stamps rows that existed
+      // before this column as legacy (forwarded only by the operator backfill);
+      // createEntry writes 0 explicitly, so every new row starts pending.
+      this.migrateAddColumn(
+        "feedback",
+        "forwarded",
+        "INTEGER NOT NULL DEFAULT 2"
+      );
+      this.migrateAddColumn("feedback", "forward_error", "TEXT");
+      this.migrateAddColumn("feedback", "forwarded_at", "INTEGER");
+      this.migrateAddColumn(
+        "feedback",
+        "forward_attempts",
+        "INTEGER NOT NULL DEFAULT 0"
+      );
     } catch (error) {
       console.error(`[Store] Migration failed: CREATE TABLE feedback:`, error);
     }
@@ -786,6 +852,18 @@ export class Store {
     } catch (error) {
       console.error(
         `[Store] Migration failed: CREATE TABLE account_rotation_leases:`,
+        error
+      );
+    }
+
+    // Issue #5127: durable audit of every cross-node request for a shared API
+    // key, kept on the key's home node. Non-droppable (unlike errorLogger), no
+    // key material. See server/src/store/apiKeyShareAuditStore.ts.
+    try {
+      for (const ddl of API_KEY_SHARE_AUDIT_DDL) this.db.run(ddl);
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: CREATE TABLE api_key_share_audit:`,
         error
       );
     }

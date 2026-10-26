@@ -19,6 +19,24 @@ import {
   JOB_KINDS,
 } from "./types";
 
+/**
+ * Subdomains no VM may be created under (#5731): `rp1` is the RP1 hub parity
+ * record's fixed name (rp1.json, #3996) and `self` is the VM-side copy's name
+ * (self.json, #2019). A VM of either name would overwrite or alias that record.
+ * The shell copy is VM_PARITY_RESERVED_SUBDOMAINS in
+ * scripts/lib/vm-parity-status-v1.sh (provision.sh's refusal); a test keeps the
+ * two equal. Only the VM-creating kinds refuse them, so a VM misnamed by hand
+ * can still be torn down or read.
+ */
+export const RESERVED_SUBDOMAINS: Readonly<Record<string, string>> = {
+  rp1: "the RP1 hub parity record is rp1.json (#3996); a VM of that name would overwrite it and share its parity-history",
+  self: "self.json is the VM-side copy rp1-home's SessionStart banner reads (#2019)",
+};
+const VM_CREATING_KINDS: ReadonlySet<JobKind> = new Set<JobKind>([
+  "provision",
+  "create-vm",
+]);
+
 // ── Value patterns (all anchored so a value can never begin with '-' and thus
 //    never masquerade as a flag, defense-in-depth atop argv-array execution) ──
 const SUBDOMAIN = /^[a-z0-9][a-z0-9-]*$/; // matches deprovision.sh's own guard
@@ -476,7 +494,7 @@ export function buildJob(
   }
 
   // Kind-specific guards.
-  applyGuards(kind, argvFlags, opts.now ?? Date.now());
+  applyGuards(kind, positionals, argvFlags, opts.now ?? Date.now());
 
   // health-check is always a read-only, machine-readable probe.
   if (kind === "health-check") {
@@ -493,7 +511,24 @@ export function buildJob(
   };
 }
 
-function applyGuards(kind: JobKind, argvFlags: string[], now: number): void {
+function applyGuards(
+  kind: JobKind,
+  positionals: readonly string[],
+  argvFlags: string[],
+  now: number
+): void {
+  // #5731: refuse a reserved subdomain before any VM is created under it.
+  if (VM_CREATING_KINDS.has(kind)) {
+    const sub = positionals[0];
+    if (Object.prototype.hasOwnProperty.call(RESERVED_SUBDOMAINS, sub)) {
+      throw new JobValidationError(
+        "guard-violation",
+        kind,
+        `subdomain '${sub}' is reserved: ${RESERVED_SUBDOMAINS[sub]} (#5731)`
+      );
+    }
+  }
+
   if (kind === "deprovision") {
     const at = argvFlags.indexOf("--service-end");
     if (at !== -1) {

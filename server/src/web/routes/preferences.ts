@@ -45,6 +45,7 @@ import {
   migrateChatDetailLevelToSections,
   OpenRouterFavoritesSchema,
   SearchFilterPreferencesSchema,
+  SHARE_API_KEYS_BY_DEFAULT_DEFAULT,
   TERMINAL_KEYBOARD_EXPANDED_DEFAULT,
 } from "@hapi/protocol/schemas";
 import type {
@@ -1025,14 +1026,15 @@ export function createPreferencesRoutes(
 
   // The per-key A-default fallbacks buildView needs (R5), hoisted so the GET and
   // the PUT cannot drift (#4548 — previously two identical literals). A
-  // federation-native key (terminalKeyboardExpanded) has no A-local storage, so
-  // its fallback is the shared default constant.
+  // federation-native key (terminalKeyboardExpanded, #5127's shareApiKeysByDefault)
+  // has no A-local storage, so its fallback is the shared default constant.
   async function federationView(block: FederationSettingsBlock) {
     return buildView(block, {
       chatSections: await readChatSections(settingsFile),
       defaultOutputStyle: { style: await readDefaultOutputStyle(settingsFile) },
       timeLogTimezone: await readLocalTimeLogTimezone(settingsFile),
       terminalKeyboardExpanded: TERMINAL_KEYBOARD_EXPANDED_DEFAULT,
+      shareApiKeysByDefault: SHARE_API_KEYS_BY_DEFAULT_DEFAULT,
     });
   }
 

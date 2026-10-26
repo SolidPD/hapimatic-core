@@ -246,6 +246,8 @@ export function createFederationSpawnRosterRoutes(
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?pmSessionId= (#5212)
+        probe: "skip",
         telemetry: "off",
       })
     ),

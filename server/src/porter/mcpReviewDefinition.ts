@@ -6,7 +6,10 @@ import type {
 } from "@hapi/protocol/porter";
 import { buildMcpServerConfig, reviewedMcpCommand } from "./mcpImport";
 import { declaredSlotNames } from "./mcpRebuild";
-import type { ImportPlan, PlannedMcpServer } from "./importArchive";
+import type { ImportPlan } from "./importArchive";
+import type { PlannedMcpServerReview } from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type { PlannedMcpServerReview } from "@hapi/protocol/porter";
 
 /**
  * The import review's definition of each planned MCP server (issue #5172,
@@ -52,11 +55,6 @@ export function assertReviewedConfigFields(
       );
     }
   }
-}
-
-/** A planned server with the definition the commit writes. */
-export interface PlannedMcpServerReview extends PlannedMcpServer {
-  definition: McpReviewDefinition;
 }
 
 /**

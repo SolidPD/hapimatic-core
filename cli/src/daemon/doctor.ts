@@ -19,29 +19,89 @@ function executableName(token: string): string {
 }
 
 /**
+ * The executable names whose processes `hapi daemon status` and `hapi doctor`
+ * list: `hapi` / `hapi.exe`, plus the running binary's own name when it is a
+ * compiled binary (#5526). A fleet instance's binary is named per instance
+ * (`hapimatic-private`, `hapimatic-dev`, `hapimatic-wt-3012`), so this lists
+ * that instance's own processes and any `hapi` / `hapi.exe` process, but no
+ * other `hapimatic-*` instance's.
+ *
+ * Only the listing uses this set. `doctor clean`'s kill list keeps the default
+ * names (see findRunawayHappyProcesses).
+ */
+export function instanceExecutableNames(
+  execPath: string,
+  compiled: boolean
+): ReadonlySet<string> {
+  const own = executableName(execPath);
+  if (
+    !compiled ||
+    !own ||
+    HAPI_EXECUTABLES.has(own) ||
+    SHELL_EXECUTABLES.has(own) ||
+    DEV_RUNTIMES.has(own)
+  ) {
+    return HAPI_EXECUTABLES;
+  }
+  return new Set([...HAPI_EXECUTABLES, own]);
+}
+
+const SECRET_FLAG = /^--(?:[a-z0-9]+-)*token$/i;
+const SECRET_FLAG_WITH_VALUE = /^(--(?:[a-z0-9]+-)*token=).+$/i;
+
+/**
+ * Hide the value of any `--token` / `--*-token` argument in a command line
+ * before it is printed (#5526). The hook forwarder runs as
+ * `<binary> hook-forwarder --port N --token <secret>`, and `hapi doctor`
+ * output is often pasted into issues.
+ */
+export function redactCommandSecrets(cmd: string): string {
+  const tokens = cmd.split(/(\s+)/);
+  let redactNext = false;
+  return tokens
+    .map(token => {
+      if (/^\s+$/.test(token) || token === "") {
+        return token;
+      }
+      if (redactNext) {
+        redactNext = false;
+        return "<redacted>";
+      }
+      if (SECRET_FLAG.test(token)) {
+        redactNext = true;
+        return token;
+      }
+      return token.replace(SECRET_FLAG_WITH_VALUE, "$1<redacted>");
+    })
+    .join("");
+}
+
+/**
  * Locate a process's hapi arguments, or null when it is not a hapi process.
  *
  * #5180 F11: the arguments are read from the executable token onwards, never
  * from a substring of the whole command line. A shell wrapper such as
  * `bash -c "cd /x && hapi daemon start"` merely contains those words; it is
- * not the daemon, and `hapi doctor clean` must never kill it.
+ * not the daemon, and `hapi doctor clean` must never kill it. The same rule
+ * applies to an instance's own binary name (#5526).
  */
 function locateHapiArgs(
   tokens: string[],
   name: string,
-  cmd: string
+  cmd: string,
+  executables: ReadonlySet<string>
 ): { args: string[]; isDevMode: boolean } | null {
   const exe = executableName(tokens[0] ?? "");
-  if (HAPI_EXECUTABLES.has(exe)) {
+  if (executables.has(exe)) {
     return { args: tokens.slice(1), isDevMode: false };
   }
-  if (HAPI_EXECUTABLES.has(name)) {
+  if (executables.has(name)) {
     // The process IS hapi, but its path contains a space ("/home/John Doe/
     // .local/bin/hapi"), so splitting on whitespace broke the path in two.
     // Start the arguments after the token that ends in the hapi binary, or
     // after argv[0] when the process rewrote its own argv[0].
     const binary = tokens.findIndex(token =>
-      HAPI_EXECUTABLES.has(executableName(token))
+      executables.has(executableName(token))
     );
     return {
       args: tokens.slice(binary >= 0 ? binary + 1 : 1),
@@ -73,16 +133,18 @@ function locateHapiArgs(
 
 /**
  * Classify one process for `hapi doctor` / `hapi daemon status`. Returns null
- * when the process is not a hapi process.
+ * when the process is not a hapi process. `executables` is the set of binary
+ * names that count as hapi (default `hapi` / `hapi.exe`).
  */
 export function classifyHappyProcess(
   proc: { pid: number; cmd: string; name: string },
-  selfPid: number
+  selfPid: number,
+  executables: ReadonlySet<string> = HAPI_EXECUTABLES
 ): string | null {
   const cmd = proc.cmd || "";
   const name = proc.name || "";
   const tokens = cmd.trim().split(/\s+/).filter(Boolean);
-  const located = locateHapiArgs(tokens, name, cmd);
+  const located = locateHapiArgs(tokens, name, cmd, executables);
   if (!located) {
     return null;
   }
@@ -101,6 +163,9 @@ export function classifyHappyProcess(
   ) {
     return isDevMode ? "dev-daemon" : "daemon";
   }
+  if (args[0] === "server") {
+    return isDevMode ? "dev-related" : "server";
+  }
   if (
     (startedBy >= 0 && args[startedBy + 1] === "daemon") ||
     args.includes("--started-by=daemon")
@@ -117,11 +182,13 @@ export function classifyHappyProcess(
 }
 
 /**
- * Find all HAPI CLI processes (including current process)
+ * Find all HAPI CLI processes (including current process). `executables` is
+ * the set of binary names that count as hapi; the listing passes
+ * instanceExecutableNames() so a fleet instance sees its own processes.
  */
-export async function findAllHappyProcesses(): Promise<
-  Array<{ pid: number; command: string; type: string }>
-> {
+export async function findAllHappyProcesses(
+  executables: ReadonlySet<string> = HAPI_EXECUTABLES
+): Promise<Array<{ pid: number; command: string; type: string }>> {
   try {
     const processes = await psList();
     const allProcesses: Array<{ pid: number; command: string; type: string }> =
@@ -132,10 +199,15 @@ export async function findAllHappyProcesses(): Promise<
       const name = proc.name || "";
       const type = classifyHappyProcess(
         { pid: proc.pid, cmd, name },
-        process.pid
+        process.pid,
+        executables
       );
       if (type === null) continue;
-      allProcesses.push({ pid: proc.pid, command: cmd || name, type });
+      allProcesses.push({
+        pid: proc.pid,
+        command: redactCommandSecrets(cmd || name),
+        type,
+      });
     }
 
     return allProcesses;
@@ -150,6 +222,11 @@ export async function findAllHappyProcesses(): Promise<
 export async function findRunawayHappyProcesses(): Promise<
   Array<{ pid: number; command: string }>
 > {
+  // #5526: the kill list deliberately stays on the default `hapi` / `hapi.exe`
+  // names. The listing adds the instance's own binary name, but a fleet
+  // instance's daemon and sessions must never become killable through it:
+  // `hapimatic-private doctor clean` would otherwise kill the prod daemon and
+  // every session it spawned.
   const allProcesses = await findAllHappyProcesses();
 
   // Filter to just runaway processes (excluding current process)

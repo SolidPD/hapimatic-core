@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { McpReviewValue } from "@hapi/protocol/porter";
-import type { PlannedMcpServer } from "@/types/porter";
+import type { PlannedMcpServerReview } from "@/types/porter";
 import { offersReAuth } from "./ReAuthStep";
 import { HiddenCharsNotice, VisibleText } from "./VisibleText";
 
@@ -54,7 +54,7 @@ function ReviewValue({ value }: { value: McpReviewValue }) {
  * the JSON form the row renders, so the notice fires only when a `U+XXXX`
  * token is actually shown (JSON already escapes a line feed as `\n`).
  */
-function rowValues(s: PlannedMcpServer): string[] {
+function rowValues(s: PlannedMcpServerReview): string[] {
   const d = s.definition;
   const literal = (v: McpReviewValue | undefined): string[] =>
     v?.kind === "value" ? [JSON.stringify(v.value)] : [];
@@ -73,7 +73,7 @@ function rowValues(s: PlannedMcpServer): string[] {
 }
 
 /** The declared secret slot names, in the server's `declaredSlotNames` order. */
-function declaredSlots(s: PlannedMcpServer): string[] {
+function declaredSlots(s: PlannedMcpServerReview): string[] {
   return [
     ...(s.argsNames ?? []).map(a => a.name),
     ...(s.urlName !== undefined ? [s.urlName] : []),
@@ -82,7 +82,11 @@ function declaredSlots(s: PlannedMcpServer): string[] {
   ];
 }
 
-export function McpServerDefinition({ server }: { server: PlannedMcpServer }) {
+export function McpServerDefinition({
+  server,
+}: {
+  server: PlannedMcpServerReview;
+}) {
   const d = server.definition;
   const id = `mcp-definition-${server.name}`;
   const slots = declaredSlots(server);

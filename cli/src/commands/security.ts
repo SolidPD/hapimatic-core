@@ -95,6 +95,7 @@ import {
   scanCoverage,
   unreadableFinding,
 } from "./securityFailClosed";
+import { checkSharedApiKeys } from "./securitySharedKeys";
 import {
   defaultGetUid,
   defaultIsPidAlive,
@@ -1147,12 +1148,29 @@ export async function runSecurityAudit(
   const gitleaksBin = deps.resolveGitleaks();
   const inputs = readInputs(paths);
   const accounts = readAccounts(paths);
+  // #5127: keys shared across the federation; a shared key raises the sandbox
+  // finding, since an agent that can read the vault can fetch every shared key.
+  const sharedKeys = checkSharedApiKeys(
+    {
+      settings: readRecord(inputs.settings),
+      dbPath: paths.dbPath,
+      envFederationToken: process.env.FEDERATION_API_TOKEN || undefined,
+      isWeakToken: isWeakCliApiToken,
+    },
+    paths.settingsFile
+  );
+  const sandbox = checkSandbox(inputs.daemonPid, deps).map(f =>
+    f.id === "sandbox-disabled" && sharedKeys.anyShared
+      ? { ...f, severity: "medium" as const }
+      : f
+  );
 
   const checked: Finding[] = [
     ...inputs.problems,
     ...checkModeBits(paths, inputs.bases),
     ...checkSettings(paths, inputs.settings),
-    ...checkSandbox(inputs.daemonPid, deps),
+    ...sandbox,
+    ...sharedKeys.findings,
     ...accounts.problems,
     ...checkAccounts(accounts),
     ...checkSupplyChain(paths),

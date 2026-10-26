@@ -42,6 +42,9 @@ export type ProviderId = z.infer<typeof ProviderIdSchema>;
  * supports keyring credential storage). `email` / `plan` / `expiresAt` are claims
  * decoded from the login's id-token; `accountId` is codex's stable account id (an
  * identifier, NOT a secret). No token/key value field exists. [ER 2026-09-19: 3806-7]
+ * `accountUuid` names the store record: the `<pk>` dir for an `"account"` row; for
+ * the host row, the importer's PK for its `accountId` (#3982), or null when the
+ * login carries no account id.
  */
 export const OpenAiAuthStateSchema = z.object({
   accountUuid: z.string().nullable(),
@@ -84,10 +87,15 @@ export type GoogleAuthState = z.infer<typeof GoogleAuthStateSchema>;
  * peer that could not be reached (`openai: []`, `google` omitted) — never silently
  * dropped, mirroring the usage aggregator's degraded-peer discipline (#1881).
  * [ER 2026-09-19: 3806-12]
+ *
+ * `status:"error"`: the SERVING node's own reader failed (#5739, the account-health
+ * `error` rule from #5420). The node answered, so it is not unreachable
+ * (`openai: []`, `google` omitted). A shipped receiver only ever sends `ok`: its
+ * reader throw answers 500, which the hub reports as `unreachable` / `http_5xx`.
  */
 export const NodeProviderAuthStateSchema = z.object({
   nodeId: z.string(),
-  status: z.enum(["ok", "unreachable"]),
+  status: z.enum(["ok", "unreachable", "error"]),
   openai: z.array(OpenAiAuthStateSchema),
   google: GoogleAuthStateSchema.optional(),
 });

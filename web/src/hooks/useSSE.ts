@@ -333,6 +333,9 @@ export function useSSE(options: {
         });
       }
 
+      // TODO(#4912): remove with Sub B's (#4914) legacy SyncEvents — since #4915
+      // nothing listens for this CustomEvent; NotificationListener reads the
+      // `notification` event instead.
       if (event.type === "tool-error") {
         const data = (event as { data?: unknown }).data as
           | { toolName?: string; toolUseId?: string; errorContent?: string }
@@ -360,6 +363,9 @@ export function useSSE(options: {
         }
       }
 
+      // TODO(#4912): remove with Sub B's (#4914) legacy SyncEvents — since #4915
+      // nothing listens for this CustomEvent; NotificationListener reads the
+      // `notification` event instead.
       if (event.type === "prompt-blocked") {
         // Issue #1348: UserPromptSubmit hook block — sibling to tool-error.
         const data = (event as { data?: unknown }).data as
@@ -395,10 +401,13 @@ export function useSSE(options: {
         }
       }
 
+      // TODO(#4912): remove with Sub B's (#4914) legacy SyncEvents — since #4915
+      // nothing listens for this CustomEvent; NotificationListener reads the
+      // `notification` event instead.
       // Issue #1233 (Epic #1231): Anthropic API error — sibling of tool-error /
       // prompt-blocked. Payload is NESTED (locked contract LC-1): read
       // event.data.* and re-emit a typed hapi:apiError CustomEvent that
-      // ApiErrorToastListener (App.tsx, inside ToastProvider) consumes.
+      // ApiErrorToastListener consumed (retired by #4915).
       if (event.type === "api-error") {
         const data = (event as { data?: unknown }).data as
           | {
@@ -432,9 +441,12 @@ export function useSSE(options: {
         }
       }
 
+      // TODO(#4912): remove with Sub B's (#4914) legacy SyncEvents — since #4915
+      // nothing listens for this CustomEvent; NotificationListener reads the
+      // `notification` event instead.
       // Issue #1531: bound account became unrefreshable mid token-refresh restart.
       // Sibling of tool-error / prompt-blocked — dispatch a window CustomEvent that
-      // the AccountUnrefreshableToastListener (App.tsx, inside ToastProvider) consumes.
+      // the AccountUnrefreshableToastListener consumed (retired by #4915).
       // event.type narrows to the variant where sessionId + accountUuid are strings.
       if (event.type === "account-unrefreshable") {
         window.dispatchEvent(
@@ -452,10 +464,13 @@ export function useSSE(options: {
         );
       }
 
+      // TODO(#4912): remove with Sub B's (#4914) legacy SyncEvents — since #4915
+      // nothing listens for this CustomEvent; NotificationListener reads the
+      // `notification` event instead.
       // Issue #1532: token-refresh restart failed BOTH respawn and rollback. The
       // session is disconnected but RECONNECTABLE. Sibling of account-unrefreshable
       // (#1531) — dispatch a window CustomEvent that the SessionRestartFailedToast-
-      // Listener (App.tsx, inside ToastProvider) consumes. event.type narrows to the
+      // Listener consumed (retired by #4915). event.type narrows to the
       // variant where sessionId + accountUuid + error are strings.
       if (event.type === "session-restart-failed") {
         window.dispatchEvent(
@@ -469,10 +484,12 @@ export function useSSE(options: {
         );
       }
 
+      // TODO(#4912): remove with Sub B's (#4914) legacy SyncEvents — since #4915
+      // nothing listens for this CustomEvent; NotificationListener reads the
+      // `notification` event instead.
       // Issue #2453 (Task 14, R6): a reconnect auto-resumed the loops paused on
       // disconnect. Sibling of session-restart-failed — dispatch a window
-      // CustomEvent the LoopsResumingToastListener (App.tsx, inside ToastProvider)
-      // consumes to show the standard bottom-center toast.
+      // CustomEvent the LoopsResumingToastListener consumed (retired by #4915).
       if (event.type === "loops-resuming") {
         window.dispatchEvent(
           new CustomEvent("hapi:loopsResuming", {
@@ -485,11 +502,14 @@ export function useSSE(options: {
         );
       }
 
+      // TODO(#4912): remove with Sub B's (#4914) legacy SyncEvents — since #4915
+      // nothing listens for this CustomEvent; NotificationListener reads the
+      // `notification` event instead.
       // Issue #2301 (Task 5, R4): a reconnect or account-switch spawn is polling
       // for a free session slot (capacity throttle). Sibling of loops-resuming —
-      // dispatch a window CustomEvent the WaitingForSlotToastListener (App.tsx,
-      // inside ToastProvider) consumes to show the advisory "waiting for a slot…"
-      // toast. Advisory only — no early return (control still reaches onEvent below).
+      // dispatch a window CustomEvent the WaitingForSlotToastListener consumed
+      // (retired by #4915). Advisory only — no early return (control still
+      // reaches onEvent below).
       if (event.type === "waiting-for-slot") {
         window.dispatchEvent(
           new CustomEvent("hapi:waitingForSlot", {
@@ -499,6 +519,24 @@ export function useSSE(options: {
               elapsedMs: event.elapsedMs,
               deadlineMs: event.deadlineMs,
             },
+          })
+        );
+      }
+
+      // Issue #4915 (epic #4912, Sub C): a notification row was created,
+      // coalesced, read or dismissed. Re-emit the stored row as a window
+      // CustomEvent; NotificationListener (App.tsx, inside ToastProvider)
+      // updates the inbox cache and decides whether it pops up. No early return
+      // — control still reaches onEventRef.current(event) below.
+      if (event.type === "notification") {
+        window.dispatchEvent(
+          new CustomEvent("hapi:notification", { detail: event.notification })
+        );
+      }
+      if (event.type === "notifications-cleared") {
+        window.dispatchEvent(
+          new CustomEvent("hapi:notificationsCleared", {
+            detail: { dismissedAt: event.dismissedAt },
           })
         );
       }

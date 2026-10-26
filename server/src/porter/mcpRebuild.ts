@@ -2,7 +2,6 @@
 import { readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
-  McpSecretBundleSchema,
   type McpSecretBundle,
   type McpServerEntry,
 } from "@hapi/protocol/porter";
@@ -19,6 +18,7 @@ import type {
   McpExclusion,
   PlannedMcpServer,
 } from "./importArchive";
+import { decryptFailureReason, parseSecretBundle } from "./secretBundle";
 
 /**
  * ADR-0006 Fork A: the recipient-supplied secret overlay carried ONCE in the
@@ -173,10 +173,21 @@ export async function rebuildMcpItems(
   let secretBundle: McpSecretBundle | undefined;
   if (plan.encryptedSecretsStagedPath) {
     const ciphertext = await readFile(plan.encryptedSecretsStagedPath);
-    const plaintext = await decryptPorterArchive(plan.settingsFile, ciphertext);
-    secretBundle = McpSecretBundleSchema.parse(
-      JSON.parse(Buffer.from(plaintext).toString("utf-8"))
-    );
+    // #5543: fixed reasons, never the decrypter's or the parser's text — both
+    // can echo bundle content (`invalid version <first line>` for a member that
+    // is not age-encrypted). The plan decrypts and parses only when a server
+    // declares secret slots, so this can be the first. A plain Error keeps the
+    // commit a 500: a SecretDecryptionError cause would be classified 400
+    // (commitFailureOf).
+    let plaintext: Uint8Array;
+    try {
+      plaintext = await decryptPorterArchive(plan.settingsFile, ciphertext);
+    } catch (err) {
+      throw new Error(decryptFailureReason(err));
+    }
+    const parsed = parseSecretBundle(plaintext);
+    if (!parsed.ok) throw new Error(parsed.reason);
+    secretBundle = parsed.bundle;
   }
   // #2640: thread the same destHome as the plan loop so a source-home command is
   // written TRANSLATED at commit. This builder is what commit ACTUALLY writes —

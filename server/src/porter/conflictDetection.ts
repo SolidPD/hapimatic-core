@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readDestination } from "./regularFile";
 
 /**
  * Conflict detection for the Configuration Porter import path (issue #2343,
@@ -10,6 +10,10 @@ import { readFile } from "node:fs/promises";
  *  - D5 — compare by CONTENT HASH, so a byte-identical re-import is a no-op
  *    (`kind: "exists"`) rather than a conflict wall. #2345's dogfood pass re-runs
  *    imports; an idempotent path is what makes that usable.
+ *    A destination that is a FIFO, socket or device has no content to compare
+ *    and is never read (#5759): it is a `"differs"` conflict whose
+ *    `existingHash` is {@link SPECIAL_FILE_HASH}, kept by default (D4; see
+ *    {@link SPECIAL_FILE_HASH} for what overwrite does).
  *  - D4 — the default resolution is SKIP, never overwrite. R3 ("intact unless the
  *    conflict is explicitly resolved") means a differing destination
  *    (`kind: "differs"`) is preserved unless the commit call carries an explicit
@@ -22,23 +26,21 @@ import { readFile } from "node:fs/promises";
  * no-op, different content is a conflict" is decided in exactly one place.
  */
 
-export type ConflictKind = "exists" | "differs";
+import type { Conflict } from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type { Conflict, ConflictKind } from "@hapi/protocol/porter";
 
 /**
- * One detected collision. `destPath` is the absolute destination file path, or
- * `"<file>#<key>"` for a keyed (settings / MCP-server) collision.
- *  - `kind: "exists"`  → destination present AND byte-identical (the content is an
- *    idempotent no-op; the commit may still add the archive's execute bit —
- *    #4129, ./modeReconcile).
- *  - `kind: "differs"` → destination present with DIFFERENT content (a real
- *    conflict; default resolution skip preserves the user's version).
+ * The `existingHash` of a destination that is a FIFO, socket or device (#5759).
+ * It never equals a SHA-256 hex, so the item is a `"differs"` conflict, kept
+ * by default (D4). Overwrite replaces a link to such a node, but a node that is
+ * not a link has no bytes to back up, so the commit refuses it before writing
+ * anything and the whole import fails (commitFs `captureBackup`; runCommit
+ * backs up every destination before its first write). The plan never reads
+ * such a node: opening a FIFO blocks until a writer appears, and a device such
+ * as `/dev/zero` reads without end.
  */
-export interface Conflict {
-  destPath: string;
-  kind: ConflictKind;
-  incomingHash: string;
-  existingHash: string;
-}
+export const SPECIAL_FILE_HASH = "special-file";
 
 /** A file staged for import: its destination path and incoming bytes. */
 export interface StagedFileItem {
@@ -72,14 +74,23 @@ export function classifyConflict(
   };
 }
 
-/** Read a file and return its content hash, or `null` if it does not exist. */
+/**
+ * The content hash of the destination, `null` if it does not exist, or
+ * {@link SPECIAL_FILE_HASH} for a FIFO, socket or device, which is never read
+ * (#5759). It follows links, so a file reached through links is hashed by its
+ * content. A directory still throws EISDIR and a link loop ELOOP, which stop
+ * the plan as before. A link to a directory must not become an overwritable
+ * conflict: if a file item replaced it, an outside `settings.json` link that
+ * resolves through it would read an empty merge base (the path now fails
+ * ENOTDIR) while its `readlink` re-check still passed. #5760's chain hold also
+ * relies on this stop: it holds each hop's last path entry, never a directory
+ * link partway along the path.
+ */
 async function existingFileHash(path: string): Promise<string | null> {
-  try {
-    return hashContent(await readFile(path));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw err;
-  }
+  const r = await readDestination(path);
+  if (r.kind === "absent") return null;
+  if (r.kind === "special") return SPECIAL_FILE_HASH;
+  return hashContent(r.content);
 }
 
 /**

@@ -7,13 +7,15 @@
 // value imports: `@/lib/notificationPreferences` computes its storage keys and
 // cache name from `window.location` at load time, which is wrong (or undefined)
 // in a service worker — the reason `getCacheNameForServiceWorker` exists in
-// `@/lib/storage-keys`. Only a type-only import is allowed here.
+// `@/lib/storage-keys`. Only a type-only import from it is allowed here; the one
+// value import, `@/lib/notificationKindPrefs`, is window-free by construction.
 import type { NotificationPreferences } from "@/lib/notificationPreferences";
+import { preferenceKeyForKind } from "@/lib/notificationKindPrefs";
 
 /** Per-type toggle keys in the preferences snapshot. */
 export type PushTypePreferenceKey = Exclude<
   keyof NotificationPreferences,
-  "mutedSessions" | "globalOptOut"
+  "mutedSessions" | "globalOptOut" | "showPopups"
 >;
 
 /**
@@ -42,7 +44,11 @@ export function getPreferenceKeyForType(
     case "usage-threshold":
       return "usage";
     default:
-      return null;
+      // Issue #4915: a push whose type is a notification kind name reads that
+      // kind's toggle, so one preference governs pop-up and push. No such push
+      // is sent today (`NOTIFICATION_KIND_DEFAULTS[k].pushType` is null for
+      // every non-push kind); this keeps the gate correct if one is added.
+      return type ? preferenceKeyForKind(type) : null;
   }
 }
 

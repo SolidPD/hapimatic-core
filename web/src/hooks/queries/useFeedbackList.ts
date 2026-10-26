@@ -28,7 +28,8 @@ export function useFeedbackList(
   params: { limit: number; offset: number },
   // #2910: the page passes the operator-instance preflight verdict here, so a
   // closed instance never requests rows (hooks cannot be called conditionally).
-  options?: { enabled?: boolean }
+  // #5571: required, so a caller cannot fetch on a closed instance by omission.
+  options: { enabled: boolean }
 ) {
   const query = useQuery<FeedbackListResponse | null>({
     queryKey: queryKeys.feedbackList(params.limit, params.offset),
@@ -39,7 +40,7 @@ export function useFeedbackList(
         offset: params.offset,
       });
     },
-    enabled: (options?.enabled ?? true) && Boolean(api),
+    enabled: options.enabled && Boolean(api),
     retry: false,
     placeholderData: keepPreviousData,
   });

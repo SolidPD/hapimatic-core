@@ -182,6 +182,31 @@ export const VmInventoryResponseSchema = z.union([
 ]);
 export type VmInventoryResponse = z.infer<typeof VmInventoryResponseSchema>;
 
+// ── RP1 hub parity (#3996) ───────────────────────────────────────────────────
+/**
+ * The reserved name of RP1's own parity record: RP1, the declared profile's
+ * verify-only source node, checks itself nightly and Sub F's writer records it
+ * as `<state dir>/rp1.json`. The same default as
+ * `scripts/lib/vm-parity-status-v1.sh` `VM_PARITY_HUB_ID` and the SessionStart
+ * banner's `DEFAULT_HUB_ID`.
+ */
+export const VM_PARITY_HUB_ID = "rp1";
+
+/**
+ * `GET /admin-vms/parity-hub`: RP1's parity summary. Deliberately OUTSIDE
+ * {@link VmInventoryEntrySchema} and the inventory array: RP1 is not a fleet VM
+ * (no `cloud-instances.json` record, no `url`), and an inventory row without a
+ * `url` would fail that `.strict()` schema. `vmParity` is absent when RP1 has
+ * no hub record yet (the hub step is not installed, or has never run).
+ */
+export const VmParityHubSchema = z
+  .object({
+    name: z.string(),
+    vmParity: VmParitySummarySchema.optional(),
+  })
+  .strict();
+export type VmParityHub = z.infer<typeof VmParityHubSchema>;
+
 /** Runtime type guard: is this response a loud verdict rather than a fleet array? */
 export function isVmInventoryVerdict(
   response: VmInventoryResponse
@@ -489,10 +514,14 @@ export type ReconcileRepairRequest = z.infer<
 
 // ── Health-check result (#2472, Sub E) ───────────────────────────────────────
 /**
- * The seven health checks, in canonical render order. Mirrors the check names
- * `infrastructure/cloud-vm/check-cloud-health.sh` emits via `add_check`. There
- * is no "service state" check — the issue text's phrasing predates the script's
- * actual check set (expert review R11).
+ * The health checks, in canonical render order: exactly the names
+ * `infrastructure/cloud-vm/check-cloud-health.sh` emits via `add_check`, in the
+ * order a healthy sweep emits them (not their order in the script's source, where
+ * the helper functions come first). `HealthCard` renders only these names, so a check
+ * missing here never reaches `/admin/vms` (#5525: `hostkey-pin`, `vm-parity`
+ * and `account-mappings` had been emitted but never shown).
+ * `scripts/test-check-cloud-health.sh` (32g) fails when the two lists diverge.
+ * There is no "service state" check (expert review R11).
  */
 export const HEALTH_CHECKS = [
   "reachability",
@@ -501,7 +530,11 @@ export const HEALTH_CHECKS = [
   "binary-version",
   "handoff",
   "gateway-mapping",
+  "hostkey-pin",
   "backup",
+  "backup-markers",
+  "vm-parity",
+  "account-mappings",
 ] as const;
 export type HealthCheckName = (typeof HEALTH_CHECKS)[number];
 

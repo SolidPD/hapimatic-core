@@ -417,9 +417,11 @@ export default function SettingsLandingPage() {
   // the admin-VM preflight (issue #2470 R1, #4906 R6), Feedback on the operator-
   // instance preflight (#2910 — HAPI_OPERATOR_INSTANCE, deliberately not the
   // RP1-only VM capability, so the inbox shows on every operator device). On a
-  // closed instance each preflight route 404s, `data` stays undefined, and the row
-  // is hidden; with both closed the group is hidden — a non-operator instance never
-  // advertises it. Each page gates again as defense-in-depth.
+  // closed instance each preflight route 404s and the row is hidden — the VM
+  // preflight leaves `data` undefined, the feedback preflight caches
+  // `{ enabled: false }` (#5571); a failed check also hides the row, and the next
+  // mount re-runs it. With both closed the group is hidden — a non-operator
+  // instance never advertises it. Each page gates again as defense-in-depth.
   const vmEnabled = useVmPreflight(api).data?.enabled === true;
   const feedbackEnabled = useFeedbackPreflight(api).data?.enabled === true;
 
@@ -428,7 +430,8 @@ export default function SettingsLandingPage() {
   // `HAPI_PORTER_EXPOSED=0` answers 404, so the row appears only when the server
   // answers 200 `{ exposed: true }` (product-map decisions 6 and 47). #4655: the
   // verdict reads the query's status first, so a tab that cached `exposed` hides
-  // the row once a refetch fails.
+  // the row once a refetch answers `porter_withheld`; any other failed refetch
+  // keeps the cached `exposed` (stale-while-error, #5212).
   const porterExposed = isPorterExposed(usePorterStatus(api));
 
   return (

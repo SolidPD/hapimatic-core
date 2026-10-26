@@ -3,6 +3,7 @@ import type { SpawnInput } from "@/hooks/mutations/useSpawnSession";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { ModelMode } from "@hapi/protocol/modes";
 import { DEFAULT_OUTPUT_STYLE_DEFAULT } from "@hapi/protocol/schemas";
+import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import type { EffortLevel } from "@hapi/protocol";
 import type { ExistingBranch } from "@hapi/protocol/gitBranches";
 import type { AgentType, SessionType } from "./types";
@@ -128,6 +129,7 @@ export type SpawnSelections = {
  *  - `launcher` omitted when equal to the resolved global default (#1660)
  *  - `worktreeName` only for `sessionType:"worktree"` and only when non-empty
  *  - `accountUuid` only for a local target with ≥1 stored account (#1496 R7)
+ *  - `apiKeyId` for a local target, or a qualified ref for a remote one (#5127)
  *  - `claimPort` always false for user-driven create (#1262/#1683)
  *
  * The runtime-only `spawnCorrelationId` and the cosmetic `emoji` are intentionally
@@ -138,9 +140,14 @@ export function buildSpawnInput(sel: SpawnSelections): SpawnInput {
   const directory = sel.directory.trim();
   const name = sel.name.trim();
   const branch = sel.worktreeName.trim();
-  // #4568: a key binding is local-only (a node's keys never cross the federation)
-  // and replaces the account binding — exactly one credential per session.
-  const apiKeyId = !isRemote && sel.apiKeyId ? sel.apiKeyId : undefined;
+  // #4568: a key binding replaces the account binding — exactly one credential
+  // per session. #5127: a remote target binds only a QUALIFIED ref (a key shared
+  // from its home node, which the target fetches itself); a bare id names a key
+  // in this node's vault and never binds a remote session.
+  const apiKeyId =
+    sel.apiKeyId && (!isRemote || isQualifiedApiKeyRef(sel.apiKeyId))
+      ? sel.apiKeyId
+      : undefined;
   return {
     machineId: sel.target?.kind === "local" ? sel.target.machineId : undefined,
     nodeId: sel.target?.kind === "remote" ? sel.target.nodeId : undefined,

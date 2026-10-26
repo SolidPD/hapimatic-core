@@ -443,6 +443,8 @@ export function createGitHubRoutes(options?: {
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?dir= or ?repo= (#5212)
+        probe: "skip",
       })
     ),
     async c => {
@@ -685,6 +687,8 @@ export function createGitHubRoutes(options?: {
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?account= (#5212)
+        probe: "skip",
       })
     ),
     async c => {

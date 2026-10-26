@@ -43,7 +43,8 @@
 #   --toolkit-source <git URL>         L1 core-tier source (install mode default:
 #                                      https://github.com/SolidPD/hapimatic-toolkit). `fetch` clones a
 #                                      toolkit only when this flag is passed; --toolkit-dir ignores it.
-#   --toolkit-tag <tag>                toolkit tag to pin (default: v1.0.0)
+#   --toolkit-tag <tag>                toolkit tag to install (default: v1.0.0, pinned to its commit;
+#                                      another tag is not verified)
 #   --toolkit-dir <local tree>         apply L1 from this already-fetched tree (offline; implies L1-only)
 #   --name <binary-name>               installed binary name (default: hapi; provision.sh passes
 #                                      hapimatic-private)
@@ -54,7 +55,7 @@
 #   -h | --help                        this help
 set -uo pipefail
 
-INSTALLER_VERSION="1.4.0"
+INSTALLER_VERSION="1.5.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MODE="install"                         # install | fetch | doctor | uninstall
@@ -65,6 +66,7 @@ TOOLKIT_SOURCE=""                      # empty = not passed (see DEFAULT_TOOLKIT
 DEFAULT_TOOLKIT_SOURCE="https://github.com/SolidPD/hapimatic-toolkit"   # install mode only (#5069): fetch and --toolkit-dir never use it
 TOOLKIT_TAG="v1.0.0"
 TOOLKIT_DIR=""
+TOOLKIT_EXPECTED=""                    # the commit the toolkit tree must be at; "" = no pin (#5074)
 BIN_NAME="hapi"
 PREFIX="$HOME/.local/bin"
 OUT_DIR=""
@@ -216,9 +218,103 @@ install_binary() {
     info "binary version: $newver"
 }
 
+# ── Toolkit commit pin (#5074) ────────────────────────────────────────────────
+# The toolkit's install.sh links its hooks into ~/.claude, so every later Claude Code session runs
+# the code this installer fetches. A tag can be moved by anyone with write access to the toolkit
+# repo, so each publisher tag the installer knows is pinned to the commit it must resolve to, and the
+# fetched tree is checked against that commit before anything uses it. Everything between the
+# TOOLKIT-PIN markers is self-contained (it calls no other installer function and reads no global),
+# so scripts/test-install-hapimatic.sh loads that block alone and exercises it on fixture repos.
+# --- TOOLKIT-PIN-BEGIN (#5074) ---
+# The commit each publisher toolkit tag must resolve to. Moving TOOLKIT_TAG means adding its entry
+# here in the same commit (docs/internal/open-core-release-runbook.md, "Moving the toolkit pin").
+# Keep older entries, so --toolkit-tag <older tag> is still verified.
+toolkit_pinned_commit() {
+    case "$1" in
+        v1.0.0) printf '%s' 31792ce6d6b11dde8f5f54bcf1c6bcfa49347782 ;;
+        *) return 1 ;;
+    esac
+}
+# True when $1 names the publisher's toolkit repository, ignoring case, one trailing "/" and then one
+# trailing ".git". Keep the literal in step with DEFAULT_TOOLKIT_SOURCE (the test suite checks it).
+toolkit_source_is_publisher() {
+    local u
+    u="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    u="${u%/}"
+    u="${u%.git}"
+    [ "$u" = "https://github.com/solidpd/hapimatic-toolkit" ]
+}
+# Resolves <rev> ($2) in the git tree <tree> ($1) to a commit and prints it. The ^{commit} peel is
+# load-bearing: for an annotated tag FETCH_HEAD is the tag object, not the commit. Returns 0 when the
+# commit equals <expected> ($3), 1 when it does not, 2 when <rev> does not resolve.
+toolkit_verify_commit() {
+    local got
+    got="$(git -C "$1" rev-parse --verify -q "$2^{commit}" 2>/dev/null)" || return 2
+    printf '%s' "$got"
+    [ "$got" = "$3" ]
+}
+# --- TOOLKIT-PIN-END (#5074) ---
+
+# Sets TOOLKIT_EXPECTED to the pinned commit for TOOLKIT_SOURCE @ TOOLKIT_TAG, or to "" (with a
+# warning) when there is no pin: a tag the installer does not know, or another source.
+resolve_toolkit_expected() {
+    TOOLKIT_EXPECTED=""
+    if toolkit_source_is_publisher "$TOOLKIT_SOURCE"; then
+        TOOLKIT_EXPECTED="$(toolkit_pinned_commit "$TOOLKIT_TAG")" && return 0
+        TOOLKIT_EXPECTED=""
+        warn "toolkit tag $TOOLKIT_TAG has no pinned commit in installer v$INSTALLER_VERSION — the tree is NOT verified against a pin"
+    else
+        warn "toolkit source $TOOLKIT_SOURCE is not the publisher's — the tree is NOT verified against a pin"
+    fi
+}
+# The dry-run wording for the check resolve_toolkit_expected set up.
+toolkit_check_plan() {
+    if [ -n "$TOOLKIT_EXPECTED" ]; then printf 'verify HEAD = %s' "$TOOLKIT_EXPECTED"; else printf 'NOT verified (no pin)'; fi
+}
+# Stops the install after a failed pin check. $1 = the commit found, $2 = toolkit_verify_commit's
+# return code, $3 = what was left on disk.
+toolkit_pin_die() {
+    if [ "$2" = 2 ]; then
+        die "could not resolve the fetched toolkit commit for $TOOLKIT_SOURCE @ $TOOLKIT_TAG — refusing to install it; $3"
+    fi
+    die "toolkit $TOOLKIT_SOURCE @ $TOOLKIT_TAG resolved to $1, not the pinned $TOOLKIT_EXPECTED — refusing to install it (the tag may have been moved); $3"
+}
+# Stops the install unless <rev> ($2) in the git tree <tree> ($1) resolves to TOOLKIT_EXPECTED; a no-op
+# when there is no pin. $3 = what was left on disk (for the message); $4, when given, is removed first.
+require_toolkit_pin() {
+    local got rc
+    [ -n "$TOOLKIT_EXPECTED" ] || return 0
+    got="$(toolkit_verify_commit "$1" "$2" "$TOOLKIT_EXPECTED")"; rc=$?
+    [ "$rc" = 0 ] && return 0
+    [ -n "${4:-}" ] && rm -rf "$4"
+    toolkit_pin_die "$got" "$rc" "$3"
+}
+# Clones TOOLKIT_SOURCE @ TOOLKIT_TAG beside <dest> ($1) and moves it to <dest> only after the pin
+# check, so a tree that fails the pin never sits at <dest>, not even after an interrupted run. With no
+# pin the clone is moved in unchecked, after resolve_toolkit_expected's warning. $2 = what the failure
+# message says was left on disk. <dest> must not exist: mv would move the clone inside it.
+clone_toolkit_verified() {
+    local dest="$1" parent tmp
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        die "toolkit tree path $dest already exists — refusing to clone over it"
+    fi
+    parent="$(dirname "$dest")"
+    tmp="$(mktemp -d "$parent/.claude-toolkit.partial.XXXXXX")" \
+        || die "could not create a temporary directory in $parent"
+    if ! git -c advice.detachedHead=false clone -q --depth 1 -b "$TOOLKIT_TAG" "$TOOLKIT_SOURCE" "$tmp"; then
+        rm -rf "$tmp"
+        die "toolkit clone failed: $TOOLKIT_SOURCE @ $TOOLKIT_TAG"
+    fi
+    require_toolkit_pin "$tmp" HEAD "$2" "$tmp"
+    mv "$tmp" "$dest" || { rm -rf "$tmp"; die "could not move the cloned toolkit into $dest"; }
+}
+
 # ── L1 toolkit core tier ──────────────────────────────────────────────────────
 # Resolves the toolkit tree (clone from --toolkit-source, or use --toolkit-dir), then runs its
-# install.sh --minimal. The clone target is PERSISTENT so the deployed symlinks never dangle.
+# install.sh --minimal. The clone target is PERSISTENT so the deployed symlinks never dangle. Because
+# ~/.claude links into that tree, a fetched commit is checked against the pin BEFORE it reaches the
+# tree (#5074): a re-run checks FETCH_HEAD before the checkout, and a fresh clone lands beside the
+# tree and is moved in only after the check.
 install_toolkit() {
     local tree
     if [ -n "$TOOLKIT_DIR" ]; then
@@ -227,18 +323,28 @@ install_toolkit() {
     else
         [ -n "$TOOLKIT_SOURCE" ] || die "no toolkit source — pass --toolkit-source <git URL> --toolkit-tag <tag> (install mode defaults to $DEFAULT_TOOLKIT_SOURCE)"
         tree="$HAPI_HOME_DIR/claude-toolkit"
+        resolve_toolkit_expected
         if [ "$DRY_RUN" = 1 ]; then
-            plan "git clone --depth 1 -b $TOOLKIT_TAG $TOOLKIT_SOURCE $tree"
+            plan "git clone --depth 1 -b $TOOLKIT_TAG $TOOLKIT_SOURCE $tree; $(toolkit_check_plan)"
         else
             mkdir -p "$HAPI_HOME_DIR"
             if [ -d "$tree/.git" ]; then
-                ( cd "$tree" && git fetch --depth 1 origin "$TOOLKIT_TAG" >/dev/null 2>&1 \
-                    && git checkout -q FETCH_HEAD ) || warn "could not update existing toolkit tree at $tree; using as-is"
+                if ( cd "$tree" && git fetch --depth 1 origin "$TOOLKIT_TAG" >/dev/null 2>&1 ); then
+                    require_toolkit_pin "$tree" FETCH_HEAD "the files in $tree were left unchanged"
+                    ( cd "$tree" && git -c advice.detachedHead=false checkout -q FETCH_HEAD ) \
+                        || warn "could not check out the fetched toolkit in $tree; using it as-is"
+                else
+                    warn "could not update existing toolkit tree at $tree; using as-is"
+                fi
+                # Second check, on what is checked out now. It also stops a tree an earlier install
+                # left at another commit, for example one cloned from a different source.
+                require_toolkit_pin "$tree" HEAD \
+                    "the tree at $tree (origin $(git -C "$tree" remote get-url origin 2>/dev/null || echo unknown)) was left as it is"
                 ok "toolkit tree already present at $tree (idempotent fetch)"
             else
-                git clone --depth 1 -b "$TOOLKIT_TAG" "$TOOLKIT_SOURCE" "$tree" \
-                    || die "toolkit clone failed: $TOOLKIT_SOURCE @ $TOOLKIT_TAG"
-                ok "cloned toolkit -> $tree"
+                [ ! -e "$tree" ] || die "toolkit tree path $tree exists but is not a git checkout — move it aside and re-run"
+                clone_toolkit_verified "$tree" "the toolkit was not installed (the hapi binary already was)"
+                ok "cloned toolkit -> $tree${TOOLKIT_EXPECTED:+ (commit $TOOLKIT_EXPECTED verified)}"
             fi
         fi
     fi
@@ -877,7 +983,10 @@ cmd_fetch() {
     [ -n "$OUT_DIR" ] || die "fetch requires --out <dir>"
     if [ "$DRY_RUN" = 1 ]; then
         plan "fetch binary ($(resolve_asset)) from $RELEASE_SOURCE into $OUT_DIR"
-        [ -n "$TOOLKIT_SOURCE" ] && plan "clone toolkit $TOOLKIT_SOURCE @ $TOOLKIT_TAG into $OUT_DIR/claude-toolkit"
+        if [ -n "$TOOLKIT_SOURCE" ]; then
+            resolve_toolkit_expected
+            plan "clone toolkit $TOOLKIT_SOURCE @ $TOOLKIT_TAG into $OUT_DIR/claude-toolkit; $(toolkit_check_plan)"
+        fi
         return 0
     fi
     mkdir -p "$OUT_DIR" || die "could not create --out dir $OUT_DIR"
@@ -886,10 +995,12 @@ cmd_fetch() {
     ok "fetched + verified binary -> $OUT_DIR/hapi"
     if [ -n "$TOOLKIT_SOURCE" ]; then
         local tdir="$OUT_DIR/claude-toolkit"
-        rm -rf "$tdir"
-        git clone --depth 1 -b "$TOOLKIT_TAG" "$TOOLKIT_SOURCE" "$tdir" \
-            || die "toolkit clone failed: $TOOLKIT_SOURCE @ $TOOLKIT_TAG"
-        ok "cloned toolkit -> $tdir"
+        resolve_toolkit_expected
+        rm -rf "$tdir" || die "could not remove the old toolkit tree at $tdir — clear it by hand and re-run"
+        # An interrupted run never leaves a tree that failed the pin where a later --toolkit-dir apply
+        # would pick it up.
+        clone_toolkit_verified "$tdir" "nothing was written to $tdir"
+        ok "cloned toolkit -> $tdir${TOOLKIT_EXPECTED:+ (commit $TOOLKIT_EXPECTED verified)}"
     fi
 }
 

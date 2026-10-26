@@ -15,9 +15,11 @@
  * The page-visible lifecycle of a porter token, surfaced by the status endpoint
  * (K4). `waiting` = minted, not yet uploaded; `received` = the source machine
  * uploaded its archive and a plan was staged; `expired` = past the TTL before an
- * upload landed. `received` is terminal-happy: once the upload is consumed a
- * later status read stays `received` even past the token TTL (the staged plan has
- * its own 30-min staging TTL, independent of the token).
+ * upload landed, or the upload leg ran out of failed attempts first (#5228; its
+ * `expiresAt` can then still be in the future). `received` is terminal-happy:
+ * once the upload is consumed a later status read stays `received` even past the
+ * token TTL (the staged plan has its own 30-min staging TTL, independent of the
+ * token).
  */
 export type PorterTokenState = "waiting" | "received" | "expired";
 
@@ -48,11 +50,12 @@ export interface PorterTokenResponse {
  * The plan summary flows to the browser HERE (not over the `curl` channel), so
  * the page reads `plan` from this endpoint to hydrate the import review UI.
  *
- * Generic over the plan-summary payload because that type differs by package:
- * the server responds with `ImportPlanSummary` (server-only,
- * `porter/importArchive.ts`); the web narrows to its field-for-field mirror
- * (`web/src/types/porter.ts`). `shared/` cannot reference either, so the plan
- * payload is a type parameter (defaults to `unknown`).
+ * Generic over the plan-summary payload (defaults to `unknown`). The type
+ * parameter predates #5601, when the plan summary was server-only and the web
+ * kept a hand copy; the summary is now the shared `ImportPlanSummary`
+ * (`./importWire.ts`), which the web passes in (`web/src/types/porter.ts`).
+ * The server builds this response through its own `PorterTokenStatusView`
+ * (`server/src/porter/porterToken.ts`), not through this generic.
  */
 export interface PorterTokenStatus<Plan = unknown> {
   state: PorterTokenState;

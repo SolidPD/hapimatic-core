@@ -38,7 +38,6 @@ import {
   type ExecutableSettingsKey,
   type Omission,
   type PorterManifest,
-  type SettingsScriptNameVerdict,
   type SettingsScriptRef,
 } from "@hapi/protocol/porter";
 import { assertSafeEntry } from "./archiveContainment";
@@ -51,7 +50,16 @@ import {
 import { findEntry } from "./planHooks";
 import type { StagedPlan } from "./planSections";
 import type { TarEntry } from "./tarArchive";
-import type { PlannedFileItem, PlannedItemKind } from "./importArchive";
+import type { PlannedFileItem } from "./importArchive";
+import type {
+  ExecutableScriptReview,
+  ScriptPreview,
+} from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type {
+  ScriptPreview,
+  ExecutableScriptReview,
+} from "@hapi/protocol/porter";
 
 /** The archive-path prefix of a carried script. */
 const PREFIX = `${SETTINGS_SCRIPTS_DIR}/`;
@@ -336,40 +344,6 @@ export function settingsKeyLands(
     conflictKeys.has(key) &&
     !overwrite.has(`${settingsPath}#${key}`)
   );
-}
-
-/** A content preview for the review (D5): inert text, never executed. */
-export interface ScriptPreview {
-  text: string;
-  truncated: boolean;
-  binary: boolean;
-  size: number;
-}
-
-/**
- * One review row per config-root reference an imported executable value makes
- * (R11). `carried`: a planned item of any kind writes `destPath` (a `hook-lib`
- * for a `hooks/` reference included); `on-destination`: nothing writes it but
- * the file exists; `missing`: neither; `not-carried`: the reference cannot be
- * carried (`reason`). `gatedBy` is set for a `settings-script` item: empty when
- * a referencing key lands as it stands, else every `<settings.json>#<key>`
- * whose overwrite would let it land (D4). Values are surfaced deliberately,
- * like the executable values themselves (#2600), and never logged. Since
- * #5178 `planImport` builds the rows after the hold, so a plan's rows are all
- * `carried`; the other statuses describe the pre-hold settings.
- */
-export interface ExecutableScriptReview {
-  key: ExecutableSettingsKey;
-  reference: string;
-  verdict: SettingsScriptNameVerdict;
-  status: "carried" | "on-destination" | "missing" | "not-carried";
-  reason?: string;
-  destPath?: string;
-  kind?: PlannedItemKind;
-  sha256?: string;
-  conflict?: Conflict["kind"];
-  gatedBy?: string[];
-  preview?: ScriptPreview;
 }
 
 function previewOf(content: Buffer): ScriptPreview {

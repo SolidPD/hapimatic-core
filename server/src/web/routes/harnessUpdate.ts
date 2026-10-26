@@ -4,7 +4,7 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
-import type { WebAppEnv } from "../middleware/auth";
+import { createAuthMiddleware, type WebAppEnv } from "../middleware/auth";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { createRateLimiter } from "../middleware/rateLimit";
@@ -17,13 +17,17 @@ import type { UpdateErrorCode } from "../../selfUpdate/updateOrchestrator";
  *   POST /api/harness/:harnessId/update    body { version, node_id? }
  *   POST /api/harness/:harnessId/rollback  body { node_id? }
  *
- * 🔴 The MOUNT POSITION *IS* the auth mechanism (R3/R11): these are PRIVILEGED,
- * host-mutating routes and MUST be mounted AFTER the global JWT gate in
- * `server.ts` (`app.use("/api/*", createAuthMiddleware(...))`), beside
- * `createHarnessRoutes`/`createSystemJobsRoutes` — NEVER in the pre-gate block.
- * A pre-gate mount ships an UNAUTHENTICATED host-mutating route with zero type
- * errors (the v1.0.644 precedent); the composed-app 401 test is the only
- * structural backstop, so it lives in the test file.
+ * 🔴 These are PRIVILEGED, host-mutating routes, so each one authenticates
+ * ITSELF (#3261): the factory applies `createAuthMiddleware` on the two exact
+ * paths (`app.use(path, auth)`, ahead of the `cataloged()` tag — never
+ * `use("*")`, see adminVms.ts), so an unauthenticated request gets 401 wherever
+ * the factory is mounted. The mount AFTER the global JWT gate in
+ * `buildWebApp.ts` (`app.use("/api/*", createAuthMiddleware(...))`), beside
+ * `createHarnessRoutes`, stays as defense-in-depth — keep it there. Before
+ * #3261 a pre-gate mount would have shipped these routes UNAUTHENTICATED with
+ * zero type errors (cf. the v1.0.644 `GET /api/jobs` precedent); the
+ * isolated-mount tests in the test file now prove the routes reject an
+ * unauthenticated request regardless of the mount.
  *
  * The privileged command NEVER reaches the client (R11): the request carries
  * only `{ action, harnessId, version }` and the command is resolved server-side
@@ -70,6 +74,10 @@ const MESSAGE_BY_CODE: Record<UpdateErrorCode, string> = {
 };
 
 export function createHarnessUpdateRoutes(opts: {
+  /** Signs the JWTs these routes verify themselves (#3261). Required, not
+   *  optional: an omitted secret must be a compile error, never a route that
+   *  silently skips its own auth check. */
+  jwtSecret: Uint8Array;
   getUpdateService: () => UpdateService | null;
   getLocalNodeId?: () => string | null;
   /** Accepted upfront for the KD-4 federation seam — v1 returns 501 for a
@@ -81,12 +89,25 @@ export function createHarnessUpdateRoutes(opts: {
   const errorLogger = opts.errorLogger ?? null;
   // A host-mutating slow subprocess warrants a low limit.
   const limiter = createRateLimiter({ name: "harness-update", limit: 5 });
+  const auth = createAuthMiddleware(opts.jwtSecret, errorLogger);
 
   // True when federation is configured AND the request targets a remote node.
   const isRemoteNode = (nodeId: string): boolean => {
     const local = opts.getLocalNodeId?.() ?? null;
     return local !== null && nodeId !== local;
   };
+
+  // Per-route auth (#3261), on the two EXACT paths — mirrors update.ts and
+  // health.ts. The position is load-bearing: Hono runs handlers in registration
+  // order, so these must stay ABOVE the app.post calls to run first, ahead of
+  // the cataloged() tag and the per-namespace limiter. The literals must match
+  // the app.post paths byte for byte (the capability invoker admits an
+  // exact-path ALL entry only on an equal path, capabilityCall.ts
+  // dispatchedMatch). NEVER `use("*")`: mounted at /api it becomes an /api/*
+  // middleware on every later-mounted route (adminVms.ts); `use("/harness/*")`
+  // would likewise catch the later /api/harness/* routes (harnessChangelog).
+  app.use("/harness/:harnessId/update", auth);
+  app.use("/harness/:harnessId/rollback", auth);
 
   app.post(
     "/harness/:harnessId/update",

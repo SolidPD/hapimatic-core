@@ -20,6 +20,10 @@ import {
   messageHooksEnabled,
   runMessageHooks,
 } from "./messageHooks";
+import {
+  promptBlockedNotification,
+  type ProducerNotification,
+} from "../notifications/producerNotifications";
 
 /**
  * Result of {@link MessageService.sendMessage} (#3124). A gate-class message hook
@@ -67,6 +71,11 @@ export interface MessageHookDeps {
   getSessionMetadata: (sessionId: string) => Metadata | undefined;
   /** Optional breadcrumb logger for the manifest-fallback path (KD4). */
   log?: (message: string, context?: Record<string, unknown>) => void;
+  /**
+   * Issue #4914: raise a user notification for a gate denial
+   * (`SyncEngine.notifyUser`, which resolves the namespace from the session).
+   */
+  notifyUser?: (input: ProducerNotification) => void;
 }
 
 export class MessageService {
@@ -218,21 +227,38 @@ export class MessageService {
           // gate IS a UserPromptSubmit-class block. `blockedReason` stays
           // byte-identical (grep-able hookId + reason); the catalogue title +
           // ISO instant ride the new OPTIONAL fields (client formats `at`, R6).
+          const blockedReason =
+            `Message blocked by hook "${stage.denied.hookId}": ${stage.denied.reason}`.slice(
+              0,
+              2000
+            );
+          // TODO(#4912): legacy prompt-blocked SyncEvent, kept for one release
+          // so a pre-#4915 web client still toasts. Remove its SSE/web delivery
+          // once Sub C (#4915) has shipped for a release.
           this.publisher.emit({
             type: "prompt-blocked",
             sessionId,
             data: {
               hookEvent: "UserPromptSubmit",
-              blockedReason:
-                `Message blocked by hook "${stage.denied.hookId}": ${stage.denied.reason}`.slice(
-                  0,
-                  2000
-                ),
+              blockedReason,
               originalPrompt: payload.text.slice(0, 500),
               title: outcome.title,
               at,
             },
           });
+          // #4914: the persisted notification never carries the denied text
+          // (R3/R8 above — the notifications table keeps rows for 48 hours, and
+          // the text can hold a USER-APPROVAL token).
+          this.hookDeps.notifyUser?.(
+            promptBlockedNotification({
+              sessionId,
+              blockedReason,
+              title: outcome.title,
+              hookId: stage.denied.hookId,
+              code: resolveKey,
+              at,
+            })
+          );
           return {
             delivered: false,
             reason: stage.denied.reason,

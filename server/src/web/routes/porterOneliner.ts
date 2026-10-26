@@ -37,8 +37,10 @@ import { cataloged } from "../../capabilities/cataloged";
  *  - {@link createPorterOnelinerPublicRoutes} → mounted at the app ROOT →
  *    public by mount position (`/p/:token` fetch + `/p/:token/archive` upload).
  *    The TOKEN is the auth: base64url + short TTL + fetch ≤ 5 + upload single-use
- *    (reserved synchronously before any `await`, #5170) + a token lookup BEFORE
- *    any body read + a Content-Length 413 pre-check. The
+ *    (reserved synchronously before any `await`, #5170, at most 5 failed
+ *    attempts, #5228) + a token lookup BEFORE any body read + a Content-Length
+ *    413 pre-check + a multipart-only gate (415) + a counted body stream that
+ *    stops a chunked upload at the size cap (#5228). The
  *    JWT middleware is `/api/*`-scoped (`server.ts` `app.use("/api/*", …)`), so
  *    these routes never enter it — precedent `/ext-assets` (`server.ts:1147`).
  *
@@ -386,6 +388,7 @@ export function createPorterOnelinerPublicRoutes(opts: {
             409
           );
         }
+        // expired, consumed, or exhausted (too many failed attempts, #5228)
         return c.json({ error: "Upload link expired or already used" }, 410);
       }
       const { entry, reservation } = claim;
@@ -408,10 +411,30 @@ export function createPorterOnelinerPublicRoutes(opts: {
           return c.json({ error: publicUploadErrorMessage(413) }, 413);
         }
 
+        // #5228: only a multipart `file` field is ever read, and parseBody()
+        // would otherwise buffer and parse a urlencoded body before the 400.
+        const contentType = c.req.header("content-type") ?? "";
+        if (!/^multipart\/form-data\s*;/i.test(contentType)) {
+          return c.json(
+            {
+              error: "Upload must be multipart/form-data with a 'file' field",
+            },
+            415
+          );
+        }
+
+        // #5228: a chunked body has no Content-Length, so the pre-check above
+        // never sees it. Count the bytes as parseBody() reads them instead.
+        const limited = limitRequestBody(c.req.raw, MAX_ARCHIVE_BYTES);
+        c.req.raw = limited.request;
+
         let body: Awaited<ReturnType<typeof c.req.parseBody>>;
         try {
           body = await c.req.parseBody();
         } catch {
+          if (limited.overLimit()) {
+            return c.json({ error: publicUploadErrorMessage(413) }, 413);
+          }
           return c.json({ error: "Malformed multipart body" }, 400);
         }
         const file = body["file"];
@@ -502,12 +525,56 @@ export function createPorterOnelinerPublicRoutes(opts: {
 }
 
 /**
+ * Wrap a request body so reading it fails past `maxBytes` (#5228). The stream
+ * pulls one chunk per read, so no more than `maxBytes` plus one chunk is ever
+ * buffered, and the source is cancelled at the limit. Hono's `bodyLimit`
+ * middleware is not used: it runs before the handler's token lookup, and its
+ * `start()` loop reads ahead without backpressure.
+ */
+function limitRequestBody(
+  raw: Request,
+  maxBytes: number
+): { request: Request; overLimit: () => boolean } {
+  let over = false;
+  if (!raw.body) return { request: raw, overLimit: () => over };
+  const source = raw.body.getReader();
+  let received = 0;
+  const limited = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const { done, value } = await source.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      received += value.byteLength;
+      if (received > maxBytes) {
+        over = true;
+        await source.cancel();
+        controller.error(new Error("request body over limit"));
+        return;
+      }
+      controller.enqueue(value);
+    },
+    cancel(reason) {
+      return source.cancel(reason);
+    },
+  });
+  return {
+    request: new Request(raw, {
+      body: limited,
+      duplex: "half",
+    } as RequestInit),
+    overLimit: () => over,
+  };
+}
+
+/**
  * The body text for a failed public upload (#5170 R7): a fixed message per
  * status, never the error's own message. Import errors carry absolute paths —
  * `SameFilesystemError` names the data dir and destination, `PathEscapeError`
  * and its subclasses the destination root, untyped fs errors the staging dir,
  * and `SecretDecryptionError` wraps inner text verbatim. No built-in client
- * shows this body (bash `curl -fsS -o /dev/null`; PowerShell
+ * shows this body (bash `curl -sS -o /dev/null`; PowerShell
  * `EnsureSuccessStatusCode`): both send the user to the Configuration page
  * upload, whose JWT-gated plan route returns the full detail.
  */

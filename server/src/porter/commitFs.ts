@@ -6,7 +6,8 @@
  * the R6 rollback restore, their record/DI-seam types, `importFileMode` (whose
  * result the commit loop passes to `atomicWriteFile`), and `settingsWriteMode`
  * (the settings.json merge write's mode, #4130; `writeMergedSettings` uses it
- * for a regular file or an outside-root link, #4281). `importArchive.ts`
+ * for a regular file, an in-root link's target, or an outside-root link,
+ * #4281). `importArchive.ts`
  * newly exports `RestoreFileOps` (module-private before the split) so the type
  * of the `CommitImportOptions.restoreFileOps` seam is nameable from there.
  *
@@ -30,13 +31,14 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   SymlinkedSettingsError,
   type SymlinkedSettingsReason,
 } from "./importArchiveErrors";
-import type { SettingsLinkState } from "@hapi/protocol/porter";
+import { readDestination } from "./regularFile";
+import type { Omission, SettingsLinkState } from "@hapi/protocol/porter";
 
 /**
  * The fs ops {@link restoreBackups} uses to undo a partial commit — a test-only
@@ -50,6 +52,32 @@ export interface RestoreFileOps {
   readlink?: typeof readlink;
   symlink?: typeof symlink;
   unlink?: typeof unlink;
+}
+
+/**
+ * #3022 (F2): one path the R6 rollback could not restore, and why. Returned by
+ * {@link restoreBackups} and `restoreModes` (./modeReconcile), so `runCommit`'s
+ * PARTIAL message names the cause of each failure, not only the path.
+ */
+export interface RestoreFailure {
+  path: string;
+  cause: string;
+}
+
+/**
+ * #3022 (F2): the cause text for a restore failure — the errno code and the
+ * syscall ("ENOSPC on copyfile"), which tells EACCES, ENOSPC and a missing
+ * backup apart. Not the fs message: it repeats the destination and adds the
+ * backup path, whose staging handle stays committable after a rolled-back
+ * commit, to the HTTP body and Sentry. A code-less error is an internal one
+ * (the test seam), so its message is used.
+ */
+export function restoreCause(err: unknown): string {
+  const e = err as NodeJS.ErrnoException | null;
+  if (e && typeof e.code === "string") {
+    return e.syscall ? `${e.code} on ${e.syscall}` : e.code;
+  }
+  return err instanceof Error ? err.message : "unknown error";
 }
 
 export interface BackupRecord {
@@ -89,6 +117,17 @@ export async function isRegularFile(p: string): Promise<boolean> {
  * one to delete. A link records its `readlink` string, plus its target's bytes
  * when the target is a regular file (so a write-through can be undone). Any
  * other `lstat` failure is recorded as absent, as `existsSync` reported it.
+ *
+ * #5759: the backup never reads a FIFO, socket or device (the old `copyFile`
+ * on a FIFO blocked under the import lock until a writer appeared). Bytes are
+ * read through {@link readDestination}'s one checked descriptor and written
+ * with the source's permission bits, as `copyFile` gave them, so the rollback's
+ * `copyFile(backup → orig)` restores the mode as before. A link to a special
+ * file is recorded as a link with no bytes, like any non-regular target. A
+ * special file that is not a link is refused before any destination is
+ * written: it has no bytes to back up, and the rollback could not recreate it.
+ * The refusal's advice fits every caller: this also runs for `settings.json`,
+ * `~/.claude.json` and account configs, which have no conflict to keep.
  */
 export async function captureBackup(
   origPath: string,
@@ -105,11 +144,39 @@ export async function captureBackup(
   rec.existed = true;
   if (st.isSymbolicLink()) {
     rec.link = { target: await readlink(origPath) };
-    if (await isRegularFile(origPath)) await copyFile(origPath, backupPath);
-  } else {
-    await copyFile(origPath, backupPath);
+    if (await isRegularFile(origPath)) {
+      const r = await readDestination(origPath);
+      if (r.kind === "file") await writeBackupCopy(backupPath, r);
+    }
+    return rec;
   }
+  const r = await readDestination(origPath, { nofollow: true });
+  if (r.kind === "special") {
+    throw new Error(
+      `${origPath} is ${r.what}, not a regular file, so the import cannot ` +
+        `back it up and does not replace it. Remove it or replace it with a ` +
+        `regular file, then import again (for an archive file, keeping its ` +
+        `conflict instead of choosing Overwrite also works).`
+    );
+  }
+  if (r.kind === "absent") {
+    throw new Error(`${origPath} changed during the import`);
+  }
+  await writeBackupCopy(backupPath, r);
   return rec;
+}
+
+/**
+ * #5759: write a backup copy with the source's permission bits, as `copyFile`
+ * does (Bun gives the new file the source's mode, setuid included). Created
+ * owner-only first, so the bytes are never readable at the umask default.
+ */
+async function writeBackupCopy(
+  backupPath: string,
+  r: { content: Buffer; mode: number }
+): Promise<void> {
+  await writeFile(backupPath, r.content, { mode: 0o600 });
+  await chmod(backupPath, r.mode);
 }
 
 /** #4146: record whether the commit wrote each of `paths` (see {@link BackupRecord.touched}). */
@@ -214,6 +281,142 @@ export async function checkSettingsLink(
   return link;
 }
 
+/** Per check-time state: true when the check saw no regular file behind the link. */
+const LINK_HAS_NO_SETTINGS_FILE: Record<SettingsLinkState, boolean> = {
+  inside: false,
+  outside: false,
+  dangling: true,
+  loop: true,
+  "not-regular": true,
+};
+
+/**
+ * #4281 (O1 = B), #5534: whether a `settings.json` link did not resolve to a
+ * regular file (dangling, looping or not-regular) when {@link checkSettingsLink}
+ * classified it. Such a link had no settings to keep, so the merge starts from an
+ * empty base (`runCommit`) and the replacement commits at 0o600
+ * ({@link writeMergedSettings}). The check-time state decides the empty base
+ * and the 0o600 mode, not where the link resolves at write time: a file item
+ * of the same import can create a dangling link's target, replace a link in
+ * the chain that points at a device such as `/dev/null`, or replace a link
+ * partway along a chain of more than 40 links, which `realpath` reports as a
+ * loop while the file item's own path still resolves. False when there is no
+ * link, so a regular `settings.json` keeps its keys. #5759: write-time
+ * resolution decides one thing, a refusal. If the link now reaches a regular
+ * file the import did not write (the file was created, or a later link in the
+ * chain re-pointed, after the check), the write refuses rather than drop that
+ * file's keys; a re-pointed `settings.json` link itself fails the `readlink`
+ * re-check first.
+ */
+export function isLinkWithoutSettingsFile(
+  link: SettingsLink | undefined
+): boolean {
+  return link !== undefined && LINK_HAS_NO_SETTINGS_FILE[link.state];
+}
+
+/**
+ * The directory entry a write to `path` replaces: the real parent directory
+ * plus the last name. `atomicWriteFile` renames into `dirname(path)`, which
+ * follows directory links, so two spellings of one file give the same key.
+ * `null` when the parent does not resolve.
+ */
+export async function direntKey(path: string): Promise<string | null> {
+  try {
+    return join(await realpath(dirname(path)), basename(path));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #5760: the directory entries `settings.json` resolves through when
+ * {@link checkSettingsLink} saw an `inside` or `outside` link: each link in
+ * the chain and the regular file it ends at, as {@link direntKey} keys. A file
+ * item written at one of them would replace the settings the merge reads, so
+ * `runCommit` holds it. Empty for no link, and for a dangling, looping or
+ * not-regular link, whose merge already starts from an empty base (#5534). A
+ * file item cannot target a link to a directory: the plan's conflict read
+ * stops on EISDIR. A walk that fails partway keeps what it collected.
+ */
+export async function settingsResolutionEntries(
+  settingsPath: string,
+  link: SettingsLink | undefined
+): Promise<Set<string>> {
+  const keys = new Set<string>();
+  if (link?.state !== "inside" && link?.state !== "outside") return keys;
+  // The file the chain ends at, as the kernel resolves it: held even if the
+  // walk below stops early.
+  const real = await realpath(settingsPath).catch(() => null);
+  if (real !== null) keys.add(real);
+  let cur = settingsPath;
+  // realpath succeeded at the check, so the chain is at most 40 links long.
+  for (let hop = 0; hop <= 40; hop++) {
+    const key = await direntKey(cur);
+    if (key === null) break;
+    keys.add(key);
+    try {
+      if (!(await lstat(cur)).isSymbolicLink()) break;
+      // A relative target is resolved from the real directory holding the
+      // link, so join it to that directory as text and let the next
+      // direntKey resolve it: path.resolve would collapse a ".." before
+      // following a directory link, and the kernel does not (#5760 R1).
+      const target = await readlink(cur);
+      cur = isAbsolute(target) ? target : `${dirname(key)}${sep}${target}`;
+    } catch {
+      break;
+    }
+  }
+  return keys;
+}
+
+/** #5760: the result notice for a file item held by {@link onSettingsResolution}. */
+export function settingsResolutionNotice(
+  root: string,
+  destPath: string
+): Omission {
+  return {
+    surface: `file ${relative(root, destPath)}`,
+    reason:
+      "not imported: settings.json resolves through this path, so writing it " +
+      "would have replaced your settings; your settings were kept as the merge base",
+  };
+}
+
+/** #5760: the `destPaths` whose directory entry is on that chain (see above). */
+export async function onSettingsResolution(
+  settingsPath: string,
+  link: SettingsLink | undefined,
+  destPaths: readonly string[]
+): Promise<Set<string>> {
+  const held = new Set<string>();
+  const chain = await settingsResolutionEntries(settingsPath, link);
+  if (chain.size === 0) return held;
+  for (const p of destPaths) {
+    const key = await direntKey(p);
+    if (key !== null && chain.has(key)) held.add(p);
+  }
+  return held;
+}
+
+/**
+ * #5759: whether `settingsPath` resolves (following links) to a regular file
+ * that is none of `writtenPaths`, compared by device and inode so any spelling
+ * of the same file matches. False when it does not resolve or is not a regular
+ * file: there are no settings to lose.
+ */
+async function reachesUnwrittenFile(
+  settingsPath: string,
+  writtenPaths: readonly string[]
+): Promise<boolean> {
+  const st = await stat(settingsPath).catch(() => null);
+  if (!st?.isFile()) return false;
+  for (const p of writtenPaths) {
+    const w = await stat(p).catch(() => null);
+    if (w && w.dev === st.dev && w.ino === st.ino) return false;
+  }
+  return true;
+}
+
 /**
  * The settings merge's write (#4146). It first re-classifies the path. If a link
  * was added, removed or re-pointed since {@link checkSettingsLink} ran, it
@@ -222,7 +425,9 @@ export async function checkSettingsLink(
  * target's own directory, leaving the link untouched. `record` is then marked
  * `writtenThrough` (K7). Anything else is written at `settingsPath` as before
  * (an acknowledged link is replaced), with `record` marked `touched` first.
- * `write` is a test-only seam.
+ * #5759: a link the check saw with no settings file behind it is refused if it
+ * now reaches a regular file that is none of `writtenPaths` (the file items
+ * this import wrote). `write` is a test-only seam.
  */
 export async function writeMergedSettings(
   root: string,
@@ -230,16 +435,20 @@ export async function writeMergedSettings(
   content: Buffer,
   expected: SettingsLink | undefined,
   record: BackupRecord | undefined,
+  writtenPaths: readonly string[],
   write: typeof atomicWriteFile = atomicWriteFile
 ): Promise<void> {
   // Compare against what the check saw (and the operator acknowledged):
   //  - no link then → still none;
   //  - an in-root link → still resolving to the same file (the write target);
   //  - an acknowledged link → still that link (same `readlink`). Where it
-  //    resolves now does not matter, because it is replaced, never written
-  //    through. So a dangling link whose target the commit just created (a file
-  //    item) is still replaced as acknowledged — and at 0o600, because its mode
-  //    comes from the check-time state below, not from that created file (#4281).
+  //    resolves now does not matter to this comparison, because it is
+  //    replaced, never written through (only the #5759 guard below looks at
+  //    where it resolves now). So a dangling link whose target the commit just
+  //    created (a file item), or a looping chain a file item shortened, is
+  //    still replaced as acknowledged — and at 0o600, because its mode comes
+  //    from the check-time state below, not from the file it now reaches
+  //    (#4281, #5534).
   const now = await classifySettingsLink(root, settingsPath);
   const unchanged = !expected
     ? now === undefined
@@ -250,6 +459,21 @@ export async function writeMergedSettings(
     throw new Error(
       `${settingsPath} changed during the import (a symlink was added, ` +
         `removed or re-pointed), so it was not written`
+    );
+  }
+  // #5759: the check saw no settings file behind the link, so the merge started
+  // from an empty base. If the link now reaches a regular file that this import
+  // did not write, something created that file or re-pointed a later link in
+  // the chain after the check (for example another writer's delete-then-write
+  // save), and replacing the link would drop that file's keys. A file a file
+  // item of this import wrote (#5534) is still replaced as acknowledged.
+  if (
+    isLinkWithoutSettingsFile(expected) &&
+    (await reachesUnwrittenFile(settingsPath, writtenPaths))
+  ) {
+    throw new Error(
+      `${settingsPath} changed during the import (its link now reaches a ` +
+        `settings file this import did not write), so it was not written`
     );
   }
   if (expected?.state === "inside" && expected.realTarget) {
@@ -268,12 +492,13 @@ export async function writeMergedSettings(
     return;
   }
   if (record) record.touched = true;
-  // #4281 (O1 = B): a link that was dangling, looping or not a regular file when
-  // checked commits at 0o600; only an outside-root regular target keeps its mode.
-  const mode =
-    expected && expected.state !== "outside"
-      ? SETTINGS_CREATE_MODE
-      : await settingsWriteMode(settingsPath);
+  // #4281 (O1 = B), #5534: a link that was dangling, looping or not a regular file
+  // when checked commits at 0o600; an outside-root regular target keeps its mode.
+  // An `inside` link never gets here: it is written through above, or (without
+  // `realTarget`) the re-check throws first.
+  const mode = isLinkWithoutSettingsFile(expected)
+    ? SETTINGS_CREATE_MODE
+    : await settingsWriteMode(settingsPath);
   await write(settingsPath, content, mode);
 }
 
@@ -315,11 +540,13 @@ const SETTINGS_CREATE_MODE = 0o600;
  *    has no settings-file mode to keep, and a directory's 0o755 would commit
  *    the file group/other-readable and executable.
  *
- * `writeMergedSettings` calls this only for a `settings.json` with no link, or
- * one linked to a regular file outside the root when checked. A link that was
- * dangling, looping or not a regular file when checked is committed at 0o600
- * without calling this, whatever it resolves to at write time, since a file
- * item of the same import may have created its target (#4281).
+ * `writeMergedSettings` calls this for a `settings.json` with no link, for the
+ * file an in-root link points at (the write-through), and for a link to a
+ * regular file outside the root when checked. A link that did not resolve to a
+ * regular file when checked ({@link isLinkWithoutSettingsFile}) is committed at
+ * 0o600 without calling this, whatever it resolves to at write time, since a
+ * file item of the same import may have created its target or replaced a link
+ * in its chain (#4281, #5534).
  */
 export async function settingsWriteMode(settingsPath: string): Promise<number> {
   try {
@@ -337,7 +564,8 @@ export async function settingsWriteMode(settingsPath: string): Promise<number> {
  * `mode` no chmod runs and the umask default applies — every commit write passes
  * one: file items `importFileMode`, the settings.json merge the mode
  * `writeMergedSettings` chooses (`settingsWriteMode`, or 0o600 for an
- * acknowledged link that was not a regular file when checked; #4130, #4281). With `mode`, the tmp file is also CREATED owner-only (0o600) before
+ * acknowledged link that did not resolve to a regular file when checked; #4130,
+ * #4281, #5534). With `mode`, the tmp file is also CREATED owner-only (0o600) before
  * that chmod (#4130), so secret-bearing content (settings.json `env` tokens,
  * `apiKeyHelper`) is never briefly group/other-readable at the umask default —
  * the same create-owner-only convention as mcpImport's tmp write.
@@ -363,9 +591,9 @@ export async function atomicWriteFile(
 
 /**
  * Restore destinations from a backup set (R6 rollback). Returns the paths that
- * FAILED to restore (#2563) — empty on a clean rollback. Restore is reverse,
- * best-effort continue; failures are COLLECTED so the caller reports an honest
- * PARTIAL rollback. `ops` is a test-only DI seam.
+ * FAILED to restore (#2563), each with its cause (#3022) — empty on a clean
+ * rollback. Restore is reverse, best-effort continue; failures are COLLECTED so
+ * the caller reports an honest PARTIAL rollback. `ops` is a test-only DI seam.
  *
  * #4146: a path the commit never wrote (`touched: false`, not `writtenThrough`)
  * is skipped — rewriting it would copy through an intact link, possibly to a
@@ -375,38 +603,50 @@ export async function atomicWriteFile(
 export async function restoreBackups(
   backups: BackupRecord[],
   ops: RestoreFileOps = { copyFile, rm }
-): Promise<string[]> {
+): Promise<RestoreFailure[]> {
   // Restore in LIFO order. Only files are restored or removed — parent
   // directories the commit created (atomicWriteFile's mkdir -p) are left in place.
-  const failed: string[] = [];
+  const failed: RestoreFailure[] = [];
   for (const b of [...backups].reverse()) {
     if (b.touched === false && !b.writtenThrough) continue;
     try {
       if (b.link) {
-        if (!(await restoreLink(b, b.link.target, ops)))
-          failed.push(b.origPath);
+        const refused = await restoreLink(b, b.link.target, ops);
+        if (refused !== null) failed.push({ path: b.origPath, cause: refused });
       } else if (b.existed) {
         await ops.copyFile(b.backupPath, b.origPath);
       } else if (existsSync(b.origPath)) {
         await ops.rm(b.origPath, { force: true });
       }
-    } catch {
+    } catch (err) {
       // Best-effort restore — continue restoring the rest, but RECORD the failed
-      // destination so the caller reports a PARTIAL rollback (#2563, R1/R4).
-      failed.push(b.origPath);
+      // destination and its cause so the caller reports a PARTIAL rollback
+      // (#2563, R1/R4; #3022).
+      failed.push({ path: b.origPath, cause: restoreCause(err) });
     }
   }
   return failed;
 }
 
 /**
- * Put a symlink record back (#4146). Returns `false` when it cannot be restored
- * honestly (the caller reports the path as a PARTIAL rollback).
+ * #3022 (F2): why {@link restoreLink} left a link as found. Fixed text — never
+ * the `readlink` target.
+ */
+export const LINK_NOW_RESOLVES_ELSEWHERE =
+  "not restored: the link no longer resolves to the file the import wrote";
+export const LINK_CHANGED_AFTER_IMPORT =
+  "not restored: the link at this path changed after the import, so it was left as found";
+
+/**
+ * Put a symlink record back (#4146). Returns `null` when restored (or nothing
+ * to undo), or the reason it cannot be restored honestly (the caller reports
+ * the path as a PARTIAL rollback with that reason, #3022).
  *
  *  - The path is still the same link. Not written through: nothing to undo.
  *    Written through: restore the bytes + mode of the file it wrote
  *    (`copyFile` carries the backup's mode), but only if the link still
- *    resolves to that file; if it now resolves elsewhere, report the path.
+ *    resolves to that file; if it no longer resolves there (re-pointed or
+ *    dangling), report the path.
  *  - The commit replaced the link (`touched`): remove what it wrote and re-create
  *    the link. The backup is NEVER copied through the re-created link — the
  *    target (possibly outside the root) was never written by the commit.
@@ -419,23 +659,27 @@ async function restoreLink(
   b: BackupRecord,
   target: string,
   ops: RestoreFileOps
-): Promise<boolean> {
+): Promise<
+  typeof LINK_NOW_RESOLVES_ELSEWHERE | typeof LINK_CHANGED_AFTER_IMPORT | null
+> {
   const cur = await (ops.lstat ?? lstat)(b.origPath).catch(() => null);
   const sameLink =
     cur?.isSymbolicLink() &&
     (await (ops.readlink ?? readlink)(b.origPath)) === target;
   if (sameLink) {
-    if (!b.writtenThrough) return true;
+    if (!b.writtenThrough) return null;
     // Undo the write-through at the file it wrote, and only if the link still
     // resolves there: the same `readlink` text can resolve elsewhere once an
     // intermediate directory is re-pointed, and the copy must not follow it.
     const real = await realpath(b.origPath).catch(() => null);
-    if (!b.link?.realTarget || real !== b.link.realTarget) return false;
+    if (!b.link?.realTarget || real !== b.link.realTarget)
+      return LINK_NOW_RESOLVES_ELSEWHERE;
     await ops.copyFile(b.backupPath, real);
-    return true;
+    return null;
   }
-  if (b.touched === false || cur?.isSymbolicLink()) return false;
+  if (b.touched === false || cur?.isSymbolicLink())
+    return LINK_CHANGED_AFTER_IMPORT;
   if (cur) await (ops.unlink ?? unlink)(b.origPath);
   await (ops.symlink ?? symlink)(target, b.origPath);
-  return true;
+  return null;
 }

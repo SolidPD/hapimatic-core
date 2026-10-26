@@ -40,9 +40,10 @@ function psq(s: string): string {
  *
  * Caller contract: `$HOME_DIR`, `$STAGING`, `$ON_WINDOWS` and `$SETTINGS` (the
  * Step 7 ordered dictionary) are set; `recordOmission`, `propOrNull`,
- * `isCredentialName`, `hasCredentialPart` and `physicalPath` are defined. The
- * lines set `$SETTINGS_SCRIPTS` (the manifest's `settingsScripts`) and
- * normalize the two executable values in `$SETTINGS` in place (D3).
+ * `isCredentialName`, `hasCredentialPart`, `physicalPath` and `walkLink` (the
+ * exporter's Step 3 link walk, which these lines share since #4928) are
+ * defined. The lines set `$SETTINGS_SCRIPTS` (the manifest's `settingsScripts`)
+ * and normalize the two executable values in `$SETTINGS` in place (D3).
  *
  * D3 needles: on Linux-pwsh only `$HOME_DIR/.claude/`, replaced as an ordinal,
  * case-sensitive literal (as bash's jq split/join). On Windows also
@@ -148,29 +149,19 @@ export function settingsScriptPowerShellLines(): string[] {
     "        }",
     "        # Two keys naming one file carry it once; a failure is reported per key.",
     "        if ($ssCarried.Contains($ssRel)) { continue }",
-    "        # The #4154 link walk (the include rule's recipe): only a SymbolicLink",
-    "        # counts, at most 40 hops, fail closed on an unusable target, and where",
-    "        # / is the separator a backslash in a target is a filename character.",
+    "        # The exporter's one link walk (walkLink, the CLAUDE.md and include walk;",
+    "        # #4928): only a SymbolicLink counts, at most 40 hops, fail closed on an",
+    "        # unusable target (status 1), and where / is the separator a backslash",
+    "        # in a target is a filename character (status 2). Off Windows a '..' in",
+    "        # a target, relative or absolute, is taken after the link before it, as",
+    "        # the kernel and bash read it, so the checks below read the file the",
+    "        # copy takes; on Windows it is still read as text (#4332).",
     "        $ssRef0 = Join-Path (Join-Path $HOME_DIR '.claude') $ssRel",
-    "        $ssSrc = $ssRef0",
-    "        $ssHops = 0",
-    "        $ssBroken = $false",
-    "        $ssBslash = $false",
-    "        while ($true) {",
-    "          $it = Get-Item -LiteralPath $ssSrc -Force -ErrorAction SilentlyContinue",
-    "          if ($null -eq $it) { if (Test-Path -LiteralPath $ssSrc) { $ssBroken = $true }; break }",
-    "          if ($it.LinkType -ne 'SymbolicLink') { break }",
-    "          if ($ssHops -ge 40) { $ssBroken = $true; break }",
-    "          $tg = @($it.Target)",
-    "          if ($tg.Count -eq 0 -or -not $tg[0]) { $ssBroken = $true; break }",
-    "          $ilt = [string]$tg[0]",
-    "          $tn = $ilt.Replace([IO.Path]::DirectorySeparatorChar, '/')",
-    "          if ($tn -eq '.' -or $tn -eq '..' -or $tn.EndsWith('/') -or $tn.EndsWith('/.') -or $tn.EndsWith('/..')) { $ssBroken = $true; break }",
-    "          if ([IO.Path]::DirectorySeparatorChar -eq '/' -and $ilt.Contains('\\')) { $ssBslash = $true; break }",
-    "          if (-not [IO.Path]::IsPathRooted($ilt)) { $ilt = Join-Path (Split-Path -Parent $ssSrc) $ilt }",
-    "          $ssSrc = $ilt",
-    "          $ssHops = $ssHops + 1",
-    "        }",
+    "        $ssW = walkLink $ssRef0",
+    "        $ssSrc = $ssW.Path",
+    "        $ssHops = $ssW.Hops",
+    "        $ssBroken = ($ssW.Status -eq 1)",
+    "        $ssBslash = ($ssW.Status -eq 2)",
     `        if ($ssBslash) { ${omit(r.linkTargetNotScript)}; continue }`,
     "        # PM ruling B1 (#4172's rule): a link chain with a credential-bearing part in",
     "        # a link's name or target text, or in its physical path, is refused; one",
@@ -184,8 +175,10 @@ export function settingsScriptPowerShellLines(): string[] {
     `          if ($ssProc) { ${omit(r.linkUnchecked)}; continue }`,
     "        }",
     `        if ($ssBroken) { ${omit(r.notRegularFile)}; continue }`,
-    `        if (-not (Test-Path -LiteralPath $ssSrc)) { ${omit(r.notFound)}; continue }`,
-    `        if (-not (Test-Path -LiteralPath $ssSrc -PathType Leaf)) { ${omit(r.notRegularFile)}; continue }`,
+    "        # #4928: a script in a folder the user cannot search does not exist here,",
+    "        # as bash's -e reads it, never an Access-denied stop.",
+    `        if (-not (Test-Path -LiteralPath $ssSrc -ErrorAction SilentlyContinue)) { ${omit(r.notFound)}; continue }`,
+    `        if (-not (Test-Path -LiteralPath $ssSrc -PathType Leaf -ErrorAction SilentlyContinue)) { ${omit(r.notRegularFile)}; continue }`,
     "        if ($ssHops -gt 0) {",
     `          if (-not [regex]::IsMatch((Split-Path -Leaf $ssSrc), $ssNamePat)) { ${omit(r.linkTargetNotScript)}; continue }`,
     "          # A linked script whose physical path could not be read is not carried.",

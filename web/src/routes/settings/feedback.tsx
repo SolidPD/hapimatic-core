@@ -161,10 +161,19 @@ export default function AdminFeedbackPage() {
   const [offset, setOffset] = useState(0);
   const [openKeys, setOpenKeys] = useState<Set<string>>(new Set());
 
-  // #2910: fail-closed — loading, error, and 404 all keep the gate closed, and
-  // the list query never fires until the gate is open.
+  // #2910: fail-closed — the list query never fires until the gate is open.
+  // #5571: the gate has three non-open states — still checking, closed (the
+  // instance answered 404), and a failed check (network / 5xx), which offers a
+  // retry instead of claiming the inbox is unavailable.
   const preflight = useFeedbackPreflight(api);
   const enabled = preflight.data?.enabled === true;
+  const gate: "open" | "closed" | "failed" | "checking" = preflight.data
+    ? preflight.data.enabled
+      ? "open"
+      : "closed"
+    : preflight.isError
+      ? "failed"
+      : "checking";
 
   const { items, total, isLoading, isError } = useFeedbackList(
     api,
@@ -197,8 +206,34 @@ export default function AdminFeedbackPage() {
 
       <div className="mx-auto min-h-0 w-full max-w-content flex-1 px-4 pb-4">
         {/* #2910: the gate is checked FIRST — a disabled list query reports
-            isLoading=false, so a closed instance must never fall through. */}
-        {!enabled ? (
+            isLoading=false, so a non-open gate must never fall through. */}
+        {gate === "checking" ? (
+          <p
+            data-testid="feedback-checking"
+            className="py-8 text-center text-[length:var(--text-body)] text-[var(--app-hint)]"
+          >
+            Checking…
+          </p>
+        ) : gate === "failed" ? (
+          <div
+            data-testid="feedback-check-failed"
+            className="flex flex-col items-center gap-3 py-8 text-center text-[length:var(--text-body)] text-[var(--app-hint)]"
+          >
+            <p>
+              Couldn&apos;t check whether the feedback inbox is available here.
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              data-testid="feedback-check-retry"
+              onClick={() => void preflight.refetch()}
+              disabled={preflight.isFetching}
+              className="h-auto rounded-md px-3 py-1 text-[length:var(--text-body)] text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] disabled:opacity-40"
+            >
+              Retry
+            </Button>
+          </div>
+        ) : gate === "closed" ? (
           <p
             data-testid="feedback-disabled"
             className="py-8 text-center text-[length:var(--text-body)] text-[var(--app-hint)]"

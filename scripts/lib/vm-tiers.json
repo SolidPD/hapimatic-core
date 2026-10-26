@@ -1,6 +1,7 @@
 {
   "$comment": "VM tier menu — SINGLE SOURCE OF TRUTH for the shorthand VM sizes (operator spec, 2026-07-31). Consumed by resolve_vm_tier() in scripts/lib/provision-helpers.sh (bash/jq, drives --tier in oci-create-vm.sh + provision.sh) and by the #2467 Admin → VMs panel tier selector, which should display est_monthly_usd next to each tier at provisioning time. est_monthly_usd is a BALLPARK: raw PAYG marginal cost per month at the pricing_basis rates. The OCI always-free allowance (4 OCPU + 24 GB A1 compute, 200 GB total block storage) absorbs roughly one VM's worth (~$60/mo of value), so the FIRST VM in the tenancy runs ~free; every additional VM costs about its est_monthly_usd.",
-  "$comment_sessions": "Per-tier open-session counts (issue #4785, operator ruling G2 of 2026-10-15) are what the capacity formula gives with the coefficients measured on 2026-10-15, except lite's recommended_sessions, which is 2 by operator ruling G2-6 (the formula gives 3; lite's #4785 mix stopped at the 2nd session on 1 OCPU, and the runtime guard takes the lower of the tier and the formula): one scratch VM per tier (lite, standard, pro; Ubuntu 24.04 arm64, the sessions slice at 10G / 12G, zram at half of RAM), each session a worktree spawn plus one real model turn, every session running the Playwright and sequential-thinking MCP servers and no LSP server (ruling G2-1 = A: the profile the fleet's sessions run; an LSP server such as tsserver adds about 1.1 GiB per session on a large TypeScript project). max_sessions = open sessions, idle (ruling G2-4 = R8-b: an open session holds its memory whether or not it is working, so max is the idle memory ceiling). recommended_sessions = the working count: open sessions that stay healthy when a third of them run builds (typecheck, web tests, single-binary build) and a third run repo tool work. Pro, pilot and ultra read the 10 GiB sessions slice on a provisioned VM (ruling D2 = A), so they share 12 / 19 until per-tier limits land (#4471). machine_minimum / machine_recommended are the standard and pro shapes with their recommended counts; their disk figures stay at #4417's values (ruling G2-5): #4417 computed disk as the measured base install plus about 0.75 GiB per open session of the test repository at the tier maximum, rounded up to 10 GB, so at the #4785 maxima they leave headroom. The disk figures count open sessions only. An archived session keeps its worktree on disk (0.75 GiB each in #4417's test, the same as an open one), and only deleting the session frees it, after a 10-day recovery window. Retention has no upper bound, so no fixed figure covers it (PM ruling R-DISK, #4754). Counts are per Hapimatic instance. docs/guide/installation.md § Machine requirements repeats machine_minimum / machine_recommended, the lite, standard and pro counts, lite's ocpus and memory_gb, and the 0.75 GiB per working copy: update it when they change.",
+  "$comment_sessions": "Per-tier open-session counts (issue #4785, operator ruling G2 of 2026-10-15) are what the capacity formula gives with the coefficients measured on 2026-10-15, except lite's recommended_sessions, which is 2 by operator ruling G2-6 (the formula gives 3 on the machine input, 2 on lite's #4471 sessions slice; lite's #4785 mix stopped at the 2nd session on 1 OCPU, and the runtime guard takes the lower of the tier and the formula): one scratch VM per tier (lite, standard, pro; Ubuntu 24.04 arm64, the sessions slice at 10G / 12G, zram at half of RAM), each session a worktree spawn plus one real model turn, every session running the Playwright and sequential-thinking MCP servers and no LSP server (ruling G2-1 = A: the profile the fleet's sessions run; an LSP server such as tsserver adds about 1.1 GiB per session on a large TypeScript project). max_sessions = open sessions, idle (ruling G2-4 = R8-b: an open session holds its memory whether or not it is working, so max is the idle memory ceiling). recommended_sessions = the working count: open sessions that stay healthy when a third of them run builds (typecheck, web tests, single-binary build) and a third run repo tool work. Pro, pilot and ultra keep 12 / 19 by ruling G2 although their per-tier sessions slice (session_slice_memory_high_mib, #4471) lets the formula give 21 (pro), 22 (pilot) and 33 (ultra): raising the published counts is a separate ruling. machine_minimum / machine_recommended are the standard and pro shapes with their recommended counts; their disk figures stay at #4417's values (ruling G2-5): #4417 computed disk as the measured base install plus about 0.75 GiB per open session of the test repository at the tier maximum, rounded up to 10 GB, so at the #4785 maxima they leave headroom. The disk figures count open sessions only. An archived session keeps its worktree on disk (0.75 GiB each in #4417's test, the same as an open one), and only deleting the session frees it, after a 10-day recovery window. Retention has no upper bound, so no fixed figure covers it (PM ruling R-DISK, #4754). Counts are per Hapimatic instance. docs/guide/installation.md § Machine requirements repeats machine_minimum / machine_recommended, the lite, standard and pro counts, lite's ocpus and memory_gb, and the 0.75 GiB per working copy: update it when they change.",
+  "$comment_memory_limits": "Per-tier memory limits (issue #4471, operator rulings D-4471-6 = A and D-4471-7 = A of 2026-10-24), all in MiB. session_slice_* bound hapimatic-sessions.slice (MemoryHigh / MemoryMax / MemorySwapMax), where every tmux-persisted session runs (#4743); daemon_memory_* bound hapimatic-private-daemon.service with the same High / Max (its own memory is about 110-220 MiB of anon, the rest reclaimable page cache). server_memory_* bound hapimatic-private.service, the web server (issue #5634, decision D-5634-2 = A), with the same High / Max: its own anon is about 140 MiB at rest with a 1,725 MiB peak RSS on ms1 (Pro, 2026-10-25), the rest reclaimable SQLite page cache, and its High stays at or above 2,048 MiB. Each of the three cgroups alone leaves system_floor_mib (D-5634-1); together they can exceed RAM, which is safe only because the daemon's and the server's own anon is small. system_floor_mib is what stays outside each cgroup: the measured outside-slice cost at 0 sessions (768 MiB up to 8 GB, 1,024 from 16 GB; #4785 section 11.2) + 256 MiB headroom + 512 MiB on desktop tiers (pro, ultra) + the zram pool for the swap bound at the 3:1 planning ratio (ceil(swap / 3)). The values were derived on each tier's MemTotal as measured on the #4417 / #4785 scratch VMs (lite 3,898, standard 7,915, pro and pilot 15,951 MiB; ultra derived, 23,977): slice max = floor128(MemTotal - floor), the band (max - high) 256 MiB up to 8 GB and max(512, floor256(15 % of max)) above, high never below 64 + 512 x max_sessions (the capacity formula's minimum for the published max), and the swap bound a quarter of MemTotal stepped down by 256 MiB until high meets that minimum. At apply time provision.sh Phase 9.7 and reconcile-vm.sh --surface session-slice clamp them to the VM's own MemTotal (memory_limits_apply in scripts/lib/provision-helpers.sh; memory_limits_for_tier computes the same clamp locally) and set them live with systemctl --user set-property; the 10G / 12G in the three unit files are only the pre-apply fallback. scripts/test-vm-tiers.sh (u) pins the invariants and cli/src/daemon/sessionCapacity.test.ts keeps every published max_sessions at or below the formula on session_slice_memory_high_mib.",
   "pricing_basis": {
     "as_of": "2026-07-31",
     "currency": "USD",
@@ -22,7 +23,15 @@
       "boot_volume_gb": 256,
       "est_monthly_usd": 66,
       "recommended_sessions": 12,
-      "max_sessions": 19
+      "max_sessions": 19,
+      "session_slice_memory_high_mib": 17280,
+      "session_slice_memory_max_mib": 20096,
+      "session_slice_swap_max_mib": 5888,
+      "daemon_memory_high_mib": 17280,
+      "daemon_memory_max_mib": 20096,
+      "server_memory_high_mib": 17280,
+      "server_memory_max_mib": 20096,
+      "system_floor_mib": 3755
     },
     "pro": {
       "label": "Pro",
@@ -31,7 +40,15 @@
       "boot_volume_gb": 160,
       "est_monthly_usd": 54,
       "recommended_sessions": 12,
-      "max_sessions": 19
+      "max_sessions": 19,
+      "session_slice_memory_high_mib": 11008,
+      "session_slice_memory_max_mib": 12800,
+      "session_slice_swap_max_mib": 3840,
+      "daemon_memory_high_mib": 11008,
+      "daemon_memory_max_mib": 12800,
+      "server_memory_high_mib": 11008,
+      "server_memory_max_mib": 12800,
+      "system_floor_mib": 3072
     },
     "pilot": {
       "label": "Pilot",
@@ -40,7 +57,15 @@
       "boot_volume_gb": 256,
       "est_monthly_usd": 58,
       "recommended_sessions": 12,
-      "max_sessions": 19
+      "max_sessions": 19,
+      "session_slice_memory_high_mib": 11520,
+      "session_slice_memory_max_mib": 13312,
+      "session_slice_swap_max_mib": 3840,
+      "daemon_memory_high_mib": 11520,
+      "daemon_memory_max_mib": 13312,
+      "server_memory_high_mib": 11520,
+      "server_memory_max_mib": 13312,
+      "system_floor_mib": 2560
     },
     "standard": {
       "label": "Standard",
@@ -49,7 +74,15 @@
       "boot_volume_gb": 60,
       "est_monthly_usd": 26,
       "recommended_sessions": 6,
-      "max_sessions": 12
+      "max_sessions": 12,
+      "session_slice_memory_high_mib": 6272,
+      "session_slice_memory_max_mib": 6528,
+      "session_slice_swap_max_mib": 1024,
+      "daemon_memory_high_mib": 6272,
+      "daemon_memory_max_mib": 6528,
+      "server_memory_high_mib": 6272,
+      "server_memory_max_mib": 6528,
+      "system_floor_mib": 1366
     },
     "lite": {
       "label": "Lite",
@@ -58,7 +91,15 @@
       "boot_volume_gb": 50,
       "est_monthly_usd": 14,
       "recommended_sessions": 2,
-      "max_sessions": 4
+      "max_sessions": 4,
+      "session_slice_memory_high_mib": 2304,
+      "session_slice_memory_max_mib": 2560,
+      "session_slice_swap_max_mib": 768,
+      "daemon_memory_high_mib": 2304,
+      "daemon_memory_max_mib": 2560,
+      "server_memory_high_mib": 2304,
+      "server_memory_max_mib": 2560,
+      "system_floor_mib": 1280
     }
   },
   "machine_minimum": {

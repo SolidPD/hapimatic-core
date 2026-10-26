@@ -21,6 +21,9 @@ interface ToastOptions {
   // Issue #3516: an optional inline action button (e.g. a back-link to the
   // session a failed delete rolled back). Clicking it runs onClick then dismisses.
   action?: { label: string; onClick: () => void };
+  // Issue #4921: an optional first line in a stronger weight — the session a
+  // notification is about. No title renders exactly as before.
+  title?: string;
 }
 
 interface ToastItem {
@@ -32,6 +35,7 @@ interface ToastItem {
   swipeY: number;
   swiping: boolean;
   action?: { label: string; onClick: () => void };
+  title?: string;
 }
 
 interface ToastContextValue {
@@ -160,6 +164,11 @@ function SingleToast({ toast, index, onDismiss }: SingleToastProps) {
 
         {/* Message + optional inline action (issue #3516) */}
         <div className="min-w-0 flex-1">
+          {toast.title && (
+            <p className="break-words text-sm font-semibold text-[var(--app-fg)]">
+              {toast.title}
+            </p>
+          )}
           <p className="break-words text-sm text-[var(--app-fg)]">
             {toast.message}
           </p>
@@ -212,8 +221,13 @@ interface ToastProviderProps {
 export function ToastProvider({ children }: ToastProviderProps) {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const nextId = useRef(0);
-  const lastMessage = useRef<{ text: string; time: number }>({
+  const lastMessage = useRef<{
+    text: string;
+    title: string | undefined;
+    time: number;
+  }>({
     text: "",
+    title: undefined,
     time: 0,
   });
   const timersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(
@@ -252,15 +266,21 @@ export function ToastProvider({ children }: ToastProviderProps) {
       const type = options?.type ?? "info";
       const duration = options?.duration ?? DEFAULT_DURATIONS[type];
 
-      // Deduplication: suppress same message within window
+      // Deduplication: suppress same message within window. Issue #4921: two
+      // toasts with different titles (two sessions, same text) both show, but
+      // an untitled toast still collapses with a titled twin of the same text
+      // (e.g. the re-login 409 toast and its notification row, #4914).
       const now = Date.now();
+      const title = options?.title || undefined;
+      const last = lastMessage.current;
       if (
-        lastMessage.current.text === message &&
-        now - lastMessage.current.time < DEDUP_WINDOW_MS
+        last.text === message &&
+        now - last.time < DEDUP_WINDOW_MS &&
+        (last.title === title || !last.title || !title)
       ) {
         return;
       }
-      lastMessage.current = { text: message, time: now };
+      lastMessage.current = { text: message, title, time: now };
 
       const id = nextId.current++;
       const newToast: ToastItem = {
@@ -272,6 +292,7 @@ export function ToastProvider({ children }: ToastProviderProps) {
         swipeY: 0,
         swiping: false,
         action: options?.action,
+        title,
       };
 
       // Compute the next visible set synchronously from the ref mirror (NOT

@@ -19,7 +19,9 @@
  *   Row 1 — Account | Permission Mode · Row 2 — Model | Effort. The right column
  *   is ONE fixed width (`NARROW_COL_PX`) sized for the wider of its two
  *   worst-case labels ("safe-YOLO" / "Extra High"), so Permission Mode and Effort
- *   share a left edge; Account and Model take everything to their left. Then
+ *   share a left edge; Account and Model take everything to their left. Between
+ *   the two rows, a full-width block shows the shown account's usage meters
+ *   (#4523, D-4523-1 A — inside neither row, so the grid is untouched). Then
  *   MCP Servers, and a footer row with "Copy params" at the lower-left and
  *   Cancel / Save-or-Apply at the right (round 12).
  *
@@ -78,11 +80,16 @@ import { FormField } from "@/components/NewSession/FormField";
 import { AccountSelectorModal } from "@/components/AccountSelectorModal";
 import { McpServersSection } from "@/components/session/McpServersSection";
 import {
+  SessionAccountUsageMeters,
+  findAccountUsage,
+} from "@/components/session/SessionAccountUsageMeters";
+import {
   API_KEY_CHIP_IDENTITY,
   apiKeyCredentialLabel,
   useSessionAccountEmail,
 } from "@/hooks/queries/useSessionAccountEmail";
 import { useAccounts } from "@/hooks/queries/useAccounts";
+import { useAccountUsage } from "@/hooks/queries/useAccountUsage";
 import { useAccountActions } from "@/hooks/mutations/useAccountActions";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
@@ -392,6 +399,32 @@ function EditSessionParamsForm({
     stagedKind === "api-key"
       ? undefined
       : (stagedAccount?.emailAddress ?? accountEmail);
+
+  // Issue #4523 (D-4523-4): the usage meters follow the binding the Account row
+  // SHOWS — the staged one while a change is pending, else the session's own. A
+  // key binds no account (#4568 / #4823), so a shown key gets no meters and no
+  // usage query (R8). Gate on the resolver, not `agent`: `toAgentType` reads an
+  // unknown flavor as claude, and the CLI stamps `metadata.accountUuid` for every
+  // flavor — a disabled query still returns cached rows, so the LOOKUP is gated
+  // too. `draftAccountUuid` is the current account's uuid until a pick is
+  // staged; the email follows the staged kind (NOT `shownEmail`, which falls
+  // back to the current account while a staged account is still loading). An
+  // errored usage query renders no block (R5): TanStack keeps the last rows
+  // after a failed refetch, so the rows alone would show stale meters as live.
+  const keySession =
+    resolvedAccount.source === "api-key" ||
+    current.paymentMethod?.kind === "api-key";
+  const keyShown = stagedKind ? stagedKind === "api-key" : keySession;
+  const meterTarget = resolvedAccount.source !== "not-claude" && !keyShown;
+  const { usage, error: usageError } = useAccountUsage(api, meterTarget);
+  const accountUsage =
+    meterTarget && usageError == null
+      ? findAccountUsage(
+          usage,
+          draftAccountUuid,
+          stagedKind === "account" ? stagedAccount?.emailAddress : accountEmail
+        )
+      : undefined;
 
   // Issue #4823 (R6): the keys group is disabled — with the reason — when the
   // server would refuse a key target. Launcher: the RAW recorded kind (a missing
@@ -744,6 +777,13 @@ function EditSessionParamsForm({
               />
             </div>
           </div>
+
+          {/* Issue #4523 (D-4523-1 A): the shown account's usage meters — a
+            full-width sibling between Row 1 and Row 2, inside neither row, so
+            the E9 grid and its fixed right column are untouched. Account-global
+            usage, the same envelope as the Account Usage page; nothing renders
+            without an envelope, for a non-Claude session or a shown key. */}
+          {accountUsage && <SessionAccountUsageMeters usage={accountUsage} />}
 
           {/* Row 2 (E9 → round 10) — Model | Effort (Claude only). TWO native
             drop-downs, each under its OWN heading. Model = the Create page's

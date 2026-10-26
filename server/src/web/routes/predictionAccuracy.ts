@@ -109,6 +109,8 @@ export function createPredictionAccuracyRoutes(
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?repo= (#5212)
+        probe: "skip",
       })
     ),
     limiter,

@@ -26,6 +26,7 @@ import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
+import { refuseAgentArchive } from "./agentEscalation";
 import {
   logAndJson,
   proxyTransportFailure,
@@ -575,6 +576,14 @@ export function createSessionsRoutes(
       if (engine instanceof Response) {
         return engine;
       }
+
+      // #5616: the archive floor precedes the local/federation split below, so
+      // archiving a remote session is refused on this hub too.
+      const refusal = refuseAgentArchive(c, engine, {
+        engine,
+        registry: options?.getNodeRegistry?.() ?? null,
+      });
+      if (refusal) return refusal;
 
       const sessionResult = requireSessionFromParam(c, engine, {
         requireActive: true,

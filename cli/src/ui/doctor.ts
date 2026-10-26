@@ -13,6 +13,7 @@ import { getDaemonEffectiveCount } from "@/daemon/controlClient";
 import {
   findRunawayHappyProcesses,
   findAllHappyProcesses,
+  instanceExecutableNames,
 } from "@/daemon/doctor";
 import {
   readDaemonState,
@@ -836,8 +837,12 @@ export async function runDoctorCommand(
       );
     }
 
-    // All hapi processes
-    const allProcesses = await findAllHappyProcesses();
+    // All hapi processes. #5526: a fleet binary is named per instance
+    // (hapimatic-private, hapimatic-wt-3012), so list that instance's own
+    // processes too. doctor clean's kill list is not widened by this.
+    const allProcesses = await findAllHappyProcesses(
+      instanceExecutableNames(process.execPath, isBunCompiled())
+    );
     if (allProcesses.length > 0) {
       console.log(chalk.bold("\n🔍 All hapi CLI Processes"));
 
@@ -856,6 +861,7 @@ export async function runDoctorCommand(
         const typeLabels: Record<string, string> = {
           current: "📍 Current Process",
           daemon: "🤖 Daemon",
+          server: "🖥️  Server",
           "daemon-version-check": "🔍 Daemon Version Check (stuck)",
           "daemon-spawned-session": "🔗 Daemon-Spawned Sessions",
           "user-session": "👤 User Sessions",

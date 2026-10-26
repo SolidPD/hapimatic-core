@@ -192,20 +192,27 @@ export function getFederationPendingSpawn(
 /**
  * Mark a placeholder failed (R2 — a background spawn error after the early ack).
  * No-op if the placeholder is gone (already reconciled or aged out).
+ *
+ * Issue #5696: returns `true` only when this call moved the entry from
+ * `spawning` to `failed`, so a caller raising a one-time effect (the hub's
+ * `spawn-failed` inbox row) skips a repeated failure for the same spawn. An
+ * already-failed entry is still refreshed (error, code, retention timer).
  */
 export function markSpawnFailed(
   sessionId: string,
   error: string,
   code?: string
-): void {
+): boolean {
   const entry = spawns.get(sessionId);
-  if (!entry) return;
+  if (!entry) return false;
+  const wasSpawning = entry.state === "spawning";
   clearTimeout(entry.timer);
   entry.state = "failed";
   entry.error = error;
   // Issue #3515: retain the refusal code alongside the message (optional).
   entry.code = code;
   entry.timer = scheduleTimer(sessionId, failedRetainMs(entry));
+  return wasSpawning;
 }
 
 /** Explicitly drop a placeholder (e.g. an immediate caller-side cleanup). */

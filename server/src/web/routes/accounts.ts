@@ -480,6 +480,8 @@ export function createAccountsRoutes(opts: {
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?uuid= (#5212)
+        probe: "skip",
       })
     ),
     async c => {
@@ -911,10 +913,14 @@ export function createAccountsRoutes(opts: {
         // agnostic (uuid-keyed). For a provider account the record is only a
         // REFERENCE — the codex login dir under `account-configs/<pk>/codex/` (or
         // the vault Gemini key) is the OPERATOR's and is deliberately NOT removed
-        // here. To fully revoke a codex login, the operator removes that dir; to
-        // revoke a Gemini key, the operator deletes the vault entry on the API Keys
-        // page. The per-provider `last_account` guard lives in AccountService.delete
-        // (#3808 Task 1b): removing the only account OF A PROVIDER trips the guard.
+        // here. #3982 (D1-A): AccountService.delete also clears any default
+        // pointer to the uuid and tombstones it (`accounts/removed.json`), so the
+        // provider importer never re-creates the record from that dir; deleting
+        // `removed.json` restores import. To fully revoke a codex login, the
+        // operator removes that dir; to revoke a Gemini key, the operator deletes
+        // the vault entry on the API Keys page. The per-provider `last_account`
+        // guard lives in AccountService.delete (#3808 Task 1b): removing the only
+        // account OF A PROVIDER trips the guard.
         const result = service.delete(c.req.param("uuid"));
         if (result.ok) {
           // TODO(#1456/J): cascade-cleanup sessions bound to this accountUuid once

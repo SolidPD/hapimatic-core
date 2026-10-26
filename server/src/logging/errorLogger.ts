@@ -6,6 +6,11 @@ import type { ErrorLogSeverity, ErrorLogSource } from "../store/types";
 import type { PushService } from "../push/pushService";
 import { captureException } from "../sentry";
 import {
+  salvageFields,
+  SERIALIZATION_ERROR_KEY,
+  serializeOrSalvage,
+} from "../utils/jsonSalvage";
+import {
   FixedWindowCounter,
   parseEnvInt,
   type RateLimitDecision,
@@ -75,25 +80,32 @@ export class ErrorLogger {
     this.pushService = pushService;
   }
 
+  /**
+   * Log one event. Returns false when the per-category rate limit dropped the
+   * event, so nothing was written anywhere; true otherwise, including the
+   * summary entry that replaces the first overflow (it carries the event's
+   * message and context) and a row the store failed to persist (the console
+   * line was written, and the failure logs itself). A caller that throttles on
+   * "already logged" can retry a dropped event (issue #5739). The severity
+   * shorthands below discard it, so their call sites and typed fakes are unchanged.
+   */
   log(
     severity: ErrorLogSeverity,
     message: string,
     options?: ErrorLogOptions
-  ): void {
+  ): boolean {
     let truncatedMessage = truncate(message, MAX_MESSAGE_LENGTH);
     const truncatedStack = options?.stack
       ? truncate(options.stack, MAX_STACK_LENGTH)
       : null;
     const category = options?.category ?? "general";
 
-    // Serialize context to JSON string
+    // Serialize context to a JSON string. A context that does not serialize
+    // keeps its serializable fields plus a marker, so the column always parses
+    // (issue #5734).
     let contextStr: string | null = null;
     if (options?.context != null) {
-      try {
-        contextStr = JSON.stringify(options.context);
-      } catch {
-        contextStr = "[serialization error]";
-      }
+      contextStr = serializeOrSalvage(options.context);
     }
 
     // Issue #1141: rate-limit gate. Prune memory then ask the counter
@@ -126,7 +138,7 @@ export class ErrorLogger {
       // Suppressed silently — the prior `summarize` event already told
       // operators that flooding started for this category. The category's
       // counter resets at window expiry and forwarding resumes.
-      return;
+      return false;
     }
 
     if (decision.action === "summarize") {
@@ -139,18 +151,27 @@ export class ErrorLogger {
       // Truncate again in case the original was near the cap — preserve
       // MAX_MESSAGE_LENGTH invariant for downstream consumers.
       truncatedMessage = truncate(truncatedMessage, MAX_MESSAGE_LENGTH);
-      const summaryContext = {
+      const summaryFields = {
         rateLimitSummary: true,
         droppedCount: decision.droppedCount,
         windowMs: RATE_WINDOW_MS,
         originalMessage,
-        ...(options?.context ?? {}),
       };
+      const callerContext = options?.context ?? {};
+      // Caller fields keep their precedence over the summary fields. The spread
+      // runs getters, so a throwing getter is salvaged here rather than thrown
+      // out of log() (issue #5734).
+      let summaryContext: Record<string, unknown>;
       try {
-        contextStr = JSON.stringify(summaryContext);
+        summaryContext = { ...summaryFields, ...callerContext };
       } catch {
-        contextStr = "[serialization error]";
+        summaryContext = {
+          ...summaryFields,
+          ...salvageFields(callerContext),
+          [SERIALIZATION_ERROR_KEY]: true,
+        };
       }
+      contextStr = serializeOrSalvage(summaryContext);
     }
 
     // Always write to console for journalctl backward compatibility
@@ -266,6 +287,7 @@ export class ErrorLogger {
         });
       }
     }
+    return true;
   }
 
   fatal(message: string, options?: ErrorLogOptions): void {

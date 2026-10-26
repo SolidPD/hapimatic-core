@@ -101,6 +101,8 @@ export function createChainFingerprintRoutes(
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?accountUuid= (#5212)
+        probe: "skip",
         telemetry: "off",
       })
     ),

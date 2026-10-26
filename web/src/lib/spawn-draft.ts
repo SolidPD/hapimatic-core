@@ -63,7 +63,8 @@ export type SpawnFormSnapshot = {
    * choice, so a retry restores it rather than re-seeding the account default,
    * which would move a failed key spawn onto a subscription. `null` = an account
    * spawn. Kept even when the key has since left the vault: the daemon then
-   * refuses with api_key_not_found (#4568 SF-2).
+   * refuses with api_key_not_found (#4568 SF-2). #5127: the key's binding ref
+   * (`<uuid>@<home>` for a key another node shares).
    */
   apiKeyId?: string | null;
 };

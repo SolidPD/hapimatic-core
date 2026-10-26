@@ -876,6 +876,49 @@ export default function AdminPreferencesPage() {
           />
         </section>
 
+        {/* Issue #5127: the initial state of every add form's "Make available to
+            all nodes" checkbox (Anthropic keys). A pure federation setting —
+            written through fedSettings.setValue, like the Time Log timezone. */}
+        <section className="flex flex-col gap-1">
+          <div className="flex items-center justify-between gap-2">
+            <label className="flex flex-1 cursor-pointer items-center justify-between gap-3">
+              <span className="text-sm font-medium text-[var(--app-fg)]">
+                Make new API keys available to all nodes
+              </span>
+              <Checkbox
+                className="h-5 w-5"
+                data-testid="share-api-keys-by-default"
+                checked={
+                  (
+                    fedView?.values.shareApiKeysByDefault as
+                      | { enabled?: boolean }
+                      | undefined
+                  )?.enabled === true
+                }
+                disabled={!api}
+                onChange={e =>
+                  fedSettings.setValue("shareApiKeysByDefault", {
+                    enabled: e.target.checked,
+                  })
+                }
+              />
+            </label>
+            <GlobalInheritToggle
+              settingLabel="Make New API Keys Available To All Nodes"
+              inherit={fedSettings.inheritFor("shareApiKeysByDefault")}
+              onToggle={next =>
+                fedSettings.setInherit("shareApiKeysByDefault", next)
+              }
+              disabled={!api}
+              nodeCount={remoteNodes.length}
+            />
+          </div>
+          <p className="text-xs text-[var(--app-hint)]">
+            New Anthropic keys start with &lsquo;Make available to all
+            nodes&rsquo; ticked. You can still change each key.
+          </p>
+        </section>
+
         {/* Auto-select optimal account (#2042 A4 create page; #3611 un-pinned spawns) */}
         <ToggleRow
           label="Auto-select optimal account"

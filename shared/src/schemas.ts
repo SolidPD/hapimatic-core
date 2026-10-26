@@ -16,6 +16,7 @@ import { FileClaimSyncSnapshotSchema } from "./fileClaims";
 import { hookCoverageRecordSchema } from "./messageHookConfig";
 import { SPEND_LIMIT_VARIANTS } from "./apiErrorClasses";
 import { AccountMonogramSchema } from "./accountMonogram";
+import { StoredNotificationSchema } from "./notifications";
 
 export const PermissionModeSchema = z.enum(PERMISSION_MODES);
 /** Issue #2346: the Claude-only permission-mode subset (no codex modes). The
@@ -1276,6 +1277,29 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
     scheduleId: z.string(),
     changeKind: z.enum(["created", "deleted", "executed"]),
   }),
+  // Issue #4913 (epic #4912, Sub A): a notification row was created, coalesced
+  // (the row carries the new `count`), read or dismissed. Carries the whole
+  // stored row so a client replaces its cached copy in place. NAMESPACE-SCOPED:
+  // `namespace` is REQUIRED and populated at emit, so `SSEManager.shouldSend()`
+  // delivers it to that namespace's `all: true` connection. Deliberately NO
+  // top-level `sessionId`: it would narrow delivery to a connection watching that
+  // session, and the federation event bridge (`shouldForwardBridgeEvent`) only
+  // forwards session-less events unconditionally — which is how a peer's
+  // notifications reach the hub's browsers. Never add it to
+  // HOST_GLOBAL_EVENT_TYPES (that would leak it across namespaces).
+  z.object({
+    type: z.literal("notification"),
+    namespace: z.string().min(1),
+    notification: StoredNotificationSchema,
+  }),
+  // Issue #4913: dismiss-all on one node. One event instead of one per row;
+  // `dismissedAt` is that node's clock, so a client should invalidate its inbox
+  // query rather than apply the timestamp locally. Same namespace rules as above.
+  z.object({
+    type: z.literal("notifications-cleared"),
+    namespace: z.string().min(1),
+    dismissedAt: z.number(),
+  }),
 ]);
 
 export type SyncEvent = z.infer<typeof SyncEventSchema>;
@@ -1785,6 +1809,19 @@ export type TerminalKeyboardExpandedPreference = z.infer<
 export const TERMINAL_KEYBOARD_EXPANDED_DEFAULT: TerminalKeyboardExpandedPreference =
   { expanded: true };
 
+// "Make new API keys available to all nodes" (#5127): the initial state of the
+// add forms' share checkbox. A federation-native key like
+// `terminalKeyboardExpanded`; `enabled` is REQUIRED (no inline default), so the
+// single default lives in the constant below — off, so sharing stays opt-in.
+export const ShareApiKeysByDefaultPreferenceSchema = z.object({
+  enabled: z.boolean(),
+});
+export type ShareApiKeysByDefaultPreference = z.infer<
+  typeof ShareApiKeysByDefaultPreferenceSchema
+>;
+export const SHARE_API_KEYS_BY_DEFAULT_DEFAULT: ShareApiKeysByDefaultPreference =
+  { enabled: false };
+
 // ── Federation-global settings layer (#2624, epic #2622 Sub-Issue B) ──
 //
 // The generic per-node settings model: each registered setting has a
@@ -1803,12 +1840,14 @@ export const TERMINAL_KEYBOARD_EXPANDED_DEFAULT: TerminalKeyboardExpandedPrefere
 // time-log timezone every node uses for day bucketing + the midnight reset.
 // `terminalKeyboardExpanded` (#4548) is a federation-NATIVE key: it has no
 // A-local `settings.json` storage, only the per-node first-paint cache #4516 owns
-// in the browser.
+// in the browser. `shareApiKeysByDefault` (#5127) is federation-native too: the
+// initial state of the add forms' "Make available to all nodes" checkbox.
 export const FEDERATION_SETTING_KEYS = [
   "chatSections",
   "defaultOutputStyle",
   "timeLogTimezone",
   "terminalKeyboardExpanded",
+  "shareApiKeysByDefault",
 ] as const;
 export type FederationSettingKey = (typeof FEDERATION_SETTING_KEYS)[number];
 
@@ -2701,6 +2740,10 @@ export const StoredApiKeySchema = z
     monogram: AccountMonogramSchema.optional(),
     /** #4463: what the last probe reported (status code, reachable models). */
     lastValidation: ApiKeyLastValidationSchema.optional(),
+    /** #5127: the key may be used by sessions on the other nodes of this
+     *  federation, which fetch it from this node on demand. Anthropic only.
+     *  Absent ⇒ not shared (every key stored before #5127). */
+    shareAcrossNodes: z.boolean().optional(),
   })
   .passthrough();
 export type StoredApiKey = z.infer<typeof StoredApiKeySchema>;
@@ -2734,8 +2777,54 @@ export const RedactedApiKeySchema = z.object({
   monogram: AccountMonogramSchema.optional(),
   /** #4463 R4: the last probe's status code and reachable-model count. */
   lastValidation: ApiKeyLastValidationSchema.optional(),
+  /** #5127: whether sessions on the other federation nodes may use the key.
+   *  Non-secret; the Settings row switch reads it. Optional on the wire (an
+   *  older node omits it): absent means not shared, the same as `false`. The
+   *  vault's `toRedactedApiKey` always sets it explicitly. */
+  shareAcrossNodes: z.boolean().optional(),
 });
 export type RedactedApiKey = z.infer<typeof RedactedApiKeySchema>;
+
+/** #5127: one key the Create-page picker can bind, from any node of the
+ *  federation. `bindingRef` is the exact `apiKeyId` the spawn must carry for the
+ *  picker's target (a bare id for a key on the UI node spawned there, otherwise
+ *  `<uuid>@<homeNodeId>`). `homeNodeId` is the home's own node id; the label is
+ *  the UI node's name for it. */
+export const AvailableApiKeySchema = RedactedApiKeySchema.extend({
+  homeNodeId: z.string(),
+  homeNodeLabel: z.string(),
+  local: z.boolean(),
+  bindingRef: z.string(),
+});
+export type AvailableApiKey = z.infer<typeof AvailableApiKeySchema>;
+
+/** Why a node's shared keys are missing from the picker (#5127). */
+export const AvailableApiKeysUnavailableReasonSchema = z.enum([
+  "offline",
+  "unsupported",
+  "transport",
+  "error",
+]);
+export type AvailableApiKeysUnavailableReason = z.infer<
+  typeof AvailableApiKeysUnavailableReasonSchema
+>;
+
+/** Response of GET /api/api-keys/available (#5127). `localNodeId` is null when
+ *  federation is disabled (every key is local and bare). */
+export const AvailableApiKeysResponseSchema = z.object({
+  localNodeId: z.string().nullable(),
+  keys: z.array(AvailableApiKeySchema),
+  unavailableNodes: z.array(
+    z.object({
+      nodeId: z.string(),
+      nodeLabel: z.string(),
+      reason: AvailableApiKeysUnavailableReasonSchema,
+    })
+  ),
+});
+export type AvailableApiKeysResponse = z.infer<
+  typeof AvailableApiKeysResponseSchema
+>;
 
 /**
  * Mask a secret for display: a fixed dot run + the last 4 chars, so the user can
@@ -2783,6 +2872,10 @@ export const AddApiKeyRequestSchema = z
     mode: ApiKeyAddModeSchema.optional(),
     /** #4463 D-3 A: the key's monogram, normalized by the route before storing. */
     monogram: AccountMonogramSchema.optional(),
+    /** #5127: share the key with the other federation nodes. Anthropic only; the
+     *  route refuses `true` for another provider. Absent ⇒ not shared, even when
+     *  an upsert replaces a shared entry (every UI form sends it explicitly). */
+    shareAcrossNodes: z.boolean().optional(),
   })
   .refine(
     r =>
@@ -2802,6 +2895,8 @@ export type AddApiKeyRequest = z.infer<typeof AddApiKeyRequestSchema>;
 export const PatchApiKeyRequestSchema = z.object({
   label: z.string().max(API_KEY_NAME_MAX_CHARS).optional(),
   monogram: AccountMonogramSchema.optional(),
+  /** #5127: turn sharing with the other federation nodes on or off. */
+  shareAcrossNodes: z.boolean().optional(),
 });
 export type PatchApiKeyRequest = z.infer<typeof PatchApiKeyRequestSchema>;
 
@@ -3231,3 +3326,17 @@ export const OnboardingStatePatchSchema = z.object({
   lastStep: OnboardingStepIdSchema.optional(),
 });
 export type OnboardingStatePatch = z.infer<typeof OnboardingStatePatchSchema>;
+
+// ── First-run backup-key prompt (node-local, #4791) ──────────────────
+//
+// Whether the user skipped the app's first-run "save your backup key" step,
+// stored in THIS instance's settings file under `backupPrompt` (never the
+// gateway). Only a skip is recorded: a saved key needs no marker, because the
+// backup identity status already reads `revealed: true` once it is acknowledged.
+// An absent key reads as not skipped.
+export const BackupPromptPreferenceSchema = z.object({
+  skipped: z.boolean(),
+});
+export type BackupPromptPreference = z.infer<
+  typeof BackupPromptPreferenceSchema
+>;

@@ -27,6 +27,45 @@ export type StoredFeedback = {
   attachmentsJson: string | null;
   emailed: boolean;
   emailError: string | null;
+  /**
+   * Forward state for the gateway's central sink (issue #2911). `pending` rows are
+   * sent by the POST kick and the reconciler; `legacy` rows predate the sink and
+   * wait for the operator backfill; `rejected` rows were refused (400/413) and are
+   * never retried.
+   */
+  forwardState: FeedbackForwardState;
+  /** The last forward failure, or null. Never contains the sink token. */
+  forwardError: string | null;
+  /** When the sink accepted the row (epoch ms), or null. */
+  forwardedAt: number | null;
+  /** Failed retryable forward attempts so far. */
+  forwardAttempts: number;
+};
+
+/** Forward state of a local feedback row (the `forwarded` column, issue #2911). */
+export type FeedbackForwardState =
+  | "pending"
+  | "forwarded"
+  | "legacy"
+  | "rejected";
+
+/** The outcome of one forward attempt, recorded by {@link FeedbackStore.markForwarded}. */
+export type FeedbackForwardOutcome =
+  | { kind: "forwarded" }
+  | { kind: "retryable"; error: string }
+  | { kind: "rejected"; error: string }
+  | { kind: "config-error"; error: string };
+
+const FORWARD_PENDING = 0;
+const FORWARD_DONE = 1;
+const FORWARD_LEGACY = 2;
+const FORWARD_REJECTED = 3;
+
+const FORWARD_STATES: Record<number, FeedbackForwardState> = {
+  [FORWARD_PENDING]: "pending",
+  [FORWARD_DONE]: "forwarded",
+  [FORWARD_LEGACY]: "legacy",
+  [FORWARD_REJECTED]: "rejected",
 };
 
 /** Input to {@link FeedbackStore.createEntry} — the route supplies scrubbed content. */
@@ -58,6 +97,10 @@ type DbFeedbackRow = {
   attachments_json: string | null;
   emailed: number;
   email_error: string | null;
+  forwarded?: number;
+  forward_error?: string | null;
+  forwarded_at?: number | null;
+  forward_attempts?: number;
 };
 
 function toStoredFeedback(row: DbFeedbackRow): StoredFeedback {
@@ -74,6 +117,12 @@ function toStoredFeedback(row: DbFeedbackRow): StoredFeedback {
     attachmentsJson: row.attachments_json ?? null,
     emailed: row.emailed === 1,
     emailError: row.email_error,
+    // A SELECT before the #2911 column migration has no forward columns; such a
+    // row reads as legacy, like the column DEFAULT.
+    forwardState: FORWARD_STATES[row.forwarded ?? FORWARD_LEGACY] ?? "legacy",
+    forwardError: row.forward_error ?? null,
+    forwardedAt: row.forwarded_at ?? null,
+    forwardAttempts: row.forward_attempts ?? 0,
   };
 }
 
@@ -101,10 +150,12 @@ export class FeedbackStore {
         `
         INSERT INTO feedback (
           id, created_at, namespace, category, description,
-          submitter_email, metadata_json, attachments_json, emailed, email_error
+          submitter_email, metadata_json, attachments_json, emailed, email_error,
+          forwarded
         ) VALUES (
           @id, @created_at, @namespace, @category, @description,
-          @submitter_email, @metadata_json, @attachments_json, 0, NULL
+          @submitter_email, @metadata_json, @attachments_json, 0, NULL,
+          0
         )
         `
       )
@@ -130,6 +181,10 @@ export class FeedbackStore {
       attachmentsJson: entry.attachmentsJson ?? null,
       emailed: false,
       emailError: null,
+      forwardState: "pending",
+      forwardError: null,
+      forwardedAt: null,
+      forwardAttempts: 0,
     };
   }
 
@@ -146,6 +201,67 @@ export class FeedbackStore {
     this.db
       .prepare("UPDATE feedback SET emailed = ?, email_error = ? WHERE id = ?")
       .run(emailed ? 1 : 0, emailError, id);
+  }
+
+  /**
+   * Pending rows, oldest first — the reconciler's queue (issue #2911). Legacy and
+   * rejected rows never block it.
+   */
+  getUnforwarded(limit: number): StoredFeedback[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM feedback WHERE forwarded = ? ORDER BY created_at, id LIMIT ?"
+      )
+      .all(FORWARD_PENDING, limit) as DbFeedbackRow[];
+    return rows.map(toStoredFeedback);
+  }
+
+  /**
+   * Record one forward attempt (issue #2911). A success marks the row forwarded;
+   * a failure only touches a row that is still pending, so a kick and the
+   * reconciler racing on one row cannot mark a forwarded row as failed.
+   */
+  markForwarded(id: string, outcome: FeedbackForwardOutcome): void {
+    switch (outcome.kind) {
+      case "forwarded":
+        this.db
+          .prepare(
+            "UPDATE feedback SET forwarded = ?, forwarded_at = ?, forward_error = NULL WHERE id = ?"
+          )
+          .run(FORWARD_DONE, Date.now(), id);
+        return;
+      case "retryable":
+        this.db
+          .prepare(
+            "UPDATE feedback SET forward_attempts = forward_attempts + 1, forward_error = ? WHERE id = ? AND forwarded = ?"
+          )
+          .run(outcome.error, id, FORWARD_PENDING);
+        return;
+      case "rejected":
+        this.db
+          .prepare(
+            "UPDATE feedback SET forwarded = ?, forward_error = ? WHERE id = ? AND forwarded = ?"
+          )
+          .run(FORWARD_REJECTED, outcome.error, id, FORWARD_PENDING);
+        return;
+      case "config-error":
+        this.db
+          .prepare(
+            "UPDATE feedback SET forward_error = ? WHERE id = ? AND forwarded = ?"
+          )
+          .run(outcome.error, id, FORWARD_PENDING);
+        return;
+    }
+  }
+
+  /**
+   * The operator backfill (issue #2911): mark every legacy row pending so the
+   * reconciler forwards it. Idempotent; returns how many rows were requeued.
+   */
+  requeueLegacyRows(): number {
+    return this.db
+      .prepare("UPDATE feedback SET forwarded = ? WHERE forwarded = ?")
+      .run(FORWARD_PENDING, FORWARD_LEGACY).changes;
   }
 
   getEntry(id: string): StoredFeedback | null {

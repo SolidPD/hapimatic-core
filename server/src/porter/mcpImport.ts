@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import {
-  chmod,
-  readFile,
-  rename,
-  writeFile,
-  readdir,
-  mkdir,
-} from "node:fs/promises";
+import { chmod, rename, writeFile, readdir, mkdir } from "node:fs/promises";
 import { existsSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -19,6 +12,16 @@ import {
   stableStringify,
 } from "./conflictDetection";
 import type { Conflict } from "./conflictDetection";
+import { readDestination } from "./regularFile";
+import type {
+  McpFileMergeResult,
+  McpImportResult,
+} from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type {
+  McpFileMergeResult,
+  McpImportResult,
+} from "@hapi/protocol/porter";
 
 /**
  * MCP-server import for the Configuration Porter (issue #2343, epic #2339 Sub D,
@@ -91,19 +94,6 @@ export function resolveSecretValue(
 export interface McpMergeItem {
   name: string;
   config: Record<string, unknown>;
-}
-
-/** Per-config-file merge outcome. */
-export interface McpFileMergeResult {
-  configPath: string;
-  imported: string[];
-  /** Same-name collisions that were skipped (differs → default skip). */
-  skipped: Conflict[];
-}
-
-export interface McpImportResult {
-  host: McpFileMergeResult;
-  perAccount: McpFileMergeResult[];
 }
 
 /**
@@ -429,13 +419,28 @@ async function mergeIntoConfigFile(
       let raw = "";
       let config: Record<string, unknown> = {};
       if (existsSync(configPath)) {
-        raw = await readFile(configPath, "utf-8");
+        // #5759: never read a FIFO, socket or device (a FIFO's open blocks
+        // until a writer appears, under the import lock and this file's lock).
+        // Fixed text: path and kind only.
+        const r = await readDestination(configPath);
+        if (r.kind === "special") {
+          throw new Error(
+            `Refusing to merge MCP servers: ${configPath} is ${r.what}, not a regular file.`
+          );
+        }
+        if (r.kind === "absent") {
+          throw new Error(
+            `Refusing to merge MCP servers: ${configPath} changed during the import.`
+          );
+        }
+        raw = r.content.toString("utf-8");
         try {
           config = JSON.parse(raw) as Record<string, unknown>;
-        } catch (err) {
+        } catch {
+          // #5676: a fixed reason, never the parser's text — Bun's JSON.parse
+          // names an unquoted value verbatim, and this file holds MCP secrets.
           throw new Error(
-            `Refusing to merge MCP servers: ${configPath} is not valid JSON ` +
-              `(${err instanceof Error ? err.message : String(err)}).`
+            `Refusing to merge MCP servers: ${configPath} is not valid JSON.`
           );
         }
       }

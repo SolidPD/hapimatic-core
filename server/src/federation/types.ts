@@ -31,6 +31,12 @@ export type NodeRegistryOptions = {
    * dead stream and reconnected. Tests lower it to exercise the watchdog.
    */
   eventBridgeIdleTimeoutMs?: number;
+  /**
+   * Issue #5127: decides whether a home node's URL may be sent a shared-API-key
+   * request (Tailscale or loopback only). Defaults to `createHomeUrlGuard()`;
+   * tests inject one to avoid DNS.
+   */
+  homeUrlGuard?: (url: string) => Promise<boolean>;
 };
 
 export type CachedRemoteSessions = {

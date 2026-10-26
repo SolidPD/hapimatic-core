@@ -36,59 +36,23 @@ import type {
 import { hookFileDest } from "./planHooks";
 import { relative, sep } from "node:path";
 import { SECTION_FOLDER, normalizeEntryPath } from "./plannedDestinations";
-
-/** One skill and its EXACT membership (files) + the hooks that serve it. */
-export interface SkillGroup {
-  /** The owning skill's dimension-entry name (`PlannedFileItem.name`). */
-  skill: string;
-  /** destPaths of this skill's file items (`kind === "skill"`, exact `name` match). */
-  files: string[];
-  /** hook-file destPaths of hooks whose command references `skills/<skill>/`. */
-  servingHooks: string[];
-}
-
-/** A hook that serves no skill — its own top-level selection unit. */
-export interface IndependentHook {
-  /** The hook-file destPath — the exclusion key (registration + file travel as one). */
-  id: string;
-  command: string;
-  events: string[];
-}
+import type {
+  ImportGroups,
+  IndependentHook,
+  SkillGroup,
+} from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type {
+  SkillGroup,
+  IndependentHook,
+  ImportGroups,
+} from "@hapi/protocol/porter";
 
 /**
- * Hierarchical grouping of ALL plan dimensions for the pre-import selection UI
- * (#3247 R1/D3a). Every value is the item's EXCLUSION KEY: file destPaths for
- * file dimensions, hook-file destPaths for hooks, server names for MCP. `hook-lib`
- * support files carry NO group of their own — they follow the hooks (written iff
- * any hook survives). #4173: `settings-script` files carry no group either, and
- * are no exclusion key: a script's fate follows the setting that runs it (D4,
- * the commit's `held` set), and settings keys are not selectable (#3247).
+ * #5601 (D4): what this server computes. The wire type keeps `memory` optional
+ * because a server that predates #4373 omitted it; this one always sends it.
  */
-export interface ImportGroups {
-  skills: SkillGroup[];
-  independentHooks: IndependentHook[];
-  mcpServers: string[];
-  agents: string[];
-  commands: string[];
-  rules: string[];
-  outputStyles: string[];
-  /** `claude-md` + `claude-md-include` file destPaths. */
-  claudeMd: string[];
-  /** #4373: a tenant archive's memory file destPaths (`projects/<key>/memory/…`). */
-  memory: string[];
-  /**
-   * #3448 (Sub C, R3/D3(a)): per-source grouping for the archive-received review
-   * cards. Each source id maps to `found` (manifest `sources[]` metadata — TRUE
-   * even for a found-but-empty source) and its EXCLUSION keys, so a card is an
-   * honest whole-source toggle. claude-code owns every file + hook dimension
-   * it brought (from `~/.claude`) plus its MCP names; Cursor / Claude Desktop
-   * carry MCP server names only; Codex (#5169) carries its MCP names plus the
-   * files of its tagged skill and instructions-rule entries, and the hooks that
-   * serve a Codex skill. A card cascades over its keys inside the ONE existing
-   * `excluded` set — no parallel selection path.
-   */
-  bySource: Record<PorterSourceId, { found: boolean; keys: string[] }>;
-}
+export type EmittedImportGroups = ImportGroups & { memory: string[] };
 
 /** The plan slice both the grouping and the exclusion resolver need. */
 type PlanForSelection = Pick<
@@ -176,7 +140,7 @@ function pushInto(
  * Group ALL plan dimensions for the selection UI (#3247 Task 1). Pure; the SAME
  * function feeds `toPlanSummary` and (transitively) `resolveCommitExclusions`.
  */
-export function computeGroups(plan: PlanForSelection): ImportGroups {
+export function computeGroups(plan: PlanForSelection): EmittedImportGroups {
   const { files, hookEntries, mcpServers, claudeDir, manifest } = plan;
 
   // Skills: group skill-kind file items by owning skill name (EXACT membership).

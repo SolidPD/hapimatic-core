@@ -201,6 +201,8 @@ export function createTimeLogRoutes(
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?startDate= (#5212)
+        probe: "skip",
       })
     ),
     async c => {
@@ -255,6 +257,8 @@ export function createTimeLogRoutes(
         auth: "jwt",
         riskTier: "readonly",
         availability: { scope: "user" },
+        // probe: needs ?startDate= and ?endDate= (#5212)
+        probe: "skip",
       })
     ),
     c => {

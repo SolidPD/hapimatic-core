@@ -17,9 +17,16 @@
  */
 
 import { readFileSync } from "node:fs";
+import { hostname } from "node:os";
+import { FEEDBACK_SINK_ORIGIN_ID_RE } from "@hapi/protocol/feedbackSink";
 import { getSettingsFile, readSettings, writeSettings } from "./settings";
 import type { FeedbackSenderConfig } from "../feedback/feedbackSender";
+import type {
+  FeedbackSinkConfig,
+  FeedbackSinkOrigin,
+} from "../feedback/sinkForward";
 import { isEnvFlagTruthy } from "../provisioner/capability";
+import { VERSION } from "../version.generated";
 
 export interface ServerSettings {
   telegramBotToken: string | null;
@@ -288,6 +295,76 @@ export function resolveOperatorInstanceEnabled(
   env: Record<string, string | undefined> = process.env
 ): boolean {
   return isEnvFlagTruthy(env[OPERATOR_INSTANCE_ENV]);
+}
+
+const RELAY_URL_SUFFIX = "/feedback-relay";
+const SINK_URL_SUFFIX = "/feedback-sink";
+
+/**
+ * Where this instance forwards its feedback rows: the gateway's central sink
+ * (issue #2911, epic #2909 Sub B). A DEDICATED seam — never fields of
+ * {@link FeedbackSenderConfig}, the email transport (the #2667 rule) — and
+ * env-only: the credential is never written to settings.json (#2410).
+ *
+ *  - Operator node: `FEEDBACK_INBOX_URL` (the gateway origin) +
+ *    `FEEDBACK_INBOX_TOKEN` (the shared operator bearer, ruling D12). The node
+ *    names itself with its federation node id (else the hostname). Wins when
+ *    both branches are configured, so an operator cloud VM forwards as operator.
+ *  - Customer VM: `FEEDBACK_RELAY_URL` ending in `/feedback-relay` +
+ *    `FEEDBACK_RELAY_TOKEN`; the sink is the sibling `/feedback-sink` route and
+ *    the gateway derives the origin from the token. Any other URL shape is null:
+ *    a token is never sent to a guessed origin.
+ *
+ * Null means no forwarding. Rows stay pending, so a later fix forwards them.
+ * Independent of `HAPI_OPERATOR_INSTANCE`, which only gates the read routes.
+ */
+export function resolveFeedbackSinkConfig(
+  origin: FeedbackSinkOrigin = {},
+  env: Record<string, string | undefined> = process.env
+): FeedbackSinkConfig | null {
+  const inboxUrl = env.FEEDBACK_INBOX_URL?.trim();
+  const inboxToken = env.FEEDBACK_INBOX_TOKEN?.trim();
+  if (inboxUrl && inboxToken) {
+    let base = inboxUrl;
+    while (base.endsWith("/")) base = base.slice(0, -1);
+    if (!/^https?:\/\/[^/]/.test(base) || !URL.canParse(base)) {
+      console.error(
+        "[feedback-sink] FEEDBACK_INBOX_URL is not an http(s) URL — feedback is not forwarded"
+      );
+      return null;
+    }
+    const originInstanceId = origin.nodeId ?? hostname();
+    if (
+      originInstanceId.length > 64 ||
+      !FEEDBACK_SINK_ORIGIN_ID_RE.test(originInstanceId)
+    ) {
+      console.error(
+        "[feedback-sink] this node's id is not a valid sink origin (letters, digits, '.', '_', '-'; up to 64) — feedback is not forwarded"
+      );
+      return null;
+    }
+    return {
+      url: `${base}/api${SINK_URL_SUFFIX}`,
+      token: inboxToken,
+      originKind: "operator",
+      originInstanceId,
+      originLabel: (origin.nodeLabel?.trim() || originInstanceId).slice(0, 64),
+      appVersion: VERSION,
+    };
+  }
+  const relayUrl = env.FEEDBACK_RELAY_URL?.trim();
+  const relayToken = env.FEEDBACK_RELAY_TOKEN?.trim();
+  if (relayUrl && relayToken && relayUrl.endsWith(RELAY_URL_SUFFIX)) {
+    return {
+      url: relayUrl.slice(0, -RELAY_URL_SUFFIX.length) + SINK_URL_SUFFIX,
+      token: relayToken,
+      originKind: "customer",
+      originInstanceId: null,
+      originLabel: null,
+      appVersion: VERSION,
+    };
+  }
+  return null;
 }
 
 /**

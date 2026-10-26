@@ -36,30 +36,21 @@ import { LoadingState } from "@/components/LoadingState";
 import { BrandedFrame } from "@/components/BrandedFrame";
 import { ThreadFullscreenProvider } from "@/lib/thread-fullscreen-context";
 import { ToastProvider, useToast } from "@/components/Toast";
-import { ApiErrorToastListener } from "@/components/ApiErrorToastListener";
+import { NotificationListener } from "@/components/NotificationListener";
 import { RemoteSpawnFailedToastListener } from "@/components/RemoteSpawnFailedToastListener";
+import { ReloginLinkListener } from "@/components/ReloginLinkListener";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
 import { OnboardingHost } from "@/components/onboarding/OnboardingHost";
+import { BackupFirstRunPrompt } from "@/components/backup/BackupFirstRunPrompt";
 import { useSplitViewContext } from "@/lib/split-view-context";
 import useDensity from "@/hooks/useDensity";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { errorReporter } from "@/lib/error-reporter";
-import {
-  createToastCoalescer,
-  type ToastCoalescer,
-} from "@/lib/toast-coalescer";
 import { runScheduledCleanup } from "@/lib/localStorageCleanup";
 import { migrateLegacyQueue } from "@/lib/migrateLegacyQueue";
 import { useFocusRestoration } from "@/hooks/useFocusRestoration";
 import { getLastSeenSeq, clearSeqTracker } from "@/lib/seq-tracker";
 import { upsertMessagesInCache } from "@/lib/messages";
-import { ACCOUNT_UNREFRESHABLE_TOAST_MESSAGE } from "@/lib/reconnectError";
-import {
-  buildReloginSearch,
-  buildReloginToast,
-  RELOGIN_EVENT,
-  type ReloginRequest,
-} from "@/lib/reloginLink";
 import { signOut } from "@/lib/signOut";
 
 export function App() {
@@ -242,23 +233,6 @@ export function App() {
       });
   }, [api]);
 
-  // Clear app badge when user returns to the app (iOS PWA home screen badge)
-  useEffect(() => {
-    if (!("clearAppBadge" in navigator)) return;
-
-    const clearBadge = () => {
-      if (document.visibilityState === "visible") {
-        navigator.clearAppBadge().catch(() => {});
-      }
-    };
-
-    // Clear badge immediately if app is already visible
-    clearBadge();
-
-    document.addEventListener("visibilitychange", clearBadge);
-    return () => document.removeEventListener("visibilitychange", clearBadge);
-  }, []);
-
   useEffect(() => {
     const preventDefault = (event: Event) => {
       event.preventDefault();
@@ -430,9 +404,10 @@ export function App() {
     // Increment token to track this specific connection
     const token = ++syncTokenRef.current;
 
-    // R2 (issue #1612): signal every SSE (re)connect so ToolErrorToastListener
-    // opens a coalescing window — a reconnect-delivered tool-error backlog must
-    // not flood the renderer with individual toasts (which tripped React #185).
+    // R2 (issue #1612): signal every SSE (re)connect so NotificationListener
+    // opens its suppression window — a reconnect-delivered notification backlog
+    // must not flood the renderer with toasts (which tripped React #185) — and
+    // usePwaRecovery sees the stream recover.
     // handleSseConnect already fires on every initial connect + reconnect, so
     // this is the lowest-blast-radius hook point; useSSE.ts (which runs on every
     // federation node) is intentionally left untouched.
@@ -624,15 +599,11 @@ export function App() {
 
   return (
     <ToastProvider>
-      <ToolErrorToastListener />
-      <ApiErrorToastListener />
-      <PromptBlockToastListener />
+      {/* #4915: the one Lane 2 listener — inbox cache, unread count, and the
+          rate-limited pop-up for every `notification` SyncEvent. */}
+      <NotificationListener api={api} />
       <ErrorOutboxDropToastListener />
-      <AccountUnrefreshableToastListener />
       <ReloginLinkListener />
-      <SessionRestartFailedToastListener />
-      <LoopsResumingToastListener />
-      <WaitingForSlotToastListener />
       {/* #2150: a remote spawn that fails or times out after the node accepted it */}
       <RemoteSpawnFailedToastListener />
       <AppContextProvider
@@ -675,151 +646,14 @@ export function App() {
               over /sessions while the node-local state is pending; Settings
               re-entry via the hapi:onboarding-open window event). */}
           <OnboardingHost />
+          {/* #4791: the first-run "save your backup key" step — one app-level
+              host, presented over /sessions after launch; it waits for the tour
+              above (contract LC6: hapi:onboarding-open / hapi:backup-prompt-*). */}
+          <BackupFirstRunPrompt />
         </ExtensionHostProvider>
       </AppContextProvider>
     </ToastProvider>
   );
-}
-
-// Tool-error toast coalescing constants (issue #1612). Starting values —
-// tunable; the failure mode is a cosmetically over/under-suppressed
-// informational toast (no data/security impact).
-const TOOL_ERROR_COALESCE_THRESHOLD = 3; // mirrors error-reporter DROP_TOAST_THRESHOLD
-const TOOL_ERROR_COALESCE_WINDOW_MS = 1000; // the AC's "<1s" burst definition
-const TOOL_ERROR_SUMMARY_DEDUP_MS = 2000; // mirrors Toast DEDUP_WINDOW_MS
-const TOOL_ERROR_RECONNECT_SUPPRESS_MS = 2500; // covers the observed ~1.1s burst + margin
-
-/**
- * Bridges `hapi:toolError` CustomEvents (dispatched by useSSE for tool-error
- * SyncEvents) to the Toast system. Lives inside ToastProvider so useToast()
- * resolves to a real provider.
- *
- * Issue #1612: a burst of tool-error events (e.g. a backlog delivered on SSE
- * reconnect from a chatty session) is coalesced into a single "N tool errors"
- * summary toast instead of one toast per event, known-benign classes are
- * filtered out, and a short post-reconnect window suppresses individual toasts
- * — so the volume can no longer crash the web app with React #185.
- */
-function ToolErrorToastListener() {
-  const { showToast } = useToast();
-  const coalescerRef = useRef<ToastCoalescer | null>(null);
-  const coalescer =
-    coalescerRef.current ??
-    (coalescerRef.current = createToastCoalescer({
-      threshold: TOOL_ERROR_COALESCE_THRESHOLD,
-      windowMs: TOOL_ERROR_COALESCE_WINDOW_MS,
-      summaryDedupMs: TOOL_ERROR_SUMMARY_DEDUP_MS,
-    }));
-  const suppressUntilRef = useRef(0);
-
-  // R2: on every SSE (re)connect, open a coalescing window and suppress
-  // individual tool-error toasts for a short window so a reconnect-delivered
-  // backlog can never flood the renderer.
-  useEffect(() => {
-    const onConnect = () => {
-      const now = Date.now();
-      suppressUntilRef.current = now + TOOL_ERROR_RECONNECT_SUPPRESS_MS;
-      coalescer.forceSummaryWindow(now);
-    };
-    window.addEventListener("hapi:sseConnected", onConnect);
-    return () => window.removeEventListener("hapi:sseConnected", onConnect);
-  }, [coalescer]);
-
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (
-        e as CustomEvent<{
-          toolName?: string;
-          errorContent?: string;
-        }>
-      ).detail;
-      if (!detail?.toolName || typeof detail.errorContent !== "string") return;
-
-      const content = detail.errorContent;
-      // R5: drop known-benign tool-error classes before counting/toasting.
-      // Keep this set minimal + commented — over-filtering hides real errors.
-      if (
-        // Hook guard working as designed (e.g. a blocked Bash command).
-        content.includes("Permission denied for Bash") ||
-        // Read/Bash routing mistakes — not a real tool failure.
-        content.includes("No such tool available")
-      ) {
-        return;
-      }
-
-      const now = Date.now();
-      const decision = coalescer.record(now);
-
-      // R2: during the post-reconnect window, never emit an individual toast.
-      if (decision.action === "individual" && now < suppressUntilRef.current) {
-        return;
-      }
-      if (decision.action === "silent") return;
-
-      if (decision.action === "summary") {
-        const n = decision.count;
-        showToast(`${n} tool error${n === 1 ? "" : "s"}`, {
-          type: "warning",
-          duration: 5000,
-        });
-        return;
-      }
-
-      // Individual toast (R4: unchanged behavior below the burst threshold).
-      const MAX = 120;
-      const truncated =
-        content.length > MAX ? content.slice(0, MAX) + "…" : content;
-      showToast(`${detail.toolName}: ${truncated}`, {
-        type: "warning",
-        duration: 5000,
-      });
-    };
-    window.addEventListener("hapi:toolError", handler);
-    return () => window.removeEventListener("hapi:toolError", handler);
-  }, [showToast, coalescer]);
-  return null;
-}
-
-/**
- * Bridges `hapi:promptBlocked` CustomEvents (dispatched by useSSE for
- * prompt-blocked SyncEvents) to the Toast system. Sibling of
- * ToolErrorToastListener. Issue #1348.
- */
-function PromptBlockToastListener() {
-  const { showToast } = useToast();
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (
-        e as CustomEvent<{
-          hookEvent?: string;
-          blockedReason?: string;
-          originalPrompt?: string;
-          title?: string;
-        }>
-      ).detail;
-      if (!detail?.hookEvent || typeof detail.blockedReason !== "string") {
-        return;
-      }
-      const MAX = 160;
-      const truncated =
-        detail.blockedReason.length > MAX
-          ? detail.blockedReason.slice(0, MAX) + "…"
-          : detail.blockedReason;
-      // #3579: prefer the catalogue title (no gate jargon, R7); the second,
-      // catalogue-less producer (routes/cli.ts) omits it and degrades to today's
-      // text.
-      showToast(
-        detail.title ?? `${detail.hookEvent} hook blocked: ${truncated}`,
-        {
-          type: "warning",
-          duration: 5000,
-        }
-      );
-    };
-    window.addEventListener("hapi:promptBlocked", handler);
-    return () => window.removeEventListener("hapi:promptBlocked", handler);
-  }, [showToast]);
-  return null;
 }
 
 /**
@@ -838,164 +672,6 @@ function ErrorOutboxDropToastListener() {
     };
     window.addEventListener("hapi:errorOutboxDropped", handler);
     return () => window.removeEventListener("hapi:errorOutboxDropped", handler);
-  }, [showToast]);
-  return null;
-}
-
-/**
- * Bridges `hapi:accountUnrefreshable` CustomEvents (dispatched by useSSE for
- * account-unrefreshable SyncEvents) to the Toast system. Sibling of
- * ToolErrorToastListener / PromptBlockToastListener. Issue #1531.
- *
- * "Actionable" is delivered as guidance text — the Toast component is text-only,
- * so the toast directs the user to the existing re-login surface (the account
- * menu in the session header) rather than rendering a button. The affected
- * accountUuid is carried in the CustomEvent detail for future enhancement.
- */
-function AccountUnrefreshableToastListener() {
-  const { showToast } = useToast();
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ nodeId?: string; nodeLabel?: string }>)
-        .detail;
-      // Issue #4461 (R8): a server-stamped event names its node — build the toast
-      // with the SAME builder (and no account name) the HTTP reconnect 409 uses,
-      // so the SSE+HTTP pair stays byte-identical, ToastProvider dedups it into
-      // ONE toast, and that toast carries the "Log in" action whichever side
-      // fired first. An unstamped event (a pre-#4461 node) keeps the shared
-      // #1835 message, matching the HTTP side for a node-less 409.
-      if (detail?.nodeId && detail.nodeLabel) {
-        const { message, action } = buildReloginToast({
-          nodeId: detail.nodeId,
-          nodeLabel: detail.nodeLabel,
-        });
-        showToast(message, { type: "warning", duration: 5000, action });
-        return;
-      }
-      showToast(ACCOUNT_UNREFRESHABLE_TOAST_MESSAGE, {
-        type: "warning",
-        duration: 5000,
-      });
-    };
-    window.addEventListener("hapi:accountUnrefreshable", handler);
-    return () =>
-      window.removeEventListener("hapi:accountUnrefreshable", handler);
-  }, [showToast]);
-  return null;
-}
-
-/**
- * Issue #4461 (R9): turns a `hapi:relogin` request (the "Log in" action on an
- * account_unrefreshable toast, and #4466's red-ring tap) into a navigation to
- * the Accounts page's deep link, `/settings/account-usage?relogin=<provider>
- * &node=<nodeId>`. The page decides what this UI can do for that node (D-A1 = A).
- */
-function ReloginLinkListener() {
-  const navigate = useNavigate();
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent<ReloginRequest>).detail;
-      if (!detail?.nodeId) return;
-      void navigate({
-        to: "/settings/account-usage",
-        search: buildReloginSearch(detail),
-      });
-    };
-    window.addEventListener(RELOGIN_EVENT, handler);
-    return () => window.removeEventListener(RELOGIN_EVENT, handler);
-  }, [navigate]);
-  return null;
-}
-
-/**
- * Bridges `hapi:sessionRestartFailed` CustomEvents (dispatched by useSSE for
- * session-restart-failed SyncEvents) to the Toast system. Sibling of
- * AccountUnrefreshableToastListener. Issue #1532.
- *
- * Distinct from account-unrefreshable (#1531, "re-login required"): here the
- * account is healthy and the session is RECONNECTABLE — so the toast directs
- * the user to reconnect from the session list rather than to re-login.
- */
-function SessionRestartFailedToastListener() {
-  const { showToast } = useToast();
-  useEffect(() => {
-    const handler = () => {
-      showToast(
-        "A session disconnected after a token refresh and couldn't restart " +
-          "automatically. Reconnect it from the session list to resume.",
-        { type: "warning", duration: 5000 }
-      );
-    };
-    window.addEventListener("hapi:sessionRestartFailed", handler);
-    return () =>
-      window.removeEventListener("hapi:sessionRestartFailed", handler);
-  }, [showToast]);
-  return null;
-}
-
-/**
- * Bridges `hapi:loopsResuming` CustomEvents (dispatched by useSSE for
- * loops-resuming SyncEvents) to the Toast system (issue #2453, Task 14 / R6).
- * Shown when a reconnect auto-resumes the loop-cron loops that were auto-paused
- * on disconnect. Sibling of SessionRestartFailedToastListener.
- *
- * Placement (D4): the app's standard bottom-center toast stack. The mockup's
- * badge-anchored placement is an accepted deviation — the Toast primitive has no
- * per-caller position channel.
- */
-function LoopsResumingToastListener() {
-  const { showToast } = useToast();
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (e as CustomEvent<{ count: number; pausedAtMs: number }>)
-        .detail;
-      if (!detail || detail.count <= 0) return;
-      const when = new Date(detail.pausedAtMs).toLocaleTimeString();
-      const n = detail.count;
-      showToast(
-        `${n} scheduled ${n === 1 ? "job" : "jobs"} resuming — paused on disconnect ${when}`,
-        { type: "info", duration: 5000 }
-      );
-    };
-    window.addEventListener("hapi:loopsResuming", handler);
-    return () => window.removeEventListener("hapi:loopsResuming", handler);
-  }, [showToast]);
-  return null;
-}
-
-/**
- * Bridges `hapi:waitingForSlot` CustomEvents (dispatched by useSSE for
- * waiting-for-slot SyncEvents) to the Toast system (issue #2301, Task 5 / R4).
- * Shown when a reconnect or account-switch spawn hits the concurrency cap and is
- * polling for a free slot. Advisory — reassures the user the operation is
- * in-progress (retrying automatically) rather than a silent stall. Sibling of
- * LoopsResumingToastListener.
- *
- * Copy coordinated with #2300 (GAP-2, shared copy not shared transport): #2300's
- * terminal capacity ERROR ("instance at capacity") rides the HTTP error path; this
- * in-progress status is the SSE toast — the two read as one coherent capacity
- * indicator.
- */
-function WaitingForSlotToastListener() {
-  const { showToast } = useToast();
-  useEffect(() => {
-    const handler = (e: Event) => {
-      const detail = (
-        e as CustomEvent<{
-          context?: "account-switch" | "reconnect";
-          elapsedMs?: number;
-          deadlineMs?: number;
-        }>
-      ).detail;
-      const verb =
-        detail?.context === "account-switch" ? "Account switch" : "Reconnect";
-      showToast(
-        `${verb} is waiting for a free session slot… (instance at capacity — retrying automatically)`,
-        { type: "info", duration: 6000 }
-      );
-    };
-    window.addEventListener("hapi:waitingForSlot", handler);
-    return () => window.removeEventListener("hapi:waitingForSlot", handler);
   }, [showToast]);
   return null;
 }

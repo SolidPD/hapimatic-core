@@ -60,75 +60,21 @@ import {
   type PluginDescriptor,
 } from "@hapi/protocol/porter";
 import { isMarketplaceTrusted, stripMarketplaceRef } from "./pluginTrust";
+import type { PluginInstallResult } from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type {
+  MarketplaceStatus,
+  MarketplaceOutcome,
+  InstalledPluginRecord,
+  SkippedPluginRecord,
+  FailedItemKind,
+  FailedRecord,
+  ReAuthRecord,
+  VersionDriftRecord,
+  PluginInstallResult,
+} from "@hapi/protocol/porter";
 
 /* ── Result shapes ── */
-
-/** A marketplace-level outcome (D-3: `pinnedRef` makes catalog pinning visible). */
-export type MarketplaceStatus =
-  | "added"
-  | "already-present"
-  | "skipped-untrusted"
-  | "failed";
-export interface MarketplaceOutcome {
-  name: string;
-  source: string;
-  status: MarketplaceStatus;
-  /** The `#<ref>` pin recorded on the source, or `null` when unpinned. */
-  pinnedRef: string | null;
-  /** Human-readable reason for `skipped-untrusted` / `failed`. */
-  reason?: string;
-}
-
-export interface InstalledPluginRecord {
-  name: string;
-  marketplace: string;
-  /** Version reported by `claude plugin list --json` after install, or null. */
-  installedVersion: string | null;
-  /** Version recorded in the descriptor, or null when unrecorded. */
-  recordedVersion: string | null;
-}
-
-export interface SkippedPluginRecord {
-  name: string;
-  marketplace: string;
-  reason: string;
-}
-
-export type FailedItemKind = "marketplace" | "plugin";
-export interface FailedRecord {
-  kind: FailedItemKind;
-  /** `source` for a marketplace, `name@marketplace` for a plugin. */
-  identifier: string;
-  /** The secret-free `claude` command attempted, or null (pre-exec rejection). */
-  command: string | null;
-  reason: string;
-}
-
-export interface ReAuthRecord {
-  plugin: string;
-  marketplace: string;
-  /** The bundled MCP server whose secret-bearing field is unresolved. */
-  server: string;
-  /** Field descriptors (env/header key names, or `url`/`args[i]`) needing a secret. */
-  missingFields: string[];
-}
-
-export interface VersionDriftRecord {
-  plugin: string;
-  marketplace: string;
-  recorded: string;
-  installed: string;
-}
-
-/** The additive `ImportResult.pluginInstall` section (present only when gate ON). */
-export interface PluginInstallResult {
-  marketplaces: MarketplaceOutcome[];
-  installed: InstalledPluginRecord[];
-  skipped: SkippedPluginRecord[];
-  failed: FailedRecord[];
-  reAuthRequired: ReAuthRecord[];
-  versionDrift: VersionDriftRecord[];
-}
 
 /* ── Injectable command runner (mocked in tests) ── */
 

@@ -55,7 +55,9 @@ import {
  *  - **succeeded:** the terminal reload waits for the target server to be healthy,
  *    then asks the SW to check for the new worker and activates it through the
  *    visibility-guarded path (R5/R8). A persisted "reloaded-for" flag makes this
- *    fire exactly once — the post-reload page stays quiet (no reload loop).
+ *    fire exactly once — the post-reload page stays quiet (no reload loop). It
+ *    fires only in a page that first saw the server on an older version, and a
+ *    stalled reload turns into a tappable "reload to finish" bar (#4924).
  *  - **failed / timeout:** one actionable bar with retry/error copy; the update
  *    is never silently hidden nor falsely reported complete (R7).
  *
@@ -86,6 +88,28 @@ function markReloadedFor(version: string): void {
     // A disabled/full store just means the once-guard degrades to per-mount; the
     // terminalFiredRef still prevents a same-mount double reload.
   }
+}
+
+/**
+ * The first real server version this PAGE saw (#4924). Module scope, not a ref:
+ * the app remounts the bar during its auth bootstrap, and a per-mount ref would
+ * forget what the page loaded against. It resets on reload, the only point at
+ * which the page can pick up new assets. A page that first saw the server already
+ * on a job's target loaded after that update, so it starts no reload flow; if it
+ * still runs an older precached shell, the sw-only bar offers the new worker.
+ */
+let firstServerVersion: string | null = null;
+const REAL_VERSION = /^\d+\.\d+\.\d+/;
+
+function noteServerVersion(version: string | undefined): void {
+  if (firstServerVersion === null && version && REAL_VERSION.test(version)) {
+    firstServerVersion = version;
+  }
+}
+
+/** Test-only reset of the page-scoped state (mirrors resetSwUpdateForTests). */
+export function resetUpdateBadgeStateForTests(): void {
+  firstServerVersion = null;
 }
 
 type BarPhase =
@@ -139,25 +163,52 @@ export function UpdateAvailableBadge() {
     }
   }, [awaitingReady, jobPhase, jobIsForLatest]);
 
+  // Declared BEFORE the terminal effect so the first data render records the
+  // version before the terminal check reads it (effects run in order).
+  useEffect(() => {
+    noteServerVersion(current);
+  }, [current]);
+
   // Completion → drive the terminal reload EXACTLY once (R5/R6/R8). We only reload
-  // when the browser is actually stale: a persisted "reloaded-for" flag means the
-  // post-reload page already runs the new assets, so it never re-fires (no loop).
+  // when the browser is actually stale: the server now runs the job's target AND
+  // this page first saw it on another version (#4924 — `job.json` is never
+  // deleted, so a `succeeded` record outlives its update and must not start a
+  // reload in a page that loaded afterwards). A persisted "reloaded-for" flag also
+  // records that this browser already started the reload flow for the target, so
+  // it never re-fires; a page still on the old worker gets the sw-only bar instead.
   useEffect(() => {
     const completed =
-      jobPhase === "succeeded" ||
-      (jobPhase === "applying" && !!target && current === target);
+      !!target &&
+      current === target &&
+      (jobPhase === "succeeded" || jobPhase === "applying");
     if (!completed || terminalFiredRef.current) return;
     terminalFiredRef.current = true;
-    if (target && readReloadedFor() === target) {
-      // Steady state: this browser has already reloaded onto the applied version.
+    if (firstServerVersion === target) {
+      // This page loaded after the update, so it starts no reload flow. It may
+      // still run an older shell from the outgoing worker's precache (a reload
+      // during the restart), so look for the new worker once: if one installs,
+      // the manual sw-only bar offers it.
+      requestSwUpdateCheck();
       return;
     }
-    if (target) markReloadedFor(target); // mark BEFORE reloading so the reloaded page is quiet
+    if (readReloadedFor() === target) {
+      // Steady state: this browser already ran the reload flow for this target.
+      return;
+    }
+    markReloadedFor(target); // mark BEFORE reloading so the reloaded page is quiet
     setReloadInFlight(true);
     requestSwUpdateCheck(); // ask the SW machinery for the new worker (self-clearing)
+  }, [jobPhase, target, current]);
+
+  // The stall timer lives in its own effect (#4924): inside the terminal effect it
+  // was cleared by that effect's cleanup when the phase moved from `applying` to
+  // `succeeded`, and the early return on terminalFiredRef never re-armed it, so
+  // the bar spun on "Update complete — reloading…" with no way out.
+  useEffect(() => {
+    if (!reloadInFlight) return;
     const t = setTimeout(() => setReloadStalled(true), SW_ACTIVATE_TIMEOUT_MS);
     return () => clearTimeout(t);
-  }, [jobPhase, target, current]);
+  }, [reloadInFlight]);
 
   // A waiting SW appeared during the terminal flow → activate it through the
   // visibility-guarded path (never a raw location.reload — R8, #1793/#3053).
@@ -175,8 +226,10 @@ export function UpdateAvailableBadge() {
   // for an older target falls through to `available` instead of pinning a permanent spinner.
   else if (jobPhase === "applying" && (jobIsForLatest || !available))
     phase = "applying";
+  // #4924: a waiting worker must still surface here — after a stalled tap the
+  // page reloads onto the same old worker with `reloaded-for` already set.
   else if (jobPhase === "succeeded" && jobIsForLatest)
-    phase = reloadInFlight ? "reloading" : null;
+    phase = reloadInFlight ? "reloading" : swPending ? "sw-only" : null;
   else if (
     jobPhase === "failed" &&
     !dismissedFailure &&
@@ -192,8 +245,13 @@ export function UpdateAvailableBadge() {
   if (phase === null) return null;
 
   const busy = stage.isPending || trigger.isPending || cancelDeferral.isPending;
+  // #4924: once the terminal reload has stalled, the bar says "reload to finish"
+  // and must take the tap (a spinning bar is disabled and its click handler
+  // returns early).
   const spinning =
-    phase === "staging" || phase === "applying" || phase === "reloading";
+    phase === "staging" ||
+    phase === "applying" ||
+    (phase === "reloading" && !reloadStalled);
 
   // ── Copy ────────────────────────────────────────────────────────────────────
   const honestCopy =

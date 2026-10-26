@@ -15,6 +15,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import {
   ANTHROPIC_LOGIN_CAPABILITY,
+  SHARED_API_KEYS_CAPABILITY,
   KNOWN_AGENT_IDS,
   resolveToolCapabilities,
 } from "@hapi/protocol";
@@ -130,10 +131,13 @@ export function detectCapabilities(opts?: {
   if (!cachedBaseCapabilities) {
     // #4462: ANTHROPIC_LOGIN_CAPABILITY is static (every binary since #4462 ships
     // the receivers), so it is cached with the base set and precedes agent:*.
+    // #5127: SHARED_API_KEYS_CAPABILITY is static too — every binary since
+    // #5127 ships the shared-key receivers and /federation/spawn-api-key.
     const capabilities = [
       "read-sessions",
       "spawn-session",
       ANTHROPIC_LOGIN_CAPABILITY,
+      SHARED_API_KEYS_CAPABILITY,
     ];
 
     for (const agent of KNOWN_AGENT_IDS) {

@@ -60,8 +60,10 @@ export function uuidV5(name: string): string {
   );
 }
 
-/** OpenAI PK (D4): codex's account id when UUID-shaped, else uuid-v5(`openai:<id>`). */
-function openAiPk(accountId: string): string {
+/** OpenAI PK (D4): codex's account id when UUID-shaped, else uuid-v5(`openai:<id>`).
+ *  Exported for the #3806 auth-state reader, which keys the host login row by this
+ *  same PK (#3982) so the Accounts page can join it to its store record. */
+export function openAiPk(accountId: string): string {
   return UUID_REGEX.test(accountId) ? accountId : uuidV5(`openai:${accountId}`);
 }
 

@@ -35,41 +35,24 @@
  */
 import { constants, type Stats } from "node:fs";
 import { lstat, open, stat, type FileHandle } from "node:fs/promises";
-import { importFileMode } from "./commitFs";
+import { importFileMode, restoreCause, type RestoreFailure } from "./commitFs";
 import { hashContent, type Conflict } from "./conflictDetection";
 import type { PlannedItemKind } from "./importArchive";
-
-/** One byte-identical file whose execute bits were restored. Modes are `& 0o7777`. */
-export interface ModeCorrection {
-  destPath: string;
-  from: number;
-  to: number;
-}
-
-/**
- * Why a byte-identical file's mode was left alone:
- *  - `symlink`: the path is a symlink (never followed); reported only when its
- *    target would have needed a correction.
- *  - `not-a-file`: the path is no longer a regular file.
- *  - `not-owner`: another user owns it (the server is not root).
- *  - `unreadable`: its mode or content could not be read.
- *  - `changed`: the commit's decision differs from the preview (the mode moved
- *    since the preview, or a change is now needed that was never previewed), or
- *    the file changed between the decision and the chmod (different inode,
- *    device, mode or content, it became a symlink, it was removed, or it is no
- *    longer a regular file).
- */
-export type ModeSkipReason =
-  | "symlink"
-  | "not-a-file"
-  | "not-owner"
-  | "unreadable"
-  | "changed";
-
-export interface ModeSkip {
-  destPath: string;
-  reason: ModeSkipReason;
-}
+import type {
+  ModeCorrection,
+  ModeReconcilePreview,
+  ModeSkip,
+  ModeSkipReason,
+} from "@hapi/protocol/porter";
+// #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
+export type {
+  ModeCorrection,
+  ModeSkipReason,
+  ModeSkip,
+  ModePreviewFix,
+  ModePreviewSkip,
+  ModeReconcilePreview,
+} from "@hapi/protocol/porter";
 
 /** What the reconcile needs from a planned file item (`PlannedFileItem` fits). */
 export interface ModeReconcileItem {
@@ -80,27 +63,6 @@ export interface ModeReconcileItem {
   mode?: number;
   /** SHA-256 of the archive content; the file must still hash to it. */
   incomingHash: string;
-}
-
-/**
- * A preview row carries its item `kind` so the client can apply the commit's
- * selection rule (`commitSelection.ts`): a `hook-lib` row is excluded only
- * when every hook is, any other row when its own destPath is.
- */
-export interface ModePreviewFix extends ModeCorrection {
-  kind: PlannedItemKind;
-}
-export interface ModePreviewSkip extends ModeSkip {
-  kind: PlannedItemKind;
-}
-
-/**
- * The plan-time preview: the changes the commit may apply (it applies no
- * others) and the files it expects to leave alone, with the reason.
- */
-export interface ModeReconcilePreview {
-  fixes: ModePreviewFix[];
-  skipped: ModePreviewSkip[];
 }
 
 /** The undo record for one applied chmod ({@link restoreModes}). */
@@ -334,20 +296,22 @@ export async function reconcileExistingModes(
 /**
  * Undo applied chmods, newest first. A file that was since removed, replaced
  * (different inode or device) or turned into a symlink has nothing of ours
- * left to undo. Returns the paths whose mode could not be restored, so the
- * caller reports a PARTIAL rollback (#2563).
+ * left to undo. Returns the paths whose mode could not be restored, each with
+ * its cause (#3022), so the caller reports a PARTIAL rollback (#2563).
  */
 export async function restoreModes(
   applied: readonly AppliedModeFix[]
-): Promise<string[]> {
-  const failed: string[] = [];
+): Promise<RestoreFailure[]> {
+  const failed: RestoreFailure[] = [];
   for (const a of [...applied].reverse()) {
     let fh: FileHandle;
     try {
       fh = await open(a.destPath, OPEN_FLAGS);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ELOOP") failed.push(a.destPath);
+      if (code !== "ENOENT" && code !== "ELOOP") {
+        failed.push({ path: a.destPath, cause: restoreCause(err) });
+      }
       continue;
     }
     try {
@@ -355,8 +319,8 @@ export async function restoreModes(
       if (s.isFile() && s.ino === a.ino && s.dev === a.dev) {
         await fh.chmod(a.from);
       }
-    } catch {
-      failed.push(a.destPath);
+    } catch (err) {
+      failed.push({ path: a.destPath, cause: restoreCause(err) });
     } finally {
       await fh.close().catch(() => {});
     }

@@ -23,6 +23,10 @@ import {
   type FeedbackEmailInput,
   type FeedbackSenderConfig,
 } from "../../feedback/feedbackSender";
+import {
+  createSinkForwardKick,
+  type FeedbackSinkConfig,
+} from "../../feedback/sinkForward";
 
 /**
  * Deep-scrub every string leaf of the composed metadata (R4 defense-in-depth).
@@ -130,6 +134,13 @@ export interface FeedbackRoutesOptions {
    * absent means closed.
    */
   operatorInstanceEnabled?: boolean;
+  /**
+   * Where to forward each new row: the gateway's central feedback sink (issue
+   * #2911, `resolveFeedbackSinkConfig`). Absent or null means no forwarding. The
+   * forward never delays or fails the 201; rows it cannot send stay pending for
+   * the reconciler.
+   */
+  sinkConfig?: FeedbackSinkConfig | null;
 }
 
 /**
@@ -160,6 +171,10 @@ export function createFeedbackRoutes(
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   const { senderConfig } = options;
+  const kickSinkForward = createSinkForwardKick(
+    store,
+    options.sinkConfig ?? null
+  );
 
   const limiter = createRateLimiter({ name: "feedback", limit: 10 });
   // Method-scoped, never `app.use("/feedback", …)`: the POST shares the path.
@@ -247,6 +262,7 @@ export function createFeedbackRoutes(
         metadata,
         attachments: emailAttachments,
       });
+      void kickSinkForward(id);
 
       return c.json({ id }, 201);
     }
@@ -262,8 +278,10 @@ export function createFeedbackRoutes(
   // rejected (401) before it reaches this handler, on open and closed instances
   // alike. Issue #2910: it is also OPERATOR-ONLY — `operatorGate` 404s it unless
   // `HAPI_OPERATOR_INSTANCE` is truthy (`1`/`true`/`yes`), so a customer instance never
-  // advertises the route. That gate is a visibility gate, not an authorization
-  // boundary (an instance owner can read the SQLite directly); the central
+  // advertises the route — and, since #5571, a closed gate also drops the entry
+  // from the capability catalog (`operatorOnly` marks it). The gate is a
+  // visibility gate, not an authorization boundary (an instance owner can read
+  // the SQLite directly); the central
   // inbox's boundary is #2912's gateway operator credential. On an operator
   // instance the list is node-global (no namespace filter). Rows carry
   // `emailed`/`email_error`, so a persist-only (`emailed=0`) row is visibly the
@@ -317,7 +335,10 @@ export function createFeedbackRoutes(
   // Mirrors `/admin-vms/preflight`: a closed instance answers 404 (the gate),
   // which the web treats as "closed" — only `{ enabled: true }` opens the
   // settings Feedback row and page. A distinct exact path from `/feedback`, so
-  // it never collides with the POST/GET routes.
+  // it never collides with the POST/GET routes. Scope `user` (#5571): the gate is
+  // per instance, so on an operator instance any authenticated caller is served;
+  // `scope: "operator"` would mean the provisioner-host proof plus a matching
+  // operator binding (`deriveScope`) instead.
   app.get(
     "/feedback/preflight",
     cataloged(
@@ -336,7 +357,7 @@ export function createFeedbackRoutes(
         },
         auth: "jwt",
         riskTier: "readonly",
-        availability: { scope: "operator" },
+        availability: { scope: "user" },
       })
     ),
     operatorGate,

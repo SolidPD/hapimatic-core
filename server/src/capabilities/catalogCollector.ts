@@ -30,6 +30,15 @@
  * ROUTE registrations in `server/src/web`, so filtering on the method costs
  * nothing.
  *
+ * CLOSED-GATE FILTER (#5571): a route group carrying a closed `operatorOnly` gate
+ * (`CLOSED_GATE_TAG`) answers 404 on this instance, so it is omitted from BOTH
+ * `rest` and `uncatalogedRest` (non-advertisement). `hapi_call` inherits this,
+ * because its allowlist is built from `rest`. Scope: only a gate passed as a
+ * ROUTE ARGUMENT is seen (an `app.use` gate is an `ALL` entry, skipped above),
+ * and `extensionEntries` merged below are not filtered. The runtime audit
+ * (`auditCollector.ts`) still reads raw `app.routes`: the route is live and
+ * tagged, so it reports no drift.
+ *
  * The catalog REFERENCES the RPC namespace (N1) by pointer, never a copy (R8 /
  * non-duplication): the `rpc` section carries each method's `CapabilityMeta`
  * (whose `inputSchema`/`outputSchema` are already JSON Schema, produced CLI-side
@@ -37,7 +46,7 @@
  * `docs/internal/architecture/capability-catalog.md`.
  */
 import type { Hono } from "hono";
-import { CAPABILITY_TAG } from "./cataloged";
+import { CAPABILITY_TAG, CLOSED_GATE_TAG } from "./cataloged";
 import { capabilityCatalogIndex } from "@hapi/protocol";
 import type { CatalogEntry, Surface } from "@hapi/protocol";
 import type { WebAppEnv } from "../web/middleware/auth";
@@ -119,18 +128,32 @@ function emptyStatic(): StaticCatalog {
  * is catalogued.
  */
 export function readCapabilityTag(handler: unknown): CatalogEntry | null {
-  if (typeof handler !== "function") return null;
+  return (readHandlerMark(handler, CAPABILITY_TAG) as CatalogEntry) || null;
+}
+
+/**
+ * True when a (possibly composed) Hono handler carries the closed-gate mark
+ * (`CLOSED_GATE_TAG`, issue #5571) — set by `operatorOnly(false)`. Reads through
+ * the same unwrap as {@link readCapabilityTag}, so "is it catalogued" and "is it
+ * closed" cannot disagree about which handler they look at.
+ */
+export function isClosedGate(handler: unknown): boolean {
+  return readHandlerMark(handler, CLOSED_GATE_TAG) === true;
+}
+
+/**
+ * Read a symbol-keyed mark off a Hono handler, directly or one composed hop
+ * down (3743-18) — the single unwrap behind {@link readCapabilityTag} and
+ * {@link isClosedGate}.
+ */
+function readHandlerMark(handler: unknown, key: symbol): unknown {
+  if (typeof handler !== "function") return undefined;
   const asRecord = handler as unknown as Record<PropertyKey, unknown>;
-  const direct = asRecord[CAPABILITY_TAG];
-  if (direct) return direct as CatalogEntry;
+  if (asRecord[key]) return asRecord[key];
   const composed = asRecord[COMPOSED_HANDLER_KEY];
-  if (typeof composed === "function") {
-    const nested = (composed as unknown as Record<PropertyKey, unknown>)[
-      CAPABILITY_TAG
-    ];
-    if (nested) return nested as CatalogEntry;
-  }
-  return null;
+  return typeof composed === "function"
+    ? (composed as unknown as Record<PropertyKey, unknown>)[key]
+    : undefined;
 }
 
 /**
@@ -148,23 +171,38 @@ function collectStaticCatalog(
     // so we fold the group and keep the tag if ANY member carries it.
     const groups = new Map<
       string,
-      { method: string; path: string; entry: CatalogEntry | null }
+      {
+        method: string;
+        path: string;
+        entry: CatalogEntry | null;
+        closed: boolean;
+      }
     >();
     for (const route of app.routes) {
       if (route.method === "ALL") continue; // middleware, never a capability (R5)
       const key = `${route.method} ${route.path}`;
       const tag = readCapabilityTag(route.handler);
+      const closed = isClosedGate(route.handler);
       const existing = groups.get(key);
       if (existing) {
         if (tag && !existing.entry) existing.entry = tag;
+        if (closed) existing.closed = true;
       } else {
-        groups.set(key, { method: route.method, path: route.path, entry: tag });
+        groups.set(key, {
+          method: route.method,
+          path: route.path,
+          entry: tag,
+          closed,
+        });
       }
     }
 
     const rest: CatalogEntry[] = [];
     const uncatalogedRest: UncatalogedRoute[] = [];
     for (const group of groups.values()) {
+      // #5571: a closed gate means this route answers 404 here — omit it from
+      // BOTH sections (non-advertisement, #2469/#2470).
+      if (group.closed) continue;
       if (group.entry) rest.push(group.entry);
       else uncatalogedRest.push({ method: group.method, path: group.path });
     }

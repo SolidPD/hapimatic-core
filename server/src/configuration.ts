@@ -250,6 +250,17 @@ export async function createConfiguration(): Promise<Configuration> {
 }
 
 /**
+ * Drop the memoized configuration so the next createConfiguration() reads the
+ * environment again. For tests that own a temp `HAPI_HOME`: without it, a later
+ * test file that shares the module registry (a non-isolated `bun test a b`)
+ * inherits a configuration whose `dataDir` an earlier file already deleted
+ * (#5228).
+ */
+export function resetConfigurationForTesting(): void {
+  _configuration = null;
+}
+
+/**
  * Get the initialized configuration.
  * Throws if createConfiguration() has not been called yet.
  */

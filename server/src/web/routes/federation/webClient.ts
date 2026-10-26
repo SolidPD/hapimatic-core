@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { Hono } from "hono";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
 import type { FederationDeps } from "./shared";
@@ -15,6 +17,9 @@ import {
   dismissPendingSpawn,
   listFederationForNamespace,
 } from "../../../sync/pendingSpawns";
+
+/** #5127: the statuses a key-bound remote spawn's refusal keeps. */
+const PASSED_REFUSAL_STATUSES = new Set([400, 403, 404, 409, 503]);
 
 export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
@@ -251,15 +256,21 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       }
 
       const body = await c.req.json().catch(() => null);
-      // Issue #4568 (R8): an API-key binding names a key in THIS node's vault, so
-      // it cannot bind a session on another node (vault keys never cross the
-      // federation, #1996). Refused loudly here — before the peer schema below
-      // silently strips the field and the remote session bills its own default.
-      if (
-        body &&
-        typeof body === "object" &&
-        (body as { apiKeyId?: unknown }).apiKeyId !== undefined
-      ) {
+      // Issue #4568 (R8): a BARE API-key id names a key in THIS node's vault, so
+      // it cannot bind a session on another node. Refused loudly here — before
+      // the peer schema below silently strips the field and the remote session
+      // bills its own default. Issue #5127: a QUALIFIED ref (`<uuid>@<home>`)
+      // names a key shared from its home, which the target fetches itself; it
+      // goes to the target's /federation/spawn-api-key below.
+      const requestedKey =
+        body && typeof body === "object"
+          ? (body as { apiKeyId?: unknown }).apiKeyId
+          : undefined;
+      const sharedKeyRef =
+        typeof requestedKey === "string" && isQualifiedApiKeyRef(requestedKey)
+          ? requestedKey
+          : undefined;
+      if (requestedKey !== undefined && sharedKeyRef === undefined) {
         return c.json(
           {
             type: "error",
@@ -345,6 +356,28 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
           nodeId,
           nodeLabel: registry.getNodeIdentity(nodeId)?.nodeLabel,
         });
+      }
+
+      // Issue #5127: a key-bound spawn goes to the target's own path, which
+      // confirms the key with its home before it accepts (or refuses with a
+      // code). The plain path is byte-identical.
+      if (sharedKeyRef !== undefined) {
+        const keyed = await registry.spawnApiKeyOnNode(nodeId, {
+          ...spawnBody,
+          apiKeyId: sharedKeyRef,
+        });
+        if (keyed.type === "error") {
+          if (spawnCorrelationId) dismissPendingSpawn(spawnCorrelationId);
+          const { status, ...answer } = keyed;
+          // Only a refusal status passes through (security review F3): a
+          // peer's 401 would make the web client sign the user out.
+          const passed =
+            status !== undefined && PASSED_REFUSAL_STATUSES.has(status)
+              ? status
+              : 502;
+          return c.json(answer, passed as ContentfulStatusCode);
+        }
+        return c.json(keyed);
       }
 
       const result = await registry.spawnOnNode(nodeId, spawnBody);

@@ -195,3 +195,12 @@ export const DEFAULT_FEDERATION_HEALTH_THRESHOLDS: FederationHealthThresholds =
     disk: { degraded: 80, warning: 90, critical: 95 },
     latency: { degraded: 500, warning: 1500, critical: 4000 },
   };
+
+// ─── Health disabled ─────────────────────────────────────────
+
+// Machine code on the 503 every health read route answers when this instance
+// runs no HealthAggregator (federation health monitoring is off). The `error`
+// string stays the human message; this code lets a client tell a deliberately
+// disabled feature from a broken route — `hapi capabilities audit --probe`
+// reports it as disabled, not as drift (issue #5212).
+export const FEDERATION_HEALTH_DISABLED_CODE = "federation_health_disabled";

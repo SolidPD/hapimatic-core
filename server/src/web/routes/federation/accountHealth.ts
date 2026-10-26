@@ -11,6 +11,7 @@ import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import { cataloged } from "../../../capabilities/cataloged";
 import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
 import { checkFederationToken, type FederationDeps } from "./shared";
+import { createDegradedLog, LOCAL_DEGRADED_LOG_KEY } from "./degradedLog";
 
 /**
  * Per-node account health (issue #4461, epic #4460 sub-issue A).
@@ -73,10 +74,10 @@ export function createFederationAccountHealthRoutes(
       if (row) {
         // ok() clears the throttle, so call it ONLY on a clean row: clearing it
         // before a dropped-entries warning would re-log that warning every poll.
-        if (!row.rejectedEntries) logOnce.ok(LOCAL_KEY);
+        if (!row.rejectedEntries) logOnce.ok(LOCAL_DEGRADED_LOG_KEY);
         else {
           logOnce.warn(
-            LOCAL_KEY,
+            LOCAL_DEGRADED_LOG_KEY,
             "rejected_entries",
             `[Federation] account-health: dropped ${row.rejectedEntries} local account record(s) that failed the whitelist schema`,
             { nodeId: identity.nodeId, rejectedEntries: row.rejectedEntries }
@@ -89,7 +90,7 @@ export function createFederationAccountHealthRoutes(
       failure = err instanceof Error ? err.message : String(err);
     }
     logOnce.warn(
-      LOCAL_KEY,
+      LOCAL_DEGRADED_LOG_KEY,
       "local_read_failed",
       `[Federation] account-health: this node's reader failed: ${failure}`,
       { nodeId: identity.nodeId }
@@ -255,46 +256,4 @@ export function createFederationAccountHealthRoutes(
   );
 
   return app;
-}
-
-/** The throttle key for this node's own reader (peer keys are their node ids). */
-const LOCAL_KEY = "\u0000local";
-
-/** How long a repeated, unchanged failure stays quiet in the log. */
-const DEGRADED_LOG_REPEAT_MS = 15 * 60_000;
-
-/**
- * A per-node log throttle for degraded account-health reads (issue #5420). The
- * aggregate is polled every 60 s by every open tab, and a peer receiver is hit by
- * every hub, so an unthrottled warning would write one row per poll. A failure is
- * logged when it first appears, again when its reason changes, and otherwise at
- * most once per {@link DEGRADED_LOG_REPEAT_MS}; a success clears the node so its
- * next failure logs at once. The map holds one entry per node, so it is bounded by
- * the mesh size.
- */
-function createDegradedLog(deps: FederationDeps) {
-  const last = new Map<string, { reason: string; at: number }>();
-  return {
-    warn(
-      key: string,
-      reason: string,
-      message: string,
-      context: Record<string, unknown>
-    ): void {
-      const t = Date.now();
-      const prev = last.get(key);
-      if (
-        prev &&
-        prev.reason === reason &&
-        t - prev.at < DEGRADED_LOG_REPEAT_MS
-      ) {
-        return;
-      }
-      last.set(key, { reason, at: t });
-      deps.errorLogger?.warn(message, { category: "federation", context });
-    },
-    ok(key: string): void {
-      last.delete(key);
-    },
-  };
 }

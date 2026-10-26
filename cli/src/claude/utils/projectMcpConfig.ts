@@ -11,19 +11,20 @@ import { isSafeMachinePath } from "@/modules/common/pathSecurity";
  * from generic transport/IO failures so callers can surface a "your Claude
  * config file is corrupt" diagnostic instead of a misleading
  * "transport_failed" error code.
+ *
+ * #5676: the message is fixed text and the parser error is NOT kept as
+ * `cause` — Bun's JSON.parse names an unquoted value verbatim, and this
+ * message is reported to the error log and returned to the client.
  */
 export class ConfigCorruptError extends Error {
   readonly path: string;
-  readonly cause: unknown;
-  constructor(path: string, cause: unknown) {
-    const causeMessage = cause instanceof Error ? cause.message : String(cause);
+  constructor(path: string) {
     super(
-      `Claude config at ${path} is not valid JSON: ${causeMessage}. ` +
+      `Claude config at ${path} is not valid JSON. ` +
         `Restore from backup or remove the corrupted entries.`
     );
     this.name = "ConfigCorruptError";
     this.path = path;
-    this.cause = cause;
   }
 }
 
@@ -134,8 +135,9 @@ export async function applyDisabledServerToggle(
       let config: ReturnType<typeof JSON.parse>;
       try {
         config = JSON.parse(raw);
-      } catch (err) {
-        throw new ConfigCorruptError(cfgPath, err);
+      } catch {
+        // #5676: fixed text, no cause — never the parser's own message.
+        throw new ConfigCorruptError(cfgPath);
       }
       config.projects ??= {};
       const project = (config.projects[projectDir] ??= {});
@@ -290,8 +292,9 @@ export async function applyPreTrustShim(
       let config: ReturnType<typeof JSON.parse>;
       try {
         config = JSON.parse(raw);
-      } catch (err) {
-        throw new ConfigCorruptError(cfgPath, err);
+      } catch {
+        // #5676: fixed text, no cause — never the parser's own message.
+        throw new ConfigCorruptError(cfgPath);
       }
 
       // Re-check after lock acquisition — another process may have written

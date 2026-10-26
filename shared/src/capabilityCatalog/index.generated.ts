@@ -307,6 +307,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "cli-token",
     "availability": {
+      "scope": "user"
+    },
+    "description": "Resolve an API-key reference to its label, masked form and home node for a spawning or relaunching session, asking the key's home node when it lives elsewhere. Never returns a key.",
+    "domain": "accounts",
+    "id": "accounts.cli-api-key-resolve",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/api-keys/resolve"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When the daemon or launcher checks a session's API-key binding."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Return the secret of an API key homed on another federation node, to the apiKeyHelper of a session bound to it on this host.",
+    "domain": "accounts",
+    "id": "accounts.cli-api-key-secret",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/api-keys/secret"
+    },
+    "probe": "skip",
+    "riskTier": "destructive",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "Only from a session's Claude Code apiKeyHelper, for a key stored on another node."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
       "scope": "operator"
     },
     "description": "Authenticate the CLI and register this machine with the server.",
@@ -488,6 +528,66 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Confirm one key THIS node shares and return its label, masked form and status, never the key.",
+    "domain": "accounts",
+    "id": "accounts.federation-api-keys-resolve",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/api-keys/resolve"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "Only node-to-node: a federation peer asking this node about a key it shares."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Return the secret of one key THIS node shares, to a federation peer whose session uses it. Audited; never generically invocable.",
+    "domain": "accounts",
+    "id": "accounts.federation-api-keys-secret",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/api-keys/secret"
+    },
+    "probe": "skip",
+    "riskTier": "destructive",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "Only node-to-node: a federation peer asking this node about a key it shares."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "List the Anthropic keys THIS node shares with its federation, redacted (label and masked form only, never a key).",
+    "domain": "accounts",
+    "id": "accounts.federation-api-keys-shared",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/api-keys/shared"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "Only node-to-node: a federation peer asking this node about a key it shares."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Return this node's sha256 refresh-token chain fingerprint for an account (never the raw token), so a peer can prove chain independence before rotating.",
     "domain": "accounts",
     "id": "accounts.federation-chain-fingerprint",
@@ -516,7 +616,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/federation/account-chain-fingerprints"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "off",
@@ -842,6 +942,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the user opens the API Keys settings page."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List the Anthropic keys a spawn on a given node may use: this node's keys and every federation node's shared keys, redacted, each with the reference the spawn must send.",
+    "domain": "accounts",
+    "id": "accounts.list-available-api-keys",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/api-keys/available"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the Create page offers API keys for a local or remote target."
   },
   {
     "auth": "jwt",
@@ -1195,7 +1315,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/accounts/usage/history"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -2003,6 +2123,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When a user creates a session targeted at this node's machine."
   },
   {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Spawn a Claude session on this node bound to an API key stored on another node; the key is confirmed with its home before the spawn is accepted.",
+    "domain": "federation",
+    "id": "federation.spawn-api-key",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/spawn-api-key"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a user creates a session on this node that bills an API key kept in another node's vault."
+  },
+  {
     "auth": "jwt",
     "availability": {
       "scope": "user"
@@ -2571,7 +2711,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/file-claims"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -3229,6 +3369,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the operator wants to see how a cloud VM's parity with RP1 has changed over time."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Return RP1's own parity summary (the hub row): RP1 checks itself against the declared operator profile nightly, recorded beside the VM parity records.",
+    "domain": "harness-admin",
+    "id": "harness-admin.api-admin-vms-parity-hub",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/admin-vms/parity-hub"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the operator wants to see whether RP1 itself still matches the declared profile."
   },
   {
     "auth": "jwt",
@@ -4072,7 +4232,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "jwt",
     "availability": {
-      "scope": "operator"
+      "scope": "user"
     },
     "description": "Report whether this instance is an operator instance that shows the feedback inbox; a non-operator instance answers 404.",
     "domain": "harness-admin",
@@ -4162,7 +4322,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/git/branches"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -4222,7 +4382,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/github/repo-issues"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -4242,7 +4402,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/github/repos"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -7823,6 +7983,206 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "jwt",
     "availability": {
+      "scope": "user"
+    },
+    "description": "Dismiss one of the caller's notifications (404 for an id outside the caller's namespace, 502 when a peer that may hold it did not answer); accepts an optional nodeId for a federated row.",
+    "domain": "notifications",
+    "id": "notifications.dismiss",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/notifications/:id/dismiss"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user dismisses a notification from the inbox."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Dismiss the caller's notifications from the last 48 hours on this node and its federated peers; 502 with failedNodes when a peer did not answer.",
+    "domain": "notifications",
+    "id": "notifications.dismiss-all",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/notifications/dismiss-all"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user clears the notifications inbox."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Dismiss one of this node's notifications for the caller namespace; 404 when the id is not in that namespace here.",
+    "domain": "notifications",
+    "id": "notifications.federation-dismiss",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/notifications/dismiss"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a federation hub dismisses a notification that lives on this peer node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Dismiss every one of this node's notifications for the caller namespace.",
+    "domain": "notifications",
+    "id": "notifications.federation-dismiss-all",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/notifications/dismiss-all"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a federation hub clears the inbox and this peer holds rows for the caller."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "List this node's notifications for the caller namespace, newest first, for a federation hub's merged inbox.",
+    "domain": "notifications",
+    "id": "notifications.federation-list",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/notifications/list"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a federation hub lists notifications that live on this peer node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Mark one of this node's notifications read for the caller namespace; 404 when the id is not in that namespace here.",
+    "domain": "notifications",
+    "id": "notifications.federation-read",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/notifications/read"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a federation hub marks read a notification that lives on this peer node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Count this node's unread notifications for the caller namespace, for a federation hub's merged badge.",
+    "domain": "notifications",
+    "id": "notifications.federation-unread-count",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/notifications/unread-count"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a federation hub counts unread notifications that live on this peer node."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List the caller's notifications from the last 48 hours, newest first, across federated nodes; supports unread=1, limit (max 200) and offset (max 1000; deeper answers 400).",
+    "domain": "notifications",
+    "id": "notifications.list",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/notifications"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When rendering the notifications inbox or checking recent session, account and node events."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Mark one of the caller's notifications read (404 for an id outside the caller's namespace, 502 when a peer that may hold it did not answer); accepts an optional nodeId for a federated row.",
+    "domain": "notifications",
+    "id": "notifications.mark-read",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/notifications/:id/read"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user opens a notification's detail."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Count the caller's notifications that are neither read nor dismissed, across federated nodes.",
+    "domain": "notifications",
+    "id": "notifications.unread-count",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/notifications/unread-count"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When rendering the unread badge on the settings gear."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
       "scope": "operator"
     },
     "description": "Report whether Configuration Porter is exposed on this instance (200 when exposed; 404 porter_withheld when withheld).",
@@ -8737,7 +9097,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/federation/session-metadata/spawn-roster"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "off",
@@ -10300,7 +10660,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/session-metadata/spawn-roster"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -11045,7 +11405,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/prediction-accuracy"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -11433,7 +11793,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/timelogs/summary/project-grouped"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -11453,7 +11813,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "method": "GET",
       "path": "/api/timelogs/summary/weekly"
     },
-    "probe": "safe",
+    "probe": "skip",
     "riskTier": "readonly",
     "surface": "rest",
     "telemetry": "sampled",
@@ -11521,6 +11881,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "off",
     "trusted": true,
     "whenToUse": "When an operator inspects how current each origin's turn mirror is on this node."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read whether the user skipped this instance's first-run backup-key step.",
+    "domain": "ui",
+    "id": "ui.backup-prompt-preference",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/preferences/backup-prompt"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the web app decides whether to present the first-run backup-key step."
   },
   {
     "auth": "jwt",
@@ -11750,6 +12130,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To point a human at the full sessions list."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Record that the user skipped (or un-skipped) this instance's first-run backup-key step. Never acknowledges or touches the backup key itself.",
+    "domain": "ui",
+    "id": "ui.set-backup-prompt-preference",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/preferences/backup-prompt"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user skips the first-run backup-key step, so it is not presented again."
   },
   {
     "auth": "jwt",
@@ -12004,7 +12404,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "The Notifications page — the notification settings.",
+    "description": "The Notifications page — notification settings and the 48-hour inbox.",
     "domain": "ui",
     "id": "ui.settings-notifications",
     "invocation": {
@@ -12016,7 +12416,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "ui",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "To point a human at their notification settings."
+    "whenToUse": "To point a human at their notification settings or their recent notifications."
   },
   {
     "auth": "jwt",

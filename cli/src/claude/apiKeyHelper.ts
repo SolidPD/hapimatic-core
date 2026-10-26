@@ -21,9 +21,17 @@
  * key the helper last returned and keeps using it until a request is rejected,
  * so removing a key from the vault does not stop a running session from
  * billing it — the same lifetime the earlier env delivery had.
+ *
+ * Issue #5127: a key homed on another federation node is bound by a qualified
+ * ref (`<uuid>@<homeNodeId>`). Its secret is not in this vault, so the helper
+ * asks this host's own server for it (`fetchSharedApiKeySecret`, which asks the
+ * home), naming the session it serves (`--session`). A bare id keeps the vault
+ * path above, unchanged.
  */
 
+import { parseApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { readSettings } from "@/persistence";
+import { fetchSharedApiKeySecret } from "@/apiKeys/sharedKeyClient";
 import {
   readVaultApiKey,
   type VaultKeyEntry,
@@ -34,14 +42,20 @@ export interface ApiKeyHelperIo {
   stderr: (text: string) => void;
   /** Defaults to the node vault (`readSettings().apiKeys`). */
   readApiKeys?: () => Promise<VaultKeyEntry[] | undefined>;
+  /** Defaults to `fetchSharedApiKeySecret` (#5127, a key on another node). */
+  fetchSharedSecret?: typeof fetchSharedApiKeySecret;
 }
 
 export interface ApiKeyHelperArgs {
   apiKeyId?: string;
   masked?: string;
+  sessionId?: string;
 }
 
-/** Parse `--id <vault id> [--mask <recorded mask>]`. Unknown flags are ignored. */
+/**
+ * Parse `--id <vault id or ref> [--mask <recorded mask>] [--session <id>]`.
+ * Unknown flags are ignored.
+ */
 export function parseApiKeyHelperArgs(args: string[]): ApiKeyHelperArgs {
   const parsed: ApiKeyHelperArgs = {};
   for (let i = 0; i < args.length; i++) {
@@ -53,6 +67,9 @@ export function parseApiKeyHelperArgs(args: string[]): ApiKeyHelperArgs {
     } else if (flag === "--mask" && value !== undefined) {
       parsed.masked = value;
       i++;
+    } else if (flag === "--session" && value !== undefined) {
+      parsed.sessionId = value;
+      i++;
     }
   }
   return parsed;
@@ -63,10 +80,14 @@ export async function runApiKeyHelper(
   args: string[],
   io: ApiKeyHelperIo
 ): Promise<number> {
-  const { apiKeyId, masked } = parseApiKeyHelperArgs(args);
+  const { apiKeyId, masked, sessionId } = parseApiKeyHelperArgs(args);
   if (!apiKeyId) {
     io.stderr("api-key-helper: --id <vault key id> is required\n");
     return 2;
+  }
+  const ref = parseApiKeyRef(apiKeyId);
+  if (ref?.homeNodeId) {
+    return runSharedApiKeyHelper(apiKeyId, masked, sessionId, io);
   }
   let apiKeys: VaultKeyEntry[] | undefined;
   try {
@@ -83,5 +104,35 @@ export async function runApiKeyHelper(
     return 1;
   }
   io.stdout(result.key);
+  return 0;
+}
+
+/**
+ * #5127: the secret of a key homed on another node, through this host's own
+ * server. The server's refusal message names the key by label or mask and the
+ * home node; nothing else reaches stderr.
+ */
+async function runSharedApiKeyHelper(
+  ref: string,
+  masked: string | undefined,
+  sessionId: string | undefined,
+  io: ApiKeyHelperIo
+): Promise<number> {
+  if (!sessionId || !masked) {
+    io.stderr(
+      "api-key-helper: a key from another node needs --session <id> and --mask <mask>\n"
+    );
+    return 2;
+  }
+  const result = await (io.fetchSharedSecret ?? fetchSharedApiKeySecret)({
+    ref,
+    expectedMasked: masked,
+    sessionId,
+  });
+  if (!result.ok) {
+    io.stderr(`api-key-helper: ${result.message}\n`);
+    return 1;
+  }
+  io.stdout(result.apiKey);
   return 0;
 }

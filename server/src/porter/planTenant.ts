@@ -177,7 +177,8 @@ async function isRealDir(p: string): Promise<boolean> {
  * Plan and stage the manifest's `memory` section. Returns the staged file
  * items, the notices (a project not present here), and the policy refusals (a
  * member outside its entry's folder, a credential-bearing name, an invalid
- * entry). A link member, or a `..` member that leaves the config root, still
+ * entry). In an import a link member never reaches here: `planImport` refuses
+ * the archive first (#4294). A `..` member that leaves the config root still
  * refuses the whole archive through `assertSafeEntry`, as a section member
  * does.
  */

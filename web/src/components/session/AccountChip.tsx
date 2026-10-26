@@ -85,6 +85,10 @@ export function AccountChip(props: {
   dashed?: boolean;
   /** Character budget for the label (default `ACCOUNT_CHIP_MAX_CHARS`). */
   maxChars?: number;
+  /** #3982: the auto-colour hash seed for an email-less account (a provider
+   * account passes its uuid — the same `email || uuid` seed AccountMonogramEditor
+   * previews). Absent ⇒ the email, so every existing chip is byte-identical. */
+  colorSeed?: string;
   className?: string;
 }) {
   const {
@@ -94,6 +98,7 @@ export function AccountChip(props: {
     compact = false,
     dashed = false,
     maxChars = ACCOUNT_CHIP_MAX_CHARS,
+    colorSeed,
     className = "",
   } = props;
   const fullLabel = (label ?? "").trim() || accountShortName(email);
@@ -102,7 +107,7 @@ export function AccountChip(props: {
   // default (derived letter / per-email hash color), so R4 holds byte-identical.
   const monoColorClass = monogram?.color
     ? MONO_CLASS_BY_ID[monogram.color]
-    : accountMonogramColor(email);
+    : accountMonogramColor(colorSeed ?? email);
   // A pinned override may be one OR two letters (ACCOUNT_MONO_MAX_CHARS); the
   // slice is a defensive cap on a hand-edited sidecar file. Auto stays the
   // single initial.
@@ -113,7 +118,9 @@ export function AccountChip(props: {
   return (
     <span
       data-testid="account-chip"
-      title={fullLabel === email ? email : `${fullLabel} · ${email}`}
+      title={
+        !email || fullLabel === email ? fullLabel : `${fullLabel} · ${email}`
+      }
       className={`inline-flex min-w-0 max-w-full items-center gap-0.5 whitespace-nowrap rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] py-0.5 pl-0.5 text-[length:var(--text-caption-xs)] font-semibold leading-none text-[var(--app-fg)] ${
         compact ? "pr-0.5" : "pr-1"
       } ${dashed ? "border-dashed" : ""} ${className}`} /* gap-0.5 + pr-1 (was gap-1 + pr-1.5): the chip's fixed chrome drops 28→24px so the nickname gets 52px of the 76px cell — on-device (iOS SF Pro) "Matt [NF]" ellipsized at 48px (2026-09-06 review) */

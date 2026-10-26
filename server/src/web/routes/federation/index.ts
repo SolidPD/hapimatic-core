@@ -16,6 +16,7 @@ import { createQueueMutationRoutes } from "./queueMutations";
 import { createFederationAccountRoutes } from "./accounts";
 import { createFederationAccountHealthRoutes } from "./accountHealth";
 import { createFederationAnthropicLoginRoutes } from "./anthropicLogin";
+import { createFederationApiKeyRoutes } from "./apiKeys";
 import { createFederationCapacityRoutes } from "./capacity";
 import { createFederationUsageRoutes } from "./usage";
 import { createFederationAccountLeaseRoutes } from "./accountLease";
@@ -26,6 +27,7 @@ import { createFederationTelemetryRoutes } from "./telemetry";
 import { createFederationTurnFeedRoutes } from "./turnFeed";
 import { createFederationSpawnRosterRoutes } from "./spawnRoster";
 import { createFederationCapabilitiesRoutes } from "./capabilities";
+import { createFederationNotificationRoutes } from "./notifications";
 
 export type { FederationDeps } from "./shared";
 
@@ -60,6 +62,10 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   // start/complete receivers (fed-token POST), advertised as
   // ANTHROPIC_LOGIN_CAPABILITY.
   app.route("/", createFederationAnthropicLoginRoutes(deps));
+  // Issue #5127: shared API keys, home side — list / resolve / secret receivers
+  // (fed-token POST, Tailscale or same-host only, audited), advertised as
+  // SHARED_API_KEYS_CAPABILITY.
+  app.route("/", createFederationApiKeyRoutes(deps));
   // Issue #1805 (R11): node-to-node set-max-concurrency receiver.
   app.route("/", createFederationCapacityRoutes(deps));
   // Epic #1855 (Sub-Issue C #1858): federation usage aggregator (JWT GET) +
@@ -88,5 +94,8 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   // GET /federation/capabilities/catalog (fed-token authed, serves the owning
   // binary's catalog for the hub's ?nodeId= proxy).
   app.route("/", createFederationCapabilitiesRoutes(deps));
+  // Issue #4913: peer-incoming notification receivers (fed-token + caller
+  // namespace, local rows only) behind the hub's /api/notifications fan-out.
+  app.route("/", createFederationNotificationRoutes(deps));
   return app;
 }

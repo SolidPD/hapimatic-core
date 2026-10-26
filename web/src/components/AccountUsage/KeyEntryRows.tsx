@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import type { AccountMonogram, ProviderId } from "@hapi/protocol";
 import {
   API_KEY_NAME_MAX_CHARS,
@@ -16,10 +17,15 @@ import {
 import { accountMonogram } from "@/components/session/accountLabel";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { useApiKeyActions } from "@/hooks/mutations/useApiKeyActions";
+import { useShareApiKeysByDefault } from "@/hooks/useShareApiKeysByDefault";
+import { ShareAcrossNodesCheckbox } from "@/components/ShareAcrossNodesCheckbox";
 import { apiKeyDisplayName } from "@/lib/apiKeyStatus";
+import { queryKeys } from "@/lib/query-keys";
 import {
+  addErrorLeftKeyStored,
   describeAddKeyError,
   describeValidKey,
+  keyKeptByServer,
   parseKeyLines,
   rowNeedsAdd,
   vaultProviderFor,
@@ -62,7 +68,8 @@ export type KeyRowsApi = ReturnType<typeof useKeyRows>;
  * The API-key rows' state (R5–R7), owned by the "+ Add" modal so Done can see
  * every untested row. Test and Done both call #4463's validate-then-store add in
  * append mode; a row becomes `passed` only on success, because under D-1 A a key
- * that does not validate is never stored.
+ * that does not validate is never stored. A row whose key the server kept after
+ * a failed add is final and is never sent again (#5646).
  */
 export function useKeyRows(
   api: ApiClient | null,
@@ -73,9 +80,27 @@ export function useKeyRows(
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
   const { add } = useApiKeyActions(api);
+  const queryClient = useQueryClient();
   // Each row's running validate-then-store, so Done can wait for a Test that is
   // still in flight instead of closing over it.
   const inflightRef = useRef(new Map<string, Promise<boolean>>());
+  // Issue #5127: the batch's "Make available to all nodes" box — one value for
+  // every row, Anthropic only. It starts from the preference until the user
+  // touches it, and every Anthropic add sends it explicitly (D7).
+  const shareDefault = useShareApiKeysByDefault(api);
+  const [shareAcrossNodes, setShareState] = useState(shareDefault.enabled);
+  const shareTouchedRef = useRef(false);
+  useEffect(() => {
+    if (!shareTouchedRef.current) setShareState(shareDefault.enabled);
+  }, [shareDefault.enabled]);
+  const shareRef = useRef(shareAcrossNodes);
+  shareRef.current = shareAcrossNodes;
+  const shareLoadedRef = useRef(shareDefault.loaded);
+  shareLoadedRef.current = shareDefault.loaded;
+  const setShareAcrossNodes = useCallback((next: boolean) => {
+    shareTouchedRef.current = true;
+    setShareState(next);
+  }, []);
 
   const update = useCallback((rowId: string, patch: Partial<KeyRow>) => {
     setRows(prev =>
@@ -83,8 +108,13 @@ export function useKeyRows(
         prev.map(r => {
           if (r.rowId !== rowId) return r;
           const next = { ...r, ...patch };
-          // Editing the key of a failed row clears its old error.
-          if (patch.key !== undefined && r.status.kind === "failed") {
+          // Editing the key of a failed row clears its old error — unless the
+          // server kept that row's key, which keeps its notice (#5646 F1).
+          if (
+            patch.key !== undefined &&
+            r.status.kind === "failed" &&
+            !keyKeptByServer(r.status)
+          ) {
             next.status = { kind: "draft" };
           }
           return next;
@@ -110,11 +140,27 @@ export function useKeyRows(
       setStatus({ kind: "testing" });
       try {
         const name = row.name.trim();
+        const vaultProvider = vaultProviderFor(provider);
+        // An add made before the preference was read must not send the
+        // pre-read default (code review F7): wait for the read (bounded).
+        for (
+          let waited = 0;
+          vaultProvider === "anthropic" &&
+          !shareLoadedRef.current &&
+          !shareTouchedRef.current &&
+          waited < 5_000;
+          waited += 100
+        ) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
         const stored = await add.mutateAsync({
-          provider: vaultProviderFor(provider),
+          provider: vaultProvider,
           key: row.key.trim(),
           mode: "append",
           validate: true,
+          ...(vaultProvider === "anthropic"
+            ? { shareAcrossNodes: shareRef.current }
+            : {}),
           ...(name ? { label: name } : {}),
           ...(row.monogram && Object.keys(row.monogram).length > 0
             ? { monogram: row.monogram }
@@ -134,14 +180,28 @@ export function useKeyRows(
         );
         return true;
       } catch (err) {
-        setStatus({
-          kind: "failed",
-          message: describeAddKeyError(err, uiNodeLabel),
-        });
+        // #5429: the server kept this key (its rollback failed), so refresh the
+        // key list — the row tells the user to remove it, and the list on the
+        // page only refreshes on a successful add.
+        const keyStored = addErrorLeftKeyStored(err);
+        if (keyStored) {
+          void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
+        }
+        // #5646 F1: a kept key makes the row final. Drop the raw secret, as a
+        // pass does, so Done and Test never send it again (that would only
+        // answer 409 and replace the remove-first text).
+        setStatus(
+          {
+            kind: "failed",
+            message: describeAddKeyError(err, uiNodeLabel),
+            ...(keyStored ? { keyStored: true as const } : {}),
+          },
+          keyStored
+        );
         return false;
       }
     },
-    [add, provider, uiNodeLabel]
+    [add, provider, uiNodeLabel, queryClient]
   );
 
   /** Validate, then store one row. Resolves true when the row passed. A row
@@ -201,6 +261,8 @@ export function useKeyRows(
     savedCount,
     pendingCount,
     testingCount,
+    shareAcrossNodes,
+    setShareAcrossNodes,
   };
 }
 
@@ -233,7 +295,8 @@ function KeyMonogramPill(props: {
  * STORED keys); this one ENTERS new keys.
  *
  * The section always writes the UI host node's vault, whatever node the login
- * radio selects: there is no federation key store until #1996.
+ * radio selects. #5127: an Anthropic key can be made available to the other
+ * nodes (the batch's checkbox); it still stays stored on this node.
  */
 export function KeyEntryRows(props: {
   api: ApiClient | null;
@@ -286,6 +349,9 @@ export function KeyEntryRows(props: {
           const name = stored?.label ?? row.name;
           const monogram = stored?.monogram ?? row.monogram;
           const testing = row.status.kind === "testing";
+          // #5646 F1: the server kept this row's key after a failed add, so
+          // the row is final: its key, name, monogram and Test controls lock.
+          const keptKey = keyKeptByServer(row.status);
           return (
             <li
               key={row.rowId}
@@ -299,7 +365,7 @@ export function KeyEntryRows(props: {
                   variant="ghostStatic"
                   size="bare"
                   aria-label="Edit name and monogram"
-                  disabled={testing}
+                  disabled={testing || keptKey}
                   onClick={() => setEditing(row.rowId)}
                   className="shrink-0"
                   data-testid="key-row-monogram"
@@ -316,7 +382,7 @@ export function KeyEntryRows(props: {
                   placeholder="Name"
                   maxLength={API_KEY_NAME_MAX_CHARS}
                   value={name}
-                  readOnly={Boolean(passed) || testing}
+                  readOnly={Boolean(passed) || testing || keptKey}
                   onChange={e =>
                     keyRows.update(row.rowId, { name: e.target.value })
                   }
@@ -338,7 +404,7 @@ export function KeyEntryRows(props: {
                     autoComplete="off"
                     spellCheck={false}
                     value={row.key}
-                    disabled={testing}
+                    disabled={testing || keptKey}
                     onChange={e =>
                       keyRows.update(row.rowId, { key: e.target.value })
                     }
@@ -360,7 +426,7 @@ export function KeyEntryRows(props: {
                     size="sm"
                     variant="outline"
                     className="w-14 shrink-0"
-                    disabled={testing || row.key.trim() === ""}
+                    disabled={testing || keptKey || row.key.trim() === ""}
                     onClick={() => void keyRows.addRow(row.rowId)}
                     data-testid="key-row-test"
                   >
@@ -435,9 +501,21 @@ export function KeyEntryRows(props: {
           </div>
         )}
       </div>
-      <p className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
-        Stored on {uiNodeLabel} only, until key sync lands (#1996)
-      </p>
+      {vaultProvider === "anthropic" ? (
+        <>
+          <ShareAcrossNodesCheckbox
+            checked={keyRows.shareAcrossNodes}
+            onChange={keyRows.setShareAcrossNodes}
+          />
+          <p className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
+            Stored on {uiNodeLabel}
+          </p>
+        </>
+      ) : (
+        <p className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
+          Stored on {uiNodeLabel} only
+        </p>
+      )}
       {editingRow && (
         <AccountMonogramEditor
           api={api}

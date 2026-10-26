@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { gunzipSync } from "node:zlib";
+import { promisify } from "node:util";
+import { gunzip, gunzipSync } from "node:zlib";
 import { ARCHIVE_LIMITS } from "@hapi/protocol/porter";
 import type { ArchiveEntryKind } from "./archiveContainment";
 
@@ -305,66 +306,148 @@ function cString(s: string): string {
   return nul === -1 ? s : s.slice(0, nul);
 }
 
+/** The inflate bound for an archive, and which F9 cap it comes from. */
+export interface InflateBound {
+  maxOutputLength: number;
+  limit: "maxDecompressionRatio" | "maxTotalUncompressedBytes";
+}
+
 /**
- * Decompress a `.tar.gz` buffer to its uncompressed tar bytes, enforcing the
- * compressed-size cap, the total-uncompressed cap, and the decompression-ratio
- * cap (F9). `maxOutputLength` makes `gunzipSync` itself refuse a bomb before it
- * allocates gigabytes.
+ * The most bytes an archive of `compressedBytes` may inflate to: the smaller of
+ * the total cap and the ratio cap × the compressed size (#5228). Passed to zlib
+ * as `maxOutputLength`, so the ratio cap stops inflation instead of being
+ * checked after it (a ~200 KB bomb used to inflate to 200 MiB first). Never
+ * below 1, because zlib refuses a `maxOutputLength` of 0.
  */
-export function decompressArchive(compressed: Uint8Array): Buffer {
+export function inflateBound(compressedBytes: number): InflateBound {
+  const byRatio = Math.floor(
+    compressedBytes * ARCHIVE_LIMITS.maxDecompressionRatio
+  );
+  if (byRatio < ARCHIVE_LIMITS.maxTotalUncompressedBytes) {
+    return {
+      maxOutputLength: Math.max(1, byRatio),
+      limit: "maxDecompressionRatio",
+    };
+  }
+  return {
+    maxOutputLength: ARCHIVE_LIMITS.maxTotalUncompressedBytes,
+    limit: "maxTotalUncompressedBytes",
+  };
+}
+
+/** The compressed-size check, then the archive as a Buffer for zlib. */
+function compressedInput(compressed: Uint8Array): Buffer {
   if (compressed.byteLength > ARCHIVE_LIMITS.maxCompressedBytes) {
     throw new ArchiveLimitError(
       "maxCompressedBytes",
       `${compressed.byteLength} bytes > ${ARCHIVE_LIMITS.maxCompressedBytes}`
     );
   }
-  const input = Buffer.from(
+  return Buffer.from(
     compressed.buffer,
     compressed.byteOffset,
     compressed.byteLength
   );
+}
 
-  let out: Buffer;
-  try {
-    out = gunzipSync(input, {
-      maxOutputLength: ARCHIVE_LIMITS.maxTotalUncompressedBytes,
-    });
-  } catch (err) {
-    // node:zlib throws ERR_BUFFER_TOO_LARGE when output would exceed
-    // maxOutputLength — that is the bomb signal.
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ERR_BUFFER_TOO_LARGE") {
-      throw new ArchiveLimitError(
-        "maxTotalUncompressedBytes",
-        `decompressed output exceeds ${ARCHIVE_LIMITS.maxTotalUncompressedBytes} bytes`
-      );
-    }
-    throw new TarParseError(
-      `gzip decompression failed: ${err instanceof Error ? err.message : String(err)}`
+/** Map a zlib failure to the typed error the import routes classify. */
+function inflateError(err: unknown, bound: InflateBound): Error {
+  // node:zlib throws ERR_BUFFER_TOO_LARGE when output would exceed
+  // maxOutputLength — that is the bomb signal.
+  if ((err as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") {
+    // The plan route shows this text to the user, so a ratio refusal names the
+    // ratio, not only a byte count that looks small for a small archive.
+    const cause =
+      bound.limit === "maxDecompressionRatio"
+        ? ` (more than ${ARCHIVE_LIMITS.maxDecompressionRatio} × the compressed size)`
+        : "";
+    return new ArchiveLimitError(
+      bound.limit,
+      `decompressed output exceeds ${bound.maxOutputLength} bytes${cause}`
     );
   }
+  return new TarParseError(
+    `gzip decompression failed: ${err instanceof Error ? err.message : String(err)}`
+  );
+}
 
-  // Belt to the maxOutputLength braces (in case a runtime does not honour it).
+/** Belt to the maxOutputLength braces (in case a runtime does not honour it). */
+function checkInflated(out: Buffer, compressedBytes: number): Buffer {
   if (out.byteLength > ARCHIVE_LIMITS.maxTotalUncompressedBytes) {
     throw new ArchiveLimitError(
       "maxTotalUncompressedBytes",
       `${out.byteLength} bytes > ${ARCHIVE_LIMITS.maxTotalUncompressedBytes}`
     );
   }
-  // Decompression-ratio guard: a compressed cap alone lets a high-ratio bomb
-  // through under the total cap.
   if (
-    compressed.byteLength > 0 &&
-    out.byteLength / compressed.byteLength >
-      ARCHIVE_LIMITS.maxDecompressionRatio
+    compressedBytes > 0 &&
+    out.byteLength / compressedBytes > ARCHIVE_LIMITS.maxDecompressionRatio
   ) {
     throw new ArchiveLimitError(
       "maxDecompressionRatio",
-      `ratio ${(out.byteLength / compressed.byteLength).toFixed(1)} > ` +
+      `ratio ${(out.byteLength / compressedBytes).toFixed(1)} > ` +
         `${ARCHIVE_LIMITS.maxDecompressionRatio}`
     );
   }
   return out;
+}
+
+/**
+ * Decompress a `.tar.gz` buffer to its uncompressed tar bytes, enforcing the
+ * compressed-size cap, the total-uncompressed cap, and the decompression-ratio
+ * cap (F9). The ratio cap binds DURING inflation via {@link inflateBound}
+ * (#5228). Synchronous: kept for tools and tests; the server's import path uses
+ * {@link decompressArchiveAsync}, which does not block the event loop.
+ */
+export function decompressArchive(compressed: Uint8Array): Buffer {
+  const input = compressedInput(compressed);
+  const bound = inflateBound(compressed.byteLength);
+  let out: Buffer;
+  try {
+    out = gunzipSync(input, { maxOutputLength: bound.maxOutputLength });
+  } catch (err) {
+    throw inflateError(err, bound);
+  }
+  return checkInflated(out, compressed.byteLength);
+}
+
+const gunzipAsync = promisify(gunzip);
+
+/**
+ * One inflate in flight at a time (#5228). The synchronous inflate ran one
+ * archive at a time by blocking the loop; this queue keeps that bound for the
+ * inflate step, so concurrent uploads never inflate side by side. It does not
+ * bound what a finished plan holds afterwards (`planImport` keeps its entries
+ * across later awaits, as it did before).
+ */
+let inflateQueue: Promise<unknown> = Promise.resolve();
+
+function oneAtATime<T>(task: () => Promise<T>): Promise<T> {
+  const run = inflateQueue.then(task, task);
+  inflateQueue = run.catch(() => undefined);
+  return run;
+}
+
+/**
+ * {@link decompressArchive} with the same caps, inflated on zlib's thread pool
+ * so a large archive does not stall every other request (#5228).
+ */
+export function decompressArchiveAsync(
+  compressed: Uint8Array
+): Promise<Buffer> {
+  return oneAtATime(async () => {
+    const input = compressedInput(compressed);
+    const bound = inflateBound(compressed.byteLength);
+    let out: Buffer;
+    try {
+      out = await gunzipAsync(input, {
+        maxOutputLength: bound.maxOutputLength,
+      });
+    } catch (err) {
+      throw inflateError(err, bound);
+    }
+    return checkInflated(out, compressed.byteLength);
+  });
 }
 
 /**
@@ -574,4 +657,11 @@ export function parseTar(buf: Buffer): TarEntry[] {
 /** Decompress + parse a `.tar.gz` in one call. */
 export function parseTarGz(compressed: Uint8Array): TarEntry[] {
   return parseTar(decompressArchive(compressed));
+}
+
+/** {@link parseTarGz} with the asynchronous, one-at-a-time inflate (#5228). */
+export async function parseTarGzAsync(
+  compressed: Uint8Array
+): Promise<TarEntry[]> {
+  return parseTar(await decompressArchiveAsync(compressed));
 }

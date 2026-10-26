@@ -338,6 +338,17 @@ export function toLastValidation(
   };
 }
 
+/** KD-1 sticky last-known-good (#5429): a `transient` probe of a key whose
+ *  prior status is 🟢 valid changes nothing the user sees — neither the
+ *  status nor the last good probe's figures. One predicate for both, so the
+ *  status rule and the details rule cannot drift apart. Pure. */
+export function keepsLastKnownGood(
+  prior: ApiKeyStatus | undefined,
+  outcome: ProbeOutcome
+): boolean {
+  return outcome === "transient" && prior === "valid";
+}
+
 /**
  * Status state machine (KD-1). A `transient` outcome resolves to 🟠 unverified
  * UNLESS the prior status was 🟢 valid — in which case the known-good status is
@@ -354,7 +365,7 @@ export function applyTransition(
     case "invalid":
       return "invalid";
     case "transient":
-      return prior === "valid" ? "valid" : "unverified";
+      return keepsLastKnownGood(prior, outcome) ? "valid" : "unverified";
     case "unsupported":
       return "unverified";
   }
@@ -389,6 +400,11 @@ export interface ValidateApiKeyOptions {
  * back (the old shape) erased any key added — and resurrected any key deleted —
  * while the probe was in flight. A key removed during the probe answers
  * `not_found` and nothing is written; other entries are never rewritten.
+ *
+ * #5429 S2: a transient re-test of a 🟢 valid key keeps its last
+ * `lastValidation` (the reachable-model count it last reported). Its
+ * `lastValidatedAt` still advances, so the TTL cache throttles re-probes of a
+ * provider that is down.
  */
 export async function validateApiKeyById(
   settingsFile: string,
@@ -428,11 +444,14 @@ export async function validateApiKeyById(
       const idx = entries.findIndex(e => e.id === id);
       if (idx === -1) return fresh;
       const current = entries[idx]!;
+      // `current` is spread, so keeping it leaves `lastValidation` exactly as
+      // stored — including absent on an entry that never had one.
+      const keep = keepsLastKnownGood(current.status, probe.outcome);
       const next: StoredApiKey = {
         ...current,
         status: applyTransition(current.status, probe.outcome),
         lastValidatedAt: new Date(now()).toISOString(),
-        lastValidation: toLastValidation(probe),
+        ...(keep ? {} : { lastValidation: toLastValidation(probe) }),
       };
       applied.entry = next;
       return {

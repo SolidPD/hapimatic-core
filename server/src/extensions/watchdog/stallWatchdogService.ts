@@ -19,7 +19,7 @@
 import type { Session, SyncEngine } from "../../sync/syncEngine";
 import type { PushService } from "../../push/pushService";
 import type { Store } from "../../store";
-import { getSessionName } from "../../notifications/sessionInfo";
+import { buildSessionPushPayloadFromSession } from "../../push/sessionPushPayload";
 import { configuration } from "../../configuration";
 import { loadStallWatchdogConfig } from "./config";
 import type {
@@ -266,21 +266,19 @@ export class StallWatchdogService {
     session: Session,
     event: StallEvent
   ): Promise<void> {
-    const name = getSessionName(session);
-    const emoji = session.emoji ? `${session.emoji} ` : "";
     const durationMin = Math.round(event.thinkingDurationMs / 60_000);
 
     try {
-      await this.pushService.sendToNamespace(session.namespace, {
-        title: `${emoji}Stall Detected`,
-        body: `${name} has been thinking for ${durationMin}+ min with no progress`,
-        tag: `stall-${session.id}`,
-        data: {
-          type: "stall-detected",
-          sessionId: session.id,
-          url: `/sessions/${session.id}`,
-        },
-      });
+      // #4921: titled by the session; the event is the body.
+      await this.pushService.sendToNamespace(
+        session.namespace,
+        buildSessionPushPayloadFromSession(
+          session,
+          "stall",
+          "stall-detected",
+          `Stall detected: thinking for ${durationMin}+ min with no progress`
+        )
+      );
     } catch (error) {
       console.error(
         `[StallWatchdog] Failed to send notification for ${session.id}:`,

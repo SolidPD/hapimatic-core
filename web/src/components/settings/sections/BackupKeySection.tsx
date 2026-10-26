@@ -17,7 +17,9 @@ import { Button } from "@/components/ui/button";
  * the private key escapes the VM; the operator never sees or holds it.
  *
  * 🔴 The revealed identity is held in component state only (never the query
- * cache) and cleared on acknowledgement, so it does not linger in client memory.
+ * cache) and cleared on acknowledgement, and the reveal mutation is detached then
+ * so its `gcTime: 0` evicts it from the MutationCache (#4791 R9): it does not
+ * linger in client memory.
  *
  * Full-width inside the drawer; does NOT attach its own useSwipeBack (SettingsDrawer
  * owns the single swipe-back handler). Mirrors `apiKeys.tsx` for layout + styling.
@@ -54,11 +56,14 @@ export function BackupKeySection() {
 
   const handleAcknowledge = () => {
     acknowledge.mutate(undefined, {
-      // Clear the secret from component memory the moment the VM shreds it.
+      // Clear the secret from component memory the moment the VM shreds it, and
+      // detach the reveal mutation so its `gcTime: 0` evicts the identity from
+      // TanStack's MutationCache too (#4791 R9).
       onSuccess: () => {
         setRevealedIdentity(null);
         setSavedChecked(false);
         setCopied(false);
+        reveal.reset();
       },
     });
   };
@@ -147,7 +152,8 @@ export function BackupKeySection() {
                   className="text-[length:var(--text-body)]"
                   style={{ color: "var(--status-hot)" }}
                 >
-                  Could not finish. Your key was NOT deleted — try again.
+                  Could not confirm that the VM deleted its copy. Keep your
+                  saved copy, then try again.
                 </p>
               )}
             </div>

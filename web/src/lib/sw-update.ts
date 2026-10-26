@@ -178,9 +178,7 @@ export function registerServiceWorker(): void {
           markSwUpdateAvailable();
         }
 
-        reg.addEventListener("updatefound", () => {
-          const installing = reg.installing;
-          if (!installing) return;
+        const watchInstalling = (installing: ServiceWorker) => {
           installing.addEventListener("statechange", () => {
             if (installing.state !== "installed") return;
             if (swContainer.controller) {
@@ -190,6 +188,17 @@ export function registerServiceWorker(): void {
               console.log("App ready for offline use");
             }
           });
+        };
+
+        // #4924: a page that loads while a new worker is still installing (for
+        // example the reload from a stalled update tap) has already missed that
+        // worker's `updatefound`, so watch it directly. A duplicate listener is
+        // harmless: markSwUpdateAvailable() is idempotent.
+        if (reg.installing) watchInstalling(reg.installing);
+
+        reg.addEventListener("updatefound", () => {
+          const installing = reg.installing;
+          if (installing) watchInstalling(installing);
         });
 
         updateTimer = setInterval(

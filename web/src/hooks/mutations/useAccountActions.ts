@@ -6,8 +6,10 @@ import type {
   AccountUsageResponse,
   RedactedAccount,
   InVmLoginStartResponse,
+  NodeActiveAccountResponse,
   SetSessionPaymentMethodRequest,
 } from "@/types/api";
+import type { ProviderId } from "@hapi/protocol";
 import { queryKeys } from "@/lib/query-keys";
 import { useToast } from "@/components/Toast";
 import { reloginToastFromError } from "@/lib/reloginLink";
@@ -113,9 +115,15 @@ function mapSwitchErrorText(err: unknown, code: string | undefined): string {
 
 export function useAccountActions(
   api: ApiClient | null,
-  opts?: { sessionId?: string; nodeId?: string }
+  // #3973: `nodeLabel` names the node in the per-node set-active toast.
+  opts?: { sessionId?: string; nodeId?: string; nodeLabel?: string }
 ): {
-  selectAccount: (accountUuid: string) => Promise<void>;
+  /** #3982: `provider` sets that provider's per-node default (node scope only);
+   *  absent ⇒ the Anthropic default, byte-identical to before. */
+  selectAccount: (
+    accountUuid: string,
+    opts?: { provider?: ProviderId }
+  ) => Promise<void>;
   /** Issue #4823: switch the SESSION onto a node-vault Anthropic API key (by
    *  vault id). Session scope only — rejects for a node-scoped instance. */
   selectApiKey: (apiKeyId: string) => Promise<void>;
@@ -136,12 +144,15 @@ export function useAccountActions(
   const { showToast } = useToast();
   const sessionId = opts?.sessionId;
   const nodeId = opts?.nodeId;
+  const nodeLabel = opts?.nodeLabel;
 
   const selectMutation = useMutation({
     // Issue #4823: the target is a payment method — an account (every existing
     // scope) or an Anthropic API key (session scope only: a key binds ONE
     // session, never a node default).
-    mutationFn: async (target: SetSessionPaymentMethodRequest) => {
+    mutationFn: async (
+      target: SetSessionPaymentMethodRequest & { provider?: ProviderId }
+    ) => {
       if (!api) {
         throw new Error("API unavailable");
       }
@@ -155,7 +166,17 @@ export function useAccountActions(
         if ("apiKeyId" in target) {
           throw new Error("An API key binds a session, not a node default");
         }
-        await api.setNodeActiveAccount(nodeId, target.accountUuid);
+        // #3982: a provider sets that provider's default; the Anthropic call
+        // keeps its exact 2-argument shape (R7).
+        if (target.provider) {
+          await api.setNodeActiveAccount(
+            nodeId,
+            target.accountUuid,
+            target.provider
+          );
+        } else {
+          await api.setNodeActiveAccount(nodeId, target.accountUuid);
+        }
       } else {
         throw new Error("No session or node target for account selection");
       }
@@ -174,16 +195,43 @@ export function useAccountActions(
     onSettled: () => {
       if (sessionId) clearActionPending(sessionId, "switch");
     },
-    onSuccess: async () => {
+    onSuccess: async (_data, target) => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.accounts });
       if (sessionId) {
         await queryClient.invalidateQueries({
           queryKey: queryKeys.session(sessionId),
         });
       } else if (nodeId) {
+        // #3982: the 2-element key is a prefix of every per-provider key
+        // (query-keys.ts), so this one call refreshes the provider defaults too.
         await queryClient.invalidateQueries({
           queryKey: queryKeys.nodeActiveAccount(nodeId),
         });
+        // #3973: acknowledge the write. The node default may be an account
+        // that is unrefreshable there (the server allows it), so read the
+        // default under the same provider key the observing component uses
+        // (NodeChip, AccountSelectorModal); the Anthropic default lives under
+        // the 2-element key. The invalidation above refetches it only while
+        // something watches it, so an unwatched or failed read falls back to
+        // the plain success toast, which is still true.
+        const readProvider =
+          target.provider === "anthropic" ? undefined : target.provider;
+        const active = queryClient.getQueryData<NodeActiveAccountResponse>(
+          queryKeys.nodeActiveAccount(nodeId, readProvider)
+        )?.activeAccount;
+        const where = nodeLabel ?? "the selected node";
+        if (
+          "accountUuid" in target &&
+          active?.accountUuid === target.accountUuid &&
+          active.unrefreshable === true
+        ) {
+          showToast(
+            `Default account set for ${where} — re-login required there before new sessions can use it`,
+            { type: "warning" }
+          );
+        } else {
+          showToast(`Default account set for ${where}`, { type: "success" });
+        }
       }
     },
   });
@@ -277,14 +325,24 @@ export function useAccountActions(
           : []
       );
       if (optimisticUuids.size > 0) {
+        // #3982: spread the cached object so the sibling providerUsage[] rows
+        // survive, and drop a removed provider account from it too.
         queryClient.setQueryData<AccountUsageResponse>(
           queryKeys.accountUsage,
           old =>
             old
               ? {
+                  ...old,
                   usage: old.usage.filter(
                     a => !optimisticUuids.has(a.accountUuid)
                   ),
+                  ...(old.providerUsage
+                    ? {
+                        providerUsage: old.providerUsage.filter(
+                          p => !optimisticUuids.has(p.accountUuid)
+                        ),
+                      }
+                    : {}),
                 }
               : old
         );
@@ -330,9 +388,30 @@ export function useAccountActions(
                 currentFailedUuids.has(a.accountUuid) &&
                 !present.has(a.accountUuid)
             );
-            return restore.length > 0
-              ? { usage: [...old.usage, ...restore] }
-              : old;
+            // #3982: restore a failed provider account's providerUsage row too.
+            const presentProvider = new Set(
+              (old.providerUsage ?? []).map(p => p.accountUuid)
+            );
+            const restoreProvider = (previous.providerUsage ?? []).filter(
+              p =>
+                currentFailedUuids.has(p.accountUuid) &&
+                !presentProvider.has(p.accountUuid)
+            );
+            if (restore.length === 0 && restoreProvider.length === 0) {
+              return old;
+            }
+            return {
+              ...old,
+              usage: [...old.usage, ...restore],
+              ...(restoreProvider.length > 0
+                ? {
+                    providerUsage: [
+                      ...(old.providerUsage ?? []),
+                      ...restoreProvider,
+                    ],
+                  }
+                : {}),
+            };
           }
         );
       }
@@ -363,8 +442,12 @@ export function useAccountActions(
   });
 
   return {
-    selectAccount: (accountUuid: string) =>
-      selectMutation.mutateAsync({ accountUuid }),
+    selectAccount: (accountUuid: string, opts?: { provider?: ProviderId }) =>
+      selectMutation.mutateAsync(
+        opts?.provider
+          ? { accountUuid, provider: opts.provider }
+          : { accountUuid }
+      ),
     selectApiKey: (apiKeyId: string) =>
       selectMutation.mutateAsync({ apiKeyId }),
     removeAccount: removeMutation.mutateAsync,

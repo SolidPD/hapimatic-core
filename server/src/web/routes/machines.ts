@@ -19,6 +19,7 @@ import {
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
 import type { ErrorLogger } from "../../logging/errorLogger";
+import type { SharedApiKeyService } from "../../services/sharedApiKeyService";
 import { requireMachine } from "./guards";
 import { refuseAgentEscalation } from "./agentEscalation";
 import { logAndJson } from "./routeErrorHelper";
@@ -27,6 +28,7 @@ import { createRateLimiter } from "../middleware/rateLimit";
 import type { SSEManager } from "../../sse/sseManager";
 import { generateSessionId, defineCapability } from "@hapi/protocol";
 import { addPendingSpawn, markSpawnFailed } from "../../sync/pendingSpawns";
+import { spawnFailedNotification } from "../../notifications/producerNotifications";
 
 // Issue #1262: `claimPort` defers port allocation from spawn-time to deploy-time.
 // Default-false: callers must opt-in to consume a 3010-3019 port slot. This
@@ -206,6 +208,9 @@ export function createMachinesRoutes(
     // Issue #4461 (R6): THIS node's identity, stamped on an account_unrefreshable
     // create refusal. Absent ⇒ the non-federated identity.
     getLocalNode?: () => { nodeId: string; nodeLabel: string };
+    // Issue #5127: resolves an `apiKeyId` homed on another federation node
+    // (`<uuid>@<homeNodeId>`) before the spawn is dispatched.
+    getSharedApiKeyService?: () => SharedApiKeyService | null;
   }
 ): Hono<WebAppEnv> {
   const errorLogger = options?.errorLogger ?? null;
@@ -332,6 +337,29 @@ export function createMachinesRoutes(
           { error: apiKeyRejection.message, code: apiKeyRejection.code },
           400
         );
+      }
+      // Issue #5127: a key homed on another node is confirmed with its home
+      // NOW, before dispatch, so an offline or unticked home fails this request
+      // (naming the home) instead of a spawn that reports it later. A bare id
+      // takes today's path untouched.
+      if (parsed.data.apiKeyId?.includes("@")) {
+        const shared = options?.getSharedApiKeyService?.();
+        if (!shared) {
+          return c.json(
+            {
+              error: "API keys from other nodes are unavailable on this node",
+              code: "api_key_shared_unavailable",
+            },
+            503
+          );
+        }
+        const resolved = await shared.resolve(parsed.data.apiKeyId);
+        if (!resolved.ok) {
+          return c.json(
+            { error: resolved.message, code: resolved.code },
+            resolved.httpStatus
+          );
+        }
       }
 
       const namespace = c.get("namespace");
@@ -481,12 +509,27 @@ export function createMachinesRoutes(
           // The placeholder also flips to lifecycleState="failed" — a poll-visible
           // backstop if the SSE is lost.
           markSpawnFailed(hapiSessionId, message, code);
+          // TODO(#4912): legacy spawn-failed SSE event, kept for one release so
+          // a pre-#4915 web client still reacts. Remove its toast use once Sub C
+          // (#4915) has shipped for a release; SpawningSessionView's in-view
+          // return-to-Create still reads it (hapi:spawnFailed).
           sseManager?.broadcast({
             type: "spawn-failed",
             sessionId: hapiSessionId,
             directory: parsed.data.directory,
             error: message,
             code,
+            namespace,
+          });
+          // #4914: the inbox row. The placeholder id is not a session (it flips
+          // to failed and is purged), so it rides context, not sessionId.
+          engine.notifyUser({
+            ...spawnFailedNotification({
+              placeholderId: hapiSessionId,
+              directory: parsed.data.directory,
+              error: message,
+              code,
+            }),
             namespace,
           });
         };

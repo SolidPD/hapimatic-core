@@ -49,9 +49,10 @@ export const SETTINGS_LINK_REASON_TEXT: Record<
  * What replacing the link does to its target, per reason. A clause that reads
  * after "…replaces the link with a regular file, and ". Only a live target
  * outside the root "stops receiving changes"; a dangling or looping link points
- * at nothing readable, so it claims no target consequence. Re-read the
- * dangling/loop clause when #4281 (which changes the commit path for a dangling
- * link whose target the same import creates) lands.
+ * at nothing readable, so it claims no target consequence. The clause holds
+ * even when a file item of the same import creates the link's target or
+ * replaces a link in its chain, because the merge then starts from an empty
+ * base rather than reading that file (#4281, #5534).
  */
 export function settingsLinkConsequence(
   reason: SymlinkedSettingsReason,

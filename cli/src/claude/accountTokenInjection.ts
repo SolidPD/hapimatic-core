@@ -7,6 +7,7 @@ import type {
   ValidateAccountResult,
 } from "@hapi/protocol/accounts";
 import { isEnvTokenAccount } from "@hapi/protocol/accounts";
+import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { accountStore } from "@/accounts/accountStore";
 import { TokenRefreshService } from "@/accounts/tokenRefreshService";
 import {
@@ -23,6 +24,7 @@ import {
 } from "@/accounts/accountConfigDir";
 import { validateAndRecoverIsolatedSnapshot } from "@/accounts/isolatedSnapshotRecovery";
 import { readSettings } from "@/persistence";
+import { resolveSharedApiKey } from "@/apiKeys/sharedKeyClient";
 import {
   readVaultApiKey,
   type VaultKeyEntry,
@@ -183,6 +185,12 @@ export interface ApiKeySessionBinding {
   apiKeyId: string;
   /** The mask recorded at spawn (`HAPI_API_KEY_MASKED`). */
   masked?: string;
+  /**
+   * Issue #5127: the session tag (`HAPI_SESSION_ID`, set by both spawn arms)
+   * the helper fetches a key homed on another node for. Only a qualified ref
+   * carries it, so a bare id's binding is unchanged.
+   */
+  sessionId?: string;
 }
 
 /** Issue #4568: this process's API-key binding, or `null` for any other session. */
@@ -190,13 +198,21 @@ export function readBoundApiKeyBinding(): ApiKeySessionBinding | null {
   const apiKeyId = readBoundApiKeyId();
   if (!apiKeyId) return null;
   const masked = process.env.HAPI_API_KEY_MASKED || undefined;
-  return masked ? { apiKeyId, masked } : { apiKeyId };
+  const binding: ApiKeySessionBinding = masked
+    ? { apiKeyId, masked }
+    : { apiKeyId };
+  const sessionId = process.env.HAPI_SESSION_ID || undefined;
+  if (sessionId && isQualifiedApiKeyRef(apiKeyId))
+    binding.sessionId = sessionId;
+  return binding;
 }
 
 /** Test seam for {@link verifyApiKeyForSession}. */
 export interface ResolveApiKeyDeps {
   /** Defaults to the node vault (`readSettings().apiKeys`). */
   readApiKeys?: () => Promise<VaultKeyEntry[] | undefined>;
+  /** Issue #5127: defaults to `resolveSharedApiKey` (a key on another node). */
+  resolveShared?: typeof resolveSharedApiKey;
 }
 
 /**
@@ -212,12 +228,41 @@ export interface ResolveApiKeyDeps {
  * longer matches the one recorded at spawn (`HAPI_API_KEY_MASKED`). Never falls
  * back to an account or the host login: a client's per-token charges cannot be
  * reversed.
+ *
+ * Issue #5127: a key homed on another node (a qualified ref) is checked with
+ * its home, through this host's server, on every (re)launch. A refusal (the
+ * home is offline, the key is no longer shared, its mask changed …) throws the
+ * message that names the home, and the launch fails the same way.
  */
 export async function verifyApiKeyForSession(
   deps: ResolveApiKeyDeps = {}
 ): Promise<ApiKeySessionBinding | null> {
   const binding = readBoundApiKeyBinding();
   if (!binding) return null;
+  if (isQualifiedApiKeyRef(binding.apiKeyId)) {
+    if (!binding.sessionId) {
+      logger.warn(
+        `[API_KEY] launch refused (no session id) for shared key ref ${binding.apiKeyId}`
+      );
+      throw new Error(
+        "This session has no session id, so its API key from another node cannot be fetched"
+      );
+    }
+    const resolved = await (deps.resolveShared ?? resolveSharedApiKey)({
+      ref: binding.apiKeyId,
+      ...(binding.masked !== undefined
+        ? { expectedMasked: binding.masked }
+        : {}),
+      sessionId: binding.sessionId,
+    });
+    if (!resolved.ok) {
+      logger.warn(
+        `[API_KEY] launch refused (${resolved.code}) for shared key ref ${binding.apiKeyId}`
+      );
+      throw new Error(resolved.message);
+    }
+    return binding;
+  }
   const apiKeys = await (
     deps.readApiKeys ?? (async () => (await readSettings()).apiKeys)
   )();

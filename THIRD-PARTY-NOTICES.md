@@ -4,11 +4,88 @@
 
 The Hapimatic core is licensed under the GNU Affero General Public License v3.0 only (see `LICENSE` and `NOTICE`). The `hapi` executable also contains, or downloads on request, the third-party software listed below. Each component is used under its own license, reproduced here as shipped by its authors. The machine-readable software bill of materials is `sbom/hapimatic-core.cdx.json`.
 
-This file covers the 617 npm packages in the core's runtime dependency closure (a superset of what the bundlers emit) and the non-npm components. Build tools that are not distributed are listed in the SBOM but need no notice here.
+This file covers the 617 npm packages in the core's runtime dependency closure (a superset of what the bundlers emit) and the non-npm components, and reproduces the notice for the happy-cli code in the `cli` package. Build tools that are not distributed are listed in the SBOM but need no notice here.
+
+## Code derived from happy-cli
+
+Part of the `cli` package derives from happy-cli (<https://github.com/slopus/happy-cli>), Copyright (c) 2024 Kirill Dubovitskiy, used under the MIT License. That code is compiled into the `hapi` executable. `cli/NOTICE` in the source tree, reproduced below, lists the derived files and carries the license text:
+
+```text
+hapi CLI
+Copyright (c) 2024-2025 weishu
+
+This software contains code derived from happy-cli
+(https://github.com/slopus/happy-cli), which is licensed
+under the MIT License:
+
+---
+
+MIT License
+
+Copyright (c) 2024 Kirill Dubovitskiy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+The following files/directories are derived from happy-cli:
+- src/api/
+- src/claude/
+- src/extensions/agent-codex/codex/ (moved from src/codex/ by #2215)
+- src/daemon/
+- src/commands/
+- src/extensions/agent-codex/command.ts (moved from src/commands/codex.ts by #2215)
+- src/ui/
+- src/utils/
+- src/modules/ripgrep/
+- src/modules/difftastic/
+- src/modules/watcher/
+- src/modules/common/registerCommonHandlers.ts
+- src/modules/common/pathSecurity.ts
+- src/parsers/
+- src/configuration.ts
+- src/persistence.ts
+- src/projectPath.ts
+- src/lib.ts
+- src/index.ts
+
+---
+
+How the source files are labeled (the SPDX-License-Identifier line at the top
+of each file):
+
+- "MIT AND AGPL-3.0-only": the file derives from happy-cli. It contains
+  MIT-licensed code from happy-cli, under the notice above, together with
+  modifications licensed under AGPL-3.0-only.
+- "AGPL-3.0-only": every other file, including files written later for
+  tiann/hapi or for Hapimatic inside the directories listed above. Where such a
+  file incorporates code moved out of a happy-cli file, that code remains
+  available under the MIT License above.
+
+A file is labeled as derived from happy-cli when any path it has had in this
+repository's history (renames included) also appears in the history of
+slopus/happy-cli.
+```
 
 ## Components outside npm
 
-### bun 1.4.0 — MIT AND LGPL-2.1-only
+### bun 1.4.4 — MIT AND LGPL-2.1-only
 
 The JavaScript runtime `bun build --compile` embeds in every hapi executable. Bun is MIT; it statically links JavaScriptCore/WebKit and tinycc (LGPL) and the permissively licensed native libraries listed below. Source: <https://bun.com>.
 
@@ -6261,34 +6338,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-```
-
-`dist/esm/icons/copyright.js`:
-
-```text
-/**
- * @license lucide-react v1.7.0 - ISC
- *
- * This source code is licensed under the ISC license.
- * See the LICENSE file in the root directory of this source tree.
- */
-
-import createLucideIcon from '../createLucideIcon.js';
-
-const __iconNode = [
-  ["circle", { cx: "12", cy: "12", r: "10", key: "1mglay" }],
-  ["path", { d: "M14.83 14.83a4 4 0 1 1 0-5.66", key: "1i56pz" }]
-];
-const Copyright = createLucideIcon("copyright", __iconNode);
-
-export { __iconNode, Copyright as default };
-//# sourceMappingURL=copyright.js.map
-```
-
-`dist/esm/icons/copyright.js.map`:
-
-```text
-{"version":3,"file":"copyright.js","sources":["../../../src/icons/copyright.ts"],"sourcesContent":["import createLucideIcon from '../createLucideIcon';\nimport { IconNode } from '../types';\n\nexport const __iconNode: IconNode = [\n  ['circle', { cx: '12', cy: '12', r: '10', key: '1mglay' }],\n  ['path', { d: 'M14.83 14.83a4 4 0 1 1 0-5.66', key: '1i56pz' }],\n];\n\n/**\n * @component @name Copyright\n * @description Lucide SVG icon component, renders SVG Element with children.\n *\n * @preview ![img](data:image/svg+xml;base64,PHN2ZyAgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIgogIHdpZHRoPSIyNCIKICBoZWlnaHQ9IjI0IgogIHZpZXdCb3g9IjAgMCAyNCAyNCIKICBmaWxsPSJub25lIgogIHN0cm9rZT0iIzAwMCIgc3R5bGU9ImJhY2tncm91bmQtY29sb3I6ICNmZmY7IGJvcmRlci1yYWRpdXM6IDJweCIKICBzdHJva2Utd2lkdGg9IjIiCiAgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIgogIHN0cm9rZS1saW5lam9pbj0icm91bmQiCj4KICA8Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIgLz4KICA8cGF0aCBkPSJNMTQuODMgMTQuODNhNCA0IDAgMSAxIDAtNS42NiIgLz4KPC9zdmc+Cg==) - https://lucide.dev/icons/copyright\n * @see https://lucide.dev/guide/packages/lucide-react - Documentation\n *\n * @param {Object} props - Lucide icons props and any valid SVG attribute\n * @returns {JSX.Element} JSX Element\n *\n */\nconst Copyright = createLucideIcon('copyright', __iconNode);\n\nexport default Copyright;\n"],"names":[],"mappings":";;;;;;;;;AAGO,CAAA,CAAA,CAAA,CAAA,CAAA,CAAM,UAAA,CAAA,CAAA,CAAuB;AAAA,CAAA,CAClC,CAAC,QAAA,CAAA,CAAU,CAAA,CAAE,EAAA,CAAA,CAAI,CAAA,CAAA,CAAA,CAAA,EAAM,CAAA,CAAA,CAAA,CAAI,IAAA,CAAA,CAAM,CAAA,EAAG,CAAA,CAAA,CAAA,CAAA,CAAA,CAAM,GAAA,CAAA,CAAK,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,EAAU,CAAA;AAAA,CAAA,CACzD,CAAC,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAQ,CAAA,CAAE,GAAG,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAiC,CAAA,CAAA,CAAA,CAAA,CAAK,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,GAAU;AAChE,CAAA;AAaA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAM,SAAA,CAAA,CAAA,CAAY,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAiB,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,EAAa,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAA,CAAU,CAAA;;"}
 ```
 
 ### 2 packages

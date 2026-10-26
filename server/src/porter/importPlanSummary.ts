@@ -18,114 +18,30 @@
  */
 import {
   EXECUTABLE_SETTINGS_KEYS,
+  type ImportPlanSummary,
   type Omission,
-  type PorterManifest,
 } from "@hapi/protocol/porter";
-import type { ImportPlan, PlannedItemKind } from "./importArchive";
-import { computeGroups, type ImportGroups } from "./commitSelection";
-import type { Conflict } from "./conflictDetection";
-import type { ModeReconcilePreview } from "./modeReconcile";
-import type { SettingsLinkState } from "./commitFs";
-import type { ExecutableScriptReview } from "./planSettingsScripts";
-import {
-  reviewMcpServers,
-  type PlannedMcpServerReview,
-} from "./mcpReviewDefinition";
+import type { ImportPlan } from "./importArchive";
+import { computeGroups, type EmittedImportGroups } from "./commitSelection";
+import { reviewMcpServers } from "./mcpReviewDefinition";
+
+// #5601: the wire shape lives in @hapi/protocol/porter (importWire.ts);
+// `importArchive.ts` re-exports it from here for public-API parity.
+export type { ImportPlanSummary };
 
 /**
- * Client-facing plan summary. Ships resolved destination paths
- * (`claudeDir`/`hostConfigPath`) — consistent with `items[].destPath`, which
- * already carries absolute dest paths (#2620 / F6).
- *
- * #2600: imported VALUES (hook command strings, `env` values, `permissions`
- * values, and — #5172 — each MCP server's command, args, and url) are surfaced
- * DELIBERATELY for review scrutiny — potentially including plain-text
- * credentials from a hostile archive; a declared secret slot stays a slot name.
- * That visibility IS the control, so this
- * summary is intentionally NOT value-free. Moved here from `importArchive.ts`
- * (#3590, #2077 max-lines) to sit beside its {@link toPlanSummary} projection;
- * `importArchive.ts` re-exports it for public-API parity.
+ * #5601 (D4): what this server emits. The wire type keeps `policySkips`,
+ * `notices` and `groups.memory` optional because an older server omitted them;
+ * this server always sends them, and says so here so its own callers and tests
+ * can rely on it.
  */
-export interface ImportPlanSummary {
-  stagingHandle: string;
-  /**
-   * #2620 (F6): resolved destination paths this commit will write to, surfaced
-   * so the operator sees the target BEFORE committing. A same-machine instance
-   * resolves these to the host `~/.claude` (+ `~/.claude.json`) UNLESS
-   * `CLAUDE_CONFIG_DIR`/`claudeDir` redirects the config root (both then follow
-   * it, with `hostConfigPath` INSIDE the resolved root).
-   */
-  claudeDir: string;
-  hostConfigPath: string;
-  items: { kind: PlannedItemKind; name: string; destPath: string }[];
-  /**
-   * #3247: hierarchical grouping of items/hooks/MCP for the pre-import selection
-   * UI. ADDITIVE beside flat `items`/`hooks`/`mcpServers`; computed by the SAME
-   * `commitSelection.computeGroups` the commit cascades from (no plan/commit drift).
-   */
-  groups: ImportGroups;
-  /** #3448 (Sub C): per-source discovery metadata for the review cards (absent on a legacy archive). */
-  sources?: PorterManifest["sources"];
-  conflicts: Conflict[];
-  /**
-   * #4129: the fixes the commit may apply (it applies no others) and the files
-   * it expects to skip.
-   */
-  modeReconcile: ModeReconcilePreview;
-  settings: {
-    keys: string[];
-    conflicts: Conflict[];
-    skippedKeys: string[];
-    /** #2600: env key→value pairs, surfaced for review (NODE_OPTIONS/ANTHROPIC_BASE_URL etc.). */
-    envValues: { key: string; value: string }[];
-    /** #2600: permissions key→value pairs, surfaced for review (e.g. defaultMode overrides). */
-    permissionsValues: { key: string; value: unknown }[];
-    /** #2565 (F5): full VALUES of executable settings keys (apiKeyHelper/statusLine) — the
-     * subset Claude Code runs as shell commands — surfaced so a values-blind review cannot
-     * miss an injected command. Non-executable keys remain name-only (in `keys`). */
-    executableValues: { key: string; value: unknown }[];
-    /** #4173 (R11): the files those values run — path, sha256, status and a preview. */
-    executableScripts: ExecutableScriptReview[];
-  };
-  /**
-   * #4146 (R4): present when the destination settings.json is a symlink and the
-   * plan merges settings or hooks. `inside` = the merge writes through it (the
-   * link is kept); any other state = the commit refuses (409) unless the request
-   * acknowledges `target` (`acknowledgeSymlinkedSettings`), which replaces the link.
-   * Both apply only if the commit's selection still merges settings keys or
-   * hooks; with every hook deselected and no settings keys, nothing is merged.
-   */
-  settingsLink?: { target: string; state: SettingsLinkState };
-  hooks: {
-    count: number;
-    unknownEvents: string[];
-    commandWarnings: string[];
-    /** #2600: per-entry hook command strings, surfaced verbatim for review scrutiny. */
-    commands: { events: string[]; matcher?: string; command: string }[];
-    /** #3590 (K4/D9): registry-referenced hook names absent from archive + dest. */
-    registryMissing: string[];
-  };
-  /** #5172: each server with the definition the commit writes (slots by name). */
-  mcpServers: PlannedMcpServerReview[];
-  plugins: { descriptorPresent: boolean; remediation: string[] };
-  /**
-   * #5202 (U8): everything the plan recorded, refusals included —
-   * `policySkips` is the refusal subset. Kept complete so a client that
-   * renders only `omissions` (one that predates #4156) still shows every
-   * refusal; the current panel subtracts `policySkips` before rendering it.
-   */
-  omissions: Omission[];
-  /** #4156: the importer's policy refusals ("Refused by import policy"). */
+export type EmittedPlanSummary = ImportPlanSummary & {
+  groups: EmittedImportGroups;
   policySkips: Omission[];
-  /**
-   * #5202 (U10): the importer's notices ("Imported with a note"), also in
-   * `omissions`; the panel subtracts them from "Deliberately omitted".
-   */
   notices: Omission[];
-  expiresAt: number;
-}
+};
 
-export function toPlanSummary(plan: ImportPlan): ImportPlanSummary {
+export function toPlanSummary(plan: ImportPlan): EmittedPlanSummary {
   return {
     stagingHandle: plan.stagingHandle,
     claudeDir: plan.claudeDir,

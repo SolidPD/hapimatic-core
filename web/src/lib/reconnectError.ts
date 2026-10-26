@@ -6,6 +6,8 @@ import { reloginToastFromError } from "@/lib/reloginLink";
  * Shared re-login toast copy for an account whose login expired and could not
  * be refreshed. Issue #1531 introduced this string as an inline literal in
  * `App.tsx`'s `AccountUnrefreshableToastListener`; issue #1835 hoisted it here
+ * (#4915: the SSE side is now the `account-unrefreshable` notification, whose
+ * title Sub B #4914 must set to this exact text / `buildReloginToast`'s message)
  * so the SSE-driven listener and the HTTP-catch reconnect branch (below) emit
  * the BYTE-IDENTICAL text. ToastProvider dedups on message text within a 2s
  * window (`Toast.tsx`, `DEDUP_WINDOW_MS`), so the identical string collapses the
@@ -46,12 +48,14 @@ export function getReconnectErrorToast(err: unknown): string {
 /**
  * Issue #4461 (R8): the reconnect toast's message AND its optional action. An
  * `account_unrefreshable` 409 that names its node gets "Re-login required on
- * <node>" plus a "Log in" action from {@link buildReloginToast} — the SAME builder
- * the SSE listener (App.tsx) uses with the same server-stamped node and no account
- * name, so the pair stays byte-identical and collapses into ONE toast carrying the
- * action whichever side fires first. A 409 without a node (a pre-#4461 node) keeps
- * the shared message and no action, as the SSE listener does for an unstamped
- * event. Every other failure maps exactly as {@link getReconnectErrorToast}.
+ * <node>" plus a "Log in" action from {@link buildReloginToast}. The refusal's
+ * twin, the `account-unrefreshable` notification, carries the same text as its
+ * title (written by the server with the shared `formatReloginMessage`, #4914) and
+ * gets the same builder's action from `formatNotificationToast` (#4915), so the
+ * pair stays byte-identical and collapses into ONE toast carrying the action
+ * whichever side fires first. A 409 without a node (a pre-#4461 node) keeps the
+ * shared message and no action, as an unstamped notification does. Every other
+ * failure maps exactly as {@link getReconnectErrorToast}.
  */
 export function getReconnectErrorToastOptions(err: unknown): {
   message: string;
@@ -79,8 +83,10 @@ function reconnectErrorMessage(err: unknown): string {
   // Issue #1835 (R2): a reconnect refused by the pre-spawn account-health gate
   // carries code "account_unrefreshable" → 409 (`sessions.ts`). The server ALSO
   // emits a session-scoped `account-unrefreshable` SSE event just before the 409
-  // (`sessionRespawn.ts`), which `AccountUnrefreshableToastListener` (`App.tsx`)
-  // already turns into a re-login toast. Return the BYTE-IDENTICAL shared string
+  // (`sessionRespawn.ts`), which `NotificationListener` (#4915) shows as a
+  // re-login toast using the notification's title — Sub B (#4914) sets that
+  // title to this same string so the pair still dedups (only while the row's
+  // count is 1: a coalesced row appends " (×N)"). Return the BYTE-IDENTICAL shared string
   // so ToastProvider's 2s identical-text dedup (`Toast.tsx`) collapses the
   // SSE+HTTP pair into ONE toast. The SSE emit is skipped when the session has
   // no `metadata.accountUuid`, so this HTTP-catch branch is the sole toast for

@@ -37,6 +37,9 @@ export const queryKeys = {
   about: ["about"] as const,
   // API Keys vault (issue #1955, epic #1954)
   apiKeys: ["api-keys"] as const,
+  // #5127: the keys a Claude session on a target can bill (own + shared).
+  availableApiKeys: (targetNodeId: string | null) =>
+    ["api-keys", "available", targetNodeId ?? "local"] as const,
   // Extension control plane — Admin → Extensions (issue #2329)
   extensionRegistry: ["extension-registry"] as const,
   // Configuration Porter — Admin → Configuration (issue #2344, epic #2339)
@@ -52,8 +55,14 @@ export const queryKeys = {
   porterTokenStatus: (token: string) => ["porter-token-status", token] as const,
   // Per-VM backup age identity — Admin → Backup Key (issue #2507, epic #2493)
   backupIdentityStatus: ["backup-identity-status"] as const,
+  // #4791: the first-run backup-key step's skip marker, and its read of the
+  // onboarding-tour state (the step waits while the tour is pending, LC6).
+  backupPromptPreference: ["backup-prompt-preference"] as const,
+  backupPromptOnboardingGate: ["backup-prompt-onboarding-gate"] as const,
   // Admin VM provisioning control plane — Admin → VMs (issue #2470, epic #2467)
   vmInventory: ["vm-inventory"] as const,
+  // #3996: RP1's own parity record (the hub row above the fleet).
+  vmParityHub: ["vm-parity-hub"] as const,
   vmPreflight: ["vm-preflight"] as const,
   // #2910: the operator-instance feedback-inbox gate (`GET /api/feedback/preflight`).
   feedbackPreflight: ["feedback-preflight"] as const,
@@ -255,4 +264,12 @@ export const queryKeys = {
   // panel's detection-status query is #1773's `harnessUpdates` key (above);
   // #1775's "Check now" invalidates that to refresh the panel + last-checked.
   harnessPollConfig: ["harness-poll-config"] as const,
+  // Notification inbox (issue #4915, epic #4912 Sub C). `notifications` is the
+  // prefix for every notification query, so invalidating it refreshes the lists
+  // and the unread count together (a `notifications-cleared` event does this).
+  notifications: ["notifications"] as const,
+  notificationLists: ["notifications", "list"] as const,
+  notificationList: (unreadOnly: boolean) =>
+    ["notifications", "list", { unreadOnly }] as const,
+  notificationUnreadCount: ["notifications", "unread-count"] as const,
 };

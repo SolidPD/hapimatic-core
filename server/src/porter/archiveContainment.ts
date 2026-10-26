@@ -101,6 +101,48 @@ export class DenylistedDestinationError extends PathEscapeError {
 }
 
 /**
+ * A symlink or hardlink member anywhere in the archive (#4294, operator ruling
+ * A). Both exporters copy a link's target, so only a hand-built archive carries
+ * one. Still a {@link PathEscapeError} with the same `name` and `reason` as
+ * {@link assertSafeEntry}'s per-member refusal, so the route's 400 mapping and
+ * the wire `kind` are unchanged, with a message that names the member and the
+ * one GNU tar rebuild that clears both kinds. `-h` alone is not enough: it
+ * stores a symlink's target, but when that target is archived too the second
+ * name becomes a hardlink member, so the advice always pairs it with
+ * `--hard-dereference`.
+ */
+export class LinkMemberError extends PathEscapeError {
+  constructor(destRoot: string, path: string, kind: "symlink" | "hardlink") {
+    super(destRoot, path, `is a ${kind} member (links are refused outright)`);
+    this.message =
+      `Refusing archive member ${JSON.stringify(path)}: it is a ` +
+      `${kind === "symlink" ? "symbolic" : "hard"} link. A porter archive ` +
+      "never carries links; both exporters copy the link's target instead. " +
+      "Re-export, or rebuild the archive with GNU tar's `-h --hard-dereference`.";
+  }
+}
+
+/**
+ * Refuse the archive when any member is a symlink or hardlink, referenced by
+ * the manifest or not (#4294). `planImport` runs it on the `manifest.json`
+ * member before parsing it, then on every member after manifest validation and
+ * before any planning or staging, so a link the planners once handled per path
+ * (a registered hook file was not staged and its registration held; a
+ * `CLAUDE.md` include became an omission) or ignored (an unreferenced member)
+ * refuses the archive instead.
+ */
+export function assertNoLinkMembers(
+  destRoot: string,
+  entries: readonly { path: string; kind: ArchiveEntryKind }[]
+): void {
+  for (const e of entries) {
+    if (e.kind === "symlink" || e.kind === "hardlink") {
+      throw new LinkMemberError(destRoot, e.path, e.kind);
+    }
+  }
+}
+
+/**
  * The lexical half of containment: reject NUL / empty / absolute / `..`, then
  * resolve and require the result to be `destRoot` or strictly under it. Shared
  * by {@link assertContained} and {@link assertSafeEntry}, which then apply their
@@ -199,7 +241,9 @@ export function isContained(destRoot: string, candidate: string): boolean {
  * contained). Returns the resolved absolute path for a `file`/`directory` entry.
  *
  * This is the single decision point `importArchive` calls for every archive
- * member before materialising it into the staging tree.
+ * member before materialising it into the staging tree. Since #4294 a link
+ * member never reaches it from `planImport` ({@link assertNoLinkMembers}
+ * refuses the archive first); the link refusal here stays as defence in depth.
  *
  * Issue #4172: after lexical containment, the denylist is applied to the
  * destination ROOT (a root that is itself sensitive refuses the archive) and to

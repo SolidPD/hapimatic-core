@@ -16,6 +16,8 @@ import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import type { SyncEngine, SyncEvent } from "../../../sync/syncEngine";
 import type { PushService } from "../../../push/pushService";
+import { buildSessionPushPayload } from "../../../push/sessionPushPayload";
+import { getSessionName } from "../../../notifications/sessionInfo";
 import type { NotificationHub } from "../../../notifications/notificationHub";
 import type { SystemEventQueue } from "../../../heartbeat/systemEvents";
 import { extractMessageEventType } from "../../../notifications/eventParsing";
@@ -580,19 +582,22 @@ export class TaskExecutor {
       if (!isSuppressed && response) {
         const session = this.syncEngine.getSession(sessionId);
         const namespace = session?.namespace ?? task.namespace;
-        await this.pushService.sendToNamespace(namespace, {
-          title: "Heartbeat",
-          body:
-            response.length > 200
-              ? response.substring(0, 197) + "..."
-              : response,
-          tag: "heartbeat-response",
-          data: {
+        // #4921: titled by the session, per-session tag, and a deep link that
+        // resolves (was `/session/<id>`, a route that does not exist).
+        await this.pushService.sendToNamespace(
+          namespace,
+          buildSessionPushPayload({
+            kind: "heartbeat",
             type: "heartbeat",
             sessionId,
-            url: `/session/${sessionId}`,
-          },
-        });
+            sessionTitle: session ? getSessionName(session) : null,
+            sessionEmoji: session?.emoji,
+            body:
+              response.length > 200
+                ? response.substring(0, 197) + "..."
+                : response,
+          })
+        );
       }
 
       // Mark as delivered
@@ -817,18 +822,29 @@ export class TaskExecutor {
           ? `Task "${task.name}" prompt delivered to session.`
           : `Task "${task.name}" failed: ${errorMessage ?? "Unknown error"}`;
 
-      await this.pushService.sendToNamespace(task.namespace, {
-        title,
-        body,
-        tag: `scheduler-${task.id}`,
-        data: sessionId
-          ? {
-              type: "scheduled-task",
-              sessionId,
-              url: `/session/${sessionId}`,
-            }
-          : undefined,
-      });
+      if (sessionId) {
+        // #4921: a session-targeted task push is titled by its session, with
+        // the status word leading the body, and opens the session.
+        const session = this.syncEngine.getSession(sessionId);
+        await this.pushService.sendToNamespace(
+          task.namespace,
+          buildSessionPushPayload({
+            kind: "scheduled-task",
+            type: "scheduled-task",
+            sessionId,
+            sessionTitle: session ? getSessionName(session) : null,
+            sessionEmoji: session?.emoji,
+            body: `${status === "delivered" ? "Delivered" : "Failed"}: ${body}`,
+          })
+        );
+      } else {
+        await this.pushService.sendToNamespace(task.namespace, {
+          title,
+          body,
+          tag: `scheduler-${task.id}`,
+          data: { type: "scheduled-task", url: "/" },
+        });
+      }
     } catch (error) {
       this.errorLogger?.error(
         `Failed to send notification for task "${task.name}"`,

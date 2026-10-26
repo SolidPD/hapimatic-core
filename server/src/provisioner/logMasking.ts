@@ -59,7 +59,9 @@
  * bash-only masking names (`FEEDBACK_RELAY_TOKEN`, `GATEWAY_SECRET_ENCRYPTION_KEY`,
  * `GATEWAY_SECRET_ENCRYPTION_KEY_OLD`, and #4804's `GATEWAY_CAMPAIGN_STATS_TOKEN`,
  * minted as 64 hex characters) are caught server-side by the entropy layer, not by
- * name — this list under-naming them does not leak their values. #4929's
+ * name — this list under-naming them does not leak their values. #5744's
+ * `GATEWAY_FEEDBACK_OPERATOR_TOKEN` is bash-only because only `provision-gateway.sh`
+ * renders the gateway env; the server provisioner never handles it. #4929's
  * `SUDO_MODEL_PASSWORD_HASH` is bash-only for a different reason: the server
  * provisioner never handles it (the operator's S3 password hash is read from an RP1
  * file by `provision.sh` / `reconcile-vm.sh` alone).

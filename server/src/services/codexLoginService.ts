@@ -88,6 +88,16 @@ export interface CodexLoginServiceOptions {
   now?: () => number;
   /** Structured logger — NEVER receives a key/token. */
   log?: (msg: string) => void;
+  /**
+   * #3982 (K-R4): the node's account-removal tombstone (AccountService). A
+   * ChatGPT device-auth login whose PK was removed from Hapimatic — its codex dir
+   * kept under D1-A — is treated as a re-add instead of "already added". Absent ⇒
+   * an existing dir is always "already added" (the pre-#3982 behaviour).
+   */
+  removedAccounts?: {
+    isTombstoned: (pk: string) => boolean;
+    clearTombstone: (pk: string) => void;
+  };
 }
 
 const API_KEY_LOGIN_TIMEOUT_MS = 30_000;
@@ -152,6 +162,7 @@ export class CodexLoginService {
   private readonly codexBinOverride?: string;
   private readonly now: () => number;
   private readonly log: (msg: string) => void;
+  private readonly removedAccounts: CodexLoginServiceOptions["removedAccounts"];
   private readonly pending = new Map<string, PendingDeviceAuth>();
   private resolvedBin: string | null = null;
   private binResolveAttempted = false;
@@ -171,6 +182,7 @@ export class CodexLoginService {
     this.codexBinOverride = opts.codexBin;
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? (() => {});
+    this.removedAccounts = opts.removedAccounts;
   }
 
   /** In-flight device-auth attempts (test/diagnostic visibility). */
@@ -523,6 +535,9 @@ export class CodexLoginService {
     // Set only after the staging dir has been moved into place, so a failure
     // AFTER the rename (sidecar write) can roll the half-added account back.
     let movedTarget: string | null = null;
+    // #3982 (K-R4): a re-add of a removed account moves the old login aside
+    // first; a failure before the attempt finishes puts it back.
+    let movedAside: { aside: string; target: string } | null = null;
     try {
       if (entry.cancelled) {
         this.finishCancelled(entry);
@@ -540,7 +555,24 @@ export class CodexLoginService {
           const pk = this.deriveChatgptPk(entry.staging);
           const pkDir = join(this.accountConfigsDir, pk);
           const target = join(pkDir, "codex");
-          if (existsSync(target)) {
+          if (existsSync(target) && this.removedAccounts?.isTombstoned(pk)) {
+            // #3982 (K-R4, D1-A): this account was removed from Hapimatic but its
+            // codex dir was kept, and a ChatGPT login reuses its PK. Treat the
+            // login as a re-add: move the old dir aside (a rename, never a delete
+            // — the importer reads only `<pk>/codex`), install the fresh login,
+            // and forget the removal so the force-import re-creates the record.
+            const aside = join(pkDir, `codex.removed-${this.now()}`);
+            renameSync(target, aside);
+            movedAside = { aside, target };
+            renameSync(entry.staging, target);
+            movedTarget = target;
+            this.writeSidecar(pk, "chatgpt", entry.label);
+            this.removedAccounts.clearTombstone(pk);
+            movedAside = null;
+            this.safeRm(entry.stagingRoot);
+            entry.state = "ok";
+            this.log("codexLoginService: device-auth re-add ok (pk redacted)");
+          } else if (existsSync(target)) {
             // Already logged in on this machine — do not clobber (D4 stable PK).
             entry.state = "failed";
             this.log("codexLoginService: device-auth account already added");
@@ -553,6 +585,11 @@ export class CodexLoginService {
             renameSync(entry.staging, target);
             movedTarget = target;
             this.writeSidecar(pk, "chatgpt", entry.label);
+            // #3982 (D1-A): a removed account whose codex dir was since deleted
+            // (or a removed host login re-added in-app — same PK) comes back
+            // through this branch; forget the removal so the force-import
+            // re-creates the record. A no-op for a never-removed account.
+            this.removedAccounts?.clearTombstone(pk);
             this.safeRm(entry.stagingRoot); // remove the now-empty .pending/<token>
             entry.state = "ok";
             this.log("codexLoginService: device-auth login ok (pk redacted)");
@@ -576,6 +613,14 @@ export class CodexLoginService {
       // A sidecar-less account dir would read as "already added" on every
       // retry — remove only the codex dir this attempt moved in.
       if (movedTarget) this.safeRm(movedTarget);
+      // #3982 (K-R4): a failed re-add restores the login it moved aside.
+      if (movedAside) {
+        try {
+          renameSync(movedAside.aside, movedAside.target);
+        } catch {
+          // Best-effort: the old login stays at codex.removed-* on disk.
+        }
+      }
       if (entry.cancelled) this.finishCancelled(entry);
       else this.failDeviceAuth(entry, "finalize", err);
     } finally {

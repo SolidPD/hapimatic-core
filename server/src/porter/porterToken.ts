@@ -29,13 +29,20 @@ import type { PorterTokenState } from "@hapi/protocol/porter";
  *    `await`, and returns a nonce; `markUploaded` consumes it and
  *    `releaseUpload` frees it after a failed stage, each only for the matching
  *    nonce, so a losing concurrent request can never release or consume the
- *    winner's reservation (#5170).
+ *    winner's reservation (#5170). Each release counts as a failed attempt;
+ *    after {@link DEFAULT_MAX_UPLOAD_ATTEMPTS} the leg is refused, so one
+ *    token cannot drive decompress-and-stage work for its whole TTL (#5228).
  */
 
 /** ~15-minute fetch-leg TTL. */
 const DEFAULT_TTL_MS = 15 * 60 * 1000;
 /** Max fetch-leg serves within the TTL (inspect-then-run + paste path). */
 const DEFAULT_MAX_FETCHES = 5;
+/**
+ * Max failed upload attempts per token (#5228). Matches the fetch budget:
+ * a legitimate retry re-runs the one-liner, which fetches the script again.
+ */
+const DEFAULT_MAX_UPLOAD_ATTEMPTS = 5;
 /** Background eviction cadence for expired entries. */
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 /**
@@ -60,6 +67,8 @@ export interface PorterTokenEntry {
   expiresAt: number;
   fetchCount: number;
   uploadConsumed: boolean;
+  /** Upload attempts that failed and released the leg (#5228). */
+  uploadFailures: number;
   /** When the upload landed (`markUploaded`) — the received-retention origin (#5170). */
   receivedAt?: number;
   /** The nonce of the in-flight upload holding the leg, if any (#5170). */
@@ -73,7 +82,7 @@ export type UploadReservation =
   | { ok: true; entry: PorterTokenEntry; reservation: string }
   | {
       ok: false;
-      reason: "unknown" | "expired" | "consumed" | "in-progress";
+      reason: "unknown" | "expired" | "consumed" | "in-progress" | "exhausted";
     };
 
 /**
@@ -93,6 +102,8 @@ export interface PorterTokenStoreOptions {
   ttlMs?: number;
   /** Max fetch-leg serves (default {@link DEFAULT_MAX_FETCHES}). */
   maxFetches?: number;
+  /** Max failed upload attempts (default {@link DEFAULT_MAX_UPLOAD_ATTEMPTS}). */
+  maxUploadAttempts?: number;
   /**
    * How long a received entry is kept after its upload landed before
    * `sweepExpired` evicts it (default {@link DEFAULT_RECEIVED_RETENTION_MS}).
@@ -114,12 +125,17 @@ export interface PorterTokenStore {
   getForFetch(token: string): PorterTokenEntry | null;
   /**
    * Claim the single-use upload leg synchronously. Succeeds IFF the token is
-   * known, not yet uploaded, unexpired and not held by another in-flight upload;
-   * the returned nonce is what {@link releaseUpload} and {@link markUploaded}
-   * require.
+   * known, not yet uploaded, unexpired, not exhausted (fewer than
+   * `maxUploadAttempts` failed attempts) and not held by another in-flight
+   * upload; the returned nonce is what {@link releaseUpload} and
+   * {@link markUploaded} require.
    */
   reserveUpload(token: string): UploadReservation;
-  /** Free a reservation after a failed stage. `false` unless the nonce holds it. */
+  /**
+   * Free a reservation after any attempt that did not stage a plan, and count
+   * it as one failed upload attempt (#5228). `false`, with nothing counted,
+   * unless the nonce holds it.
+   */
   releaseUpload(token: string, reservation: string): boolean;
   /**
    * Consume the upload leg and record the staged plan handle. `false` unless
@@ -152,12 +168,16 @@ export function createPorterTokenStore(
 ): PorterTokenStore {
   const ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
   const maxFetches = opts.maxFetches ?? DEFAULT_MAX_FETCHES;
+  const maxUploadAttempts =
+    opts.maxUploadAttempts ?? DEFAULT_MAX_UPLOAD_ATTEMPTS;
   const receivedRetentionMs =
     opts.receivedRetentionMs ?? DEFAULT_RECEIVED_RETENTION_MS;
   const now = opts.now ?? (() => Date.now());
   const entries = new Map<string, PorterTokenEntry>();
 
   const isExpired = (e: PorterTokenEntry): boolean => now() >= e.expiresAt;
+  const isExhausted = (e: PorterTokenEntry): boolean =>
+    e.uploadFailures >= maxUploadAttempts;
 
   function mint(input: {
     namespace: string;
@@ -175,6 +195,7 @@ export function createPorterTokenStore(
       expiresAt: createdAt + ttlMs,
       fetchCount: 0,
       uploadConsumed: false,
+      uploadFailures: 0,
       scope: "porter",
     };
     entries.set(token, entry);
@@ -197,6 +218,7 @@ export function createPorterTokenStore(
     // matching status() below.
     if (e.uploadConsumed) return { ok: false, reason: "consumed" };
     if (isExpired(e)) return { ok: false, reason: "expired" };
+    if (isExhausted(e)) return { ok: false, reason: "exhausted" };
     if (e.uploadReservation) return { ok: false, reason: "in-progress" };
     const reservation = randomBytes(12).toString("base64url");
     e.uploadReservation = reservation;
@@ -207,6 +229,7 @@ export function createPorterTokenStore(
     const e = entries.get(token);
     if (!e || e.uploadReservation !== reservation) return false;
     delete e.uploadReservation;
+    e.uploadFailures += 1;
     return true;
   }
 
@@ -231,7 +254,9 @@ export function createPorterTokenStore(
     // the token TTL (the plan was staged in time; its own staging TTL governs it).
     let state: PorterTokenState;
     if (e.uploadConsumed) state = "received";
-    else if (isExpired(e)) state = "expired";
+    // An exhausted leg reads `expired`: the page shows its "generate a new
+    // link" notice instead of waiting out the TTL (#5228).
+    else if (isExpired(e) || isExhausted(e)) state = "expired";
     else state = "waiting";
     return {
       state,

@@ -281,8 +281,10 @@ export const uiCatalogEntries = [
     id: "ui.settings-notifications",
     domain: "ui",
     surface: "ui",
-    description: "The Notifications page — the notification settings.",
-    whenToUse: "To point a human at their notification settings.",
+    description:
+      "The Notifications page — notification settings and the 48-hour inbox.",
+    whenToUse:
+      "To point a human at their notification settings or their recent notifications.",
     invocation: { kind: "ui", location: "/settings/notifications" },
     auth: "jwt",
     riskTier: "readonly",

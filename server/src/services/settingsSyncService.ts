@@ -6,6 +6,7 @@ import {
   DefaultOutputStylePreferenceSchema,
   TimeLogTimezoneSchema,
   TerminalKeyboardExpandedPreferenceSchema,
+  ShareApiKeysByDefaultPreferenceSchema,
   FEDERATION_SETTING_KEYS,
   FederationSettingsBlockSchema,
   FederationSettingsSyncSchema,
@@ -16,7 +17,11 @@ import {
   type FederationSettingsView,
   type TimestampedValue,
 } from "@hapi/protocol/schemas";
-import { readSettings, writeSettings } from "../config/settings";
+import {
+  readSettings,
+  SettingsUnreadableError,
+  updateSettings,
+} from "../config/settings";
 
 /**
  * Issue #2624 (Sub-Issue B of epic #2622): the federation-global settings layer.
@@ -93,6 +98,12 @@ export const SETTING_REGISTRY: Record<
   // browser's first-paint cache (#4516), never a server settings.json key.
   terminalKeyboardExpanded: {
     schema: TerminalKeyboardExpandedPreferenceSchema,
+  },
+  // Federation-native (#5127): the initial state of the add forms' "Make
+  // available to all nodes" checkbox. No A-local storage; unset ⇒ the web uses
+  // SHARE_API_KEYS_BY_DEFAULT_DEFAULT (off).
+  shareApiKeysByDefault: {
+    schema: ShareApiKeysByDefaultPreferenceSchema,
   },
 };
 
@@ -469,6 +480,16 @@ export class SettingsSyncService {
     return run;
   }
 
+  /**
+   * Issue #5127 (D19): the cycle runs inside `updateSettings`, the per-file
+   * write chain every settings.json writer that uses it shares (the API-key
+   * vault routes among them). The block is merged into a FRESH read taken
+   * inside that chain, so this periodic writer cannot write back a stale
+   * snapshot over a concurrent vault change made in this server process (e.g.
+   * leave a key shared after it was unticked). A CLI process writing
+   * settings.json under its own lock is not covered (#4365). An unreadable file
+   * is still never written.
+   */
   private async runMutation<T>(
     fn: (block: FederationSettingsBlock) => {
       block: FederationSettingsBlock;
@@ -477,23 +498,30 @@ export class SettingsSyncService {
     },
     onUnreadable: () => T
   ): Promise<T> {
-    const settings = await readSettings(this.settingsFile);
-    if (settings === null) {
-      console.warn(
-        "[SettingsSync] settings.json unreadable — skipping federationSettings write"
-      );
-      return onUnreadable();
+    let outcome: { result: T } | null = null;
+    try {
+      await updateSettings(this.settingsFile, current => {
+        const rec = current as Record<string, unknown>;
+        const block = FederationSettingsBlockSchema.parse(
+          rec.federationSettings ?? {}
+        );
+        const { block: next, result, changed } = fn(block);
+        outcome = { result };
+        return changed
+          ? ({ ...current, federationSettings: next } as typeof current)
+          : current;
+      });
+    } catch (err) {
+      if (err instanceof SettingsUnreadableError) {
+        console.warn(
+          "[SettingsSync] settings.json unreadable — skipping federationSettings write"
+        );
+        return onUnreadable();
+      }
+      throw err;
     }
-    const rec = settings as Record<string, unknown>;
-    const block = FederationSettingsBlockSchema.parse(
-      rec.federationSettings ?? {}
-    );
-    const { block: next, result, changed } = fn(block);
-    if (changed) {
-      rec.federationSettings = next;
-      await writeSettings(this.settingsFile, settings);
-    }
-    return result;
+    // `updateSettings` runs `mutate` exactly once before it resolves.
+    return (outcome as { result: T } | null)!.result;
   }
 
   private peers(): SettingsSyncPeer[] {

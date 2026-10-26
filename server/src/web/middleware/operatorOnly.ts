@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { MiddlewareHandler } from "hono";
+import { markClosedGate } from "../../capabilities/cataloged";
 import type { WebAppEnv } from "./auth";
 
 /**
@@ -15,11 +16,17 @@ import type { WebAppEnv } from "./auth";
  * stays closed. The flag is resolved once per server process
  * (`resolveOperatorInstanceEnabled`). Reused by #2912's inbox proxy routes —
  * keep the name and signature stable.
+ *
+ * The gate also drives catalog visibility (issue #5571): a closed gate is marked
+ * with `CLOSED_GATE_TAG`, so the capability collector omits the route from the
+ * served catalog and `hapi_call` refuses it. A gated route therefore needs no
+ * extra availability predicate — declare its entry `scope: "user"` (the gate is
+ * per instance; `scope: "operator"` means the provisioner-host proof plus a
+ * matching operator binding — `deriveScope`). Pass it as a route argument: an
+ * `app.use` gate is not seen by the collector.
  */
 export function operatorOnly(enabled: boolean): MiddlewareHandler<WebAppEnv> {
   const open = enabled === true;
-  return async (c, next) => {
-    if (!open) return c.notFound();
-    return next();
-  };
+  if (!open) return markClosedGate(async c => c.notFound());
+  return async (_c, next) => next();
 }

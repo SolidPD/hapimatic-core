@@ -15,6 +15,7 @@ import type { ErrorLogger } from "../logging/errorLogger";
 // Issue #3632: value import (not `import type`) — this predicate is CALLED at
 // spawn time to stamp the owning server's message-hook stage into the RPC.
 import { messageHooksEnabled } from "./messageHooks";
+import { spawnSuccessFromRpc, type SpawnSuccess } from "./spawnSuccess";
 
 /** Default ack timeout for daemon RPC calls (cleanup, list-directory, etc.). */
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
@@ -244,7 +245,7 @@ export class RpcGateway {
   }
 
   async spawnSession(opts: SpawnSessionOptions): Promise<
-    | { type: "success"; sessionId: string }
+    | SpawnSuccess
     // Issue #1772: carry the daemon's error `code` (e.g. "at_capacity") back to
     // syncEngine.spawnSession, whose return type already declares `code?`.
     | { type: "error"; message: string; code?: string }
@@ -357,13 +358,8 @@ export class RpcGateway {
       if (result && typeof result === "object") {
         const obj = result as Record<string, unknown>;
         if (obj.type === "success" && typeof obj.sessionId === "string") {
-          return {
-            type: "success",
-            sessionId: obj.sessionId,
-            ...(typeof obj.resolvedName === "string"
-              ? { resolvedName: obj.resolvedName }
-              : {}),
-          };
+          // Issue #5614: copies resolvedName and sessionTypeDowngrade (#1262 trap).
+          return spawnSuccessFromRpc({ ...obj, sessionId: obj.sessionId });
         }
         if (obj.type === "error" && typeof obj.errorMessage === "string") {
           // Issue #1772: propagate the daemon's error `code` (e.g. "at_capacity")

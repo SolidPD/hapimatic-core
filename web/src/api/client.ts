@@ -13,6 +13,7 @@ import {
 } from "@/lib/nodeAvailability";
 import type {
   AddApiKeyRequest,
+  AvailableApiKeysResponse,
   PatchApiKeyRequest,
   AutoRecoverPreference,
   AutoSelectOptimalAccountPreference,
@@ -37,6 +38,7 @@ import type {
   DaemonCapSource,
   OnboardingState,
   OnboardingStatePatch,
+  BackupPromptPreference,
 } from "@hapi/protocol/schemas";
 import type { QueuedMessage, SessionView } from "@hapi/protocol/types";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
@@ -158,6 +160,9 @@ import type {
   TelemetryTimeseries,
   TelemetryTokenEstimate,
   UpdateScheduledTaskRequest,
+  NotificationListResponse,
+  NotificationUnreadCountResponse,
+  StoredNotification,
 } from "@/types/api";
 import type {
   PorterRecipientResponse,
@@ -250,6 +255,17 @@ type RequestReportOptions = {
 const FEDERATION_HEALTH_REPORT_OPTS: RequestReportOptions = {
   expectedStatuses: [503],
 };
+
+/**
+ * The POST init for a notification read / dismiss (#4916). With a `nodeId` the
+ * body routes the call straight to the node that holds the row; without one the
+ * request has no body, exactly as before.
+ */
+function notificationMutationInit(nodeId?: string): RequestInit {
+  return nodeId
+    ? { method: "POST", body: JSON.stringify({ nodeId }) }
+    : { method: "POST" };
+}
 
 function parseErrorCode(bodyText: string): string | undefined {
   try {
@@ -645,9 +661,24 @@ export class ApiClient {
    * `path` must be the full server path (e.g. `/api/session-notes/abc`).
    * Callers own their own response typing — the server contract for an
    * extension route is owned by that extension, not by this class.
+   *
+   * `opts.expectedStatuses` declares a designed non-2xx answer so it is not
+   * filed as a client error report (issue #5571; same contract as
+   * `getFeedbackPreflight`).
    */
-  async extensionRequest<T>(path: string, init?: RequestInit): Promise<T> {
-    return await this.request<T>(path, init);
+  async extensionRequest<T>(
+    path: string,
+    init?: RequestInit,
+    opts?: RequestReportOptions
+  ): Promise<T> {
+    return await this.request<T>(
+      path,
+      init,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      opts
+    );
   }
 
   async authenticate(
@@ -727,6 +758,71 @@ export class ApiClient {
       method: "DELETE",
       body: JSON.stringify(payload),
     });
+  }
+
+  // Notification inbox (issue #4915; routes from #4913). A row from the hub's
+  // list carries `nodeId` for a peer row, and read / dismiss forward it so the
+  // hub goes straight to that node (#4916). A row bridged by a SyncEvent carries
+  // none (the event bridge forwards a peer's `notification` event as-is); the
+  // hub then asks every peer. A 404 (row gone) and a 502 (a peer did not answer)
+  // are designed answers, so they are not error-reported (#2362).
+  async getNotifications(
+    options: { unread?: boolean; limit?: number; offset?: number } = {}
+  ): Promise<NotificationListResponse> {
+    const params = new URLSearchParams();
+    if (options.unread) params.set("unread", "1");
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.offset !== undefined)
+      params.set("offset", String(options.offset));
+    const qs = params.toString();
+    return await this.request<NotificationListResponse>(
+      `/api/notifications${qs ? `?${qs}` : ""}`
+    );
+  }
+
+  async getNotificationUnreadCount(): Promise<NotificationUnreadCountResponse> {
+    return await this.request<NotificationUnreadCountResponse>(
+      "/api/notifications/unread-count"
+    );
+  }
+
+  async markNotificationRead(
+    id: string,
+    nodeId?: string
+  ): Promise<{ notification: StoredNotification }> {
+    return await this.request<{ notification: StoredNotification }>(
+      `/api/notifications/${encodeURIComponent(id)}/read`,
+      notificationMutationInit(nodeId),
+      0,
+      undefined,
+      undefined,
+      { expectedStatuses: [404, 502] }
+    );
+  }
+
+  async dismissNotification(
+    id: string,
+    nodeId?: string
+  ): Promise<{ notification: StoredNotification }> {
+    return await this.request<{ notification: StoredNotification }>(
+      `/api/notifications/${encodeURIComponent(id)}/dismiss`,
+      notificationMutationInit(nodeId),
+      0,
+      undefined,
+      undefined,
+      { expectedStatuses: [404, 502] }
+    );
+  }
+
+  async dismissAllNotifications(): Promise<{ dismissed: number }> {
+    return await this.request<{ dismissed: number }>(
+      "/api/notifications/dismiss-all",
+      { method: "POST" },
+      0,
+      undefined,
+      undefined,
+      { expectedStatuses: [502] }
+    );
   }
 
   async getSession(sessionId: string): Promise<SessionResponse> {
@@ -1897,7 +1993,9 @@ export class ApiClient {
     // #4497: parent link + cut point of a remote fan-out peer (one trailing
     // object, never positionals). The hub resolves the parent and forwards it
     // only when it resolves (#2822); an older node strips the fields.
-    parent?: SpawnParentOptions
+    // #5127: `apiKeyId` rides the same trailing object — the qualified ref of a
+    // key shared from another node, which the target fetches itself.
+    parent?: SpawnParentOptions & { apiKeyId?: string }
   ): Promise<SpawnResponse> {
     return await this.request<SpawnResponse>(
       `/api/federation/nodes/${encodeURIComponent(nodeId)}/spawn`,
@@ -1928,6 +2026,7 @@ export class ApiClient {
           parentSessionId: parent?.parentSessionId,
           parentRelationship: parent?.parentRelationship,
           sourceBranch: parent?.sourceBranch,
+          apiKeyId: parent?.apiKeyId,
         }),
       },
       0,
@@ -3356,9 +3455,10 @@ export class ApiClient {
    * Operator-instance gate for the feedback inbox (issue #2910, epic #2909 Sub
    * A). `GET /api/feedback/preflight` answers `{ enabled: true }` on an operator
    * instance and 404 everywhere else. The 404 is a designed steady state, so it
-   * is declared in `expectedStatuses`: it still rejects (the caller's query
-   * errors and the gate stays closed) but is never filed as a client error
-   * report — once #2913 mounts this on every page, an unreported 404 matters.
+   * is declared in `expectedStatuses`: it still rejects with an `ApiError` (which
+   * `useFeedbackPreflight` turns into a cached `{ enabled: false }`, #5571) but is
+   * never filed as a client error report — once #2913 mounts this on every page,
+   * an unreported 404 matters.
    */
   async getFeedbackPreflight(): Promise<{ enabled: boolean }> {
     return await this.request<{ enabled: boolean }>(
@@ -3744,6 +3844,23 @@ export class ApiClient {
   }
 
   /**
+   * #5127: the Anthropic keys a Claude session on `targetNodeId` (null = this
+   * node) can bill — this node's own keys and the keys other nodes share — each
+   * with the `bindingRef` the spawn sends, plus the nodes whose shared keys
+   * could not be listed. Redacted view only.
+   */
+  async listAvailableApiKeys(
+    targetNodeId: string | null
+  ): Promise<AvailableApiKeysResponse> {
+    const query = targetNodeId
+      ? `?targetNodeId=${encodeURIComponent(targetNodeId)}`
+      : "";
+    return await this.request<AvailableApiKeysResponse>(
+      `/api/api-keys/available${query}`
+    );
+  }
+
+  /**
    * #4463: with `validate: true` the server probes first and stores only an
    * accepted key. Its three designed refusals — 409 `duplicate_key`, 422
    * `key_rejected` (with `upstreamStatus`) and 424 `key_unverified` — are
@@ -4060,6 +4177,23 @@ export class ApiClient {
     return await this.request<{ ok: boolean }>(
       "/api/backup/identity/acknowledge",
       { method: "POST" }
+    );
+  }
+
+  /** #4791: whether the user skipped the first-run backup-key step (node-local). */
+  async getBackupPromptPreference(): Promise<BackupPromptPreference> {
+    return await this.request<BackupPromptPreference>(
+      "/api/preferences/backup-prompt"
+    );
+  }
+
+  /** #4791: record a skip of the first-run backup-key step. Never acknowledges. */
+  async setBackupPromptPreference(
+    preference: BackupPromptPreference
+  ): Promise<BackupPromptPreference> {
+    return await this.request<BackupPromptPreference>(
+      "/api/preferences/backup-prompt",
+      { method: "PUT", body: JSON.stringify(preference) }
     );
   }
 

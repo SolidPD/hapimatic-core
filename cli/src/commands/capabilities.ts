@@ -22,10 +22,13 @@
 import axios from "axios";
 import { configuration } from "@/configuration";
 import { writeStdout } from "@/utils/stdout";
-import { capabilityCatalogIndex } from "@hapi/protocol";
+import {
+  capabilityCatalogIndex,
+  FEDERATION_HEALTH_DISABLED_CODE,
+} from "@hapi/protocol";
 import type { CatalogEntry } from "@hapi/protocol";
 import type { CommandDefinition } from "./types";
-import { authenticateCli } from "./cliAuth";
+import { authenticateCli, resolveCliApiToken } from "./cliAuth";
 import { listCommands } from "./registry";
 import { API_RESOURCE_ACTIONS } from "./api";
 import {
@@ -217,20 +220,61 @@ async function runLocalAudit(jsonMode: boolean): Promise<void> {
  */
 export const PROBE_PORTER_WITHHELD_CODE = "porter_withheld";
 
+/**
+ * #5212: a capability the instance has turned off on purpose, so its probe
+ * answers with a refusal that is not drift. `withheld` is Configuration Porter
+ * withheld by `HAPI_PORTER_EXPOSED` (#4533, #4655); `disabled` is federation
+ * health monitoring that this instance does not run.
+ */
+export type DeliberateOffKind = "withheld" | "disabled";
+
 /** #4655: one readonly probe response, classified for the comparator. */
 export type ProbeClassification =
   | { kind: "outcome"; outcome: ProbeOutcome }
-  | { kind: "withheld" };
+  | { kind: DeliberateOffKind };
+
+/**
+ * #5212: the refusals that mean "turned off here". A response matches only on
+ * all three of domain, status and body `code`, so the same code from another
+ * domain or on another status is still drift.
+ */
+const DELIBERATE_OFF_STATES: readonly {
+  domain: string;
+  status: number;
+  code: string;
+  kind: DeliberateOffKind;
+}[] = [
+  {
+    domain: "porter",
+    status: 404,
+    code: PROBE_PORTER_WITHHELD_CODE,
+    kind: "withheld",
+  },
+  {
+    domain: "federation",
+    status: 503,
+    code: FEDERATION_HEALTH_DISABLED_CODE,
+    kind: "disabled",
+  },
+];
+
+/** #5212: why each deliberate-off kind is not a mismatch (text output). */
+const DELIBERATE_OFF_LABELS: Record<DeliberateOffKind, string> = {
+  withheld:
+    "Configuration Porter is withheld on this instance by HAPI_PORTER_EXPOSED",
+  disabled: "federation health monitoring is not enabled on this instance",
+};
 
 /**
  * #4655: classify one readonly probe response. A 2xx is an `ok` outcome; any
  * other status is a failed outcome whose rejection is the body's `code`, then
- * its `error`, then `http_<status>`. The one exception is a Porter capability
- * answering the exposure gate's 404 `porter_withheld`: that is the instance's
- * deliberate withheld state (`HAPI_PORTER_EXPOSED`, #4533) — discovery is not
- * exposure — so it is reported as withheld, never as drift. The domain check
- * keeps a `porter_withheld` from any non-Porter route counted as drift. PURE:
- * exported so the verb's test classifies responses without a server.
+ * its `error`, then `http_<status>`. The exceptions are the deliberate-off
+ * states in `DELIBERATE_OFF_STATES`: a Porter capability answering the
+ * exposure gate's 404 `porter_withheld` (discovery is not exposure, #4533) is
+ * reported as withheld, and a federation-health route answering 503
+ * `federation_health_disabled` (#5212) as disabled — never as drift. Matching
+ * on the domain keeps either code from any other domain counted as drift.
+ * PURE: exported so the verb's test classifies responses without a server.
  */
 export function classifyProbeResponse(
   entry: { id: string; domain: string },
@@ -247,12 +291,11 @@ export function classifyProbeResponse(
       : undefined;
   const code = typeof fields?.code === "string" ? fields.code : undefined;
   const error = typeof fields?.error === "string" ? fields.error : undefined;
-  if (
-    entry.domain === "porter" &&
-    status === 404 &&
-    code === PROBE_PORTER_WITHHELD_CODE
-  ) {
-    return { kind: "withheld" };
+  const off = DELIBERATE_OFF_STATES.find(
+    s => s.domain === entry.domain && s.status === status && s.code === code
+  );
+  if (off) {
+    return { kind: off.kind };
   }
   return {
     kind: "outcome",
@@ -271,28 +314,71 @@ export interface ProbeResult {
 }
 
 /**
- * #4655: fold probe results into the comparator's two inputs plus the withheld
- * ids. A withheld entry leaves BOTH lists, because `advertisedVsActual` reads an
- * advertised entry with no outcome as advertised-but-dead. PURE: exported so
- * the verb's test exercises the same partition the probe uses.
+ * #4655: fold probe results into the comparator's two inputs plus the ids of
+ * each deliberate-off kind. A withheld or disabled entry leaves BOTH lists,
+ * because `advertisedVsActual` reads an advertised entry with no outcome as
+ * advertised-but-dead. PURE: exported so the verb's test exercises the same
+ * partition the probe uses.
  */
 export function partitionProbeResults(results: readonly ProbeResult[]): {
   advertised: AdvertisedCapability[];
   outcomes: ProbeOutcome[];
   withheld: string[];
+  disabled: string[];
 } {
   const advertised: AdvertisedCapability[] = [];
   const outcomes: ProbeOutcome[] = [];
-  const withheld: string[] = [];
+  const off: Record<DeliberateOffKind, string[]> = {
+    withheld: [],
+    disabled: [],
+  };
   for (const { capability, classification } of results) {
-    if (classification.kind === "withheld") {
-      withheld.push(capability.id);
+    if (classification.kind !== "outcome") {
+      off[classification.kind].push(capability.id);
       continue;
     }
     advertised.push(capability);
     outcomes.push(classification.outcome);
   }
-  return { advertised, outcomes, withheld };
+  return {
+    advertised,
+    outcomes,
+    withheld: off.withheld,
+    disabled: off.disabled,
+  };
+}
+
+/** #5212: the CLI token as `resolveCliApiToken` found it, for the probe. */
+export interface ProbeCliToken {
+  token: string;
+  /** Read from settings.json rather than the `CLI_API_TOKEN` env var. */
+  fromSettings: boolean;
+}
+
+/**
+ * #5212: the auth a probe GET carries. An entry whose catalog `auth` is
+ * `cli-token` is sent the CLI token, because those routes reject a JWT (a
+ * JWT-probed `GET /cli/sessions` read as dead with 401); every other entry is
+ * sent the JWT as before. `CatalogEntry.auth` is the only input — no id is
+ * special-cased. The CLI token is this instance's long-lived credential, so it
+ * travels under `authenticateCli`'s rule: a settings-file token goes only to
+ * the loopback server the URL names, with no ambient proxy and no redirect
+ * (#5136). Pass no `cliToken` for a URL outside the configured server; the
+ * entry then gets the JWT, and a refusal reads as drift. PURE: exported so the
+ * verb's test checks the selection without a server.
+ */
+export function probeRequestFor(
+  entry: { auth: CatalogEntry["auth"] },
+  jwt: string,
+  cliToken: ProbeCliToken | undefined
+): { headers: Record<string, string>; proxy?: false; maxRedirects?: 0 } {
+  if (entry.auth !== "cli-token" || cliToken === undefined) {
+    return { headers: authHeaders(jwt) };
+  }
+  const headers = authHeaders(cliToken.token);
+  return cliToken.fromSettings
+    ? { headers, proxy: false, maxRedirects: 0 }
+    : { headers };
 }
 
 /**
@@ -304,20 +390,35 @@ export function partitionProbeResults(results: readonly ProbeResult[]): {
  * D6 cut from #3744); reports mismatches and issues only readonly GETs — but on
  * an instance that exposes Configuration Porter, the first
  * `GET /api/porter/recipient/public` creates its age keypair (#5170). #4655: a
- * Porter entry answering 404 `porter_withheld` is listed as withheld and kept
- * out of the comparator, so it never counts as a mismatch. Exit 0 clean /
+ * Porter entry answering 404 `porter_withheld` is listed as withheld, and
+ * #5212: a federation-health entry answering 503 `federation_health_disabled`
+ * as disabled; both are kept out of the comparator, so neither counts as a
+ * mismatch. #5212: a `cli-token` entry is probed with the CLI token
+ * (`probeRequestFor`), and an entry that cannot answer without a query
+ * parameter carries `probe: "skip"` in its catalog metadata. Exit 0 clean /
  * 1 mismatches / 2 tool error — recorded in the PR, NOT gated in CI (V5).
  */
 async function runProbeAudit(jsonMode: boolean): Promise<void> {
-  let headers: Record<string, string>;
+  let jwt: string;
+  let cliToken: ProbeCliToken | undefined;
   let catalog: {
     rest?: (CatalogEntry & { available?: boolean; reason?: string })[];
   };
   try {
-    headers = authHeaders(await authenticateCli(2));
+    jwt = await authenticateCli(2);
+    // authenticateCli exits unless a token resolved, and a second resolution
+    // reports the same source (cliAuth.ts reads process.env, not the singleton).
+    const resolution = await resolveCliApiToken();
+    cliToken =
+      resolution.kind === "env" || resolution.kind === "settings"
+        ? {
+            token: resolution.token,
+            fromSettings: resolution.kind === "settings",
+          }
+        : undefined;
     const resp = await axios.get(
       `${configuration.serverUrl}/api/capabilities/catalog`,
-      { headers, timeout: 10_000 }
+      { headers: authHeaders(jwt), timeout: 10_000 }
     );
     catalog = resp.data as typeof catalog;
   } catch (error) {
@@ -334,13 +435,15 @@ async function runProbeAudit(jsonMode: boolean): Promise<void> {
     // skip rather than emit a false "advertised-but-dead" for a 404.
     if (e.invocation.path.includes(":")) continue;
     const path = e.invocation.path;
-    const url = path.startsWith("http")
+    const absolute = path.startsWith("http");
+    const url = absolute
       ? path
       : `${configuration.serverUrl}${path.startsWith("/") ? "" : "/"}${path}`;
     let classification: ProbeClassification;
     try {
       const r = await axios.get(url, {
-        headers,
+        // The CLI token only ever goes to the configured server.
+        ...probeRequestFor(e, jwt, absolute ? undefined : cliToken),
         timeout: 8_000,
         validateStatus: () => true,
       });
@@ -361,19 +464,27 @@ async function runProbeAudit(jsonMode: boolean): Promise<void> {
     });
   }
 
-  const { advertised, outcomes, withheld } = partitionProbeResults(results);
+  const { advertised, outcomes, withheld, disabled } =
+    partitionProbeResults(results);
   const mismatches = advertisedVsActual(advertised, outcomes);
-  // Every GET issued, compared or withheld.
-  const probed = advertised.length + withheld.length;
+  // Every GET issued: compared, withheld or disabled.
+  const probed = advertised.length + withheld.length + disabled.length;
   if (jsonMode) {
-    writeStdout(JSON.stringify({ probed, withheld, mismatches }, null, 2));
+    writeStdout(
+      JSON.stringify({ probed, withheld, disabled, mismatches }, null, 2)
+    );
   } else {
     const lines = [`Probed ${probed} readonly GET capabilities.`];
-    if (withheld.length > 0) {
-      lines.push(
-        `${withheld.length} withheld (Configuration Porter is withheld on this ` +
-          `instance by HAPI_PORTER_EXPOSED; not a mismatch): ${withheld.join(", ")}`
-      );
+    for (const [kind, ids] of [
+      ["withheld", withheld],
+      ["disabled", disabled],
+    ] as const) {
+      if (ids.length > 0) {
+        lines.push(
+          `${ids.length} ${kind} (${DELIBERATE_OFF_LABELS[kind]}; not a ` +
+            `mismatch): ${ids.join(", ")}`
+        );
+      }
     }
     if (mismatches.length === 0) {
       lines.push("No advertised-vs-actual mismatches.");

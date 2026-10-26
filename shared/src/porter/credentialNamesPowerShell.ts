@@ -14,7 +14,9 @@
  * NODE-FREE (R7): string builders only.
  */
 import {
+  ARCHIVE_BACKSLASH_PATH_OMISSION_REASON,
   ARCHIVE_CREDENTIAL_OMISSION_REASON,
+  ARCHIVE_LINK_LOOP_OMISSION_REASON,
   ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
   psq,
 } from "./exportShared";
@@ -89,7 +91,9 @@ export function credentialNamesPowerShellLines(): string[] {
  * `under_link` in `credentialNamesShell.ts`, plus `reparseTag` and
  * `isCloudPlaceholder` (#4321, ruling O2). Moved here from
  * `exportScriptPowerShell.ts` (#4321, epic #4290 T25); #4321 then added the
- * O2 placeholder rule and the loop (`l`) lines. They rely on `isCredentialName`
+ * O2 placeholder rule and the loop (`l`) lines, and #5549 (item 5)
+ * `linkHoldsItself`, the walk's loop test applied to a staged folder link
+ * itself (the bash twin runs it inline in `materialize_links`). They rely on `isCredentialName`
  * (above) and on the main block's `$ON_WINDOWS`, `$STAGING` and `$STG_FULL`.
  */
 export function linkCheckPowerShellLines(): string[] {
@@ -294,6 +298,66 @@ export function linkCheckPowerShellLines(): string[] {
     `      if (-not $phys) { return '${ARCHIVE_LINK_UNCHECKED_OMISSION_REASON}' }`,
     `      if (hasCredentialPart $phys) { return '${ARCHIVE_CREDENTIAL_OMISSION_REASON}' }`,
     "      return $null",
+    "    }",
+    "    # #5549 (item 5): true when the folder link at $src names the folder it",
+    "    # sits in or one above it (loop -> ., up -> ..), so copying it would copy",
+    "    # that folder into itself. The walk's test for the links under a copy",
+    "    # (credentialLinks), applied to the link itself, as the bash twin does.",
+    "    function linkHoldsItself($src) {",
+    "      $phys = physicalPath $src",
+    "      if (-not $phys) { return $false }",
+    "      $psep = [string][IO.Path]::DirectorySeparatorChar",
+    "      $pcmp = if ($ON_WINDOWS) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }",
+    "      $ppar = physicalPath ([IO.Path]::GetDirectoryName($src))",
+    "      return [bool]($ppar -and ($ppar + $psep).StartsWith($phys.TrimEnd($psep) + $psep, $pcmp))",
+    "    }",
+  ];
+}
+
+/**
+ * `copyLinkedFolder <src> <dst> <rel>` (issue #5549, Item 2): copies the folder
+ * a link names into staging the way the bash twin's `materialize_links` copies
+ * a staged folder link: `credentialLinks` walks it, `tar -h` copies it with each
+ * loop left out, and each path the walk refused is taken out with one omission.
+ * Moved verbatim from `materializeLinks`, which calls it, and also used by Step
+ * 4 for a linked `hooks/lib` or `hooks/_shared`: bash stages that one as a link
+ * and materializes it so, while a plain copy here left a loop in it to be
+ * caught one level down, shipping a second copy. Relies on the main block's
+ * `copyTreeExcluding`, `recordOmission`, `stagedItem`, `removeStaged` and
+ * `$TAR_ANCHOR`, and on `credentialLinks` / `underLink` (above).
+ */
+export function linkedFolderCopyPowerShellLines(): string[] {
+  return [
+    "    # #5549: copies the folder a link names into staging as the bash twin",
+    "    # materializes a staged folder link. $src is the link's source path, $dst",
+    "    # the staged folder, $rel its staged path. False when the copy failed; the",
+    "    # caller records that omission.",
+    "    function copyLinkedFolder($src, $dst, $rel) {",
+    "      $surface = $rel -replace '\\\\','/'",
+    "      $refused = credentialLinks $src $surface",
+    "      # #4321: in ordinal order, and each loop left out of the copy (GNU tar",
+    "      # -h follows one without end); a glob character is matched literally.",
+    "      if ($refused.Count -gt 1) { [Array]::Sort($refused, [StringComparer]::Ordinal) }",
+    "      $loopEx = @()",
+    "      foreach ($entry in $refused) {",
+    "        $lk, $lp = $entry.Split([char[]]@([char]9), 2)",
+    "        if ($lk -eq 'l') { $loopEx += ('--exclude=' + $TAR_ANCHOR + './' + ([regex]::Replace($lp.Substring($surface.Length + 1), '[\\[*?]', '[$0]'))) }",
+    "      }",
+    "      if (-not (copyTreeExcluding $src $dst $loopEx $true)) { return $false }",
+    "      # -h followed the links under it too: take out each one credentialLinks",
+    "      # refused, with one omission per path it staged. A path below a link",
+    "      # tar kept is not this copy's, so it is left alone.",
+    "      foreach ($entry in $refused) {",
+    "        $kind, $cl = $entry.Split([char[]]@([char]9), 2)",
+    "        if (underLink $cl) { continue }",
+    `        if ($kind -eq 'l') { recordOmission $cl '${ARCHIVE_LINK_LOOP_OMISSION_REASON}'; continue }`,
+    "        $si = stagedItem $cl",
+    "        if (-not $si) { continue }",
+    `        if ($kind -eq 'u') { $cwhy = '${ARCHIVE_LINK_UNCHECKED_OMISSION_REASON}' } elseif ($kind -eq 'b') { $cwhy = '${ARCHIVE_BACKSLASH_PATH_OMISSION_REASON}' } else { $cwhy = '${ARCHIVE_CREDENTIAL_OMISSION_REASON}' }`,
+    "        recordOmission $cl $cwhy",
+    "        removeStaged $si",
+    "      }",
+    "      return $true",
     "    }",
   ];
 }

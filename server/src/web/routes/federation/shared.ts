@@ -14,6 +14,8 @@ import type { ProviderAuthFacts } from "../../../services/providerAuthState";
 import type { CodexLoginService } from "../../../services/codexLoginService";
 import type { AccountLoginService } from "../../../services/accountLoginService";
 import type { LeaseStore } from "../../../store/leaseStore";
+import type { ApiKeyShareAuditStore } from "../../../store/apiKeyShareAuditStore";
+import type { SharedApiKeyService } from "../../../services/sharedApiKeyService";
 import type { SystemJobsService } from "../../../systemJobs/service";
 import type { OutputStyleSyncService } from "../../../services/outputStyleSyncService";
 import type { SettingsSyncService } from "../../../services/settingsSyncService";
@@ -29,8 +31,13 @@ import type {
 } from "../../../capabilities/availabilityContext";
 import { constantTimeEquals } from "../../../utils/crypto";
 import type { WebAppEnv } from "../../middleware/auth";
+import type { NotificationService } from "../../../notifications/notificationService";
 
 export type FederationDeps = {
+  // Issue #4913: the LOCAL-node notifications service for the peer-incoming
+  // /federation/notifications/* receivers. Optional because federation test
+  // stubs omit it (mirrors getSystemJobsService).
+  getNotificationService?: () => NotificationService | null;
   getSyncEngine: () => SyncEngine | null;
   getSseManager: () => SSEManager | null;
   getNodeRegistry: () => NodeRegistry | null;
@@ -109,6 +116,20 @@ export type FederationDeps = {
     caller: Caller;
     nodeVersion?: string;
   }) => AvailabilityContext;
+  // Issue #5127: the shared-API-key receivers (`./apiKeys.ts`) read THIS node's
+  // vault (settings.json `apiKeys[]`) on every request and audit every request.
+  // Optional because federation test stubs omit them; a receiver with no vault
+  // or no audit store refuses rather than serve unaudited.
+  getSettingsFile?: () => string;
+  getApiKeyShareAudit?: () => ApiKeyShareAuditStore | null;
+  /** Issue #5127: the requesting-side service the api-key spawn receiver
+   *  confirms a key with before it accepts the spawn. */
+  getSharedApiKeyService?: () => SharedApiKeyService | null;
+  /** Issue #5127: true on a hosted customer VM (defaults to `isTenantVm`). */
+  isTenantVm?: () => boolean;
+  /** Issue #5127 test seam: the TCP peer of a request. Defaults to Bun's
+   *  `getConnInfo`, which is unavailable under `app.request()` in tests. */
+  getPeerAddress?: (c: Context<WebAppEnv>) => string | undefined;
   federationConfig: FederationConfig | null;
   apiToken: string | null;
   jwtSecret: Uint8Array;

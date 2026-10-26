@@ -16,6 +16,8 @@ import { queryKeys } from "@/lib/query-keys";
  * instance withheld by the kill switch (`HAPI_PORTER_EXPOSED=0`) answers 404
  * `porter_withheld`. Callers gate on {@link porterExposure} /
  * {@link isPorterExposed}, and Porter UI mounts only on an `exposed` verdict.
+ * Once confirmed, `exposed` survives a failed refetch other than
+ * `porter_withheld` (stale-while-error, #5212).
  * `retry: false` is load-bearing: a retry storm on the designed 404 would only
  * delay that verdict. The client method declares 404 an expected status, so a
  * withheld tenant's Settings visit reports nothing.
@@ -53,17 +55,21 @@ export function isPorterWithheldError(error: unknown): boolean {
 }
 
 /**
- * The exposure verdict for a probe query (#4655). The ERROR branch comes first:
- * TanStack Query v5 keeps the last successful `data` when a refetch fails, so a
- * tab that cached `{ exposed: true }` before an exposed → withheld rollback must
- * not stay exposed. A 404 `porter_withheld` is `withheld`. Every other failure
- * (a 5xx, a timeout, a network drop, an unrecovered 401) is `unknown`: it is
- * not proof of withholding, so the page offers Retry instead of the
- * not-available notice.
+ * The exposure verdict for a probe query (#4655, #5212). The ERROR branch comes
+ * first: TanStack Query v5 keeps the last successful `data` when a refetch
+ * fails, so a tab that cached `{ exposed: true }` before an exposed → withheld
+ * rollback must not stay exposed. A 404 `porter_withheld` is `withheld`, and it
+ * is the ONLY failure that overrides cached data. Every other failure (a 5xx, a
+ * timeout, a network drop, an unrecovered 401) is not proof of withholding: with
+ * `{ exposed: true }` cached it stays `exposed` (stale but last known), because
+ * a 502 during a deploy would otherwise unmount an open import review whose plan
+ * and choices live only in component memory (#5212); with nothing cached it is
+ * `unknown`, so the page offers Retry instead of the not-available notice.
  */
 export function porterExposure(query: PorterStatusQuery): PorterExposure {
   if (query.status === "error") {
-    return isPorterWithheldError(query.error) ? "withheld" : "unknown";
+    if (isPorterWithheldError(query.error)) return "withheld";
+    return query.data?.exposed === true ? "exposed" : "unknown";
   }
   if (query.status === "pending") return "loading";
   return query.data?.exposed === true ? "exposed" : "unknown";

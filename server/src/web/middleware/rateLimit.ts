@@ -13,6 +13,10 @@ const DEFAULT_WINDOW_MS = parseEnvInt(
   process.env.HAPI_RATE_LIMIT_WINDOW_MS,
   60_000
 );
+const DEFAULT_MAX_KEYS = parseEnvInt(
+  process.env.HAPI_RATE_LIMIT_MAX_KEYS,
+  10_000
+);
 
 const PRUNE_EVERY = 100;
 
@@ -20,6 +24,8 @@ export interface RateLimitOptions {
   name: string;
   limit?: number;
   windowMs?: number;
+  /** Most buckets the limiter keeps; the oldest window is evicted past it (#5228). */
+  maxKeys?: number;
   keyFn?: (c: Context<WebAppEnv>) => string;
 }
 
@@ -33,6 +39,7 @@ export function createRateLimiter(
 ): MiddlewareHandler<WebAppEnv> {
   const limit = options.limit ?? DEFAULT_LIMIT;
   const windowMs = options.windowMs ?? DEFAULT_WINDOW_MS;
+  const maxKeys = options.maxKeys ?? DEFAULT_MAX_KEYS;
   const keyFn =
     options.keyFn ?? (c => (c.get("namespace") ?? "anonymous") as string);
 
@@ -60,6 +67,16 @@ export function createRateLimiter(
     const entry = buckets.get(key);
 
     if (!entry || now > entry.resetAt) {
+      // #5228: a client cycling source addresses adds a bucket per address, so
+      // the map is capped. A key is re-inserted on every window reset, so Map
+      // order is window-start order and the first key is the oldest window.
+      // Evicting it, rather than refusing new keys, never locks a new client out.
+      buckets.delete(key);
+      while (buckets.size >= maxKeys) {
+        const oldest = buckets.keys().next().value;
+        if (oldest === undefined) break;
+        buckets.delete(oldest);
+      }
       buckets.set(key, { count: 1, resetAt: now + windowMs });
       await next();
       return;

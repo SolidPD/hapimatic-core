@@ -197,11 +197,21 @@ export function startDaemonControlServer({
             sourceBranch: z.string().min(1).max(255).optional(),
             name: z.string().max(255).optional(),
           }),
+          // #5614: every reply key must be declared here, because
+          // serializerCompiler serializes the zod-parsed value and z.object
+          // strips undeclared keys (the 500 `code` was stripped since #1772).
           response: {
             200: z.object({
               success: z.boolean(),
               sessionId: z.string().optional(),
               approvedNewDirectoryCreation: z.boolean().optional(),
+              sessionTypeDowngrade: z
+                .object({
+                  from: z.literal("worktree"),
+                  to: z.literal("simple"),
+                  reason: z.string(),
+                })
+                .optional(),
             }),
             409: z.object({
               success: z.boolean(),
@@ -212,6 +222,7 @@ export function startDaemonControlServer({
             500: z.object({
               success: z.boolean(),
               error: z.string().optional(),
+              code: z.string().optional(),
             }),
           },
         },
@@ -269,6 +280,11 @@ export function startDaemonControlServer({
               success: true,
               sessionId: result.sessionId,
               approvedNewDirectoryCreation: true,
+              // Issue #5614 (#5202 U2): the downgrade reason, for parity with
+              // the hub's RPC path.
+              ...(result.sessionTypeDowngrade
+                ? { sessionTypeDowngrade: result.sessionTypeDowngrade }
+                : {}),
             };
 
           case "requestToApproveDirectoryCreation":

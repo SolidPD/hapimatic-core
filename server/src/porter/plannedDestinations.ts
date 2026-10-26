@@ -252,8 +252,8 @@ export function assertPlannedDestinations(
 /**
  * The `omissions` surface a skipped section entry is reported under. The one
  * spelling shared by the emitters ({@link sectionEntryOmission},
- * {@link sectionUnmatchedOmission}) and the
- * parity report (./commitHooks), which skips an entry only when the plan
+ * {@link sectionUnmatchedOmission}, {@link sectionPartialMatchOmission}) and
+ * the parity report (./commitHooks), which skips an entry only when the plan
  * actually carries this omission for it.
  */
 export function sectionSkipSurface(
@@ -287,10 +287,12 @@ export function stripEntrySpelling(p: string): string {
  * (`//`, a leading `/`), `.` or `..` part: such an entry is never used as a
  * NORMALIZED prefix; `planDimension` (./planSections) matches it as written,
  * as before #4185 (#5188), and reports it as an invalid entry path only when
- * that reaches no file. An omission still names the
- * RAW entry spelling. Parts are split on `/` only, the tar separator, so a `\`
- * path is matched as it is, and `assertSafeEntry` (which also splits on `\`)
- * still refuses a member with a `..` part.
+ * that reaches no file, and, when it reaches some, reports a file it would
+ * match without its `.` parts that no entry of the section reached (#5598).
+ * An omission still
+ * names the RAW entry spelling. Parts are split on `/` only, the tar
+ * separator, so a `\` path is matched as it is, and `assertSafeEntry` (which
+ * also splits on `\`) still refuses a member with a `..` part.
  */
 export function normalizeEntryPath(p: string): string | null {
   const s = stripEntrySpelling(p);
@@ -299,6 +301,23 @@ export function normalizeEntryPath(p: string): string | null {
   if (parts.some(part => part === "" || part === "." || part === ".."))
     return null;
   return s;
+}
+
+/**
+ * A path with its leading `./`, trailing `/` and every `.` part removed:
+ * `./hooks/./sub` → `hooks/sub`, `.` → `""` (the archive root). `null` when a
+ * part is empty or `..`. Used only to REPORT a member an invalid entry leaves
+ * behind (#5598, ./planSections); never to plan. A `..` or empty part (split
+ * on `/` only, like {@link normalizeEntryPath}) yields `null`. A `..` written
+ * with `\` is not caught here (containment also splits on `\`), so such a
+ * member can be named as left behind; it is still never planned or staged.
+ */
+export function dotlessEntryPath(p: string): string | null {
+  const s = stripEntrySpelling(p);
+  if (s === "") return ""; // "./": the archive root, like "."
+  const parts = s.split("/");
+  if (parts.some(part => part === "" || part === "..")) return null;
+  return parts.filter(part => part !== ".").join("/");
 }
 
 function moreFiles(count: number): string {
@@ -333,10 +352,11 @@ export interface SkipTally {
 }
 
 /**
- * The single plan warning for one section entry (#4172). The web list keys each
- * omission on its `surface`, so an entry gets ONE omission even when both
- * causes fire: the #4160 outside-folder reason, the credential reason, or both
- * joined with "; also ".
+ * The plan warning for one section entry's #4160/#4172 skips (#4172): ONE row
+ * even when both causes fire: the #4160 outside-folder reason, the credential
+ * reason, or both joined with "; also ". A #5598 partial-match row
+ * ({@link sectionPartialMatchOmission}) can share the surface; the web keys
+ * rows by index (ImportOmissions.tsx).
  */
 export function sectionEntryOmission(
   field: SectionField,
@@ -367,10 +387,14 @@ export function sectionEntryOmission(
  * no FILE member (#4185), or because its path is not a valid entry path
  * ({@link normalizeEntryPath} returned `null`) and its as-written match
  * reached no file (#5188). It carries the same surface as
- * {@link sectionEntryOmission}, so an entry still gets ONE omission, and the
- * post-commit parity (./commitHooks) drops a "missing" result for an entry
- * already reported here. At most one of the two fires per entry: a member
- * skipped for either #4160 or #4172 reason counts as a match.
+ * {@link sectionEntryOmission}, and the post-commit parity (./commitHooks)
+ * drops a "missing" result for an entry already reported here. At most one of
+ * the two fires per entry: a member
+ * skipped for either #4160 or #4172 reason counts as a match. The #5598
+ * partial-match omission ({@link sectionPartialMatchOmission}) carries the
+ * same surface and can sit beside a #4160/#4172 one for the same entry; the
+ * web keys rows by index and subtracts `policySkips` as a multiset on
+ * surface + reason (#5202 U8), so two rows under one surface are safe.
  */
 export function sectionUnmatchedOmission(
   field: SectionField,
@@ -383,5 +407,22 @@ export function sectionUnmatchedOmission(
       cause === "invalid-path"
         ? `not imported: this is not a valid entry path (it has an empty, "." or ".." part)`
         : "not imported: no file in the archive matches this entry",
+  };
+}
+
+/**
+ * The plan warning for an entry with an empty, `.` or `..` part whose as-written
+ * match reached some files but left behind files it would match once its `.`
+ * parts are removed (#5598): names the first left-behind destination and the
+ * count of the rest. Same surface as {@link sectionUnmatchedOmission}.
+ */
+export function sectionPartialMatchOmission(
+  field: SectionField,
+  entryPath: string,
+  tally: SkipTally
+): Omission {
+  return {
+    surface: sectionSkipSurface(field, entryPath),
+    reason: `not imported: ${tally.first}${moreFiles(tally.count)}, because this entry has an empty, "." or ".." part and matches only files spelled the same way`,
   };
 }

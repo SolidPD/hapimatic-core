@@ -709,6 +709,9 @@ export function createPorterImportRoutes(opts: {
         // does (a plan-approved, non-overlaid server whose slot vanished at commit)
         // embeds the server + KEY name only, and no porter module logs the merged
         // config. Overlay validation errors (returned 400 above) carry names too.
+        // #5676: a malformed destination .claude.json / settings.json refusal
+        // carries a fixed reason, never the parser's text (Bun echoes an
+        // unquoted value).
         const message =
           err instanceof Error ? err.message : "Import commit failed";
         // #4177 (L4) + #4242 + #4315: a 5xx or a rolled-back failure (clean or

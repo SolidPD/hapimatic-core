@@ -13,7 +13,6 @@ import type {
   NodeAccountHealth,
   NodeAccountHealthReason,
   NodePmSpawnRoster,
-  NodeProviderAuthState,
   NodeTurnAggregates,
   TurnFeedDigest,
   TurnFeedPage,
@@ -22,12 +21,22 @@ import type {
   PmSpawnRosterUpsert,
   SessionSummary,
   SessionView,
+  StoredNotification,
   UiCollapseState,
 } from "@hapi/protocol";
 import type { SyncEvent } from "@hapi/protocol/types";
 import type { GitBranchListing } from "@hapi/protocol/gitBranches";
 import {
   ANTHROPIC_LOGIN_CAPABILITY,
+  FederationApiKeyRefusalSchema,
+  FederationApiKeyResolvedSchema,
+  FederationApiKeySecretSchema,
+  FederationSharedApiKeysSchema,
+  SHARED_API_KEYS_CAPABILITY,
+  type FederationApiKeyRequest,
+  type FederationApiKeySpawnBody,
+  type FederationApiKeyResolved,
+  type FederationSharedApiKeys,
   parseNodeAccountHealthPerEntry,
   SupervisedLoop,
   displayNodeLabel,
@@ -43,6 +52,7 @@ import type {
 import type { SSEManager } from "../sse/sseManager";
 import type { PeerStore } from "../store/peerStore";
 import type { CachedRemoteSessions, NodeRegistryOptions } from "./types";
+import { createHomeUrlGuard } from "./secretTransport";
 import type { FileClaimSync } from "./fileClaimSync";
 import type { FileClaimSyncSnapshot } from "@hapi/protocol";
 import type { RedactedAccount } from "../services/accountService";
@@ -67,6 +77,36 @@ import type {
 import { readPeerJsonObject } from "./proxyFetchSignal";
 
 const FETCH_TIMEOUT_MS = 10_000;
+/** #5127: fetch error codes (Bun and Node) that mean the peer is unreachable. */
+const UNREACHABLE_CODES = new Set([
+  "ConnectionRefused",
+  "ConnectionClosed",
+  "FailedToOpenSocket",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ETIMEDOUT",
+]);
+/** Per-peer timeout for the notification fan-out (issue #4913): the badge polls. */
+const NOTIFICATION_PROXY_TIMEOUT_MS = 3_000;
+
+/** A failed notification proxy call; `status` is the peer's HTTP status, absent on a transport fault, timeout or offline node. */
+export type NotificationProxyError = {
+  type: "error";
+  message: string;
+  status?: number;
+};
+
+/**
+ * Outcome of a proxied notification read / dismiss (issue #4913): the updated
+ * row, `notFound` (the peer answered 404 — not in the caller's namespace
+ * there), or an error for any other failure (offline, timeout, non-2xx).
+ */
+export type NotificationIdActionResult =
+  | { notification: StoredNotification }
+  | { notFound: true }
+  | { type: "error"; message: string };
 
 /**
  * #3815: failure of a per-session action proxied to a peer. `status` is the
@@ -79,6 +119,24 @@ export type RemoteSessionActionError = {
   status?: number;
   offline?: true;
 };
+
+/**
+ * #5739: one classified peer read, shared by `getAccountHealthOnNode` and
+ * `getProviderAuthStateOnNode` so the two readers never classify the same peer
+ * reply differently. `ok` carries the peer's parsed 2xx body as untrusted data
+ * for the caller to validate. `message` on `unreachable` is for the hub's log
+ * only and never carries the peer's response body: an HTTP failure is named by
+ * its status, a throw by the runtime's error text.
+ */
+export type PeerReadOutcome =
+  | { kind: "ok"; body: unknown }
+  | { kind: "offline" }
+  | { kind: "unsupported" }
+  | {
+      kind: "unreachable";
+      reason: NodeAccountHealthReason;
+      message: string;
+    };
 
 /**
  * #5487: read a non-OK peer reply's error body. An empty or unparseable body
@@ -120,6 +178,23 @@ export const ANTHROPIC_LOGIN_COMPLETE_TIMEOUT_MS = 35_000;
  * may have acted" (`timeout`, `transport`) and from a peer that answered non-2xx
  * (`http`).
  */
+/**
+ * #5127: the outcome of one shared-API-key call to a key's home node. Every
+ * failure is a fixed shape with no peer response text: `unknown_node` (this
+ * registry does not track that node), `offline`, `unsupported` (no
+ * `api-keys:shared` capability, or an older binary answering 404), `transport`
+ * (the home is reached at a non-tailnet URL), `refused` (the home's own refusal
+ * code and message), or `error`.
+ */
+export type ApiKeyCallOutcome<T> =
+  | { kind: "ok"; value: T }
+  | { kind: "unknown_node" }
+  | { kind: "offline" }
+  | { kind: "unsupported" }
+  | { kind: "transport" }
+  | { kind: "refused"; code: string; message: string }
+  | { kind: "error"; message: string };
+
 export type AnthropicLoginProxyResult =
   | { type: "answer"; body: unknown }
   | {
@@ -387,7 +462,11 @@ export class NodeRegistry {
   /** Remote nodes to poll (own nodeId filtered out to prevent self-poll). */
   private remoteNodes: FederationNodeConfig[];
 
+  /** #5127: may a home node's URL be sent a shared-API-key request? */
+  private readonly homeUrlGuard: (url: string) => Promise<boolean>;
+
   constructor(options: NodeRegistryOptions) {
+    this.homeUrlGuard = options.homeUrlGuard ?? createHomeUrlGuard();
     this.config = options.config;
     this.apiToken = options.apiToken;
     this.getLocalSessionCount = options.getLocalSessionCount;
@@ -1414,6 +1493,100 @@ export class NodeRegistry {
     }
   }
 
+  /**
+   * #5127 (D21): spawn a session bound to an API key stored on another node,
+   * through the target's `/federation/spawn-api-key`. The target confirms the
+   * key with its home before it accepts, so its refusal arrives here at once
+   * and keeps its code and status. A target without the capability, or one
+   * that answers 404 (an older binary), gets the needs-updating refusal; the
+   * plain `/federation/spawn` is never tried, because it would drop the key and
+   * bill the target's own default. A refusal's message is the target's own
+   * fixed text; any other answer becomes a fixed message.
+   */
+  async spawnApiKeyOnNode(
+    nodeId: string,
+    body: FederationApiKeySpawnBody
+  ): Promise<
+    | { type: "success"; sessionId: string }
+    | { type: "error"; message: string; code?: string; status?: number }
+  > {
+    const state = this.nodeStates.get(nodeId);
+    if (!state || state.status === "offline") {
+      return { type: "error", message: "Node is offline" };
+    }
+    const needsUpdating = {
+      type: "error" as const,
+      code: "api_key_remote_unsupported",
+      message: `${displayNodeLabel(state.config.label, { url: state.config.url }) || state.config.id} needs updating before a session there can use an API key from another node`,
+      status: 400,
+    };
+    if (!this.nodeSupports(nodeId, SHARED_API_KEYS_CAPABILITY)) {
+      return needsUpdating;
+    }
+    let res: Response;
+    try {
+      // The target asks the key's home before it answers, with the federation
+      // timeout, so this call allows for that round trip on top of its own.
+      res = await this.fetchWithAuth(
+        `${state.config.url}/api/federation/spawn-api-key`,
+        "POST",
+        body,
+        SPAWN_TIMEOUT_MS,
+        undefined,
+        "error"
+      );
+    } catch (err) {
+      return {
+        type: "error",
+        message: err instanceof Error ? err.message : "Spawn request failed",
+      };
+    }
+    let json: unknown = null;
+    try {
+      json = await res.json();
+    } catch {
+      json = null;
+    }
+    // An older target has no such path (404 with no refusal body): it needs
+    // updating. A 404 that IS a refusal (api_key_not_found, …) passes through.
+    const isRefusal =
+      json !== null &&
+      typeof json === "object" &&
+      (json as { type?: unknown }).type === "error" &&
+      typeof (json as { code?: unknown }).code === "string";
+    if (res.status === 404 && !isRefusal) return needsUpdating;
+    if (!res.ok) {
+      const answer = json as {
+        type?: unknown;
+        message?: unknown;
+        code?: unknown;
+      } | null;
+      if (
+        answer &&
+        answer.type === "error" &&
+        typeof answer.message === "string" &&
+        answer.message.length <= 400
+      ) {
+        return {
+          type: "error",
+          message: answer.message,
+          ...(typeof answer.code === "string" && answer.code.length <= 64
+            ? { code: answer.code }
+            : {}),
+          status: res.status,
+        };
+      }
+      return { type: "error", message: `Node returned ${res.status}` };
+    }
+    void this.pollNode(state.config, "spawn-accept").catch(err => {
+      console.warn(
+        `[Federation] Background poll failed after spawn on ${state.config.id}:`,
+        err
+      );
+    });
+    return { type: "success", sessionId: "" };
+  }
+
   /** Reconnect a session on a remote node via its federation API.
    *
    * The node-side endpoint is fire-and-forget: it validates the session,
@@ -1838,7 +2011,13 @@ export class NodeRegistry {
     });
   }
 
-  /** Proxy set-active-account to a remote node (Sub-Issue F, #1452). */
+  /**
+   * Proxy set-active-account to a remote node (Sub-Issue F, #1452). #3982: like
+   * `removeAccountOnNode` (below), this does NOT use `proxyToNode`, which collapses
+   * every non-2xx into a code-less error — the receiver's structured 400
+   * `provider_mismatch` / 404 `account_not_found` must reach the hub route
+   * (routes/nodes.ts) so it answers the right status instead of 502.
+   */
   async setActiveAccountOnNode(
     nodeId: string,
     accountUuid: string,
@@ -1846,11 +2025,39 @@ export class NodeRegistry {
     // default (absent ⇒ the Anthropic pointer). Only the uuid + provider cross
     // the boundary — never a token (R7).
     provider?: string
-  ): Promise<{ type: "success" } | { type: "error"; message: string }> {
-    return this.proxyToNode(nodeId, "/api/federation/active-account", {
-      accountUuid,
-      ...(provider ? { provider } : {}),
-    });
+  ): Promise<
+    { type: "success" } | { type: "error"; message: string; code?: string }
+  > {
+    const state = this.nodeStates.get(nodeId);
+    if (!state || state.status === "offline") {
+      return { type: "error", message: "Node is offline" };
+    }
+    const url = `${state.config.url}/api/federation/active-account`;
+    try {
+      const res = await this.fetchWithAuth(url, "POST", {
+        accountUuid,
+        ...(provider ? { provider } : {}),
+      });
+      if (!res.ok) {
+        const body = await readPeerErrorBody(
+          res,
+          `active-account on ${state.config.id}`
+        );
+        return {
+          type: "error",
+          message:
+            (body as Record<string, string>).error ??
+            `Node returned ${res.status}`,
+          code: (body as Record<string, string>).code,
+        };
+      }
+      return { type: "success" };
+    } catch (err) {
+      return {
+        type: "error",
+        message: err instanceof Error ? err.message : "Request failed",
+      };
+    }
   }
 
   /**
@@ -1964,17 +2171,23 @@ export class NodeRegistry {
   }
 
   /**
-   * Proxy a remote node's provider auth state — Codex (OpenAI) logins + Gemini
-   * (Google) derived state (issue #3806, epic #3345). Public (not `proxyToNode`,
-   * which is private :1604) and placed beside `getUsageOnNode` as its sibling.
-   * POST because the generic `proxyToNode` only issues POST. Only DERIVED fields
-   * cross the wire — never a token/key. On error the hub aggregator renders the
-   * peer as a degraded `unreachable` row. [ER 2026-09-19: 3806-5]
+   * Read a peer's provider auth state: Codex (OpenAI) logins + Gemini (Google)
+   * derived state (issue #3806, epic #3345). Only DERIVED fields cross the wire,
+   * never a token or key. [ER 2026-09-19: 3806-5]
+   *
+   * Classified by `readPeerRoute`, the reader `getAccountHealthOnNode` uses, so
+   * a peer without the route reads `unsupported` and a 2xx that is not JSON
+   * reads `malformed` here too (#5739). It used to go through the generic
+   * `proxyToNode`, which returns a peer's 2xx body unchanged, so the aggregator
+   * could not tell a peer's `{type, message}` body from the registry's own error.
+   * An `ok` body is untrusted: the aggregator validates it as a row.
    */
-  async getProviderAuthStateOnNode(
-    nodeId: string
-  ): Promise<NodeProviderAuthState | { type: "error"; message: string }> {
-    return this.proxyToNode(nodeId, "/api/federation/provider-auth-state", {});
+  async getProviderAuthStateOnNode(nodeId: string): Promise<PeerReadOutcome> {
+    return this.readPeerRoute(
+      nodeId,
+      "/api/federation/provider-auth-state",
+      "Provider-auth-state"
+    );
   }
 
   /**
@@ -1998,6 +2211,9 @@ export class NodeRegistry {
    *     schemas (hub-side ingress parse, R4; `parseNodeAccountHealthPerEntry`), so
    *     one entry this build cannot read is dropped and counted, not the whole
    *     row. A body that is not JSON or not a row is `unreachable`/`malformed`.
+   *
+   * Every rule but the row parse lives in `readPeerRoute`, which
+   * `getProviderAuthStateOnNode` shares (#5739).
    */
   async getAccountHealthOnNode(nodeId: string): Promise<
     | { kind: "ok"; row: NodeAccountHealth }
@@ -2009,52 +2225,13 @@ export class NodeRegistry {
         message: string;
       }
   > {
-    const state = this.nodeStates.get(nodeId);
-    if (!state || state.status === "offline") {
-      return { kind: "offline" };
-    }
-    const url = `${state.config.url}/api/federation/account-health`;
-    let res: Response;
-    try {
-      res = await this.fetchWithAuth(url, "POST", {});
-    } catch (err) {
-      const timedOut = err instanceof Error && err.name === "TimeoutError";
-      return {
-        kind: "unreachable",
-        reason: timedOut ? "timeout" : "network",
-        message: err instanceof Error ? err.message : "Request failed",
-      };
-    }
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      if (
-        res.status === 404 ||
-        (res.status === 401 && isInvalidTokenBody(text))
-      ) {
-        return { kind: "unsupported" };
-      }
-      return {
-        kind: "unreachable",
-        reason:
-          res.status === 401 || res.status === 403
-            ? "auth"
-            : res.status >= 500
-              ? "http_5xx"
-              : "http_4xx",
-        message: `Node returned ${res.status}`,
-      };
-    }
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch (err) {
-      return {
-        kind: "unreachable",
-        reason: "malformed",
-        message: `Account-health body is not JSON: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-    const row = parseNodeAccountHealthPerEntry(body);
+    const outcome = await this.readPeerRoute(
+      nodeId,
+      "/api/federation/account-health",
+      "Account-health"
+    );
+    if (outcome.kind !== "ok") return outcome;
+    const row = parseNodeAccountHealthPerEntry(outcome.body);
     if (!row) {
       return {
         kind: "unreachable",
@@ -2114,6 +2291,181 @@ export class NodeRegistry {
     return this.proxyToNode(nodeId, "/api/federation/openai-login/cancel", {
       loginToken,
     });
+  }
+
+  /**
+   * #5127: the state of the node that calls itself `nodeId` — its self-reported
+   * `info.nodeId` from the last poll — falling back to the configured id. A key's
+   * qualified ref names the home by its own node id, and this registry's name
+   * for a peer can differ (`accountHealth.ts` keys nodes the same way).
+   */
+  private findNodeStateByIdentity(nodeId: string) {
+    // Two peers claiming one identity: trust neither (security review F4) —
+    // a peer could otherwise take another node's key calls.
+    const claimed = [...this.nodeStates.values()].filter(
+      state => state.info?.nodeId === nodeId
+    );
+    if (claimed.length > 1) return undefined;
+    if (claimed.length === 1) return claimed[0];
+    return this.nodeStates.get(nodeId);
+  }
+
+  /** #5127: true when `nodeId` names a node this registry tracks. */
+  knowsNode(nodeId: string): boolean {
+    return this.findNodeStateByIdentity(nodeId) !== undefined;
+  }
+
+  /** #5127: this registry's label for the node `nodeId`, or null when unknown. */
+  nodeLabelForIdentity(nodeId: string): string | null {
+    return this.findNodeStateByIdentity(nodeId)?.config.label ?? null;
+  }
+
+  /**
+   * #5127: list the shared Anthropic keys of the node that calls itself
+   * `homeNodeId` (redacted; no secret crosses).
+   */
+  async listSharedApiKeysOnNode(
+    homeNodeId: string
+  ): Promise<ApiKeyCallOutcome<FederationSharedApiKeys>> {
+    // The Create-page picker waits for every peer's list, so a peer the last
+    // poll saw online but that has since wedged gets the short notification
+    // budget, not the full federation timeout (perf review M1).
+    const outcome = await this.apiKeyCall(
+      homeNodeId,
+      "/api/federation/api-keys/shared",
+      { requestingNodeId: this.config.nodeId },
+      FederationSharedApiKeysSchema,
+      NOTIFICATION_PROXY_TIMEOUT_MS
+    );
+    // The list must be the asked node's own (security review F4): the keys'
+    // refs name their home by this id.
+    if (outcome.kind === "ok") {
+      const state = this.findNodeStateByIdentity(homeNodeId);
+      const expected = state?.info?.nodeId ?? state?.config.id;
+      if (outcome.value.homeNodeId !== expected) {
+        return {
+          kind: "error",
+          message: "The node answered for a different node id",
+        };
+      }
+    }
+    return outcome;
+  }
+
+  /** #5127: confirm one shared key on its home node (identity only). */
+  async resolveApiKeyOnNode(
+    homeNodeId: string,
+    body: Omit<FederationApiKeyRequest, "requestingNodeId" | "homeNodeId">
+  ): Promise<ApiKeyCallOutcome<FederationApiKeyResolved>> {
+    return this.apiKeyCall(
+      homeNodeId,
+      "/api/federation/api-keys/resolve",
+      { ...body, homeNodeId, requestingNodeId: this.config.nodeId },
+      FederationApiKeyResolvedSchema
+    );
+  }
+
+  /**
+   * #5127: fetch one shared key's secret from its home node. The caller holds
+   * the returned key in memory only; it is never logged or written.
+   */
+  async fetchApiKeySecretOnNode(
+    homeNodeId: string,
+    body: Omit<FederationApiKeyRequest, "requestingNodeId" | "homeNodeId">
+  ): Promise<ApiKeyCallOutcome<{ apiKey: string }>> {
+    const outcome = await this.apiKeyCall(
+      homeNodeId,
+      "/api/federation/api-keys/secret",
+      { ...body, homeNodeId, requestingNodeId: this.config.nodeId },
+      FederationApiKeySecretSchema
+    );
+    return outcome.kind === "ok"
+      ? { kind: "ok", value: { apiKey: outcome.value.apiKey } }
+      : outcome;
+  }
+
+  /**
+   * #5127: one structured shared-API-key call. Never `proxyToNode`, which
+   * folds a peer's response text into its error message: here a response is
+   * read only through the schema the caller names, an unexpected answer becomes
+   * a fixed message, and no response text, request body or key reaches an error
+   * or a log. The home is found by its self-reported node id; a node without the
+   * capability, offline, or reached at a non-tailnet URL is refused before any
+   * request is sent. Redirects fail rather than follow.
+   */
+  private async apiKeyCall<T>(
+    homeNodeId: string,
+    endpoint: string,
+    body: unknown,
+    schema: {
+      safeParse(v: unknown): { success: true; data: T } | { success: false };
+    },
+    timeoutMs: number = FETCH_TIMEOUT_MS
+  ): Promise<ApiKeyCallOutcome<T>> {
+    const state = this.findNodeStateByIdentity(homeNodeId);
+    if (!state) return { kind: "unknown_node" };
+    if (state.status === "offline") return { kind: "offline" };
+    if (!this.nodeSupports(state.config.id, SHARED_API_KEYS_CAPABILITY)) {
+      return { kind: "unsupported" };
+    }
+    if (!(await this.homeUrlGuard(state.config.url))) {
+      return { kind: "transport" };
+    }
+    let res: Response;
+    try {
+      res = await this.fetchWithAuth(
+        `${state.config.url}${endpoint}`,
+        "POST",
+        body,
+        timeoutMs,
+        { "X-Hapi-Requesting-Node": this.config.nodeId },
+        "error"
+      );
+    } catch (err) {
+      // A timeout or a refused / unreachable connection means the home is
+      // down, even before a poll has marked it offline. Anything else (a
+      // refused redirect, a TLS failure) is an error with a fixed message.
+      const name = err instanceof Error ? err.name : "";
+      const code = (err as { code?: unknown } | null)?.code;
+      return name === "TimeoutError" ||
+        name === "AbortError" ||
+        (typeof code === "string" && UNREACHABLE_CODES.has(code))
+        ? { kind: "offline" }
+        : { kind: "error", message: "The request to the home node failed" };
+    }
+    if (res.status === 404) return { kind: "unsupported" };
+    if (res.status === 401) {
+      return {
+        kind: "error",
+        message: "The home node refused this node's federation token",
+      };
+    }
+    if (!res.ok) {
+      return { kind: "error", message: `The home node answered ${res.status}` };
+    }
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch {
+      return {
+        kind: "error",
+        message: "The home node sent an unreadable answer",
+      };
+    }
+    const refusal = FederationApiKeyRefusalSchema.safeParse(json);
+    if (refusal.success) {
+      return {
+        kind: "refused",
+        code: refusal.data.code,
+        message: refusal.data.message,
+      };
+    }
+    const parsed = schema.safeParse(json);
+    if (parsed.success) return { kind: "ok", value: parsed.data };
+    return {
+      kind: "error",
+      message: "The home node sent an unexpected answer",
+    };
   }
 
   /** True when the node's last polled `/federation/info` advertises `capability`. */
@@ -2337,6 +2689,188 @@ export class NodeRegistry {
       "/api/federation/system-jobs/loop-cron/mutate",
       body
     );
+  }
+
+  // ── Notifications (issue #4913) ─────────────────────────────────────────
+  // Hub → peer proxies for the /api/notifications fan-out. Each forwards the
+  // caller's namespace (the receivers fail closed without it, #1097) and uses a
+  // short timeout because the gear badge polls the unread count.
+
+  async listNotificationsOnNode(
+    nodeId: string,
+    namespace: string,
+    body: { unreadOnly: boolean; limit: number; offset: number }
+  ): Promise<{ notifications: StoredNotification[] } | NotificationProxyError> {
+    return this.proxyToNodeAsCaller(
+      nodeId,
+      "/api/federation/notifications/list",
+      body,
+      namespace
+    );
+  }
+
+  async countUnreadNotificationsOnNode(
+    nodeId: string,
+    namespace: string
+  ): Promise<{ count: number } | NotificationProxyError> {
+    return this.proxyToNodeAsCaller(
+      nodeId,
+      "/api/federation/notifications/unread-count",
+      {},
+      namespace
+    );
+  }
+
+  async markNotificationReadOnNode(
+    nodeId: string,
+    namespace: string,
+    id: string
+  ): Promise<NotificationIdActionResult> {
+    return this.notificationIdActionOnNode(nodeId, namespace, "read", id);
+  }
+
+  async dismissNotificationOnNode(
+    nodeId: string,
+    namespace: string,
+    id: string
+  ): Promise<NotificationIdActionResult> {
+    return this.notificationIdActionOnNode(nodeId, namespace, "dismiss", id);
+  }
+
+  async dismissAllNotificationsOnNode(
+    nodeId: string,
+    namespace: string
+  ): Promise<{ dismissed: number } | NotificationProxyError> {
+    return this.proxyToNodeAsCaller(
+      nodeId,
+      "/api/federation/notifications/dismiss-all",
+      {},
+      namespace
+    );
+  }
+
+  private async notificationIdActionOnNode(
+    nodeId: string,
+    namespace: string,
+    verb: "read" | "dismiss",
+    id: string
+  ): Promise<NotificationIdActionResult> {
+    const result = await this.proxyToNodeAsCaller<{
+      notification: StoredNotification;
+    }>(nodeId, `/api/federation/notifications/${verb}`, { id }, namespace);
+    if ("notification" in result) return { notification: result.notification };
+    // The receiver answers 404 only when the row is not in the caller's
+    // namespace there; every other failure (timeout, 5xx, an older peer's 401)
+    // stays an error so the hub never reports a missed write as "not found".
+    if (result.status === 404) return { notFound: true };
+    return { type: "error", message: result.message };
+  }
+
+  /**
+   * POST `{}` to a peer's federation read route and classify the outcome (#5739,
+   * extracted from #4461/#5420's `getAccountHealthOnNode`):
+   *   - the registry already marks the node offline, or it is unknown →
+   *     `offline`, with no fetch;
+   *   - HTTP 404, or HTTP 401 whose body is exactly `{"error":"Invalid token"}`
+   *     (the JWT middleware answering for a route the peer does not have) →
+   *     `unsupported`;
+   *   - any other non-2xx → `unreachable`, reason `auth` (401/403), `http_5xx` or
+   *     `http_4xx`, message `Node returned <status>` with no body text;
+   *   - a throw → `timeout` (`TimeoutError`) or `network`, with its error text;
+   *   - a 2xx that is not JSON → `malformed`;
+   *   - any other 2xx → `ok` with the parsed body, for the caller to validate.
+   * `label` names the read in the malformed message.
+   */
+  private async readPeerRoute(
+    nodeId: string,
+    endpoint: string,
+    label: string
+  ): Promise<PeerReadOutcome> {
+    const state = this.nodeStates.get(nodeId);
+    if (!state || state.status === "offline") {
+      return { kind: "offline" };
+    }
+    const url = `${state.config.url}${endpoint}`;
+    let res: Response;
+    try {
+      res = await this.fetchWithAuth(url, "POST", {});
+    } catch (err) {
+      const timedOut = err instanceof Error && err.name === "TimeoutError";
+      return {
+        kind: "unreachable",
+        reason: timedOut ? "timeout" : "network",
+        message: err instanceof Error ? err.message : "Request failed",
+      };
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      if (
+        res.status === 404 ||
+        (res.status === 401 && isInvalidTokenBody(text))
+      ) {
+        return { kind: "unsupported" };
+      }
+      return {
+        kind: "unreachable",
+        reason:
+          res.status === 401 || res.status === 403
+            ? "auth"
+            : res.status >= 500
+              ? "http_5xx"
+              : "http_4xx",
+        message: `Node returned ${res.status}`,
+      };
+    }
+    try {
+      return { kind: "ok", body: await res.json() };
+    } catch (err) {
+      return {
+        kind: "unreachable",
+        reason: "malformed",
+        message: `${label} body is not JSON: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+
+  /**
+   * `proxyToNode` with the caller's namespace forwarded as
+   * `X-Hapi-Caller-Namespace` and a short timeout. Any non-2xx — including an
+   * older peer without the route (401 "Invalid token", the #4461 K13 shape) —
+   * resolves to the `{ type: "error" }` shape, carrying the HTTP `status`, so a
+   * fan-out degrades instead of failing and a caller can tell 404 from the rest.
+   */
+  private async proxyToNodeAsCaller<T>(
+    nodeId: string,
+    endpoint: string,
+    body: unknown,
+    namespace: string
+  ): Promise<T | NotificationProxyError> {
+    const state = this.nodeStates.get(nodeId);
+    if (!state || state.status === "offline") {
+      return { type: "error", message: "Node is offline" };
+    }
+    try {
+      const res = await this.fetchWithAuth(
+        `${state.config.url}${endpoint}`,
+        "POST",
+        body,
+        NOTIFICATION_PROXY_TIMEOUT_MS,
+        { "X-Hapi-Caller-Namespace": namespace }
+      );
+      if (!res.ok) {
+        return {
+          type: "error",
+          message: `Node returned ${res.status}`,
+          status: res.status,
+        };
+      }
+      return (await res.json()) as T;
+    } catch (err) {
+      return {
+        type: "error",
+        message: err instanceof Error ? err.message : "Request failed",
+      };
+    }
   }
 
   /** Generic proxy helper: POST JSON to a node's federation endpoint. */
@@ -2935,7 +3469,8 @@ export class NodeRegistry {
     method: "GET" | "POST" | "DELETE" = "GET",
     body?: unknown,
     timeoutMs: number = FETCH_TIMEOUT_MS,
-    extraHeaders?: Record<string, string>
+    extraHeaders?: Record<string, string>,
+    redirect?: "follow" | "error" | "manual"
   ): Promise<Response> {
     const headers: Record<string, string> = { ...extraHeaders };
     if (this.apiToken) {
@@ -2950,6 +3485,9 @@ export class NodeRegistry {
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(timeoutMs),
+      // #5127: only the shared-API-key calls pass `redirect` ("error"); every
+      // other caller keeps fetch's default.
+      ...(redirect !== undefined ? { redirect } : {}),
     });
   }
 }

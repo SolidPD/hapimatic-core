@@ -72,6 +72,9 @@ export const SECRET_ENV_VARS: ReadonlySet<string> = new Set([
   // window-env scrub (`TmuxManager`) — surfaces that consume SECRET_ENV_VARS only.
   // ALSO in AGENT_FORBIDDEN_ENV_VARS (deliberate dual membership — see that set's doc).
   "GH_TOKEN",
+  // #2911: an operator node's bearer for the gateway's central feedback sink. Only the
+  // server reads it (resolveFeedbackSinkConfig); a spawned agent never needs it.
+  "FEEDBACK_INBOX_TOKEN",
 ]);
 
 /**

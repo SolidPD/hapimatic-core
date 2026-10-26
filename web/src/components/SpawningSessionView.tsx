@@ -36,6 +36,7 @@ import {
   endSpawnHandover,
   stashRetryForm,
 } from "@/lib/spawn-draft";
+import { registerMountedSpawnPlaceholder } from "@/lib/mountedSpawnPlaceholders";
 
 /** Map a pre-daemon refusal code to actionable copy; fall back to the message. */
 function failureMessage(code: string | undefined, fallback?: string): string {
@@ -90,6 +91,13 @@ export function SpawningSessionView({
       setDraft(value);
       setSpawnDraft(placeholderId, value);
     },
+    [placeholderId]
+  );
+
+  // Issue #4915: while this view is up it shows the spawn failure itself, so
+  // NotificationListener suppresses the duplicate spawn-failed pop-up.
+  useEffect(
+    () => registerMountedSpawnPlaceholder(placeholderId),
     [placeholderId]
   );
 

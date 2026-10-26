@@ -264,6 +264,22 @@ Creates a new session.
 }
 ```
 
+When a spawn with no `sessionType` defaulted to a worktree but ran as a simple
+session because git is missing or could not read the folder, or its branch-from
+HEAD has no commits, the body also carries the reason (#5202, #5614):
+
+```json
+{
+  "sessionTypeDowngrade": {
+    "from": "worktree",
+    "to": "simple",
+    "reason": "the branch-from HEAD at '/path' has no commits yet"
+  }
+}
+```
+
+The designed `not-a-repo` downgrade of a scratch folder stays silent.
+
 **Response (409) - Requires Approval:**
 
 ```json
@@ -278,8 +294,10 @@ Creates a new session.
 **Response (500) - Error:**
 
 ```json
-{ "success": false, "error": "Error message" }
+{ "success": false, "error": "Error message", "code": "at_capacity" }
 ```
+
+`code` is optional; it classifies the error without string-matching (#1772).
 
 #### POST `/stop`
 
@@ -337,17 +355,26 @@ All data is plain JSON over TLS; authentication is `CLI_API_TOKEN` (no end-to-en
 
 ### Doctor Command
 
-`hapi doctor` uses `ps aux | grep` to find all HAPI processes:
+`hapi doctor` and `hapi daemon status` list processes with `ps-list` and type each one by its executable token and
+the arguments after it (`classifyHappyProcess` in `doctor.ts`), not by a substring of the whole command line, so a
+shell wrapper that merely mentions `hapi daemon start` is not a hapi process (#5180). The exception is the legacy
+`happy-coder` / `happy-cli` match, which still tests the whole command line:
 
-- Production: matches `hapi` binary, `happy-coder`
-- Development: matches `src/index.ts` (run via `bun`)
-- Categorizes by command args: daemon, daemon-spawned, user-session, doctor
+- Production: the `hapi` / `hapi.exe` binary, plus the running binary's own name. A fleet instance's binary is named per
+  instance (`hapimatic-private`, `hapimatic-dev`, `hapimatic-wt-3012`), so each lists its own processes and any
+  `hapi`-named process, but no other `hapimatic-*` instance's (`instanceExecutableNames`, #5526). The legacy
+  `happy-coder` binaries are also matched.
+- Development: `bun` / `node` running `src/index.ts`
+- Types by command args: daemon, daemon-spawned session, server, doctor, user-session
+- The value of any `--token` / `--*-token` argument prints as `<redacted>` (#5526)
 
 ### Clean Runaway Processes
 
 `hapi doctor clean`:
 
-1. `findRunawayHappyProcesses()` filters for likely orphans
+1. `findRunawayHappyProcesses()` selects the daemon, daemon-spawned sessions and stuck `--version` checks. It matches
+   only `hapi` / `hapi.exe` (plus dev mode and the legacy binaries), never the running binary's own name, so it never
+   reaches a `hapimatic-*` instance's daemon or sessions (#5526)
 2. `killRunawayHappyProcesses()`:
    - Sends SIGTERM
    - Waits 1 second

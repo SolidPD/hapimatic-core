@@ -13,7 +13,7 @@
 ![React 19](https://img.shields.io/badge/React-19-61dafb?style=flat-square&logo=react&logoColor=black)
 ![Platform: 64-bit Linux (x86-64 and ARM64)](<https://img.shields.io/badge/platform-64--bit%20Linux%20(x86--64%20%C2%B7%20ARM64)-2c2c2e?style=flat-square>)
 
-[Website](https://hapimatic.com) · [Docs](https://hapimatic.com/docs/) · [Install](https://hapimatic.com/install) · [Install guide](https://hapimatic.com/docs/guide/installation) · [Releases](https://github.com/SolidPD/hapimatic-core/releases)
+[Website](https://hapimatic.com) · [Docs](https://hapimatic.com/docs/) · [Install](https://hapimatic.com/install) · [Install guide](https://hapimatic.com/docs/guide/installation) · [Releases](https://github.com/SolidPD/hapimatic-core/releases) · [Watch the talk](https://youtu.be/FA4J1-CL8w4)
 
 </div>
 
@@ -49,6 +49,22 @@ Hapimatic, released under the GNU Affero General Public License v3.0.
 <img src="docs/readme-assets/mobile-chat.png" alt="The same session in the installed web app on a phone" width="250" />
 
 </div>
+
+---
+
+## Watch the talk
+
+<!-- Claim trace: docs/public-site/ia.md §C row TK1 (the talk); the bench work it shows is add-on A3, named with its paywall before the capabilities -->
+
+<div align="center">
+
+<a href="https://youtu.be/FA4J1-CL8w4"><img src="docs/readme-assets/talk-closing-the-loop.jpg" alt="Closing the Loop: Hardware Development with Advanced Agentic AI, by Matt Starfield, the Senior Electrical Engineer at Solid Product Design. Select it to watch on YouTube" width="760" /></a>
+
+</div>
+
+**[Closing the Loop: Hardware Development with Advanced Agentic AI](https://youtu.be/FA4J1-CL8w4)** · 29 minutes · 15th Philly Hardware Meetup, Drexel University, October 21, 2026
+
+Matt Starfield, the Senior Electrical Engineer at Solid Product Design, shows how he built Hapimatic one bottleneck at a time, then closes the loop on real hardware with the Hardware Bench, a paid add-on of the hosted service that is not part of this repository: agents that flash firmware onto live boards, drive bench instruments, and prove every fix with a measurement. Every slide and link from the talk is at [hapimatic.com/talks/closing-the-loop](https://hapimatic.com/talks/closing-the-loop/).
 
 ---
 

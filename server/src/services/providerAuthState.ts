@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { GoogleAuthState, OpenAiAuthState } from "@hapi/protocol";
+import { openAiPk } from "./providerAccountImport";
 
 /**
  * Provider auth-state reader (issue #3806, epic #3345 — the ROOT of the
@@ -161,8 +162,14 @@ async function deriveOpenAiRow(
     auth.tokens.account_id.length > 0
       ? auth.tokens.account_id
       : undefined;
+  // #3982: the host login has no account dir to name it, so key it by the store
+  // PK the importer mints for it (providerAccountImport.ts, `openAiPk`); the
+  // Accounts page joins it to its record that way and marks it read-only (D2).
+  const resolvedUuid =
+    accountUuid ??
+    (source === "host" && accountId ? openAiPk(accountId) : null);
   return {
-    accountUuid,
+    accountUuid: resolvedUuid,
     source,
     mode,
     ...(label ? { label } : {}),
@@ -180,7 +187,9 @@ async function readOpenAiState(
 ): Promise<OpenAiAuthState[]> {
   const rows: OpenAiAuthState[] = [];
 
-  // Host `~/.codex` (source:"host", accountUuid:null, the pre-#3808 single login).
+  // Host `~/.codex` (source:"host", the pre-#3808 single login). Its accountUuid is
+  // the importer's store PK `openAiPk(accountId)` when auth.json names an account
+  // id (#3982), else null (keyring storage / API-key login).
   // Emitted only when the dir exists — a node that has never used codex shows no
   // host row, so the OpenAI section renders its empty state (host-side instructions).
   const hostHome =

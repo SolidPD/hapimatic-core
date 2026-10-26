@@ -137,8 +137,9 @@ export function credentialCasePattern(): string {
 export function physicalPathFunctionLines(): string[] {
   return [
     "physical_path() { # $1 = a path; prints the physical path it names, or nothing; returns 3 when a link it follows (its name or target) names a credential store, 4 when its walk reaches /proc",
-    "  # A path missing here is still walked, for /proc only: /proc/self/cwd/z is",
-    "  # missing from this folder yet present from the one tar reads it in.",
+    "  # A path missing here is still walked: for /proc (/proc/self/cwd/z is",
+    "  # missing from this folder yet present from the one tar reads it in), and",
+    "  # so a credential-named link on the way still returns 3 (#4928).",
     '  _pe=1; [ -e "$1" ] || _pe=0',
     "  # One part at a time, as the pwsh twin walks: cd -P would hide a link in the",
     "  # middle of the path, and a followed link's name or target text can name a",
@@ -162,7 +163,9 @@ export function physicalPathFunctionLines(): string[] {
     '      case "$_pc" in /proc|/proc/*) [ "$_prc" -ne 3 ] || return 3; return 4 ;; esac',
     "    fi",
     "  done",
-    '  [ "$_pe" -eq 1 ] || return 0',
+    "  # #4928: a missing path prints nothing but keeps its status, so a dangling",
+    "  # chain through a credential-named link is refused (3), as the pwsh twin's is.",
+    '  [ "$_pe" -eq 1 ] || return "$_prc"',
     "  printf '%s\\n' \"${_pc:-/}\"",
     '  return "$_prc"',
     "}",
@@ -198,9 +201,11 @@ export function physicalPathFunctionLines(): string[] {
  *   the physical path no longer shows one (`~/.ssh -> ~/Dropbox/keys`, reached
  *   through the link `skills/k -> ~/.ssh` or as `~/.ssh/x`); 4 when the walk
  *   reaches `/proc` (3 still wins when such a link came first); otherwise 0. A
- *   path missing from this folder prints nothing and returns 0, unless a
- *   credential-named link came before a link it cannot follow or before
- *   `/proc` (3), or the walk reaches `/proc` (4).
+ *   path missing from this folder prints nothing and keeps the status its walk
+ *   reached: 3 when a credential-named link came first, 4 when the walk
+ *   reaches `/proc`, otherwise 0. So a dangling chain through a credential
+ *   store (`skills/keys -> ~/.ssh/id`, `~/.ssh -> ~/gone`) is refused (3), as
+ *   the PowerShell twin refuses it, not reported as a broken link (#4928).
  * - `has_credential_part <path>` is true when a part of `<path>`, in any case,
  *   is credential-bearing. A lower-casing that fails counts as a match, so a
  *   missing `tr` refuses rather than ships.

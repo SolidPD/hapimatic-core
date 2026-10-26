@@ -38,6 +38,11 @@ import type { LoopCronLifecycleCoupler } from "./loopCronLifecycle";
 // deadline for the pre-kill wait, the switch tail, and this reconnect poll).
 import { spawnWithRetry } from "./rpcGateway";
 import { ACCOUNT_SWITCH_SLOT_WAIT_DEADLINE_MS } from "./accountRestart";
+import {
+  accountUnrefreshableNotification,
+  type ProducerNotification,
+  waitingForSlotNotification,
+} from "../notifications/producerNotifications";
 
 type SpawnSessionResult =
   | { type: "success"; sessionId: string; resolvedName?: string }
@@ -80,6 +85,11 @@ export interface SessionRespawnDeps {
    * onReconnect at each success exit to auto-resume the session's ledgered loops.
    */
   getLoopCronCoupler?: () => LoopCronLifecycleCoupler | null;
+  /**
+   * Issue #4914: raise a user notification (`SyncEngine.notifyUser`). Optional,
+   * so a construction without it raises none; the legacy events still fire.
+   */
+  notifyUser?: (input: ProducerNotification) => void;
 }
 
 export class SessionRespawn {
@@ -90,6 +100,7 @@ export class SessionRespawn {
   private readonly getTurnLifecycle: () => TurnLifecycle | null;
   private readonly spawnSession: SpawnSessionFn;
   private readonly getLoopCronCoupler: () => LoopCronLifecycleCoupler | null;
+  private readonly notifyUser: (input: ProducerNotification) => void;
 
   constructor(deps: SessionRespawnDeps) {
     this.sessionCache = deps.sessionCache;
@@ -99,6 +110,7 @@ export class SessionRespawn {
     this.getTurnLifecycle = deps.getTurnLifecycle;
     this.spawnSession = deps.spawnSession;
     this.getLoopCronCoupler = deps.getLoopCronCoupler ?? (() => null);
+    this.notifyUser = deps.notifyUser ?? (() => {});
   }
 
   /**
@@ -506,13 +518,26 @@ export class SessionRespawn {
         capacityMode: "full",
         capacityDeadlineMs: ACCOUNT_SWITCH_SLOT_WAIT_DEADLINE_MS,
         signal,
-        onWaitingForSlot: () =>
+        onWaitingForSlot: info => {
+          // TODO(#4912): legacy waiting-for-slot SyncEvent, kept for one
+          // release so a pre-#4915 web client still toasts. Remove its SSE/web
+          // delivery once Sub C (#4915) has shipped for a release.
           this.eventPublisher.emit({
             type: "waiting-for-slot",
             sessionId,
             context: "reconnect",
             deadlineMs: ACCOUNT_SWITCH_SLOT_WAIT_DEADLINE_MS,
-          }),
+          });
+          this.notifyUser({
+            ...waitingForSlotNotification({
+              sessionId,
+              context: "reconnect",
+              deadlineMs: ACCOUNT_SWITCH_SLOT_WAIT_DEADLINE_MS,
+              elapsedMs: info.elapsedMs,
+            }),
+            namespace: session.namespace,
+          });
+        },
       }
     );
 
@@ -537,10 +562,23 @@ export class SessionRespawn {
     if (result.code === "account_unrefreshable") {
       const accountUuid = session.metadata?.accountUuid;
       if (accountUuid) {
+        // TODO(#4912): legacy account-unrefreshable SyncEvent, kept for one
+        // release so a pre-#4915 web client still toasts. Remove its SSE/web
+        // delivery once Sub C (#4915) has shipped for a release. Server
+        // consumers: InitiativeEventObserver — keep the internal event or
+        // migrate it first.
         this.eventPublisher.emit({
           type: "account-unrefreshable",
           sessionId,
           accountUuid,
+        });
+        this.notifyUser({
+          ...accountUnrefreshableNotification({
+            sessionId,
+            accountUuid,
+            source: "reconnect",
+          }),
+          namespace: session.namespace,
         });
       }
       return { type: "error", message: result.message, code: result.code };

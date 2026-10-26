@@ -315,6 +315,26 @@ export const ARCHIVE_LINK_LOOP_OMISSION_REASON =
   "link loop: not exported, its target is a folder that contains it";
 
 /**
+ * #4321 (Item 7) / #5549 (OOS-1): the omission reason both exporters record for
+ * a hook support folder (`hooks/lib`, `hooks/_shared`) whose copy failed (the
+ * tar that reads it could not read a file or folder in it). What the copy
+ * extracted is removed, the hooks-tree copy leaves the folder out, and it gets
+ * no `hookSupport` entry. ASCII, like the reasons above.
+ */
+export const ARCHIVE_HOOK_SUPPORT_COPY_OMISSION_REASON =
+  "hook support folder could not be copied";
+
+/**
+ * #4321 (Item 7) / #5549 (OOS-1): the omission reason both exporters record when
+ * the hooks-tree copy fails (the tar that reads `hooks/` could not read a file
+ * or folder in it). Nothing of that copy is extracted; the scripts the
+ * registration walk staged and the support folders stay. ASCII, like the
+ * reasons above.
+ */
+export const ARCHIVE_HOOK_TREE_COPY_OMISSION_REASON =
+  "hooks folder could not be copied in full";
+
+/**
  * #4172: the omission reason the PowerShell exporter records, off Windows, for
  * a link it would copy in (or an entry under a linked folder) whose path holds
  * a backslash. Its path cmdlets read a backslash there as a folder separator,
@@ -371,6 +391,18 @@ export const ARCHIVE_HOOK_SLOT_UNLISTABLE_OMISSION_REASON =
  */
 export const ARCHIVE_HOOK_SLOT_TAKEN_OMISSION_REASON =
   "not exported: the script of a hook registered outside hooks/ is not copied, because another hook with different content already has that name in hooks/; its registration is kept";
+
+/**
+ * #5604: the omission reason both exporters record for a registered hook
+ * script they cannot read (a mode-000 file, inside or outside hooks/). The
+ * copy would stop the whole export, so the script is not copied and its
+ * registration is dropped, as for a missing file. The credential refusal is
+ * checked first and keeps its own reason. The surface is the staged path as
+ * registered (`hooks/<name>`). ASCII, with no quote, `$`, backslash or
+ * backtick, like the reasons above.
+ */
+export const ARCHIVE_HOOK_UNREADABLE_OMISSION_REASON =
+  "not exported: the script of a hook registration could not be read, so it is not copied and its registration is dropped";
 
 /** The name-only part of the rule (the filesystem checks live in each emitter). */
 export type ClaudeMdIncludeNameVerdict =

@@ -175,6 +175,10 @@ export function resolveApiKeyDisplayLabelById(
   return entry.label?.trim() || maskApiKey(entry.key);
 }
 
+/** Issue #4568: the refusal an API-key spawn of any agent but Claude gets. */
+export const API_KEY_AGENT_UNSUPPORTED_MESSAGE =
+  "API-key billing is available for Claude Code sessions only";
+
 /** Issue #4568: the daemon's spawn-time refusal codes for an API-key spawn. */
 export type ApiKeyBindingErrorCode =
   | "api_key_agent_unsupported"
@@ -205,7 +209,7 @@ export function resolveApiKeyBinding(input: {
     return {
       ok: false,
       code: "api_key_agent_unsupported",
-      message: "API-key billing is available for Claude Code sessions only",
+      message: API_KEY_AGENT_UNSUPPORTED_MESSAGE,
     };
   }
   const entry = (input.apiKeys ?? []).find(k => k.id === input.apiKeyId);
@@ -366,6 +370,10 @@ export function computeAuthBinding(input: {
   /** Issue #4568: a Claude spawn bound to THIS vault key id → an `api-key`
    *  binding for anthropic, labelled by the key's label (else its mask). */
   claudeApiKeyId?: string;
+  /** Issue #5127: the bound key's display label as resolved at spawn — for a
+   *  key on another node, "<label> (<home node>)". Wins over the vault lookup,
+   *  which cannot see a key stored elsewhere. */
+  claudeApiKeyLabel?: string;
 }): AuthBinding {
   const agent = input.agent || "claude";
   const apiKeys = input.apiKeys ?? [];
@@ -375,10 +383,9 @@ export function computeAuthBinding(input: {
   if (agent === "claude" && input.claudeApiKeyId) {
     return {
       kind: "api-key",
-      displayIdentity: resolveApiKeyDisplayLabelById(
-        apiKeys,
-        input.claudeApiKeyId
-      ),
+      displayIdentity:
+        input.claudeApiKeyLabel ||
+        resolveApiKeyDisplayLabelById(apiKeys, input.claudeApiKeyId),
       providerId: "anthropic",
     };
   }

@@ -343,7 +343,7 @@ export function createCapabilityCallRoutes(options: {
       // (filesystem extensions), which the router cannot tell from one
       // `app.get(p, cataloged(e), h)` call; a RESPONDING exact-path
       // `app.use(p, h)` ahead of the route, admitted by `dispatchedMatch`'s
-      // companion rule (all 4 today are auth middleware, pinned by a
+      // companion rule (all 6 today are auth middleware, pinned by a
       // buildWebApp.test.ts guard); and a catalogued handler that itself calls
       // `next()` (none today). Extension-declared REST entries are refused
       // unless their route is tagged.

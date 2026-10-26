@@ -48,6 +48,13 @@ export interface VmTierShape {
   est_monthly_usd?: number;
   recommended_sessions?: number;
   max_sessions?: number;
+  /** Per-tier memory limits in MiB (#4471): the sessions slice, the daemon unit, and the system floor. */
+  session_slice_memory_high_mib?: number;
+  session_slice_memory_max_mib?: number;
+  session_slice_swap_max_mib?: number;
+  daemon_memory_high_mib?: number;
+  daemon_memory_max_mib?: number;
+  system_floor_mib?: number;
 }
 
 /** Which resolver layer decided the live cap (wire vocabulary, shared with the server). */

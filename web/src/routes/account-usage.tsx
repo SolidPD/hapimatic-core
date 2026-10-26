@@ -38,18 +38,15 @@ import {
 } from "@/hooks/queries/useAccountUsage";
 import { AccountUsageCard } from "@/components/AccountUsage/AccountUsageCard";
 import { useAccountUsageHistory } from "@/hooks/queries/useAccountUsageHistory";
-import type {
-  AccountUsage,
-  NodeProviderAuthState,
-  ProviderAccountUsage,
-} from "@hapi/protocol";
+import type { AccountUsage } from "@hapi/protocol";
 import { LOCAL_NODE_ID, LOCAL_NODE_LABEL } from "@hapi/protocol";
 import { ProviderSection } from "@/components/AccountUsage/ProviderSection";
-import { UsageBar } from "@/components/AccountUsage/UsageBar";
+import {
+  GeminiSectionBody,
+  OpenAiSectionBody,
+} from "@/components/AccountUsage/ProviderSectionBodies";
 import { useProviderAuthState } from "@/hooks/queries/useProviderAuthState";
 import { useAccounts } from "@/hooks/queries/useAccounts";
-import { AddAccountInstructions } from "@/components/AddAccountInstructions";
-import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
 import type { ApiClient } from "@/api/client";
 import { DeviceConnectionFooter } from "@/components/AccountUsage/DeviceConnectionFooter";
 import { ApiKeysSection } from "@/components/settings/sections/ApiKeysSection";
@@ -175,365 +172,6 @@ function AccountUsageCardWithHistory(props: {
   );
 }
 
-// ── Non-Anthropic provider sections (issue #3806, epic #3345) ───────────────
-// The OpenAI + Google Gemini sections render per-node DERIVED rows from the
-// provider-auth-state envelope. Presentational + self-contained; they read only
-// `NodeProviderAuthState[]` and a node-label resolver. NEVER render a token/key
-// value — the envelope carries none (structural guarantee, R6).
-
-const OPENAI_MODE_LABEL: Record<string, string> = {
-  chatgpt: "ChatGPT subscription",
-  "api-key": "API key",
-  unknown: "Unknown — run codex login status",
-  none: "Not configured",
-};
-const OPENAI_SOURCE_LABEL: Record<string, string> = {
-  host: "Host login (~/.codex)",
-  account: "Per-account",
-};
-const GEMINI_AUTH_LABEL: Record<string, string> = {
-  "api-key": "API key",
-  "google-login": "Google login",
-  vertex: "Vertex AI",
-  none: "Not configured",
-  unknown: "Unknown",
-};
-const GEMINI_KEYSOURCE_LABEL: Record<string, string> = {
-  vault: "Key: vault (this node)",
-  "daemon-env": "Key: daemon env-file",
-  none: "No key on this node",
-};
-
-function ProviderDetailRow(props: {
-  label: string;
-  value: string;
-  testId?: string;
-}) {
-  return (
-    <div
-      className="flex items-baseline justify-between gap-3 py-0.5"
-      data-testid={props.testId}
-    >
-      <span className="shrink-0 text-[length:var(--text-caption)] text-[var(--app-hint)]">
-        {props.label}
-      </span>
-      <span className="min-w-0 truncate text-[length:var(--text-body)] text-[var(--app-fg)]">
-        {props.value}
-      </span>
-    </div>
-  );
-}
-
-/**
- * OpenAI per-account pacing meter (issue #3809) — rendered into the #3806 login
- * row's meter slot. Reuses `UsageBar` UNCHANGED for the 5-hour + weekly windows
- * (mapped server-side from codex primary/secondary); shows "as of <time>" when
- * the snapshot is stale/error, and a hint when no snapshot has arrived yet. Uses
- * only existing token classes (no new hex/px literal — the design-token ratchet).
- */
-function OpenAiUsageMeter(props: { usage: ProviderAccountUsage }) {
-  const { usage } = props;
-  if (usage.status === "unknown") {
-    return (
-      <p
-        className="mt-2 text-[length:var(--text-caption)] text-[var(--app-hint)]"
-        data-testid="openai-usage-unknown"
-      >
-        No usage snapshot yet — run a Codex session to populate.
-      </p>
-    );
-  }
-  const fiveHour = usage.utilization.five_hour?.utilization ?? null;
-  const weekly = usage.utilization.seven_day?.utilization ?? null;
-  return (
-    <div
-      className="mt-2 flex flex-col gap-1.5"
-      data-testid="openai-usage-meter"
-    >
-      <UsageBar label="5-hour" value={fiveHour} />
-      <UsageBar label="Weekly" value={weekly} />
-      {(usage.status === "stale" || usage.status === "error") && (
-        <span
-          className="text-[length:var(--text-caption)] text-[var(--app-hint)]"
-          data-testid="openai-usage-asof"
-        >
-          as of {formatRelativeTime(usage.fetchedAt) ?? "unknown"}
-        </span>
-      )}
-    </div>
-  );
-}
-
-/**
- * Google (Gemini) token-SPEND counter (issue #3809) — NEVER a % bar (no queryable
- * account-level limit for an API key). Renders "tokens used (no limit known)" +
- * the rolling today / this-week totals from the derived counter. Token classes
- * mirror the sibling provider rows (no new hex/px literal).
- */
-function GoogleUsageCounter(props: { usage: ProviderAccountUsage }) {
-  const { usage } = props;
-  const spend = usage.tokenSpend;
-  return (
-    <div
-      className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
-      data-testid="google-usage-counter"
-    >
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <span className="min-w-0 truncate text-[length:var(--text-label-strong)] font-medium text-[var(--app-fg)]">
-          {usage.nickname || usage.displayLabel}
-        </span>
-        <span className="shrink-0 text-[length:var(--text-caption)] text-[var(--app-hint)]">
-          tokens used (no limit known)
-        </span>
-      </div>
-      <ProviderDetailRow
-        label="Today"
-        value={`${(spend?.tokensToday ?? 0).toLocaleString()} tokens`}
-        testId="google-usage-today"
-      />
-      <ProviderDetailRow
-        label="This week"
-        value={`${(spend?.tokensThisWeek ?? 0).toLocaleString()} tokens`}
-        testId="google-usage-week"
-      />
-    </div>
-  );
-}
-
-function DegradedNodeRow(props: { nodeLabel: string }) {
-  return (
-    <div
-      className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
-      data-testid="provider-node-unreachable"
-    >
-      <p className="text-[length:var(--text-body)] text-[var(--toast-warning)]">
-        {props.nodeLabel}: unreachable
-      </p>
-    </div>
-  );
-}
-
-function OpenAiSectionBody(props: {
-  nodes: NodeProviderAuthState[];
-  resolveNodeLabel: (nodeId: string) => string;
-  api: ApiClient | null;
-  // Issue #3809: the OpenAI providerUsage[] rows keyed by accountUuid, rendered
-  // into each login row's meter slot below.
-  openaiUsageByUuid: Map<string, ProviderAccountUsage>;
-}) {
-  const [wizardOpen, setWizardOpen] = useState(false);
-  const anyRows = props.nodes.some(
-    n => n.status === "ok" && n.openai.length > 0
-  );
-  const allReachableNoLogin =
-    !anyRows && props.nodes.every(n => n.status === "ok");
-  // #4464: the in-app "Add account" opens the OpenAI "+ Add" modal — ChatGPT
-  // device-auth or a Codex API-key login on the node the user picks (the UI
-  // host by default), plus OpenAI vault keys.
-  const addButton = (
-    <div className="flex justify-end">
-      <Button
-        type="button"
-        size="sm"
-        onClick={() => setWizardOpen(true)}
-        data-testid="openai-add-account"
-      >
-        Add account
-      </Button>
-    </div>
-  );
-  const wizard = wizardOpen ? (
-    <AddToProviderModal
-      isOpen
-      onClose={() => setWizardOpen(false)}
-      api={props.api}
-      provider="openai"
-    />
-  ) : null;
-
-  if (allReachableNoLogin) {
-    // Every node reachable, no Codex login anywhere → host-side add instructions
-    // (the on-host fallback) PLUS the in-app add for the local node (#3807).
-    return (
-      <div className="flex flex-col gap-3">
-        <div
-          className="flex flex-col gap-2 text-[length:var(--text-body)]"
-          data-testid="provider-section-openai-empty"
-        >
-          <AddAccountInstructions
-            provider="openai"
-            intro="No Codex (OpenAI) login on this node yet:"
-          />
-        </div>
-        {addButton}
-        {wizard}
-      </div>
-    );
-  }
-  return (
-    <div className="flex flex-col gap-3">
-      {props.nodes.map(node => {
-        const nodeLabel = props.resolveNodeLabel(node.nodeId);
-        if (node.status === "unreachable") {
-          return <DegradedNodeRow key={node.nodeId} nodeLabel={nodeLabel} />;
-        }
-        if (node.openai.length === 0) return null;
-        return (
-          <div key={node.nodeId} className="flex flex-col gap-2">
-            {node.openai.map((row, i) => (
-              <div
-                key={`${node.nodeId}:${row.source}:${row.accountUuid ?? i}`}
-                className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
-                data-testid="openai-login-row"
-              >
-                <div className="mb-1 flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-[length:var(--text-label-strong)] font-medium text-[var(--app-fg)]">
-                    {row.label ?? row.email ?? nodeLabel}
-                  </span>
-                  <span className="shrink-0 text-[length:var(--text-caption)] text-[var(--app-hint)]">
-                    {OPENAI_SOURCE_LABEL[row.source] ?? row.source}
-                  </span>
-                </div>
-                <ProviderDetailRow
-                  label="Mode"
-                  value={OPENAI_MODE_LABEL[row.mode] ?? row.mode}
-                  testId="openai-mode"
-                />
-                {/* Email as a detail row ONLY when a label occupies the header,
-                    so a host login (header == email) never shows it twice. */}
-                {row.email && row.label && (
-                  <ProviderDetailRow label="Email" value={row.email} />
-                )}
-                {row.plan && (
-                  <ProviderDetailRow label="Plan" value={row.plan} />
-                )}
-                {row.expiresAt && (
-                  <ProviderDetailRow
-                    label="Expires"
-                    value={
-                      formatRelativeTime(new Date(row.expiresAt).getTime()) ??
-                      row.expiresAt
-                    }
-                  />
-                )}
-                {/* #3809: the per-account OpenAI pacing meter — the sibling
-                    providerUsage[] row for this login, matched by accountUuid.
-                    Renders nothing until a session of the account reports a
-                    snapshot (status "unknown" shows a hint). */}
-                {row.accountUuid &&
-                  props.openaiUsageByUuid.has(row.accountUuid) && (
-                    <OpenAiUsageMeter
-                      usage={props.openaiUsageByUuid.get(row.accountUuid)!}
-                    />
-                  )}
-              </div>
-            ))}
-          </div>
-        );
-      })}
-      {addButton}
-      {wizard}
-    </div>
-  );
-}
-
-function GeminiSectionBody(props: {
-  nodes: NodeProviderAuthState[];
-  resolveNodeLabel: (nodeId: string) => string;
-  currentNodeId: string;
-  api: ApiClient | null;
-  // Issue #3809: the Google providerUsage[] counter rows (account-keyed, not
-  // node-keyed like the auth rows), rendered at the top of the section.
-  googleUsageRows: ProviderAccountUsage[];
-}) {
-  // #4464: ONE "Add key" button opens the Gemini "+ Add" modal (keys only). It
-  // writes THIS node's local vault (POST /api/api-keys — there is no federation
-  // key store until #1996); a peer node's row keeps the #3806 host-side
-  // instruction.
-  const [addOpen, setAddOpen] = useState(false);
-  return (
-    <div className="flex flex-col gap-3">
-      {/* Issue #3809: the derived Google token-spend counters (account-keyed),
-          shown above the per-node auth rows. A count row is never a % bar. */}
-      {props.googleUsageRows.length > 0 && (
-        <div
-          className="flex flex-col gap-2"
-          data-testid="google-usage-counters"
-        >
-          {props.googleUsageRows.map(u => (
-            <GoogleUsageCounter key={u.accountUuid} usage={u} />
-          ))}
-        </div>
-      )}
-      {props.nodes.map(node => {
-        const nodeLabel = props.resolveNodeLabel(node.nodeId);
-        if (node.status === "unreachable") {
-          return <DegradedNodeRow key={node.nodeId} nodeLabel={nodeLabel} />;
-        }
-        const g = node.google;
-        const isLocal = node.nodeId === props.currentNodeId;
-        return (
-          <div key={node.nodeId} className="flex flex-col gap-2">
-            {g && (
-              <div
-                className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
-                data-testid="gemini-node-row"
-              >
-                <div className="mb-1 flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-[length:var(--text-label-strong)] font-medium text-[var(--app-fg)]">
-                    {nodeLabel}
-                  </span>
-                  <span className="shrink-0 text-[length:var(--text-caption)] text-[var(--app-hint)]">
-                    {GEMINI_KEYSOURCE_LABEL[g.keySource] ?? g.keySource}
-                  </span>
-                </div>
-                <ProviderDetailRow
-                  label="Auth type"
-                  value={
-                    GEMINI_AUTH_LABEL[g.selectedAuthType] ?? g.selectedAuthType
-                  }
-                  testId="gemini-auth-type"
-                />
-              </div>
-            )}
-            {!isLocal && !g?.bound && (
-              // A peer node with no bound Gemini key → host-side instruction
-              // (federation key persistence is #1996's; R4).
-              <div
-                className="flex flex-col gap-2 text-[length:var(--text-body)]"
-                data-testid="provider-section-google-peer-empty"
-              >
-                <AddAccountInstructions
-                  provider="google"
-                  intro={`No Gemini key bound on ${nodeLabel} yet:`}
-                />
-              </div>
-            )}
-          </div>
-        );
-      })}
-      <div className="flex justify-end">
-        <Button
-          type="button"
-          size="sm"
-          onClick={() => setAddOpen(true)}
-          data-testid="gemini-add-key"
-        >
-          Add key
-        </Button>
-      </div>
-      {addOpen && (
-        <AddToProviderModal
-          isOpen
-          onClose={() => setAddOpen(false)}
-          api={props.api}
-          provider="google"
-        />
-      )}
-    </div>
-  );
-}
-
 export default function AccountUsagePage(props?: { onBack?: () => void }) {
   const { api } = useAppContext();
   const defaultGoBack = useAppGoBack();
@@ -582,16 +220,13 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
   // and provider sections above it have loaded, or they push it back down.
   useScrollToLocationHash(!isLoading && !providerLoading);
 
-  // Issue #3809: split the sibling providerUsage[] into the OpenAI meter map
-  // (accountUuid → the login row's meter slot) and the Google counter rows
+  // Issue #3809 / #3982: split the sibling providerUsage[] into the OpenAI
+  // account cards (one per stored account) and the Google counter rows
   // (account-keyed, rendered as a group at the top of the Gemini section).
-  const openaiUsageByUuid = useMemo(() => {
-    const m = new Map<string, ProviderAccountUsage>();
-    for (const u of providerUsage) {
-      if (u.provider === "openai") m.set(u.accountUuid, u);
-    }
-    return m;
-  }, [providerUsage]);
+  const openaiUsage = useMemo(
+    () => providerUsage.filter(u => u.provider === "openai"),
+    [providerUsage]
+  );
   const googleUsageRows = useMemo(
     () => providerUsage.filter(u => u.provider === "google"),
     [providerUsage]
@@ -632,6 +267,25 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
     }
     return m;
   }, [localNode, remoteNodes]);
+  // #3982: an OpenAI card's `machines` labels → the node ids its NodeChips target.
+  // Non-federated (D2): the server stamps no node label, so `machines` is [] —
+  // treat the instance as one implicit local node, as the Anthropic cards do.
+  const resolveNodes = useCallback(
+    (machines: string[]) =>
+      machines.length === 0
+        ? [
+            {
+              nodeId: currentNodeId,
+              nodeLabel: localNode?.nodeLabel ?? LOCAL_NODE_LABEL,
+            },
+          ]
+        : machines
+            .map(label => nodeByLabel.get(label))
+            .filter(
+              (n): n is { nodeId: string; nodeLabel: string } => n != null
+            ),
+    [nodeByLabel, currentNodeId, localNode]
+  );
 
   // Resolve each account's nodes (with the D2 non-federated single-local-node
   // fallback) and its email-matched bound sessions ONCE — the card list reads
@@ -656,13 +310,16 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
                   nodeLabel: localNode?.nodeLabel ?? LOCAL_NODE_LABEL,
                 },
               ];
-        // Sessions bound to this account by email match — mirrors
-        // AccountSelectorModal's boundSessions derivation.
-        const boundSessions = account.email
-          ? remoteSessions
-              .filter(s => getAccountEmail(s) === account.email)
-              .map(s => ({ id: s.id, label: getSessionTitle(s) }))
-          : [];
+        // Sessions bound to this account (#3982, E15): the uuid the session
+        // recorded at spawn; a session that recorded none (an un-pinned Claude
+        // session) falls back to the email match AccountSelectorModal uses.
+        const boundSessions = remoteSessions
+          .filter(s => {
+            const recorded = s.metadata?.accountUuid;
+            if (recorded) return recorded === account.accountUuid;
+            return !!account.email && getAccountEmail(s) === account.email;
+          })
+          .map(s => ({ id: s.id, label: getSessionTitle(s) }));
         return { account, nodes, boundSessions };
       }),
     [usage, nodeByLabel, currentNodeId, localNode, remoteSessions]
@@ -1340,7 +997,11 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
               nodes={providerNodes}
               resolveNodeLabel={resolveNodeLabel}
               api={api}
-              openaiUsageByUuid={openaiUsageByUuid}
+              openaiUsage={openaiUsage}
+              resolveNodes={resolveNodes}
+              onDragActiveChange={active => {
+                isDraggingRef.current = active;
+              }}
             />
           </ProviderSection>
 

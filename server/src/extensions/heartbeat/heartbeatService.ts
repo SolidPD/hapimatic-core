@@ -17,6 +17,8 @@ import { existsSync } from "node:fs";
 import type { SyncEngine, SyncEvent } from "../../sync/syncEngine";
 import type { NotificationHub } from "../../notifications/notificationHub";
 import type { PushService } from "../../push/pushService";
+import { buildSessionPushPayload } from "../../push/sessionPushPayload";
+import { getSessionName } from "../../notifications/sessionInfo";
 import { extractMessageEventType } from "../../notifications/eventParsing";
 import { configuration } from "../../configuration";
 import { loadHeartbeatConfig } from "../../config/heartbeatConfig";
@@ -339,19 +341,22 @@ export class HeartbeatService {
       const session = this.syncEngine.getSession(sessionId);
       const namespace = session?.namespace;
       if (namespace) {
-        await this.pushService.sendToNamespace(namespace, {
-          title: "Heartbeat",
-          body:
-            response.length > 200
-              ? response.substring(0, 197) + "..."
-              : response,
-          tag: "heartbeat-response",
-          data: {
+        // #4921: titled by the session, per-session tag, opens the session
+        // (was one fixed tag shared by every session, and the mini-app URL).
+        await this.pushService.sendToNamespace(
+          namespace,
+          buildSessionPushPayload({
+            kind: "heartbeat",
             type: "heartbeat",
             sessionId,
-            url: configuration.miniAppUrl,
-          },
-        });
+            sessionTitle: session ? getSessionName(session) : null,
+            sessionEmoji: session?.emoji,
+            body:
+              response.length > 200
+                ? response.substring(0, 197) + "..."
+                : response,
+          })
+        );
       }
     }
 

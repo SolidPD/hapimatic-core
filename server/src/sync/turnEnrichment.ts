@@ -27,6 +27,7 @@
  * `runFinalizeSteps` try/catch).
  */
 
+import { apiKeyRefVaultId } from "@hapi/protocol/apiKeyRef";
 import type { Session } from "@hapi/protocol/types";
 
 import type {
@@ -92,7 +93,13 @@ export function createOpenEnrichStep(
         accountId: m?.accountUuid ?? null,
         planTier: m?.claudeAccount?.rateLimitTier ?? null,
         authBindingKind: bindingKind,
-        apiKeyId: bindingKind === "api-key" ? (m?.apiKeyId ?? null) : null,
+        // Issue #5127: a key stored on another node is bound by its qualified
+        // ref (`<uuid>@<home>`); the ledger keeps its vault id, so one key has
+        // one id in the turn ledger on every node.
+        apiKeyId:
+          bindingKind === "api-key" && m?.apiKeyId != null
+            ? apiKeyRefVaultId(m.apiKeyId)
+            : null,
         safeMode: m?.safeMode ?? null,
         sessionMode: deriveSessionMode(m?.source), // R4
         permissionMode: session.permissionMode ?? null,

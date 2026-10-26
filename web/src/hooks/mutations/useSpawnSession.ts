@@ -122,6 +122,15 @@ export function useSpawnSession(api: ApiClient | null): {
           : undefined;
 
       if (input.nodeId) {
+        // #5127: a remote spawn bound to a key shared from another node sends
+        // its qualified ref on the same trailing object (never a positional).
+        const remoteTrailing =
+          parent || input.apiKeyId
+            ? {
+                ...(parent ?? {}),
+                ...(input.apiKeyId ? { apiKeyId: input.apiKeyId } : {}),
+              }
+            : undefined;
         return await api.spawnOnNode(
           input.nodeId,
           input.directory,
@@ -148,8 +157,9 @@ export function useSpawnSession(api: ApiClient | null): {
           input.nativeModelSelection,
           // hapimatic-private#4481: existing-branch worktree.
           input.existingBranch,
-          // #4497: parent link + cut point of a remote fan-out peer.
-          parent
+          // #4497: parent link + cut point of a remote fan-out peer; #5127:
+          // the shared key's ref.
+          remoteTrailing
         );
       }
 

@@ -271,8 +271,8 @@ export class ErrorReporter {
     this.lastToastAt = now;
     this.dropsSinceLastToast = 0; // Reset for the next "since last toast" window.
     // CustomEvent bridge — error-reporter is a non-React module, Toast lives
-    // in React context. App.tsx listens for this and calls showToast(). The
-    // pattern mirrors existing hapi:toolError handling. detail.count
+    // in React context. ErrorOutboxDropToastListener (App.tsx) listens for this
+    // and calls showToast(). detail.count
     // surfaces lifetime drop count for diagnostics (existing test contract).
     window.dispatchEvent(
       new CustomEvent("hapi:errorOutboxDropped", {
