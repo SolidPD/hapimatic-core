@@ -281,7 +281,7 @@ export function refuseAgentMessage(
     return escalationRefused(c, ESCALATION_REFUSED_ERROR);
   }
   const target = resolveSessionView(
-    c.req.param("id"),
+    c.req.param("id") ?? "",
     c.get("namespace"),
     lookup
   );
@@ -308,7 +308,7 @@ export function refuseAgentArchive(
     return escalationRefused(c, ESCALATION_REFUSED_ERROR);
   }
   const allowed = isSpawnDescendantOrSelf(
-    c.req.param("id"),
+    c.req.param("id") ?? "",
     caller.id,
     c.get("namespace"),
     lookup

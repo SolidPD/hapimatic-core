@@ -357,28 +357,40 @@ All data is plain JSON over TLS; authentication is `CLI_API_TOKEN` (no end-to-en
 
 `hapi doctor` and `hapi daemon status` list processes with `ps-list` and type each one by its executable token and
 the arguments after it (`classifyHappyProcess` in `doctor.ts`), not by a substring of the whole command line, so a
-shell wrapper that merely mentions `hapi daemon start` is not a hapi process (#5180). The exception is the legacy
-`happy-coder` / `happy-cli` match, which still tests the whole command line:
+shell wrapper that merely mentions `hapi daemon start` is not a hapi process (#5180):
 
 - Production: the `hapi` / `hapi.exe` binary, plus the running binary's own name. A fleet instance's binary is named per
   instance (`hapimatic-private`, `hapimatic-dev`, `hapimatic-wt-3012`), so each lists its own processes and any
-  `hapi`-named process, but no other `hapimatic-*` instance's (`instanceExecutableNames`, #5526). The legacy
-  `happy-coder` binaries are also matched.
-- Development: `bun` / `node` running `src/index.ts`
-- Types by command args: daemon, daemon-spawned session, server, doctor, user-session
+  `hapi`-named process, but no other `hapimatic-*` instance's (`instanceExecutableNames`, #5526).
+- Development: `bun` / `node` running the CLI's own entry, a path ending in `cli/src/index.ts`. Another project's
+  `src/index.ts` is not hapi (#5763).
+- Legacy `happy-coder`: its `happy` binary, or `node` running a script path inside the `happy-coder` / `happy-cli`
+  package. A command line that only carries the word `happy-coder` (`ssh h happy-coder daemon start`) is not hapi
+  (#5763).
+- Types by command args: daemon, daemon-spawned session, server, doctor, user-session. A version check is a process
+  whose only argument is `--version`: `ps` joins argv with spaces, so a `--version` word inside a prompt does not make a
+  session a version check (#5763).
 - The value of any `--token` / `--*-token` argument prints as `<redacted>` (#5526)
+- A failed `ps-list` call is reported as `Could not list processes: <reason>`, not read as "No hapi processes found"
+  (#5763).
 
 ### Clean Runaway Processes
 
-`hapi doctor clean`:
+`hapi doctor clean [--dry-run]` (`runDoctorClean` in `commands/doctor.ts`):
 
-1. `findRunawayHappyProcesses()` selects the daemon, daemon-spawned sessions and stuck `--version` checks. It matches
+1. Options are checked first: `--dry-run` lists what would be killed and kills nothing; any other option (a typo such as
+   `--dryrun` included) prints the usage and exits 2 before anything is listed or killed (#5763).
+2. `findRunawayHappyProcesses()` selects the daemon, daemon-spawned sessions and stuck `--version` checks. It matches
    only `hapi` / `hapi.exe` (plus dev mode and the legacy binaries), never the running binary's own name, so it never
    reaches a `hapimatic-*` instance's daemon or sessions (#5526)
-2. `killRunawayHappyProcesses()`:
+3. `killRunawayHappyProcesses()`:
    - Sends SIGTERM
    - Waits 1 second
    - Sends SIGKILL if still alive
+   - Counts a process as killed only when a signal reached it. `killProcess` returns false both for a process that
+     already exited and for one this user may not signal (EPERM), so a false return is checked against the process
+     list: an exited process is reported as already exited, a live one is recorded as an error (#5763).
+4. The command exits 1 when any kill failed or the process list could not be read, and 0 otherwise (#5763).
 
 ## 8. Integration Testing
 

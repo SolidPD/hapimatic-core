@@ -840,10 +840,27 @@ export async function runDoctorCommand(
     // All hapi processes. #5526: a fleet binary is named per instance
     // (hapimatic-private, hapimatic-wt-3012), so list that instance's own
     // processes too. doctor clean's kill list is not widened by this.
-    const allProcesses = await findAllHappyProcesses(
-      instanceExecutableNames(process.execPath, isBunCompiled())
-    );
-    if (allProcesses.length > 0) {
+    let allProcesses: Array<{
+      pid: number;
+      command: string;
+      type: string;
+    }> | null;
+    try {
+      allProcesses = await findAllHappyProcesses(
+        instanceExecutableNames(process.execPath, isBunCompiled())
+      );
+    } catch (error) {
+      // #5763: a failed listing is reported, never read as "no processes".
+      allProcesses = null;
+      console.log(
+        chalk.red(`❌ Could not list processes: ${(error as Error).message}`)
+      );
+      logger.reportCaught(error, {
+        category: "doctor-process-list",
+        severity: "warn",
+      });
+    }
+    if (allProcesses && allProcesses.length > 0) {
       console.log(chalk.bold("\n🔍 All hapi CLI Processes"));
 
       // Group by type
@@ -887,11 +904,11 @@ export async function runDoctorCommand(
           console.log(`  ${color(`PID ${pid}`)}: ${chalk.gray(command)}`);
         });
       });
-    } else {
+    } else if (allProcesses) {
       console.log(chalk.red("❌ No hapi processes found"));
     }
 
-    if (filter === "all" && allProcesses.length > 1) {
+    if (filter === "all" && allProcesses && allProcesses.length > 1) {
       // More than just current process
       console.log(chalk.bold("\n💡 Process Management"));
       console.log(

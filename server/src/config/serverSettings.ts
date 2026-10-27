@@ -297,6 +297,78 @@ export function resolveOperatorInstanceEnabled(
   return isEnvFlagTruthy(env[OPERATOR_INSTANCE_ENV]);
 }
 
+/**
+ * The operator node's gateway credential: `FEEDBACK_INBOX_URL` (the gateway
+ * origin, trailing slashes dropped) + `FEEDBACK_INBOX_TOKEN` (the shared
+ * operator bearer, ruling D12). Null when either is unset; `"invalid"` when the
+ * URL is not http(s). The one parse both the sink (#2911) and the inbox (#2912)
+ * use, so the two cannot disagree about whether a node is configured.
+ */
+function readOperatorInboxEnv(
+  env: Record<string, string | undefined>
+): { baseUrl: string; token: string } | "invalid" | null {
+  const inboxUrl = env.FEEDBACK_INBOX_URL?.trim();
+  const token = env.FEEDBACK_INBOX_TOKEN?.trim();
+  if (!inboxUrl || !token) return null;
+  let baseUrl = inboxUrl;
+  while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
+  if (!/^https?:\/\/[^/]/.test(baseUrl) || !URL.canParse(baseUrl)) {
+    return "invalid";
+  }
+  return { baseUrl, token };
+}
+
+/** Where an operator instance reads the central inbox (issue #2912, epic #2909 Sub C). */
+export interface FeedbackInboxConfig {
+  /** The gateway origin, e.g. `https://hapimatic.com`. */
+  baseUrl: string;
+  /** The shared operator bearer. Env-only; never written to settings.json. */
+  token: string;
+}
+
+/**
+ * The operator node's credential for the gateway's central feedback inbox
+ * (issue #2912): the same `FEEDBACK_INBOX_URL` + `FEEDBACK_INBOX_TOKEN` the sink
+ * forwards with. Null when unset or malformed, which keeps every inbox proxy
+ * route closed (404) even where `HAPI_OPERATOR_INSTANCE` is set: the flag is a
+ * visibility gate, the gateway bearer is the authorization boundary.
+ */
+export function resolveFeedbackInboxConfig(
+  env: Record<string, string | undefined> = process.env
+): FeedbackInboxConfig | null {
+  const inbox = readOperatorInboxEnv(env);
+  if (inbox === "invalid") {
+    console.error(
+      "[feedback-inbox] FEEDBACK_INBOX_URL is not an http(s) URL — the inbox stays closed"
+    );
+    return null;
+  }
+  return inbox;
+}
+
+/** The repo Convert-to-issue files into when `FEEDBACK_ISSUE_REPO` is unset. */
+export const DEFAULT_FEEDBACK_ISSUE_REPO = "MattStarfield/hapimatic-private";
+
+/**
+ * The repo the inbox's Convert-to-issue files into (`FEEDBACK_ISSUE_REPO`,
+ * `owner/repo`), chosen by the server and never by the client. Unset ⇒ the
+ * default; set but malformed ⇒ null, and Convert refuses rather than filing
+ * into a repo nobody named.
+ */
+export function resolveFeedbackIssueRepo(
+  env: Record<string, string | undefined> = process.env
+): string | null {
+  const raw = env.FEEDBACK_ISSUE_REPO?.trim();
+  if (!raw) return DEFAULT_FEEDBACK_ISSUE_REPO;
+  if (!/^[\w.-]+\/[\w.-]+$/.test(raw)) {
+    console.error(
+      "[feedback-inbox] FEEDBACK_ISSUE_REPO is not owner/repo — Convert to issue is off"
+    );
+    return null;
+  }
+  return raw;
+}
+
 const RELAY_URL_SUFFIX = "/feedback-relay";
 const SINK_URL_SUFFIX = "/feedback-sink";
 
@@ -322,17 +394,16 @@ export function resolveFeedbackSinkConfig(
   origin: FeedbackSinkOrigin = {},
   env: Record<string, string | undefined> = process.env
 ): FeedbackSinkConfig | null {
-  const inboxUrl = env.FEEDBACK_INBOX_URL?.trim();
-  const inboxToken = env.FEEDBACK_INBOX_TOKEN?.trim();
-  if (inboxUrl && inboxToken) {
-    let base = inboxUrl;
-    while (base.endsWith("/")) base = base.slice(0, -1);
-    if (!/^https?:\/\/[^/]/.test(base) || !URL.canParse(base)) {
-      console.error(
-        "[feedback-sink] FEEDBACK_INBOX_URL is not an http(s) URL — feedback is not forwarded"
-      );
-      return null;
-    }
+  const inbox = readOperatorInboxEnv(env);
+  if (inbox === "invalid") {
+    console.error(
+      "[feedback-sink] FEEDBACK_INBOX_URL is not an http(s) URL — feedback is not forwarded"
+    );
+    return null;
+  }
+  if (inbox !== null) {
+    const base = inbox.baseUrl;
+    const inboxToken = inbox.token;
     const originInstanceId = origin.nodeId ?? hostname();
     if (
       originInstanceId.length > 64 ||

@@ -51,7 +51,8 @@ See `src/daemon/run.ts`.
 ### Diagnostics
 
 - `hapi doctor` - Show full diagnostics (version, daemon status, logs, processes).
-- `hapi doctor clean` - Kill runaway HAPI processes.
+- `hapi doctor clean` - Kill runaway HAPI processes. Exits 1 if a kill or the process listing failed.
+- `hapi doctor clean --dry-run` - List the processes `doctor clean` would kill, without killing any.
 
 See `src/ui/doctor.ts`.
 

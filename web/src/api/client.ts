@@ -40,6 +40,18 @@ import type {
   OnboardingStatePatch,
   BackupPromptPreference,
 } from "@hapi/protocol/schemas";
+import {
+  feedbackInboxFiltersToQuery,
+  FeedbackCountsSchema,
+  FeedbackInboxItemSchema,
+  FeedbackInboxListSchema,
+  type FeedbackCounts,
+  type FeedbackInboxFilters,
+  type FeedbackInboxItem,
+  type FeedbackInboxList,
+  type FeedbackPatch,
+} from "@hapi/protocol/feedbackSink";
+import type { FeedbackConvertResponse } from "@/types/api";
 import type { QueuedMessage, SessionView } from "@hapi/protocol/types";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type {
@@ -298,6 +310,13 @@ export class RequestTimeoutError extends Error {
 // #5409: defined in the leaf module to avoid an import cycle; re-exported so
 // consumers import it from here like the other error classes.
 export { NetworkError };
+
+/** Designed degraded answers of the feedback inbox reads (#2912). */
+const FEEDBACK_INBOX_READ_EXPECTED = [404, 502, 503, 504] as const;
+/** …and of its writes: a 409 is another operator acting first. */
+const FEEDBACK_INBOX_WRITE_EXPECTED = [409, 502, 503, 504] as const;
+/** …and of Convert: 422 is the feedback label missing in the target repo. */
+const FEEDBACK_INBOX_CONVERT_EXPECTED = [409, 422, 502, 503, 504] as const;
 
 export class ApiError extends Error {
   status: number;
@@ -3488,6 +3507,87 @@ export class ApiClient {
     const qs = params.toString();
     return await this.request<FeedbackListResponse>(
       `/api/feedback${qs ? `?${qs}` : ""}`
+    );
+  }
+
+  /**
+   * The operators' shared feedback inbox (issue #2912). This instance proxies
+   * to the gateway's central store; the browser never calls the gateway. 404
+   * (the flag is set but this node holds no gateway credential) and 502–504
+   * (gateway unreachable) are designed degraded states the page renders, so
+   * they are declared and never filed as client error reports. Every response
+   * is runtime-parsed: a drifted payload errors the query instead of rendering.
+   */
+  async getFeedbackInbox(
+    filters: Partial<FeedbackInboxFilters>
+  ): Promise<FeedbackInboxList> {
+    const qs = feedbackInboxFiltersToQuery(filters).toString();
+    const raw = await this.request<unknown>(
+      `/api/feedback/inbox${qs ? `?${qs}` : ""}`,
+      undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: FEEDBACK_INBOX_READ_EXPECTED }
+    );
+    return FeedbackInboxListSchema.parse(raw);
+  }
+
+  /** Per-status totals and the origins list; #2913's badge reads this too. */
+  async getFeedbackInboxCounts(): Promise<FeedbackCounts> {
+    const raw = await this.request<unknown>(
+      "/api/feedback/inbox/counts",
+      undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: FEEDBACK_INBOX_READ_EXPECTED }
+    );
+    return FeedbackCountsSchema.parse(raw);
+  }
+
+  async getFeedbackInboxItem(id: string): Promise<FeedbackInboxItem> {
+    const raw = await this.request<unknown>(
+      `/api/feedback/inbox/${encodeURIComponent(id)}`,
+      undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: FEEDBACK_INBOX_READ_EXPECTED }
+    );
+    return FeedbackInboxItemSchema.parse(raw);
+  }
+
+  /**
+   * Move a row through the lifecycle. The acting operator is recorded by the
+   * server; nothing here names one. A 409 means another operator moved the row
+   * first (its `body` carries the row as it is now).
+   */
+  async patchFeedbackInboxItem(
+    id: string,
+    body: FeedbackPatch
+  ): Promise<FeedbackInboxItem> {
+    const raw = await this.request<unknown>(
+      `/api/feedback/inbox/${encodeURIComponent(id)}`,
+      { method: "PATCH", body: JSON.stringify(body) },
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: FEEDBACK_INBOX_WRITE_EXPECTED }
+    );
+    return FeedbackInboxItemSchema.parse(raw);
+  }
+
+  /** File the row as a GitHub issue (server-chosen repo) and mark it actioned. */
+  async convertFeedbackInboxItem(id: string): Promise<FeedbackConvertResponse> {
+    return await this.request<FeedbackConvertResponse>(
+      `/api/feedback/inbox/${encodeURIComponent(id)}/convert`,
+      { method: "POST", body: "{}" },
+      0,
+      undefined,
+      // `gh` may take a while: one list and one create, each bounded at 30 s.
+      75_000,
+      { expectedStatuses: FEEDBACK_INBOX_CONVERT_EXPECTED }
     );
   }
 

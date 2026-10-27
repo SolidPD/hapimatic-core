@@ -231,11 +231,35 @@ export type FeedbackListItem = {
   metadataJson: string;
   emailed: boolean;
   emailError: string | null;
+  /** #2911: whether the row has reached the gateway's central store. */
+  forwardState?: "pending" | "forwarded" | "legacy" | "rejected";
+  forwardError?: string | null;
 };
 
 export type FeedbackListResponse = {
   items: FeedbackListItem[];
   total: number;
+};
+
+// The operators' shared feedback inbox (issue #2912, epic #2909 Sub C). The
+// shapes are server-owned (`@hapi/protocol/feedbackSink`) and re-exported here,
+// never re-declared.
+export type {
+  FeedbackCounts,
+  FeedbackInboxFilters,
+  FeedbackInboxItem,
+  FeedbackInboxList,
+  FeedbackPatch,
+  FeedbackStatus,
+} from "@hapi/protocol/feedbackSink";
+
+/** `200` body of `POST /api/feedback/inbox/:id/convert`. */
+export type FeedbackConvertResponse = {
+  /** `owner/repo#N`. */
+  issue: string;
+  url: string | null;
+  /** False when the issue was filed but the row could not be marked yet. */
+  stamped: boolean;
 };
 
 // In-app self-help support (issue #4371, E6 Sub F). The shapes of

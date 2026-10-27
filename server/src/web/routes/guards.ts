@@ -41,6 +41,11 @@ export function requireSessionFromParam(
 ): { sessionId: string; session: Session } | Response {
   const paramName = options?.paramName ?? "id";
   const sessionId = c.req.param(paramName);
+  if (sessionId === undefined) {
+    // Hono >= 4.12 types a non-literal param name as string | undefined; a route
+    // that omits the param used to fall through to the same 404 via getSession.
+    return c.json({ error: "Session not found" }, 404);
+  }
   const session = requireSession(c, engine, sessionId, {
     requireActive: options?.requireActive,
   });

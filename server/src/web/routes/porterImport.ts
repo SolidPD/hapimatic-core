@@ -25,6 +25,7 @@ import {
   type ImportResult,
 } from "../../porter/importArchive";
 import { CommitRollbackError } from "../../porter/importArchiveErrors";
+import { commitFailureStack, commitFailureText } from "../../porter/commitFs";
 import { PathEscapeError } from "../../porter/archiveContainment";
 import { ArchiveLimitError, TarParseError } from "../../porter/tarArchive";
 import { SecretInjectionError } from "../../porter/mcpImport";
@@ -218,7 +219,9 @@ export function commitFailureOf(err: unknown): unknown {
  * thrown error itself when it has none (#4242) — so it reaches Sentry. A 4xx
  * refusal raised before runCommit's try logs at `warn` with no stack. Reads
  * `err`, not {@link commitFailureOf}(err): the unwrap would hide the rollback.
- * The status is not changed here (#4246).
+ * The status is not changed here (#4246). #5787: an errno failure's stack has
+ * its fs message (which can name a backup or staged path) replaced by its code
+ * + syscall; frames are kept.
  */
 export function commitFailureLog(
   err: unknown,
@@ -231,7 +234,7 @@ export function commitFailureLog(
   const source = cause instanceof Error ? cause : err;
   return {
     severity: "error",
-    stack: source instanceof Error ? (source.stack ?? null) : null,
+    stack: source instanceof Error ? commitFailureStack(source) : null,
   };
 }
 
@@ -711,9 +714,13 @@ export function createPorterImportRoutes(opts: {
         // config. Overlay validation errors (returned 400 above) carry names too.
         // #5676: a malformed destination .claude.json / settings.json refusal
         // carries a fixed reason, never the parser's text (Bun echoes an
-        // unquoted value).
+        // unquoted value). #5787: an errno failure raised before runCommit's
+        // try (mkdir(backupDir)) is its code + syscall, never a backup path
+        // (the handle's, or the porter-backup root a failed mkdir reports).
         const message =
-          err instanceof Error ? err.message : "Import commit failed";
+          err instanceof Error
+            ? commitFailureText(err, plan)
+            : "Import commit failed";
         // #4177 (L4) + #4242 + #4315: a 5xx or a rolled-back failure (clean or
         // PARTIAL) logs the original failure's stack at `error` — the rollback
         // wrap's `cause`, or the thrown error itself when it was raised before

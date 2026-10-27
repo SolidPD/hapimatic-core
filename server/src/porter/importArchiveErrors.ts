@@ -126,14 +126,21 @@ export class SymlinkedSettingsError extends Error {
   }
 }
 
-/** commitImport called on a plan whose staging dir no longer exists (expired). */
+/**
+ * commitImport called on a plan whose staging dir no longer exists (expired).
+ * #5787: the message names no path — the dir holds the staging handle — so the
+ * dir is kept as a property ({@link StagingExpiredError.stagingDir}), which
+ * only tests read; nothing logs or returns it.
+ */
 export class StagingExpiredError extends Error {
+  readonly stagingDir: string;
   constructor(stagingDir: string) {
     super(
-      `Import plan expired: staging dir ${stagingDir} no longer exists ` +
+      `Import plan expired: its staging dir no longer exists ` +
         `(a server restart or TTL sweep cleared it). Re-run the plan step.`
     );
     this.name = "StagingExpiredError";
+    this.stagingDir = stagingDir;
   }
 }
 

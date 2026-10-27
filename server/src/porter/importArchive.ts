@@ -102,6 +102,7 @@ import {
   captureBackup,
   checkSettingsLink,
   classifySettingsLink,
+  commitFailureText,
   importFileMode,
   isLinkWithoutSettingsFile,
   isRegularFile,
@@ -1197,7 +1198,9 @@ async function runCommit(
     // rollback as clean.
     const restoreFailures = await restoreBackups(backups, restoreFileOps);
     restoreFailures.push(...(await restoreModes(appliedModes)));
-    const reason = err instanceof Error ? err.message : String(err);
+    // #5787: an errno failure is its code + syscall (`<dest> (…)` when a
+    // destination resolves), never a backup/staged path.
+    const reason = commitFailureText(err, plan);
     // #4177 (L4) + #4246: typed wrap; `cause` = original failure (or applyOne's chmod error).
     if (restoreFailures.length > 0) {
       throw new CommitRollbackError(

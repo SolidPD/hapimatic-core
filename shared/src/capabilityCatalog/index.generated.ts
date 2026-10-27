@@ -4234,6 +4234,106 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Convert a feedback inbox row into a GitHub issue labeled feedback in the server-configured repo, then mark the row actioned with the issue reference. Idempotent.",
+    "domain": "harness-admin",
+    "id": "harness-admin.feedback-inbox-convert",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/feedback/inbox/:id/convert"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a feedback row should become a tracked GitHub issue."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Per-status totals of the shared feedback inbox, plus every origin with its row count.",
+    "domain": "harness-admin",
+    "id": "harness-admin.feedback-inbox-counts",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/feedback/inbox/counts"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When showing how much feedback is waiting, or listing the origins to filter by."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read one row of the shared feedback inbox with its lifecycle (status, who acted, note, linked issue).",
+    "domain": "harness-admin",
+    "id": "harness-admin.feedback-inbox-get",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/feedback/inbox/:id"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When checking a single feedback row's current state."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List the operators' shared feedback inbox (every instance's feedback, from the gateway's central store) with status, category, origin and text filters.",
+    "domain": "harness-admin",
+    "id": "harness-admin.feedback-inbox-list",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/feedback/inbox"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When triaging submitted feedback across every node and customer VM."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Move a feedback inbox row through its lifecycle (acknowledge, dismiss with a note, reopen), recorded against the acting operator; compare-and-set with expectedStatus.",
+    "domain": "harness-admin",
+    "id": "harness-admin.feedback-inbox-patch",
+    "invocation": {
+      "kind": "rest",
+      "method": "PATCH",
+      "path": "/api/feedback/inbox/:id"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When acknowledging, dismissing or reopening a feedback row."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Report whether this instance is an operator instance that shows the feedback inbox; a non-operator instance answers 404.",
     "domain": "harness-admin",
     "id": "harness-admin.feedback-preflight",

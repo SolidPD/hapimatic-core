@@ -70,14 +70,112 @@ export interface RestoreFailure {
  * backup apart. Not the fs message: it repeats the destination and adds the
  * backup path, whose staging handle stays committable after a rolled-back
  * commit, to the HTTP body and Sentry. A code-less error is an internal one
- * (the test seam), so its message is used.
+ * (the test seam), so its message is used. #5787: also the cause part of the
+ * original failure's text ({@link commitFailureText}, after any destination)
+ * and the replacement for its message in its stack
+ * ({@link commitFailureStack}).
  */
 export function restoreCause(err: unknown): string {
-  const e = err as NodeJS.ErrnoException | null;
-  if (e && typeof e.code === "string") {
-    return e.syscall ? `${e.code} on ${e.syscall}` : e.code;
+  if (hasErrnoCode(err)) {
+    return err.syscall ? `${err.code} on ${err.syscall}` : err.code;
   }
   return err instanceof Error ? err.message : "unknown error";
+}
+
+/** The name prefix of {@link atomicWriteFile}'s tmp file (#5787 reads it back). */
+const PORTER_TMP_PREFIX = ".porter-tmp.";
+
+/** Whether `err` carries a string `code` (an fs or Node error), the rule {@link restoreCause} keys on. */
+function hasErrnoCode(
+  err: unknown
+): err is NodeJS.ErrnoException & { code: string } {
+  return typeof (err as NodeJS.ErrnoException | null)?.code === "string";
+}
+
+/** #5787: what {@link commitFailureText} reads from the import plan. */
+export interface CommitFailurePlan {
+  dataDir: string;
+  stagingHandle: string;
+  files: readonly { stagedPath: string; destPath: string }[];
+}
+
+/**
+ * #5787: the data-dir subtrees that hold staging handles; no commit-failure
+ * text names a path in them ({@link isPorterInternalPath}).
+ */
+const PORTER_INTERNAL_DIRS = ["porter-backup", "porter-staging"] as const;
+
+/**
+ * #5787: the text a failed commit reports for its original failure — the
+ * rollback messages, and the commit route's body and log. An error with a
+ * `code` is rendered as {@link restoreCause}, never its fs message: Bun's
+ * message names the path of the failed call (both paths, for a `rename`), so
+ * a failed backup write names `porter-backup/<handle>/N` and a failed staged
+ * read names `porter-staging/<handle>/…`, and the handle stays committable
+ * after a rolled-back commit (clean or PARTIAL). The failure's path is named
+ * as {@link failedDestination} resolves it. A code-less error is a
+ * porter-raised Error whose text names no backup or staging path (a
+ * destination, a server or key name, or a fixed reason such as #5676's
+ * `is not valid JSON`), so its message is kept.
+ */
+export function commitFailureText(
+  err: unknown,
+  plan: CommitFailurePlan
+): string {
+  if (!hasErrnoCode(err)) {
+    return err instanceof Error ? err.message : String(err);
+  }
+  const cause = restoreCause(err);
+  const dest = failedDestination(err, plan);
+  return dest ? `${dest} (${cause})` : cause;
+}
+
+/**
+ * #5787: the path a failure names, or undefined. A staged path is replaced by
+ * its item's destination. {@link atomicWriteFile}'s tmp file stands for the
+ * destination it replaces: the rename's target, else the tmp file's directory.
+ * A path that holds the staging handle is never named (the handle is a
+ * `randomUUID`, so no destination holds it), nor any path at or under
+ * `<dataDir>/porter-backup` or `<dataDir>/porter-staging`: a recursive `mkdir`
+ * that cannot create the backup root reports that root, without the handle.
+ */
+function failedDestination(
+  err: NodeJS.ErrnoException & { dest?: unknown },
+  plan: CommitFailurePlan
+): string | undefined {
+  const raw = err.path;
+  if (typeof raw !== "string" || raw === "") return undefined;
+  const isTmp = basename(raw).startsWith(PORTER_TMP_PREFIX);
+  const tmpDest = typeof err.dest === "string" ? err.dest : dirname(raw);
+  const path = isTmp ? tmpDest : raw;
+  const item = plan.files.find(f => f.stagedPath === path);
+  if (item) return item.destPath;
+  return isPorterInternalPath(path, plan) ? undefined : path;
+}
+
+/**
+ * #5787: whether `path` holds the staging handle or lies in a
+ * {@link PORTER_INTERNAL_DIRS} subtree.
+ */
+function isPorterInternalPath(path: string, plan: CommitFailurePlan): boolean {
+  if (path.includes(plan.stagingHandle)) return true;
+  return PORTER_INTERNAL_DIRS.some(sub => {
+    const base = join(plan.dataDir, sub);
+    return path === base || path.startsWith(base + sep);
+  });
+}
+
+/**
+ * #5787: `err`'s stack for the commit route's log. Bun's stack begins
+ * `Error: <message>`, so a failed fs call's stack names the same backup or
+ * staged path its message does: for an error with a `code`, that message is
+ * replaced by {@link restoreCause} and the frames are kept. Any other error's
+ * stack is returned as it is.
+ */
+export function commitFailureStack(err: Error): string | null {
+  const stack = err.stack ?? null;
+  if (stack === null || !hasErrnoCode(err) || err.message === "") return stack;
+  return stack.split(err.message).join(restoreCause(err));
 }
 
 export interface BackupRecord {
@@ -578,7 +676,7 @@ export async function atomicWriteFile(
   await mkdir(dirname(destPath), { recursive: true });
   const tmp = join(
     dirname(destPath),
-    `.porter-tmp.${process.pid}.${randomUUID()}`
+    `${PORTER_TMP_PREFIX}${process.pid}.${randomUUID()}`
   );
   await writeFile(
     tmp,

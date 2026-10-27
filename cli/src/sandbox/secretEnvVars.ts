@@ -131,6 +131,14 @@ export const AGENT_FORBIDDEN_ENV_VARS: ReadonlySet<string> = new Set([
   // server/daemon consumers (githubRest.ts token resolution) read their OWN process
   // env, which these per-child strips never touch.
   "GH_TOKEN",
+  // #5764: the mesh-wide federation bearer. Only the server reads it
+  // (server/src/config/federationConfig.ts); the daemon never does, and deletes
+  // it from its own env at start (daemon/run.ts) — unlike the onboarding vars it
+  // never consumes it first. This strip is defence in depth for a tmux server an
+  // older daemon created (its frozen env survives KillMode=process) and for any
+  // other route that leaves it in a wrapper's env. It is not a boundary against a
+  // same-user process reading settings.json.
+  "FEDERATION_API_TOKEN",
 ]);
 
 /**

@@ -184,6 +184,13 @@ export async function startDaemon(
   // child processes, causing session collision. See issue #283.
   delete process.env.HAPI_SESSION_ID;
   delete process.env.HAPI_TMUX_WINDOW;
+  // #5764: only the server reads the federation token
+  // (server/src/config/federationConfig.ts); the daemon never does, and every
+  // child it spawns copies its environment (sessionSpawner.ts). Remove it before
+  // recovery, tmux or any spawn can see it. This changes neither the launch
+  // snapshot in /proc/<pid>/environ nor what a same-user process can read from
+  // settings.json; it stops the token being handed to sessions.
+  delete process.env.FEDERATION_API_TOKEN;
 
   // We don't have cleanup function at the time of server construction
   // Control flow is:

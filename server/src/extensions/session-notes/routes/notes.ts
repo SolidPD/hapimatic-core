@@ -76,6 +76,9 @@ export function createSessionNotesRoutes(
     }
 
     const sessionId = c.req.param("sessionId");
+    if (sessionId === undefined) {
+      return c.json({ error: "Session not found" }, 404);
+    }
     const session = engine.getSession(sessionId);
     // Missing session and cross-namespace session are deliberately
     // indistinguishable to the caller (#1097).

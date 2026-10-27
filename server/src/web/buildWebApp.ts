@@ -125,12 +125,15 @@ import { createHarnessChangelogRoutes } from "./routes/harnessChangelog";
 import type { JobRegistry, JobStatus } from "@hapi/protocol";
 import { createErrorReportRoutes } from "./routes/errorReports";
 import { createFeedbackRoutes } from "./routes/feedback";
+import { createFeedbackInboxProxyRoutes } from "./routes/feedbackInbox";
 import { createSupportRoutes } from "./routes/support";
 import { resolveCurrentLauncherKind } from "./routes/launcher";
 import { getKnownSecretLiterals } from "../services/knownSecretLiterals";
 import {
   readSupportEscalationSettings,
   resolveFeedbackSenderConfig,
+  resolveFeedbackInboxConfig,
+  resolveFeedbackIssueRepo,
   resolveFeedbackSinkConfig,
   resolveOperatorInstanceEnabled,
   resolveSupportChannel,
@@ -1392,6 +1395,18 @@ export function buildWebApp(options: {
         nodeId: options.federationConfig?.nodeId ?? null,
         nodeLabel: options.federationConfig?.nodeLabel ?? null,
       }),
+    })
+  );
+  // Issue #2912: the operators' shared inbox over the gateway's central store.
+  // Open only with HAPI_OPERATOR_INSTANCE AND the gateway credential; the
+  // browser calls this instance, which proxies to the gateway.
+  app.route(
+    "/api",
+    createFeedbackInboxProxyRoutes({
+      operatorInstanceEnabled: resolveOperatorInstanceEnabled(),
+      inboxConfig: resolveFeedbackInboxConfig(),
+      nodeLabel: localNode().nodeLabel,
+      issueRepo: resolveFeedbackIssueRepo(),
     })
   );
   // Issue #4371 (E6 Sub F): in-app self-help support — the support session,

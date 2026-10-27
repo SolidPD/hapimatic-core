@@ -12,10 +12,58 @@ import { killProcess } from "@/utils/process";
 const SHELL_EXECUTABLES = new Set(["bash", "sh", "zsh", "dash"]);
 const HAPI_EXECUTABLES = new Set(["hapi", "hapi.exe"]);
 const DEV_RUNTIMES = new Set(["bun", "bun.exe", "node", "node.exe"]);
+// The legacy happy-coder CLI ran under node only.
+const NODE_RUNTIMES = new Set(["node", "node.exe"]);
+const LEGACY_HAPPY_EXECUTABLES = new Set(["happy", "happy.mjs"]);
+const LEGACY_HAPPY_PACKAGES = new Set(["happy-coder", "happy-cli"]);
+
+function pathSegments(token: string): string[] {
+  return token.split(/[\\/]/);
+}
 
 function executableName(token: string): string {
-  const parts = token.split(/[\\/]/);
+  const parts = pathSegments(token);
   return parts[parts.length - 1] ?? "";
+}
+
+/**
+ * Arguments of a process whose comm name is one of `names` but whose
+ * executable token is not: its path contains a space ("/home/John Doe/
+ * .local/bin/hapi"), so splitting on whitespace broke the path in two. Start
+ * after the token that ends in the binary, or after argv[0] when the process
+ * rewrote its own argv[0].
+ */
+function argsAfterBinary(
+  tokens: string[],
+  names: ReadonlySet<string>
+): string[] {
+  const binary = tokens.findIndex(token => names.has(executableName(token)));
+  return tokens.slice(binary >= 0 ? binary + 1 : 1);
+}
+
+/**
+ * The hapi CLI's own dev entry: a path ending in `cli/src/index.ts`, which is
+ * what every dev-mode spawn passes (spawnHappyCLI). Another project's
+ * `src/index.ts` is not hapi (#5763).
+ */
+function isHapiDevEntry(token: string): boolean {
+  return pathSegments(token).slice(-3).join("/") === "cli/src/index.ts";
+}
+
+/**
+ * A script path inside the legacy happy-coder / happy-cli package, or that
+ * package's `happy` bin. A bare word is not a path, so
+ * `ssh h happy-coder daemon start` never matches (#5763).
+ */
+function isLegacyHappyScript(token: string): boolean {
+  const segments = pathSegments(token);
+  if (segments.length < 2) {
+    return false;
+  }
+  return (
+    segments.some(segment => LEGACY_HAPPY_PACKAGES.has(segment)) ||
+    LEGACY_HAPPY_EXECUTABLES.has(segments[segments.length - 1] ?? "")
+  );
 }
 
 /**
@@ -83,12 +131,14 @@ export function redactCommandSecrets(cmd: string): string {
  * from a substring of the whole command line. A shell wrapper such as
  * `bash -c "cd /x && hapi daemon start"` merely contains those words; it is
  * not the daemon, and `hapi doctor clean` must never kill it. The same rule
- * applies to an instance's own binary name (#5526).
+ * applies to an instance's own binary name (#5526), to dev mode (a `bun` /
+ * `node` running the hapi CLI's own `cli/src/index.ts`) and to the legacy
+ * happy-coder CLI (its `happy` binary, or `node` running a script inside the
+ * happy-coder / happy-cli package) (#5763).
  */
 function locateHapiArgs(
   tokens: string[],
   name: string,
-  cmd: string,
   executables: ReadonlySet<string>
 ): { args: string[]; isDevMode: boolean } | null {
   const exe = executableName(tokens[0] ?? "");
@@ -96,22 +146,13 @@ function locateHapiArgs(
     return { args: tokens.slice(1), isDevMode: false };
   }
   if (executables.has(name)) {
-    // The process IS hapi, but its path contains a space ("/home/John Doe/
-    // .local/bin/hapi"), so splitting on whitespace broke the path in two.
-    // Start the arguments after the token that ends in the hapi binary, or
-    // after argv[0] when the process rewrote its own argv[0].
-    const binary = tokens.findIndex(token =>
-      executables.has(executableName(token))
-    );
-    return {
-      args: tokens.slice(binary >= 0 ? binary + 1 : 1),
-      isDevMode: false,
-    };
+    return { args: argsAfterBinary(tokens, executables), isDevMode: false };
   }
   if (DEV_RUNTIMES.has(exe)) {
-    // Dev mode: bun/node running src/index.ts (production is the binary).
+    // Dev mode: bun/node running the CLI's src/index.ts (production is the
+    // binary).
     const entry = tokens.findIndex(
-      (token, index) => index > 0 && token.endsWith("src/index.ts")
+      (token, index) => index > 0 && isHapiDevEntry(token)
     );
     if (entry > 0) {
       return { args: tokens.slice(entry + 1), isDevMode: true };
@@ -120,15 +161,24 @@ function locateHapiArgs(
   if (SHELL_EXECUTABLES.has(exe)) {
     return null;
   }
-  const isLegacyHappy =
-    name.includes("happy") ||
-    (name === "node" && cmd.includes("happy-cli")) ||
-    cmd.includes("happy-coder");
-  if (!isLegacyHappy) {
-    return null;
+  if (LEGACY_HAPPY_EXECUTABLES.has(exe)) {
+    return { args: tokens.slice(1), isDevMode: false };
   }
-  const entry = tokens.findIndex(token => token.includes("happy"));
-  return { args: tokens.slice(entry >= 0 ? entry + 1 : 1), isDevMode: false };
+  if (LEGACY_HAPPY_EXECUTABLES.has(name)) {
+    return {
+      args: argsAfterBinary(tokens, LEGACY_HAPPY_EXECUTABLES),
+      isDevMode: false,
+    };
+  }
+  if (NODE_RUNTIMES.has(exe)) {
+    const script = tokens.findIndex(
+      (token, index) => index > 0 && isLegacyHappyScript(token)
+    );
+    if (script > 0) {
+      return { args: tokens.slice(script + 1), isDevMode: false };
+    }
+  }
+  return null;
 }
 
 /**
@@ -144,7 +194,7 @@ export function classifyHappyProcess(
   const cmd = proc.cmd || "";
   const name = proc.name || "";
   const tokens = cmd.trim().split(/\s+/).filter(Boolean);
-  const located = locateHapiArgs(tokens, name, cmd, executables);
+  const located = locateHapiArgs(tokens, name, executables);
   if (!located) {
     return null;
   }
@@ -154,7 +204,9 @@ export function classifyHappyProcess(
   if (proc.pid === selfPid) {
     return "current";
   }
-  if (args.includes("--version")) {
+  // `ps` joins argv with spaces, so a `--version` word inside a prompt reads
+  // as an argument; a version check is `<binary> --version` alone (#5763).
+  if (args.length === 1 && args[0] === "--version") {
     return isDevMode ? "dev-daemon-version-check" : "daemon-version-check";
   }
   if (
@@ -185,39 +237,39 @@ export function classifyHappyProcess(
  * Find all HAPI CLI processes (including current process). `executables` is
  * the set of binary names that count as hapi; the listing passes
  * instanceExecutableNames() so a fleet instance sees its own processes.
+ *
+ * Rejects when the process list cannot be read, so a caller reports the
+ * failure instead of reading it as "no hapi processes" (#5763).
  */
 export async function findAllHappyProcesses(
   executables: ReadonlySet<string> = HAPI_EXECUTABLES
 ): Promise<Array<{ pid: number; command: string; type: string }>> {
-  try {
-    const processes = await psList();
-    const allProcesses: Array<{ pid: number; command: string; type: string }> =
-      [];
+  const processes = await psList();
+  const allProcesses: Array<{ pid: number; command: string; type: string }> =
+    [];
 
-    for (const proc of processes) {
-      const cmd = proc.cmd || "";
-      const name = proc.name || "";
-      const type = classifyHappyProcess(
-        { pid: proc.pid, cmd, name },
-        process.pid,
-        executables
-      );
-      if (type === null) continue;
-      allProcesses.push({
-        pid: proc.pid,
-        command: redactCommandSecrets(cmd || name),
-        type,
-      });
-    }
-
-    return allProcesses;
-  } catch (error) {
-    return [];
+  for (const proc of processes) {
+    const cmd = proc.cmd || "";
+    const name = proc.name || "";
+    const type = classifyHappyProcess(
+      { pid: proc.pid, cmd, name },
+      process.pid,
+      executables
+    );
+    if (type === null) continue;
+    allProcesses.push({
+      pid: proc.pid,
+      command: redactCommandSecrets(cmd || name),
+      type,
+    });
   }
+
+  return allProcesses;
 }
 
 /**
- * Find all runaway HAPI CLI processes that should be killed
+ * Find all runaway HAPI CLI processes that should be killed. Rejects when the
+ * process list cannot be read.
  */
 export async function findRunawayHappyProcesses(): Promise<
   Array<{ pid: number; command: string }>
@@ -245,41 +297,67 @@ export async function findRunawayHappyProcesses(): Promise<
 }
 
 /**
- * Kill all runaway HAPI CLI processes
+ * Whether a process is still in the process list. `ps-list` is used rather
+ * than `isProcessAlive`, which reads another user's live process (EPERM) as
+ * dead.
  */
-export async function killRunawayHappyProcesses(): Promise<{
+async function isListed(pid: number): Promise<boolean> {
+  const processes = await psList();
+  return processes.some(p => p.pid === pid);
+}
+
+/**
+ * Kill all runaway HAPI CLI processes. A process counts as killed only when a
+ * signal reached it: `killProcess` returns false for both an exited process
+ * and one this user may not signal, so a false return is re-checked against
+ * the process list (#5763). `graceMs` is the wait between SIGTERM and the
+ * SIGKILL fallback.
+ */
+export async function killRunawayHappyProcesses(
+  options: { graceMs?: number } = {}
+): Promise<{
   killed: number;
   errors: Array<{ pid: number; error: string }>;
 }> {
+  const graceMs = options.graceMs ?? 1000;
   const runawayProcesses = await findRunawayHappyProcesses();
   const errors: Array<{ pid: number; error: string }> = [];
   let killed = 0;
+
+  const fail = (pid: number, error: string): void => {
+    errors.push({ pid, error });
+    console.log(`Failed to kill process PID ${pid}: ${error}`);
+  };
 
   for (const { pid, command } of runawayProcesses) {
     try {
       console.log(`Killing runaway process PID ${pid}: ${command}`);
 
-      await killProcess(pid, false);
+      if (!(await killProcess(pid, false))) {
+        if (await isListed(pid)) {
+          fail(pid, "could not send SIGTERM (permission denied?)");
+        } else {
+          console.log(`Process PID ${pid} had already exited`);
+        }
+        continue;
+      }
 
-      // Wait a moment
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, graceMs));
 
-      // Check if still alive
-      const processes = await psList();
-      const stillAlive = processes.find(p => p.pid === pid);
-      if (stillAlive) {
+      if (await isListed(pid)) {
         console.log(
           `Process PID ${pid} ignored termination request, using force kill`
         );
-        await killProcess(pid, true);
+        if (!(await killProcess(pid, true)) && (await isListed(pid))) {
+          fail(pid, "could not send SIGKILL (permission denied?)");
+          continue;
+        }
       }
 
       console.log(`Successfully killed runaway process PID ${pid}`);
       killed++;
     } catch (error) {
-      const errorMessage = (error as Error).message;
-      errors.push({ pid, error: errorMessage });
-      console.log(`Failed to kill process PID ${pid}: ${errorMessage}`);
+      fail(pid, (error as Error).message);
     }
   }
 

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { FeedbackInboxFilters } from "@hapi/protocol/feedbackSink";
 import { LOCAL_NODE_ID } from "@hapi/protocol";
 export const queryKeys = {
   sessions: ["sessions"] as const,
@@ -206,6 +207,11 @@ export const queryKeys = {
   // persisted feedback rows from `GET /api/feedback`.
   feedbackList: (limit: number, offset: number) =>
     ["feedback-list", limit, offset] as const,
+  // #2912: the shared feedback inbox (`GET /api/feedback/inbox`) and its
+  // per-status counts — #2913's badge reads the same counts key.
+  feedbackInbox: (filters: Partial<FeedbackInboxFilters>) =>
+    ["feedback-inbox", filters] as const,
+  feedbackInboxCounts: ["feedback-inbox-counts"] as const,
   // Issue #4371: in-app support channel info from `GET /api/support/channel`.
   supportChannel: ["support-channel"] as const,
   searchFilterPreferences: ["search-filter-preferences"] as const,
