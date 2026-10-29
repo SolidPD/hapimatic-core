@@ -18,6 +18,7 @@ import { useSSE } from "@/hooks/useSSE";
 import { usePwaRecovery } from "@/hooks/usePwaRecovery";
 import { useSyncingState } from "@/hooks/useSyncingState";
 import { usePushNotifications } from "@/hooks/usePushNotifications";
+import { useClearNotificationsOnOpen } from "@/hooks/useClearNotificationsOnOpen";
 import {
   readGlobalOptOut,
   syncPreferencesToCache,
@@ -232,6 +233,10 @@ export function App() {
         console.warn("[migrateLegacyQueue] top-level failure:", err);
       });
   }, [api]);
+
+  // N1 (2026-10-29): opening the app clears the home-screen badge and closes
+  // the delivered notifications, on load and on every return to visible.
+  useClearNotificationsOnOpen();
 
   useEffect(() => {
     const preventDefault = (event: Event) => {
@@ -601,7 +606,7 @@ export function App() {
     <ToastProvider>
       {/* #4915: the one Lane 2 listener — inbox cache, unread count, and the
           rate-limited pop-up for every `notification` SyncEvent. */}
-      <NotificationListener api={api} />
+      <NotificationListener />
       <ErrorOutboxDropToastListener />
       <ReloginLinkListener />
       {/* #2150: a remote spawn that fails or times out after the node accepted it */}

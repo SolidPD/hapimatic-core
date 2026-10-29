@@ -3751,14 +3751,14 @@ export class SyncEngine {
 
   async getGitDiffNumstat(
     sessionId: string,
-    options: { cwd?: string; staged?: boolean }
+    options: { cwd?: string; staged?: boolean; base?: string }
   ): Promise<RpcCommandResponse> {
     return await this.rpcGateway.getGitDiffNumstat(sessionId, options);
   }
 
   async getGitDiffFile(
     sessionId: string,
-    options: { cwd?: string; filePath: string; staged?: boolean }
+    options: { cwd?: string; filePath: string; staged?: boolean; base?: string }
   ): Promise<RpcCommandResponse> {
     return await this.rpcGateway.getGitDiffFile(sessionId, options);
   }

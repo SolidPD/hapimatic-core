@@ -55,6 +55,14 @@ export type RpcCommandResponse = {
   stderr?: string;
   exitCode?: number;
   error?: string;
+  /**
+   * #4469: a `base` diff echoes the requested branch, the commit it measured
+   * against and how that commit was found. No `mergeBase` with a `base` means
+   * the plain uncommitted diff ("uncommitted only"), never a failure.
+   */
+  base?: string;
+  mergeBase?: string;
+  baseSource?: "branch-start" | "merge-base";
 };
 
 export type RpcReadFileResponse = {
@@ -727,7 +735,7 @@ export class RpcGateway {
 
   async getGitDiffNumstat(
     sessionId: string,
-    options: { cwd?: string; staged?: boolean }
+    options: { cwd?: string; staged?: boolean; base?: string }
   ): Promise<RpcCommandResponse> {
     return (await this.sessionRpc(
       sessionId,
@@ -738,7 +746,7 @@ export class RpcGateway {
 
   async getGitDiffFile(
     sessionId: string,
-    options: { cwd?: string; filePath: string; staged?: boolean }
+    options: { cwd?: string; filePath: string; staged?: boolean; base?: string }
   ): Promise<RpcCommandResponse> {
     return (await this.sessionRpc(
       sessionId,

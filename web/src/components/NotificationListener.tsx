@@ -3,9 +3,6 @@ import { useEffect, useRef } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useToast } from "@/components/Toast";
 import type { StoredNotification } from "@/types/api";
-import type { ApiClient } from "@/api/client";
-import { useNotificationUnreadCount } from "@/hooks/queries/useNotifications";
-import { useAppBadgeSync } from "@/hooks/useAppBadgeSync";
 import { readNotificationPreferences } from "@/lib/notificationPreferences";
 import {
   createToastGate,
@@ -61,22 +58,9 @@ function readPreferencesFailOpen(): ToastGatePreferences {
  * provider, whose MAX_VISIBLE cap and 2 s dedup stay the last line of the #1612
  * burst protection.
  */
-export function NotificationListener({
-  api,
-}: {
-  /**
-   * #4921: the listener is mounted outside AppContextProvider, so App passes
-   * the client in. With it, the server unread count is mirrored to the app
-   * badge; the query's focus refetch replaces the old clear-on-visible.
-   * Required (pass `null` when signed out) because this mirror is the only
-   * thing that clears the app badge — a dropped prop must fail typecheck.
-   */
-  api: ApiClient | null;
-}): null {
+export function NotificationListener(): null {
   const { showToast } = useToast();
   const queryClient = useQueryClient();
-  const unread = useNotificationUnreadCount(api);
-  useAppBadgeSync(unread.data?.count, unread.dataUpdatedAt);
   const gateRef = useRef<ToastGate | null>(null);
   const gate = gateRef.current ?? (gateRef.current = createToastGate());
   const refresherRef = useRef<UnreadCountRefresher | null>(null);

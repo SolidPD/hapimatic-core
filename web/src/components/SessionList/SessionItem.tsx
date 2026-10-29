@@ -37,6 +37,7 @@ import { useToast } from "@/components/Toast";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { WorktreeDeleteDialog } from "@/components/WorktreeDeleteDialog";
+import { useFanOutMenu } from "@/components/FanOut/useFanOutMenu";
 import { SESSION_NAME_MAX_LENGTH, validateSessionName } from "@hapi/protocol";
 import {
   useSessionActions,
@@ -270,6 +271,16 @@ export function SessionItem(props: {
   // Construct branch URL
   const branchUrl =
     repoUrl && branchName ? `${repoUrl}/tree/${branchName}` : null;
+
+  // #3818 / #4469: the kebab's Fan out and Peers entries and their dialogs,
+  // shared with the session header so both kebabs offer the same entries.
+  const fanOutMenu = useFanOutMenu({
+    api,
+    session: s,
+    title: sessionName,
+    nodeUrl: s.nodeUrl,
+    branchName,
+  });
 
   // #4480: the kebab's Copy Session Info entry. The card holds only the
   // SessionSummary, so opening the kebab prefetches the full record.
@@ -999,6 +1010,8 @@ export function SessionItem(props: {
                 isBranchDisabled: isPending || isBranching,
                 onCopySessionInfo,
                 onKebabOpenChange,
+                onFanOut: fanOutMenu.onFanOut,
+                onPeers: fanOutMenu.onPeers,
                 sessionName,
                 isPending,
                 notesValue: s.metadata?.notes,
@@ -1097,6 +1110,8 @@ export function SessionItem(props: {
         currentIssueNumber={currentIssue?.number}
         api={api}
       />
+
+      {fanOutMenu.dialogs}
 
       <BranchConfirmDialog
         isOpen={branchDialogOpen}

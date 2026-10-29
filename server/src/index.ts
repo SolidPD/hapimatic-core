@@ -624,7 +624,8 @@ async function main() {
     getPushService: () => pushService,
     errorLogger,
   });
-  // #4921: every push carries the sending node's unread count (app badge).
+  // #4921: every push carries the sending node's unread count. Since N1
+  // (2026-10-29) the service worker badges 1 and ignores it.
   const unreadCountSource = notificationService;
   pushService.setUnreadCountProvider(ns => unreadCountSource.countUnread(ns));
 

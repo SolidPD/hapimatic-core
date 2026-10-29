@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiClient } from "@/api/client";
+import { getPlatform } from "@/hooks/usePlatform";
 import { Spinner } from "@/components/Spinner";
 import { Button } from "@/components/ui/button";
 import {
@@ -41,6 +42,21 @@ export function LoginPrompt(props: LoginPromptProps) {
   const [isServerDialogOpen, setIsServerDialogOpen] = useState(false);
   const [serverInput, setServerInput] = useState(props.serverUrl ?? "");
   const [serverError, setServerError] = useState<string | null>(null);
+  const tokenInputRef = useRef<HTMLInputElement>(null);
+
+  // #5766: pressing a button blurs the token field, which drops the touch lift
+  // (see the stage div below) and moves the button before the click lands, so
+  // the tap is lost. Keep focus in the field while the button is pressed; only
+  // the focus change is prevented, the click and submit still run. Touch only,
+  // so desktop focus behavior is unchanged.
+  const holdTokenFieldFocus = useCallback((e: React.MouseEvent) => {
+    if (
+      getPlatform().isTouch &&
+      document.activeElement === tokenInputRef.current
+    ) {
+      e.preventDefault();
+    }
+  }, []);
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -127,7 +143,14 @@ export function LoginPrompt(props: LoginPromptProps) {
   const ssoEnabled = props.ssoEnabled ?? false;
 
   return (
-    <div className="relative h-full flex items-center justify-center p-4">
+    // #5766: on touch devices, lift the form to the top while the token field
+    // is focused, so it sits above the on-screen keyboard from the first frame
+    // and stays still while AppShell shrinks to the visual viewport (a centered
+    // form re-centered on every keyboard resize step). CSS, not React state,
+    // so it applies in the same style pass as the focus (see the keyboard rules
+    // in index.css). pt-14 clears the Server button. The Server dialog's input
+    // is portaled out of this div, so it does not trigger the lift.
+    <div className="relative h-full flex items-center justify-center p-4 pointer-coarse:has-[input:focus]:items-start pointer-coarse:has-[input:focus]:pt-14">
       {!isBindMode && (
         <div className="absolute right-4 top-4 z-10">
           <Dialog
@@ -227,6 +250,7 @@ export function LoginPrompt(props: LoginPromptProps) {
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <input
+              ref={tokenInputRef}
               type="password"
               value={accessToken}
               onChange={e => setAccessToken(e.target.value)}
@@ -248,6 +272,7 @@ export function LoginPrompt(props: LoginPromptProps) {
             variant="default"
             disabled={isLoading || !accessToken.trim()}
             aria-busy={isLoading}
+            onMouseDown={holdTokenFieldFocus}
             className="h-auto w-full gap-2 rounded-lg py-2.5 transition-all hover:bg-[var(--brand-accent)] hover:text-white hover:opacity-100"
           >
             {isLoading ? (
@@ -281,6 +306,7 @@ export function LoginPrompt(props: LoginPromptProps) {
             <Button
               type="button"
               variant="outline"
+              onMouseDown={holdTokenFieldFocus}
               onClick={() => {
                 // #2650: begin Google SSO directly on the apex gateway instead of
                 // landing on hapimatic.com (which forced a second click). Carries a

@@ -392,10 +392,14 @@ export function createGitRoutes(
         }
 
         const staged = parseBooleanParam(c.req.query("staged"));
+        // #4469: the daemon validates `base` and picks the commit to diff
+        // against; an empty value is the plain diff.
+        const base = c.req.query("base") || undefined;
         const result = await runRpc(() =>
           engine.getGitDiffNumstat(sessionResult.sessionId, {
             cwd: sessionPath,
             staged,
+            base,
           })
         );
         return c.json(result);
@@ -471,11 +475,13 @@ export function createGitRoutes(
         }
 
         const staged = parseBooleanParam(c.req.query("staged"));
+        const base = c.req.query("base") || undefined; // #4469
         const result = await runRpc(() =>
           engine.getGitDiffFile(sessionResult.sessionId, {
             cwd: sessionPath,
             filePath: parsed.data.path,
             staged,
+            base,
           })
         );
         return c.json(result);

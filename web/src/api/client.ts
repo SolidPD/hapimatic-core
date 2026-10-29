@@ -913,12 +913,19 @@ export class ApiClient {
     );
   }
 
+  /**
+   * #4469: `base` (a branch name) measures the diff against that branch — the
+   * response's `mergeBase` / `baseSource` say which commit was used; no
+   * `mergeBase` means the plain uncommitted diff.
+   */
   async getGitDiffNumstat(
     sessionId: string,
-    staged: boolean
+    staged: boolean,
+    base?: string
   ): Promise<GitCommandResponse> {
     const params = new URLSearchParams();
     params.set("staged", staged ? "true" : "false");
+    if (base) params.set("base", base);
     return await this.request<GitCommandResponse>(
       `/api/sessions/${encodeURIComponent(sessionId)}/git-diff-numstat?${params.toString()}`
     );
@@ -927,13 +934,15 @@ export class ApiClient {
   async getGitDiffFile(
     sessionId: string,
     path: string,
-    staged?: boolean
+    staged?: boolean,
+    base?: string
   ): Promise<GitCommandResponse> {
     const params = new URLSearchParams();
     params.set("path", path);
     if (staged !== undefined) {
       params.set("staged", staged ? "true" : "false");
     }
+    if (base) params.set("base", base); // #4469
     return await this.request<GitCommandResponse>(
       `/api/sessions/${encodeURIComponent(sessionId)}/git-diff-file?${params.toString()}`
     );

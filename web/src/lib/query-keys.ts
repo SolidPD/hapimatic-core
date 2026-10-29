@@ -130,6 +130,16 @@ export const queryKeys = {
   // Server-side chat bookmarks (issue #3115) — per-session, node-local.
   bookmarks: (sessionId: string) => ["bookmarks", sessionId] as const,
   gitStatus: (sessionId: string) => ["git-status", sessionId] as const,
+  // #4469: a fan-out peer's diff against the parent's branch. Kept OFF
+  // gitStatus, which useBranchInfo and useGitStatusFiles already share with
+  // different result shapes.
+  fanOutPeerNumstat: (peerId: string, base: string | null) =>
+    ["fan-out-peer-numstat", peerId, base ?? ""] as const,
+  fanOutPeerFileDiff: (peerId: string, path: string, base: string | null) =>
+    ["fan-out-peer-file-diff", peerId, path, base ?? ""] as const,
+  // #4469: the parent's recent messages, read for the ranked report.
+  fanOutParentMessages: (parentId: string) =>
+    ["fan-out-parent-messages", parentId] as const,
   sessionFiles: (sessionId: string, query: string) =>
     ["session-files", sessionId, query] as const,
   sessionFile: (sessionId: string, path: string) =>

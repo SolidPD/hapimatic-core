@@ -46,15 +46,29 @@
  *   lane's transcript instead. A background job left by an archived session is
  *   judged by the mode that session last reported, which the hub keeps until it
  *   restarts; after a restart the mode is absent and the job is refused, the
- *   same as under R8. The caller is resolved only on the hub that receives the
- *   request, so a `hapi api sessions send` pointed at another hub
- *   (`HAPI_SERVER_URL` overridden while `HAPI_SESSION_ID` is inherited) names a
- *   caller that hub cannot find, and is refused even from a bypass session.
+ *   same as under R8.
+ * - Caller lookup across hubs (#5640, operator ruling D2 = a): the send and
+ *   archive floors resolve the caller on the entry hub from the local record in
+ *   the caller's namespace (by id, then tag), else from the federation cache (by
+ *   id, then tag) when its node is not offline, reading its mode only when it is
+ *   a known mode. So a bypass session's `hapi api sessions send` pointed at
+ *   another hub (`HAPI_SERVER_URL` overridden while `HAPI_SESSION_ID` is
+ *   inherited) passes when that hub polls the session's node. A remote record
+ *   carries no namespace, so none is checked (#5291); the header is
+ *   unauthenticated, so a pass on a remote record is no more than omitting the
+ *   header already gives. A caller the hub cannot find at all (one on a hub it
+ *   does not poll, such as a `hapimatic-dev` or worktree-instance session sending
+ *   through the prod hub, or a session in another namespace) is refused with its
+ *   own text (PM ruling OD-1 = 1). The R8 floors resolve callers locally only:
+ *   their header comes only from the injected MCP wrapper, which posts to the
+ *   session's own hub.
  */
 import type { Context } from "hono";
 import {
-  getPermissionModesForFlavor,
+  isPermissionMode,
+  isPermissionModeAllowedForFlavor,
   isYoloEquivalentMode,
+  KNOWN_AGENT_IDS,
 } from "@hapi/protocol";
 import type { PermissionMode } from "@hapi/protocol/types";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
@@ -113,28 +127,95 @@ export function refuseSelfPermission(
   );
 }
 
+/** What the caller-mode floors read of the caller, local or (#5640) remote. */
+type CallerView = { id: string; permissionMode?: PermissionMode };
+
 /**
- * The caller check every caller-mode floor shares (R8 and #5616), so the three
- * cannot drift: `"pass"` with no header (today's behaviour) or for a bypass-mode
- * caller; `"refuse"` when the caller cannot be resolved or has no live mode (fail
- * closed); otherwise the resolved non-bypass caller, for a floor to judge against
- * its target.
+ * The federation-cache lookups the #5616 floors read. `locateSessionByTag`
+ * (#5640) is optional, like the engine's tag lookup, so a fake may omit it.
+ */
+type FederationLookup = Pick<NodeRegistry, "locateSession"> &
+  Partial<Pick<NodeRegistry, "locateSessionByTag">>;
+
+/**
+ * #5640 (operator ruling D2 = a): the caller from the hub's federation cache, by
+ * id then by tag (`hapi api sessions send` stamps the tag). Trusted only from a
+ * node that is not offline, because a frozen cache must not keep passing an old
+ * bypass mode, and its mode only when it is a known mode (remote summaries are
+ * cast, not validated), else it reads as mode-less. An ambiguous tag resolves
+ * nothing (`locateSessionByTag`). The id is the summary's, never the header,
+ * which may be a tag: the archive floor's spawn walk compares ids.
+ */
+function resolveRemoteCaller(
+  callerId: string,
+  registry: FederationLookup | null
+): CallerView | undefined {
+  const hit =
+    registry?.locateSession(callerId) ??
+    registry?.locateSessionByTag?.(callerId) ??
+    null;
+  if (!hit || hit.status === "offline") return undefined;
+  const mode: unknown = hit.session.permissionMode;
+  return {
+    id: hit.session.id,
+    permissionMode:
+      typeof mode === "string" && isPermissionMode(mode) ? mode : undefined,
+  };
+}
+
+/**
+ * The caller a floor judges: the local record (`resolveCallerSession`), else,
+ * for a floor that passes a registry, the federation cache. A local id in
+ * another namespace settles it as unresolved (the `requireSession` rule) and is
+ * never re-read remotely.
+ */
+function resolveCallerView(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null,
+  registry: FederationLookup | null
+): CallerView | undefined {
+  const callerId = c.req.header(CALLER_SESSION_HEADER);
+  if (!callerId || !engine) return undefined;
+  const local = resolveCallerSession(c, engine);
+  if (local || engine.getSession(callerId)) return local;
+  return resolveRemoteCaller(callerId, registry);
+}
+
+/**
+ * The caller check every caller-mode floor shares (R8 and #5616), so they cannot
+ * drift; they differ only in whether they pass a registry (#5640: the send and
+ * archive floors do, R8's do not). `"pass"` with no header (today's behaviour)
+ * or for a bypass-mode caller; `"unknown"` when the caller cannot be found and
+ * `"refuse"` when it has no live mode (both fail closed); otherwise the
+ * non-bypass caller, for a floor to judge against its target.
  */
 function classifyCaller(
   c: Context<WebAppEnv>,
-  engine: CallerSessionLookup | null
-): "pass" | "refuse" | Session {
+  engine: CallerSessionLookup | null,
+  registry: FederationLookup | null = null
+): "pass" | "unknown" | "refuse" | CallerView {
   if (!c.req.header(CALLER_SESSION_HEADER)) return "pass";
-  const caller = resolveCallerSession(c, engine);
-  const mode = caller?.permissionMode;
-  if (mode !== undefined && isYoloEquivalentMode(mode)) return "pass";
-  if (!caller || mode === undefined) return "refuse";
+  const caller = resolveCallerView(c, engine, registry);
+  if (!caller) return "unknown";
+  const mode = caller.permissionMode;
+  if (mode === undefined) return "refuse";
+  if (isYoloEquivalentMode(mode)) return "pass";
   return caller;
 }
 
-/** The R8 refusal text; also the #5616 floors' text for a fail-closed caller. */
+/**
+ * The R8 refusal text, for an unknown caller too; the #5616 floors' text for a
+ * mode-less caller.
+ */
 const ESCALATION_REFUSED_ERROR =
   "A session that is not in a bypass permission mode cannot do this through the capability channel";
+
+/**
+ * #5640 (PM ruling OD-1 = 1): the send and archive floors' text for a caller
+ * this hub cannot find. R8's text is unchanged.
+ */
+const UNKNOWN_CALLER_ERROR =
+  "The session named in X-Hapi-Session-Id is not known to this hub, so its permission mode cannot be checked; send through a hub that runs or polls that session";
 
 /** The 403 envelope every caller-mode floor returns (#5616 D7: the R8 code). */
 function escalationRefused(c: Context<WebAppEnv>, error: string): Response {
@@ -175,7 +256,7 @@ export function refusePermissionResponse(
  */
 export type TargetSessionLookup = {
   engine: Pick<SyncEngine, "getSession">;
-  registry?: Pick<NodeRegistry, "locateSession"> | null;
+  registry?: FederationLookup | null;
 };
 
 /** The longest spawn chain the archive floor walks (#5616 D3). */
@@ -222,14 +303,26 @@ function resolveSessionView(
 }
 
 /**
- * #5616 D6: a target counts as bypass when it cannot be found, has no live
- * mode, runs a flavor with no in-session modes (gemini and opencode never report
- * one, so the server's `"default"` could hide a yolo session), or is in a bypass
- * mode. Fails closed.
+ * #5616 D6 + #5640 S2: a target counts as bypass when it cannot be found, has no
+ * live mode, runs a flavor this hub does not know (a newer peer's agent, whose
+ * modes it cannot read; a null or empty flavor reads as claude), reports a mode
+ * its flavor does not have (`null`, an unrecognised string, another flavor's
+ * mode: remote summaries are cast, not validated), runs a flavor with no
+ * in-session modes (gemini and opencode never report one, so the server's
+ * `"default"` could hide a yolo session; their mode list is empty), or is in a
+ * bypass mode. Fails closed.
  */
 function isBypassTarget(view: SessionView | undefined): boolean {
   if (!view || view.permissionMode === undefined) return true;
-  if (getPermissionModesForFlavor(view.flavor).length === 0) return true;
+  if (
+    view.flavor &&
+    !(KNOWN_AGENT_IDS as readonly string[]).includes(view.flavor)
+  ) {
+    return true;
+  }
+  if (!isPermissionModeAllowedForFlavor(view.permissionMode, view.flavor)) {
+    return true;
+  }
   return isYoloEquivalentMode(view.permissionMode);
 }
 
@@ -267,16 +360,19 @@ function isSpawnDescendantOrSelf(
 /**
  * #5616 send floor (D2): refuse a non-bypass caller's message to a target that
  * counts as bypass (`isBypassTarget`), with no exception for the caller's own
- * parent. Returns `null` with no header, for a bypass-mode caller, or for a
- * non-bypass target (the caller itself included); fails closed like R8.
+ * parent. Returns `null` with no header, for a bypass-mode caller (local, or
+ * remote from the federation cache, #5640), or for a non-bypass target (the
+ * caller itself included); fails closed like R8, with its own text for a caller
+ * this hub cannot find.
  */
 export function refuseAgentMessage(
   c: Context<WebAppEnv>,
   engine: CallerSessionLookup | null,
   lookup: TargetSessionLookup | null
 ): Response | null {
-  const caller = classifyCaller(c, engine);
+  const caller = classifyCaller(c, engine, lookup?.registry ?? null);
   if (caller === "pass") return null;
+  if (caller === "unknown") return escalationRefused(c, UNKNOWN_CALLER_ERROR);
   if (caller === "refuse") {
     return escalationRefused(c, ESCALATION_REFUSED_ERROR);
   }
@@ -295,15 +391,18 @@ export function refuseAgentMessage(
 /**
  * #5616 archive floor (D3): a non-bypass caller can archive only itself or a
  * session it spawned (`isSpawnDescendantOrSelf`). Returns `null` with no header
- * or for a bypass-mode caller; fails closed like R8.
+ * or for a bypass-mode caller (local, or remote from the federation cache,
+ * #5640); fails closed like R8, with its own text for a caller this hub cannot
+ * find.
  */
 export function refuseAgentArchive(
   c: Context<WebAppEnv>,
   engine: CallerSessionLookup | null,
   lookup: TargetSessionLookup | null
 ): Response | null {
-  const caller = classifyCaller(c, engine);
+  const caller = classifyCaller(c, engine, lookup?.registry ?? null);
   if (caller === "pass") return null;
+  if (caller === "unknown") return escalationRefused(c, UNKNOWN_CALLER_ERROR);
   if (caller === "refuse") {
     return escalationRefused(c, ESCALATION_REFUSED_ERROR);
   }

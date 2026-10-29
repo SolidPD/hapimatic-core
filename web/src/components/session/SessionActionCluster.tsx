@@ -38,6 +38,7 @@ import {
   FilesIcon,
   LayersIcon,
   TrashIcon,
+  TreeIcon,
 } from "@/components/icons";
 import { SessionKebabMenu, type SessionKebabEntry } from "./SessionKebabMenu";
 
@@ -69,9 +70,12 @@ export type SessionActionClusterProps = {
   // Interim prop-gated view buttons (instance surface only, retire with #3286).
   onDesktop?: () => void;
   onViewFiles?: () => void;
-  /** #3818: opens the fan-out dialog. Instance surface only — the list surface
-   *  never passes it, so the entry never shows on a session card. */
+  /** #3818: opens the fan-out dialog. Both surfaces (#4469 operator review);
+   *  `useFanOutMenu` leaves it unset for a session served by another node. */
   onFanOut?: () => void;
+  /** #4469: opens the Experiment view of this session's peers. Both surfaces;
+   *  `useFanOutMenu` sets it only when the session has spawn children. */
+  onPeers?: () => void;
 
   // Dialog copy + pending state for the R5 confirm.
   sessionName: string;
@@ -99,6 +103,7 @@ export function SessionActionCluster({
   onDesktop,
   onViewFiles,
   onFanOut,
+  onPeers,
   sessionName,
   isPending,
   notesValue,
@@ -146,14 +151,26 @@ export function SessionActionCluster({
       onSelect: onCopySessionInfo,
     },
     // #3818: fan out N peers from this session (it becomes their parent).
-    // Instance-only: gated on the surface as well as the prop.
-    ...(onFanOut && !isList
+    // Gated on the prop only, so the card and the header offer the same
+    // entries (#3288 parity; #4469 operator review 2026-10-27).
+    ...(onFanOut
       ? [
           {
             key: "fan-out",
             label: "Fan out",
             icon: <LayersIcon className="h-4 w-4" />,
             onSelect: onFanOut,
+          },
+        ]
+      : []),
+    // #4469: review and rank this session's peers, after "Fan out".
+    ...(onPeers
+      ? [
+          {
+            key: "peers",
+            label: "Peers",
+            icon: <TreeIcon className="h-4 w-4" />,
+            onSelect: onPeers,
           },
         ]
       : []),

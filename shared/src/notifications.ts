@@ -259,8 +259,9 @@ export type NotificationUnreadCountResponse = z.infer<
  * The badge fields every Web Push payload may carry (issue #4921). R5: the
  * sending node's unread count (rows neither read nor dismissed) at send time,
  * stamped once per namespace by `PushService.sendToNamespace`; omitted when it
- * cannot be computed. R6: the service worker sets the app badge to
- * `max(unreadCount, 1)` on a displayed push, or `1` when the field is absent.
+ * cannot be computed. R6 (the app badge = this count) was replaced by N1 on
+ * 2026-10-29: the service worker sets the badge to 1 on a displayed push and
+ * opening the app clears it, so no client reads this field today.
  */
 export type PushBadgeFields = {
   unreadCount?: number;

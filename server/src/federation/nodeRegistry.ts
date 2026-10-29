@@ -1043,6 +1043,37 @@ export class NodeRegistry {
   }
 
   /**
+   * #5640: `locateSession` by tag, for the caller-mode floors —
+   * `hapi api sessions send` stamps the session's `HAPI_SESSION_ID` tag, not its
+   * id. Returns the owner whatever its status, like `locateSession`; the floor
+   * decides what an offline owner means. `null` for an empty tag, no match, or a
+   * tag more than one cached session carries, so an ambiguous tag never resolves
+   * a caller.
+   */
+  locateSessionByTag(tag: string): {
+    nodeId: string;
+    status: "online" | "degraded" | "offline";
+    session: SessionSummary;
+  } | null {
+    if (!tag) return null;
+    let found: { nodeId: string; session: SessionSummary } | null = null;
+    for (const cached of this.sessionCache.values()) {
+      for (const session of cached.sessions) {
+        if (session.tag !== tag) continue;
+        if (found) return null;
+        found = { nodeId: cached.nodeId, session };
+      }
+    }
+    if (!found) return null;
+    const state = this.nodeStates.get(found.nodeId);
+    return {
+      nodeId: found.nodeId,
+      status: state?.status ?? "offline",
+      session: found.session,
+    };
+  }
+
+  /**
    * True until every static peer has completed one SUCCESSFUL poll since this
    * hub started, or until `HUB_RESTART_GRACE_MS` has passed. Until a peer polls
    * successfully the session cache holds nothing for it, so its live sessions

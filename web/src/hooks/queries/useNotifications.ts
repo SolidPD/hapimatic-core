@@ -8,13 +8,14 @@ import { INBOX_PAGE_LIMIT } from "@/lib/notificationInbox";
  * Notification inbox queries (issue #4915, epic #4912 Sub C). The cache is kept
  * live by `NotificationListener`: every `notification` SyncEvent patches the
  * cached lists in place and refetches the unread count. The inbox on Settings →
- * Notifications (Sub D #4916) renders from `useNotificationList`; Sub G (#4921)
- * mirrors `useNotificationUnreadCount` to the app badge.
+ * Notifications (Sub D #4916) renders from `useNotificationList` and
+ * `useNotificationUnreadCount`. The home-screen badge does not read the count
+ * (N1, 2026-10-29: a push sets it to 1, opening the app clears it).
  *
  * The app's QueryClient turns `refetchOnWindowFocus` off
- * (`web/src/lib/query-client.ts`). The unread count opts back in, so the badge
- * is right when the app returns to the foreground, and it also polls every
- * 30 s. The list does not refetch on focus: the inbox passes its own
+ * (`web/src/lib/query-client.ts`). The unread count opts back in, so the
+ * inbox's count is right when the app returns to the foreground, and it also
+ * polls every 30 s. The list does not refetch on focus: the inbox passes its own
  * `refetchInterval` and refetches when the event stream reconnects.
  */
 export function useNotificationList(
@@ -63,9 +64,8 @@ export function useNotificationUnreadCount(
     staleTime: 30_000,
     refetchInterval: 30_000,
     // #4921 R7: refetch when the app returns to the foreground, overriding the
-    // app-wide `refetchOnWindowFocus: false`. The badge mirror reads this query,
-    // and it replaces App.tsx's old clear-on-visible: a backgrounded iOS PWA
-    // shows the true count on return instead of waiting for the next poll.
+    // app-wide `refetchOnWindowFocus: false`, so a backgrounded iOS PWA shows
+    // the true count on return instead of waiting for the next poll.
     refetchOnWindowFocus: "always",
   });
 }

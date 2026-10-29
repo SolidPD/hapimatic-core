@@ -405,6 +405,8 @@ export const GIT_STATUS_META: CapabilityMeta = {
 const gitDiffNumstatInput = z.object({
   cwd: z.string().optional(),
   staged: z.boolean().optional(),
+  // #4469: a branch to measure the diff against (branch start, then merge-base).
+  base: z.string().optional(),
   timeout: z.number().optional(),
 });
 /**
@@ -423,6 +425,8 @@ const gitDiffFileInput = z.object({
   cwd: z.string().optional(),
   filePath: z.string(),
   staged: z.boolean().optional(),
+  // #4469: see gitDiffNumstatInput.base.
+  base: z.string().optional(),
   timeout: z.number().optional(),
 });
 /**

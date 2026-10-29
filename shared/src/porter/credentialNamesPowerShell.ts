@@ -93,7 +93,9 @@ export function credentialNamesPowerShellLines(): string[] {
  * `exportScriptPowerShell.ts` (#4321, epic #4290 T25); #4321 then added the
  * O2 placeholder rule and the loop (`l`) lines, and #5549 (item 5)
  * `linkHoldsItself`, the walk's loop test applied to a staged folder link
- * itself (the bash twin runs it inline in `materialize_links`). They rely on `isCredentialName`
+ * itself (the bash twin runs it inline in `materialize_links`); #5822 also
+ * applies it to a linked `hooks/` before its tree copy (the bash twin's
+ * `_hrefuse` gate). They rely on `isCredentialName`
  * (above) and on the main block's `$ON_WINDOWS`, `$STAGING` and `$STG_FULL`.
  */
 export function linkCheckPowerShellLines(): string[] {
@@ -303,6 +305,7 @@ export function linkCheckPowerShellLines(): string[] {
     "    # sits in or one above it (loop -> ., up -> ..), so copying it would copy",
     "    # that folder into itself. The walk's test for the links under a copy",
     "    # (credentialLinks), applied to the link itself, as the bash twin does.",
+    "    # #5822: also applied to a linked hooks/ before its tree is copied.",
     "    function linkHoldsItself($src) {",
     "      $phys = physicalPath $src",
     "      if (-not $phys) { return $false }",

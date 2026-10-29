@@ -6,6 +6,7 @@
  * Helps diagnose and fix issues with hung or orphaned processes
  */
 
+import { KNOWN_AGENT_IDS } from "@hapi/protocol";
 import psList from "ps-list";
 import { killProcess } from "@/utils/process";
 
@@ -16,6 +17,14 @@ const DEV_RUNTIMES = new Set(["bun", "bun.exe", "node", "node.exe"]);
 const NODE_RUNTIMES = new Set(["node", "node.exe"]);
 const LEGACY_HAPPY_EXECUTABLES = new Set(["happy", "happy.mjs"]);
 const LEGACY_HAPPY_PACKAGES = new Set(["happy-coder", "happy-cli"]);
+// The subcommand a daemon spawn names first: the direct spawn passes the
+// agent's id (sessionSpawner.ts), buildCodexCommand passes "codex".
+const AGENT_SUBCOMMANDS: ReadonlySet<string> = new Set(KNOWN_AGENT_IDS);
+// hapi's starting-mode flag, and the legacy happy-coder CLI's spelling of it.
+const STARTING_MODE_FLAGS = new Set([
+  "--hapi-starting-mode",
+  "--happy-starting-mode",
+]);
 
 function pathSegments(token: string): string[] {
   return token.split(/[\\/]/);
@@ -182,6 +191,29 @@ function locateHapiArgs(
 }
 
 /**
+ * Whether `args` open the way every daemon spawn writes them: an optional
+ * agent subcommand, an optional starting-mode flag and its value, then
+ * `--started-by daemon` (sessionSpawner.ts, tmuxSpawnAdapter.ts
+ * buildClaudeCommand, codexTmuxLauncher.ts buildCodexCommand). `ps` joins argv
+ * with spaces, so the same two words later in a prompt are not that argument,
+ * and a user session that mentions them is never on `doctor clean`'s kill
+ * list (#5838).
+ */
+function isDaemonStarted(args: string[]): boolean {
+  let at = 0;
+  if (AGENT_SUBCOMMANDS.has(args[at] ?? "")) {
+    at++;
+  }
+  if (STARTING_MODE_FLAGS.has(args[at] ?? "")) {
+    at += 2;
+  }
+  return (
+    args[at] === "--started-by=daemon" ||
+    (args[at] === "--started-by" && args[at + 1] === "daemon")
+  );
+}
+
+/**
  * Classify one process for `hapi doctor` / `hapi daemon status`. Returns null
  * when the process is not a hapi process. `executables` is the set of binary
  * names that count as hapi (default `hapi` / `hapi.exe`).
@@ -199,7 +231,6 @@ export function classifyHappyProcess(
     return null;
   }
   const { args, isDevMode } = located;
-  const startedBy = args.indexOf("--started-by");
 
   if (proc.pid === selfPid) {
     return "current";
@@ -218,10 +249,7 @@ export function classifyHappyProcess(
   if (args[0] === "server") {
     return isDevMode ? "dev-related" : "server";
   }
-  if (
-    (startedBy >= 0 && args[startedBy + 1] === "daemon") ||
-    args.includes("--started-by=daemon")
-  ) {
+  if (isDaemonStarted(args)) {
     return isDevMode ? "dev-daemon-spawned" : "daemon-spawned-session";
   }
   if (args.includes("doctor")) {
@@ -307,11 +335,15 @@ async function isListed(pid: number): Promise<boolean> {
 }
 
 /**
- * Kill all runaway HAPI CLI processes. A process counts as killed only when a
- * signal reached it: `killProcess` returns false for both an exited process
- * and one this user may not signal, so a false return is re-checked against
- * the process list (#5763). `graceMs` is the wait between SIGTERM and the
- * SIGKILL fallback.
+ * Kill all runaway HAPI CLI processes. A process counts as killed when a
+ * signal reached it, or when it is gone from the process list after the force
+ * kill: `killProcess` returns false for both an exited process and one this
+ * user may not signal, so a false return is re-checked against the process
+ * list (#5763). `graceMs` is the wait between SIGTERM and the
+ * SIGKILL fallback. A soft kill that fails on a process still listed falls
+ * through to the force kill, as it did before #5763: on Windows `taskkill`
+ * without /F cannot end a windowless process (Fallback Preservation Rule,
+ * #5838).
  */
 export async function killRunawayHappyProcesses(
   options: { graceMs?: number } = {}
@@ -333,23 +365,29 @@ export async function killRunawayHappyProcesses(
     try {
       console.log(`Killing runaway process PID ${pid}: ${command}`);
 
-      if (!(await killProcess(pid, false))) {
+      const softSent = await killProcess(pid, false);
+      let forceReason: string | null = null;
+      if (softSent) {
+        await new Promise(resolve => setTimeout(resolve, graceMs));
         if (await isListed(pid)) {
-          fail(pid, "could not send SIGTERM (permission denied?)");
-        } else {
-          console.log(`Process PID ${pid} had already exited`);
+          forceReason = "ignored termination request";
         }
+      } else if (await isListed(pid)) {
+        forceReason = "could not be sent a termination request";
+      } else {
+        console.log(`Process PID ${pid} had already exited`);
         continue;
       }
 
-      await new Promise(resolve => setTimeout(resolve, graceMs));
-
-      if (await isListed(pid)) {
-        console.log(
-          `Process PID ${pid} ignored termination request, using force kill`
-        );
+      if (forceReason) {
+        console.log(`Process PID ${pid} ${forceReason}, using force kill`);
         if (!(await killProcess(pid, true)) && (await isListed(pid))) {
-          fail(pid, "could not send SIGKILL (permission denied?)");
+          fail(
+            pid,
+            softSent
+              ? "could not send SIGKILL (permission denied?)"
+              : "could not send SIGTERM or SIGKILL (permission denied?)"
+          );
           continue;
         }
       }

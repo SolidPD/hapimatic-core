@@ -6,7 +6,7 @@ import { CacheFirst, NetworkFirst } from "workbox-strategies";
 import { ExpirationPlugin } from "workbox-expiration";
 import { getCacheNameForServiceWorker } from "@/lib/storage-keys";
 import { decidePushAction } from "@/lib/pushDisplayGate";
-import { applyBadge, decidePushBadge } from "@/lib/pushBadge";
+import { PUSH_BADGE, applyBadge } from "@/lib/pushBadge";
 import { withoutWebManifest } from "@/lib/precacheEntries";
 import {
   boundedFetchPlugin,
@@ -51,9 +51,6 @@ type PushPayload = {
     sessionId?: string;
     url?: string;
   };
-  // Issue #4921: the server's unread count at send time (PushBadgeFields in
-  // shared/src/notifications.ts); absent from an older server.
-  unreadCount?: number;
 };
 
 // Instance-specific cache name to prevent cross-contamination between instances
@@ -306,11 +303,11 @@ self.addEventListener("push", event => {
         tag,
       });
 
-      // Set the iOS home-screen badge (iOS 16.4+) from the server's unread
-      // count (issue #4921): max(count, 1), or 1 from an older server. Always a
-      // positive integer — setAppBadge() with no args shows an empty badge on
-      // iOS Safari. The open app's mirror is the only thing that clears it.
-      await applyBadge(self.navigator, decidePushBadge(payload.unreadCount));
+      // Set the iOS home-screen badge (iOS 16.4+) to 1 (N1, 2026-10-29): the
+      // badge means "something arrived since you last opened the app", not
+      // the server's unread count (the payload's `unreadCount` is ignored).
+      // Opening the app clears it (useClearNotificationsOnOpen).
+      await applyBadge(self.navigator, PUSH_BADGE);
     })()
   );
 });
@@ -322,8 +319,9 @@ self.addEventListener("notificationclick", event => {
 
   event.waitUntil(
     (async () => {
-      // Issue #4921: a tap does not clear the badge — it opens the session,
-      // and the page's unread-count mirror then writes the true count.
+      // A tap clears the badge (N1). Opening the app clears it too, but a tap
+      // that focuses an already-visible tab fires no visibilitychange.
+      await applyBadge(self.navigator, { kind: "clear" });
 
       // Try to navigate an existing window instead of opening a new one
       const clients = await self.clients.matchAll({

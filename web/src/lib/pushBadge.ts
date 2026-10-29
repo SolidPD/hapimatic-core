@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// App-badge decisions for the service worker's push handler and the open
-// page's unread-count mirror (issue #4921). Pure and window-free so sw.ts can
-// bundle it and vitest can test it (sw.ts itself has no test harness), the
-// same split as `pushDisplayGate.ts`.
+// App-badge and delivered-notification handling for the service worker's push
+// handler and the open page (N1, 2026-10-29, which replaced #4921's
+// unread-count badge). A displayed push sets the badge to 1; opening the app
+// clears it and closes the delivered notifications. Window-free so sw.ts can
+// bundle it and vitest can test it (sw.ts itself has no test harness), the same
+// split as `pushDisplayGate.ts`.
 
 export type BadgeAction = { kind: "set"; count: number } | { kind: "clear" };
 
@@ -12,31 +14,23 @@ export type BadgeNavigator = {
   clearAppBadge?: () => Promise<void>;
 };
 
-/**
- * The badge for a push the service worker DISPLAYS. The server stamps
- * `unreadCount` (its inbox count at send time, #4921 R5); the badge never shows
- * less than 1, because the banner just shown is itself not yet addressed — the
- * live ready / permission / question pushes are not inbox rows (D14). Only the
- * open app's mirror clears the badge. An absent or invalid count (an older
- * server) keeps the previous `setAppBadge(1)` behaviour.
- */
-export function decidePushBadge(unreadCount: unknown): BadgeAction {
-  if (
-    typeof unreadCount === "number" &&
-    Number.isInteger(unreadCount) &&
-    unreadCount >= 0
-  ) {
-    return { kind: "set", count: Math.max(unreadCount, 1) };
-  }
-  return { kind: "set", count: 1 };
-}
+/** The subset of `ServiceWorkerRegistration` that lists shown notifications. */
+export type NotificationRegistration = {
+  getNotifications?: () => Promise<ReadonlyArray<{ close(): void }>>;
+};
 
-/** The badge for the open app: the server unread count, cleared at zero. */
-export function decideMirrorBadge(unreadCount: number): BadgeAction {
-  return unreadCount > 0
-    ? { kind: "set", count: unreadCount }
-    : { kind: "clear" };
-}
+/** The subset of `Navigator` the open-app clear needs. */
+export type OpenClearNavigator = BadgeNavigator & {
+  serviceWorker?: { ready: Promise<NotificationRegistration> };
+};
+
+/**
+ * The badge for a push the service worker DISPLAYS: 1, whatever the server's
+ * unread count, so the badge means "something arrived since you last opened
+ * the app". A positive integer because `setAppBadge()` with no argument shows
+ * an empty badge on iOS Safari.
+ */
+export const PUSH_BADGE: BadgeAction = { kind: "set", count: 1 };
 
 /**
  * Apply a badge action. Feature-detected: a browser tab without the Badging
@@ -59,4 +53,52 @@ export async function applyBadge(
   } catch {
     // Badge API unavailable in this context — ignore.
   }
+}
+
+/**
+ * Close every notification the registration is still showing. Fails soft: a
+ * registration without `getNotifications`, a rejected listing, or one
+ * notification that refuses to close never stops the rest.
+ */
+export async function closeDeliveredNotifications(
+  registration: NotificationRegistration | null | undefined
+): Promise<void> {
+  if (!registration || typeof registration.getNotifications !== "function") {
+    return;
+  }
+  let delivered: ReadonlyArray<{ close(): void }>;
+  try {
+    delivered = await registration.getNotifications();
+  } catch {
+    return;
+  }
+  for (const notification of delivered) {
+    try {
+      notification.close();
+    } catch {
+      // Already gone, or this context cannot close it — keep going.
+    }
+  }
+}
+
+/**
+ * What opening the app does (N1): clear the home-screen badge and close the
+ * delivered notifications. The two run independently, so a Badging API that
+ * hangs or throws never keeps the banners open. Without a service worker
+ * there is nothing to close.
+ */
+export async function clearOnAppOpen(
+  nav: OpenClearNavigator | null | undefined
+): Promise<void> {
+  if (!nav) return;
+  const closeBanners = async () => {
+    try {
+      const sw = nav.serviceWorker;
+      if (!sw) return;
+      await closeDeliveredNotifications(await sw.ready);
+    } catch {
+      // No usable service worker in this context — nothing to close.
+    }
+  };
+  await Promise.all([applyBadge(nav, { kind: "clear" }), closeBanners()]);
 }

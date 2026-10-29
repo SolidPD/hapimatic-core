@@ -177,6 +177,21 @@ export function parseNumStat(numStatOutput: string): DiffSummary {
   return result;
 }
 
+/**
+ * The stats for a `git status` path. Status keeps git's quoting while
+ * `createDiffStatsMap` keys a rename by its decoded paths, so a quoted path
+ * is looked up both ways.
+ */
+function diffStatsFor(
+  stats: Record<string, { added: number; removed: number; binary: boolean }>,
+  path: string
+): { added: number; removed: number; binary: boolean } {
+  return (
+    stats[path] ??
+    stats[unquoteGitPath(path)] ?? { added: 0, removed: 0, binary: false }
+  );
+}
+
 export function createDiffStatsMap(
   summary: DiffSummary
 ): Record<string, { added: number; removed: number; binary: boolean }> {
@@ -237,11 +252,7 @@ export function buildGitStatusFiles(
 
     if (file.index !== " " && file.index !== "." && file.index !== "?") {
       const status = getFileStatus(file.index);
-      const stats = stagedStats[file.path] ?? {
-        added: 0,
-        removed: 0,
-        binary: false,
-      };
+      const stats = diffStatsFor(stagedStats, file.path);
       stagedFiles.push({
         fileName,
         filePath,
@@ -256,11 +267,7 @@ export function buildGitStatusFiles(
 
     if (file.workingDir !== " " && file.workingDir !== ".") {
       const status = getFileStatus(file.workingDir);
-      const stats = unstagedStats[file.path] ?? {
-        added: 0,
-        removed: 0,
-        binary: false,
-      };
+      const stats = diffStatsFor(unstagedStats, file.path);
       unstagedFiles.push({
         fileName,
         filePath,
@@ -354,23 +361,85 @@ function getFileStatus(statusChar: string): GitFileStatus["status"] {
   }
 }
 
-function normalizeNumstatPath(rawPath: string): {
+/** A path git quoted (`core.quotePath`): `"..."` with C-style escapes. */
+const QUOTED_GIT_PATH = /^"(?:[^"\\]|\\.)*"$/;
+
+const GIT_PATH_ESCAPES: Record<string, number> = {
+  a: 7,
+  b: 8,
+  t: 9,
+  n: 10,
+  v: 11,
+  f: 12,
+  r: 13,
+  '"': 34,
+  "\\": 92,
+};
+
+/**
+ * Undo git's path quoting: a path with a non-ASCII byte, a control character,
+ * `"` or `\` comes back as `"a/\303\274.txt"` (octal UTF-8 bytes). Any other
+ * text is returned unchanged.
+ */
+export function unquoteGitPath(path: string): string {
+  if (!QUOTED_GIT_PATH.test(path)) return path;
+  const chars = Array.from(path.slice(1, -1));
+  const bytes: number[] = [];
+  const encoder = new TextEncoder();
+  for (let i = 0; i < chars.length; i += 1) {
+    const ch = chars[i] ?? "";
+    if (ch !== "\\") {
+      bytes.push(...encoder.encode(ch));
+      continue;
+    }
+    const octal = chars.slice(i + 1, i + 4).join("");
+    if (/^[0-7]{3}$/.test(octal)) {
+      bytes.push(parseInt(octal, 8));
+      i += 3;
+      continue;
+    }
+    const code = GIT_PATH_ESCAPES[chars[i + 1] ?? ""];
+    if (code !== undefined) {
+      bytes.push(code);
+      i += 1;
+      continue;
+    }
+    bytes.push(92);
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+const BRACED_RENAME = /\{([^{}]+?)\s*=>\s*([^{}]+?)\}/g;
+
+/**
+ * The paths of one `git diff --numstat` entry. A rename comes back as
+ * `old => new` or, when the paths share a prefix or suffix, as
+ * `dir/{old => new}/file`, where either side of the braces can be empty
+ * (`a/{ => b}/z.ts` is `a/z.ts` → `a/b/z.ts`). A quoted path (see
+ * `unquoteGitPath`) is decoded; git quotes each side of a rename on its own
+ * and never uses the braced form for one.
+ */
+export function normalizeNumstatPath(rawPath: string): {
   newPath: string;
   oldPath?: string;
 } {
   const trimmed = rawPath.trim();
-  if (
-    trimmed.includes("{") &&
-    trimmed.includes("=>") &&
-    trimmed.includes("}")
-  ) {
-    const newPath = trimmed.replace(
-      /\{([^{}]+?)\s*=>\s*([^{}]+?)\}/g,
-      (_, oldPart: string, newPart: string) => newPart.trim()
+  if (QUOTED_GIT_PATH.test(trimmed)) {
+    return { newPath: unquoteGitPath(trimmed) };
+  }
+
+  // A brace in a file name (`src{a}.ts => src{b}.ts`) is not this form.
+  if (/\{[^{}]+?\s*=>\s*[^{}]+?\}/.test(trimmed)) {
+    // An empty side leaves `a//z.ts` (or a leading `/`): collapse it.
+    const tidy = (path: string): string =>
+      path.replace(/\/{2,}/g, "/").replace(/^\//, "");
+    const newPath = tidy(
+      trimmed.replace(BRACED_RENAME, (_, oldPart: string, newPart: string) =>
+        newPart.trim()
+      )
     );
-    const oldPath = trimmed.replace(
-      /\{([^{}]+?)\s*=>\s*([^{}]+?)\}/g,
-      (_, oldPart: string) => oldPart.trim()
+    const oldPath = tidy(
+      trimmed.replace(BRACED_RENAME, (_, oldPart: string) => oldPart.trim())
     );
     return { newPath, oldPath };
   }
@@ -380,7 +449,10 @@ function normalizeNumstatPath(rawPath: string): {
     const oldPath = parts[0]?.trim();
     const newPath = parts[parts.length - 1]?.trim();
     if (newPath) {
-      return { newPath, oldPath };
+      return {
+        newPath: unquoteGitPath(newPath),
+        oldPath: oldPath === undefined ? undefined : unquoteGitPath(oldPath),
+      };
     }
   }
 

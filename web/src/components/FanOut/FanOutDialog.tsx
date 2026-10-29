@@ -5,7 +5,7 @@ import { LOCAL_NODE_ID } from "@hapi/protocol";
 import type { EffortLevel } from "@hapi/protocol";
 import { resolveSpawnPermissionMode } from "@hapi/protocol/modes";
 import type { ApiClient } from "@/api/client";
-import type { Machine, Session } from "@/types/api";
+import type { Machine } from "@/types/api";
 import {
   Dialog,
   DialogContent,
@@ -183,12 +183,26 @@ function capacityLine(
   return `${notice.requested} more sessions takes ${target ?? "this hub"} past its recommended ${notice.recommended} (${notice.effectiveCount} running).`;
 }
 
+/**
+ * The fields the dialog reads from its parent. A `Session` (the header) and a
+ * `SessionSummary` (a session card, #4469) both fit.
+ */
+export type FanOutDialogParent = {
+  id: string;
+  active: boolean;
+  metadata?: {
+    path?: string;
+    flavor?: string | null;
+    machineId?: string;
+  } | null;
+};
+
 export function FanOutDialog(props: {
   isOpen: boolean;
   onClose: () => void;
   api: ApiClient | null;
-  /** The open session — the fan-out's parent. */
-  parent: Session;
+  /** The session the peers fan out from — the fan-out's parent. */
+  parent: FanOutDialogParent;
   parentTitle: string;
 }) {
   const { isOpen, onClose, api, parent, parentTitle } = props;

@@ -415,6 +415,14 @@ export type GitCommandResponse = {
   stderr?: string;
   exitCode?: number;
   error?: string;
+  /**
+   * #4469: a diff requested with a `base` echoes it, plus the commit it was
+   * measured against and how that commit was found. A `base` answer with no
+   * `mergeBase` is the plain uncommitted diff ("uncommitted only").
+   */
+  base?: string;
+  mergeBase?: string;
+  baseSource?: "branch-start" | "merge-base";
 };
 
 export type FileSearchItem = {
