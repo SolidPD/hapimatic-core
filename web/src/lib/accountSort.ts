@@ -19,7 +19,12 @@
  * sort mode; issue #3537 retired the old "custom" mode) ignores direction: the stored
  * drag order is absolute.
  */
-import type { AccountUsage, Spend, SpendMoney } from "@hapi/protocol";
+import {
+  normalizeUsageRow,
+  type AccountUsage,
+  type Spend,
+  type SpendMoney,
+} from "@hapi/protocol";
 import { getStorageKey } from "@/lib/storage-keys";
 
 export type SortMode =
@@ -107,7 +112,8 @@ export function sortValue(
 ): number | null {
   const finite = (v: number | null | undefined): number | null =>
     v != null && Number.isFinite(v) ? v : null;
-  const u = account.utilization;
+  // #6095: a 5-hour window Anthropic no longer reports sorts as 0 %, not missing.
+  const u = normalizeUsageRow(account).utilization;
   switch (mode) {
     case "pace":
       return finite(account.score);

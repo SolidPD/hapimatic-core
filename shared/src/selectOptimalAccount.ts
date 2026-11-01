@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { HARD_LOCK_UTILIZATION } from "./usage";
+import { HARD_LOCK_UTILIZATION, normalizeUsageRow } from "./usage";
 import type { AccountUsage } from "./usage";
 
 /**
@@ -189,8 +189,11 @@ export function selectOptimalAccountUuid(
     if (!u) continue;
     // `AccountUsage.utilization` is required by the schema, but test fixtures use
     // partial casts, so optional-chain defensively (an absent window → "no signal").
-    const fiveHourUtilization = u.utilization?.five_hour?.utilization ?? null;
-    const sevenDayUtilization = u.utilization?.seven_day?.utilization ?? null;
+    // #6095: read through normalizeUsageRow so a 5-hour window Anthropic no longer
+    // reports ranks as 0 % in the tie-break (idempotent for already-served rows).
+    const util = normalizeUsageRow(u).utilization;
+    const fiveHourUtilization = util?.five_hour?.utilization ?? null;
+    const sevenDayUtilization = util?.seven_day?.utilization ?? null;
     if (
       !isOptimalCandidate(
         {

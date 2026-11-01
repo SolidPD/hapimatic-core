@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { useId } from "react";
 import { PickerModal } from "./PickerModal";
 import { Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -8,7 +9,9 @@ import { GitHubAccountAvatar } from "@/components/GitHubAccountAvatar";
 import type { GitHubAccount } from "@/hooks/queries/useGitHubRepos";
 import {
   GITHUB_STATUS_PRESENTATION,
+  GITHUB_STATUS_UNCHECKED_NOTE,
   groupGitHubAccountsByLinker,
+  isGitHubStatusUnchecked,
 } from "@/lib/githubConnections";
 
 /**
@@ -95,6 +98,8 @@ export function GitHubAccountSelectorModal(props: {
     canClone = true,
     connectHref,
   } = props;
+  // #6085: ids for the "could not check" notes the rows point at (aria-describedby).
+  const noteIdPrefix = useId();
 
   const handleSelect = (login: string | null) => {
     onSelect(login);
@@ -154,7 +159,7 @@ export function GitHubAccountSelectorModal(props: {
             No GitHub account connected
           </div>
         ) : (
-          groupGitHubAccountsByLinker(accounts).map(group => (
+          groupGitHubAccountsByLinker(accounts).map((group, groupIndex) => (
             <div
               key={group.email ?? ""}
               role="group"
@@ -166,18 +171,22 @@ export function GitHubAccountSelectorModal(props: {
                   {group.email}
                 </div>
               )}
-              {group.accounts.map(account => {
+              {group.accounts.map((account, accountIndex) => {
                 const checked = selectedAccount === account.login;
                 const statusText = accountStatusText(account);
                 const tone = account.status
                   ? GITHUB_STATUS_PRESENTATION[account.status].tone
                   : null;
+                const uncheckedNoteId = isGitHubStatusUnchecked(account)
+                  ? `${noteIdPrefix}-unchecked-${groupIndex}-${accountIndex}`
+                  : undefined;
                 return (
                   <Button
                     key={`${account.email ?? ""}/${account.login}`}
                     type="button"
                     variant="ghost"
                     aria-pressed={checked}
+                    aria-describedby={uncheckedNoteId}
                     onClick={() => handleSelect(account.login)}
                     className={`${ROW} ${rowState(checked)}`}
                   >
@@ -212,6 +221,20 @@ export function GitHubAccountSelectorModal(props: {
                             <StatusDot status={tone} label={statusText} />
                           </span>
                           {statusText}
+                        </span>
+                      )}
+                      {/* #6085: its own line, wrapping (the row button is nowrap), so the "reopen"
+                          half is never truncated on a phone. It is the row's DESCRIPTION, not part
+                          of its name: aria-hidden keeps it out of the name computed from content,
+                          and the button's aria-describedby still reads it (a directly referenced
+                          node counts even when hidden). */}
+                      {uncheckedNoteId && (
+                        <span
+                          id={uncheckedNoteId}
+                          aria-hidden="true"
+                          className="whitespace-normal text-[length:var(--text-caption)] text-[var(--status-warn)]"
+                        >
+                          {GITHUB_STATUS_UNCHECKED_NOTE}
                         </span>
                       )}
                     </span>

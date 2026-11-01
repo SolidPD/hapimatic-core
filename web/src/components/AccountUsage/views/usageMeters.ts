@@ -12,7 +12,11 @@
  * windows only.
  */
 import type { CSSProperties } from "react";
-import type { AccountUsage, ProviderId } from "@hapi/protocol";
+import {
+  isSyntheticWindow,
+  type AccountUsage,
+  type ProviderId,
+} from "@hapi/protocol";
 import { centsToUsd, moneyToUsd, overagePercent } from "../AccountUsageCard";
 
 export type UsageColumn = {
@@ -42,6 +46,9 @@ type Utilization = AccountUsage["utilization"];
 export const CREDITS_RESET_LABEL = "monthly";
 /** A credits placeholder (no spend limit and no legacy pool). */
 export const CREDITS_PLACEHOLDER_LABEL = "not enabled";
+/** Reset text for a 5-hour window Anthropic no longer reports (#6095): the
+ *  meter shows 0 % and says there is no limit, instead of an empty column. */
+export const NO_LIMIT_LABEL = "no limit";
 
 const SHORT_TITLES: Record<string, string> = {
   "5-hour": "5h",
@@ -71,10 +78,25 @@ function windowColumn(
   id: string,
   title: string,
   win:
-    | { utilization?: number | null; resets_at?: string | null }
+    | {
+        utilization?: number | null;
+        resets_at?: string | null;
+        hapi_synthetic?: boolean;
+      }
     | null
     | undefined
 ): UsageColumn {
+  // #6095: a filled-in window reads as a 0 % meter labelled "no limit".
+  if (isSyntheticWindow(win)) {
+    return {
+      id,
+      title,
+      shortTitle: abbreviate(title),
+      pct: 0,
+      resetsAt: null,
+      resetLabel: NO_LIMIT_LABEL,
+    };
+  }
   const pct = win?.utilization ?? null;
   if (pct == null) {
     return {

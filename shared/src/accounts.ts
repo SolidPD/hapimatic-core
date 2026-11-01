@@ -434,6 +434,20 @@ export function validateAccountIndex(
 }
 
 /**
+ * True for a subscription entitled to the Max-class models (`"max"`, or
+ * `"ultra"`). Anthropic now calls Max 20x the "Ultra" plan (#6095); no captured
+ * `oauth/profile` response returns `"ultra"` yet, so accepting it is
+ * forward-compatible hardening — a rename must not drop the `opus[1m]` entitled
+ * pin or the model-downgrade warning, which both gate on this predicate.
+ */
+export function isMaxClassSubscription(
+  subscriptionType: string | null | undefined
+): boolean {
+  const normalized = subscriptionType?.trim().toLowerCase();
+  return normalized === "max" || normalized === "ultra";
+}
+
+/**
  * Computes a human-readable plan label from subscription type and rate limit tier.
  *
  * Mapping:
@@ -441,6 +455,7 @@ export function validateAccountIndex(
  * - "max" + "default_claude_max_5x" → "Max 5X"
  * - "max" + "default_claude_max_20x" → "Max 20X"
  * - "max" (unknown tier) → "Claude Max"
+ * - "ultra" → "Ultra" (#6095)
  * - unknown → subscription type as-is, or undefined
  *
  * Lives in `@hapi/protocol` (shared) so BOTH the cli (host-credential read +
@@ -469,6 +484,10 @@ export function computePlanLabel(
       return "Max 20X";
     }
     return "Claude Max";
+  }
+
+  if (normalizedType === "ultra") {
+    return "Ultra";
   }
 
   // For unknown types, return the raw value with capitalization

@@ -29,6 +29,8 @@ export interface GitHubAccount {
   isDefault?: boolean;
   /** #4793, broker only: the link's status. */
   status?: GitHubConnectionStatus;
+  /** #6085, broker only: GitHub did not confirm `status` in time, so it may be out of date. */
+  statusUnchecked?: boolean;
 }
 
 export interface GitHubRepo {

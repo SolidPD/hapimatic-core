@@ -25,6 +25,7 @@ import type {
   LimitEntry,
   RateLimit,
 } from "@hapi/protocol";
+import { isSyntheticWindow } from "@hapi/protocol";
 import { usageLevel, LEVEL_COLOR } from "../UsageBar";
 import {
   centsToUsd,
@@ -33,6 +34,7 @@ import {
   formatResetCountdown,
   formatUsd,
   moneyToUsd,
+  NO_FIVE_HOUR_LIMIT_MESSAGE,
   overagePercent,
   PROJECTION_WINDOWS,
   RESET_PENDING_MESSAGE,
@@ -138,14 +140,22 @@ export function BarsView({
             // Inside populated.map (utilization != null), so an empty
             // resetLine means "populated window, missing resets_at" —
             // prompt the user to start the window instead of a blank line.
-            const resetDisplay =
-              resetLine !== "" ? resetLine : RESET_PENDING_MESSAGE;
+            // #6095: a 5-hour window Anthropic no longer reports is filled in
+            // as 0 % — say there is no limit rather than prompting to start a
+            // reset window that will never open.
+            const synthetic = isSyntheticWindow(win);
+            const resetDisplay = synthetic
+              ? NO_FIVE_HOUR_LIMIT_MESSAGE
+              : resetLine !== ""
+                ? resetLine
+                : RESET_PENDING_MESSAGE;
             // A pending-reset window can still carry a projection (the
             // server sets reachesLimitBeforeReset=true when resets_at is
             // null), which would collide with the message inside the
             // truncate span at 393px — so suppress the projection while
             // the pending-reset message renders. [#2052, expert-review D9]
-            const showProjection = resetLine !== "" && projection !== "";
+            const showProjection =
+              !synthetic && resetLine !== "" && projection !== "";
             return (
               <div
                 key={label}

@@ -34,6 +34,11 @@ export const RateLimitSchema = z
   .object({
     utilization: z.number().nullable(), // 0–100 percentage
     resets_at: z.string().nullable(), // ISO-8601 timestamp
+    // Set ONLY by Hapimatic, never by Anthropic: marks a 5-hour window that the
+    // upstream no longer reports and that Hapimatic reads as 0 % with no reset
+    // (#6095, see withEffectiveFiveHour). Namespaced so it cannot collide with a
+    // future upstream field on this passthrough object.
+    hapi_synthetic: z.boolean().optional(),
   })
   .passthrough();
 
@@ -591,6 +596,72 @@ export function findUsageRowHardLock(
     modelFamily: opts?.modelFamily ?? null,
     now: opts?.now,
   });
+}
+
+/**
+ * Missing 5-hour window (#6095). Anthropic removed the 5-hour limit from Max
+ * 20x ("Ultra") accounts, so `oauth/usage` returns `five_hour: null` while the
+ * weekly windows stay populated. Every Hapimatic reader treats such a window as
+ * a 5-hour limit at 0 % with no reset, never as unknown usage.
+ *
+ * The rule applies only inside a SUCCESSFUL read: the weekly (`seven_day`)
+ * meter must carry a finite utilization. Degraded rows (`expired` /
+ * `refreshing` / `no_scope` / `error`, and a `rate_limited` row with no
+ * last-good meters) are built with `utilization: {}`, so they fail that test
+ * and stay unknown — the rp1-home#2074 guard against reading a failed read as
+ * spare capacity.
+ */
+const finitePct = (v: number | null | undefined): v is number =>
+  typeof v === "number" && Number.isFinite(v);
+
+/** True when the 5-hour window is absent from an otherwise-successful read
+ *  (no finite 5-hour utilization, but a finite weekly one) — #6095. */
+export function isFiveHourAbsent(
+  utilization: Utilization | null | undefined
+): boolean {
+  if (!utilization) return false;
+  return (
+    !finitePct(utilization.five_hour?.utilization) &&
+    finitePct(utilization.seven_day?.utilization)
+  );
+}
+
+/** True for a window Hapimatic filled in for a missing 5-hour meter (#6095).
+ *  The one reader of the `hapi_synthetic` marker — accepts any window shape so
+ *  the web's looser structural window types can use it too. */
+export function isSyntheticWindow(
+  win: { hapi_synthetic?: boolean } | null | undefined
+): boolean {
+  return win?.hapi_synthetic === true;
+}
+
+/**
+ * The utilization with a missing 5-hour window read as 0 % with no reset
+ * (#6095). Returns the SAME object when the 5-hour window is real or the read
+ * did not succeed, so an account that still reports the window behaves exactly
+ * as before. Idempotent: the filled-in window carries a finite utilization.
+ */
+export function withEffectiveFiveHour(utilization: Utilization): Utilization {
+  if (!isFiveHourAbsent(utilization)) return utilization;
+  return {
+    ...utilization,
+    five_hour: { utilization: 0, resets_at: null, hapi_synthetic: true },
+  };
+}
+
+/**
+ * {@link withEffectiveFiveHour} for one usage row, applied only when its meters
+ * are known (`ok` / `rate_limited` — the same gate as
+ * {@link findUsageRowHardLock}). Returns the same row when nothing changes.
+ * Typed on `AccountUsage` so it is never applied to an OpenAI/Codex
+ * `ProviderAccountUsage`, whose `five_hour` is a different contract.
+ */
+export function normalizeUsageRow<
+  T extends Pick<AccountUsage, "status" | "utilization">,
+>(row: T): T {
+  if (row.status !== "ok" && row.status !== "rate_limited") return row;
+  const utilization = withEffectiveFiveHour(row.utilization);
+  return utilization === row.utilization ? row : { ...row, utilization };
 }
 
 /**

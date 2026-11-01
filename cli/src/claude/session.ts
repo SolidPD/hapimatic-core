@@ -12,6 +12,7 @@ import type { LocalLaunchExitReason } from "@/agent/localLaunchPolicy";
 // does NOT import session.ts, and `import type` is erased at compile time, so
 // this introduces no runtime cycle.
 import type { Query } from "./sdk/query";
+import { isResumeValue, stripOneTimeFlags } from "./utils/resumeArgs";
 
 type LocalLaunchFailure = {
   message: string;
@@ -184,39 +185,29 @@ export class Session extends AgentSessionBase<EnhancedMode> {
   };
 
   /**
-   * Consume one-time Claude flags from claudeArgs after Claude spawn
-   * Currently handles: --resume (with or without session ID)
+   * Consume one-time Claude flags from claudeArgs after Claude spawn:
+   * `--resume [<id>]` and, since #6088, `--fork-session` (a retained
+   * `--fork-session` made each same-process relaunch of a branched session fork
+   * again).
    */
   consumeOneTimeFlags = (): void => {
     if (!this.claudeArgs) return;
 
-    const filteredArgs: string[] = [];
-    for (let i = 0; i < this.claudeArgs.length; i++) {
-      if (this.claudeArgs[i] === "--resume") {
-        // Check if next arg looks like a UUID (contains dashes and alphanumeric)
-        if (i + 1 < this.claudeArgs.length) {
-          const nextArg = this.claudeArgs[i + 1];
-          // Simple UUID pattern check - contains dashes and is not another flag
-          if (!nextArg.startsWith("-") && nextArg.includes("-")) {
-            // Skip both --resume and the UUID
-            i++; // Skip the UUID
-            logger.debug(
-              `[Session] Consumed --resume flag with session ID: ${nextArg}`
-            );
-          } else {
-            // Just --resume without UUID
-            logger.debug("[Session] Consumed --resume flag (no session ID)");
-          }
-        } else {
-          // --resume at the end of args
-          logger.debug("[Session] Consumed --resume flag (no session ID)");
-        }
-      } else {
-        filteredArgs.push(this.claudeArgs[i]);
-      }
+    const before = this.claudeArgs;
+    const resumeAt = before.indexOf("--resume");
+    if (resumeAt >= 0) {
+      const value = before[resumeAt + 1];
+      logger.debug(
+        isResumeValue(value)
+          ? `[Session] Consumed --resume flag with session ID: ${value}`
+          : "[Session] Consumed --resume flag (no session ID)"
+      );
+    }
+    if (before.includes("--fork-session")) {
+      logger.debug("[Session] Consumed --fork-session flag (issue #6088)");
     }
 
-    this.claudeArgs = filteredArgs.length > 0 ? filteredArgs : undefined;
+    this.claudeArgs = stripOneTimeFlags(before);
     logger.debug(
       `[Session] Consumed one-time flags, remaining args:`,
       this.claudeArgs

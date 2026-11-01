@@ -10,7 +10,11 @@ import type {
 } from "@hapi/protocol";
 import type { UsageHistoryStore } from "../store/usageHistoryStore";
 import type { ErrorLogger } from "../logging/errorLogger";
-import { SupervisedLoop, type JobRegistry } from "@hapi/protocol";
+import {
+  SupervisedLoop,
+  isSyntheticWindow,
+  type JobRegistry,
+} from "@hapi/protocol";
 
 /**
  * Usage history sampler + projection (epic #1855, Sub-Issue I / #1864).
@@ -293,7 +297,12 @@ export class UsageSampler {
     for (const usage of usages) {
       if (usage.status !== "ok") continue;
       for (const key of USAGE_LIMIT_KEYS) {
-        const util = usage.utilization?.[key]?.utilization;
+        const window = usage.utilization?.[key];
+        // #6095: a 5-hour window Hapimatic filled in for a missing meter is not
+        // a measurement — persisting its 0 % every sample would write points
+        // Anthropic never reported and feed fake projections.
+        if (isSyntheticWindow(window)) continue;
+        const util = window?.utilization;
         if (typeof util === "number" && Number.isFinite(util)) {
           rows.push({
             accountUuid: usage.accountUuid,

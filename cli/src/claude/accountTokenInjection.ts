@@ -6,7 +6,10 @@ import type {
   StoredAccount,
   ValidateAccountResult,
 } from "@hapi/protocol/accounts";
-import { isEnvTokenAccount } from "@hapi/protocol/accounts";
+import {
+  isEnvTokenAccount,
+  isMaxClassSubscription,
+} from "@hapi/protocol/accounts";
 import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { accountStore } from "@/accounts/accountStore";
 import { TokenRefreshService } from "@/accounts/tokenRefreshService";
@@ -111,7 +114,8 @@ export function accountInfoFromStored(
  * bound sessions silently fall back to Sonnet 4.6 / 200k.
  */
 export function resolveEntitledModel(account: StoredAccount): string | null {
-  return account.subscriptionType.toLowerCase() === "max"
+  // #6095: "ultra" (the renamed Max 20x plan) is entitled exactly like "max".
+  return isMaxClassSubscription(account.subscriptionType)
     ? ENTITLED_PIN_MODEL
     : null;
 }

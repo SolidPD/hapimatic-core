@@ -78,6 +78,13 @@ export const PROJECTION_WINDOWS = new Set<RateLimitKey>([
 export const RESET_PENDING_MESSAGE = "Send a message to start the reset window";
 
 /**
+ * Reset line for a 5-hour window Anthropic no longer reports (#6095). The
+ * window is filled in as 0 % with no reset, so the pending-reset prompt above
+ * would be wrong — there is no window to start. Rendered by views/BarsView.tsx.
+ */
+export const NO_FIVE_HOUR_LIMIT_MESSAGE = "No 5-hour limit";
+
+/**
  * Format the time remaining until `resetsAt` as a short forward-duration string.
  * Under 1 hour: minutes ("resets in 30m"). Under 1 day: hours AND minutes
  * ("resets in 3h 25m") so the reading is actionable, not coarse. 1 day and

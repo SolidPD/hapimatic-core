@@ -4,6 +4,8 @@ import { claudeLocal } from "./claudeLocal";
 import { Session } from "./session";
 import { Future } from "@/utils/future";
 import { createSessionScanner } from "./utils/sessionScanner";
+import { resumeSessionIdFromArgs } from "./utils/resumeArgs";
+import { createTranscriptForwarder } from "./services/transcriptForwarder";
 import { ToolErrorDetector } from "./utils/toolErrorDetector";
 import { ApiErrorDetector } from "./utils/apiErrorDetector";
 import { UserPromptBlockDetector } from "./utils/userPromptBlockDetector";
@@ -103,12 +105,28 @@ export async function claudeLocalLauncher(
   // mode.
   const rateLimitDetector = createSessionRateLimitDetector(session);
 
+  // Issue #6088 (SINK-4, #1573 parity with pty/tmux): resolve the account
+  // config dir once, up front (it never throws — null for host/non-isolated
+  // sessions), so the scanner watches the projects tree the account-bound
+  // claude child writes to under isolation. Reused for the launch below.
+  const accountConfigDir = await resolveAccountConfigDirForSession(session);
+
+  // Issue #6088 (SINK-6): what reaches the chat — every record except Claude
+  // Code's "No response requested." placeholder; the detectors below still
+  // see every record.
+  const forwardToChat = createTranscriptForwarder(session.client);
+
   // Create scanner
   const scanner = await createSessionScanner({
     sessionId: session.sessionId,
+    // Issue #6088 (SINK-1): a fresh `--resume` process seeds the scanner from
+    // the resumed transcript, so its history reaches neither the chat nor the
+    // detectors below.
+    resumeSessionId: resumeSessionIdFromArgs(session.claudeArgs) ?? undefined,
     workingDirectory: session.path,
+    configDir: accountConfigDir ?? undefined,
     onMessage: message => {
-      session.client.sendClaudeSessionMessage(message);
+      forwardToChat(message);
       // Detect and report tool errors to the error log system
       toolErrorDetector.processMessage(message, session.sessionId);
       // Detect and report Anthropic API errors to the error log system (#1232)
@@ -128,9 +146,12 @@ export async function claudeLocalLauncher(
     onRawLine: raw => session.backgroundAgentTracker.onTranscriptLine(raw),
   });
 
-  // Issue #4383: hand the tracker this session's reconcile context (the local
-  // launcher watches the host projects tree — no account-config override).
-  session.setBackgroundAgentContext({ workingDirectory: session.path });
+  // Issue #4383: hand the tracker this session's reconcile context (the same
+  // account-config dir the scanner watches, #1573 / #6088).
+  session.setBackgroundAgentContext({
+    configDir: accountConfigDir ?? undefined,
+    workingDirectory: session.path,
+  });
 
   const handleSessionFound = (sessionId: string) => {
     scanner.onNewSession(sessionId);
@@ -237,7 +258,7 @@ export async function claudeLocalLauncher(
       // non-host account (native owns refresh). null falls through to the
       // env-token path, which AUGMENTS — never replaces — isolation (Fallback
       // Preservation Rule) and carries the unknown/unrefreshable throws (R3/R4).
-      const accountConfigDir = await resolveAccountConfigDirForSession(session);
+      // The config dir was resolved up front (above createSessionScanner, #6088).
       const accountToken = accountConfigDir
         ? null
         : await resolveAccountTokenForSession(session);

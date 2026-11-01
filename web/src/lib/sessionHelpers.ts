@@ -7,6 +7,7 @@ import {
   formatModelName,
   MODEL_MODE_LABELS,
   HARNESS_MANIFESTS,
+  isMaxClassSubscription,
   NATIVE_SESSION_ID_ABSENT,
   resolveNativeSessionIdAxis,
 } from "@hapi/protocol";
@@ -315,7 +316,10 @@ export function getDefaultModelResolutionLabel(session: SessionLike): string {
  */
 export function isModelDowngraded(session: SessionLike): boolean {
   // Only Max accounts are entitled above Sonnet/200k — Pro/empty are not.
-  if (session.metadata?.claudeAccount?.subscriptionType !== "max") {
+  // #6095: "ultra" (the renamed Max 20x plan) carries the same entitlement.
+  if (
+    !isMaxClassSubscription(session.metadata?.claudeAccount?.subscriptionType)
+  ) {
     return false;
   }
   // Explicit Sonnet selection is intentional, not a silent downgrade.

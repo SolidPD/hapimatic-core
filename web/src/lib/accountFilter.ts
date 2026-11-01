@@ -23,7 +23,7 @@
  * the strict `kind === "weekly_scoped"` predicate stays byte-identical to the sort's
  * (NOT the looser `display_name === "Fable"` paraphrase).
  */
-import type { AccountUsage } from "@hapi/protocol";
+import { normalizeUsageRow, type AccountUsage } from "@hapi/protocol";
 import { getStorageKey } from "@/lib/storage-keys";
 import { sortValue } from "@/lib/accountSort";
 
@@ -88,9 +88,11 @@ export function matchesFilters(
   account: AccountUsage,
   f: AccountFilters
 ): boolean {
+  // #6095: a 5-hour window Anthropic no longer reports counts as 0 % used —
+  // remaining capacity — instead of a missing datum that hides the account.
   if (
     f.fiveHour === "remaining" &&
-    !hasRemaining(account.utilization.five_hour?.utilization)
+    !hasRemaining(normalizeUsageRow(account).utilization.five_hour?.utilization)
   ) {
     return false;
   }

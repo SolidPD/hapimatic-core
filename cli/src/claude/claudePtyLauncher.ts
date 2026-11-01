@@ -3,10 +3,9 @@ import { logger } from "@/ui/logger";
 import { Session } from "./session";
 import { Future } from "@/utils/future";
 import { createSessionScanner } from "./utils/sessionScanner";
-import {
-  createWebEchoSuppressor,
-  shouldSuppressUserEcho,
-} from "./utils/webEchoSuppressor";
+import { resumeSessionIdFromArgs } from "./utils/resumeArgs";
+import { createTranscriptForwarder } from "./services/transcriptForwarder";
+import { createWebEchoSuppressor } from "./utils/webEchoSuppressor";
 import { ToolErrorDetector } from "./utils/toolErrorDetector";
 import { ApiErrorDetector } from "./utils/apiErrorDetector";
 import { CronUsageDetector } from "./utils/cronUsageDetector";
@@ -234,18 +233,24 @@ export async function claudePtyLauncher(
   // through submit, so their echo is never suppressed (Fallback Preservation).
   const webEchoSuppressor = createWebEchoSuppressor();
 
+  // Issue #1719 / #6088: what reaches the chat. The forwarder skips the
+  // duplicate web-user echo (Message A already rendered it) and Claude Code's
+  // "No response requested." placeholder; only the chat send is gated — the
+  // detectors below still see every record.
+  const forwardToChat = createTranscriptForwarder(session.client, {
+    webEchoSuppressor,
+  });
+
   const scanner = await createSessionScanner({
     sessionId: session.sessionId,
+    // Issue #6088 (SINK-1): a fresh `--resume` process seeds the scanner from
+    // the resumed transcript, so its history reaches neither the chat nor the
+    // detectors below.
+    resumeSessionId: resumeSessionIdFromArgs(session.claudeArgs) ?? undefined,
     workingDirectory: session.path,
     configDir: accountConfigDir ?? undefined,
     onMessage: message => {
-      // Issue #1719: skip the duplicate web-user echo (Message A already
-      // rendered it). Only this send is gated — the detectors below still run
-      // (they act on tool/agent/system messages; a suppressed user-text echo is
-      // inert to them, and transcript activity must still clear a TUI prompt).
-      if (!shouldSuppressUserEcho(message, webEchoSuppressor)) {
-        session.client.sendClaudeSessionMessage(message);
-      }
+      forwardToChat(message);
       toolErrorDetector.processMessage(message, session.sessionId);
       // Detect and report Anthropic API errors to the error log system (#1232)
       apiErrorDetector.processMessage(message, session.sessionId);

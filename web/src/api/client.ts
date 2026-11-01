@@ -83,7 +83,7 @@ import type {
   BookmarkUpsertRequest,
   BookmarkUpsertResponse,
 } from "@hapi/protocol";
-import { serializeNotes } from "@hapi/protocol";
+import { normalizeUsageRow, serializeNotes } from "@hapi/protocol";
 import type {
   CapabilityCatalogResponse,
   CapabilityAuditResponse,
@@ -1313,9 +1313,15 @@ export class ApiClient {
     // #1909: `?force=1` makes the aggregator do a real upstream refresh of the
     // local node (manual refresh button); the default read serves the cache.
     const query = opts?.force ? "?force=1" : "";
-    return await this.request<AccountUsageResponse>(
+    const data = await this.request<AccountUsageResponse>(
       `/api/federation/accounts/usage${query}`
     );
+    // #6095: the server already serves a missing 5-hour window as 0 %; normalize
+    // again here (idempotent) so every web view reads the same rule even from a
+    // node that predates it. The one seam both the poll and force refresh use.
+    return Array.isArray(data?.usage)
+      ? { ...data, usage: data.usage.map(normalizeUsageRow) }
+      : data;
   }
 
   // Federation-wide non-Anthropic provider auth state (issue #3806, epic #3345).
@@ -2561,6 +2567,7 @@ export class ApiClient {
     /**
      * #4793: a broker-served account also carries the linking user's email, whether it is their
      * default, and its connection status; a `gh` / REST account has only login and name.
+     * #6085: `statusUnchecked: true` when GitHub did not confirm that status in time.
      */
     accounts: Array<{
       login: string;
@@ -2568,6 +2575,7 @@ export class ApiClient {
       email?: string;
       isDefault?: boolean;
       status?: GitHubConnectionStatus;
+      statusUnchecked?: boolean;
     }>;
     error?: string;
     /** #2327: machine-readable failure cause when `success` is false. */

@@ -7,6 +7,7 @@ import {
   computePlanLabel,
   computeUtilizationScore,
   isEnvTokenAccount,
+  withEffectiveFiveHour,
   type AccountUsage,
   type StoredAccount,
   type Utilization,
@@ -700,8 +701,15 @@ export class UsageService {
   private buildUsage(
     account: RedactedAccount,
     status: AccountUsage["status"],
-    utilization: Utilization
+    rawUtilization: Utilization
   ): AccountUsage {
+    // #6095: a successful read whose 5-hour window Anthropic no longer reports
+    // is served as 0 % with no reset, so every reader of this envelope (server
+    // consumers, the web, federation peers, rp1-home's selector) sees a usable
+    // meter. Degraded statuses keep their `{}` utilization and stay unknown. The
+    // `rate_limited` last-good path copies an already-normalized prior row.
+    const utilization =
+      status === "ok" ? withEffectiveFiveHour(rawUtilization) : rawUtilization;
     return {
       accountUuid: account.accountUuid,
       displayLabel: account.displayName || account.emailAddress,

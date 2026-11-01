@@ -25,6 +25,7 @@
 import {
   UtilizationSchema,
   computeUtilizationScore,
+  withEffectiveFiveHour,
 } from "@hapi/protocol/usage";
 import type { AccountIndexEntry } from "@hapi/protocol/accounts";
 import { logger } from "@/ui/logger";
@@ -153,13 +154,17 @@ export async function sampleAccountUtilization(
     }
     const parsed = UtilizationSchema.safeParse(data);
     if (!parsed.success) return { status: "unknown", score: null };
+    // #6095: a missing 5-hour window on this successful read is a 5-hour limit at
+    // 0 % with no reset (Anthropic removed it from Max 20x), not "no signal".
+    const util = withEffectiveFiveHour(parsed.data);
     return {
       status: "ok",
-      score: computeUtilizationScore(parsed.data, { now: now() }),
+      score: computeUtilizationScore(util, { now: now() }),
       // #3611: stash the raw window utilizations from the SAME parsed usage for the
-      // optimal-pick tie-break (R9). `?? null` so an absent window is "no signal".
-      fiveHourUtilization: parsed.data.five_hour?.utilization ?? null,
-      sevenDayUtilization: parsed.data.seven_day?.utilization ?? null,
+      // optimal-pick tie-break (R9). `?? null` keeps a window that is still unknown
+      // (no weekly meter either) as "no signal".
+      fiveHourUtilization: util.five_hour?.utilization ?? null,
+      sevenDayUtilization: util.seven_day?.utilization ?? null,
     };
   } catch {
     // Network failure, timeout (AbortError), or malformed JSON → undetermined. Never log

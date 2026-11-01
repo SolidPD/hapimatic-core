@@ -13,8 +13,10 @@ import {
   GITHUB_MANAGE_HREF,
   GITHUB_SETTINGS_HREF,
   GITHUB_STATUS_PRESENTATION,
+  GITHUB_STATUS_UNCHECKED_NOTE,
   githubConnectHref,
   groupGitHubAccountsByLinker,
+  isGitHubStatusUnchecked,
 } from "@/lib/githubConnections";
 
 /**
@@ -121,6 +123,16 @@ function AccountRow(props: { account: GitHubAccount }) {
         {status && (
           <span className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
             {status.detail}
+          </span>
+        )}
+        {/* #6085: hapimatic.com could not confirm this status with GitHub in time. A plain line:
+            one live region per row would be noisy, and the row keeps its one action link. */}
+        {isGitHubStatusUnchecked(account) && (
+          <span
+            className="text-[length:var(--text-caption)] text-[var(--status-warn)]"
+            data-testid={`github-account-${account.login}-unchecked`}
+          >
+            {GITHUB_STATUS_UNCHECKED_NOTE}
           </span>
         )}
       </div>

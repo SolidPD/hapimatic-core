@@ -6,7 +6,11 @@ import { CONTROL_BASE, ControlChevron } from "./controls";
 import { Button } from "@/components/ui/button";
 import { BareButton } from "@/components/ui/BareButton";
 import type { GitHubAccount, GitHubRepo } from "@/hooks/queries/useGitHubRepos";
-import { GITHUB_SETTINGS_HREF } from "@/lib/githubConnections";
+import {
+  GITHUB_SETTINGS_HREF,
+  GITHUB_STATUS_UNCHECKED_NOTE,
+  isGitHubStatusUnchecked,
+} from "@/lib/githubConnections";
 
 /** #4793 (ruling D-4793-3): the Repo field's one line on a broker-backed host. */
 export const CLONE_UNAVAILABLE_TEXT =
@@ -153,9 +157,13 @@ export function GitHubAccountRepoSelector(props: {
   // GitHub"; every failure reason keeps its own wording (finding 4793-5).
   const isBroker = accountsSource === "broker" && !isUnavailable;
   const offerConnect = isBroker && noAccounts && !isLoadingAccounts;
-  const selectedStatus = selectedAccount
-    ? accounts.find(x => x.login === selectedAccount)?.status
+  const selectedEntry = selectedAccount
+    ? accounts.find(x => x.login === selectedAccount)
     : undefined;
+  const selectedStatus = selectedEntry?.status;
+  // #6085: hapimatic.com could not confirm the selected link's status with GitHub in time.
+  const selectedUnchecked =
+    selectedEntry !== undefined && isGitHubStatusUnchecked(selectedEntry);
 
   // Compact account-field summary. Four states, in priority order.
   let accountSummary: string;
@@ -244,6 +252,11 @@ export function GitHubAccountRepoSelector(props: {
                 : "GitHub access was removed. Re-link in Settings"}
             </a>
           )}
+        {isBroker && selectedUnchecked && (
+          <p className="text-[length:var(--text-caption)] text-[var(--status-warn)]">
+            {GITHUB_STATUS_UNCHECKED_NOTE}
+          </p>
+        )}
       </FormField>
 
       {detectedRepo ? (

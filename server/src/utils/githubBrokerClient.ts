@@ -206,12 +206,16 @@ function toAccount(raw: unknown): GitHubAccountResult | null {
   if (typeof r.isDefault === "boolean") account.isDefault = r.isDefault;
   const status = asGitHubConnectionStatus(r.status);
   if (status) account.status = status;
+  // #6085: kept only when the gateway sent the boolean `true`. Anything else, including a missing
+  // field, is treated as checked (an older gateway sends no flag, so it cannot say).
+  if (r.statusUnchecked === true) account.statusUnchecked = true;
   return account;
 }
 
 /**
  * The GitHub accounts the VM's users linked on hapimatic.com (#4793), default first, each with its
- * email, status and default mark. The WHOLE list: an empty list is a SUCCESS (`ok: true`, no
+ * email, status and default mark, and `statusUnchecked: true` when GitHub did not confirm that
+ * status in time (#6085). The WHOLE list: an empty list is a SUCCESS (`ok: true`, no
  * accounts — the Create page then offers "Connect GitHub"), never `broker_unavailable`, which is
  * a real outage (finding 4793-5). The gateway never lists its own credential here (R8).
  */

@@ -47,6 +47,7 @@ import {
   JOB_KIND_IN_PROCESS_LOOP,
   formatReloginMessage,
   isEnvTokenAccount,
+  isMaxClassSubscription,
   generateSessionId,
   type JobRegistry,
 } from "@hapi/protocol";
@@ -369,7 +370,11 @@ export function isSessionModelDowngraded(session: {
   contextWindowTokens?: number;
   metadata?: { claudeAccount?: { subscriptionType?: string } } | null;
 }): boolean {
-  if (session.metadata?.claudeAccount?.subscriptionType !== "max") return false;
+  // #6095: "ultra" (the renamed Max 20x plan) carries the same entitlement.
+  if (
+    !isMaxClassSubscription(session.metadata?.claudeAccount?.subscriptionType)
+  )
+    return false;
   if (session.modelMode === "sonnet") return false;
   // Explicit Fable selection is likewise intentional (issue #1633) — mirror of
   // web/src/lib/sessionHelpers.ts `isModelDowngraded`. Keep the two in sync.

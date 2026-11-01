@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { AccountUsage, UsageLimitKey } from "@hapi/protocol";
+import {
+  isSyntheticWindow,
+  type AccountUsage,
+  type UsageLimitKey,
+} from "@hapi/protocol";
 import type { PushPayload } from "../push/pushService";
 import {
   NO_RESET_WINDOW,
@@ -94,6 +98,9 @@ export class UsageAlertService {
 
       for (const limitKey of ALERT_LIMIT_KEYS) {
         const window = usage.utilization?.[limitKey];
+        // #6095: a filled-in 5-hour window (0 %, no reset) can never cross a
+        // threshold; skip it so no no-reset alert key is evaluated every pass.
+        if (isSyntheticWindow(window)) continue;
         const util = window?.utilization;
         if (typeof util !== "number" || !Number.isFinite(util)) continue;
 

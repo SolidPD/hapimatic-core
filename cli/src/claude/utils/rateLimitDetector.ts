@@ -106,7 +106,7 @@ export class RateLimitDetector {
    */
   constructor(
     private readonly onRateLimited?: (
-      sessionId: string,
+      sessionId: string | null,
       info: RateLimitResetInfo
     ) => void,
     /**
@@ -116,7 +116,7 @@ export class RateLimitDetector {
      * on a bare turn-end. Fired only on the transition, never on every
      * forward-progress record (else every assistant fragment triggers a keepAlive).
      */
-    private readonly onCleared?: (sessionId: string) => void,
+    private readonly onCleared?: (sessionId: string | null) => void,
     /**
      * #4936: fired for each record the shared classifier calls an API spend
      * cap / user-set spend limit. Such a record never latches the session-limit
@@ -126,7 +126,7 @@ export class RateLimitDetector {
      * clear the false "usage limit" match used to provide (`TurnEndDetector`
      * ignores synthetic records, and no Stop hook fires on API-error turns).
      */
-    private readonly onSpendLimit?: (sessionId: string) => void
+    private readonly onSpendLimit?: (sessionId: string | null) => void
   ) {}
 
   /** True while a session-limit 429 is latched (no forward progress since). */
@@ -138,15 +138,19 @@ export class RateLimitDetector {
    * Process a parsed JSONL/SDK-converted message. Call for every message emitted
    * by the session scanner or SDK-to-log converter (same seam as
    * ToolErrorDetector / AuthErrorDetector).
+   *
+   * Issue #6088 (SINK-5): every edge this takes fires its callback, whatever the
+   * `sessionId` (null included). The callbacks act on the session they were
+   * built for and ignore the id, so withholding one would consume the edge for
+   * nothing: a 429 seen before the id is known would never raise the chip, and
+   * a recovery seen then would leave it stuck.
    */
   processMessage(message: RawJSONLines, sessionId: string | null): void {
     // #4936: a spend cap / user-set spend limit is not a usage window — no
     // latch, and not forward progress either. Clear "thinking" instead.
     const signal = extractApiLimitSignal(message);
     if (signal && classifyApiLimitSignal(signal).kind === "spend-limit") {
-      if (sessionId) {
-        this.onSpendLimit?.(sessionId);
-      }
+      this.onSpendLimit?.(sessionId);
       return;
     }
 
@@ -169,9 +173,7 @@ export class RateLimitDetector {
             structured !== null ? "structured" : "text"
           }) (issue #1647)`
         );
-        if (sessionId) {
-          this.onRateLimited?.(sessionId, info);
-        }
+        this.onRateLimited?.(sessionId, info);
       }
       return;
     }
@@ -183,9 +185,7 @@ export class RateLimitDetector {
     if (isForwardProgress(message)) {
       if (this.limited) {
         this.limited = false;
-        if (sessionId) {
-          this.onCleared?.(sessionId);
-        }
+        this.onCleared?.(sessionId);
       }
     }
   }
@@ -404,7 +404,7 @@ function parseResetEpoch(resetText: string, now: number): number | null {
       const day = parseInt(monthDay[2], 10);
       const year = monthDay[3] ? parseInt(monthDay[3], 10) : today.year;
       if (!isCalendarDate(year, month, day)) return null;
-      return epochForTzWallClock(year, month, day, hour, minute, tz);
+      return epochForTzWallClock(year, month, day, hour, minute, tz, now);
     }
     if (MONTH_NAME.test(body)) return null;
 
@@ -444,11 +444,15 @@ function isCalendarDate(year: number, month: number, day: number): boolean {
 
 /**
  * The epoch ms of hour:minute on the calendar day `aheadDays` after `today`
- * (in `tz`, or local time when tz is undefined). If that instant is not after
- * `now`, step `stepDays` further (1 for a clock-only reset, 7 for a weekday).
- * The roll is built from the calendar date, never by adding a fixed 24 h, so a
- * DST change in between does not shift the wall clock. Returns null on any
- * failure (e.g. an invalid tz name).
+ * (in `tz`, or local time when tz is undefined). If no instant of it is after
+ * `now`, step `stepDays` further, once (1 for a clock-only reset, 7 for a
+ * weekday). The roll is built from the calendar date, never by adding a fixed
+ * 24 h, so a DST change in between does not shift the wall clock. Issue #6088
+ * (SINK-7): on a fall-back day a wall clock in the repeated hour names two
+ * instants; exactly one after `now` is the answer, two is ambiguous (null). A
+ * wall clock in a spring-forward gap names none that day, so the occurrence
+ * `stepDays` later is tried. Returns null on any failure (e.g. an invalid tz
+ * name).
  */
 function nextOccurrenceEpoch(
   today: { year: number; month: number; day: number },
@@ -459,11 +463,11 @@ function nextOccurrenceEpoch(
   tz: string | undefined,
   now: number
 ): number | null {
-  const onDay = (days: number): number | null => {
+  const futureOn = (days: number): number[] | null => {
     const date = new Date(
       Date.UTC(today.year, today.month - 1, today.day + days)
     );
-    return epochForTzWallClock(
+    const instants = wallClockInstants(
       date.getUTCFullYear(),
       date.getUTCMonth() + 1,
       date.getUTCDate(),
@@ -471,10 +475,15 @@ function nextOccurrenceEpoch(
       minute,
       tz
     );
+    return instants === null ? null : instants.filter(i => i > now);
   };
-  const candidate = onDay(aheadDays);
-  if (candidate === null) return null;
-  return candidate > now ? candidate : onDay(aheadDays + stepDays);
+  for (const days of [aheadDays, aheadDays + stepDays]) {
+    const future = futureOn(days);
+    if (future === null) return null;
+    if (future.length === 1) return future[0];
+    if (future.length > 1) return null;
+  }
+  return null;
 }
 
 /** Extract year/month/day/weekday for an instant as rendered in a timezone. */
@@ -511,12 +520,14 @@ function tzParts(
   }
 }
 
+/** Hours either side of the two-pass answer at which the zone offset is probed. */
+const OFFSET_PROBE_MS = 6 * 60 * 60 * 1000;
+
 /**
- * Invert a wall-clock time in a timezone to an epoch ms. Formats a UTC guess
- * in the tz to measure the offset, corrects, then measures the offset AGAIN at
- * the corrected instant: when a DST change falls between the guess and the
- * answer, the two offsets differ by an hour and one pass lands an hour off
- * (#6065).
+ * Invert a wall-clock time on a given date in a timezone to an epoch ms
+ * (#6088, SINK-7). A time in a fall-back repeated hour names two instants: the
+ * one still after `now` when exactly one is, else null (ambiguous). A time in a
+ * spring-forward gap names none: null.
  */
 function epochForTzWallClock(
   year: number,
@@ -524,8 +535,35 @@ function epochForTzWallClock(
   day: number,
   hour: number,
   minute: number,
-  tz: string | undefined
+  tz: string | undefined,
+  now: number
 ): number | null {
+  const instants = wallClockInstants(year, month, day, hour, minute, tz);
+  if (instants === null || instants.length === 0) return null;
+  if (instants.length === 1) return instants[0];
+  const future = instants.filter(i => i > now);
+  return future.length === 1 ? future[0] : null;
+}
+
+/**
+ * Every instant that renders as this wall-clock time in the timezone, sorted
+ * (0, 1, or 2 of them), or null on failure. Formats a UTC guess in the tz to
+ * measure the offset, corrects, then measures the offset AGAIN at the corrected
+ * instant: when a DST change falls between the guess and the answer, the two
+ * offsets differ by an hour and one pass lands an hour off (#6065). The offset
+ * is then also measured 6 h either side of that answer, so a time in a repeated
+ * hour finds both of its instants (#6088); each candidate counts only if it
+ * renders back to exactly the wanted wall clock. No zone changes offset twice
+ * within 12 h, and the largest DST shift in use is 2 h.
+ */
+function wallClockInstants(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  tz: string | undefined
+): number[] | null {
   try {
     const wanted = Date.UTC(year, month - 1, day, hour, minute);
     const offsetAt = (instant: number): number | null => {
@@ -544,7 +582,29 @@ function epochForTzWallClock(
     if (firstOffset === null) return null;
     const secondOffset = offsetAt(wanted - firstOffset);
     if (secondOffset === null) return null;
-    return wanted - secondOffset;
+    const answer = wanted - secondOffset;
+    const found = new Set<number>();
+    for (const probe of [
+      answer - OFFSET_PROBE_MS,
+      answer,
+      answer + OFFSET_PROBE_MS,
+    ]) {
+      const offset = offsetAt(probe);
+      if (offset === null) return null;
+      const candidate = wanted - offset;
+      const seen = tzPartsFull(new Date(candidate), tz);
+      if (
+        seen !== null &&
+        seen.year === year &&
+        seen.month === month &&
+        seen.day === day &&
+        seen.hour === hour &&
+        seen.minute === minute
+      ) {
+        found.add(candidate);
+      }
+    }
+    return [...found].sort((a, b) => a - b);
   } catch {
     return null;
   }

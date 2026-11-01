@@ -155,3 +155,26 @@ export function isSyntheticAssistantRecord(message: RawJSONLines): boolean {
   const inner = msg.message as Record<string, unknown> | null | undefined;
   return inner?.model === SYNTHETIC_MODEL;
 }
+
+/** The text of the placeholder Claude Code writes after an interrupted turn. */
+export const NO_RESPONSE_PLACEHOLDER_TEXT = "No response requested.";
+
+/**
+ * Issue #6088 (SINK-6): true for Claude Code's "No response requested."
+ * placeholder — a `<synthetic>` assistant record, not an API-error notice,
+ * whose only content block is that text. Claude Code writes it after an
+ * interrupted turn (it follows the turn's last tool_result). The default SDK
+ * launcher never puts it in the chat, so the transcript launchers drop it
+ * there too; the detectors still see it. A synthetic API-error notice (a
+ * usage-window 429, an auth 401) is not a placeholder and stays in the chat.
+ */
+export function isNoResponsePlaceholder(message: RawJSONLines): boolean {
+  if (!isSyntheticAssistantRecord(message)) return false;
+  const msg = message as Record<string, unknown>;
+  if (msg.isApiErrorMessage === true) return false;
+  const inner = msg.message as Record<string, unknown> | null | undefined;
+  const content = inner?.content;
+  if (!Array.isArray(content) || content.length !== 1) return false;
+  const block = content[0] as Record<string, unknown> | null | undefined;
+  return block?.type === "text" && block.text === NO_RESPONSE_PLACEHOLDER_TEXT;
+}

@@ -6,6 +6,7 @@ import {
   ProviderAccountUsageSchema,
   type ProviderAccountUsage,
   defineCapability,
+  normalizeUsageRow,
 } from "@hapi/protocol";
 import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import { cataloged } from "../../../capabilities/cataloged";
@@ -251,7 +252,10 @@ export function createFederationUsageRoutes(
       }
 
       return c.json({
-        usage: mergeAccountUsage(all),
+        // #6095: normalize AFTER the merge so a peer still on an older binary
+        // (which sends `five_hour: null`) is read as 0 % too. Idempotent — rows
+        // this node already normalized pass through by reference.
+        usage: mergeAccountUsage(all).map(normalizeUsageRow),
         providerUsage: mergeProviderUsage(allProvider),
       });
     }

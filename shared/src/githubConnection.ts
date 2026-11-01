@@ -8,6 +8,11 @@
  * drift (the #2391 lesson). The gateway keeps its own copy in gateway/src/lib/githubConnections.ts
  * because it deploys standalone, without `shared/`; the four values must stay identical.
  *
+ * A status the gateway could not confirm with GitHub in time arrives with a separate
+ * `statusUnchecked: true` beside it (#6085). That flag is not a fifth status: the status stays the
+ * stored value (the last known one, or a first link's provisional one), so this list and the
+ * gateway's copy keep four values.
+ *
  *   - `connected`: the App is installed where the user can see it; private repositories list too.
  *   - `not_installed`: authorized but not installed; public repositories only.
  *   - `expired`: the refresh token is dead; the user must re-link.

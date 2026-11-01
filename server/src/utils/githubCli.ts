@@ -67,6 +67,11 @@ export interface GitHubAccountResult {
   isDefault?: boolean;
   /** #4793, broker only: the link's status (an install hint for `not_installed`, re-link for the rest). */
   status?: GitHubConnectionStatus;
+  /**
+   * #6085, broker only: GitHub did not confirm `status` in time, so it may be out of date.
+   * Present only when true; an older gateway never sends it.
+   */
+  statusUnchecked?: boolean;
 }
 
 /** A repository accessible to a host GitHub account. */

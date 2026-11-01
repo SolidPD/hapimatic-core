@@ -91,6 +91,30 @@ export const GITHUB_STATUS_PRESENTATION: Record<
 };
 
 /**
+ * The note under a linked account whose status hapimatic.com could not confirm with GitHub in time
+ * (`statusUnchecked`, #6085): the status shown is the stored one (the last known, or a first link's
+ * provisional status). Settings → Connectors and the Create page share it, so the two never word it
+ * differently. It carries the same message as hapimatic.com's own warning
+ * (`GITHUB_STATUS_UNCHECKED_NOTICE` in gateway/src/routes/githubConnect.ts) and what its
+ * "Installation status not checked" page already told the user ("reopen the page there after that").
+ * A standalone line, so no terminal period.
+ */
+export const GITHUB_STATUS_UNCHECKED_NOTE =
+  "Could not check this account's status with GitHub just now, so it may be out of date. Reopen this page in a minute or two";
+
+/**
+ * Whether to show {@link GITHUB_STATUS_UNCHECKED_NOTE} for an account (#6085): only a linked
+ * (broker) account has a status, and the flag counts only when it is strictly `true`. One rule for
+ * Settings → Connectors and the Create page, so the surfaces never disagree.
+ */
+export function isGitHubStatusUnchecked(account: {
+  status?: GitHubConnectionStatus;
+  statusUnchecked?: boolean;
+}): boolean {
+  return account.status !== undefined && account.statusUnchecked === true;
+}
+
+/**
  * Where each row action goes. Install and re-link open hapimatic.com's manage page, whose row for
  * the same account carries the App's install URL and the account's re-link id — neither reaches
  * the VM. Configure opens GitHub directly.
