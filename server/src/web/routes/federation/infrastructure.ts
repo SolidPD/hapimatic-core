@@ -21,7 +21,10 @@ import {
   fetchGitHubAccounts,
   fetchGitHubRepos,
 } from "../../../utils/githubCli";
-import { getDaemonCapacity } from "../../../utils/daemonControlClient";
+import {
+  getDaemonCapacity,
+  getDaemonSpawnDefaults,
+} from "../../../utils/daemonControlClient";
 
 export function createInfrastructureRoutes(
   deps: FederationDeps
@@ -76,7 +79,12 @@ export function createInfrastructureRoutes(
       // the consumer degrades to "unknown"). `sessionCount` is left exactly as-is
       // — it is a DIFFERENT number (live session records, NOT the spawn-gate
       // count) and must NOT be overloaded (the load-bearing #1477 constraint).
-      const capacity = await getDaemonCapacity();
+      // Issue #6028: the daemon's spawn default effort rides alongside, from
+      // its sibling /spawn-defaults endpoint; omitted on error (optional field).
+      const [capacity, spawnDefaults] = await Promise.all([
+        getDaemonCapacity(),
+        getDaemonSpawnDefaults(),
+      ]);
       const capacityFields =
         "error" in capacity
           ? {}
@@ -110,6 +118,10 @@ export function createInfrastructureRoutes(
           // as version.ts's defaultDirectory, re-emitted on the fed-token channel).
           homeDir: homedir(),
           ...capacityFields,
+          // Issue #6028: the node's resolved spawn default effort (optional).
+          ...("error" in spawnDefaults
+            ? {}
+            : { defaultEffort: spawnDefaults.effort }),
         },
       });
     }

@@ -90,6 +90,14 @@ export function AccountChip(props: {
    * previews). Absent ⇒ the email, so every existing chip is byte-identical. */
   colorSeed?: string;
   className?: string;
+  /** #5467 S7: extra classes on the name only (not the monogram bubble), e.g.
+   * the dotted underline that marks a nickname as revealing its email. Absent ⇒
+   * byte-identical. */
+  labelClassName?: string;
+  /** #5467 S7: `false` drops the chip's own `title` when an outer
+   * `HoverTooltipButton` reveals the email, so desktop shows one bubble, not two.
+   * Default `true` (byte-identical). */
+  nativeTitle?: boolean;
 }) {
   const {
     email,
@@ -100,6 +108,8 @@ export function AccountChip(props: {
     maxChars = ACCOUNT_CHIP_MAX_CHARS,
     colorSeed,
     className = "",
+    labelClassName,
+    nativeTitle = true,
   } = props;
   const fullLabel = (label ?? "").trim() || accountShortName(email);
   const name = truncateAccountLabel(fullLabel, maxChars);
@@ -119,7 +129,11 @@ export function AccountChip(props: {
     <span
       data-testid="account-chip"
       title={
-        !email || fullLabel === email ? fullLabel : `${fullLabel} · ${email}`
+        !nativeTitle
+          ? undefined
+          : !email || fullLabel === email
+            ? fullLabel
+            : `${fullLabel} · ${email}`
       }
       className={`inline-flex min-w-0 max-w-full items-center gap-0.5 whitespace-nowrap rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] py-0.5 pl-0.5 text-[length:var(--text-caption-xs)] font-semibold leading-none text-[var(--app-fg)] ${
         compact ? "pr-0.5" : "pr-1"
@@ -134,7 +148,13 @@ export function AccountChip(props: {
       >
         {monoLetter}
       </span>
-      {compact ? null : <span className="truncate">{name}</span>}
+      {compact ? null : (
+        <span
+          className={labelClassName ? `truncate ${labelClassName}` : "truncate"}
+        >
+          {name}
+        </span>
+      )}
     </span>
   );
 }

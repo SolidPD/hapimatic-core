@@ -51,7 +51,10 @@ export type AddToProviderModalProps = {
  * Done runs only what has no prior pass (R7): the pasted code, a typed Codex
  * key, and every untested key row. Rows that passed a Test are already stored
  * (#4463 D-1 A), so Done skips them. On any failure the modal stays open with a
- * problem count and per-row messages. Cancel closes it; saved rows stay saved,
+ * problem count and per-row messages; the count follows the problem lines still
+ * shown (#5467 S12). While Done runs, the text inputs and the controls that
+ * start new work are locked, so nothing entered in that window is dropped when
+ * it closes (#5467 S8). Cancel closes it; saved rows stay saved,
  * a pending ChatGPT sign-in is cancelled, and a tenant VM's in-VM sign-in stays
  * resumable (R8, R11).
  *
@@ -137,8 +140,23 @@ function AddToProviderBody(props: AddToProviderModalProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [keyRows.savedCount]);
 
-  const [problems, setProblems] = useState(0);
+  // #5467 S12: the banner counts the problem lines still on screen, not the
+  // number the last Done returned, so a node change (which clears the login
+  // step's lines) or a fixed row drops the count at once. `doneRan` gates it to
+  // after a Done and clears once nothing is left to report.
+  const [doneRan, setDoneRan] = useState(false);
   const [running, setRunning] = useState(false);
+  const liveLoginProblems =
+    provider === "anthropic"
+      ? anthropic.problemCount
+      : provider === "openai"
+        ? openai.problemCount
+        : 0;
+  const liveProblems = liveLoginProblems + keyRows.failedCount;
+  const kept = keyRows.keptCount;
+  useEffect(() => {
+    if (doneRan && liveProblems === 0 && kept === 0) setDoneRan(false);
+  }, [doneRan, liveProblems, kept]);
 
   const loginSaved =
     provider === "anthropic"
@@ -152,7 +170,9 @@ function AddToProviderBody(props: AddToProviderModalProps) {
       : provider === "openai"
         ? (openai.pending ? 1 : 0) + (openai.codexKey.trim() ? 1 : 0)
         : 0;
-  const saved = loginSaved + keyRows.savedCount;
+  // #5467 S9: a key the server kept after a failed add is in the vault, so the
+  // footer counts it as saved; the banner says it has no account.
+  const saved = loginSaved + keyRows.savedCount + kept;
   const pending = loginPending + keyRows.pendingCount;
 
   const handleDone = async () => {
@@ -173,7 +193,7 @@ function AddToProviderBody(props: AddToProviderModalProps) {
         keyRows.addUntested(),
       ]);
       const total = loginProblems + keyProblems;
-      setProblems(total);
+      setDoneRan(total > 0);
       if (total === 0) onClose();
     } finally {
       setRunning(false);
@@ -199,14 +219,26 @@ function AddToProviderBody(props: AddToProviderModalProps) {
       </DialogHeader>
 
       <div className="-mx-1 flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto overflow-x-hidden px-1 py-1 text-sm text-[var(--app-fg)]">
-        {problems > 0 && (
+        {doneRan && (liveProblems > 0 || kept > 0) && (
           <div
-            className="rounded-md border border-[var(--accent-rose-400)] bg-red-900/20 px-3 py-2 text-red-400"
+            className="flex flex-col gap-1 rounded-md border border-[var(--accent-rose-400)] bg-red-900/20 px-3 py-2 text-red-400"
             role="alert"
             data-testid="add-modal-banner"
           >
-            {problems} problem{problems === 1 ? "" : "s"} · fix{" "}
-            {problems === 1 ? "it" : "them"} and press Done again
+            {liveProblems > 0 && (
+              <p>
+                {liveProblems} problem{liveProblems === 1 ? "" : "s"} · fix{" "}
+                {liveProblems === 1 ? "it" : "them"} and press Done again
+              </p>
+            )}
+            {/* #5467 S9: a kept key cannot be fixed here, so no retry prompt. */}
+            {kept > 0 && (
+              <p data-testid="add-modal-kept">
+                {kept === 1
+                  ? "1 key was saved without its account · remove it, then add it again"
+                  : `${kept} keys were saved without their accounts · remove them, then add them again`}
+              </p>
+            )}
           </div>
         )}
         {hasLogin && (
@@ -222,6 +254,7 @@ function AddToProviderBody(props: AddToProviderModalProps) {
             unknownNodeId={unknownNodeId}
             anthropic={provider === "anthropic" ? anthropic : undefined}
             openai={provider === "openai" ? openai : undefined}
+            locked={running}
           />
         )}
         <KeyEntryRows
@@ -229,6 +262,7 @@ function AddToProviderBody(props: AddToProviderModalProps) {
           provider={provider}
           uiNodeLabel={uiHostLabel}
           keyRows={keyRows}
+          locked={running}
         />
       </div>
 

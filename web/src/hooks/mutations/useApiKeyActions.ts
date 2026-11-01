@@ -6,6 +6,10 @@ import type {
   PatchApiKeyRequest,
 } from "@hapi/protocol/schemas";
 import { queryKeys } from "@/lib/query-keys";
+import {
+  addErrorGotNoAnswer,
+  addErrorLeftKeyStored,
+} from "@/components/AccountUsage/addModalDone";
 
 /** gemini and google keys are Google accounts too (#4463 R3). */
 function isGoogleProvider(provider: string | undefined): boolean {
@@ -44,6 +48,16 @@ export function useApiKeyActions(api: ApiClient | null) {
       return await api.addApiKey(input);
     },
     onSuccess: entry => invalidate(entry.provider),
+    // #4466 R18: a failed add can still have stored the key (its account mint
+    // failed and the rollback did too, #5429). Refresh the list so the kept key
+    // shows — one rule for every add surface (KeyEntryRows also refreshes).
+    // #5467 S1: so can an add that got no complete answer (a dropped
+    // connection, a timeout, a cancel) — its row says to check the list.
+    onError: err => {
+      if (addErrorLeftKeyStored(err) || addErrorGotNoAnswer(err)) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
+      }
+    },
   });
 
   // #4463 R6: one PATCH sets the key's name and monogram.

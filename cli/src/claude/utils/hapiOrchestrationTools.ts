@@ -78,6 +78,7 @@ export type SpawnSessionArgs = {
   name?: string;
   yolo?: boolean;
   accountUuid?: string;
+  forceAccount?: boolean;
   model?: string;
   modelMode?: string;
   effort?: string;
@@ -92,7 +93,9 @@ export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
     "Find machine ids with hapi_call {GET, /api/machines}. The peer bypasses " +
     "permission prompts unless you pass yolo: false; unless THIS session runs " +
     "in a bypass permission mode you MUST pass yolo: false, or the call is " +
-    "refused (agent_escalation_refused).",
+    "refused (agent_escalation_refused). A 409 account_exhausted means the " +
+    "pinned accountUuid is at a usage cap: pin the named alternative, or pass " +
+    "forceAccount: true to bind it anyway.",
   inputSchema: z.object({
     machineId: z.string().describe("Target machine id."),
     directory: z.string().describe("Absolute project directory."),
@@ -120,6 +123,15 @@ export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
         "Peer bypasses permission prompts; OMITTED MEANS TRUE. Pass false for a prompting peer."
       ),
     accountUuid: z.string().optional(),
+    // Issue #6028: the route accepts it and the 409 tells the caller to send
+    // it; without it here the zod object stripped the key and an agent could
+    // only repeat the same refused call.
+    forceAccount: z
+      .boolean()
+      .optional()
+      .describe(
+        "Bind accountUuid even when it is at a usage cap; the response then carries a forced_exhausted_account warning."
+      ),
     model: z
       .string()
       .optional()

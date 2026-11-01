@@ -51,20 +51,23 @@ let hadController = false;
 let controllerReloadFired = false;
 let registrationCleanup: (() => void) | null = null;
 
-/** True once a waiting SW has been detected (read by the update bar on mount). */
+/** True once a waiting SW has been detected (read by the update surfaces on mount). */
 export function isSwUpdatePending(): boolean {
   return swUpdatePending;
 }
 
 /**
  * Idempotently ask the browser to check for a fresh service worker (issue #3057).
- * Wraps the stored registration's `update()`. The single mint update bar calls this
+ * Wraps the stored registration's `update()`. The update reload engine calls this
  * after a pipeline apply reports the target server is healthy: the swap made the
  * server serve fresh static assets, so an explicit `update()` triggers the SW
  * machinery (updatefound → statechange:installed → markSwUpdateAvailable), whose
  * `waiting` latch then drives the guarded activation via {@link activateSwUpdate}.
+ * After the app's Refresh button reloads the page, the reloaded page calls it
+ * 3 s and 8 s after it mounts (#3277).
  * Best-effort — a missing registration or a rejected `update()` is swallowed; the
- * bar's activation timeout + a manual Reload retry cover that failure (R5/R6/R8).
+ * engine's activation timeout + the banner's manual reload retry cover that
+ * failure (R5/R6/R8).
  * Post-reload there is no waiting SW to find, so this is a safe no-op (no reload
  * loop).
  */

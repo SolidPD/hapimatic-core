@@ -884,7 +884,6 @@ export async function runDoctorCommand(
           "user-session": "👤 User Sessions",
           "dev-daemon": "🛠️  Dev Daemon",
           "dev-daemon-version-check": "🛠️  Dev Daemon Version Check (stuck)",
-          "dev-session": "🛠️  Dev Sessions",
           "dev-doctor": "🛠️  Dev Doctor",
           "dev-related": "🛠️  Dev Related",
           doctor: "🩺 Doctor",

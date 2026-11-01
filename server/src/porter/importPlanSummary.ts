@@ -31,14 +31,15 @@ export type { ImportPlanSummary };
 
 /**
  * #5601 (D4): what this server emits. The wire type keeps `policySkips`,
- * `notices` and `groups.memory` optional because an older server omitted them;
- * this server always sends them, and says so here so its own callers and tests
- * can rely on it.
+ * `notices`, `notImported` (#5625) and `groups.memory` optional because an
+ * older server omitted them; this server always sends them, and says so here
+ * so its own callers and tests can rely on it.
  */
 export type EmittedPlanSummary = ImportPlanSummary & {
   groups: EmittedImportGroups;
   policySkips: Omission[];
   notices: Omission[];
+  notImported: Omission[];
 };
 
 export function toPlanSummary(plan: ImportPlan): EmittedPlanSummary {
@@ -107,6 +108,7 @@ export function toPlanSummary(plan: ImportPlan): EmittedPlanSummary {
     omissions: plan.omissions,
     policySkips: plan.policySkips,
     notices: plan.notices,
+    notImported: plan.notImported,
     expiresAt: plan.createdAt + plan.ttlMs,
   };
 }

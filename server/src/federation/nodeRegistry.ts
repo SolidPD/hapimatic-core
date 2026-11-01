@@ -49,12 +49,21 @@ import type {
   ClaudeAccountInfo,
   DaemonCapSource,
 } from "@hapi/protocol/schemas";
+import type { EffortLevel } from "@hapi/protocol/effort";
 import type { SSEManager } from "../sse/sseManager";
 import type { PeerStore } from "../store/peerStore";
 import type { CachedRemoteSessions, NodeRegistryOptions } from "./types";
 import { createHomeUrlGuard } from "./secretTransport";
 import type { FileClaimSync } from "./fileClaimSync";
 import type { FileClaimSyncSnapshot } from "@hapi/protocol";
+import {
+  AccountExhaustionSchema,
+  SpawnAccountSchema,
+  SpawnWarningSchema,
+  type AccountExhaustion,
+  type SpawnAccount,
+  type SpawnWarning,
+} from "@hapi/protocol";
 import type { RedactedAccount } from "../services/accountService";
 // Issue #1537: type-only import (erased at build — no runtime coupling, does NOT
 // pull the systemd reconciler into the federation module graph). The wrappers
@@ -380,6 +389,45 @@ function isInvalidTokenBody(text: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Issue #5879: a peer's coded spawn refusal (`{type:"error", message, code,
+ * exhaustion?}`), or null when the body is not one. Bounded like
+ * `spawnApiKeyOnNode` (message ≤ 400, code ≤ 64); `exhaustion` is kept only when
+ * it validates against the whitelist schema (no token can ride through).
+ */
+export function parseSpawnRefusal(
+  text: string
+): { message: string; code: string; exhaustion?: AccountExhaustion } | null {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!json || typeof json !== "object") return null;
+  const answer = json as {
+    type?: unknown;
+    message?: unknown;
+    code?: unknown;
+    exhaustion?: unknown;
+  };
+  if (
+    answer.type !== "error" ||
+    typeof answer.message !== "string" ||
+    answer.message.length > 400 ||
+    typeof answer.code !== "string" ||
+    answer.code.length > 64
+  ) {
+    return null;
+  }
+  const exhaustion = AccountExhaustionSchema.safeParse(answer.exhaustion);
+  return {
+    message: answer.message,
+    code: answer.code,
+    ...(exhaustion.success ? { exhaustion: exhaustion.data } : {}),
+  };
 }
 
 /**
@@ -1477,7 +1525,19 @@ export class NodeRegistry {
     nodeId: string,
     body: FederationSpawnBody
   ): Promise<
-    { type: "success"; sessionId: string } | { type: "error"; message: string }
+    | {
+        type: "success";
+        sessionId: string;
+        warnings?: SpawnWarning[];
+        account?: SpawnAccount;
+      }
+    | {
+        type: "error";
+        message: string;
+        code?: string;
+        status?: number;
+        exhaustion?: AccountExhaustion;
+      }
   > {
     const state = this.nodeStates.get(nodeId);
     if (!state || state.status === "offline") {
@@ -1494,11 +1554,23 @@ export class NodeRegistry {
       const res = await this.fetchWithAuth(url, "POST", body);
       if (!res.ok) {
         const text = await res.text().catch(() => "");
+        // Issue #5879: keep a peer's coded refusal (e.g. 409 account_exhausted)
+        // intact — code, status and the validated exhaustion detail — with the
+        // same bounds as spawnApiKeyOnNode (#5127). Anything else keeps today's text.
+        const refusal = parseSpawnRefusal(text);
+        if (refusal) {
+          return { type: "error", ...refusal, status: res.status };
+        }
         return {
           type: "error",
           message: `Node returned ${res.status}: ${text}`,
         };
       }
+      // Issue #5879: the accept may carry headroom warnings and the pinned account.
+      const accept = (await res.json().catch(() => null)) as {
+        warnings?: unknown;
+        account?: unknown;
+      } | null;
       console.log(
         `[perf][spawn] stage=hub-dispatch-accept node=${nodeId} dir=${body.directory} ms=${Date.now() - perfDispatchT0}`
       );
@@ -1515,7 +1587,19 @@ export class NodeRegistry {
 
       // Node returns { type: "accepted" } — translate to success with empty
       // sessionId so the client knows to navigate to the session list.
-      return { type: "success", sessionId: "" };
+      const warnings = Array.isArray(accept?.warnings)
+        ? accept.warnings.flatMap(w => {
+            const p = SpawnWarningSchema.safeParse(w);
+            return p.success ? [p.data] : [];
+          })
+        : [];
+      const account = SpawnAccountSchema.safeParse(accept?.account);
+      return {
+        type: "success",
+        sessionId: "",
+        ...(warnings.length > 0 ? { warnings } : {}),
+        ...(account.success ? { account: account.data } : {}),
+      };
     } catch (err) {
       return {
         type: "error",
@@ -2956,6 +3040,10 @@ export class NodeRegistry {
     // and reports the source as "remote" (fail-open).
     recommendedConcurrent?: number;
     capSource?: DaemonCapSource;
+    // Issue #6028: the peer daemon's resolved spawn default effort, forwarded
+    // from its /federation/info. Undefined for a pre-#6028 peer → the Create
+    // page keeps the shared default label.
+    defaultEffort?: EffortLevel;
   }> {
     return Array.from(this.nodeStates.values()).map(s => ({
       nodeId: s.config.id,
@@ -2970,6 +3058,7 @@ export class NodeRegistry {
       maxConcurrent: s.info?.maxConcurrent,
       recommendedConcurrent: s.info?.recommendedConcurrent,
       capSource: s.info?.capSource,
+      defaultEffort: s.info?.defaultEffort,
     }));
   }
 

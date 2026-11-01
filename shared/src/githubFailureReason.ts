@@ -49,6 +49,7 @@ export const GITHUB_FAILURE_REASONS = [
   "forbidden",
   "network",
   "broker_unavailable",
+  "broker_not_configured",
   "unknown",
 ] as const;
 
@@ -82,6 +83,10 @@ export const GITHUB_REASON_MESSAGE: Record<GitHubFailureReason, string> = {
   // is not supposed to have a token (that is the #2672 property), so `no_token`
   // would render actively wrong guidance (finding 3013-7).
   broker_unavailable: "GitHub read broker unavailable — retry shortly",
+  // #4793: the gateway answered, and said its GitHub App is not configured yet (operator Task 0
+  // Part 2). Not an outage, so it never reads as "did not answer" or "retry shortly".
+  broker_not_configured:
+    "GitHub connections are not set up on hapimatic.com yet",
   unknown: "GitHub resolution failed",
 };
 
@@ -106,6 +111,8 @@ export const GITHUB_REASON_DISPLAY_TEXT: Record<GitHubFailureReason, string> = {
   network: "could not reach GitHub",
   // #3013: broker-outage fragment — NOT "no GitHub token" (finding 3013-7).
   broker_unavailable: "read broker unavailable",
+  // #4793: the gateway's GitHub App is not configured yet — not an outage.
+  broker_not_configured: "not set up on hapimatic.com yet",
   unknown: "resolution failed",
 };
 

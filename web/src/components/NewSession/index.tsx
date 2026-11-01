@@ -33,7 +33,11 @@ import { beginSpawnHandover, takeRetryForm } from "@/lib/spawn-draft";
 import { buildClaimedIssueIndex } from "@/lib/claimedIssues";
 import { selectOptimalAccountUuid } from "@/lib/selectOptimalAccount";
 import type { LinkedIssue } from "@hapi/protocol/types";
-import { validateSessionName } from "@hapi/protocol";
+import {
+  findUsageRowHardLock,
+  resolveModelFamily,
+  validateSessionName,
+} from "@hapi/protocol";
 import type { AgentType, SessionMode, SessionType } from "./types";
 import { ActionButtons } from "./ActionButtons";
 import { FooterBar } from "./FooterBar";
@@ -66,7 +70,8 @@ import {
   getSpawnPermissionModeOptionsForFlavor,
 } from "@hapi/protocol/modes";
 import type { ModelMode, PermissionMode } from "@hapi/protocol/modes";
-import type { EffortLevel } from "@hapi/protocol";
+import type { AccountUsage, EffortLevel } from "@hapi/protocol";
+import type { RedactedAccount } from "@/types/api";
 import { AgentSelector } from "./AgentSelector";
 import { CapabilityChips } from "./CapabilityChips";
 import { ProviderModelFields } from "./ProviderModelFields";
@@ -92,6 +97,7 @@ import {
   buildGitHubSummary,
 } from "./GitHubAccountRepoSelector";
 import { GitHubAccountSelectorModal } from "./GitHubAccountSelectorModal";
+import { GITHUB_SETTINGS_HREF } from "@/lib/githubConnections";
 import { GitHubRepoSelectorModal } from "./GitHubRepoSelectorModal";
 import { useGitHubSection } from "./useGitHubSection";
 import type { GitHubRepo } from "@/hooks/queries/useGitHubRepos";
@@ -127,6 +133,56 @@ import {
   defaultScheduleState,
   type ScheduleState,
 } from "./ScheduleSection";
+
+/** Issue #5879: whether a known usage row holds the account at a usage cap
+ *  (the server's refusal predicate; an unread or degraded row is not locked).
+ *  `modelFamily` adds that model's `weekly_scoped` window, as the server does. */
+function isAccountLocked(
+  usage: AccountUsage[],
+  accountUuid: string,
+  modelFamily: string | null
+): boolean {
+  return (
+    findUsageRowHardLock(
+      usage.find(u => u.accountUuid === accountUuid),
+      { modelFamily }
+    ) !== null
+  );
+}
+
+/** Issue #5879: `accountUuid`, or — when it is at a usage cap — the lowest-score
+ *  free account, else the first free, refreshable one. When every account is
+ *  locked it stays, and the server's 409 names the way out. */
+function freeAccountFor(
+  accountUuid: string,
+  scopedAccounts: RedactedAccount[],
+  usage: AccountUsage[],
+  modelFamily: string | null
+): string {
+  const isFree = (uuid: string) => !isAccountLocked(usage, uuid, modelFamily);
+  if (isFree(accountUuid)) return accountUuid;
+  // The served score ignores a model's own weekly window, so the lowest-score
+  // pick is taken from the free accounts only (the server's alternative).
+  const optimal = selectOptimalAccountUuid(
+    scopedAccounts.filter(a => isFree(a.accountUuid)),
+    usage
+  );
+  if (optimal) return optimal;
+  // Otherwise the first free account whose token is not known dead: an unread
+  // row is fine (fail-open), an expired or errored one is not.
+  const healthy = (uuid: string) => {
+    const status = usage.find(u => u.accountUuid === uuid)?.status;
+    return status === undefined || status === "ok" || status === "rate_limited";
+  };
+  return (
+    scopedAccounts.find(
+      a =>
+        a.unrefreshable !== true &&
+        isFree(a.accountUuid) &&
+        healthy(a.accountUuid)
+    )?.accountUuid ?? accountUuid
+  );
+}
 
 /** Imperative handle exposed to the page header (expand/collapse-all button). */
 export type NewSessionHandle = { toggleAll: () => void };
@@ -237,6 +293,12 @@ export const NewSession = forwardRef<
     return null;
   }, [spawnTarget, selectedRemoteNode]);
   const spawnCapacity = useSpawnCapacity(props.api, capacityTarget);
+  // Issue #6028: the target node's resolved spawn default effort (read through
+  // the same local poll / remote summary as the capacity), so the Effort
+  // "default" option names what the daemon will run. Undefined (an older daemon
+  // or peer) ⇒ the shared default.
+  const nodeDefaultEffort: EffortLevel | undefined =
+    spawnCapacity.defaultEffort;
 
   const meterTargetLabel = useMemo(
     () => buildMeterTargetLabel(spawnTarget, props.remoteNodes),
@@ -317,9 +379,22 @@ export const NewSession = forwardRef<
   // Distinguishes "not yet defaulted" from "user explicitly chose node-default".
   // A restored key pick (#4825) starts locked, as the original pick did.
   const accountInitializedRef = useRef(Boolean(retryForm?.apiKeyId));
+  // Issue #5879: true only while the account was picked through the picker's
+  // "at its usage limit" confirm — the spawn then sends forceAccount so the
+  // server does not refuse it. Any other account change clears it.
+  const [accountForced, setAccountForced] = useState(false);
+  // Issue #5879: the bound account came from the default (not a user pick), so
+  // the one-shot lock check below may swap it for a free account; and that
+  // check has not run yet for the current default (it re-arms when the default
+  // is handed back, and it keeps the usage query on until it runs).
+  const accountAutoPickedRef = useRef(false);
+  const [lockCheckPending, setLockCheckPending] = useState(true);
   const handleAccountChange = (uuid: string | null) => {
     accountInitializedRef.current = true;
+    accountAutoPickedRef.current = false;
+    setLockCheckPending(false);
     setAccountUuid(uuid);
+    setAccountForced(false);
     // #4568: picking an account replaces a picked API key.
     setApiKeyId(null);
   };
@@ -327,8 +402,11 @@ export const NewSession = forwardRef<
   // auto-select out (accountInitializedRef), so no default can re-bind one.
   const handleApiKeyChange = (id: string) => {
     accountInitializedRef.current = true;
+    accountAutoPickedRef.current = false;
+    setLockCheckPending(false);
     setApiKeyId(id);
     setAccountUuid(null);
+    setAccountForced(false);
   };
 
   const {
@@ -393,13 +471,25 @@ export const NewSession = forwardRef<
   // current agent flavor); collapsed to the wire `yolo` boolean in formState.
   const { prefs: adminPrefs } = useAdminPreferences();
   // #2042 (A4): the usage envelope carries each account's `score` (from #2039),
-  // used to auto-select the most-underutilized account on create. Gated on the
-  // preference so OFF performs zero fetch/poll — a true no-op (R2).
-  const { usage: accountUsage, isLoading: accountUsageLoading } =
-    useAccountUsage(
-      props.api,
-      !isRemoteTarget && adminPrefs.autoSelectOptimalAccount
-    );
+  // used to auto-select the most-underutilized account on create. Polled only
+  // while the preference is ON (R2). Issue #5879: with it OFF the snapshot is
+  // still read once for an Anthropic default, so a default at its usage cap is
+  // swapped for a free account (R8). The score stays ignored, and the query is
+  // disabled again (no poll) once that check has run or the user picks.
+  const usageForLockCheck =
+    lockCheckPending &&
+    accountSelectorProvider === undefined &&
+    accounts.some(a => (a.provider ?? "anthropic") === "anthropic");
+  const {
+    usage: accountUsage,
+    isLoading: accountUsageLoading,
+    dataUpdatedAt: accountUsageUpdatedAt,
+    error: accountUsageError,
+  } = useAccountUsage(
+    props.api,
+    !isRemoteTarget &&
+      (adminPrefs.autoSelectOptimalAccount || usageForLockCheck)
+  );
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() =>
     resolveSpawnPermissionMode(adminPrefs.defaultSpawnPermissionMode, agent)
   );
@@ -427,6 +517,10 @@ export const NewSession = forwardRef<
   const [modelMode] = useState<ModelMode>("default");
   const [rawModel, setRawModel] = useState("");
   const [effort, setEffort] = useState<EffortLevel | "">("");
+  // Issue #5879: the Claude model family this spawn names, so the account lock
+  // checks include that model's weekly window (as the server's refusal does).
+  const spawnModelFamily =
+    agent === "claude" ? resolveModelFamily(rawModel || modelMode) : null;
   // Issue #3348: gemini native model ("" = Auto), codex ChatGPT-token model
   // ("" = Default), codex reasoning effort ("" = default). Only the picker for
   // the current agent's native catalog renders (deriveFormState gates them via
@@ -562,6 +656,7 @@ export const NewSession = forwardRef<
     accountsLoading: githubAccountsLoading,
     accountsUnavailable: githubAccountsUnavailable,
     accountsReason: githubAccountsReason,
+    accountsSource: githubAccountsSource,
     repos: githubRepos,
     reposLoading: githubReposLoading,
     issues: repoIssues,
@@ -587,6 +682,15 @@ export const NewSession = forwardRef<
   useEffect(() => {
     if (detectedRepo != null && cloneRepoRef.current) applyCloneRepo(null);
   }, [detectedRepo, applyCloneRepo]);
+  // #4793 (D-4793-3): a broker-backed cloud VM cannot clone, so the Repo field is one line
+  // and any clone repo — a restored saved default included — is dropped. Keyed on cloneRepo
+  // too, so a restore that lands after the account list still never reaches the spawn.
+  // Like the restore setter's own clear, a dropped RESTORED repo hands the saved Git Type back.
+  useEffect(() => {
+    if (githubAccountsSource !== "broker" || !cloneRepo) return;
+    applyCloneRepo(null);
+    if (restoredGitTypeRef.current) setSessionType(restoredGitTypeRef.current);
+  }, [githubAccountsSource, cloneRepo, applyCloneRepo]);
 
   // hapimatic-private#4481: the Branch control (both Git Types). `markTouched`
   // comes from the defaults engine further down, which itself needs this hook's
@@ -645,20 +749,39 @@ export const NewSession = forwardRef<
       if (accountUsageLoading) return; // re-runs when usage settles
       const optimal = selectOptimalAccountUuid(scopedAccounts, accountUsage);
       if (optimal) {
-        setAccountUuid(optimal);
+        // Issue #5879: the score ignores a model's own weekly window, so the
+        // pick still goes through the lock check for the chosen model.
+        setAccountUuid(
+          freeAccountFor(
+            optimal,
+            scopedAccounts,
+            accountUsage,
+            spawnModelFamily
+          )
+        );
         accountInitializedRef.current = true;
+        accountAutoPickedRef.current = true;
         return;
       }
       // No eligible (ok + finite-score) account → fall through to the default.
     }
 
-    if (activeAccount) {
-      setAccountUuid(activeAccount.accountUuid);
-      accountInitializedRef.current = true;
-    } else if (!nodeAccountLoading && scopedAccounts.length > 0) {
-      setAccountUuid(scopedAccounts[0].accountUuid);
-      accountInitializedRef.current = true;
-    }
+    const fallback = activeAccount
+      ? activeAccount.accountUuid
+      : !nodeAccountLoading && scopedAccounts.length > 0
+        ? scopedAccounts[0].accountUuid
+        : null;
+    if (fallback === null) return;
+    // Issue #5879: never pre-select an account at its usage cap while another
+    // scoped account is free — the server refuses a pinned spawn onto it. The
+    // default is not held back for the usage read: whatever the snapshot shows
+    // now decides, and the one-shot check below swaps a locked pick once the
+    // read lands.
+    setAccountUuid(
+      freeAccountFor(fallback, scopedAccounts, accountUsage, spawnModelFamily)
+    );
+    accountInitializedRef.current = true;
+    accountAutoPickedRef.current = true;
   }, [
     activeAccount,
     nodeAccountLoading,
@@ -669,6 +792,72 @@ export const NewSession = forwardRef<
     accountUsageLoading,
     accountUsage,
     accountDefaultEpoch,
+    spawnModelFamily,
+  ]);
+
+  // Issue #5879: once the usage read lands (data or an error), check the
+  // auto-picked account against it ONE time and swap it if it sits at a usage
+  // cap. A user's pick is never swapped. The check then turns the usage query
+  // off again, so with the auto-select preference OFF there is no poll.
+  const accountUsageSettled =
+    !accountUsageLoading &&
+    (accountUsageUpdatedAt > 0 || accountUsageError !== null);
+  useEffect(() => {
+    if (!lockCheckPending || !accountUsageSettled) return;
+    if (accountAutoPickedRef.current && accountUuid !== null) {
+      const scopedAccounts = accounts.filter(
+        a =>
+          (a.provider ?? "anthropic") ===
+          (accountSelectorProvider ?? "anthropic")
+      );
+      const pick = freeAccountFor(
+        accountUuid,
+        scopedAccounts,
+        accountUsage,
+        spawnModelFamily
+      );
+      if (pick !== accountUuid) setAccountUuid(pick);
+    } else if (accountUuid === null && !accountInitializedRef.current) {
+      // Nothing is picked yet: the default effect decides with this snapshot.
+      return;
+    }
+    setLockCheckPending(false);
+  }, [
+    lockCheckPending,
+    accountUsageSettled,
+    accountUsage,
+    accountUuid,
+    accounts,
+    accountSelectorProvider,
+    spawnModelFamily,
+  ]);
+
+  // Issue #5879: picking a model can put the auto-picked account at that model's
+  // weekly cap (the Fable weekly window). Swap it once for a free account; a
+  // user's pick is never swapped — the picker shows it locked, with the
+  // "Use anyway" confirm.
+  const prevSpawnModelFamilyRef = useRef(spawnModelFamily);
+  useEffect(() => {
+    if (prevSpawnModelFamilyRef.current === spawnModelFamily) return;
+    prevSpawnModelFamilyRef.current = spawnModelFamily;
+    if (!accountAutoPickedRef.current || accountUuid === null) return;
+    const scopedAccounts = accounts.filter(
+      a =>
+        (a.provider ?? "anthropic") === (accountSelectorProvider ?? "anthropic")
+    );
+    const pick = freeAccountFor(
+      accountUuid,
+      scopedAccounts,
+      accountUsage,
+      spawnModelFamily
+    );
+    if (pick !== accountUuid) setAccountUuid(pick);
+  }, [
+    spawnModelFamily,
+    accountUuid,
+    accounts,
+    accountSelectorProvider,
+    accountUsage,
   ]);
 
   // #3808 Task 5: when the spawn's PROVIDER changes (an agent switch), reset the
@@ -680,7 +869,10 @@ export const NewSession = forwardRef<
     if (prevAccountProviderRef.current !== accountSelectorProvider) {
       prevAccountProviderRef.current = accountSelectorProvider;
       accountInitializedRef.current = false;
+      accountAutoPickedRef.current = false;
+      setLockCheckPending(true);
       setAccountUuid(null);
+      setAccountForced(false);
       // #4568: a key is a Claude credential — a provider change drops it too.
       setApiKeyId(null);
     }
@@ -941,7 +1133,9 @@ export const NewSession = forwardRef<
         cliHarness: setAgent,
         account: v => {
           accountInitializedRef.current = true;
+          accountAutoPickedRef.current = false;
           setAccountUuid(v);
+          setAccountForced(false);
           // #4568: a restored account replaces a picked key (one credential).
           setApiKeyId(null);
         },
@@ -1042,12 +1236,15 @@ export const NewSession = forwardRef<
       setSessionTypeUserSelected(false);
       // Reset session mode to standard (scheduled not supported on remote targets)
       applySessionMode("standard");
+      // #5879: an at-limit override is confirmed per target — a new target asks again.
+      setAccountForced(false);
       // #5127: a picked key's ref is relative to the target, so a target change
       // drops it — and hands the account default back (the key pick had locked
       // it out). An explicit account pick is left alone.
       if (apiKeyIdRef.current !== null) {
         setApiKeyId(null);
         accountInitializedRef.current = false;
+        setLockCheckPending(true);
         setAccountDefaultEpoch(e => e + 1);
       }
     },
@@ -1143,12 +1340,17 @@ export const NewSession = forwardRef<
       // #1496 R7 accountUuid) byte-for-byte. Runtime-only fields (emoji,
       // spawnCorrelationId) are merged here — they never live in SpawnSelections
       // and never surface in the preview.
+      const spawnInput = buildSpawnInput(spawnSelections);
       const result = await spawnSession({
         // #1950 A3: model now flows through buildSpawnInput via spawnSelections
         // (formState.effective.model, gated on codex + openrouter + selection),
         // so the live preview and the real spawn read it from ONE source — the
         // #1733-documented follow-up. Only runtime-only fields are merged here.
-        ...buildSpawnInput(spawnSelections),
+        ...spawnInput,
+        // Issue #5879: only an account picked through the at-limit confirm, and
+        // only when the payload actually pins it (a local account spawn).
+        forceAccount:
+          accountForced && spawnInput.accountUuid ? true : undefined,
         emoji: sessionEmoji ?? undefined,
         spawnCorrelationId,
         // Issue #3515: LOCAL spawns opt into the early-ack optimistic path so the
@@ -1474,6 +1676,8 @@ export const NewSession = forwardRef<
     detectedRepo,
     isWorktree: formState.effective.sessionType === "worktree",
     accountsUnavailable: githubAccountsUnavailable,
+    connectable:
+      githubAccountsSource === "broker" && githubAccounts.length === 0,
   });
 
   const isPending = spawnPending || schedulePending;
@@ -1650,6 +1854,7 @@ export const NewSession = forwardRef<
                   api={props.api}
                   rawModel={rawModel}
                   effort={effort}
+                  nodeDefaultEffort={nodeDefaultEffort}
                   onRawModelChange={v => {
                     markTouched("model");
                     setRawModel(v);
@@ -1698,6 +1903,7 @@ export const NewSession = forwardRef<
                   isLoadingRepos={githubReposLoading}
                   accountsUnavailable={githubAccountsUnavailable}
                   accountsUnavailableReason={githubAccountsReason}
+                  accountsSource={githubAccountsSource}
                   isDisabled={isFormDisabled}
                   onOpenAccount={() => setGithubAccountModalOpen(true)}
                   onOpenRepo={() => setGithubRepoModalOpen(true)}
@@ -1970,9 +2176,13 @@ export const NewSession = forwardRef<
           // codex spawn offers OpenAI accounts, a gemini spawn Google accounts.
           providerScope={accountSelectorProvider ?? "anthropic"}
           selectedAccountUuid={accountUuid}
-          onSelect={uuid => {
+          // #5879: lock rows on the chosen model's weekly window too.
+          modelFamily={spawnModelFamily}
+          onSelect={(uuid, opts) => {
             markTouched("account");
             handleAccountChange(uuid);
+            // #5879: after handleAccountChange, which clears it.
+            setAccountForced(opts?.forceAccount === true);
             setAccountModalOpen(false);
           }}
           // #4568: the "API keys" section — a Standard Claude session (the modal
@@ -2010,6 +2220,10 @@ export const NewSession = forwardRef<
           accounts={githubAccounts}
           selectedAccount={githubAccount}
           isLoading={githubAccountsLoading}
+          canClone={githubAccountsSource !== "broker"}
+          connectHref={
+            githubAccountsSource === "broker" ? GITHUB_SETTINGS_HREF : undefined
+          }
           onSelect={login => {
             handleGithubAccountChange(login);
             setGithubAccountModalOpen(false);

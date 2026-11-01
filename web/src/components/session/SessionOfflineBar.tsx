@@ -2,9 +2,9 @@
 /**
  * SessionOfflineBar — the slim muted-red offline notice (issue #3272; operator
  * ruling 2026-08-25). Replaces the old grey `p-3` bubble at the top of the chat
- * transcript. Sized to the VM-update bar (`UpdateAvailableBadge`: `px-3 py-1
- * text-xs`) so the two system bars share one height, colored with the existing
- * error badge tokens (muted red — never a hardcoded color).
+ * transcript. Sized like the former VM-update bar (`px-3 py-1 text-xs`; #3277
+ * moved that alert into the settings drawer), colored with the existing error
+ * badge tokens (muted red — never a hardcoded color).
  *
  * Placement is the consumer's job: directly below the Session Details section
  * when expanded, or directly below the Session Basic Info Bar when collapsed —

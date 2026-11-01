@@ -11,7 +11,7 @@ import {
   renameSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /**
  * Server-side Codex (OpenAI) login driver (issue #3807, epic #3345, Tasks 2+3).
@@ -50,14 +50,23 @@ export type DeviceAuthState =
   | "cancelled";
 /** Parsed `codex login status` vocabulary — the same as the #3806 reader's `mode`. */
 export type CodexLoginStatusMode = "chatgpt" | "api-key" | "none";
+/**
+ * Why a login answered `failed`, when the driver knows (#5871). Additive: an
+ * older peer or client that ignores it still sees `failed`.
+ *   - `codex-not-installed` — no `codex` binary on this node, so neither path
+ *     can start; the user has to install Codex on the node first.
+ */
+export type CodexLoginFailureReason = "codex-not-installed";
 
 export interface ApiKeyLoginResult {
   loginToken: string;
   state: ApiKeyLoginState;
+  reason?: CodexLoginFailureReason;
 }
 export interface DeviceAuthResult {
   loginToken: string;
   state: DeviceAuthState;
+  reason?: CodexLoginFailureReason;
   verificationUrl?: string;
   userCode?: string;
   expiresAt?: string;
@@ -85,6 +94,18 @@ export interface CodexLoginServiceOptions {
   hapiHome?: string;
   /** Codex binary path override. Tests inject a fake shim; prod resolves it. */
   codexBin?: string;
+  /**
+   * PATH searched for `codex` when there is no override. Default: the
+   * server's own `process.env.PATH`, read at each lookup. Tests inject one.
+   */
+  searchPath?: () => string;
+  /**
+   * System directories checked for `codex` after `~/.local/bin` and
+   * `~/.npm-global/bin`, before the nvm directories.
+   * Default: `/usr/local/bin`, `/usr/bin`. Tests pass `[]` so a host-wide
+   * Codex cannot hide the not-installed case.
+   */
+  systemBinDirs?: string[];
   now?: () => number;
   /** Structured logger — NEVER receives a key/token. */
   log?: (msg: string) => void;
@@ -164,11 +185,18 @@ export class CodexLoginService {
   private readonly log: (msg: string) => void;
   private readonly removedAccounts: CodexLoginServiceOptions["removedAccounts"];
   private readonly pending = new Map<string, PendingDeviceAuth>();
+  private readonly homeDir: string;
+  private readonly searchPath: () => string;
+  private readonly systemBinDirs: string[];
   private resolvedBin: string | null = null;
-  private binResolveAttempted = false;
+  /** The last lookup's answer as logged; `undefined` until the first lookup. */
+  private loggedBin: string | null | undefined = undefined;
 
   constructor(opts: CodexLoginServiceOptions = {}) {
     const home = opts.homeDir ?? homedir();
+    this.homeDir = home;
+    this.searchPath = opts.searchPath ?? (() => process.env.PATH ?? "");
+    this.systemBinDirs = opts.systemBinDirs ?? ["/usr/local/bin", "/usr/bin"];
     this.accountConfigsDir =
       opts.accountConfigsDir ??
       join(
@@ -194,66 +222,81 @@ export class CodexLoginService {
   // A systemd-launched server has a minimal PATH (harness/detection.ts KD-5),
   // and codex frequently lives under nvm — so `Bun.which` alone is not enough.
   // Resolution order: override → $CODEX_BIN → Bun.which → well-known paths →
-  // nvm glob. The resolved path is logged ONCE (never a key).
+  // nvm glob. The answer is logged when it changes (never a key).
+  //
+  // #5871: only a FOUND binary is cached. A miss is looked up again on the next
+  // login, so Codex installed after the server started (the normal order on a
+  // new machine) is found without a server restart; a cached path that has
+  // since gone is looked up again too.
   private resolveBin(): string | null {
     if (this.codexBinOverride) {
       return existsSync(this.codexBinOverride) ? this.codexBinOverride : null;
     }
-    if (this.binResolveAttempted) return this.resolvedBin;
-    this.binResolveAttempted = true;
-    const envBin = process.env.CODEX_BIN;
-    if (envBin && existsSync(envBin)) {
-      this.resolvedBin = envBin;
-    } else {
-      const fromPath = typeof Bun !== "undefined" ? Bun.which("codex") : null;
-      if (fromPath) {
-        this.resolvedBin = fromPath;
-      } else {
-        const home = homedir();
-        const candidates = [
-          join(home, ".local", "bin", "codex"),
-          join(home, ".npm-global", "bin", "codex"),
-          "/usr/local/bin/codex",
-          "/usr/bin/codex",
-        ];
-        for (const c of candidates) {
-          if (existsSync(c)) {
-            this.resolvedBin = c;
-            break;
-          }
-        }
-        if (!this.resolvedBin) {
-          // nvm fallback: ~/.nvm/versions/node/<v>/bin/codex
-          try {
-            const nvmBase = join(home, ".nvm", "versions", "node");
-            if (existsSync(nvmBase)) {
-              for (const v of readdirSync(nvmBase)) {
-                const c = join(nvmBase, v, "bin", "codex");
-                if (existsSync(c)) {
-                  this.resolvedBin = c;
-                  break;
-                }
-              }
-            }
-          } catch {
-            /* ignore */
-          }
-        }
-      }
+    if (this.resolvedBin && existsSync(this.resolvedBin)) {
+      return this.resolvedBin;
     }
-    this.log(
-      this.resolvedBin
-        ? `codexLoginService: resolved codex binary at ${this.resolvedBin}`
-        : "codexLoginService: codex binary NOT found (login will report failed)"
-    );
+    this.resolvedBin = this.findBin();
+    if (this.resolvedBin !== this.loggedBin) {
+      this.loggedBin = this.resolvedBin;
+      this.log(
+        this.resolvedBin
+          ? `codexLoginService: resolved codex binary at ${this.resolvedBin}`
+          : "codexLoginService: codex binary NOT found (login will report codex-not-installed)"
+      );
+    }
     return this.resolvedBin;
   }
 
-  /** Controlled child env: inherit, override CODEX_HOME, clear any ambient key. */
-  private childEnv(codexHome: string): NodeJS.ProcessEnv {
+  private findBin(): string | null {
+    const envBin = process.env.CODEX_BIN;
+    if (envBin && existsSync(envBin)) return envBin;
+    const fromPath =
+      typeof Bun !== "undefined"
+        ? Bun.which("codex", { PATH: this.searchPath() })
+        : null;
+    if (fromPath) return fromPath;
+    const home = this.homeDir;
+    // `~/.local/bin` is where OpenAI's own installer puts it
+    // (chatgpt.com/codex/install.sh); a systemd user unit's PATH lacks it.
+    const candidates = [
+      join(home, ".local", "bin", "codex"),
+      join(home, ".npm-global", "bin", "codex"),
+      ...this.systemBinDirs.map(dir => join(dir, "codex")),
+    ];
+    for (const c of candidates) {
+      if (existsSync(c)) return c;
+    }
+    // nvm fallback: ~/.nvm/versions/node/<v>/bin/codex
+    try {
+      const nvmBase = join(home, ".nvm", "versions", "node");
+      if (existsSync(nvmBase)) {
+        for (const v of readdirSync(nvmBase)) {
+          const c = join(nvmBase, v, "bin", "codex");
+          if (existsSync(c)) return c;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  /**
+   * Controlled child env: inherit, override CODEX_HOME, clear any ambient key.
+   * #5871: the binary's own directory is put at the front of PATH when PATH
+   * lacks it (an existing entry is left where it is; when it is prepended,
+   * empty entries, which mean the current directory, are dropped). npm's
+   * `codex` is a `#!/usr/bin/env node` script, and under nvm `node` sits
+   * beside it, in a directory a systemd unit's PATH does not include; without
+   * this the login exits 127 and reads as a plain failure.
+   */
+  private childEnv(codexHome: string, bin: string): NodeJS.ProcessEnv {
     const env = { ...process.env };
     delete env.OPENAI_API_KEY; // never let an ambient key shadow the stdin key
     env.CODEX_HOME = codexHome;
+    const binDir = dirname(bin);
+    const parts = (env.PATH ?? "").split(":").filter(Boolean);
+    if (!parts.includes(binDir)) env.PATH = [binDir, ...parts].join(":");
     return env;
   }
 
@@ -293,7 +336,7 @@ export class CodexLoginService {
     if (!bin) return Promise.resolve({ code: -1, output: "codex not found" });
     return new Promise(resolvePromise => {
       let settled = false;
-      const child = spawn(bin, args, { env: this.childEnv(codexHome) });
+      const child = spawn(bin, args, { env: this.childEnv(codexHome, bin) });
       let output = "";
       const onData = (d: Buffer) => {
         output += d.toString();
@@ -331,8 +374,10 @@ export class CodexLoginService {
   private parseStatusMode(output: string): CodexLoginStatusMode {
     const clean = stripAnsi(output);
     if (/Logged in using ChatGPT/i.test(clean)) return "chatgpt";
-    // "Logged in using an API key - sk-...***..." — map, DISCARD the masked key.
-    if (/Logged in using an API key/i.test(clean)) return "api-key";
+    // "Logged in using an API key - sk-...***..." (before 0.165.0) and "API key
+    // configured - sk-...***..." (0.165.0, #5871) — map, DISCARD the masked key.
+    if (/Logged in using an API key|API key configured/i.test(clean))
+      return "api-key";
     return "none";
   }
 
@@ -388,6 +433,9 @@ export class CodexLoginService {
     const pkDir = join(this.accountConfigsDir, pk);
     const codexHome = join(pkDir, "codex");
     this.assertSafeCodexHome(codexHome);
+    if (!this.resolveBin()) {
+      return { loginToken, state: "failed", reason: "codex-not-installed" };
+    }
     mkdirSync(codexHome, { recursive: true, mode: 0o700 });
     const { code, output } = await this.runCodex(
       ["login", "--with-api-key"],
@@ -423,14 +471,12 @@ export class CodexLoginService {
     const stagingRoot = join(this.accountConfigsDir, ".pending", loginToken);
     const staging = join(stagingRoot, "codex");
     this.assertSafeCodexHome(staging);
-    mkdirSync(staging, { recursive: true, mode: 0o700 });
-
     const bin = this.resolveBin();
-    const expiresAt = new Date(this.now() + DEVICE_AUTH_TTL_MS).toISOString();
     if (!bin) {
-      this.safeRm(stagingRoot);
-      return { loginToken, state: "failed" };
+      return { loginToken, state: "failed", reason: "codex-not-installed" };
     }
+    mkdirSync(staging, { recursive: true, mode: 0o700 });
+    const expiresAt = new Date(this.now() + DEVICE_AUTH_TTL_MS).toISOString();
 
     // `detached: true` makes the child a process-GROUP leader so a cancel can
     // kill the whole tree — `codex` is a node wrapper that forks the real codex
@@ -438,7 +484,7 @@ export class CodexLoginService {
     // (it would keep polling OpenAI until the device code expires). Group-kill
     // via `process.kill(-pid)` reaps both (see `killChildTree`).
     const child = spawn(bin, ["login", "--device-auth"], {
-      env: this.childEnv(staging),
+      env: this.childEnv(staging, bin),
       detached: true,
     });
 

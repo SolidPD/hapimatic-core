@@ -10,6 +10,7 @@ import type {
   Metadata,
 } from "@hapi/protocol/schemas";
 import { getKnownSecretLiterals } from "../services/knownSecretLiterals";
+import { recordFirstCliConnect } from "../socket/handlers/cli/cliConnectFloors";
 import type {
   ModelMode,
   PermissionMode,
@@ -769,6 +770,12 @@ export class SessionCache {
     const session =
       this.sessions.get(sessionId) ?? this.refreshSession(sessionId);
     if (!session) return false;
+    // #4682 (IR-1): record the first-connect floor BEFORE the session goes
+    // active. After a restart this re-attach can accept a send before an old
+    // wrapper's socket returns; a floor taken at that later connection would
+    // sit above the send, and the old wrapper's floor-served backfill would
+    // never deliver it. Only the first record per session counts; never throws.
+    recordFirstCliConnect(this.store, sessionId);
     const now = Date.now();
     session.active = true;
     session.activeAt = Math.max(session.activeAt, now);

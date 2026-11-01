@@ -15,6 +15,7 @@ import {
   RefusalDetector,
   buildRefusalUserMessage,
 } from "./utils/refusalDetector";
+import { createSessionRateLimitDetector } from "./services/sessionRateLimitDetector";
 import { getLocalLaunchExitReason } from "@/agent/localLaunchPolicy";
 import {
   resolveAccountTokenForSession,
@@ -96,6 +97,11 @@ export async function claudeLocalLauncher(
       }
     }
   );
+  // Issue #6065: report a usage-window cap the way the pty and tmux launchers
+  // do (the shared factory). The chip and the server's rate-limit edges read
+  // `session.rateLimited`, and setting it also clears `thinking`, whatever the
+  // mode.
+  const rateLimitDetector = createSessionRateLimitDetector(session);
 
   // Create scanner
   const scanner = await createSessionScanner({
@@ -113,6 +119,8 @@ export async function claudeLocalLauncher(
       surrogateErrorDetector.processMessage(message, session.sessionId);
       // Surface model content-policy refusals in the chat thread (#1633)
       refusalDetector.processMessage(message, session.sessionId);
+      // Surface the 429 usage-window rate-limited state (#1647, #6065)
+      rateLimitDetector.processMessage(message, session.sessionId);
     },
     // Issue #4383: feed the background-Agent tracker every raw transcript line
     // (including the queue-operation <task-notification> enqueue/remove that
@@ -307,9 +315,18 @@ export async function claudeLocalLauncher(
     );
     session.queue.setOnMessage(null);
 
+    // Issue #3235 / #6065: a dead or switched-away session must not show a
+    // stale chip. The remote launcher's fresh detector starts unlatched, so it
+    // could never fire the falling edge for a cap seen here.
+    session.setRateLimited(null);
+
     // Cleanup
     session.removeSessionFoundCallback(handleSessionFound);
     await scanner.cleanup();
+    // #6065: a scan in flight during cleanup can still deliver a 429 after the
+    // clear above (runScan does not re-check `stopped` once it has read the
+    // file), so clear once more now that no scan can run.
+    session.setRateLimited(null);
   }
 
   // Return

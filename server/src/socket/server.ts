@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { Server as Engine } from "@socket.io/bun-engine";
 import { Server, type DefaultEventsMap } from "socket.io";
-import { jwtVerify } from "jose";
-import { z } from "zod";
 import type { Store } from "../store";
 import { configuration } from "../configuration";
 import { constantTimeEquals } from "../utils/crypto";
 import { parseAccessToken } from "../utils/accessToken";
+import { verifyWebSocketToken } from "./webSocketAuth";
 import { registerCliHandlers } from "./handlers/cli";
 import { registerTerminalHandlers } from "./handlers/terminal";
 import { registerClaudePtyWebHandlers } from "./handlers/claudePty";
@@ -21,11 +20,6 @@ import type { SocketData, SocketServer } from "./socketTypes";
 import type { RemoteTerminalProxy } from "../federation/remoteTerminalProxy";
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { MessageWriteRetryQueue } from "./handlers/cli/messageWriteRetryQueue";
-
-const jwtPayloadSchema = z.object({
-  uid: z.number(),
-  ns: z.string(),
-});
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_MAX_TERMINALS = 4;
@@ -193,27 +187,16 @@ export function createSocketServer(deps: SocketServerDeps): {
   );
 
   terminalNs.use(async (socket, next) => {
+    // #5444 (D10): one verifier for both browser namespaces; it also refuses
+    // the hcp_ pairing token and the hhr_ health read token by name.
     const auth = socket.handshake.auth as Record<string, unknown> | undefined;
-    const token = typeof auth?.token === "string" ? auth.token : null;
-    if (!token) {
-      return next(new Error("Missing token"));
+    const result = await verifyWebSocketToken(auth?.token, deps.jwtSecret);
+    if (!result.ok) {
+      return next(new Error(result.error));
     }
-
-    try {
-      const verified = await jwtVerify(token, deps.jwtSecret, {
-        algorithms: ["HS256"],
-      });
-      const parsed = jwtPayloadSchema.safeParse(verified.payload);
-      if (!parsed.success) {
-        return next(new Error("Invalid token payload"));
-      }
-      socket.data.userId = parsed.data.uid;
-      socket.data.namespace = parsed.data.ns;
-      next();
-      return;
-    } catch {
-      return next(new Error("Invalid token"));
-    }
+    socket.data.userId = result.uid;
+    socket.data.namespace = result.ns;
+    next();
   });
   terminalNs.on("connection", socket =>
     registerTerminalHandlers(socket, {
@@ -230,27 +213,16 @@ export function createSocketServer(deps: SocketServerDeps): {
   );
 
   claudePtyNs.use(async (socket, next) => {
+    // #5444 (D10): one verifier for both browser namespaces; it also refuses
+    // the hcp_ pairing token and the hhr_ health read token by name.
     const auth = socket.handshake.auth as Record<string, unknown> | undefined;
-    const token = typeof auth?.token === "string" ? auth.token : null;
-    if (!token) {
-      return next(new Error("Missing token"));
+    const result = await verifyWebSocketToken(auth?.token, deps.jwtSecret);
+    if (!result.ok) {
+      return next(new Error(result.error));
     }
-
-    try {
-      const verified = await jwtVerify(token, deps.jwtSecret, {
-        algorithms: ["HS256"],
-      });
-      const parsed = jwtPayloadSchema.safeParse(verified.payload);
-      if (!parsed.success) {
-        return next(new Error("Invalid token payload"));
-      }
-      socket.data.userId = parsed.data.uid;
-      socket.data.namespace = parsed.data.ns;
-      next();
-      return;
-    } catch {
-      return next(new Error("Invalid token"));
-    }
+    socket.data.userId = result.uid;
+    socket.data.namespace = result.ns;
+    next();
   });
   claudePtyNs.on("connection", socket =>
     registerClaudePtyWebHandlers(socket, {

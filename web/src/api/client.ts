@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /* eslint-disable max-lines -- Grandfathered god-file (Epic 0, #2077); decomposition verdict tracked in claudedocs/architecture-hotspot-review.md. */
+import type { GitHubConnectionStatus } from "@hapi/protocol/githubConnection";
 import type {
   ExistingBranch,
   GitBranchListing,
@@ -386,6 +387,9 @@ export type SpawnParentOptions = {
   parentRelationship?: "branch" | "spawn";
   /** #4370: cut the worktree from exactly this branch (absent → repo target). */
   sourceBranch?: string;
+  /** Issue #5879: spawn on `accountUuid` even when it is at its usage cap (the
+   *  server otherwise answers 409 `account_exhausted`). Absent → not forced. */
+  forceAccount?: boolean;
 };
 
 /**
@@ -1593,12 +1597,15 @@ export class ApiClient {
     maxConcurrent: number | null;
     recommendedConcurrent: number | null;
     capSource: DaemonCapSource | null;
+    /** #6028: the daemon's resolved spawn default effort; absent for an older daemon. */
+    spawnDefaults?: { effort: EffortLevel };
   }> {
     return await this.request<{
       effectiveCount: number | null;
       maxConcurrent: number | null;
       recommendedConcurrent: number | null;
       capSource: DaemonCapSource | null;
+      spawnDefaults?: { effort: EffortLevel };
     }>("/api/daemon/capacity");
   }
 
@@ -1963,6 +1970,7 @@ export class ApiClient {
           parentSessionId: parent?.parentSessionId,
           parentRelationship: parent?.parentRelationship,
           sourceBranch: parent?.sourceBranch,
+          forceAccount: parent?.forceAccount,
         }),
       },
       0,
@@ -2055,6 +2063,7 @@ export class ApiClient {
           parentRelationship: parent?.parentRelationship,
           sourceBranch: parent?.sourceBranch,
           apiKeyId: parent?.apiKeyId,
+          forceAccount: parent?.forceAccount,
         }),
       },
       0,
@@ -2549,11 +2558,21 @@ export class ApiClient {
    */
   async getGitHubAccounts(nodeId?: string | null): Promise<{
     success: boolean;
-    accounts: Array<{ login: string; name: string | null }>;
+    /**
+     * #4793: a broker-served account also carries the linking user's email, whether it is their
+     * default, and its connection status; a `gh` / REST account has only login and name.
+     */
+    accounts: Array<{
+      login: string;
+      name: string | null;
+      email?: string;
+      isDefault?: boolean;
+      status?: GitHubConnectionStatus;
+    }>;
     error?: string;
     /** #2327: machine-readable failure cause when `success` is false. */
     reason?: string;
-    /** #2327: which transport served a successful result ("gh" | "rest"). */
+    /** #2327 / #4793: which transport served a successful result ("gh" | "rest" | "broker"). */
     source?: string;
   }> {
     let url = `/api/github/accounts`;

@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { ChevronRight } from "lucide-react";
 import { reasonDisplayText } from "@hapi/protocol/githubFailureReason";
 import { FormField } from "./FormField";
 import { CONTROL_BASE, ControlChevron } from "./controls";
 import { Button } from "@/components/ui/button";
 import { BareButton } from "@/components/ui/BareButton";
 import type { GitHubAccount, GitHubRepo } from "@/hooks/queries/useGitHubRepos";
+import { GITHUB_SETTINGS_HREF } from "@/lib/githubConnections";
+
+/** #4793 (ruling D-4793-3): the Repo field's one line on a broker-backed host. */
+export const CLONE_UNAVAILABLE_TEXT =
+  "Cloning a repository into a new session is not available on this instance yet";
 
 /** Drop the owner/ prefix for display — "MattStarfield/foo" → "foo". */
 function repoName(nameWithOwner: string): string {
@@ -47,12 +53,19 @@ export function buildGitHubSummary(args: {
   detectedRepo: string | null | undefined;
   isWorktree: boolean;
   accountsUnavailable: boolean;
+  /**
+   * #4793: true on a broker-backed host whose users have linked no GitHub account yet — the
+   * expanded field offers "Connect GitHub", so the collapsed summary says so too.
+   */
+  connectable?: boolean;
 }): string {
   if (args.sessionMode !== "standard") return "Local (no GitHub)";
   const repo = args.cloneRepo || args.detectedRepo;
   const account = args.accountsUnavailable
     ? "GitHub unavailable"
-    : args.githubAccount || "Disabled";
+    : args.connectable
+      ? "GitHub not connected"
+      : args.githubAccount || "Disabled";
   const parts = [account];
   if (repo) parts.push(repo);
   parts.push(args.isWorktree ? "Worktree" : "Basic");
@@ -73,12 +86,19 @@ export function buildGitHubSummary(args: {
  *    directory") and the clone-repo picker is hidden — you're opening an existing
  *    repo, not cloning one.
  * 2. **Empty / non-repo directory** (`detectedRepo` null): the clone-on-spawn
- *    picker — choose a host `gh` account, then a repo to clone into the working
+ *    picker — choose a GitHub account, then a repo to clone into the working
  *    dir before launch.
  *
- * The "account" is the host `gh` CLI identity (NOT an OAuth account). Presentational
- * only — the parent owns the queries, the derived `directory`/`cloneRepo` state, and
- * the modal open-state + modal mounts (it opens them via `onOpenAccount`/`onOpenRepo`).
+ * #4793: on a broker-backed cloud VM (`accountsSource === "broker"`) the accounts are the
+ * GitHub accounts the VM's users linked on hapimatic.com. An EMPTY list there offers
+ * "Connect GitHub" (it is the one case connecting can fix — `no_token` on RP1/CI and
+ * `broker_unavailable` keep their wording, finding 4793-5); a `not_installed` account gets
+ * the install hint and an expired or revoked one a re-link hint; and the Repo picker is
+ * replaced by one line, because `gh repo clone` has no credential there (D-4793-3).
+ *
+ * Presentational only — the parent owns the queries, the derived `directory`/`cloneRepo`
+ * state, and the modal open-state + modal mounts (it opens them via
+ * `onOpenAccount`/`onOpenRepo`).
  */
 export function GitHubAccountRepoSelector(props: {
   accounts: GitHubAccount[];
@@ -101,6 +121,8 @@ export function GitHubAccountRepoSelector(props: {
   accountsUnavailable?: boolean;
   /** #2327: machine-readable cause behind `accountsUnavailable`. */
   accountsUnavailableReason?: string | null;
+  /** #4793: the transport behind a successful account list ("gh" | "rest" | "broker"). */
+  accountsSource?: string | null;
   isDisabled: boolean;
   /** Open the GitHub account selection modal (parent owns the open state + mount). */
   onOpenAccount: () => void;
@@ -117,6 +139,7 @@ export function GitHubAccountRepoSelector(props: {
     isLoadingRepos,
     accountsUnavailable,
     accountsUnavailableReason,
+    accountsSource,
     isDisabled,
     onOpenAccount,
     onOpenRepo,
@@ -126,6 +149,13 @@ export function GitHubAccountRepoSelector(props: {
   // #2327: resolution failed. Distinct from `noAccounts` — which now means only
   // "resolution SUCCEEDED and returned nothing".
   const isUnavailable = Boolean(accountsUnavailable) && !isLoadingAccounts;
+  // #4793: a broker-backed cloud VM. Only a SUCCESSFUL empty broker list offers "Connect
+  // GitHub"; every failure reason keeps its own wording (finding 4793-5).
+  const isBroker = accountsSource === "broker" && !isUnavailable;
+  const offerConnect = isBroker && noAccounts && !isLoadingAccounts;
+  const selectedStatus = selectedAccount
+    ? accounts.find(x => x.login === selectedAccount)?.status
+    : undefined;
 
   // Compact account-field summary. Four states, in priority order.
   let accountSummary: string;
@@ -139,7 +169,7 @@ export function GitHubAccountRepoSelector(props: {
     const a = accounts.find(x => x.login === selectedAccount);
     accountSummary = a?.name ? `${a.login} — ${a.name}` : selectedAccount;
   } else {
-    accountSummary = "None (no clone)";
+    accountSummary = isBroker ? "None" : "None (no clone)";
   }
 
   // Compact repo-field summary + private flag for the badge.
@@ -156,30 +186,64 @@ export function GitHubAccountRepoSelector(props: {
     <div className="flex flex-col gap-1 px-3 py-1.5">
       <FormField
         label="GitHub Account"
-        tooltip="The GitHub identity (host gh CLI login) this session uses for repository access — cloning, issue lookups, and pull requests act as this account. Pick None to skip GitHub integration for this session."
+        tooltip="The GitHub account this session uses for repository access — repository listings, cloning, issue lookups, and pull requests act as this account. Pick None to skip GitHub integration for this session."
         bookmarkId="githubAccount"
       >
-        <BareButton
-          type="button"
-          aria-label="GitHub account"
-          title={isUnavailable ? accountSummary : undefined}
-          onClick={onOpenAccount}
-          disabled={isDisabled || (noAccounts && !isLoadingAccounts)}
-          className={`${CONTROL_BASE} flex items-center justify-between gap-2 px-2.5 text-left font-normal`}
-        >
-          <span
-            className={`truncate ${
-              isUnavailable
-                ? "text-[var(--status-warn)]"
-                : selectedAccount
-                  ? ""
-                  : "text-[var(--app-hint)]"
-            }`}
+        {offerConnect ? (
+          <a
+            href={GITHUB_SETTINGS_HREF}
+            aria-label="Connect GitHub"
+            className={`${CONTROL_BASE} flex items-center justify-between gap-2 px-2.5 text-left font-medium text-[var(--app-link)] no-underline`}
           >
-            {accountSummary}
-          </span>
-          <ControlChevron className="h-4 w-4 shrink-0 text-[var(--app-hint)]" />
-        </BareButton>
+            <span className="truncate">Connect GitHub</span>
+            {/* A link out, not a picker: the right chevron says "goes somewhere". */}
+            <ChevronRight
+              aria-hidden
+              className="h-4 w-4 shrink-0 text-[var(--app-hint)]"
+            />
+          </a>
+        ) : (
+          <BareButton
+            type="button"
+            aria-label="GitHub account"
+            title={isUnavailable ? accountSummary : undefined}
+            onClick={onOpenAccount}
+            disabled={isDisabled || (noAccounts && !isLoadingAccounts)}
+            className={`${CONTROL_BASE} flex items-center justify-between gap-2 px-2.5 text-left font-normal`}
+          >
+            <span
+              className={`truncate ${
+                isUnavailable
+                  ? "text-[var(--status-warn)]"
+                  : selectedAccount
+                    ? ""
+                    : "text-[var(--app-hint)]"
+              }`}
+            >
+              {accountSummary}
+            </span>
+            <ControlChevron className="h-4 w-4 shrink-0 text-[var(--app-hint)]" />
+          </BareButton>
+        )}
+        {isBroker && selectedStatus === "not_installed" && (
+          <a
+            href={GITHUB_SETTINGS_HREF}
+            className="text-[length:var(--text-caption)] text-[var(--app-link)]"
+          >
+            Install the Hapimatic GitHub App to see private repositories
+          </a>
+        )}
+        {isBroker &&
+          (selectedStatus === "expired" || selectedStatus === "revoked") && (
+            <a
+              href={GITHUB_SETTINGS_HREF}
+              className="text-[length:var(--text-caption)] text-[var(--status-warn)]"
+            >
+              {selectedStatus === "expired"
+                ? "This GitHub link expired. Re-link in Settings"
+                : "GitHub access was removed. Re-link in Settings"}
+            </a>
+          )}
       </FormField>
 
       {detectedRepo ? (
@@ -197,6 +261,16 @@ export function GitHubAccountRepoSelector(props: {
             {repoName(detectedRepo)}
           </div>
         </FormField>
+      ) : isBroker ? (
+        /* #4793 (D-4793-3): a broker-backed VM cannot clone (gh holds no credential there), so the
+           Repo field is one line and never sets a clone repo. #4850 lifts it for public repos. */
+        selectedAccount && (
+          <FormField label="Repo">
+            <p className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
+              {CLONE_UNAVAILABLE_TEXT}
+            </p>
+          </FormField>
+        )
       ) : (
         selectedAccount && (
           <FormField

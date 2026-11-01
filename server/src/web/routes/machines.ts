@@ -20,6 +20,18 @@ import type { SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { SharedApiKeyService } from "../../services/sharedApiKeyService";
+import type { UsageService } from "../../accounts/usageService";
+import type { AccountService } from "../../services/accountService";
+import {
+  ACCOUNT_EXHAUSTED_CODE,
+  checkAccountHeadroom,
+  headroomWarnings,
+} from "../../accounts/accountHeadroom";
+import {
+  resolveModelFamily,
+  type SpawnAccount,
+  type SpawnWarning,
+} from "@hapi/protocol";
 import { requireMachine } from "./guards";
 import { refuseAgentEscalation } from "./agentEscalation";
 import { logAndJson } from "./routeErrorHelper";
@@ -53,6 +65,10 @@ export const spawnBodySchema = z.object({
   /** Multi-account (#1455): bind the new session to this stored account.
    *  Optional — omitted spawns use the host/node-default credential. */
   accountUuid: z.string().uuid().optional(),
+  /** Issue #5879: spawn on `accountUuid` even when this node's cached usage shows
+   *  it at a usage cap (bypasses the 409 `account_exhausted` headroom refusal).
+   *  Server-only — deliberately NOT threaded into `spawnOptions`/the daemon. */
+  forceAccount: z.boolean().optional(),
   /** Issue #4568: bill this Claude session to the node-vault Anthropic API key
    *  with this id (`GET /api/api-keys` → `id`) — NEVER the key itself. Mutually
    *  exclusive with `accountUuid`; Claude + the SDK launcher only (ruling
@@ -211,6 +227,11 @@ export function createMachinesRoutes(
     // Issue #5127: resolves an `apiKeyId` homed on another federation node
     // (`<uuid>@<homeNodeId>`) before the spawn is dispatched.
     getSharedApiKeyService?: () => SharedApiKeyService | null;
+    // Issue #5879: this node's usage cache + account store for the spawn
+    // account-headroom check. Absent ⇒ the check is not configured: clear, with
+    // no warning. A missing snapshot or row is what warns usage_unavailable.
+    getUsageService?: () => UsageService | null;
+    getAccountService?: () => AccountService | null;
   }
 ): Hono<WebAppEnv> {
   const errorLogger = options?.errorLogger ?? null;
@@ -361,6 +382,70 @@ export function createMachinesRoutes(
           );
         }
       }
+
+      // Issue #5879 (three-point spawn checklist, point 2 — account headroom):
+      // refuse an EXPLICIT pin onto an account this node's cached usage shows at
+      // a cap (a window at >= 100 with a future reset), unless `forceAccount`.
+      // Runs BEFORE the early-return placeholder/SSE/inbox writes, so a refusal
+      // leaves nothing behind. Un-pinned spawns are never checked (#5460); the
+      // daemon's resolver picks their account. API-key spawns bind no account.
+      const spawnWarnings: SpawnWarning[] = [];
+      let accountSource: SpawnAccount["source"] | undefined;
+      let accountEmail: string | null = null;
+      if (
+        parsed.data.accountUuid &&
+        !parsed.data.apiKeyId &&
+        (spawnFlavor === "claude" || spawnFlavor === "opencode")
+      ) {
+        const verdict = await checkAccountHeadroom(
+          {
+            usageService: options?.getUsageService?.() ?? null,
+            accountService: options?.getAccountService?.() ?? null,
+            nodeIdentity: getLocalNode(),
+            errorLogger,
+          },
+          {
+            accountUuid: parsed.data.accountUuid,
+            modelFamily: resolveModelFamily(
+              parsed.data.rawModel ?? parsed.data.modelMode
+            ),
+            forceAccount: parsed.data.forceAccount === true,
+          }
+        );
+        if (verdict.kind === "exhausted" && !verdict.forced) {
+          return c.json(
+            {
+              error: verdict.message,
+              code: ACCOUNT_EXHAUSTED_CODE,
+              exhaustion: verdict.exhaustion,
+              ...getLocalNode(),
+            },
+            409
+          );
+        }
+        spawnWarnings.push(...headroomWarnings(verdict));
+        accountEmail = verdict.email;
+        accountSource =
+          verdict.kind === "exhausted" && verdict.forced
+            ? "forced"
+            : "requested";
+      }
+      const withSpawnNotes = <T extends object>(
+        body: T,
+        account?: SpawnAccount
+      ): T & { warnings?: SpawnWarning[]; account?: SpawnAccount } => ({
+        ...body,
+        ...(spawnWarnings.length > 0 ? { warnings: spawnWarnings } : {}),
+        ...(account ? { account } : {}),
+      });
+      const requestedAccount: SpawnAccount | undefined =
+        parsed.data.accountUuid && accountSource
+          ? {
+              accountUuid: parsed.data.accountUuid,
+              email: accountEmail,
+              source: accountSource,
+            }
+          : undefined;
 
       const namespace = c.get("namespace");
 
@@ -542,7 +627,12 @@ export function createMachinesRoutes(
           .catch(err => {
             surfaceFailure(err instanceof Error ? err.message : String(err));
           });
-        return c.json({ type: "accepted", sessionId: hapiSessionId });
+        return c.json(
+          withSpawnNotes(
+            { type: "accepted" as const, sessionId: hapiSessionId },
+            requestedAccount
+          )
+        );
       }
 
       const result = await engine.spawnSession(spawnOptions);
@@ -564,7 +654,11 @@ export function createMachinesRoutes(
           // Issue #1772: an at-capacity spawn rejection maps to HTTP 409 (same
           // precedent), so a client discriminates by `code`, not by string-matching
           // the "Too many concurrent sessions" message.
-          result.code === "at_capacity")
+          result.code === "at_capacity" ||
+          // Issue #5879: defense in depth — the headroom refusal happens above,
+          // but any future engine-level `account_exhausted` must surface as a 409,
+          // never as a 200 with an error body.
+          result.code === ACCOUNT_EXHAUSTED_CODE)
       ) {
         // Issue #4461 (R6): name the refusing node and the account — for
         // account_unrefreshable only; the other 409 bodies are unchanged.
@@ -583,6 +677,31 @@ export function createMachinesRoutes(
         }
         return c.json({ error: result.message, code: result.code }, 409);
       }
+      if (result.type === "success") {
+        // Issue #5879 (R3): name the bound account. A pinned spawn names the
+        // requested account; an un-pinned one reads what the daemon bound from
+        // the session record (omitted when the record has not registered yet).
+        // Fail-soft: the session already exists, so a lookup failure must never
+        // turn this into a 500 (a caller that sees 500 retries → a duplicate).
+        let account = requestedAccount;
+        if (!account) {
+          try {
+            const meta = engine.getSession(result.sessionId)?.metadata;
+            if (meta) {
+              account = {
+                accountUuid: meta.accountUuid ?? null,
+                email: meta.claudeAccount?.email ?? null,
+                source: "node",
+              };
+            }
+          } catch {
+            account = undefined;
+          }
+        }
+        return c.json(withSpawnNotes(result, account));
+      }
+      // Issue #5879: a failed spawn carries no headroom notes — "proceeding
+      // without a headroom check" would misreport a spawn that did not proceed.
       return c.json(result);
     }
   );

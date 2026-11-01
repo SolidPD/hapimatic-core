@@ -38,19 +38,37 @@ import {
 } from "@/hooks/queries/useAccountUsage";
 import { AccountUsageCard } from "@/components/AccountUsage/AccountUsageCard";
 import { useAccountUsageHistory } from "@/hooks/queries/useAccountUsageHistory";
-import type { AccountUsage } from "@hapi/protocol";
+import { useAccountsUsageView } from "@/hooks/useAccountsUsageView";
+import type {
+  AccountUsage,
+  ProviderAccountUsage,
+  ProviderId,
+} from "@hapi/protocol";
 import { LOCAL_NODE_ID, LOCAL_NODE_LABEL } from "@hapi/protocol";
+import type { RedactedApiKey } from "@hapi/protocol/schemas";
 import { ProviderSection } from "@/components/AccountUsage/ProviderSection";
 import {
   GeminiSectionBody,
   OpenAiSectionBody,
+  geminiPeerRows,
 } from "@/components/AccountUsage/ProviderSectionBodies";
+import { useAccountHealth } from "@/hooks/queries/useAccountHealth";
+import { useApiKeys } from "@/hooks/queries/useApiKeys";
+import { ApiKeyCard } from "@/components/AccountUsage/ApiKeyCard";
+import { OtherWaysToAddPopover } from "@/components/AccountUsage/OtherWaysToAddPopover";
+import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
+import {
+  buildAccountNodeItems,
+  type AccountNodeItem,
+  type NodeFacts,
+} from "@/components/AccountUsage/AccountNodeRow";
+import type { AlertNodeEntry } from "@/components/AccountUsage/AccountAlertIcon";
 import { useProviderAuthState } from "@/hooks/queries/useProviderAuthState";
+import { accountShortName } from "@/components/session/accountLabel";
 import { useAccounts } from "@/hooks/queries/useAccounts";
 import type { ApiClient } from "@/api/client";
 import { DeviceConnectionFooter } from "@/components/AccountUsage/DeviceConnectionFooter";
 import { ApiKeysSection } from "@/components/settings/sections/ApiKeysSection";
-import { AddAccountSection } from "@/components/AccountUsage/AddAccountSection";
 import {
   RemoveAccountsModal,
   type AccountRemovalRow,
@@ -109,6 +127,19 @@ import {
   type AccountFilters,
 } from "@/lib/accountFilter";
 
+/** #4466 R16 (E-7 = 1): the key providers that render as cards in a provider
+ *  section; the foot Provider API Keys section lists every other provider. */
+const SECTION_KEY_PROVIDERS = new Set([
+  "anthropic",
+  "openai",
+  "gemini",
+  "google",
+]);
+// Stable empty fallbacks, so a pending or failed read keeps one identity across
+// renders and the memos below do not recompute every frame.
+const EMPTY_API_KEYS: RedactedApiKey[] = [];
+const EMPTY_NODE_ITEMS: AccountNodeItem[] = [];
+
 // Pull-to-refresh tuning (epic #1855, Sub F / #1861, R8).
 const PULL_THRESHOLD = 64; // px of resisted pull that triggers a refresh
 const PULL_RESISTANCE = 0.5; // finger travel → indicator travel ratio
@@ -150,7 +181,11 @@ function AccountUsageCardWithHistory(props: {
   defaultExpanded: boolean;
   onRetry: () => void;
   api: ApiClient | null;
-  nodes: { nodeId: string; nodeLabel: string }[];
+  /** #4466 R6: the node row's items; R4: the nodes needing a re-login. */
+  nodeItems: AccountNodeItem[];
+  alertNodes?: AlertNodeEntry[];
+  /** #4466 R8: absent on a provider's last account. */
+  onRemove?: () => void;
   /** #3537: forwarded from the SortableAccountCard render-prop to the card. */
   dragHandle?: SortableDragHandle;
 }) {
@@ -165,7 +200,9 @@ function AccountUsageCardWithHistory(props: {
       defaultExpanded={props.defaultExpanded}
       onRetry={props.onRetry}
       api={props.api}
-      nodes={props.nodes}
+      nodeItems={props.nodeItems}
+      alertNodes={props.alertNodes}
+      onRemove={props.onRemove}
       history={history ?? undefined}
       dragHandle={props.dragHandle}
     />
@@ -178,6 +215,8 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
   const goBack = props?.onBack ?? defaultGoBack;
   useDocumentTitle("Provider Accounts - Hapimatic");
   useEmojiFavicon(null);
+  // #4467: the per-provider usage view (Anthropic + OpenAI only, ruling G-2 A).
+  const usageViews = useAccountsUsageView(api);
 
   const {
     usage,
@@ -267,7 +306,8 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
     }
     return m;
   }, [localNode, remoteNodes]);
-  // #3982: an OpenAI card's `machines` labels → the node ids its NodeChips target.
+  // #3982: an OpenAI card's `machines` labels → the node ids its removal
+  // targets (`openaiRemovalRow`).
   // Non-federated (D2): the server stamps no node label, so `machines` is [] —
   // treat the instance as one implicit local node, as the Anthropic cards do.
   const resolveNodes = useCallback(
@@ -287,9 +327,102 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
     [nodeByLabel, currentNodeId, localNode]
   );
 
+  // #4466: A's per-node account health read (#4461) — each node's records with
+  // their re-login flags. It feeds the node rows (R6) and the row-1 alert (R4).
+  const { nodes: healthNodes } = useAccountHealth(api, true);
+  // #4466 R9a / R16 (E-7 = 1): this node's vault keys, split by section. The
+  // foot Provider API Keys section lists the providers no section shows.
+  const { data: apiKeys = EMPTY_API_KEYS } = useApiKeys(api);
+  const keysByProvider = useMemo(() => {
+    const anthropic = apiKeys.filter(k => k.provider === "anthropic");
+    const openai = apiKeys.filter(k => k.provider === "openai");
+    const gemini = apiKeys.filter(
+      k => k.provider === "gemini" || k.provider === "google"
+    );
+    return { anthropic, openai, gemini };
+  }, [apiKeys]);
+  const uiHost = useMemo(
+    () => ({
+      nodeId: currentNodeId,
+      nodeLabel: localNode?.nodeLabel ?? LOCAL_NODE_LABEL,
+    }),
+    [currentNodeId, localNode]
+  );
+  const describeNode = useCallback(
+    (nodeId: string): NodeFacts => {
+      if (nodeId === currentNodeId) {
+        return { isUiHost: true, nodeStatus: "online" };
+      }
+      const peer = remoteNodes.find(n => n.nodeId === nodeId);
+      return peer ? { nodeUrl: peer.url, nodeStatus: peer.status } : {};
+    },
+    [currentNodeId, remoteNodes]
+  );
+  // Each account's node-row items, built once per data change: the page
+  // re-renders on every pull-to-refresh frame.
+  const nodeItemsByKey = useMemo(() => {
+    const build = (
+      provider: ProviderId,
+      accountUuid: string,
+      machines: string[]
+    ) =>
+      buildAccountNodeItems({
+        provider,
+        accountUuid,
+        machines,
+        resolveLabel: label => nodeByLabel.get(label),
+        fallbackNode: uiHost,
+        healthNodes,
+        describe: describeNode,
+      });
+    const m = new Map<string, AccountNodeItem[]>();
+    for (const a of usage) {
+      m.set(
+        `anthropic:${a.accountUuid}`,
+        build("anthropic", a.accountUuid, a.machines)
+      );
+    }
+    for (const u of openaiUsage) {
+      m.set(
+        `openai:${u.accountUuid}`,
+        build("openai", u.accountUuid, u.machines)
+      );
+    }
+    return m;
+  }, [usage, openaiUsage, nodeByLabel, uiHost, healthNodes, describeNode]);
+  const nodeItemsFor = useCallback(
+    (provider: ProviderId, accountUuid: string) =>
+      nodeItemsByKey.get(`${provider}:${accountUuid}`) ?? EMPTY_NODE_ITEMS,
+    [nodeItemsByKey]
+  );
+  // R4: per Anthropic account, the nodes whose record needs a re-login (only a
+  // node whose read is `ok` carries a trustworthy flag — R6 amended).
+  const alertByUuid = useMemo(() => {
+    const m = new Map<string, AlertNodeEntry[]>();
+    for (const row of healthNodes) {
+      if (row.status !== "ok") continue;
+      for (const e of row.accounts) {
+        if (e.provider !== "anthropic" || !e.needsRelogin) continue;
+        const list = m.get(e.accountUuid) ?? [];
+        list.push({
+          nodeLabel: row.nodeLabel,
+          since: e.since,
+          sinceSource: e.sinceSource,
+        });
+        m.set(e.accountUuid, list);
+      }
+    }
+    return m;
+  }, [healthNodes]);
+  const geminiPeers = useMemo(
+    () =>
+      geminiPeerRows(googleUsageRows, keysByProvider.gemini, uiHost.nodeLabel),
+    [googleUsageRows, keysByProvider.gemini, uiHost.nodeLabel]
+  );
+
   // Resolve each account's nodes (with the D2 non-federated single-local-node
-  // fallback) and its email-matched bound sessions ONCE — the card list reads
-  // `nodes`, and the bulk-removal modal (issue #2131) reads the full row.
+  // fallback) and its email-matched bound sessions ONCE, for the single-account
+  // Remove modal's rows below (the card's node row comes from `nodeItemsFor`).
   const accountsResolved = useMemo(
     () =>
       usage.map(account => {
@@ -325,10 +458,12 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
     [usage, nodeByLabel, currentNodeId, localNode, remoteSessions]
   );
 
-  // Rows for the bulk "Remove Accounts" modal (issue #2131). Mirror the card's
-  // Row-1 primary (email, else displayLabel) + Row-2 colloquial label (nickname,
-  // falling back to the OAuth display name when no nickname is set) so the modal
-  // row identifies each account the same way the card does.
+  // Rows for the single-account Remove modal (issues #2131, #4466 R8). They
+  // follow the card's row 1: the primary (email, else displayLabel) and the
+  // nickname chain (nickname, else a display name that differs from the email,
+  // else the email's local part), so the modal names each account the way the
+  // card does. An email-less row's label is already its primary, so it gets no
+  // nickname (the card shows that label once too).
   const removalRows: AccountRemovalRow[] = useMemo(
     () =>
       accountsResolved.map(({ account, nodes, boundSessions }) => {
@@ -336,9 +471,13 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
         const primary = hasEmail
           ? (account.email as string)
           : account.displayLabel;
-        const colloquialFallback = hasEmail ? account.displayLabel : "";
         const nickname =
-          (account.nickname && account.nickname.trim()) || colloquialFallback;
+          account.nickname?.trim() ||
+          (hasEmail
+            ? account.displayLabel && account.displayLabel !== primary
+              ? account.displayLabel
+              : accountShortName(primary)
+            : "");
         return {
           accountUuid: account.accountUuid,
           email: primary,
@@ -359,9 +498,31 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
     return m;
   }, [localNode, remoteNodes]);
 
+  // #4466 Task 9: an OpenAI card's removal row, built explicitly because
+  // `removalRows` is Anthropic-only (#3982's ruling erratum): its label, its
+  // `machines` resolved like `accountsResolved`, and the sessions that recorded
+  // its uuid (#3982 Task 6).
+  const openaiRemovalRow = useCallback(
+    (u: ProviderAccountUsage): AccountRemovalRow => ({
+      accountUuid: u.accountUuid,
+      email: u.nickname?.trim() || u.displayLabel,
+      nickname: "",
+      nodes: resolveNodes(u.machines),
+      boundSessions: remoteSessions
+        .filter(s => s.metadata?.accountUuid === u.accountUuid)
+        .map(s => ({ id: s.id, label: getSessionTitle(s) })),
+    }),
+    [resolveNodes, remoteSessions]
+  );
+
   const { removeAccountsFromNodes, isRemovingFromNodes } =
     useAccountActions(api);
-  const [removeOpen, setRemoveOpen] = useState(false);
+  // #4466 R8: the account a card's "Remove Account" opened (null = closed).
+  const [removeTarget, setRemoveTarget] = useState<AccountRemovalRow | null>(
+    null
+  );
+  // #4466 R2: the provider whose "+ Add" pill was tapped (null = closed).
+  const [addProvider, setAddProvider] = useState<ProviderId | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
   const doRefresh = useCallback(async () => {
@@ -849,7 +1010,20 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
         <div className="mx-auto w-full max-w-content px-3 pb-6">
           <ProviderSection
             title="Anthropic"
+            providerId="anthropic"
             testId="provider-section-anthropic"
+            counts={{
+              accounts: usage.length,
+              keys: keysByProvider.anthropic.length,
+            }}
+            onAdd={() => setAddProvider("anthropic")}
+            footer={<OtherWaysToAddPopover provider="anthropic" />}
+            usageView={usageViews.viewFor("anthropic")}
+            onUsageViewChange={
+              usageViews.ready
+                ? v => usageViews.setView("anthropic", v)
+                : undefined
+            }
           >
             {error != null && (
               <div
@@ -872,8 +1046,8 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
                 data-testid="onboarding-registration-missing"
               >
                 The Claude account you signed in with during setup wasn&apos;t
-                added to Hapimatic — use Add account to sign in with that same
-                account again
+                added to Hapimatic — use + Add to sign in with that same account
+                again
               </div>
             )}
             {onboardingRegistration === "pending" && (
@@ -930,7 +1104,7 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
                   strategy={verticalListSortingStrategy}
                 >
                   <div className="flex flex-col gap-2">
-                    {visibleAccounts.map(({ account, nodes }) => (
+                    {visibleAccounts.map(({ account }) => (
                       <SortableAccountCard
                         key={`${account.accountUuid}:${genId}`}
                         id={account.accountUuid}
@@ -941,7 +1115,22 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
                             defaultExpanded={allExpanded}
                             onRetry={doRefresh}
                             api={api}
-                            nodes={nodes}
+                            nodeItems={nodeItemsFor(
+                              "anthropic",
+                              account.accountUuid
+                            )}
+                            alertNodes={alertByUuid.get(account.accountUuid)}
+                            onRemove={
+                              usage.length >= 2
+                                ? () =>
+                                    setRemoveTarget(
+                                      removalRows.find(
+                                        r =>
+                                          r.accountUuid === account.accountUuid
+                                      ) ?? null
+                                    )
+                                : undefined
+                            }
                             dragHandle={dragHandle}
                           />
                         )}
@@ -952,30 +1141,22 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
               </DndContext>
             )}
 
-            {/* "How to add a new account" collapsible (epic #2049, Sub F / #2055) —
-              hosts the add-account guidance once Sub G (#2056) strips the buttons
-              from the Switch Account modal. Rendered unconditionally (like the
-              footer) so it appears in every page state, including the empty state
-              where a user most needs it. */}
-            <AddAccountSection />
-
-            {/* Bulk "Remove Accounts" trigger (issue #2131) — replaces the per-card
-              red ✕. Right-aligned, red-outline destructive styling, between the
-              add-account section and the device footer. Proactive last-account-
-              anywhere block: hidden below 2 accounts (nothing meaningful to
-              bulk-remove; AddAccountSection carries the "add a new account first"
-              guidance). Per-node last-account cases stay on the server 409. */}
-            {usage.length >= 2 && (
-              <div className="mt-2 flex justify-end">
-                <Button
-                  variant="outline"
-                  type="button"
-                  data-testid="remove-accounts-button"
-                  onClick={() => setRemoveOpen(true)}
-                  className="h-auto rounded-md border-red-500/60 px-3 py-1.5 text-[length:var(--text-body)] font-medium text-red-500 hover:bg-red-500/10"
-                >
-                  Remove Accounts
-                </Button>
+            {/* R9a: the Anthropic vault keys follow the accounts — outside the
+              drag context, in vault order, never filtered (R12). */}
+            {keysByProvider.anthropic.length > 0 && (
+              <div
+                className="mt-2 flex flex-col gap-2"
+                data-testid="anthropic-key-cards"
+              >
+                {keysByProvider.anthropic.map(key => (
+                  <ApiKeyCard
+                    key={`${key.id}:${genId}`}
+                    apiKey={key}
+                    api={api}
+                    localNode={uiHost}
+                    defaultExpanded={allExpanded}
+                  />
+                ))}
               </div>
             )}
           </ProviderSection>
@@ -990,26 +1171,60 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
             </div>
           )}
 
-          {/* OpenAI (Codex) section — per-node derived login rows (#3806) + the
-              in-app "Add account" (the OpenAI "+ Add" modal, #4464). */}
-          <ProviderSection title="OpenAI" testId="provider-section-openai">
+          {/* OpenAI (Codex) section — account cards, then key cards, then the
+              per-node login rows (#3806, #4466); the header's "+ Add" opens the
+              OpenAI "+ Add" modal (#4464). */}
+          <ProviderSection
+            title="OpenAI"
+            providerId="openai"
+            testId="provider-section-openai"
+            counts={{
+              accounts: openaiUsage.length,
+              keys: keysByProvider.openai.length,
+            }}
+            onAdd={() => setAddProvider("openai")}
+            footer={<OtherWaysToAddPopover provider="openai" />}
+            usageView={usageViews.viewFor("openai")}
+            onUsageViewChange={
+              usageViews.ready
+                ? v => usageViews.setView("openai", v)
+                : undefined
+            }
+          >
             <OpenAiSectionBody
               nodes={providerNodes}
               resolveNodeLabel={resolveNodeLabel}
               api={api}
               openaiUsage={openaiUsage}
-              resolveNodes={resolveNodes}
+              resolveNodeItems={u => nodeItemsFor("openai", u.accountUuid)}
+              keys={keysByProvider.openai}
+              localNode={uiHost}
+              allExpanded={allExpanded}
+              genId={genId}
+              onRemove={
+                openaiUsage.length >= 2
+                  ? u => setRemoveTarget(openaiRemovalRow(u))
+                  : undefined
+              }
               onDragActiveChange={active => {
                 isDraggingRef.current = active;
               }}
             />
           </ProviderSection>
 
-          {/* Google Gemini section — per-node auth type + key binding (#3806) +
-              the "Add key" button (the Gemini "+ Add" modal, #4464). */}
+          {/* Google Gemini section — key cards (a peer's read-only), then the
+              muted per-node auth lines (#3806, #4466); the header's "+ Add"
+              opens the Gemini "+ Add" modal (#4464). */}
           <ProviderSection
             title="Google Gemini"
+            providerId="google"
             testId="provider-section-google"
+            counts={{
+              accounts: 0,
+              keys: keysByProvider.gemini.length + geminiPeers.length,
+            }}
+            onAdd={() => setAddProvider("google")}
+            footer={<OtherWaysToAddPopover provider="google" />}
           >
             <GeminiSectionBody
               nodes={providerNodes}
@@ -1017,6 +1232,10 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
               currentNodeId={currentNodeId}
               api={api}
               googleUsageRows={googleUsageRows}
+              keys={keysByProvider.gemini}
+              localNode={uiHost}
+              allExpanded={allExpanded}
+              genId={genId}
             />
           </ProviderSection>
 
@@ -1029,7 +1248,9 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
               title="Provider API Keys"
               testId="provider-section-api-keys"
             >
-              <ApiKeysSection />
+              <ApiKeysSection
+                listProviders={p => !SECTION_KEY_PROVIDERS.has(p)}
+              />
             </ProviderSection>
           </div>
 
@@ -1039,15 +1260,25 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
           <DeviceConnectionFooter />
 
           <RemoveAccountsModal
-            isOpen={removeOpen}
-            onClose={() => setRemoveOpen(false)}
-            accounts={removalRows}
-            currentNodeId={currentNodeId}
+            account={removeTarget}
+            onClose={() => setRemoveTarget(null)}
             isPending={isRemovingFromNodes}
             onConfirm={removals =>
               removeAccountsFromNodes({ removals, currentNodeId, nodeLabels })
             }
           />
+
+          {/* #4466 R2: the section headers' "+ Add" pill, on the UI host. The
+            `?relogin=` deep link keeps its own modal (ReloginDeepLink). */}
+          {addProvider != null && (
+            <AddToProviderModal
+              isOpen
+              onClose={() => setAddProvider(null)}
+              api={api}
+              provider={addProvider}
+              initialNodeId={currentNodeId}
+            />
+          )}
         </div>
       </div>
     </div>

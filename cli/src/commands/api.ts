@@ -64,6 +64,30 @@ export type ResolvedSpawnArgs = {
 export type SpawnArgsError = { error: string };
 
 /**
+ * Issue #5879: the stderr lines for the headroom notes a spawn accept carries
+ * (`usage_unavailable`, `forced_exhausted_account`). Pure, so it is testable
+ * without a server; malformed entries are skipped.
+ */
+export function spawnWarningLines(
+  warnings: Array<{ code?: string; message?: string }> | undefined
+): string[] {
+  return (warnings ?? [])
+    .filter(w => typeof w?.message === "string" && w.message.length > 0)
+    .map(w => `Warning: ${w.message}`);
+}
+
+/**
+ * Issue #5879 (R3): the stderr line naming the account a spawned session bound,
+ * read from its list summary (`metadata.claudeAccount`). A session with no
+ * recorded account is on the node's host credential.
+ */
+export function boundAccountLine(
+  claudeAccount: { email?: string } | null | undefined
+): string {
+  return `Bound account: ${claudeAccount?.email || "(host credential)"}`;
+}
+
+/**
  * Resolve `sessions spawn` flags, defaulting `--machine` to the local machine
  * ID from `<HAPI_HOME>/settings.json` (`configuration.settingsFile`) when
  * omitted (issue #994). An explicit `--machine` always wins and short-circuits
@@ -446,7 +470,14 @@ async function handleSessions(args: string[]): Promise<void> {
     // legacy synchronous {success|error}, which we print unchanged (R5 fallback).
     // #1559: keep the raised client timeout for the (now rarer) synchronous case
     // and reuse it as the overall poll ceiling.
-    let resp: { data: { type?: string; sessionId?: string } };
+    let resp: {
+      data: {
+        type?: string;
+        sessionId?: string;
+        // Issue #5879: headroom notes on the accept (e.g. usage_unavailable).
+        warnings?: Array<{ code?: string; message?: string }>;
+      };
+    };
     try {
       resp = await axios.post(
         `${configuration.serverUrl}/api/machines/${encodeURIComponent(machineId)}/spawn`,
@@ -498,6 +529,11 @@ async function handleSessions(args: string[]): Promise<void> {
       process.exit(1);
     }
     console.error(`Spawning session ${sessionId}…`);
+    // Issue #5879: surface the server's headroom notes (stderr — stdout stays
+    // the machine-readable JSON).
+    for (const line of spawnWarningLines(resp.data.warnings)) {
+      console.error(line);
+    }
     const POLL_INTERVAL_MS = 2000;
     const deadline = Date.now() + SPAWN_CLIENT_TIMEOUT_MS;
     for (;;) {
@@ -506,7 +542,10 @@ async function handleSessions(args: string[]): Promise<void> {
         id?: string;
         tag?: string | null;
         lifecycleState?: string;
-        metadata?: { summary?: { text?: string } | null } | null;
+        metadata?: {
+          summary?: { text?: string } | null;
+          claudeAccount?: { email?: string } | null;
+        } | null;
       }> = [];
       try {
         const listResp = await axios.get(
@@ -529,6 +568,8 @@ async function handleSessions(args: string[]): Promise<void> {
         process.exit(1);
       }
       if (s && state !== "spawning") {
+        // Issue #5879 (R3): name the account the daemon bound (stderr).
+        console.error(boundAccountLine(s.metadata?.claudeAccount));
         writeStdout(
           JSON.stringify(
             { type: "success", sessionId, lifecycleState: state ?? "running" },

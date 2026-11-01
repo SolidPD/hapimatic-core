@@ -95,6 +95,10 @@ export type SpawnInput = {
   /** #3818 / #4370: cut the worktree from exactly this branch. Both branches
    *  forward it (#4497). */
   sourceBranch?: string;
+  /** Issue #5879: spawn on `accountUuid` even at its usage cap. Rides the
+   *  trailing options object; kept out of SpawnSelections, so the command
+   *  preview never shows it. Both branches forward it. */
+  forceAccount?: boolean;
 };
 
 export function useSpawnSession(api: ApiClient | null): {
@@ -111,13 +115,18 @@ export function useSpawnSession(api: ApiClient | null): {
       }
 
       // #3818 / #4497: parent link + cut point, as ONE trailing object (T26),
-      // forwarded by both the federated and the local branch.
+      // forwarded by both the federated and the local branch. #5879: the
+      // account override rides the same object.
       const parent =
-        input.parentSessionId || input.parentRelationship || input.sourceBranch
+        input.parentSessionId ||
+        input.parentRelationship ||
+        input.sourceBranch ||
+        input.forceAccount
           ? {
               parentSessionId: input.parentSessionId,
               parentRelationship: input.parentRelationship,
               sourceBranch: input.sourceBranch,
+              ...(input.forceAccount ? { forceAccount: true } : {}),
             }
           : undefined;
 

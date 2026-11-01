@@ -76,7 +76,11 @@ import { loadGitHubWebhookConfig } from "./config/githubWebhookConfig";
 import type { SchedulerService } from "./extensions/scheduler/scheduler/schedulerService";
 import { AutoRecoveryService } from "./services/autoRecoveryService";
 import { loadAutoRecoveryConfig } from "./config/autoRecoveryConfig";
-import { AutoSwitchOnRateLimitService } from "./services/autoSwitchOnRateLimit";
+import {
+  AutoSwitchOnRateLimitService,
+  composeEdgeObservers,
+  type EdgeObserver,
+} from "./services/autoSwitchOnRateLimit";
 import { loadAutoSwitchConfig } from "./config/autoSwitchConfig";
 import { ContextWatermarkService } from "./watermark/contextWatermarkService";
 import { loadContextWatermarkConfig } from "./config/contextWatermarkConfig";
@@ -1078,7 +1082,11 @@ async function main() {
       nodeRegistry,
       autoRecoveryConfig,
       errorLogger,
-      settingsFile
+      settingsFile,
+      undefined,
+      // #3612: the usage-window nudge reads the account's reset time from the
+      // same shared usage cache (`getLatest` only, never a refresh).
+      { usageService }
     );
     autoRecoveryService.start();
 
@@ -1090,6 +1098,19 @@ async function main() {
     // shared UsageService cache (getLatest only, never a hot-path refresh) and the
     // hoisted AccountService (getRaw, fresh file read) — no second cache, no
     // web/server.ts injection.
+    //
+    // #3612 (ruling D3): the rising/cleared edge seam has several consumers, so
+    // each edge gets ONE list here and every consumer pushes onto it — never
+    // assign `onRisingEdge` / `onCleared` directly. #3612's reset-time nudge is
+    // armed on the rising edge and cancelled on the cleared edge (a recovery,
+    // a successful account switch, or the session ending).
+    const risingEdgeObservers: EdgeObserver[] = [];
+    const clearedEdgeObservers: EdgeObserver[] = [];
+    const recovery = autoRecoveryService;
+    risingEdgeObservers.push((id, session) =>
+      recovery.onUsageWindowRisingEdge(id, session)
+    );
+    clearedEdgeObservers.push(id => recovery.cancelUsageWindowNudge(id));
     const autoSwitchConfig = await loadAutoSwitchConfig(config.dataDir);
     autoSwitchService = new AutoSwitchOnRateLimitService(
       syncEngine,
@@ -1100,6 +1121,8 @@ async function main() {
       {
         usageService,
         getAccountService: () => usageAccountService,
+        onRisingEdge: composeEdgeObservers(risingEdgeObservers),
+        onCleared: composeEdgeObservers(clearedEdgeObservers),
       }
     );
     autoSwitchService.start();

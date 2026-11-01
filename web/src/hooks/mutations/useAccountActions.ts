@@ -97,6 +97,10 @@ function mapSwitchErrorText(err: unknown, code: string | undefined): string {
       return "API-key billing is available for Claude Code sessions only.";
     case "api_key_not_found":
       return "That API key is no longer in this node's vault.";
+    // Issue #5879: a rebind onto an account at its usage cap. The server's own
+    // message names the window, its reset time and the best alternative, so it
+    // is shown as-is (falls through to the body read below).
+    case "account_exhausted":
     default: {
       if (err instanceof ApiError && err.body) {
         try {
@@ -210,7 +214,7 @@ export function useAccountActions(
         // #3973: acknowledge the write. The node default may be an account
         // that is unrefreshable there (the server allows it), so read the
         // default under the same provider key the observing component uses
-        // (NodeChip, AccountSelectorModal); the Anthropic default lives under
+        // (AccountNodeRow, AccountSelectorModal); the Anthropic default lives under
         // the 2-element key. The invalidation above refetches it only while
         // something watches it, so an unwatched or failed read falls back to
         // the plain success toast, which is still true.
@@ -437,7 +441,18 @@ export function useAccountActions(
       // getCachedOrRefresh() would serve the stale TTL snapshot and the card
       // would resurrect until the next 2-min sampler tick. An account that still
       // lives on unselected nodes reappears here (D3, expected).
-      await queryClient.invalidateQueries({ queryKey: queryKeys.accountUsage });
+      // #4466: the card's node row and re-login alert read the account-health
+      // query too, so refresh it as well, or a removed node keeps its pill and
+      // red ring until the 60 s poll. The OpenAI section reads the auth state
+      // to tell the host login from a store record, and a removal can change
+      // which one a node uses.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.accountUsage }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.accountHealth }),
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.providerAuthState,
+        }),
+      ]);
     },
   });
 
@@ -596,7 +611,14 @@ export function useInVmAccountLogin(api: ApiClient | null): {
     },
     cancel: async loginToken => {
       if (!api) return;
-      await api.cancelInVmAccountLogin(loginToken).catch(() => undefined);
+      try {
+        await api.cancelInVmAccountLogin(loginToken);
+      } catch (err) {
+        // Issue #6028: the server answers 200 even for an unknown token, so every
+        // rejection is a real failure. Rethrow it with the body's human `error`
+        // so Start over can stop instead of resuming the uncancelled sign-in.
+        throw cleanLoginError(err);
+      }
     },
   };
 }

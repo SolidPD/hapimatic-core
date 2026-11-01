@@ -27,6 +27,8 @@ import {
   type DaemonCapSource,
 } from "@hapi/protocol/schemas";
 import { setSpawnPaused } from "./spawnPauseState";
+import { EFFORT_LEVELS, type EffortLevel } from "@hapi/protocol";
+import { resolveNodeSpawnEffort } from "./nodeSpawnDefaults";
 
 export function startDaemonControlServer({
   getChildren,
@@ -37,6 +39,14 @@ export function startDaemonControlServer({
   forceRefreshAccount,
   getEffectiveCount,
   getJobs,
+  getSpawnDefaults = async () => {
+    const resolved = await resolveNodeSpawnEffort();
+    return {
+      effort: resolved.level,
+      // No explicit level is passed, so "body" cannot occur here.
+      effortSource: resolved.source === "body" ? "default" : resolved.source,
+    };
+  },
 }: {
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string) => boolean;
@@ -59,6 +69,13 @@ export function startDaemonControlServer({
   }>;
   /** #1964 (Sub-D): snapshot of this daemon process's runtime job registry. */
   getJobs: () => JobStatus[];
+  /** Issue #6028: this daemon's resolved spawn default effort (env
+   *  `HAPI_DEFAULT_EFFORT` > settings `defaultEffort` > xhigh). Defaults to the
+   *  same resolver the spawn path uses; tests inject a stub. */
+  getSpawnDefaults?: () => Promise<{
+    effort: EffortLevel;
+    effortSource: "env" | "settings" | "default";
+  }>;
 }): Promise<{ port: number; token: string; stop: () => Promise<void> }> {
   return new Promise(resolve => {
     const app = fastify({
@@ -366,6 +383,30 @@ export function startDaemonControlServer({
       async () => {
         logger.debug("[CONTROL SERVER] Effective-count request");
         return await getEffectiveCount();
+      }
+    );
+
+    // Issue #6028: this daemon's resolved spawn default effort, for the New
+    // Session label (local via GET /api/daemon/capacity, remote via
+    // /federation/info). A sibling of /effective-count rather than extra fields
+    // on it: that endpoint is the spawn-gate contract and must not gain a
+    // settings read. Every reply key is declared — serializerCompiler + z.object
+    // strip undeclared keys (#5614).
+    typed.post(
+      "/spawn-defaults",
+      {
+        schema: {
+          response: {
+            200: z.object({
+              effort: z.enum(EFFORT_LEVELS),
+              effortSource: z.enum(["env", "settings", "default"]),
+            }),
+          },
+        },
+      },
+      async () => {
+        logger.debug("[CONTROL SERVER] Spawn-defaults request");
+        return await getSpawnDefaults();
       }
     );
 

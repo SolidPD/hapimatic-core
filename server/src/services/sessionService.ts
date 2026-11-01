@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import {
+  AccountExhaustionSchema,
+  SpawnWarningSchema,
+  type AccountExhaustion,
+  type SpawnWarning,
+} from "@hapi/protocol";
 import type { SyncEngine } from "../sync/syncEngine";
 import type { PaymentMethodTarget } from "../sync/accountRestart";
 import type { NodeRegistry } from "../federation/nodeRegistry";
@@ -94,7 +100,14 @@ export type QueueDrainServiceResult =
 export type SwitchAccountServiceResult =
   // `staged` (issue #3633): true when the session was DISCONNECTED and the
   // account was staged for the next reconnect rather than switched live.
-  | { type: "success"; accountEmail: string; staged?: boolean }
+  // `warnings` (issue #5879): the owning node's headroom notes on a peer-owned
+  // rebind (a forced or usage-unknown switch), passed through for the caller.
+  | {
+      type: "success";
+      accountEmail: string;
+      staged?: boolean;
+      warnings?: SpawnWarning[];
+    }
   | { type: "not-found" }
   | {
       type: "error";
@@ -106,6 +119,8 @@ export type SwitchAccountServiceResult =
       nodeId?: string;
       nodeLabel?: string;
       accountUuid?: string;
+      // Issue #5879: a peer's validated `account_exhausted` detail.
+      exhaustion?: AccountExhaustion;
     };
 
 /**
@@ -141,8 +156,13 @@ function switchAccountCodeToStatus(code: string | undefined): number {
     // (capacity conflict, retryable) rather than 500. #2300 maps it client-side.
     // `stage_failed` (issue #3633): a staged-write failure on a disconnected
     // session is a conflict, not a 5xx — triageable and distinct from a crash.
+    // `account_exhausted` (issue #5879): defense in depth. The local engine never
+    // emits it (the rebind route checks headroom before the engine runs, and a
+    // peer's refusal keeps its own status); if it ever does, it is a conflict
+    // with the account's state — 409, never the 500 an unmapped code falls to.
     case "not_active":
     case "account_unrefreshable":
+    case "account_exhausted":
     case "no_change":
     case "at_capacity":
     case "switch_failed_rolled_back":
@@ -347,11 +367,17 @@ export class SessionService {
       // "transport_failed" at the switchAccount stamp below. Absent on a genuine
       // transport fault (the catch below leaves code undefined).
       const code = (errBody as { code?: string }).code;
+      // Issue #5879: keep a peer's account_exhausted detail when it validates
+      // (whitelist schema — no token can ride through).
+      const exhaustion = AccountExhaustionSchema.safeParse(
+        (errBody as { exhaustion?: unknown }).exhaustion
+      );
       return {
         type: "error",
         message,
         status: resp.status,
         ...(typeof code === "string" ? { code } : {}),
+        ...(exhaustion.success ? { exhaustion: exhaustion.data } : {}),
       };
     } catch (error) {
       // Both branches leave `code` undefined: switchPaymentMethod maps that to
@@ -627,7 +653,10 @@ export class SessionService {
     sessionId: string,
     target: PaymentMethodTarget,
     namespace: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    // Issue #5879: forwarded to a peer-owned session's owner, which runs the
+    // account-headroom check (the local path is checked by the route itself).
+    opts?: { forceAccount?: boolean }
   ): Promise<SwitchPaymentMethodServiceResult> {
     if (this.isLocalSession(sessionId)) {
       const result = await this.engine.switchPaymentMethod(
@@ -682,7 +711,10 @@ export class SessionService {
       "/account",
       "POST",
       namespace,
-      { accountUuid: target.accountUuid }
+      {
+        accountUuid: target.accountUuid,
+        ...(opts?.forceAccount ? { forceAccount: true } : {}),
+      }
     );
     if (result.type === "success") {
       // Issue #1517 (R6): the owning node persisted the switch locally; update
@@ -695,6 +727,7 @@ export class SessionService {
         accountUuid?: string;
         claudeAccount?: ClaudeAccountInfo;
         authBinding?: AuthBinding;
+        warnings?: unknown;
       };
       if (data.accountUuid && data.claudeAccount) {
         this.registry?.updateCachedSessionAccount(
@@ -704,7 +737,20 @@ export class SessionService {
           data.authBinding
         );
       }
-      return { type: "success", accountEmail: data.accountEmail ?? "" };
+      // Issue #5879: keep the owner's headroom notes (validated, unknown entries
+      // dropped) so a forced or usage-unknown rebind of a peer-owned session
+      // tells the caller, as a local one does.
+      const warnings = Array.isArray(data.warnings)
+        ? data.warnings.flatMap(w => {
+            const p = SpawnWarningSchema.safeParse(w);
+            return p.success ? [p.data] : [];
+          })
+        : [];
+      return {
+        type: "success",
+        accountEmail: data.accountEmail ?? "",
+        ...(warnings.length > 0 ? { warnings } : {}),
+      };
     }
     if (result.type === "not-found") {
       return { type: "not-found" };
@@ -719,6 +765,7 @@ export class SessionService {
       // (proxyToNode's catch leaves result.code undefined).
       code: result.code ?? "transport_failed",
       ...this.refusalStamp(result.code, target.accountUuid, node.nodeId),
+      ...(result.exhaustion ? { exhaustion: result.exhaustion } : {}),
     };
   }
 

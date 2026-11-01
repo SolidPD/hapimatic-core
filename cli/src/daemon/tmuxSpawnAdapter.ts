@@ -41,6 +41,7 @@ import { buildSystemPrompt } from "@/claude/utils/systemPrompt";
 import { getDefaultClaudeCodePath } from "@/claude/sdk/utils";
 import { MAX_RETRY_BUDGET } from "@/claude/claudeTmuxRemoteLauncher";
 import { buildTmuxEnvFileCommand } from "@/claude/launcherShared";
+import { buildPaneEnvFilter } from "@/tmux/TmuxManager";
 import { getActiveEgressBrokerPort } from "@/sandbox/egressBroker";
 import { buildCodexCommand } from "@/extensions/agent-codex/codex/codexTmuxLauncher";
 import {
@@ -609,6 +610,52 @@ export function buildBwrapJailCommand(
 }
 
 /**
+ * Issues #5919, #5942, #5943: the command a daemon session's pane runs
+ * (`new-window` and the reconnect `respawn-pane`):
+ * `env -u <names> bash <script> ; rm -f <script> ; exec env -u <names> bash`.
+ *
+ * The pane's shell starts from the tmux server's global table. When
+ * `TmuxManager.scrubServerGlobalEnv` fails to remove a variable there (it logs the
+ * name and goes on), the filter still keeps that variable out of the two shells
+ * the pane starts: `bash <script>`, and the idle `bash` left after the wrapper
+ * exits, which a user may attach to and start a `claude` or `hapi` in. The
+ * `rm -f` between them is a third program, started unfiltered from the outer
+ * shell; it reads no credential.
+ *
+ * The names are {@link paneEnvScrubNames}: the wrapper's own per-pane list first,
+ * then the rest of the active scrub set, so with the sandbox on they include
+ * `SECRET_ENV_VARS` (#5942). The wrapper reads its own values from its env file,
+ * which the script sources after the filter, so its environment is unchanged. No
+ * `subscriptionClaudePane`: this pane starts every session kind's wrapper, and a
+ * key session's wrapper keeps `ANTHROPIC_BASE_URL` (#4884).
+ *
+ * `env -u`, not `unset` (#5943): tmux runs this string through the operator's
+ * `default-shell -c`, and `unset` does nothing to the environment under fish or
+ * tcsh. `env` is an external command looked up on the pane's `PATH`, so no shell
+ * can skip it the way fish skips `unset`, and `env -u` of a fixed name cannot
+ * fail; the filter and the program are one exec, so the launch never depends on
+ * a separate removal step. If `env` itself cannot run (a non-executable `env`
+ * earlier on `PATH`), the pane dies rather than start an unfiltered shell.
+ * Not covered here: the outer shell's own
+ * `/proc/<pid>/environ` still shows the table's values until its final `exec`,
+ * and the tmux server's own environ keeps its creator's values until that server
+ * restarts (a scrub never changes it).
+ *
+ * #2646 R8 still holds: `env` execs `bash` in the same process, so a dead Claude
+ * leaves a childless idle-bash pane, and the bwrap jail wraps only the inner
+ * launch command inside the script. The script path keeps the `hapi-spawn-`
+ * signature that `reconcileOrphanWindows` matches with `includes`.
+ */
+export function buildPaneInitialCommand(
+  scriptPath: string,
+  sandboxOn: boolean = configuration.omniboxSandboxEnabled
+): string {
+  const filter = buildPaneEnvFilter(sandboxOn);
+  const script = escapeShellArg(scriptPath);
+  return `${filter} bash ${script} ; rm -f ${script} ; exec ${filter} bash`;
+}
+
+/**
  * Issue #3813: resolve the RO-bind install prefix for a jail-eligible flavor whose
  * binary is NOT self-contained. Claude is a self-contained binary (its `claudePath`
  * is RO-bound directly) → no prefix. Codex is a shim needing `node` + its
@@ -1162,12 +1209,14 @@ export async function spawnSessionInTmux(
     });
     logger.debug(`[TmuxSpawnAdapter] Temp script: ${tmpScript}`);
 
-    const launchCmd = `bash ${escapeShellArg(tmpScript)} ; rm -f ${escapeShellArg(tmpScript)}`;
     // When used as a window's initial process (new-window or respawn-pane),
-    // drop into an interactive shell after the hapi process exits.  This
-    // gives a visible command prompt as a visual indicator that the session
-    // is disconnected, and keeps the pane alive for reconnect via send-keys.
-    const initialProcessCmd = `${launchCmd} ; exec bash`;
+    // run the script, then drop into an interactive shell after the hapi
+    // process exits.  This gives a visible command prompt as a visual indicator
+    // that the session is disconnected; a reconnect respawns the pane (#1555).
+    // #5919/#5943: both shells start under an `env -u` filter, so neither the
+    // wrapper's shell nor that idle shell inherits what a failed global-table
+    // scrub left behind, whatever the default shell is.
+    const initialProcessCmd = buildPaneInitialCommand(tmpScript);
 
     // Captured index from new-window -P -F. Surfaced in the return value so
     // run.ts's post-spawn PID lookup can bypass the broken-on-tmux-3.4
@@ -1820,9 +1869,10 @@ export async function setArchiveTag(
 
 /**
  * Issue #2683: signature the pane-start-command of a daemon-spawned SESSION
- * window carries (`bash /tmp/hapi-spawn-<id>.sh ; … ; exec bash`). It survives
- * the trailing `exec bash`, so it positively distinguishes a leaked session
- * window from the `ensureSession` placeholder / any non-session window.
+ * window carries (`env -u … bash '/tmp/hapi-spawn-<id>.sh' ; … ; exec env -u …
+ * bash`, built by `buildPaneInitialCommand`). It survives the trailing exec, so
+ * it positively distinguishes a leaked session window from the `ensureSession`
+ * placeholder / any non-session window.
  */
 export const HAPI_SPAWN_PANE_SIGNATURE = "hapi-spawn-";
 
@@ -1858,8 +1908,9 @@ export const ORPHAN_REAP_DEBOUNCE_TICKS = 2;
  *
  * #2646 CONTRACT (semantic hasActiveChildren invariant): this reaper — like
  * `decideWrapperAlive` and `computeEffectiveCount` — depends on the pane running
- * `<launchCmd> ; exec bash` so a dead Claude leaves a childless pane PID. #2646's
- * bwrap jail MUST wrap only `launchCmd` and keep `; exec bash` host-side, else a
+ * `bash <script> ; … ; exec … bash` (`buildPaneInitialCommand`) so a dead Claude
+ * leaves a childless pane PID. #2646's bwrap jail MUST wrap only the launch inside
+ * the script and keep the trailing `exec … bash` host-side, else a
  * dead session's pane keeps the jail child forever and this predicate never
  * matches. #2683's churn test MUST run with HAPI_OMNIBOX_SANDBOX=1 to guard it.
  *

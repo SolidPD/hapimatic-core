@@ -20,7 +20,7 @@
  * and calls this.
  */
 import { Hono } from "hono";
-import { defineCapability } from "@hapi/protocol";
+import { defineCapability, resolveModelEffortLevels } from "@hapi/protocol";
 import { cataloged } from "../capabilities/cataloged";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
@@ -111,6 +111,7 @@ import { createSpawnRosterRoutes } from "./routes/spawnRoster";
 import { createVersionRoutes } from "./routes/version";
 import { createLauncherRoutes } from "./routes/launcher";
 import { createHealthRoutes } from "./routes/health";
+import { createHealthReadTokenVerifier } from "../config/healthReadToken";
 import { createUpdateRoutes } from "./routes/update";
 import { createUploadRoutes } from "./routes/upload";
 import { createWatermarkRoutes } from "./routes/watermark";
@@ -512,7 +513,16 @@ export function buildWebApp(options: {
   app.route("/api", createBindRoutes(options.jwtSecret, options.store));
   app.route("/api", createVersionRoutes());
   app.route("/api", createLauncherRoutes());
-  app.route("/api", createHealthRoutes(options.jwtSecret, options.errorLogger));
+  // #5444: /api/system-health also accepts the monitoring sweep's read-only
+  // health token, read live from settings.json (delete = revoke, replace = rotate).
+  app.route(
+    "/api",
+    createHealthRoutes(
+      options.jwtSecret,
+      options.errorLogger,
+      createHealthReadTokenVerifier(configuration.settingsFile)
+    )
+  );
 
   // GET /api/update-status (public, reads local staged marker) + POST
   // /api/update-trigger (JWT, systemd-run transient unit). Mounted PRE-AUTH so
@@ -648,6 +658,16 @@ export function buildWebApp(options: {
   // session. AccountService post-dates SyncEngine construction (index.ts),
   // so this is a setter rather than a constructor arg.
   options.getSyncEngine()?.setAccountService(accountService);
+
+  // Issue #6028: let spawnSession stamp the pinned model's supported effort
+  // levels from THIS node's catalog (one instance — the same one behind
+  // GET /api/claude/models). peekModels() never waits on Anthropic, so a spawn
+  // is never delayed by a live fetch. Wired here, not in index.ts, because this
+  // file owns the catalog.
+  options.getSyncEngine()?.setModelEffortLevelsResolver(pin => {
+    const { models, source } = claudeModelCatalog.peekModels();
+    return resolveModelEffortLevels(models, source, pin);
+  });
 
   // Issue #3806 (epic #3345): the LOCAL-node provider auth-state reader, shared by
   // the local /api/accounts/provider-auth-state route and the federation
@@ -1135,6 +1155,8 @@ export function buildWebApp(options: {
       getAccountService: () => accountService,
       // Issue #4461 (R6): names this node on an account_unrefreshable reconnect.
       getLocalNode: localNode,
+      // Issue #5879: the rebind account-headroom check reads this node's usage.
+      getUsageService: () => usageService,
     })
   );
   // Issue #2418 (epic #2416 B): capability enumeration read path. Same federation
@@ -1304,6 +1326,9 @@ export function buildWebApp(options: {
       getLocalNode: localNode,
       // Issue #5127: a spawn bound to a key on another node is confirmed first.
       getSharedApiKeyService: () => sharedApiKeyService,
+      // Issue #5879: the spawn account-headroom check reads this node's usage.
+      getUsageService: () => usageService,
+      getAccountService: () => accountService,
     })
   );
   // hapimatic-private#4481: Create-page Branch control listing (local + federated).
@@ -1395,6 +1420,8 @@ export function buildWebApp(options: {
         nodeId: options.federationConfig?.nodeId ?? null,
         nodeLabel: options.federationConfig?.nodeLabel ?? null,
       }),
+      // Issue #2952: a failed feedback email raises a centralized error.
+      errorLogger: options.errorLogger,
     })
   );
   // Issue #2912: the operators' shared inbox over the gateway's central store.
@@ -1438,6 +1465,7 @@ export function buildWebApp(options: {
         ].filter((v): v is string => typeof v === "string" && v.length >= 6),
       ],
       getLauncherKind: resolveCurrentLauncherKind,
+      errorLogger: options.errorLogger,
     })
   );
   // Issue #1967 (Epic #1965 Sub B): file-claim write/release/query API,

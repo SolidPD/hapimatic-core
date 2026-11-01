@@ -11,6 +11,7 @@ import { manifest as manifest4 } from "./extensions/harness-cline/manifest";
 import { manifest as manifest5 } from "./extensions/harness-grok/manifest";
 import { manifest as manifest6 } from "./extensions/harness-pi/manifest";
 import { manifest as manifest7 } from "./extensions/harness-kimi/manifest";
+import { manifest as manifest8 } from "./extensions/harness-strands/manifest";
 
 export interface GeneratedExtensionEntry {
   manifest: HapiExtensionManifest;
@@ -25,4 +26,5 @@ export const extensions: readonly GeneratedExtensionEntry[] = [
   { manifest: manifest5 },
   { manifest: manifest6 },
   { manifest: manifest7 },
+  { manifest: manifest8 },
 ];

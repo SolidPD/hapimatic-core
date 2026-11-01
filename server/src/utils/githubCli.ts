@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { GitHubFailureReason } from "@hapi/protocol/githubFailureReason";
+import type { GitHubConnectionStatus } from "@hapi/protocol/githubConnection";
 import {
   fetchAccountViaRest,
   fetchReposViaRest,
@@ -8,7 +9,7 @@ import {
   type FetchImpl,
 } from "./githubRest";
 import {
-  fetchAccountViaBroker,
+  fetchAccountsViaBroker,
   fetchReposViaBroker,
   resolveGithubBrokerConfig,
 } from "./githubBrokerClient";
@@ -17,28 +18,33 @@ import {
  * GitHub account/repo resolution for the GitHub-account → repo selector
  * (Issue #1953 A6; transport reworked by #2327).
  *
- * 🔴 There is NO GitHub OAuth in Hapimatic. The "account" is a host identity,
- * NOT an OAuth account, and the token is NEVER returned to the web client or
- * threaded into a spawned agent's environment (R11). Shared between the local
- * route (`extensions/github-issues/routes.ts`) and the federation receiver
- * (`web/routes/federation/infrastructure.ts`).
+ * 🔴 There is NO GitHub OAuth on the VM. On a host with `gh` or a `GH_TOKEN` the
+ * "account" is that host identity; on a cloud VM it is a GitHub account the user
+ * linked on hapimatic.com, whose per-user GitHub App token lives on the GATEWAY
+ * (#4793) and never reaches the VM. Either way the token is NEVER returned to the
+ * web client or threaded into a spawned agent's environment (R11). Shared between
+ * the local route (`extensions/github-issues/routes.ts`) and the federation
+ * receiver (`web/routes/federation/infrastructure.ts`).
  *
- * ## Two transports, in a fixed order (#2327)
+ * ## Three transports, in a fixed order (#2327, #3013)
  *
  * 1. **`gh` CLI** — the original path. Tried FIRST so RP1 and every federation
  *    peer keep byte-identical behavior.
- * 2. **GitHub REST** (`githubRest.ts`) — the fallback, used only when `gh` fails.
- *    Authenticates with the `GH_TOKEN` the gateway wizard installs on a VM.
+ * 2. **GitHub REST** (`githubRest.ts`) — used only when `gh` fails and a
+ *    `GH_TOKEN` is set (CI, operator hosts).
+ * 3. **The gateway read broker** (`githubBrokerClient.ts`) — used only when there
+ *    is no token AND the host is provisioned for the broker (a cloud VM). It lists
+ *    every account the VM's users linked (#4793), default first.
  *
- * The order is load-bearing (CLAUDE.md → "🔴 Fallback Preservation Rule"): the
- * new fast path AUGMENTS the existing one, it does not replace it.
+ * The order is load-bearing (CLAUDE.md → "🔴 Fallback Preservation Rule"): each
+ * later transport AUGMENTS the earlier ones, it does not replace them.
  *
- * ## Why the fallback exists
+ * ## Why the fallbacks exist
  *
- * A provisioned cloud VM has no `gh` binary — by design invariant, not accident
- * (`scripts/lib/provision-helpers.sh:73`: "RP1-side only — never on a user VM";
- * the VM's only apt install at `scripts/provision.sh:426` omits it; verified
- * live on `matt-b`). Every `Bun.spawn(["gh", …])` there throws, so before #2327
+ * A provisioned cloud VM has the `gh` binary (`scripts/provision.sh` installs it
+ * from the `cli.github.com` apt source) but no GitHub credential, by design:
+ * #2672 D999-10 keeps every GitHub token off the VM (`FORBIDDEN_VM_ENV_KEYS` in
+ * `gateway/src/lib/vmEnvFile.ts`). So `gh api user` fails there, and before #2327
  * these helpers returned `[]` and the caller reported `success: true` — making a
  * hard dependency failure indistinguishable from "this account has no repos".
  *
@@ -55,6 +61,12 @@ import {
 export interface GitHubAccountResult {
   login: string;
   name: string | null;
+  /** #4793, broker only: the Hapimatic user (email) who linked this account on hapimatic.com. */
+  email?: string;
+  /** #4793, broker only: that user's default account (listed first). */
+  isDefault?: boolean;
+  /** #4793, broker only: the link's status (an install hint for `not_installed`, re-link for the rest). */
+  status?: GitHubConnectionStatus;
 }
 
 /** A repository accessible to a host GitHub account. */
@@ -139,6 +151,18 @@ const repoCache = new Map<string, CacheEntry<GitHubRepoResult>>();
 const GH_CACHE_TTL_MS = 60 * 1000;
 const GH_CACHE_MAX_SIZE = 100;
 const ACCOUNT_CACHE_KEY = "__host__";
+
+/**
+ * #4793: on a broker-provisioned cloud VM `gh` is installed but never signed in, and the broker's
+ * account list is not cached, so every account read would first spawn a failing `gh api user`
+ * (~0.2 s and a journal line). There, and only there, that failure is remembered for one TTL: `gh`
+ * is still retried once a minute, so a later `gh auth login` wins within a minute (Fallback
+ * Preservation), while the broker read itself stays fresh.
+ */
+let brokerHostGhFailure: {
+  reason: GitHubFailureReason;
+  timestamp: number;
+} | null = null;
 
 /** Read a live cache entry, or null when absent/expired. */
 function readCache<T>(
@@ -255,33 +279,47 @@ export async function fetchGitHubAccounts(
   if (cached) return { ok: true, data: cached.data, source: cached.source };
 
   let ghReason: GitHubFailureReason;
-  try {
-    const { code, stdout, stderr } = await runGh([
-      "gh",
-      "api",
-      "user",
-      "--jq",
-      "{login: .login, name: .name}",
-    ]);
-    if (code === 0) {
-      const parsed = JSON.parse(stdout) as {
-        login?: string;
-        name?: string | null;
-      };
-      if (parsed?.login) {
-        const accounts: GitHubAccountResult[] = [
-          { login: parsed.login, name: parsed.name ?? null },
-        ];
-        writeCache(accountCache, ACCOUNT_CACHE_KEY, accounts, "gh");
-        return { ok: true, data: accounts, source: "gh" };
+  const brokerHost = resolveGithubBrokerConfig(env) !== null;
+  const rememberedGhFailure =
+    brokerHost &&
+    brokerHostGhFailure !== null &&
+    Date.now() - brokerHostGhFailure.timestamp < GH_CACHE_TTL_MS
+      ? brokerHostGhFailure
+      : null;
+  if (rememberedGhFailure) {
+    ghReason = rememberedGhFailure.reason;
+  } else {
+    try {
+      const { code, stdout, stderr } = await runGh([
+        "gh",
+        "api",
+        "user",
+        "--jq",
+        "{login: .login, name: .name}",
+      ]);
+      if (code === 0) {
+        const parsed = JSON.parse(stdout) as {
+          login?: string;
+          name?: string | null;
+        };
+        if (parsed?.login) {
+          const accounts: GitHubAccountResult[] = [
+            { login: parsed.login, name: parsed.name ?? null },
+          ];
+          writeCache(accountCache, ACCOUNT_CACHE_KEY, accounts, "gh");
+          return { ok: true, data: accounts, source: "gh" };
+        }
+        ghReason = "unknown";
+      } else {
+        console.error(`[GitHub] gh api user failed: ${stderr}`);
+        ghReason = classifyGhExit(stderr);
       }
-      ghReason = "unknown";
-    } else {
-      console.error(`[GitHub] gh api user failed: ${stderr}`);
-      ghReason = classifyGhExit(stderr);
+    } catch (error) {
+      ghReason = classifyGhThrow(error);
     }
-  } catch (error) {
-    ghReason = classifyGhThrow(error);
+    if (brokerHost) {
+      brokerHostGhFailure = { reason: ghReason, timestamp: Date.now() };
+    }
   }
 
   // `gh` did not produce an identity — fall through to the REST transport.
@@ -292,11 +330,14 @@ export async function fetchGitHubAccounts(
     // VM-resident credential. A non-broker host (RP1 / CI / dev) has no broker config, so
     // it keeps the pre-#3013 no-token behavior byte-unchanged (Fallback Preservation Rule).
     if (resolveGithubBrokerConfig(env)) {
-      const broker = await fetchAccountViaBroker(env, fetchImpl);
+      // #4793: every account the VM's users linked, default first. An empty list is a success
+      // (`source: "broker"` tells the Create page to offer "Connect GitHub"), never an outage.
+      // NOT cached: the list changes on hapimatic.com (link, unlink, default, install), and a
+      // user who just linked GitHub returns here expecting to see it, not a minute-old "none".
+      // The read is one gateway round trip; the web query's own staleTime bounds the rate.
+      const broker = await fetchAccountsViaBroker(env, fetchImpl);
       if (broker.ok) {
-        const accounts = [broker.data];
-        writeCache(accountCache, ACCOUNT_CACHE_KEY, accounts, "broker");
-        return { ok: true, data: accounts, source: "broker" };
+        return { ok: true, data: broker.data, source: "broker" };
       }
       errorLogger?.warn("[GitHub] Account resolution via broker failed", {
         category: "github-fetch-accounts",
@@ -436,4 +477,5 @@ export async function fetchGitHubRepos(
 export function __clearGitHubCachesForTest(): void {
   accountCache.clear();
   repoCache.clear();
+  brokerHostGhFailure = null;
 }

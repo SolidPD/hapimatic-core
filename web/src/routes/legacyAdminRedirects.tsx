@@ -164,6 +164,15 @@ export function makeLegacyAdminRedirects<TRoot extends AnyRoute>(
         throw redirect({ to: "/settings/notifications" });
       },
     }),
+    // #4793: the Connectors page. Never-shipped /admin/* alias, registered only to keep
+    // the 1:1 settings↔admin invariant.
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: "/admin/connectors",
+      beforeLoad: () => {
+        throw redirect({ to: "/settings/connectors" });
+      },
+    }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: "/admin/extensions",

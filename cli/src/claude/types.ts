@@ -13,7 +13,10 @@ export const UsageSchema = z
     cache_creation_input_tokens: z.number().int().nonnegative().optional(),
     cache_read_input_tokens: z.number().int().nonnegative().optional(),
     output_tokens: z.number().int().nonnegative(),
-    service_tier: z.string().optional(),
+    // Issue #6065: Claude Code writes `service_tier: null` on every synthetic
+    // record (API errors, "No response requested."). A string-only schema
+    // rejected them all, and the session scanner silently skips a rejected line.
+    service_tier: z.string().nullish(),
   })
   .passthrough();
 

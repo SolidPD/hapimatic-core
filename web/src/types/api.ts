@@ -338,6 +338,9 @@ export type OpenAiLoginState =
 export type OpenAiLoginStartResponse = {
   loginToken: string;
   state: OpenAiLoginState;
+  /** #5871: why a `failed` start failed, when the node knows. Older nodes omit
+   *  it. `codex-not-installed` — the node has no Codex CLI to run the login. */
+  reason?: "codex-not-installed";
   verificationUrl?: string;
   userCode?: string;
   expiresAt?: string;

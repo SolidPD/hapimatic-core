@@ -322,7 +322,19 @@ export interface SpawnSessionOptions {
    *  no per-caller edit. Forwarded to the daemon on the spawn RPC (the #1262 trap);
    *  undefined/false ⇒ the daemon runs NO optimal-pick (#3023 unchanged, R3). */
   autoSelectOptimalAccount?: boolean;
+  /** Issue #6028: the effort levels the pinned model supports, from this node's
+   *  model catalog. Server-stamped by `spawnSession` on a fresh claude spawn —
+   *  never a client body field. The daemon clamps its own default (env / settings
+   *  / xhigh) to it. Absent ⇒ the daemon uses its static fallback lookup (or no
+   *  clamp). Forwarded field-by-field on the spawn RPC (the #1262 trap). */
+  modelEffortLevels?: EffortLevel[];
 }
+
+/** Issue #6028: maps a spawn's model pin to the effort levels that model supports. */
+type ModelEffortLevelsResolver = (pin: {
+  rawModel?: string;
+  modelMode?: string;
+}) => EffortLevel[] | undefined;
 
 /**
  * Minimal structural seam for target-account validation (issue #1456,
@@ -524,6 +536,14 @@ export class SyncEngine {
    * pick. Null / a throwing reader ⇒ the daemon runs NO optimal-pick (fail-closed).
    */
   private readAutoSelectOptimalAccount: (() => Promise<boolean>) | null = null;
+
+  /**
+   * Issue #6028 — resolves the effort levels a spawn's pinned model supports,
+   * from the node's model catalog. Injected from `buildWebApp.ts` (which owns the
+   * catalog) via `setModelEffortLevelsResolver`. Null / a throw / `undefined` ⇒
+   * `spawnSession` stamps nothing and the daemon uses its static-catalog lookup.
+   */
+  private resolveModelEffortLevels: ModelEffortLevelsResolver | null = null;
 
   /**
    * Issue #1883 (Phase 2, R9) — per-session auto-abort dedupe. Marked BEFORE the
@@ -3317,6 +3337,27 @@ export class SyncEngine {
       }
     }
 
+    // Issue #6028: stamp the pinned model's supported effort levels so the daemon
+    // can fit its spawn default (env / settings / xhigh, resolved daemon-side) to
+    // the model. Only a fresh claude spawn resolves a default; a resume re-threads
+    // its recorded effort. Fail-open: no resolver, a throw, or an unknown model
+    // stamps nothing; the daemon then uses its static-catalog exact-id lookup.
+    if (
+      this.resolveModelEffortLevels &&
+      (opts.agent ?? "claude") === "claude" &&
+      !opts.resumeSessionId
+    ) {
+      try {
+        const levels = this.resolveModelEffortLevels({
+          rawModel: opts.rawModel,
+          modelMode: opts.modelMode,
+        });
+        if (levels) opts.modelEffortLevels = levels;
+      } catch {
+        // Fail-open — the daemon falls back to its static-catalog lookup.
+      }
+    }
+
     // [perf] issue #2147: universal spawn choke-point timing. Every spawn path
     // (create, reconnect start-fresh, branch, scheduler, federation peer-incoming)
     // funnels through here, so this one stamp gives the local baseline for free
@@ -3596,6 +3637,15 @@ export class SyncEngine {
    */
   setAutoSelectOptimalAccountReader(reader: () => Promise<boolean>): void {
     this.readAutoSelectOptimalAccount = reader;
+  }
+
+  /**
+   * Issue #6028 — inject the model-effort resolver (wired from `buildWebApp.ts`,
+   * which owns the model catalog). Unset ⇒ `spawnSession` stamps no
+   * `modelEffortLevels` and the daemon uses its static-catalog lookup.
+   */
+  setModelEffortLevelsResolver(resolver: ModelEffortLevelsResolver): void {
+    this.resolveModelEffortLevels = resolver;
   }
 
   /**

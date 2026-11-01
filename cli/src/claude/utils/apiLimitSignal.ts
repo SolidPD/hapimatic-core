@@ -103,3 +103,55 @@ export function extractApiLimitSignal(
 
   return null;
 }
+
+/** Accepted range for an epoch-SECONDS reset (years 2001 to 5138). */
+const MIN_RESET_SEC = 1e9;
+const MAX_RESET_SEC = 1e11;
+
+/**
+ * The reset instant (epoch ms) Claude Code recorded on a usage-window 429, or
+ * `null`. Claude Code writes `quotaLimits.resetsAt` (and, from 2.1.312,
+ * `apiErrorParams.rate_limit_info.resetsAt`) in epoch seconds on its synthetic
+ * transcript record. It is the value its "resets …" text is formatted from, so
+ * it is exact where the text needs a date and zone parse (#6065). Only a
+ * seconds-magnitude number is accepted: a field that ever changes unit falls
+ * back to the text parse instead of producing a wild date. Pure; reads the
+ * passthrough fields defensively.
+ */
+export function extractStructuredResetAt(message: RawJSONLines): number | null {
+  const msg = message as Record<string, unknown>;
+  const quota = msg.quotaLimits as Record<string, unknown> | null | undefined;
+  const params = msg.apiErrorParams as
+    | Record<string, unknown>
+    | null
+    | undefined;
+  const info = params?.rate_limit_info as
+    | Record<string, unknown>
+    | null
+    | undefined;
+  for (const value of [quota?.resetsAt, info?.resetsAt]) {
+    if (
+      typeof value === "number" &&
+      Number.isFinite(value) &&
+      value >= MIN_RESET_SEC &&
+      value < MAX_RESET_SEC
+    ) {
+      return value * 1000;
+    }
+  }
+  return null;
+}
+
+/**
+ * True for an assistant record Claude Code wrote itself (`model:
+ * "<synthetic>"`): an API-error notice or a placeholder such as "No response
+ * requested.", not model output. Such a record is never forward progress
+ * (#6065); the transcript launchers see it once `usage.service_tier: null`
+ * passes the schema.
+ */
+export function isSyntheticAssistantRecord(message: RawJSONLines): boolean {
+  const msg = message as Record<string, unknown>;
+  if (msg.type !== "assistant") return false;
+  const inner = msg.message as Record<string, unknown> | null | undefined;
+  return inner?.model === SYNTHETIC_MODEL;
+}

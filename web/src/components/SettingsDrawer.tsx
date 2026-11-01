@@ -8,6 +8,7 @@ import SettingsLandingPage from "@/routes/settings/index";
 import { TitleChip } from "@/components/settings/SettingsSectionHeader";
 import { Button } from "@/components/ui/button";
 import { CONTENT_MAX_WIDTH } from "@/lib/layout-thresholds";
+import { UpdateDrawerBanner } from "@/components/UpdateAvailableBadge";
 
 /**
  * SettingsDrawer — a right-anchored, URL-driven slide-in MENU for the settings area.
@@ -21,7 +22,8 @@ import { CONTENT_MAX_WIDTH } from "@/lib/layout-thresholds";
  * #1935: the drawer is now a PURE MENU. It renders only `SettingsLandingPage` (the section
  * list). Every informational section was promoted to its own `/settings/*` route, so tapping
  * a menu row navigates to a full page and dismisses the drawer (the menu's `navigate({ to })`
- * drops `?drawer=settings`). Nothing renders *inside* the drawer except the menu.
+ * drops `?drawer=settings`). Nothing renders *inside* the drawer except the menu and,
+ * while an update is pending, the update banner above it (#3277).
  *
  * #1035 invariant (load-bearing): the admin content renders in EXACTLY ONE place. An earlier
  * path-route design hosted section content in an `<Outlet />`, which double-rendered it in
@@ -154,6 +156,12 @@ export function SettingsDrawer() {
           >
             <X className="h-5 w-5" />
           </Button>
+        </div>
+        {/* #3277 R3: the update banner, pinned under the title bar and above the
+            menu (the USER group first). It renders nothing when no update is
+            pending, so the wrapper collapses with it. */}
+        <div className="flex-shrink-0 px-3 pt-2.5 empty:hidden">
+          <UpdateDrawerBanner />
         </div>
         {/* Scrollable menu. */}
         <div className="min-h-0 flex-1 overflow-y-auto">

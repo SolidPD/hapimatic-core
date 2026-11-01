@@ -60,10 +60,11 @@ export const enabledExtensions: readonly string[] = [
   "server/src/extensions/extension-marketplace",
   "web/src/extensions/extension-marketplace",
   "web/src/extensions/time-log",
-  // HAL catalog CLI harnesses (#3120, epic #3117 Sub-D). Six `defaultEnabled: true` catalog
-  // extensions whose metadata contributions register at load so the Extensions-page catalog
-  // is browsable/installable before the CLI BINARY is present (the binary installs lazily via
-  // the recipe, ruling D2). The catalog UI is folded into `builtin.extension-marketplace`
+  // HAL catalog CLI harnesses (#3120, epic #3117 Sub-D; #5927 adds Strands). Seven
+  // `defaultEnabled: true` catalog extensions whose metadata contributions register at
+  // load so the Extensions-page catalog is browsable/installable before the CLI BINARY is
+  // present (the binary installs lazily via the recipe, ruling D2). The catalog UI is
+  // folded into `builtin.extension-marketplace`
   // (ruling 1B-17 accepted alternative), so there is NO separate web entry here.
   "cli/src/extensions/harness-crush",
   "cli/src/extensions/harness-cursor",
@@ -71,6 +72,7 @@ export const enabledExtensions: readonly string[] = [
   "cli/src/extensions/harness-grok",
   "cli/src/extensions/harness-pi",
   "cli/src/extensions/harness-kimi",
+  "cli/src/extensions/harness-strands",
   // `builtin.voice-input` (#4707, epic #4706) — server-only. The mic button and the
   // Settings section are core web UI gated on `/api/voice/status` (404 → hidden).
   "server/src/extensions/voice-input",

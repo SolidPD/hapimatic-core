@@ -17,8 +17,12 @@ import {
   API_KEY_HELPER_OUTRANKING_ENV_VARS,
   BINDING_ENV_VARS,
   SDK_SIGNAL_ENV_VARS,
+  paneEnvUnsetNames,
 } from "@/claude/launcherShared";
-import { SECRET_ENV_VARS } from "@/sandbox/secretEnvVars";
+import {
+  AGENT_FORBIDDEN_ENV_VARS,
+  SECRET_ENV_VARS,
+} from "@/sandbox/secretEnvVars";
 import { shellEscape } from "@/utils/shellEscape";
 import type { OwnedWindowTarget } from "./windowOwnership";
 import {
@@ -53,9 +57,10 @@ import type {
  * hold GitHub auth at all (onboarding no longer plants a PAT; re-delivery is the
  * gateway-side broker follow-up tracked on #2672). This whole set is applied
  * ONLY when the sandbox gate is ON (caller-gated at the `runTmux` /
- * `scrubServerGlobalEnv` sites). With the gate OFF the tmux seed env is unchanged,
- * but `scrubServerGlobalEnv` still scrubs the `BINDING_ENV_VARS` subset from the
- * global table (#3731 R3) — the only gate-OFF difference from pre-#2646.
+ * `scrubServerGlobalEnv` sites). With the gate OFF this set is not applied to the
+ * tmux seed env, and `scrubServerGlobalEnv` scrubs only its `BINDING_ENV_VARS`
+ * subset from the global table (#3731 R3). Both still drop the ungated sets
+ * (`API_KEY_HELPER_OUTRANKING_ENV_VARS`, #4884; `AGENT_FORBIDDEN_ENV_VARS`, #5847).
  */
 let _omniboxServerEnvStrip: ReadonlySet<string> | undefined;
 export function omniboxServerEnvStrip(): ReadonlySet<string> {
@@ -100,6 +105,10 @@ export function omniboxServerEnvStrip(): ReadonlySet<string> {
  * `ANTHROPIC_API_KEY`) is also stripped, ungated, so a daemon whose own env carries
  * one never seeds a server that hands it to every pane — parity with how
  * `ANTHROPIC_API_KEY` was already kept out as an SDK signal var.
+ *
+ * Issue #5847: {@link AGENT_FORBIDDEN_ENV_VARS} (the federation token, the
+ * onboarding vars, `GH_TOKEN`) is stripped too, ungated: no pane may receive one,
+ * and a server freezes its seed env for the life of the server.
  */
 export function buildTmuxSpawnEnv(
   processEnv: NodeJS.ProcessEnv,
@@ -112,6 +121,8 @@ export function buildTmuxSpawnEnv(
     if (SDK_SIGNAL_ENV_VARS.has(key)) continue;
     // #4884: an env credential that outranks the session's subscription login.
     if (API_KEY_HELPER_OUTRANKING_ENV_VARS.has(key)) continue;
+    // #5847: a var no spawned agent may receive by any route, sandbox ON or OFF.
+    if (AGENT_FORBIDDEN_ENV_VARS.has(key)) continue;
     // #2646 (OmniBox Phase-1, Path 3 — caller-gated): also strip the credential
     // set ({@link omniboxServerEnvStrip}) from the ambient copy so the
     // long-lived tmux server never freezes it into its global env table. Ambient
@@ -142,13 +153,80 @@ export function buildTmuxSpawnEnv(
  *   `ANTHROPIC_AUTH_TOKEN` frozen into the table outranks every pane's
  *   subscription credential, exactly like the `ANTHROPIC_API_KEY` already
  *   scrubbed as an SDK signal var.
+ * - both: ∪ {@link AGENT_FORBIDDEN_ENV_VARS} (#5847) — a tmux server an older
+ *   daemon started keeps the federation token (or an onboarding var) in its
+ *   table across `KillMode=process` restarts, and hands it to every new pane.
  */
 export function buildServerGlobalScrubSet(sandboxOn: boolean): Set<string> {
   return new Set<string>([
     ...SDK_SIGNAL_ENV_VARS,
     ...(sandboxOn ? omniboxServerEnvStrip() : BINDING_ENV_VARS),
     ...API_KEY_HELPER_OUTRANKING_ENV_VARS,
+    ...AGENT_FORBIDDEN_ENV_VARS,
   ]);
+}
+
+/**
+ * The variable names the daemon's session panes, `ensureSession`'s control pane
+ * and the tmux launcher's window remove from their environment at exec, so a
+ * name a failed `scrubServerGlobalEnv` removal left in the global table never
+ * reaches them (#5919, #5951, #5963). The wrapper's per-pane
+ * list ({@link paneEnvUnsetNames}) first, then every other name the active
+ * scrub set covers: with the sandbox off the list IS `paneEnvUnsetNames()`, in
+ * order; with it on it adds `SECRET_ENV_VARS` (#5942). Pure + exported for unit
+ * testing; it references the imported sets only inside its body (the
+ * TmuxManager ↔ launcherShared import cycle).
+ */
+export function paneEnvScrubNames(sandboxOn: boolean): string[] {
+  return [
+    ...new Set([
+      ...paneEnvUnsetNames(),
+      ...buildServerGlobalScrubSet(sandboxOn),
+    ]),
+  ];
+}
+
+/**
+ * Issue #5943: `env -u A -u B …`, the filter the daemon's session pane, the
+ * control pane and the tmux launcher's window put in front of the shells they
+ * start (not the daemon pane's `rm -f`, which reads no credential). tmux runs a pane command through the
+ * operator's `default-shell -c`, so a POSIX `unset` is a no-op where that shell
+ * is not POSIX: fish has no `unset`, and tcsh's clears only shell variables.
+ * `env` is an external command looked up on `PATH`, so no shell can skip it the
+ * way fish skips `unset`, and the filter and the program are one exec, so no
+ * separate removal step can fail while the launch goes on. The names are fixed identifiers (a test pins it),
+ * so they need no quoting.
+ */
+export function buildPaneEnvFilter(sandboxOn: boolean): string {
+  return `env ${paneEnvScrubNames(sandboxOn)
+    .map(name => `-u ${name}`)
+    .join(" ")}`;
+}
+
+/**
+ * A pane command that starts a filtered interactive login bash, used by two
+ * panes that would otherwise run the raw default shell. Without it a pane runs
+ * that shell with whatever its environment held at fork.
+ *
+ * Issue #5951: `ensureSession`'s `control` pane, the shell `tmux attach` lands
+ * in. Its environment could hold a fresh server's seed (OOS-1), a name whose
+ * pre-scrub removal failed (OOS-2), or a table another process froze between
+ * that scrub and the `new-session` (OOS-3). The filter applies to all three. A
+ * command that failed to start would end the new session's only window before
+ * `remain-on-exit` is set, and every spawn after it; `ensureSession` does not
+ * check that the pane survived.
+ *
+ * Issue #5963: the tmux launcher's window, whose send-keys chain is POSIX. Under
+ * fish or tcsh a raw default shell never runs that chain, so the launch stalled
+ * with the pane holding the global table and the env file on disk.
+ *
+ * `bash` because the daemon's session panes already require it on every node
+ * (`bash <script>`, the idle shell), so neither pane adds a dependency. `-l`
+ * keeps tmux's login-shell default; `exec` leaves the pane one process, the
+ * filtered shell.
+ */
+export function buildFilteredLoginShellCommand(sandboxOn: boolean): string {
+  return `exec ${buildPaneEnvFilter(sandboxOn)} bash -l`;
 }
 
 /**
@@ -419,7 +497,9 @@ export function isEnvDumpCommand(args: readonly string[]): boolean {
  * Issue #3731 (F3): whether a failed tmux call means "this socket has no server".
  * That is a definitive answer for a table read — no server, no global table, so
  * nothing is ambient — and is distinct from a real failure (permission, timeout,
- * missing binary), which must read as UNKNOWN, never as clean.
+ * missing binary), which must read as UNKNOWN, never as clean. Issue #5920: the
+ * global-table scrub uses the same rule, so a removal that fails this way is not
+ * reported as a variable left in the table.
  */
 export function isNoTmuxServerError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -540,26 +620,34 @@ export class TmuxManager {
   }
 
   /**
-   * Ensure the hapimatic tmux session exists
+   * Ensure the hapimatic tmux session exists. A missing session is created
+   * after a scrub of the server's global env table is attempted (#5920), with a
+   * `control` pane that filters the scrub set itself (#5951).
    */
   async ensureSession(): Promise<boolean> {
     const exists = await this.sessionExists();
+    if (!exists) {
+      // #5920: a running server, including one with no session left that
+      // `exit-empty off` keeps alive, forks the new session's `control` pane
+      // from its global table. A server an older daemon started can still hold
+      // a frozen credential there (#5847), so scrub it before either
+      // new-session below; the scrub is not gated on readServerPid, which reads
+      // a timeout as "no server". With no server there is no table: every
+      // removal fails with the no-server error, which the scrub does not
+      // report. #5951: the table scrub is not enough for this pane. A removal
+      // can fail (OOS-2), a fresh server freezes its seed env, which with the
+      // sandbox off keeps BINDING_ENV_VARS (OOS-1), and another process can
+      // freeze the table between this scrub and the new-session (OOS-3). So the
+      // pane's own command filters the scrub set (buildFilteredLoginShellCommand).
+      await this.scrubServerGlobalEnv();
+    }
     // #4743: try to create the session (and so the server) inside the sessions
     // slice first; on any failure fall through to the plain start below.
     const createdInSlice = !exists && (await this.createSessionInSlice());
     if (!exists && !createdInSlice) {
       try {
         // Create detached session with a placeholder window
-        await this.runTmux([
-          "new-session",
-          "-d",
-          "-s",
-          this.sessionName,
-          "-n",
-          "control",
-          "-c",
-          this.defaultCwd,
-        ]);
+        await this.runTmux(this.controlSessionArgs());
         logger.info(`[TmuxManager] Created session "${this.sessionName}"`);
       } catch (error) {
         logger.warn(`[TmuxManager] Failed to create session: ${error}`);
@@ -643,6 +731,26 @@ export class TmuxManager {
   }
 
   /**
+   * The `new-session` argv for the session's `control` window, shared by the
+   * sessions-slice start and the plain start. The pane command is LAST: tmux
+   * reads the first positional argument as the shell command (#961). #5951: the
+   * command filters the active scrub set (buildFilteredLoginShellCommand).
+   */
+  private controlSessionArgs(): string[] {
+    return [
+      "new-session",
+      "-d",
+      "-s",
+      this.sessionName,
+      "-n",
+      "control",
+      "-c",
+      this.defaultCwd,
+      buildFilteredLoginShellCommand(configuration.omniboxSandboxEnabled),
+    ];
+  }
+
+  /**
    * #4743: start the session — and so the tmux server — inside the sessions
    * slice. Returns true when the session exists afterwards; false means the
    * caller runs its plain `new-session`. Only for a named socket: the default
@@ -653,16 +761,7 @@ export class TmuxManager {
     if (!socketName) return false;
     const outcome = await startTmuxServerInSlice({
       socketName,
-      tmuxArgs: [
-        "new-session",
-        "-d",
-        "-s",
-        this.sessionName,
-        "-n",
-        "control",
-        "-c",
-        this.defaultCwd,
-      ],
+      tmuxArgs: this.controlSessionArgs(),
       env: buildTmuxSpawnEnv(
         process.env,
         this.env,
@@ -770,7 +869,10 @@ export class TmuxManager {
     // around the load-bearing per-pane `unset` in buildTmuxEnvFileCommand —
     // covers panes that do NOT route through that helper and keeps
     // `show-environment -g` clean for diagnostics. Best-effort; never blocks
-    // window creation.
+    // window creation. #5920: ensureSession scrubs a running server before it
+    // creates a missing session. This pass is still needed: it covers a session
+    // that already existed, and on a fresh server it clears what the seed env
+    // froze (BINDING_ENV_VARS with the sandbox off).
     await this.scrubServerGlobalEnv();
 
     // Pre-flight check: does this window already exist?
@@ -902,9 +1004,9 @@ export class TmuxManager {
    * the race-free window index (#945/#1315). Accepts the full CreateWindowOptions
    * so daemon callers can pass an initial `command`.
    *
-   * This is the single shared implementation behind all three window-creation
-   * sites: claudeTmuxLauncher, claudeTmuxRemote (via createOrReplaceRemoteWindow),
-   * and tmuxSpawnAdapter's new-window branch.
+   * This is the single shared implementation behind both window-creation sites:
+   * claudeTmuxRemote (via createOrReplaceRemoteWindow) and tmuxSpawnAdapter's
+   * new-window branch.
    *
    * `onNameConflict` (#4443) chooses what a refused first create means.
    * `"replace"` (the default) kills the same-named window and recreates, which
@@ -1694,6 +1796,13 @@ export class TmuxManager {
       return false;
     }
 
+    // #5847: a respawned pane is spawned from the server's global env table just
+    // like a new window, so scrub it here too. Without this, a reconnect on a
+    // server an older daemon froze handed its federation token to the respawned
+    // pane (and to the `exec bash` left behind when the wrapper exits).
+    // Best-effort, like createWindow's scrub — never blocks the respawn.
+    await this.scrubServerGlobalEnv();
+
     try {
       const args = [
         "respawn-pane",
@@ -2340,9 +2449,15 @@ export class TmuxManager {
   // ==================== Private Methods ====================
 
   /**
-   * Scrub every {@link SDK_SIGNAL_ENV_VARS} member — and, ungated since #3731,
-   * every {@link BINDING_ENV_VARS} member — from this socket's tmux GLOBAL
-   * environment table (issue #1692, Task 3 — defense-in-depth).
+   * Scrub every {@link SDK_SIGNAL_ENV_VARS} member — and, ungated, every
+   * {@link BINDING_ENV_VARS} (#3731), {@link API_KEY_HELPER_OUTRANKING_ENV_VARS}
+   * (#4884) and {@link AGENT_FORBIDDEN_ENV_VARS} (#5847) member — from this
+   * socket's tmux GLOBAL environment table (issue #1692, Task 3 —
+   * defense-in-depth). The full set is {@link buildServerGlobalScrubSet}. Runs
+   * before every pane spawn: in `ensureSession` before its `new-session` when
+   * the session is gone (#5920), and in `createWindow` and `respawnPane`. A
+   * removal that fails because the socket has no server is not reported: with
+   * no server there is no table to inherit from.
    *
    * Remediates a server whose global env table was ALREADY poisoned before this
    * fix shipped — created by a pre-fix Hapimatic binary, or by a non-Hapimatic /
@@ -2356,10 +2471,20 @@ export class TmuxManager {
    * test pins this.
    *
    * Idempotent and cheap (the removals run concurrently). Best-effort: a
-   * failure is swallowed — a remediation miss is covered by the load-bearing
-   * per-pane `unset`, and this must NEVER block window creation. Deliberately
-   * does NOT use `kill-server`/socket-recreate, which would kill every other
-   * instance's live sessions on the shared socket (#1655).
+   * failure is logged by variable name (one warn line per call, never a value,
+   * #5919) and this must NEVER block window creation. A remediation miss is
+   * covered only where a pane filters the name. The per-pane `unset` in
+   * `buildTmuxEnvFileCommand` runs before the program starts. On the
+   * daemon→wrapper hop its list lacks `SECRET_ENV_VARS`, so with the sandbox on it
+   * does not cover those there; the tmux launcher's chain adds them through
+   * `extraUnsetNames`. Three panes filter the whole active scrub set with `env -u` at exec
+   * ({@link paneEnvScrubNames}): a daemon session pane's command
+   * (`buildPaneInitialCommand`) for `bash <script>` and the idle `bash` left after
+   * the wrapper exits, and the `control` pane and the tmux launcher's window
+   * ({@link buildFilteredLoginShellCommand}). A pane that runs no filter, a window
+   * an attached user opens, still inherits a variable whose removal failed.
+   * Deliberately does NOT use `kill-server`/socket-recreate, which would kill
+   * every other instance's live sessions on the shared socket (#1655).
    */
   private async scrubServerGlobalEnv(): Promise<void> {
     // #2646 (OmniBox Phase-1, Task 7a): when the sandbox is ON, ALSO scrub the
@@ -2385,19 +2510,42 @@ export class TmuxManager {
     //
     // Issue #4884: both states also scrub ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY
     // (buildServerGlobalScrubSet).
+    //
+    // Issue #5847: both states also scrub AGENT_FORBIDDEN_ENV_VARS (the federation
+    // token, the onboarding vars, GH_TOKEN). The daemon deletes these at source, but
+    // a tmux server an older daemon started keeps them in its table across
+    // KillMode=process restarts, and every new pane inherited them until it exited.
     const toScrub = buildServerGlobalScrubSet(
       configuration.omniboxSandboxEnabled
     );
+    const failed: string[] = [];
+    let firstReason = "";
     await Promise.all(
       [...toScrub].map(async varName => {
         try {
           await this.runTmux(["set-environment", "-gr", varName]);
-        } catch {
-          // best-effort — covered by the load-bearing per-pane unset; never
-          // block window creation on a global-table remediation miss.
+        } catch (error) {
+          // #5920: a socket with no server has no global table, so nothing is
+          // left to remove (the #3731 F3 rule). Checked first, so a skipped
+          // error never supplies the reason shown for a real failure.
+          if (isNoTmuxServerError(error)) return;
+          // Best-effort: never block pane or session creation on a miss.
+          // The daemon's session panes, the control pane and the tmux launcher's
+          // window filter the name at exec; a pane that does not (one an attached
+          // user opens) inherits it (see the docstring).
+          failed.push(varName);
+          if (!firstReason) firstReason = describeTmuxFailure(error);
         }
       })
     );
+    // #5919: one line per call naming every variable still in the table. A
+    // removal command carries only the name, so neither the names nor the tmux
+    // error text can hold a value.
+    if (failed.length > 0) {
+      logger.warn(
+        `[TmuxManager] global env scrub could not remove ${failed.sort().join(", ")} from the tmux global table (${firstReason}); a pane that does not unset them itself inherits them (#5919)`
+      );
+    }
   }
 
   private runTmux(

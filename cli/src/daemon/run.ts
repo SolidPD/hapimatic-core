@@ -191,6 +191,12 @@ export async function startDaemon(
   // snapshot in /proc/<pid>/environ nor what a same-user process can read from
   // settings.json; it stops the token being handed to sessions.
   delete process.env.FEDERATION_API_TOKEN;
+  // #5781: the same for the feedback-inbox operator bearer and a cloud VM's
+  // feedback-relay bearer. Only the server reads either; a daemon unit that sets
+  // one (a VM provisioned before #5926 still has 21-feedback.conf here) would hand
+  // it to the direct-spawn wrapper and the routes that skip the strip (#4125, #4057).
+  delete process.env.FEEDBACK_INBOX_TOKEN;
+  delete process.env.FEEDBACK_RELAY_TOKEN;
 
   // We don't have cleanup function at the time of server construction
   // Control flow is:

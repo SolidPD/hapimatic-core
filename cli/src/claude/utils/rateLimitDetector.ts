@@ -20,7 +20,13 @@
  *      `{ type: "assistant", isApiErrorMessage: true, apiErrorStatus: 429,
  *      error: "rate_limit", message.content[].text: "You've hit your session
  *      limit · resets 12:50pm (America/New_York)" }` entry (verified against the
- *      live 2026-06-10 incident transcripts).
+ *      live 2026-06-10 incident transcripts). Claude Code writes
+ *      `message.usage.service_tier: null` on it, which the transcript schema
+ *      accepts since #6065 (before that the scanner dropped every such record).
+ *      Current versions (2.1.282 onward, the oldest sampled) also write
+ *      `quotaLimits.resetsAt` (epoch seconds), the value the text is formatted
+ *      from; the rising edge prefers it and falls back to parsing the text
+ *      (#6065).
  *   2. SDK launcher — `{ type: "system", subtype: "api_error", error: {
  *      status|statusCode: 429, message: "..." } }` injected by
  *      parseStderrApiError().
@@ -54,7 +60,12 @@ import {
   USAGE_WINDOW_SUBSTRINGS,
   classifyApiLimitSignal,
 } from "@hapi/protocol/apiErrorClasses";
-import { extractApiLimitSignal, extractAssistantText } from "./apiLimitSignal";
+import {
+  extractApiLimitSignal,
+  extractAssistantText,
+  extractStructuredResetAt,
+  isSyntheticAssistantRecord,
+} from "./apiLimitSignal";
 
 /** HTTP status treated as a (potential) rate limit. */
 export const RATE_LIMIT_STATUS = 429;
@@ -78,7 +89,10 @@ const MAX_TEXT_LENGTH = 2000;
 export type RateLimitResetInfo = {
   /** Human-readable reset text, e.g. "12:50pm (America/New_York)". Always set. */
   resetText: string;
-  /** Best-effort epoch ms of the reset; null when the free-text parse fails. */
+  /**
+   * Best-effort epoch ms of the reset: Claude Code's structured value when the
+   * record carries one, else the free-text parse; null when neither yields one.
+   */
   resetAt: number | null;
 };
 
@@ -106,7 +120,8 @@ export class RateLimitDetector {
     /**
      * #4936: fired for each record the shared classifier calls an API spend
      * cap / user-set spend limit. Such a record never latches the session-limit
-     * chip (it is not a usage window), so the tmux/pty launchers wire this to
+     * chip (it is not a usage window), so the transcript launchers (pty, tmux
+     * and local, through `createSessionRateLimitDetector`) wire this to
      * `session.onThinkingChange(false)` to keep the turn-boundary "thinking"
      * clear the false "usage limit" match used to provide (`TurnEndDetector`
      * ignores synthetic records, and no Stop hook fires on API-error turns).
@@ -139,11 +154,20 @@ export class RateLimitDetector {
     if (text !== null) {
       if (!this.limited) {
         this.limited = true;
-        const info = parseSessionLimitReset(text);
+        // #6065: the structured reset Claude Code recorded on the record is
+        // exact; the text parse is the fallback (older versions, Shape B).
+        const parsed = parseSessionLimitReset(text);
+        const structured = extractStructuredResetAt(message);
+        const info: RateLimitResetInfo = {
+          resetText: parsed.resetText,
+          resetAt: structured ?? parsed.resetAt,
+        };
         logger.warn(
           `[rateLimitDetector]: session-limit 429 observed${
             sessionId ? ` for session ${sessionId}` : ""
-          } — resets ${info.resetText} (issue #1647)`
+          } — resets ${info.resetText} (source: ${
+            structured !== null ? "structured" : "text"
+          }) (issue #1647)`
         );
         if (sessionId) {
           this.onRateLimited?.(sessionId, info);
@@ -231,6 +255,8 @@ function isUsageWindow429(text: string, errorCode: unknown): boolean {
  * AuthErrorDetector.isSuccessSignal):
  *  - a result message with is_error falsy
  *  - a normal assistant message (NOT an api error) — real model output
+ * A record Claude Code wrote itself (`model: "<synthetic>"`, e.g. "No response
+ * requested.") is not model output, so it never clears the latch (#6065).
  */
 function isForwardProgress(message: RawJSONLines): boolean {
   const msg = message as Record<string, unknown>;
@@ -240,6 +266,9 @@ function isForwardProgress(message: RawJSONLines): boolean {
     msg.is_error !== true
   ) {
     return true;
+  }
+  if (isSyntheticAssistantRecord(message)) {
+    return false;
   }
   if (msg.type === "assistant" && msg.isApiErrorMessage !== true) {
     return true;
@@ -251,87 +280,215 @@ function isForwardProgress(message: RawJSONLines): boolean {
  * Parse the free-text reset clause into a display string + best-effort epoch.
  * Pure + exported for unit testing. Degrades gracefully: `resetText` is always
  * populated (the substring after "resets ", or the trimmed whole text);
- * `resetAt` is null whenever the wall-clock parse is uncertain. Nothing in the
- * core feature depends on `resetAt` being non-null (issue #1647 — the optional
- * auto-resume stretch consumes it later).
+ * `resetAt` is null whenever the wall-clock parse is uncertain. A null value
+ * only leaves the server's #3612 reset nudge without a session value: it then
+ * uses the account's usage snapshot, or leaves the lock to the ladder.
+ *
+ * @param now Epoch ms the reset is resolved against. Defaults to the current
+ *   time; tests pin it.
  */
-export function parseSessionLimitReset(text: string): RateLimitResetInfo {
+export function parseSessionLimitReset(
+  text: string,
+  now: number = Date.now()
+): RateLimitResetInfo {
   const resetsMatch = text.match(/resets\s+(.+)$/i);
   const resetText = resetsMatch
     ? resetsMatch[1].trim()
     : text.replace(/^you've hit your session limit\s*[·:-]?\s*/i, "").trim() ||
       text.trim();
 
-  return { resetText, resetAt: parseResetEpoch(resetText) };
+  return { resetText, resetAt: parseResetEpoch(resetText, now) };
 }
 
+/** Month abbreviation → month number (1–12). */
+const MONTH_NUMBERS: Record<string, number> = {
+  jan: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  may: 5,
+  jun: 6,
+  jul: 7,
+  aug: 8,
+  sep: 9,
+  oct: 10,
+  nov: 11,
+  dec: 12,
+};
+
+const WEEKDAYS: Record<string, number> = {
+  sun: 0,
+  mon: 1,
+  tue: 2,
+  wed: 3,
+  thu: 4,
+  fri: 5,
+  sat: 6,
+};
+
+/** `2pm`, `12:50pm`, `11:10 PM`. */
+const CLOCK = /(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b/i;
+
+/** Month names, enumerated (not `[a-z]*`) so "marching" never reads as March. */
+const MONTH_NAMES =
+  "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?";
+
 /**
- * Best-effort wall-clock → epoch ms for a reset string like
- * "12:50pm (America/New_York)" or "2pm". Returns null on any uncertainty.
+ * `Nov 4`, `Oct 17,`, `Jan 2, 2027`, `November 4th` — Claude Code renders a
+ * reset more than 24 h away as month + day, adding the year only when it
+ * differs from the current one (#6065).
+ */
+const MONTH_DAY = new RegExp(
+  `\\b(${MONTH_NAMES})\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(\\d{4}))?\\b`,
+  "i"
+);
+
+/**
+ * Any month name. A month name with no MONTH_DAY match (e.g. `4 Nov, 2pm`) is a
+ * date form this parser does not know, so the reset is uncertain: null, never
+ * the next clock time.
+ */
+const MONTH_NAME = new RegExp(`\\b(?:${MONTH_NAMES})\\b`, "i");
+
+/**
+ * `Mon 2pm`, `Monday, 2pm`. No sampled Claude Code version (2.1.282 to
+ * 2.1.312) renders this form; it is
+ * accepted so a weekday reset never reads as today or tomorrow (#6065 D9).
+ * Enumerated so "monthly" never reads as Monday.
+ */
+const WEEKDAY =
+  /\b(sun(?:day)?|mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?)\.?(?=[\s,]|$)/i;
+
+/** The first parenthesized token, e.g. `(UTC)` or `(America/New_York)`. */
+const ZONE = /\(([^()]+)\)/;
+
+/**
+ * Best-effort wall-clock → epoch ms for a reset string. Accepted forms:
+ *   - clock only, `2pm` / `12:50pm (America/New_York)`: the next time that
+ *     wall clock occurs (today, else tomorrow);
+ *   - month + day, `Oct 17, 3am (UTC)` / `Jan 2, 2027, 2pm (…)`: that calendar
+ *     day, with no roll-forward (the year defaults to the current year in the
+ *     zone, as Claude Code omits it only when it is unchanged);
+ *   - weekday, `Mon 2pm`: the next occurrence of that weekday.
+ * The first parenthesized token is the zone and must be one `Intl` accepts
+ * (`UTC`, any IANA name); with none, the process's local zone is used. Returns
+ * null on any uncertainty: no clock, an unknown zone, an impossible date.
  * Never throws.
  */
-function parseResetEpoch(resetText: string): number | null {
+function parseResetEpoch(resetText: string, now: number): number | null {
   try {
-    const m = resetText.match(/(\d{1,2})(?::(\d{2}))?\s*([ap]m)/i);
-    if (!m) return null;
-    let hour = parseInt(m[1], 10);
-    const minute = m[2] ? parseInt(m[2], 10) : 0;
-    const ampm = m[3].toLowerCase();
+    const zone = resetText.match(ZONE);
+    let tz: string | undefined;
+    if (zone) {
+      tz = zone[1].trim();
+      if (!isValidTimeZone(tz)) return null;
+    }
+    // Date and clock tokens come only from the text before the zone, so
+    // trailing text such as "· progress saved" is never read as a date or clock.
+    const body = zone ? resetText.slice(0, zone.index) : resetText;
+
+    const clock = body.match(CLOCK);
+    if (!clock) return null;
+    let hour = parseInt(clock[1], 10);
+    const minute = clock[2] ? parseInt(clock[2], 10) : 0;
+    if (hour < 1 || hour > 12 || minute > 59) return null;
     if (hour === 12) hour = 0;
-    if (ampm === "pm") hour += 12;
-    if (hour > 23 || minute > 59) return null;
+    if (clock[3].toLowerCase() === "pm") hour += 12;
 
-    const tzMatch = resetText.match(/\(([A-Za-z]+\/[A-Za-z_]+)\)/);
-    const tz = tzMatch ? tzMatch[1] : undefined;
+    const today = tzParts(new Date(now), tz);
+    if (!today) return null;
 
-    return nextOccurrenceEpoch(hour, minute, tz);
+    const monthDay = body.match(MONTH_DAY);
+    if (monthDay) {
+      const month = MONTH_NUMBERS[monthDay[1].slice(0, 3).toLowerCase()];
+      const day = parseInt(monthDay[2], 10);
+      const year = monthDay[3] ? parseInt(monthDay[3], 10) : today.year;
+      if (!isCalendarDate(year, month, day)) return null;
+      return epochForTzWallClock(year, month, day, hour, minute, tz);
+    }
+    if (MONTH_NAME.test(body)) return null;
+
+    const weekday = body.match(WEEKDAY);
+    if (weekday) {
+      const target = WEEKDAYS[weekday[1].slice(0, 3).toLowerCase()];
+      const ahead = (target - today.weekday + 7) % 7;
+      return nextOccurrenceEpoch(today, ahead, 7, hour, minute, tz, now);
+    }
+
+    return nextOccurrenceEpoch(today, 0, 1, hour, minute, tz, now);
   } catch {
     return null;
   }
 }
 
+/** True when `Intl` accepts `tz` as a time zone (`UTC`, `America/New_York`). */
+function isValidTimeZone(tz: string): boolean {
+  if (!tz) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True when year-month-day names a real calendar date (no Feb 30). */
+function isCalendarDate(year: number, month: number, day: number): boolean {
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  return (
+    probe.getUTCFullYear() === year &&
+    probe.getUTCMonth() === month - 1 &&
+    probe.getUTCDate() === day
+  );
+}
+
 /**
- * Compute the epoch ms of the next time the wall clock reads hour:minute in the
- * given IANA timezone (or local time when tz is undefined). If that instant is
- * already in the past relative to now, roll forward one day. Returns null on any
+ * The epoch ms of hour:minute on the calendar day `aheadDays` after `today`
+ * (in `tz`, or local time when tz is undefined). If that instant is not after
+ * `now`, step `stepDays` further (1 for a clock-only reset, 7 for a weekday).
+ * The roll is built from the calendar date, never by adding a fixed 24 h, so a
+ * DST change in between does not shift the wall clock. Returns null on any
  * failure (e.g. an invalid tz name).
  */
 function nextOccurrenceEpoch(
+  today: { year: number; month: number; day: number },
+  aheadDays: number,
+  stepDays: number,
   hour: number,
   minute: number,
-  tz: string | undefined
+  tz: string | undefined,
+  now: number
 ): number | null {
-  const now = new Date();
-  // Determine "today" in the target timezone.
-  const partsNow = tzParts(now, tz);
-  if (!partsNow) return null;
-
-  let candidate = epochForTzWallClock(
-    partsNow.year,
-    partsNow.month,
-    partsNow.day,
-    hour,
-    minute,
-    tz
-  );
+  const onDay = (days: number): number | null => {
+    const date = new Date(
+      Date.UTC(today.year, today.month - 1, today.day + days)
+    );
+    return epochForTzWallClock(
+      date.getUTCFullYear(),
+      date.getUTCMonth() + 1,
+      date.getUTCDate(),
+      hour,
+      minute,
+      tz
+    );
+  };
+  const candidate = onDay(aheadDays);
   if (candidate === null) return null;
-  if (candidate <= now.getTime()) {
-    candidate += 24 * 60 * 60 * 1000; // roll to tomorrow
-  }
-  return candidate;
+  return candidate > now ? candidate : onDay(aheadDays + stepDays);
 }
 
-/** Extract year/month/day for an instant as rendered in a timezone. */
+/** Extract year/month/day/weekday for an instant as rendered in a timezone. */
 function tzParts(
   date: Date,
   tz: string | undefined
-): { year: number; month: number; day: number } | null {
+): { year: number; month: number; day: number; weekday: number } | null {
   try {
     const fmt = new Intl.DateTimeFormat("en-US", {
       timeZone: tz,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
+      weekday: "short",
     });
     const parts = fmt.formatToParts(date);
     const get = (t: string) =>
@@ -339,16 +496,27 @@ function tzParts(
     const year = get("year");
     const month = get("month");
     const day = get("day");
-    if ([year, month, day].some(Number.isNaN)) return null;
-    return { year, month, day };
+    const weekday =
+      WEEKDAYS[
+        (parts.find(p => p.type === "weekday")?.value ?? "")
+          .slice(0, 3)
+          .toLowerCase()
+      ];
+    if ([year, month, day].some(Number.isNaN) || weekday === undefined) {
+      return null;
+    }
+    return { year, month, day, weekday };
   } catch {
     return null;
   }
 }
 
 /**
- * Invert a wall-clock time in a timezone to an epoch ms. Uses the standard
- * "format a UTC guess in the tz, measure the offset, correct" technique.
+ * Invert a wall-clock time in a timezone to an epoch ms. Formats a UTC guess
+ * in the tz to measure the offset, corrects, then measures the offset AGAIN at
+ * the corrected instant: when a DST change falls between the guess and the
+ * answer, the two offsets differ by an hour and one pass lands an hour off
+ * (#6065).
  */
 function epochForTzWallClock(
   year: number,
@@ -359,18 +527,24 @@ function epochForTzWallClock(
   tz: string | undefined
 ): number | null {
   try {
-    const utcGuess = Date.UTC(year, month - 1, day, hour, minute);
-    const seenParts = tzPartsFull(new Date(utcGuess), tz);
-    if (!seenParts) return null;
-    const seenAsUTC = Date.UTC(
-      seenParts.year,
-      seenParts.month - 1,
-      seenParts.day,
-      seenParts.hour,
-      seenParts.minute
-    );
-    const offset = seenAsUTC - utcGuess;
-    return utcGuess - offset;
+    const wanted = Date.UTC(year, month - 1, day, hour, minute);
+    const offsetAt = (instant: number): number | null => {
+      const seen = tzPartsFull(new Date(instant), tz);
+      if (!seen) return null;
+      const seenAsUTC = Date.UTC(
+        seen.year,
+        seen.month - 1,
+        seen.day,
+        seen.hour,
+        seen.minute
+      );
+      return seenAsUTC - instant;
+    };
+    const firstOffset = offsetAt(wanted);
+    if (firstOffset === null) return null;
+    const secondOffset = offsetAt(wanted - firstOffset);
+    if (secondOffset === null) return null;
+    return wanted - secondOffset;
   } catch {
     return null;
   }

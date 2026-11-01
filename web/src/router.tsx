@@ -138,6 +138,7 @@ import AdminHelpPage from "@/routes/settings/help";
 import AdminPreferencesPage from "@/routes/settings/preferences";
 import AdminAboutPage from "@/routes/settings/about";
 import NotificationsPage from "@/routes/settings/notifications";
+import ConnectorsPage from "@/routes/settings/connectors";
 import ExtensionsAdminPage from "@/routes/settings/extensions";
 import ConfigurationAdminPage from "@/routes/settings/configuration";
 import AdminVmsPage from "@/routes/settings/vms";
@@ -1694,6 +1695,15 @@ const settingsNotificationsRoute = createRoute({
   component: NotificationsPage,
 });
 
+// Connectors (#4793 Task 6, PM ruling D-4793-6): the GitHub accounts a cloud VM's
+// users linked on hapimatic.com; #2724 adds its server-used keys to the same page.
+// Registered here AND as a USER row (settings/index.tsx), both broker-host only.
+const settingsConnectorsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/connectors",
+  component: ConnectorsPage,
+});
+
 const settingsAboutRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/about",
@@ -1792,6 +1802,7 @@ export const routeTree = rootRoute.addChildren([
   settingsHelpRoute,
   settingsPreferencesRoute,
   settingsNotificationsRoute,
+  settingsConnectorsRoute,
   settingsAboutRoute,
   settingsExtensionsRoute,
   settingsConfigurationRoute,

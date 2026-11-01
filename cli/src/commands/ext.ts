@@ -483,14 +483,19 @@ async function runAssertStock(flags: ParsedFlags): Promise<number> {
   }
 }
 
-/** Friendly display names for the catalog CLIs (ids are short; the UI shows these). */
-const HARNESS_DISPLAY_NAMES: Record<string, string> = {
+/**
+ * Friendly display names for the catalog CLIs (ids are short; the UI shows these). Each
+ * value matches its `catalog.harness-<id>` extension's `displayName`; `ext.test.ts`
+ * fails when a catalog extension has no entry here or its entry differs (#6001).
+ */
+export const HARNESS_DISPLAY_NAMES: Record<string, string> = {
   crush: "Crush",
   cline: "Cline",
   pi: "Pi",
   kimi: "Kimi Code",
   grok: "Grok Build",
   cursor: "Cursor CLI",
+  strands: "Strands Agents",
 };
 
 /**

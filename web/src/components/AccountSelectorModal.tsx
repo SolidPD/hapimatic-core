@@ -56,7 +56,17 @@ import {
   persistFilters,
   type AccountFilters,
 } from "@/lib/accountFilter";
-import { AccountUsageCard } from "@/components/AccountUsage/AccountUsageCard";
+import {
+  AccountUsageCard,
+  formatResetAbsolute,
+  formatResetCountdown,
+} from "@/components/AccountUsage/AccountUsageCard";
+import { findUsageRowHardLock, type HardLock } from "@hapi/protocol";
+import {
+  AccountCardRow1,
+  ApiKeyStatusPill,
+  rowMonogram,
+} from "@/components/AccountUsage/AccountCardRow1";
 import { AccountSelectorEmptyState } from "@/components/AccountSelectorEmptyState";
 import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
 import { useVisualViewportHeight } from "@/hooks/useVisualViewportHeight";
@@ -127,7 +137,14 @@ export type AccountSelectorModalProps = {
    * selected. The modal closes immediately and performs NO network mutation
    * (never setSessionAccount / setNodeActiveAccount).
    */
-  onSelect?: (accountUuid: string) => void;
+  onSelect?: (accountUuid: string, opts?: { forceAccount?: boolean }) => void;
+  /**
+   * Issue #5879: the model family the selection is for (e.g. `"fable"`). When
+   * set, an account whose `weekly_scoped` window for that family is at its cap
+   * reads as locked, as the server's spawn refusal does. Unset → only the
+   * account-wide 5-hour and weekly windows count.
+   */
+  modelFamily?: string | null;
   /**
    * Issue #4568: the node's vault API keys (redacted view) offered in an
    * "API keys" section beside the Anthropic accounts. Rendered only when
@@ -239,34 +256,38 @@ function ApiKeyRows({
         // #5127: a key stored on another node names its home ("· RP1").
         const name = apiKeyDisplayNameWithHome(key);
         return (
-          <BareButton
+          // #4466 T41: a key row is the shared row 1's picker variant — one
+          // select button over the name, the masked key and "API key"; no
+          // score, alert or node row.
+          <div
             key={ref}
-            type="button"
             data-testid="account-selector-api-key-row"
             data-api-key-id={ref}
-            disabled={unselectable}
-            onClick={() => onSelect(ref)}
-            aria-label={`API key ${name} (${key.maskedKey}) — ${status.label}${isCurrent ? " — current" : ""}`}
-            className={`flex w-full min-w-0 items-center gap-2 rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2 text-left text-sm text-[var(--app-fg)] hover:bg-[var(--app-hover)] disabled:cursor-not-allowed ${unselectable ? "opacity-50" : ""}`}
+            className={
+              /* design-tokens-allow: 13px card radius — matches AccountUsageCard (no --radius token maps to 13px, L3 #3405) */ `rounded-[13px] border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3.5 py-1.5 ${unselectable ? "opacity-50" : ""}`
+            }
           >
-            <span className="min-w-0 flex-1 truncate">{name}</span>
-            <span className="shrink-0 font-mono text-xs text-[var(--app-hint)]">
-              {key.maskedKey}
-            </span>
-            <span className="flex shrink-0 items-center gap-1 text-[length:var(--text-caption-xs)] text-[var(--app-hint)]">
-              <span
-                aria-hidden="true"
-                className="inline-block h-2 w-2 rounded-full"
-                style={{ backgroundColor: status.color }}
-              />
-              {status.label}
-            </span>
-            {isCurrent && (
-              <span className="shrink-0 text-[length:var(--text-caption-xs)] font-medium text-[var(--app-accent)]">
-                Current
-              </span>
-            )}
-          </BareButton>
+            <AccountCardRow1
+              monogram={rowMonogram({
+                override: key.monogram,
+                label: name,
+                seed: key.id,
+              })}
+              nickname={name}
+              revealText={name}
+              secondary={key.maskedKey}
+              secondaryMono
+              planLabel="API key"
+              statusPill={<ApiKeyStatusPill status={key.status} />}
+              statusPillWraps={
+                key.status === "unverified" || key.status === "none"
+              }
+              currentMarker={isCurrent}
+              onSelect={() => onSelect(ref)}
+              selectDisabled={unselectable}
+              selectLabel={`API key ${name} (${key.maskedKey}) — ${status.label}${isCurrent ? " — current" : ""}`}
+            />
+          </div>
         );
       })}
       {(unavailableHints ?? []).map(hint => (
@@ -298,7 +319,17 @@ type PendingAction =
   // spawn may fail. Hard-confirm (not hard-disable) preserves #1658's
   // deliberate keep-selectable behavior for the non-authoritative snapshot.
   | { kind: "confirm-stale-spawn"; account: RedactedAccount }
+  // Issue #5879: spawn-scope confirm for an account at a usage cap. Confirming
+  // selects it WITH forceAccount, so the server's 409 refusal is overridden.
+  | { kind: "confirm-locked-spawn"; account: RedactedAccount; lock: HardLock }
   | null;
+
+/** Issue #5879: "weekly" / "5-hour" for a lock's caption and confirm copy. */
+function lockWindowName(lock: HardLock): string {
+  if (lock.window === "five_hour") return "5-hour";
+  if (lock.window === "weekly_scoped") return `${lock.model ?? "model"} weekly`;
+  return "weekly";
+}
 
 /**
  * Account-switching modal (epic #1446, Sub-Issue H). Three states modelled as
@@ -319,6 +350,7 @@ export function AccountSelectorModal({
   selectedAccountUuid,
   providerScope,
   onSelect,
+  modelFamily,
   apiKeys,
   selectedApiKeyId,
   onSelectApiKey,
@@ -408,6 +440,16 @@ export function AccountSelectorModal({
   const isStaleAccount = (account: RedactedAccount): boolean =>
     account.unrefreshable !== true &&
     usageByUuid.get(account.accountUuid)?.status === "expired";
+
+  // Issue #5879: an account at a usage cap (5-hour or weekly window at 100 % with
+  // a future reset, plus the `weekly_scoped` window of `modelFamily` when one is
+  // given) — the same shared predicate the server's 409 refusal uses. Reads the
+  // RAW usage map (never the synthesized buildCardUsage envelope) and only rows
+  // whose meters are known (`ok` / `rate_limited`).
+  const lockFor = (account: RedactedAccount): HardLock | null =>
+    findUsageRowHardLock(usageByUuid.get(account.accountUuid), {
+      modelFamily,
+    });
 
   // #2056 (Sub-Issue G, R8 / D-G5): the reused AccountUsageCard renders from an
   // `AccountUsage` envelope, but the modal's authoritative list is the local-node
@@ -608,6 +650,17 @@ export function AccountSelectorModal({
       ? undefined
       : () => setShowAddWizard(true);
 
+  // #4466 R13: an unrefreshable record shows the row-1 re-login alert, naming
+  // the scope node when one is in scope (the per-node scope). The picker's
+  // records carry no `since`, so the alert line has no timestamp.
+  const scopeNodeLabel =
+    scope === "per-node" && nodeId
+      ? nodeId === LOCAL_NODE_ID ||
+        nodeId === federationNodes?.localNode?.nodeId
+        ? federationNodes?.localNode?.nodeLabel
+        : federationNodes?.nodes.find(n => n.config.id === nodeId)?.config.label
+      : undefined;
+
   // Master expand/collapse-all for the account cards — mirrors the
   // account-usage page's header chevron. Each card owns its expanded state
   // internally (useState(defaultExpanded)), so toggling all is a remount via a
@@ -667,6 +720,14 @@ export function AccountSelectorModal({
     handleClose();
   };
 
+  // Issue #5879: the user chose an account at its usage cap anyway — select it
+  // WITH the override so the create page sends forceAccount: true.
+  const handleConfirmLockedSpawn = () => {
+    if (pendingAction?.kind !== "confirm-locked-spawn") return;
+    onSelect?.(pendingAction.account.accountUuid, { forceAccount: true });
+    handleClose();
+  };
+
   // #2056 (Sub-Issue G / KD3): the scope-specific select logic that used to live
   // inline on the retired row's `onSelect` prop. Kept in the modal (not the
   // reused card) so every accreted gate survives the rewire. The reused card fires
@@ -684,6 +745,13 @@ export function AccountSelectorModal({
       // card renders opacity-50 with no select handler), but guard anyway so a
       // future caller change can't select a dead account.
       if (account.unrefreshable === true) return;
+      // Issue #5879: an account at a usage cap is selectable only through a
+      // confirm that carries the override (the server refuses it otherwise).
+      const lock = lockFor(account);
+      if (lock) {
+        setPendingAction({ kind: "confirm-locked-spawn", account, lock });
+        return;
+      }
       // #1707 + #1961: hard-confirm before selecting an account whose live token
       // is genuinely expired. The AUTHORITATIVE signal is usage.status (via
       // isStaleAccount, keyed off the RAW usage map) — a usable account (status
@@ -827,12 +895,21 @@ export function AccountSelectorModal({
                 cliIncompatible;
               // Issue #4568 (D-4568-3 A): name each Codex credential's kind.
               const kindLabel = openAiKindLabel(account);
+              // Issue #5879: an account at a usage cap renders greyed with its
+              // reset time in every scope; in spawn scope selecting it opens the
+              // override confirm (handleRowSelect).
+              const lock = lockFor(account);
               const card = (
                 <AccountUsageCard
                   key={`${account.accountUuid}:${genId}`}
                   account={buildCardUsage(account)}
                   defaultExpanded={allExpanded}
                   disableSetActive
+                  alertNodes={
+                    account.unrefreshable === true
+                      ? [{ nodeLabel: scopeNodeLabel }]
+                      : undefined
+                  }
                   currentMarker={
                     activeUuid != null &&
                     !selectedApiKeyId &&
@@ -841,22 +918,33 @@ export function AccountSelectorModal({
                   onSelect={
                     isUnselectable ? undefined : () => handleRowSelect(account)
                   }
-                  className={isUnselectable ? "opacity-50" : undefined}
+                  className={isUnselectable || lock ? "opacity-50" : undefined}
                 />
               );
-              if (!kindLabel) return card;
+              const lockCaption = lock ? (
+                <span
+                  data-testid="account-locked-caption"
+                  className="px-1 text-[length:var(--text-caption-xs)] font-medium text-[var(--app-hint)]"
+                >
+                  {`Locked · ${lockWindowName(lock)} limit · ${formatResetCountdown(lock.resetsAt)}`}
+                </span>
+              ) : null;
+              if (!kindLabel && !lockCaption) return card;
               return (
                 <div
                   key={`${account.accountUuid}:${genId}`}
                   className="flex flex-col gap-0.5"
                 >
-                  <span
-                    data-testid="account-kind-label"
-                    className="px-1 text-[length:var(--text-caption-xs)] font-medium text-[var(--app-hint)]"
-                  >
-                    {kindLabel}
-                  </span>
+                  {kindLabel ? (
+                    <span
+                      data-testid="account-kind-label"
+                      className="px-1 text-[length:var(--text-caption-xs)] font-medium text-[var(--app-hint)]"
+                    >
+                      {kindLabel}
+                    </span>
+                  ) : null}
                   {card}
+                  {lockCaption}
                 </div>
               );
             })}
@@ -1180,6 +1268,22 @@ export function AccountSelectorModal({
         confirmLabel="Use anyway"
         confirmingLabel="Selecting…"
         onConfirm={async () => handleConfirmStaleSpawn()}
+        isPending={false}
+      />
+
+      {/* Issue #5879: spawn-scope confirm for an account at a usage cap. */}
+      <ConfirmDialog
+        isOpen={pendingAction?.kind === "confirm-locked-spawn"}
+        onClose={() => setPendingAction(null)}
+        title="This account is at its usage limit"
+        description={
+          pendingAction?.kind === "confirm-locked-spawn"
+            ? `This account is at its ${lockWindowName(pendingAction.lock)} limit until ${formatResetAbsolute(pendingAction.lock.resetsAt)}. Sessions on it fail on their first turn until then. Use it anyway?`
+            : ""
+        }
+        confirmLabel="Use anyway"
+        confirmingLabel="Selecting…"
+        onConfirm={async () => handleConfirmLockedSpawn()}
         isPending={false}
       />
 

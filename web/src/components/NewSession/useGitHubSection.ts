@@ -42,6 +42,11 @@ export function useGitHubSection(args: {
   accountsUnavailable: boolean;
   /** #2327: machine-readable cause behind `accountsUnavailable`. */
   accountsReason: string | null;
+  /**
+   * #4793: the transport behind a successful account list ("gh" | "rest" | "broker"), else null.
+   * `broker` = a cloud VM: accounts are hapimatic.com links and cloning is unavailable (D-4793-3).
+   */
+  accountsSource: string | null;
   repos: GitHubRepo[];
   reposLoading: boolean;
   issues: RepoIssueItem[];
@@ -60,8 +65,11 @@ export function useGitHubSection(args: {
   const accountsQuery = useGitHubAccounts(args.api, args.nodeId, {
     enabled: args.enabled,
   });
+  // #4793: a broker-backed cloud VM shows no repository list (cloning is unavailable there,
+  // D-4793-3), so its repos are never fetched: each fetch would spend the VM's broker budget
+  // and the user's GitHub quota for nothing. Re-enable it when #4850 brings cloning.
   const reposQuery = useGitHubRepos(args.api, args.account, args.nodeId, {
-    enabled: args.enabled,
+    enabled: args.enabled && accountsQuery.source !== "broker",
   });
   const issuesQuery = useRepoIssues(args.api, args.directory, args.nodeId);
 
@@ -70,6 +78,7 @@ export function useGitHubSection(args: {
     accountsLoading: accountsQuery.isLoading,
     accountsUnavailable: accountsQuery.unavailable,
     accountsReason: accountsQuery.reason,
+    accountsSource: accountsQuery.source,
     repos: reposQuery.repos,
     reposLoading: reposQuery.isLoading,
     issues: issuesQuery.issues,

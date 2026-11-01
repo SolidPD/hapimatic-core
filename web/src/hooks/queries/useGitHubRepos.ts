@@ -2,12 +2,14 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ApiClient } from "@/api/client";
 import { queryKeys } from "@/lib/query-keys";
+import type { GitHubConnectionStatus } from "@hapi/protocol/githubConnection";
 
 /**
  * Issue #1953 (A6): query hooks for the GitHub-account → repo selector.
  *
- * The "account" is the host GitHub identity (NOT an OAuth account — Hapimatic
- * has no GitHub OAuth).
+ * The "account" is the host's `gh` / `GH_TOKEN` identity, or — on a cloud VM —
+ * a GitHub account its users linked on hapimatic.com (#4793), whose token stays
+ * on the gateway. No token ever reaches the browser.
  *
  * #2327: these hooks used to map a `success: false` response onto an empty
  * array, which erased the only signal that resolution had FAILED. Combined with
@@ -21,6 +23,12 @@ import { queryKeys } from "@/lib/query-keys";
 export interface GitHubAccount {
   login: string;
   name: string | null;
+  /** #4793, broker only: the Hapimatic user who linked this account on hapimatic.com. */
+  email?: string;
+  /** #4793, broker only: that user's default account (listed first). */
+  isDefault?: boolean;
+  /** #4793, broker only: the link's status. */
+  status?: GitHubConnectionStatus;
 }
 
 export interface GitHubRepo {
@@ -55,6 +63,12 @@ export function useGitHubAccounts(
   unavailable: boolean;
   /** Machine-readable cause when `unavailable`, else null. */
   reason: string | null;
+  /**
+   * #4793: the transport that served a SUCCESSFUL list ("gh" | "rest" | "broker"), else null.
+   * `broker` means a cloud VM whose accounts are links its users made on hapimatic.com — the only
+   * case where an empty list can be fixed by connecting GitHub.
+   */
+  source: string | null;
 } {
   const query = useQuery({
     queryKey: queryKeys.githubAccounts(nodeId),
@@ -64,6 +78,7 @@ export function useGitHubAccounts(
           accounts: [] as GitHubAccount[],
           unavailable: false,
           reason: null as string | null,
+          source: null as string | null,
         };
       }
       const result = await api.getGitHubAccounts(nodeId);
@@ -72,12 +87,14 @@ export function useGitHubAccounts(
           accounts: [] as GitHubAccount[],
           unavailable: true,
           reason: result.reason ?? "unknown",
+          source: null as string | null,
         };
       }
       return {
         accounts: result.accounts,
         unavailable: false,
         reason: null as string | null,
+        source: result.source ?? null,
       };
     },
     enabled: (options?.enabled ?? true) && Boolean(api),
@@ -92,6 +109,7 @@ export function useGitHubAccounts(
     error: query.error instanceof Error ? query.error.message : null,
     unavailable: query.data?.unavailable ?? false,
     reason: query.data?.reason ?? null,
+    source: query.data?.source ?? null,
   };
 }
 

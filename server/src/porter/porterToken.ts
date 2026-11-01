@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { randomBytes } from "node:crypto";
-import type { PorterTokenState } from "@hapi/protocol/porter";
+import type {
+  PorterTokenExpiredReason,
+  PorterTokenState,
+} from "@hapi/protocol/porter";
 
 /**
  * Configuration Porter — in-memory tokenized-export store (issue #3446, epic
@@ -32,6 +35,9 @@ import type { PorterTokenState } from "@hapi/protocol/porter";
  *    winner's reservation (#5170). Each release counts as a failed attempt;
  *    after {@link DEFAULT_MAX_UPLOAD_ATTEMPTS} the leg is refused, so one
  *    token cannot drive decompress-and-stage work for its whole TTL (#5228).
+ *
+ * The legs stay independent in one direction only: a spent fetch leg never closes
+ * the upload leg, but an exhausted upload leg also closes the fetch leg (#5708).
  */
 
 /** ~15-minute fetch-leg TTL. */
@@ -92,6 +98,8 @@ export type UploadReservation =
  */
 export interface PorterTokenStatusView {
   state: PorterTokenState;
+  /** Present iff `state === "expired"` (#5708). */
+  expiredReason?: PorterTokenExpiredReason;
   expiresAt: number;
   fetchCount: number;
   stagingHandle?: string;
@@ -119,8 +127,9 @@ export interface PorterTokenStore {
   /** Mint a fresh token bound to the caller's namespace/user. */
   mint(input: { namespace: string; userId: string }): PorterTokenEntry;
   /**
-   * Return the entry IFF unexpired and `fetchCount < maxFetches`, incrementing
-   * `fetchCount`. `null` → 404 (unknown) or 410 (expired/over-fetched) upstream.
+   * Return the entry IFF unexpired, its upload leg not exhausted (#5708), and
+   * `fetchCount < maxFetches`, incrementing `fetchCount`. `null` → 404 (unknown)
+   * or 410 (expired / exhausted / over-fetched) upstream.
    */
   getForFetch(token: string): PorterTokenEntry | null;
   /**
@@ -206,6 +215,10 @@ export function createPorterTokenStore(
     const e = entries.get(token);
     if (!e) return null;
     if (isExpired(e)) return null;
+    // #5708: an exhausted upload leg closes the fetch leg too; the script would run
+    // the whole export only to be refused at upload. Checked before the count so a
+    // refused fetch is never counted.
+    if (isExhausted(e)) return null;
     if (e.fetchCount >= maxFetches) return null;
     e.fetchCount += 1;
     return e;
@@ -253,13 +266,21 @@ export function createPorterTokenStore(
     // `received` is terminal-happy: a consumed upload stays `received` even past
     // the token TTL (the plan was staged in time; its own staging TTL governs it).
     let state: PorterTokenState;
+    let expiredReason: PorterTokenExpiredReason | undefined;
     if (e.uploadConsumed) state = "received";
-    // An exhausted leg reads `expired`: the page shows its "generate a new
-    // link" notice instead of waiting out the TTL (#5228).
-    else if (isExpired(e) || isExhausted(e)) state = "expired";
-    else state = "waiting";
+    // An exhausted leg reads `expired` instead of waiting out the TTL (#5228),
+    // with its own reason so the page does not say the link went unused (#5708).
+    // Exhaustion wins: every failed attempt began inside the TTL.
+    else if (isExhausted(e)) {
+      state = "expired";
+      expiredReason = "exhausted";
+    } else if (isExpired(e)) {
+      state = "expired";
+      expiredReason = "ttl";
+    } else state = "waiting";
     return {
       state,
+      ...(expiredReason ? { expiredReason } : {}),
       expiresAt: e.expiresAt,
       fetchCount: e.fetchCount,
       stagingHandle: e.stagingHandle,

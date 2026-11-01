@@ -67,8 +67,8 @@ async function bootstrap() {
   // closure-private, unconditional controllerchange→location.reload() on the
   // `waiting` event that would preempt the visibility-guarded reload (R2).
   // registerServiceWorker() owns the ENTIRE detect→prompt→activate→reload
-  // chain through reloadWhenVisible; the single UpdateAvailableBadge update bar
-  // (#3057) surfaces the non-blocking "tap to reload". (vite.config.ts
+  // chain through reloadWhenVisible; the update banner in the settings drawer
+  // (#3057, relocated by #3277) surfaces the non-blocking "tap to reload". (vite.config.ts
   // injectRegister:false keeps the plugin from injecting its own registration
   // script.)
   registerServiceWorker();

@@ -13,11 +13,11 @@
  * so server importers are unchanged.
  *
  * Older servers: a field an older server does not send stays OPTIONAL here
- * (`ImportGroups.memory`, `ImportPlanSummary.policySkips` / `notices`,
- * `ImportResult.notices`), because the web must still render that server's
- * payload. The current server always sends them; its producers declare that by
- * narrowing these fields to required in their own return types (#5601 D4) —
- * never by making the wire field required.
+ * (`ImportGroups.memory`, `ImportPlanSummary.policySkips` / `notices` /
+ * `notImported`, `ImportResult.notices` / `notImported`), because the web must
+ * still render that server's payload. The current server always sends them;
+ * its producers declare that by narrowing these fields to required in their
+ * own return types (#5601 D4) — never by making the wire field required.
  *
  * Type-only module: no runtime exports.
  */
@@ -375,7 +375,8 @@ export interface ImportPlanSummary {
    * #5202 (U8): everything the plan recorded, refusals included —
    * `policySkips` is the refusal subset. Kept complete so a client that
    * renders only `omissions` (one that predates #4156) still shows every
-   * refusal; the current panel subtracts `policySkips` before rendering it.
+   * refusal; the current panel subtracts `policySkips` and `notices` (which
+   * includes `notImported`) before rendering it.
    * A server between #4156 and #5202 sent only the non-refusal part.
    */
   omissions: Omission[];
@@ -385,11 +386,21 @@ export interface ImportPlanSummary {
    */
   policySkips?: Omission[];
   /**
-   * #5202 (U10): the importer's notices ("Imported with a note"), also in
-   * `omissions`; the panel subtracts them from "Deliberately omitted". Absent
-   * from a server that predates #5202.
+   * #5202 (U10): the importer's notices, also in `omissions`; the panel
+   * subtracts them from "Deliberately omitted". Includes the `notImported`
+   * subset. Absent from a server that predates #5202.
    */
   notices?: Omission[];
+  /**
+   * #5625: the subset of `notices` whose item the import did not write (a
+   * carried script the archive lacks). Each row is also in `notices` and
+   * `omissions`; on the wire they are equal rows (same surface and reason),
+   * not shared objects, so a consumer matches them by value, counting
+   * duplicates. The panel lists them under "Not imported" and the rest of
+   * `notices` under "Imported with a note". Absent from a server that predates
+   * #5625.
+   */
+  notImported?: Omission[];
   expiresAt: number;
 }
 
@@ -651,7 +662,15 @@ export interface ImportResult {
   /**
    * #5202 (U12): notes the commit's own choices produced — a rewritten include
    * written while CLAUDE.md was not, with the `@claude-includes/…` line to add.
-   * Absent from a server that predates #5202.
+   * Includes the `notImported` subset. Absent from a server that predates #5202.
    */
   notices?: Omission[];
+  /**
+   * #5625: the subset of `notices` whose item the commit held back (#5760: a
+   * file item settings.json resolves through). Each row is also in `notices`
+   * as an equal row (same surface and reason), matched by value on the wire.
+   * The panel lists them under "Not imported". Absent from a server that
+   * predates #5625.
+   */
+  notImported?: Omission[];
 }

@@ -64,6 +64,14 @@ import {
   resolveClientInvalidBody,
 } from "./sessionMutationHandlers";
 import type { AccountService } from "../../services/accountService";
+import type { UsageService } from "../../accounts/usageService";
+import {
+  ACCOUNT_EXHAUSTED_CODE,
+  checkAccountHeadroom,
+  headroomWarnings,
+  sessionModelFamily,
+} from "../../accounts/accountHeadroom";
+import type { SpawnWarning } from "@hapi/protocol";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { scanSlashCommandsFromFilesystem } from "../../utils/slashCommands";
 import {
@@ -92,6 +100,9 @@ const setSessionAccountSchema = z
   .object({
     accountUuid: z.string().uuid().optional(),
     apiKeyId: z.string().min(1).max(200).optional(),
+    // Issue #5879: rebind onto an account at a usage cap anyway (bypasses the
+    // 409 account_exhausted headroom refusal).
+    forceAccount: z.boolean().optional(),
   })
   .refine(
     b => (b.accountUuid === undefined) !== (b.apiKeyId === undefined),
@@ -216,6 +227,8 @@ export function createSessionsRoutes(
     // Issue #4461 (R6): THIS node's identity, stamped on an account_unrefreshable
     // reconnect refusal. Absent ⇒ the non-federated identity.
     getLocalNode?: () => { nodeId: string; nodeLabel: string };
+    // Issue #5879: this node's usage cache for the rebind headroom check.
+    getUsageService?: () => UsageService | null;
   }
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
@@ -1374,13 +1387,48 @@ export function createSessionsRoutes(
         parsed.data.apiKeyId !== undefined
           ? { kind: "api-key", apiKeyId: parsed.data.apiKeyId }
           : { kind: "account", accountUuid: parsed.data.accountUuid! };
+      // Issue #5879 (three-point checklist, point 2): a rebind onto an account
+      // this node's cached usage shows at a cap is refused unless forceAccount.
+      // LOCAL sessions are checked here (this node owns the account record); a
+      // peer-owned session is checked by its owner's receiver, which gets
+      // forceAccount through the proxy. Route-level on purpose: auto-switch and
+      // the switch rollback call the engine directly and must never be refused.
+      const rebindWarnings: SpawnWarning[] = [];
+      if (localSession && target.kind === "account") {
+        const verdict = await checkAccountHeadroom(
+          {
+            usageService: options?.getUsageService?.() ?? null,
+            accountService: options?.getAccountService?.() ?? null,
+            nodeIdentity: getLocalNode(),
+            errorLogger,
+          },
+          {
+            accountUuid: target.accountUuid,
+            modelFamily: sessionModelFamily(localSession),
+            forceAccount: parsed.data.forceAccount === true,
+          }
+        );
+        if (verdict.kind === "exhausted" && !verdict.forced) {
+          return c.json(
+            {
+              ok: false,
+              error: verdict.message,
+              code: ACCOUNT_EXHAUSTED_CODE,
+              exhaustion: verdict.exhaustion,
+            },
+            409
+          );
+        }
+        rebindWarnings.push(...headroomWarnings(verdict));
+      }
       const result = await service.switchPaymentMethod(
         sessionId,
         target,
         namespace,
         // Issue #2299 (Task 4): forward the request abort signal so a client
         // disconnect cancels switchAccount's bounded pre-kill capacity wait.
-        c.req.raw.signal
+        c.req.raw.signal,
+        { forceAccount: parsed.data.forceAccount === true }
       );
       if (result.type === "success") {
         // issue #3633: a DISCONNECTED session was STAGED (no relaunch) — answer
@@ -1391,6 +1439,15 @@ export function createSessionsRoutes(
           ok: true,
           restartRequired: !result.staged,
           ...(result.staged ? { staged: true } : {}),
+          // Issue #5879: present only when a headroom note applies — this
+          // node's (a local session) or the owning node's (a peer-owned one).
+          ...(() => {
+            const warnings = [
+              ...rebindWarnings,
+              ...("warnings" in result ? (result.warnings ?? []) : []),
+            ];
+            return warnings.length > 0 ? { warnings } : {};
+          })(),
         });
       }
       if (result.type === "not-found") {
@@ -1413,6 +1470,10 @@ export function createSessionsRoutes(
                 nodeLabel: result.nodeLabel,
                 accountUuid: result.accountUuid,
               }
+            : {}),
+          // Issue #5879: a peer-owned session's owner refused the rebind.
+          ...("exhaustion" in result && result.exhaustion
+            ? { exhaustion: result.exhaustion }
             : {}),
         },
         result.status as 400 | 404 | 409 | 500 | 502 | 503

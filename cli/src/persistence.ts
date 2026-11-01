@@ -31,6 +31,7 @@ import { isProcessAlive } from "@/utils/process";
 import type { AmbientOnboardingTokenState } from "@hapi/protocol/accounts";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { StoredApiKey } from "@hapi/protocol/schemas";
+import type { EffortLevel } from "@hapi/protocol";
 
 interface Settings {
   // This ID is used as the actual database ID on the server
@@ -76,6 +77,11 @@ interface Settings {
    *  projection degrades to an annotated "unavailable" provenance and the spawn
    *  proceeds without projection (never a hard failure, Task 5 failure policy). */
   halCanonicalCheckoutPath?: string;
+  /** Issue #5879: the reasoning effort a fresh claude spawn launches with when
+   *  the spawn names none. Overridden by the `HAPI_DEFAULT_EFFORT` env var on the
+   *  daemon unit; absent → `xhigh` (`SPAWN_DEFAULT_EFFORT_LEVEL`). An invalid
+   *  value is ignored with a warning (`resolveSpawnEffort`). */
+  defaultEffort?: EffortLevel;
 }
 
 /**
@@ -97,6 +103,7 @@ export const SETTINGS_DISPLAY = {
   launcher: "public",
   maxConcurrentSessions: "public",
   halCanonicalCheckoutPath: "public",
+  defaultEffort: "public",
 } as const satisfies Record<keyof Settings, "public" | "secret">;
 
 const defaultSettings: Settings = {};

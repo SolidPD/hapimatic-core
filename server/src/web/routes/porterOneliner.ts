@@ -5,7 +5,10 @@ import {
   buildExportScript,
   buildExportScriptPowerShell,
 } from "@hapi/protocol/porter";
-import type { PorterTokenResponse } from "@hapi/protocol/porter";
+import type {
+  PorterTokenResponse,
+  PorterTokenStatus,
+} from "@hapi/protocol/porter";
 import type { WebAppEnv } from "../middleware/auth";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { SSEManager } from "../../sse/sseManager";
@@ -204,9 +207,11 @@ export function createPorterOnelinerApiRoutes(opts: {
         : undefined;
       const base = {
         state: st.state,
+        // #5708: only an expired status carries it, so other bodies are unchanged.
+        ...(st.expiredReason ? { expiredReason: st.expiredReason } : {}),
         expiresAt: st.expiresAt,
         fetchCount: st.fetchCount,
-      };
+      } satisfies PorterTokenStatus;
       if (!plan) return c.json(base);
       // #5202 (U14): a summary that throws is reported in the body, not as a
       // 500 — the poller stops on `received` and shows `planError` instead of
@@ -300,13 +305,16 @@ export function createPorterOnelinerPublicRoutes(opts: {
       const entry = opts.tokenStore.getForFetch(token);
       if (!entry) {
         // Distinguish unknown (404) from expired/over-fetched (410): a non-null
-        // status means the token exists but its fetch leg is spent or expired.
-        return opts.tokenStore.status(token)
-          ? c.text(
-              "Gone: this export link has expired or been used too many times.\n",
-              410
-            )
-          : c.text("Not found.\n", 404);
+        // status means the token exists but its fetch leg is spent or expired,
+        // or its upload leg is exhausted (#5708), which gets its own text.
+        const gone = opts.tokenStore.status(token);
+        if (!gone) return c.text("Not found.\n", 404);
+        return c.text(
+          gone.expiredReason === "exhausted"
+            ? "Gone: this export link stopped accepting uploads after repeated failed attempts.\n"
+            : "Gone: this export link has expired or been used too many times.\n",
+          410
+        );
       }
 
       const { origin, instanceLabel } = await resolveOrigin(

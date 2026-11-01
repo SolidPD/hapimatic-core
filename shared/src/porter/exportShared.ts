@@ -306,13 +306,36 @@ export const ARCHIVE_LINK_UNCHECKED_OMISSION_REASON =
 /**
  * #4321 (Item 5): the omission reason both exporters record for a folder link,
  * inside a linked folder, whose target is a folder on its own path or a folder
- * that holds it (`loop -> .`, `up -> ..`). The copy that dereferences the linked folder leaves it out:
+ * that holds it (`loop -> .`, `up -> ..`), or the config root or a folder above
+ * its physical path, wherever the link sits (#5862: the root holds the path
+ * that reached the link). The last two also catch another spelling of the
+ * folder (#5935: off Windows a bind mount or a case variant is compared by
+ * identity; on Windows the text test ignores case). The copy that dereferences
+ * the linked folder leaves it out:
  * GNU tar's `-h` would follow it without end (the export hung), and bsdtar
  * would keep it as a link. ASCII, with no quote, `$`, backslash or backtick,
  * like the reasons above.
  */
 export const ARCHIVE_LINK_LOOP_OMISSION_REASON =
   "link loop: not exported, its target is a folder that contains it";
+
+/**
+ * #5934: the omission reason both exporters record for a link whose physical
+ * target lies inside the config root but outside the exported section folders
+ * (`skills`, `agents`, `commands`, `rules`, `output-styles`, `hooks`), or in one
+ * of them where some part of the path below the folder matches a name its copy
+ * excludes (`state`, `.git`, a hook tree's `tests` …), and for a folder link
+ * whose target is `hooks/` or below it (a copy through it would skip the hooks
+ * tree's exclusions). The normal export never ships such a path (the raw
+ * `settings.json` with its `env` values, `history.jsonl`, the shell snapshots),
+ * so nothing is copied through the link. It covers a staged link, a link nested
+ * in a linked folder, a linked `hooks/` or hook support folder, and a hook script
+ * `settings.json` registers that is itself such a link or sits under `hooks/`
+ * below a refused folder link (its registration is dropped). ASCII, with no
+ * quote, `$`, backslash or backtick, like the reasons above.
+ */
+export const ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON =
+  "not exported: a link to a file or folder inside the config root";
 
 /**
  * #4321 (Item 7) / #5549 (OOS-1): the omission reason both exporters record for
@@ -462,6 +485,108 @@ export function psq(s: string): string {
 }
 
 /**
+ * #5849: the characters that end a word in a hook command, for the literal
+ * source-home step. It rewrites a POSIX home only where a path can start: at the
+ * start of the command or right after one of these, optionally through a quote that
+ * opens the word. A `/mnt/root/.claude` is not the home of `HOME=/root`, and
+ * `"$CLAUDE_PROJECT_DIR"/.claude` under `HOME=/` is not either: that quote closes
+ * a word. It leaves any other position as written, because a wrong rewrite corrupts
+ * the command; bash's `/home/<user>` rule then runs at any position. `:` and `=` are here for `PYTHONPATH=/a:/root/.claude/lib`, so a
+ * remote or container path equal to the home is rewritten too
+ * (`scp box:/root/.claude/x`); no text test can tell the two apart.
+ */
+const HOOK_HOME_WORD_BREAKS = " \t\n\r=:;&|(<>,";
+
+/** #5849: the quotes that can open a word in a hook command. */
+const HOOK_HOME_OPEN_QUOTES = "\"'`";
+
+/**
+ * #5849: what the bash literal rewrite writes, swapped for the token right after
+ * the shipped `/home/<user>` sed rule. It holds a `/` so that rule, whose `<user>`
+ * is `[^/ ]+`, cannot read across it: written as the token straight away,
+ * `cd /home/alice;/home/alice/.claude/x.sh` would lose its `/home/alice;`. A
+ * command that already spells this text has it read as the marker.
+ */
+export const HOOK_HOME_MARKER = "@HAPI-HOME/TOKEN@";
+
+/** A jq string literal with no `'`, so a program needs no shell escaping. */
+function jqLiteral(s: string): string {
+  return JSON.stringify(s).replace(/'/g, "\\u0027");
+}
+
+/**
+ * #5849: the jq program that rewrites `$n` (the literal home plus `/.claude`) in
+ * `$c` to {@link HOOK_HOME_MARKER}, with jq's literal `split`: no regex escaping
+ * of a home path (see `settingsScriptNormalizeJq`). The text accumulated so far
+ * decides each occurrence, against {@link HOOK_HOME_WORD_BREAKS} and
+ * {@link HOOK_HOME_OPEN_QUOTES}.
+ */
+export function hookHomeMarkerJq(): string {
+  const breaks = jqLiteral(HOOK_HOME_WORD_BREAKS);
+  const quotes = jqLiteral(HOOK_HOME_OPEN_QUOTES);
+  return (
+    `def brk: . as $e | $e == "" or (${breaks} | contains($e)); ` +
+    `($c | split($n)) as $p | reduce $p[1:][] as $x ($p[0]; . as $a | $a[-1:] as $l | $a + ` +
+    `(if ($l | brk) or ((${quotes} | contains($l)) and ($a[-2:-1] | brk)) then ` +
+    `"${HOOK_HOME_MARKER}" else $n end) + $x)`
+  );
+}
+
+/** #5849: the same test as {@link hookHomeMarkerJq}, as a .NET lookbehind. */
+export function hookHomeLeadRegex(): string {
+  const breaks = HOOK_HOME_WORD_BREAKS.replace(/\t/g, "\\t")
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r");
+  return `(?<=(?:^|[${breaks}])[${HOOK_HOME_OPEN_QUOTES}]?)`;
+}
+
+/**
+ * #6034: the start of the `hooks` omission both exporters record for a hook
+ * registration whose JSON shape they cannot read. The rest names the part by its
+ * path in settings.json and what it is not: `hooks.PreToolUse[1].hooks is not a
+ * list` (indices from 0).
+ */
+export const HOOK_REGISTRATION_SHAPE_OMISSION_PREFIX =
+  "not exported: a hook registration in settings.json could not be read: ";
+
+/**
+ * #6034: the jq program the bash exporter reads hook registrations with. It
+ * checks the type at every level, so a valid JSON file never makes it fail: each
+ * registration it can read is one `{event, command, matcher?}` row, and each part
+ * it cannot read is one `{omit: <reason>}` row, so the parts beside it are kept.
+ * jq still exits non-zero for a file that is not valid JSON or cannot be read.
+ * Settings that are not an object, a null `hooks` or event, a block with no
+ * `hooks` and an entry with no `command` give no row. Before #6034 a null event
+ * failed the whole read; it now reads like an empty list, which Windows
+ * PowerShell 5.1 can turn one into. The PowerShell twin applies the same checks
+ * with the same reasons.
+ */
+export function hookRegistrationReaderJq(): string {
+  const prefix = jqLiteral(HOOK_REGISTRATION_SHAPE_OMISSION_PREFIX);
+  return (
+    `def bad($p; $k): {omit: (${prefix} + $p + " is not " + $k)}; ` +
+    `if type != "object" or .hooks == null then empty ` +
+    `elif (.hooks | type) != "object" then bad("hooks"; "an object") ` +
+    `else .hooks | to_entries[] as $e | ("hooks." + $e.key) as $ep ` +
+    `| if $e.value == null then empty ` +
+    `elif ($e.value | type) != "array" then bad($ep; "a list") ` +
+    `else $e.value | to_entries[] as $b ` +
+    `| ($ep + "[" + ($b.key | tostring) + "]") as $bp | $b.value as $blk ` +
+    `| if ($blk | type) != "object" then bad($bp; "an object") ` +
+    `elif $blk.hooks == null then empty ` +
+    `elif ($blk.hooks | type) != "array" then bad($bp + ".hooks"; "a list") ` +
+    `else $blk.hooks | to_entries[] as $h ` +
+    `| ($bp + ".hooks[" + ($h.key | tostring) + "]") as $hp ` +
+    `| if ($h.value | type) != "object" then bad($hp; "an object") ` +
+    `elif $h.value.command == null then empty ` +
+    `elif ($h.value.command | type) != "string" then bad($hp + ".command"; "a string") ` +
+    `else {event: $e.key, command: $h.value.command} ` +
+    `+ (if ($blk.matcher // "") != "" then {matcher: $blk.matcher} else {} end) ` +
+    `end end end end`
+  );
+}
+
+/**
  * #5239: the self-upload URL both emitters embed, or `undefined` when the
  * input is not an http(s) URL.
  *
@@ -489,3 +614,87 @@ export function validUploadUrl(
     ? parsed.href
     : undefined;
 }
+
+/**
+ * #5985: the `sh` script both exporters run (bash through `/bin/sh -c`, the
+ * PowerShell twin off Windows through `'…' | & '/bin/sh'`) to ask whether a
+ * link target that the text and `-ef` parent tests do not place inside the
+ * config root is nonetheless the same file (one device and inode) as an entry
+ * below it: a bind mount of a folder inside the root (`~/.claude/projects`
+ * bound at `/mnt/proj`), renamed or not, or a file under one. Inputs travel in
+ * the environment: `HAPI_PORTER_EF_T` (the target's physical path),
+ * `HAPI_PORTER_EF_A` (`CONFIG_ROOT_PHYS`) and `HAPI_PORTER_EF_S` (a set-file
+ * path in the exporter's `$WORK`). Output: nothing (not held: ship), one in-root
+ * path per line (the entries that are the same file; each caller maps them
+ * through its own section test, and refuses when any is refused), or `?` (the
+ * check cannot answer: refuse). The status is normally 0, but a redirect that
+ * fails (an unwritable `$WORK`, for example) makes `sh` exit non-zero with no
+ * output, so each caller treats a non-zero status as `?` (bash `|| return 0`,
+ * PowerShell's `$LASTEXITCODE` check): removing that check fails open.
+ *
+ * Once per run it lists the inode number of every entry below the root with
+ * `find … -exec ls -di {} +`: `ls` stats each operand, so a mount point inside
+ * the root reports its mounted root (`ls -iRA` does not list the root itself,
+ * and some `ls` versions take `-i` from `readdir`). The listing is complete
+ * unless it reports an error line that does not end in ": No such file or
+ * directory" or does not name a path below the root (only an entry a live
+ * session removed mid-listing is answered; `find` reports a missing `ls` in the
+ * same words, but names `ls`, and a folder whose name holds those words still
+ * ends its line in "Permission denied"; under GNU tools a root path with a
+ * byte outside printable ASCII (and, in `find`'s lines, a `'` or `\`) is
+ * escaped in those lines, so there a vanished entry counts as an error too,
+ * #6090), fails with no message, or is
+ * cut short (on a full disk `mawk` reports the write failure and still exits 0,
+ * so the list must end with the line `e` that `awk`'s END writes). An
+ * incomplete listing answers `?` for every link, so a root holding a folder the
+ * user cannot search refuses every link outside the root (a bind source below
+ * that folder cannot be ruled out). Each lookup takes the target and every
+ * folder above it, so a file created after the listing is still found through
+ * the folder the bind mounts. A number match (or a lookup that fails or prints
+ * nothing) is confirmed live with `find -samefile` and `test -ef` (BSD `find`
+ * matches `-samefile` by inode number alone), after #5953's one-entry check
+ * that `find` has `-samefile` and `-exec` and `test` has `-ef`; that walk
+ * answers `?` when it dies (exit above 1) or fails for any reason other than an
+ * entry below the root that vanished. A number match alone is never taken as
+ * the same file, because inode numbers repeat across volumes; but where the
+ * capability check fails, a number match answers `?`, so on such a host the
+ * lookup decides which honest links ship.
+ *
+ * R2 (the PowerShell embedding): no `'`, `exit`, `&&` or `||`, ASCII only,
+ * and `t=` first. A byte-order mark in front turns the first word into a
+ * command, so the line opens with `t=;` and assigns `t` again after it: an
+ * inherited `t` is never the path checked. One line: the fragments below are
+ * joined with spaces.
+ */
+export const ROOT_HOLDS_SH = [
+  "t=; t=$HAPI_PORTER_EF_T; a=$HAPI_PORTER_EF_A; s=$HAPI_PORTER_EF_S; o=;",
+  'if [ -z "$t" ]; then o=?; fi; if [ -z "$a" ]; then o=?; fi; if [ -z "$s" ]; then o=?; fi;',
+  // The listing, once per run.
+  'if [ -z "$o" ]; then if [ ! -f "$s.ok" ]; then if [ ! -f "$s.bad" ];',
+  'then { LC_ALL=C find "$a" -exec ls -di {} + 2> "$s.err"; echo $? > "$s.rc"; }',
+  '| LC_ALL=C awk "\\$1 ~ /^[0-9]+\\$/ {print \\$1} END {print \\"e\\"}" > "$s"; r=$(cat "$s.rc"); b=0;',
+  // Answered: only an entry below the root that vanished mid-listing (grep
+  // exits 1 when every line says so; 0 is another error, above 1 no answer).
+  'LC_ALL=C grep -v ": No such file or directory\\$" "$s.err" > /dev/null; if [ $? != 1 ]; then b=1; fi;',
+  'LC_ALL=C grep -vF "$a/" "$s.err" > /dev/null; if [ $? != 1 ]; then b=1; fi;',
+  'if [ "$r" != 0 ]; then if [ ! -s "$s.err" ]; then b=1; fi; fi;',
+  // A list cut short lacks the end line.
+  'if [ "$(tail -n 1 "$s" 2> /dev/null)" != e ]; then b=1; fi;',
+  'if [ "$b" = 1 ]; then : > "$s.bad"; else : > "$s.ok"; fi; fi; fi;',
+  'if [ -f "$s.bad" ]; then o=?; fi; fi;',
+  // The lookup: the target and every folder above it.
+  'if [ -z "$o" ]; then set -- "$t"; p=$t;',
+  'while :; do case $p in /) break ;; esac; p=${p%/*}; if [ -z "$p" ]; then p=/; fi; set -- "$@" "$p"; done;',
+  'LC_ALL=C ls -di "$@" 2> /dev/null | LC_ALL=C awk "\\$1 ~ /^[0-9]+\\$/ {print \\$1}" > "$s.n"; c=0;',
+  'if LC_ALL=C grep -qxF -f "$s.n" "$s"; then c=1; else g=$?; if [ "$g" -gt 1 ]; then c=1; fi; fi;',
+  'if [ ! -s "$s.n" ]; then c=1; fi;',
+  // A match: #5953's capability check, then the live confirm.
+  'if [ "$c" = 1 ]; then k=$(find "$a" -prune -samefile "$a" -exec test {} -ef "$a" \\; -print 2> /dev/null);',
+  'if [ "$k" != "$a" ]; then o=?; fi; if [ -z "$o" ];',
+  'then m=$(LC_ALL=C find "$a" -samefile "$t" -exec test {} -ef "$t" \\; -print -prune 2> "$s.ferr"); f=$?;',
+  'if [ "$f" -gt 1 ]; then o=?; fi; if [ "$f" = 1 ]; then',
+  'LC_ALL=C grep -v ": No such file or directory\\$" "$s.ferr" > /dev/null; if [ $? != 1 ]; then o=?; fi;',
+  'LC_ALL=C grep -vF "$a/" "$s.ferr" > /dev/null; if [ $? != 1 ]; then o=?; fi;',
+  'if [ ! -s "$s.ferr" ]; then o=?; fi; fi; if [ -z "$o" ]; then o=$m; fi; fi; fi; fi;',
+  'if [ -n "$o" ]; then printf "%s\\n" "$o"; fi',
+].join(" ");

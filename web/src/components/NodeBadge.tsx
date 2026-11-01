@@ -311,6 +311,10 @@ export function NodeBadge({
   interactive = true,
   resourceHealth = true,
   labelAsReceived = false,
+  ring,
+  onActivate,
+  title: titleOverride,
+  collapsed = false,
 }: {
   nodeId?: string;
   nodeLabel?: string;
@@ -342,6 +346,38 @@ export function NodeBadge({
    * classify, and the server has already applied the casing rule.
    */
   labelAsReceived?: boolean;
+  /**
+   * #4466: an attention ring on the chip — `alert` (red: this node needs a
+   * re-login for the account the row is about) or `default` (mint: this node's
+   * default account). It REPLACES the #4538 identity ring (`tone.ringClass`) —
+   * two ring width/colour utilities on one element resolve by CSS order, and the
+   * identity ring's `ring-inset` would draw the alert ring inside the chip.
+   * Absent ⇒ the identity ring, unchanged.
+   */
+  ring?: "alert" | "default";
+  /**
+   * #4466: when set, a tap calls this instead of opening Node Health (the
+   * Accounts page's red-ring pill opens the "+ Add" modal on that node). The
+   * " — node health" suffix is dropped from the title and aria-label, because
+   * the tap no longer opens Node Health. Ignored when `interactive` is false.
+   */
+  onActivate?: () => void;
+  /**
+   * #4466 (shared with #4468): the `title` attribute, overriding the default
+   * "<label> (<health>)" — plus " — node health" on an interactive badge
+   * without `onActivate`. The aria-label uses it too, followed
+   * by " — node health" unless `onActivate` is set (K14). When `interactive`
+   * is false the override is both the title and the aria-label (#4468).
+   */
+  title?: string;
+  /**
+   * #4468 Task 2: hide the label and keep only the health dot, centered in a
+   * fixed tile 14px wide and 12px tall — a badge span without text has no
+   * height, so the absolutely positioned dot would hang outside it. The
+   * title-bar node chip collapses to this when the full chip would pass the
+   * wordmark's clearance gap.
+   */
+  collapsed?: boolean;
 }): React.ReactElement | null {
   // Hook before the early return (rules-of-hooks); the modal mounts only while
   // open, so a closed badge in a long list carries no data/mutation hooks.
@@ -438,26 +474,48 @@ export function NodeBadge({
   }
 
   const baseTitle = `${casedLabel} (${healthLabel})`;
-  const title = `${baseTitle} — node health`;
+  // K14 (#4468 / #4466): a `title` override replaces the title attribute, and
+  // the aria-label is the override or the base plus the suffix exactly once.
+  // With `onActivate` the tap no longer opens Node Health, so neither the
+  // title nor the aria-label promises it.
+  const healthSuffix = onActivate ? "" : " — node health";
+  const title = titleOverride ?? `${baseTitle}${healthSuffix}`;
+  const ariaLabel = `${titleOverride ?? baseTitle}${healthSuffix}`;
   const stop = (e: React.SyntheticEvent) => e.stopPropagation();
+  // #4466: an attention ring replaces the identity ring (never both — see `ring`).
+  const ringClass =
+    ring === "alert"
+      ? "ring-2 ring-[var(--status-hot)]"
+      : ring === "default"
+        ? "ring-2 ring-[var(--app-accent)]"
+        : tone.ringClass;
+
+  // Collapsed: a fixed tile (`h-3 w-3.5`, no padding) with the dot centered.
+  // Uncollapsed, both class strings are byte-identical to the pre-#4468 ones.
+  const boxClass = collapsed ? "h-3 w-3.5" : "pl-1 pr-2.5 py-[2.5px]";
+  const dotPosition = collapsed
+    ? "left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
+    : "bottom-0.5 right-0.5";
 
   const badge = (
     <span
-      className={`relative inline-flex items-center justify-center pl-1 pr-2.5 py-[2.5px] text-[length:var(--text-caption-xs)] font-mono font-bold tracking-wide leading-tight rounded-md ${tone.bgClass} ${tone.textClass} ${tone.ringClass} whitespace-nowrap ${
-        fillCell ? "w-full" : ""
+      className={`relative inline-flex items-center justify-center ${boxClass} text-[length:var(--text-caption-xs)] font-mono font-bold tracking-wide leading-tight rounded-md ${tone.bgClass} ${tone.textClass} ${ringClass} whitespace-nowrap ${
+        fillCell && !collapsed ? "w-full" : ""
       }`} /* design-tokens-allow: py-[2.5px] is the E9 `.nodebadge` padding (mockup-pinned); no --space token at 2.5px */
       data-testid="node-badge"
       data-tone={tone.key}
+      data-ring={ring}
+      data-collapsed={collapsed ? "true" : undefined}
     >
       {/* pr-2.5 (10px): the inset health dot occupies the 2–9px band from the
           right edge, so the label needs ≥9px of right padding to stay clear of
           it — 10px leaves a 1px gutter (E9 inset, 2026-09-06). */}
-      {display}
+      {collapsed ? null : display}
       <span
         aria-hidden="true"
         data-testid="node-health-dot"
         data-health={healthLabel}
-        className={`absolute bottom-0.5 right-0.5 h-[7px] w-[7px] rounded-full border-[1.5px] ${healthRing} ${healthColor}`} /* design-tokens-allow: 7px health dot + 1.5px ring are the E6 `.health` overlay dimensions (mockup-pinned); no icon-size token at 7px; the connectivity-offline ring uses border-[var(--app-fg)] (thin white) for legibility on the dark badge */
+        className={`absolute ${dotPosition} h-[7px] w-[7px] rounded-full border-[1.5px] ${healthRing} ${healthColor}`} /* design-tokens-allow: 7px health dot + 1.5px ring are the E6 `.health` overlay dimensions (mockup-pinned); no icon-size token at 7px; the connectivity-offline ring uses border-[var(--app-fg)] (thin white) for legibility on the dark badge */
         style={healthStyle}
       />
     </span>
@@ -467,8 +525,8 @@ export function NodeBadge({
     return (
       <span
         className={`inline-flex ${fillCell ? "w-full" : ""}`}
-        title={baseTitle}
-        aria-label={baseTitle}
+        title={titleOverride ?? baseTitle}
+        aria-label={titleOverride ?? baseTitle}
         data-testid="node-badge-static"
       >
         {badge}
@@ -483,13 +541,14 @@ export function NodeBadge({
         variant="ghostStatic"
         size="bare"
         title={title}
-        aria-label={title}
+        aria-label={ariaLabel}
         data-testid="node-badge-trigger"
         className={`inline-flex font-normal hover:opacity-80 ${fillCell ? "w-full" : ""}`}
         onClick={e => {
           e.stopPropagation();
           e.preventDefault();
-          setHealthOpen(true);
+          if (onActivate) onActivate();
+          else setHealthOpen(true);
         }}
         // The DOWN and UP events too: SessionItem's row navigation runs on
         // useLongPress's onMouseUp/onTouchEnd, and its click detection fires on a

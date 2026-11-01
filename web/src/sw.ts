@@ -23,8 +23,8 @@ declare const self: ServiceWorkerGlobalScope & {
 // Issue #1793: do NOT force skipWaiting() on install. A freshly-deployed SW
 // (when a controller already exists) now parks in the "waiting" state instead
 // of taking over immediately — that is what lets "prompt" mode surface the
-// user-controlled "tap to reload" affordance (surfaced by the single
-// UpdateAvailableBadge update bar, #3057). The waiting SW activates only when the user taps
+// user-controlled "tap to reload" affordance (surfaced by the update banner in
+// the settings drawer and the gear badge, #3057/#3277). The waiting SW activates only when the user taps
 // reload, which posts { type: "SKIP_WAITING" } below. First install (no existing
 // controller) still activates immediately — skipWaiting only matters on update.
 //

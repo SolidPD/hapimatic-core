@@ -208,6 +208,10 @@ export const CreateSessionResponseSchema = z.object({
     permissionMode: PermissionModeSchema.optional(),
     modelMode: ModelModeSchema.optional(),
   }),
+  // #4682: the seq after which this wrapper takes delivery of user messages.
+  // Optional: an older server omits it, and the wrapper then keeps its legacy
+  // backfill start.
+  deliveryFloorSeq: z.number().int().nonnegative().optional(),
 });
 
 export type CreateSessionResponse = z.infer<typeof CreateSessionResponseSchema>;

@@ -24,6 +24,14 @@ export function useProviderAuthState(
 ): {
   nodes: NodeProviderAuthState[];
   isLoading: boolean;
+  /**
+   * #6054 SINK-2: this read is enabled and has not answered yet. Unlike
+   * `isLoading` (pending AND fetching) it stays true while the first fetch is
+   * paused offline (TanStack's default `networkMode: "online"`), so a caller
+   * never reads "no rows yet" as "no logins". It is false whenever this
+   * observer is disabled, even if another observer of the same query fetches.
+   */
+  awaitingAnswer: boolean;
   error: string | null;
 } {
   const query = useQuery({
@@ -43,6 +51,7 @@ export function useProviderAuthState(
   return {
     nodes: query.data?.nodes ?? EMPTY_NODES,
     isLoading: query.isLoading,
+    awaitingAnswer: Boolean(api && enabled) && query.isPending,
     error:
       query.error instanceof Error
         ? query.error.message

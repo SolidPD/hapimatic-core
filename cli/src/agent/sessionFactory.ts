@@ -432,13 +432,17 @@ export async function bootstrapSession(
     sessionRole: options.sessionRole,
   });
 
-  const sessionInfo = await api.getOrCreateSession({
-    tag: sessionTag,
-    metadata,
-    state: agentState,
-  });
+  const { session: sessionInfo, deliveryFloorSeq } =
+    await api.getOrCreateSession({
+      tag: sessionTag,
+      metadata,
+      state: agentState,
+    });
 
-  const session = api.sessionSyncClient(sessionInfo);
+  // #4682: the wrapper takes delivery only of user messages above the attach
+  // floor, so a reconnect does not replay the session's earlier history
+  // (residual KR1: docs/internal/architecture/sync.md).
+  const session = api.sessionSyncClient(sessionInfo, { deliveryFloorSeq });
 
   await reportSessionStarted(sessionInfo.id, metadata);
 

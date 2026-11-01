@@ -37,6 +37,7 @@ export * from "./accountMonogram";
 export * from "./accountHealth";
 export * from "./usage";
 export * from "./selectOptimalAccount";
+export * from "./spawnHeadroom";
 export * from "./providerAuthState";
 export * from "./queuedMessages";
 export * from "./launcherResolver";

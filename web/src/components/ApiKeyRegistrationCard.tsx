@@ -8,6 +8,8 @@ import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { useApiKeyActions } from "@/hooks/mutations/useApiKeyActions";
 import { useShareApiKeysByDefault } from "@/hooks/useShareApiKeysByDefault";
 import { ShareAcrossNodesCheckbox } from "@/components/ShareAcrossNodesCheckbox";
+import { apiKeyAddErrorMessage } from "@/components/settings/sections/ApiKeysSection";
+import { addErrorLeftKeyStored } from "@/components/AccountUsage/addModalDone";
 
 const INPUT_CLASS =
   "rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2 text-[var(--app-fg)]";
@@ -91,6 +93,11 @@ export function ApiKeyRegistrationCard({
         onSuccess: redacted => {
           setSecret("");
           setMaskedResult(redacted.maskedKey);
+        },
+        // #4466: the server kept the key — drop the secret so a retry cannot
+        // send it again (it would only answer 409 duplicate_key; #5646 F1).
+        onError: err => {
+          if (addErrorLeftKeyStored(err)) setSecret("");
         },
       }
     );
@@ -214,7 +221,10 @@ export function ApiKeyRegistrationCard({
           className="text-[length:var(--text-body-dense)] text-[var(--accent-rose-400)]"
           data-testid="api-key-registration-error"
         >
-          Failed to register the key — please try again.
+          {apiKeyAddErrorMessage(
+            add.error,
+            "Failed to register the key — please try again."
+          )}
         </p>
       ) : null}
     </div>

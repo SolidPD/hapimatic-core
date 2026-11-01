@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useQuery } from "@tanstack/react-query";
 import type { ApiClient } from "@/api/client";
-import type { FederationNodeStatus } from "@hapi/protocol";
+import type { EffortLevel, FederationNodeStatus } from "@hapi/protocol";
 import type { DaemonCapSource } from "@hapi/protocol/schemas";
 import type { SessionSummary } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
@@ -32,6 +32,9 @@ export type FederationRemoteNode = {
   // pre-#4417 peer → the remote meter shows no warn threshold / source "remote".
   recommendedConcurrent?: number;
   capSource?: DaemonCapSource;
+  // #6028: the node daemon's resolved spawn default effort, forwarded via
+  // getNodeSummaries(). Undefined for a pre-#6028 peer → the shared default label.
+  defaultEffort?: EffortLevel;
 };
 
 // #3508: module-level stable empty fallbacks — keep the pending-query array

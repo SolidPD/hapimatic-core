@@ -26,7 +26,8 @@
  * `API_KEY_HELPER_OUTRANKING_ENV_VARS` (#4884), and an API-key session's
  * credential is its `apiKeyHelper` (#4568). The web
  * terminal still strips `ANTHROPIC_API_KEY` — it derives its filter from
- * `SECRET_ENV_VARS ∪ {ANTHROPIC_API_KEY}` (`TerminalManager.ts`).
+ * `SECRET_ENV_VARS ∪ AGENT_FORBIDDEN_ENV_VARS ∪ {ANTHROPIC_API_KEY}`
+ * (`TerminalManager.ts`, both sets since #5847).
  *
  * **Why `CLAUDE_CODE_OAUTH_TOKEN` is NOT here.** The agent legitimately needs it
  * for inference on the env-token account-binding path (#1446); it lives in
@@ -67,14 +68,12 @@ export const SECRET_ENV_VARS: ReadonlySet<string> = new Set([
   "OPENAI_API_KEY",
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
-  // #2672 (D999-10): a GitHub PAT (gh's native token env). Membership HERE drives the
-  // web-terminal filter (`TerminalManager.buildFilteredEnv`, ungated) and the tmux
-  // window-env scrub (`TmuxManager`) — surfaces that consume SECRET_ENV_VARS only.
-  // ALSO in AGENT_FORBIDDEN_ENV_VARS (deliberate dual membership — see that set's doc).
+  // #2672 (D999-10): a GitHub PAT (gh's native token env). Membership HERE puts it in
+  // the sandbox-gated tmux strip (`omniboxServerEnvStrip`). The web-terminal filter and
+  // the tmux seed env and global-table scrub consume BOTH sets since #5847, so they
+  // strip it either way. ALSO in AGENT_FORBIDDEN_ENV_VARS (deliberate dual membership —
+  // see that set's doc).
   "GH_TOKEN",
-  // #2911: an operator node's bearer for the gateway's central feedback sink. Only the
-  // server reads it (resolveFeedbackSinkConfig); a spawned agent never needs it.
-  "FEEDBACK_INBOX_TOKEN",
 ]);
 
 /**
@@ -106,11 +105,21 @@ export const SECRET_ENV_VARS: ReadonlySet<string> = new Set([
  * launcher), plus the codex and gemini child spawns — `codexLocal.ts`,
  * `codexMcpClient.ts` and the gemini `registerAgent.ts` — all via
  * {@link buildHarnessChildEnv}. The LOCAL claude launcher (`claudeLocal.ts`)
- * does not apply it yet — tracked in #4125. The daemon additionally deletes the var
- * from its own
+ * does not apply it yet — tracked in #4125 — and neither does the opencode
+ * runner (`agent/runners/opencode.ts` `buildEnv`) — tracked in #4057. The
+ * daemon additionally deletes the var from its own
  * `process.env` after consuming it (`daemon/run.ts`) — that source-removal is the
  * primary fix; these strips are defence in depth for a tmux server whose env was
  * frozen by an older daemon (`KillMode=process` preserves it across restarts).
+ *
+ * Issue #5847: the tmux and web-terminal paths apply it too, ungated, because a
+ * frozen tmux server hands its global table to every new pane: the tmux server
+ * seed env (`TmuxManager` `buildTmuxSpawnEnv`, on every tmux command), the
+ * global-table scrub (`buildServerGlobalScrubSet`, inside `createWindow` and
+ * `respawnPane`), the
+ * per-pane `unset` and env file of `buildTmuxEnvFileCommand` (`launcherShared.ts`,
+ * which covers the daemon→wrapper hop and so the wrapper's local-mode child), and
+ * the web terminal filter (`TerminalManager` `buildFilteredEnv`).
  */
 export const AGENT_FORBIDDEN_ENV_VARS: ReadonlySet<string> = new Set([
   "HAPI_ONBOARDING_OAUTH_TOKENS",
@@ -125,9 +134,10 @@ export const AGENT_FORBIDDEN_ENV_VARS: ReadonlySet<string> = new Set([
   // the exposure (onboarding formerly planted one; branch A removed the plant, this
   // strip is belt-and-suspenders for a VM still carrying a legacy env entry). This var
   // is DELIBERATELY in BOTH sets — the one sanctioned exception to their disjointness:
-  // membership here gives the ungated agent strip; membership in SECRET_ENV_VARS gives
-  // the web-terminal filter + tmux window-env scrub, which consume only that set. At
-  // the agent spawn sites the double-strip is redundant but harmless. Legitimate
+  // membership here gives the ungated agent strip; membership in SECRET_ENV_VARS puts it
+  // in the sandbox-gated tmux strip (`omniboxServerEnvStrip`). Since #5847 the
+  // web-terminal filter and the tmux seed env and global-table scrub consume both sets.
+  // At the agent spawn sites the double-strip is redundant but harmless. Legitimate
   // server/daemon consumers (githubRest.ts token resolution) read their OWN process
   // env, which these per-child strips never touch.
   "GH_TOKEN",
@@ -139,6 +149,25 @@ export const AGENT_FORBIDDEN_ENV_VARS: ReadonlySet<string> = new Set([
   // other route that leaves it in a wrapper's env. It is not a boundary against a
   // same-user process reading settings.json.
   "FEDERATION_API_TOKEN",
+  // #5781: an operator node's bearer for the gateway's central feedback sink (#2911)
+  // and its inbox reads (#2912). Only the server reads it (resolveFeedbackSinkConfig /
+  // resolveFeedbackInboxConfig, server/src/config/serverSettings.ts); the daemon never
+  // does, and deletes it from its own env at start (daemon/run.ts). Not in
+  // SECRET_ENV_VARS: since #5847 every surface that consumes that set also applies this
+  // one, ungated, so a second membership would add no strip (the #5764 precedent). It is
+  // not a boundary against a same-user process reading the operator's env file.
+  "FEEDBACK_INBOX_TOKEN",
+  // #5781 (D7): a cloud VM's per-VM bearer for the gateway feedback relay (#2667), which
+  // also redeems backup restore grants (#2509). Only the server reads it
+  // (serverSettings.ts, buildWebApp.ts). VMs provisioned before #5926 also carry its
+  // drop-in (21-feedback.conf) on the daemon unit, until the reconcile feedback-relay
+  // repair removes that copy, so without this every agent on such a VM inherits it. Keep
+  // it after that repair too: the repair restarts only the daemon (KillMode=process), so a
+  // tmux server started by an older daemon can still hold the variable.
+  // The daemon deletes it from its own env at start (daemon/run.ts). restore-backup.sh
+  // reads it from the server unit's drop-in FILE, never from an environment, so the
+  // strip cannot break a restore.
+  "FEEDBACK_RELAY_TOKEN",
 ]);
 
 /**
@@ -197,10 +226,11 @@ export function stripSecretEnvVars<V>(
  *    for the Claude launcher).
  *  - GATED on `configuration.omniboxSandboxEnabled`: the per-flavor view
  *    `SECRET_ENV_VARS − hostJail.keepSecrets(flavor)`. A Claude child (keepSecrets
- *    `[]`) loses the whole 8-member set — identical to today's Claude seams; a Codex
- *    child KEEPS `OPENAI_API_KEY`; a Gemini child KEEPS `GEMINI_API_KEY`/
- *    `GOOGLE_API_KEY`; EVERY child still loses `CLI_API_TOKEN`, `HAPI_SERVER_URL`,
- *    `HAPI_HTTP_MCP_URL`, `TELEGRAM_BOT_TOKEN`, `GH_TOKEN` and the rest. The 8-member
+ *    `[]`) loses the whole `SECRET_ENV_VARS` set — identical to today's Claude
+ *    seams; a Codex child KEEPS `OPENAI_API_KEY`; a Gemini child KEEPS
+ *    `GEMINI_API_KEY`/`GOOGLE_API_KEY`; EVERY child still loses `CLI_API_TOKEN`,
+ *    `HAPI_SERVER_URL`, `HAPI_HTTP_MCP_URL`, `TELEGRAM_BOT_TOKEN`, `GH_TOKEN` and
+ *    the rest. The
  *    {@link SECRET_ENV_VARS} constant is untouched (subtraction, not a rewrite), so a
  *    future member joins every child's loss set automatically.
  *

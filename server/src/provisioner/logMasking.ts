@@ -20,8 +20,8 @@
  *
  *   1. **Value-based** — exact-substring redaction of KNOWN secret values, sourced
  *      from the operator's `~/.oci/hapimatic-infra.env` and the fleet inventory's
- *      per-VM `access_token`s (see {@link parseSecretEnvValues} /
- *      {@link parseInventoryAccessTokens}). Length-gated (≥ {@link MIN_VALUE_LEN})
+ *      per-VM `access_token`s and `health_token`s (see {@link parseSecretEnvValues} /
+ *      {@link parseInventoryTokens}). Length-gated (≥ {@link MIN_VALUE_LEN})
  *      to mirror the bash `mask_secrets` `${#val} >= 6` guard.
  *   2. **NAME=value** — redacts the value that follows any secret env-var NAME
  *      (`TS_AUTHKEY=…`, `CF_API_TOKEN: …`). This is the ONLY server-side masking
@@ -57,11 +57,14 @@
  * inverts its contract and fail-closes the capability gate. The gate's required
  * set is `REQUIRED_PROVISION_ENV_NAMES` in `./capability` (issue #2933). Note the
  * bash-only masking names (`FEEDBACK_RELAY_TOKEN`, `GATEWAY_SECRET_ENCRYPTION_KEY`,
- * `GATEWAY_SECRET_ENCRYPTION_KEY_OLD`, and #4804's `GATEWAY_CAMPAIGN_STATS_TOKEN`,
- * minted as 64 hex characters) are caught server-side by the entropy layer, not by
+ * `GATEWAY_SECRET_ENCRYPTION_KEY_OLD`, #4804's `GATEWAY_CAMPAIGN_STATS_TOKEN` and #3496's
+ * per-VM `VM_GITHUB_BROKER_TOKEN`, minted as 64 hex characters) are caught server-side by
+ * the entropy layer, not by
  * name — this list under-naming them does not leak their values. #5744's
- * `GATEWAY_FEEDBACK_OPERATOR_TOKEN` is bash-only because only `provision-gateway.sh`
- * renders the gateway env; the server provisioner never handles it. #4929's
+ * `GATEWAY_FEEDBACK_OPERATOR_TOKEN`, #3496's `GITHUB_BROKER_PAT` and #4793's
+ * `GITHUB_APP_CLIENT_SECRET` are bash-only
+ * because only `provision-gateway.sh` renders the gateway env; the server provisioner
+ * never handles them. #4929's
  * `SUDO_MODEL_PASSWORD_HASH` is bash-only for a different reason: the server
  * provisioner never handles it (the operator's S3 password hash is read from an RP1
  * file by `provision.sh` / `reconcile-vm.sh` alone).
@@ -139,7 +142,8 @@ const NAME_VALUE_PATTERNS: readonly RegExp[] = ADMIN_VM_SECRET_ENV_NAMES.map(
 
 /**
  * Redact secrets from ONE log line (layers 1–4 in order). `secretValues` are the
- * known literal secret strings (from `infra.env` + inventory `access_token`s);
+ * known literal secret strings (from `infra.env` + inventory `health_token` /
+ * `access_token` values);
  * pass an empty iterable to rely on the value-independent layers alone.
  *
  * The line must NOT contain a newline (call per-line, or use {@link maskSecretText}
@@ -221,12 +225,18 @@ export function parseSecretEnvValues(envFileText: string): string[] {
   return values;
 }
 
+/** Inventory record fields that hold a per-VM credential (masked by value). */
+const INVENTORY_TOKEN_FIELDS = ["access_token", "health_token"] as const;
+
 /**
- * Collect the per-VM `access_token` values from the fleet inventory JSON (a
- * top-level array of records). Only string tokens of at least {@link MIN_VALUE_LEN}
- * are returned; malformed JSON yields an empty list (never throws).
+ * Collect the per-VM token values from the fleet inventory JSON (a top-level
+ * array of records): `access_token` (the owner token #5444 is retiring; rows not
+ * yet refreshed, and the sweep's PR 1 fallback, still use it) and
+ * `health_token` (the read-only health credential, #5444). Only string tokens of
+ * at least {@link MIN_VALUE_LEN} are returned; malformed JSON yields an empty
+ * list (never throws).
  */
-export function parseInventoryAccessTokens(inventoryText: string): string[] {
+export function parseInventoryTokens(inventoryText: string): string[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(inventoryText);
@@ -237,9 +247,11 @@ export function parseInventoryAccessTokens(inventoryText: string): string[] {
   const tokens: string[] = [];
   for (const record of parsed) {
     if (record == null || typeof record !== "object") continue;
-    const token = (record as Record<string, unknown>).access_token;
-    if (typeof token === "string" && token.length >= MIN_VALUE_LEN) {
-      tokens.push(token);
+    for (const field of INVENTORY_TOKEN_FIELDS) {
+      const token = (record as Record<string, unknown>)[field];
+      if (typeof token === "string" && token.length >= MIN_VALUE_LEN) {
+        tokens.push(token);
+      }
     }
   }
   return tokens;

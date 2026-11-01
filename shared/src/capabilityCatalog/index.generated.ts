@@ -5135,6 +5135,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "jwt",
     "availability": {
+      "scope": "user"
+    },
+    "description": "Check the update bucket for a newer harness version now, instead of waiting for the 6-hourly timer.",
+    "domain": "harness-admin",
+    "id": "harness-admin.update-check",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/update-check"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a user refreshes the app and wants a pending harness update to surface at once."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
       "scope": "operator"
     },
     "description": "Roll a harness back to its prior version (privileged, host-mutating).",
@@ -8969,7 +8989,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Read one session's message history over the CLI-token surface.",
+    "description": "Read one session's message history over the CLI-token surface. Send exactCursor=1 to read from seq 0; without it, afterSeq=0 is served from the session's first-attach floor, if one exists (#4682).",
     "domain": "session-introspection",
     "id": "session-introspection.cli-session-messages",
     "invocation": {
@@ -10130,7 +10150,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "cli",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "To spawn a session via `hapi api sessions spawn`."
+    "whenToUse": "To spawn from a shell, run `~/scripts/hapi-spawn.sh` instead: it checks capacity and account headroom, and a raw-spawn guard blocks direct calls."
   },
   {
     "auth": "jwt",

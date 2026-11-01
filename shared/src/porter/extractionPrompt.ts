@@ -595,7 +595,8 @@ empty-matcher registrations are exactly the ones a careless filter drops.
    same bytes (one script registered for several events) are no conflict. Set
    the entry's \`file.path\` (sub-step 4) to that archive path.
 3. Normalize each \`command\` path to the portable form: rewrite the source home
-   prefix (\`/home/<user>/.claude\` or \`~/.claude\`) to
+   prefix (the user's real home, whatever its shape: \`/home/<user>/.claude\`,
+   \`/Users/<user>/.claude\`, \`/root/.claude\` or any other, or \`~/.claude\`) to
    \`${PORTABLE_HOME_TOKEN}/.claude\` so the command is not dead-on-arrival where
    the destination user's home differs.
 4. Emit one manifest \`hooks[]\` entry per (event, command) row:

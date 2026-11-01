@@ -5,8 +5,8 @@ import path from "node:path";
 /**
  * Durable two-phase-updater lifecycle state (issue #3057).
  *
- * The single mint-green update bar needs one truthful source of "where is the
- * update right now" that survives the server restarting itself mid-apply. That
+ * The update flow (the gear badge and the drawer banner, #3277) needs one
+ * truthful source of "where is the update right now" that survives the server restarting itself mid-apply. That
  * state lives in `<HAPI_HOME>/staged-update/job.json`, written atomically by
  * BOTH the server (the initial `staging`/`applying` transition, so the UI
  * reflects the phase the instant a POST returns) and `scripts/update-hapimatic.sh`

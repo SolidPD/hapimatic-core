@@ -155,9 +155,11 @@ export function referencedScriptRels(
  * producer); not a regular file; another script already claims the same
  * case/NFC-folded name. A planned script is owner-executable (R13).
  *
- * #5202 (U13): `skipped` holds the refusals; an entry whose member the archive
- * lacks is a notice (the review's "Imported with a note"), in `notices`, so the
- * caller never has to tell them apart by reason text.
+ * #5202 (U13): `skipped` holds the refusals. #5625: an entry whose member the
+ * archive lacks is not imported but is not a refusal either, so it is returned
+ * in `notImported`; the caller lists it in the plan's `notices` and
+ * `notImported` (the review's "Not imported"), and never tells the kinds apart
+ * by reason text.
  */
 export function planSettingsScripts(
   entries: TarEntry[],
@@ -166,10 +168,10 @@ export function planSettingsScripts(
   claudeDir: string,
   homeDir: string,
   stagingDir: string
-): { plans: StagedPlan[]; skipped: Omission[]; notices: Omission[] } {
+): { plans: StagedPlan[]; skipped: Omission[]; notImported: Omission[] } {
   const plans: StagedPlan[] = [];
   const skipped: Omission[] = [];
-  const notices: Omission[] = [];
+  const notImported: Omission[] = [];
   const referenced = referencedScriptRels(settings, claudeDir, homeDir);
   const named = okRels(settings);
   const claimed = new Set<string>();
@@ -189,7 +191,7 @@ export function planSettingsScripts(
     }
     const member = findEntry(entries, path);
     if (!member) {
-      notices.push({
+      notImported.push({
         surface: settingsScriptEntrySurface(path),
         reason: r.missing,
       });
@@ -221,7 +223,7 @@ export function planSettingsScripts(
       content: member.data,
     });
   }
-  return { plans, skipped, notices };
+  return { plans, skipped, notImported };
 }
 
 /**

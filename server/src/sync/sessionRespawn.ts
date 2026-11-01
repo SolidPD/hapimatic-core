@@ -731,6 +731,11 @@ export class SessionRespawn {
       // daemon forces the SDK launcher for it); absent for a subscription parent.
       apiKeyId: session.metadata?.apiKeyId,
       apiKeyMasked: session.metadata?.apiKeyMasked,
+      // Issue #5879 (R7): a branched child keeps its parent's recorded reasoning
+      // effort. A branch carries `resumeSessionId`, so the daemon's fresh-spawn
+      // default does not apply to it, and without this it ran the binary default
+      // (reconnect already re-sources metadata.effort the same way).
+      effort: session.metadata?.effort,
     });
 
     if (result.type === "success") {

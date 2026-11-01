@@ -24,6 +24,11 @@ import type { RotationLeaseService } from "../../services/rotationLeaseService";
 import type { SharedApiKeyService } from "../../services/sharedApiKeyService";
 import type { Context } from "hono";
 import { createCliApiKeyRoutes } from "./cliApiKeys";
+import {
+  backfillAfterSeq,
+  getMessagesQuerySchema,
+  sessionCreateResponse,
+} from "./cliMessageDelivery";
 import { logAndJson } from "./routeErrorHelper";
 import { cataloged } from "../../capabilities/cataloged";
 import {
@@ -104,11 +109,6 @@ const createOrLoadMachineSchema = z.object({
   id: z.string().min(1),
   metadata: z.unknown(),
   daemonState: z.unknown().nullable().optional(),
-});
-
-const getMessagesQuerySchema = z.object({
-  afterSeq: z.coerce.number().int().min(0),
-  limit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
 // Issue #4914 (epic #4912): the CLI report categories that raise a user
@@ -327,7 +327,7 @@ export function createCliRoutes(
         parsed.data.agentState ?? null,
         namespace
       );
-      return c.json({ session });
+      return c.json(sessionCreateResponse(engine, session)); // #4682
     }
   );
 
@@ -375,7 +375,7 @@ export function createCliRoutes(
         domain: "session-introspection",
         surface: "rest",
         description:
-          "Read one session's message history over the CLI-token surface.",
+          "Read one session's message history over the CLI-token surface. Send exactCursor=1 to read from seq 0; without it, afterSeq=0 is served from the session's first-attach floor, if one exists (#4682).",
         whenToUse: "When the daemon syncs a session's transcript.",
         invocation: {
           kind: "rest",
@@ -407,7 +407,7 @@ export function createCliRoutes(
       const limit = parsed.data.limit ?? 200;
       // Use resolved.session.id (UUID), not sessionId which may be a tag
       const messages = engine.getMessagesAfter(resolved.session.id, {
-        afterSeq: parsed.data.afterSeq,
+        afterSeq: backfillAfterSeq(store, resolved.session.id, parsed.data),
         limit,
       });
       return c.json({ messages });

@@ -6,6 +6,8 @@
  * Helps diagnose and fix issues with hung or orphaned processes
  */
 
+import { readFileSync, readlinkSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { KNOWN_AGENT_IDS } from "@hapi/protocol";
 import psList from "ps-list";
 import { killProcess } from "@/utils/process";
@@ -25,6 +27,12 @@ const STARTING_MODE_FLAGS = new Set([
   "--hapi-starting-mode",
   "--happy-starting-mode",
 ]);
+// The package names of the hapi CLI whose `cli/src/index.ts` is a dev entry:
+// this fork's (cli/package.json) and upstream tiann/hapi's.
+const HAPI_CLI_PACKAGES = new Set(["hapi-cli", "@twsxtd/hapi"]);
+
+/** Whether `entry`, a dev-entry token of process `pid`, is the hapi CLI's. */
+export type HapiCliEntryCheck = (entry: string, pid: number) => boolean;
 
 function pathSegments(token: string): string[] {
   return token.split(/[\\/]/);
@@ -51,12 +59,71 @@ function argsAfterBinary(
 }
 
 /**
- * The hapi CLI's own dev entry: a path ending in `cli/src/index.ts`, which is
- * what every dev-mode spawn passes (spawnHappyCLI). Another project's
- * `src/index.ts` is not hapi (#5763).
+ * The shape of the hapi CLI's dev entry: a path ending in `cli/src/index.ts`,
+ * which is what every dev-mode spawn passes (spawnHappyCLI). Another project's
+ * `src/index.ts` is not hapi (#5763). The shape alone does not tell hapi's
+ * `cli` directory from another project's; isHapiCliPackageEntry does.
  */
 function isHapiDevEntry(token: string): boolean {
   return pathSegments(token).slice(-3).join("/") === "cli/src/index.ts";
+}
+
+/**
+ * Whether dev entry `entry` of process `pid` belongs to the hapi CLI: its
+ * `cli` directory's package.json names a hapi CLI package. Another project's
+ * `cli/src/index.ts` is not hapi, so it is neither listed nor on `doctor
+ * clean`'s kill list (#5855 OOS-4). A relative entry is read from the
+ * process's own working directory (`/proc/<pid>/cwd`). An entry that cannot be
+ * read is not hapi: such a process is never listed and never killed.
+ */
+export function isHapiCliPackageEntry(entry: string, pid: number): boolean {
+  let path = entry;
+  if (!isAbsolute(path)) {
+    try {
+      path = resolve(readlinkSync(join("/proc", String(pid), "cwd")), path);
+    } catch {
+      return false;
+    }
+  }
+  try {
+    const pkg: unknown = JSON.parse(
+      readFileSync(join(path, "..", "..", "package.json"), "utf8")
+    );
+    const name =
+      typeof pkg === "object" && pkg !== null
+        ? (pkg as { name?: unknown }).name
+        : undefined;
+    return typeof name === "string" && HAPI_CLI_PACKAGES.has(name);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the dev entry ending at `tokens[entry]` is the hapi CLI's. `ps`
+ * joins argv with spaces, so an entry whose path holds a space ("/home/John
+ * Doe/hapi/cli/src/index.ts") arrives split across tokens: the last piece is
+ * tried, then that piece joined to each earlier token that starts an absolute
+ * path (#5855).
+ */
+function isHapiCliEntryAt(
+  tokens: string[],
+  entry: number,
+  pid: number,
+  isHapiCli: HapiCliEntryCheck
+): boolean {
+  if (isHapiCli(tokens[entry] ?? "", pid)) {
+    return true;
+  }
+  for (let start = entry - 1; start > 0; start--) {
+    if (
+      isAbsolute(tokens[start] ?? "") &&
+      isHapiCli(tokens.slice(start, entry + 1).join(" "), pid)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -148,7 +215,9 @@ export function redactCommandSecrets(cmd: string): string {
 function locateHapiArgs(
   tokens: string[],
   name: string,
-  executables: ReadonlySet<string>
+  executables: ReadonlySet<string>,
+  pid: number,
+  isHapiCli: HapiCliEntryCheck
 ): { args: string[]; isDevMode: boolean } | null {
   const exe = executableName(tokens[0] ?? "");
   if (executables.has(exe)) {
@@ -158,12 +227,14 @@ function locateHapiArgs(
     return { args: argsAfterBinary(tokens, executables), isDevMode: false };
   }
   if (DEV_RUNTIMES.has(exe)) {
-    // Dev mode: bun/node running the CLI's src/index.ts (production is the
-    // binary).
+    // Dev mode: bun/node running the hapi CLI's own src/index.ts (production
+    // is the binary). Only the first token shaped like a dev entry is checked:
+    // when it is another project's, a hapi path after it is an argument of
+    // that project's script, not what the runtime runs (#5855 OOS-4).
     const entry = tokens.findIndex(
       (token, index) => index > 0 && isHapiDevEntry(token)
     );
-    if (entry > 0) {
+    if (entry > 0 && isHapiCliEntryAt(tokens, entry, pid, isHapiCli)) {
       return { args: tokens.slice(entry + 1), isDevMode: true };
     }
   }
@@ -216,17 +287,25 @@ function isDaemonStarted(args: string[]): boolean {
 /**
  * Classify one process for `hapi doctor` / `hapi daemon status`. Returns null
  * when the process is not a hapi process. `executables` is the set of binary
- * names that count as hapi (default `hapi` / `hapi.exe`).
+ * names that count as hapi (default `hapi` / `hapi.exe`). `isHapiCli` decides
+ * whether a dev entry is the hapi CLI's (default: its package.json).
  */
 export function classifyHappyProcess(
   proc: { pid: number; cmd: string; name: string },
   selfPid: number,
-  executables: ReadonlySet<string> = HAPI_EXECUTABLES
+  executables: ReadonlySet<string> = HAPI_EXECUTABLES,
+  isHapiCli: HapiCliEntryCheck = isHapiCliPackageEntry
 ): string | null {
   const cmd = proc.cmd || "";
   const name = proc.name || "";
   const tokens = cmd.trim().split(/\s+/).filter(Boolean);
-  const located = locateHapiArgs(tokens, name, executables);
+  const located = locateHapiArgs(
+    tokens,
+    name,
+    executables,
+    proc.pid,
+    isHapiCli
+  );
   if (!located) {
     return null;
   }
@@ -252,12 +331,16 @@ export function classifyHappyProcess(
   if (isDaemonStarted(args)) {
     return isDevMode ? "dev-daemon-spawned" : "daemon-spawned-session";
   }
-  if (args.includes("doctor")) {
+  // resolveCommand dispatches `doctor` only from the first argument
+  // (commands/registry.ts), so a prompt that mentions it is not one (#5855
+  // OOS-5).
+  if (args[0] === "doctor") {
     return isDevMode ? "dev-doctor" : "doctor";
   }
-  if (args.includes("--yolo")) {
-    return "dev-session";
-  }
+  // `--yolo` is not typed: `hapi claude` reads it anywhere in its argv
+  // (commands/claude.ts), so in ps's space-joined command line it cannot be
+  // told from a prompt word, and the session is a user session either way
+  // (#5855 OOS-5).
   return isDevMode ? "dev-related" : "user-session";
 }
 

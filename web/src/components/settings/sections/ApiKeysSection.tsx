@@ -12,7 +12,11 @@ import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { useApiKeyActions } from "@/hooks/mutations/useApiKeyActions";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/Checkbox";
-import { API_KEY_STATUS_META as STATUS_META } from "@/lib/apiKeyStatus";
+import {
+  API_KEY_STATUS_META as STATUS_META,
+  apiKeyDisplayName,
+} from "@/lib/apiKeyStatus";
+import { addErrorLeftKeyStored } from "@/components/AccountUsage/addModalDone";
 import { ApiError } from "@/api/client";
 import { useShareApiKeysByDefault } from "@/hooks/useShareApiKeysByDefault";
 import { ShareAcrossNodesCheckbox } from "@/components/ShareAcrossNodesCheckbox";
@@ -21,8 +25,9 @@ import { ShareAcrossNodesCheckbox } from "@/components/ShareAcrossNodesCheckbox"
 export const UNSHARE_CONFIRM_TEXT =
   "Other nodes can no longer start or restart sessions on this key. Sessions already running there keep it until they stop.";
 
-/** Issue #5127: the server's reason for refusing a sharing change, else a retry line. */
-function shareErrorMessage(err: unknown): string {
+/** Issue #5127: the server's reason for refusing a sharing change, else a retry
+ *  line. Shared with the Accounts page's key cards (#4466 R19). */
+export function shareErrorMessage(err: unknown): string {
   if (
     err instanceof ApiError &&
     (err.code === "share_unavailable" || err.code === "share_unsupported") &&
@@ -38,6 +43,38 @@ function shareErrorMessage(err: unknown): string {
     }
   }
   return "Could not change sharing — please try again.";
+}
+
+/**
+ * #4466 R17: the line for a failed add, naming the cause — a kept key (#5429)
+ * says to remove it first; a sharing refusal says why; any other server answer
+ * is that answer; otherwise the caller's generic retry line.
+ */
+export function apiKeyAddErrorMessage(err: unknown, generic: string): string {
+  if (
+    err instanceof ApiError &&
+    (err.code === "share_unavailable" || err.code === "share_unsupported")
+  ) {
+    return shareErrorMessage(err);
+  }
+  if (addErrorLeftKeyStored(err)) {
+    return "Saved without its account · remove the key, then add it again";
+  }
+  if (err instanceof ApiError && err.body) {
+    try {
+      const parsed = JSON.parse(err.body) as { error?: unknown };
+      if (
+        typeof parsed.error === "string" &&
+        parsed.error.trim() &&
+        parsed.error.length <= 300
+      ) {
+        return parsed.error.trim();
+      }
+    } catch {
+      // fall through to the generic line
+    }
+  }
+  return generic;
 }
 
 const INPUT_CLASS =
@@ -61,10 +98,24 @@ const INPUT_CLASS =
  * owns the single swipe-back handler). Does NOT touch NewSession/ — the future
  * Create-Session key selector (A3 #1950, SEAM-2) is separate, PM-owned work.
  */
-export function ApiKeysSection() {
+export function ApiKeysSection(
+  props: {
+    /**
+     * #4466 R16 (E-7 = 1): list only the keys whose provider this returns true
+     * for. The Accounts page shows Anthropic, OpenAI and Gemini keys as cards in
+     * their own sections, so its foot section lists the rest (openrouter,
+     * custom). Absent ⇒ every key.
+     */
+    listProviders?: (provider: string) => boolean;
+  } = {}
+) {
   const { api } = useAppContext();
 
-  const { data: keys = [], isLoading } = useApiKeys(api);
+  const { data: allKeys = [], isLoading } = useApiKeys(api);
+  const { listProviders } = props;
+  const keys = listProviders
+    ? allKeys.filter(k => listProviders(k.provider))
+    : allKeys;
   const { add, update, remove, validate } = useApiKeyActions(api);
 
   const [provider, setProvider] = useState<string>(API_KEY_PROVIDERS[0]);
@@ -131,6 +182,11 @@ export function ApiKeysSection() {
         onSuccess: () => {
           setKeyValue("");
           setLabel("");
+        },
+        // #4466: the server kept the key, so a retry with the same secret could
+        // only answer 409 duplicate_key — drop it, as KeyEntryRows does (#5646 F1).
+        onError: err => {
+          if (addErrorLeftKeyStored(err)) setKeyValue("");
         },
       }
     );
@@ -237,12 +293,11 @@ export function ApiKeysSection() {
                 style={{ color: "var(--status-hot)" }}
                 data-testid="api-key-error"
               >
-                {/* #5127: a sharing refusal says why (e.g. federation off). */}
-                {add.error instanceof ApiError &&
-                (add.error.code === "share_unavailable" ||
-                  add.error.code === "share_unsupported")
-                  ? shareErrorMessage(add.error)
-                  : "Failed to add key — please try again."}
+                {/* #5127 / #4466 R17: the line names the cause. */}
+                {apiKeyAddErrorMessage(
+                  add.error,
+                  "Failed to add key — please try again."
+                )}
               </p>
             )}
           </div>
@@ -264,10 +319,14 @@ export function ApiKeysSection() {
             >
               <KeyRound className="h-6 w-6 text-[var(--app-hint)]" />
               <p className="text-[length:var(--text-label-strong)] text-[var(--app-fg)]">
-                No API keys stored
+                {listProviders
+                  ? "No other provider keys stored"
+                  : "No API keys stored"}
               </p>
               <p className="text-[length:var(--text-body)] text-[var(--app-hint)]">
-                Add a provider key above to get started.
+                {listProviders
+                  ? "Anthropic, OpenAI and Gemini keys appear in their sections above."
+                  : "Add a provider key above to get started."}
               </p>
             </div>
           ) : (
@@ -345,6 +404,7 @@ export function ApiKeysSection() {
                       type="button"
                       onClick={() => validate.mutate(k.id)}
                       disabled={validate.isPending}
+                      aria-label={`Validate ${apiKeyDisplayName(k)}`}
                       className="h-auto shrink-0 px-2.5 py-1 text-[length:var(--text-body-dense)] text-[var(--app-fg)]"
                       data-testid={`api-key-validate-${k.id}`}
                     >
@@ -355,7 +415,7 @@ export function ApiKeysSection() {
                       size="icon"
                       type="button"
                       onClick={() => setPendingDelete(k)}
-                      aria-label={`Remove ${k.provider} key`}
+                      aria-label={`Remove ${k.provider} key ${apiKeyDisplayName(k)}`}
                       className="shrink-0 rounded-md"
                       data-testid={`api-key-remove-${k.id}`}
                     >

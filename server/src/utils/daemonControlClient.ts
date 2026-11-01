@@ -33,6 +33,7 @@ import {
   DaemonCapSourceSchema,
   type DaemonCapSource,
 } from "@hapi/protocol/schemas";
+import { EFFORT_LEVELS, type EffortLevel } from "@hapi/protocol/effort";
 
 /**
  * The subset of daemon.state.json this client needs. `controlToken` survives in
@@ -233,4 +234,69 @@ export async function setDaemonSpawnPaused(
       }`,
     };
   }
+}
+
+/**
+ * POST a JSON body to a local daemon control endpoint (bearer-gated, #1738) and
+ * return the parsed JSON, or `{ error }`. Never throws.
+ */
+async function postDaemonControl(
+  path: string,
+  body: unknown
+): Promise<{ data: unknown } | { error: string }> {
+  const state = readDaemonState();
+  if (!state?.httpPort) {
+    return { error: "No daemon running (no state file or httpPort)" };
+  }
+  if (!isPidAlive(state.pid)) {
+    return { error: "Daemon not running (stale state file)" };
+  }
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (state.controlToken) {
+      headers["Authorization"] = `Bearer ${state.controlToken}`;
+    }
+    const res = await fetch(`http://127.0.0.1:${state.httpPort}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(DAEMON_CAPACITY_TIMEOUT_MS),
+    });
+    if (!res.ok) return { error: `Daemon ${path} HTTP ${res.status}` };
+    return { data: await res.json() };
+  } catch (err) {
+    return {
+      error: `Daemon ${path} failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+}
+
+/** Result of a spawn-defaults read — the default effort or a diagnostic error. */
+export type DaemonSpawnDefaultsResult =
+  | { effort: EffortLevel }
+  | { error: string };
+
+/**
+ * Read the local daemon's resolved spawn default effort (issue #6028) from
+ * `/spawn-defaults` — the level a fresh claude spawn on this node gets before
+ * the per-model fit (env `HAPI_DEFAULT_EFFORT` on the daemon's unit > settings
+ * `defaultEffort` > xhigh). The server cannot resolve it itself: the env tier
+ * lives on the daemon's unit. `{ error }` on any failure (an older daemon has no
+ * such endpoint); never throws.
+ */
+export async function getDaemonSpawnDefaults(): Promise<DaemonSpawnDefaultsResult> {
+  const res = await postDaemonControl("/spawn-defaults", {});
+  if ("error" in res) return res;
+  const effort = (res.data as { effort?: unknown } | null)?.effort;
+  if (
+    typeof effort !== "string" ||
+    !(EFFORT_LEVELS as readonly string[]).includes(effort)
+  ) {
+    return { error: "Daemon returned a malformed spawn-defaults payload" };
+  }
+  return { effort: effort as EffortLevel };
 }

@@ -39,7 +39,7 @@ import {
   SURROGATE_LOOP_USER_MESSAGE,
 } from "./utils/surrogateErrorDetector";
 import { AuthErrorDetector } from "./utils/authErrorDetector";
-import { RateLimitDetector } from "./utils/rateLimitDetector";
+import { createSessionRateLimitDetector } from "./services/sessionRateLimitDetector";
 import { TurnEndDetector } from "./utils/turnEndDetector";
 import {
   RefusalDetector,
@@ -111,7 +111,8 @@ export const DEFAULT_READINESS_TIMEOUT_MS = 45000;
 // Login-shell basenames. A pane reporting one of these (after stripping a
 // leading `-` from login shells like `-bash`) while SessionStart has not
 // fired means `exec claude` never ran. node/bun/claude/anything-else ⇒ the
-// exec took effect.
+// exec took effect. `env` is what a dead pane reports: tmux falls back to the
+// pane's start command, and the window starts `exec env -u … bash -l` (#5963).
 const LOGIN_SHELL_COMMANDS = new Set([
   "bash",
   "sh",
@@ -119,6 +120,7 @@ const LOGIN_SHELL_COMMANDS = new Set([
   "fish",
   "dash",
   "ash",
+  "env",
 ]);
 
 /**
@@ -453,28 +455,11 @@ export async function claudeTmuxRemoteLauncher(
   // binding is frozen per launcher invocation, so retries cannot heal auth).
   const authErrorDetector = new AuthErrorDetector();
 
-  // Issue #1647: detect the 429 session-limit in the transcript stream and flip
-  // the session into the rate-limited state (which also clears `thinking` — a
-  // rate-limited turn fires no Stop hook under tmux/pty, so the #1611 latch would
-  // otherwise stick forever). Mirrors the other detectors' onMessage wiring.
-  const rateLimitDetector = new RateLimitDetector(
-    (sessionId, info) => {
-      session.setRateLimited({
-        resetText: info.resetText,
-        resetAt: info.resetAt,
-        since: Date.now(),
-      });
-    },
-    // Issue #3235: clear the chip on the FALLING edge (genuine forward progress).
-    // onThinkingChange no longer clears `rateLimited`, so this is the resume-path
-    // clear; teardown clears it separately in the `finally` below.
-    () => session.setRateLimited(null),
-    // Issue #4936: an API spend cap / user-set spend limit never latches the
-    // chip (it is not a usage window), so clear `thinking` at that turn
-    // boundary here — TurnEndDetector skips synthetic records and no Stop hook
-    // fires on an API-error turn under tmux/pty.
-    () => session.onThinkingChange(false)
-  );
+  // Issues #1647 / #3235 / #4936: the shared transcript-launcher wiring (#6065).
+  // The rising edge flips the session into the rate-limited state (which also
+  // clears `thinking`: a rate-limited turn fires no Stop hook under tmux/pty),
+  // the falling edge clears the chip, and a spend cap clears `thinking`.
+  const rateLimitDetector = createSessionRateLimitDetector(session);
 
   // Issue #1742: clear `thinking` on a clean turn-end the same way the SDK
   // launcher does (stream `result` → updateThinking(false)). The Stop hook
@@ -1086,6 +1071,10 @@ export async function claudeTmuxRemoteLauncher(
     }
 
     await scanner.cleanup();
+    // #6065: a scan in flight during cleanup can still deliver a 429 after the
+    // clear above (runScan does not re-check `stopped` once it has read the
+    // file), so clear once more now that no scan can run.
+    session.setRateLimited(null);
 
     resolveExitFuture();
   }

@@ -5,7 +5,8 @@ import type {
   ProviderId,
 } from "@hapi/protocol";
 import type { ApiKeyProvider, RedactedApiKey } from "@hapi/protocol/schemas";
-import { ApiError } from "@/api/client";
+import { ApiError, NetworkError, RequestTimeoutError } from "@/api/client";
+import { REQUEST_CANCELLED_MESSAGE } from "@/lib/nodeAvailability";
 
 /**
  * Pure helpers behind the "+ Add" modal (issue #4464): the Done planner, the
@@ -27,6 +28,10 @@ export type KeyRowStatus =
       maskedKey: string;
       modelCount?: number;
       modelCountCapped?: boolean;
+      /** The add response's name and monogram (#5467 S5): what the row shows
+       *  until the key list has the stored key. */
+      label?: string;
+      monogram?: AccountMonogram;
     }
   | { kind: "failed"; message: string; keyStored?: true };
 
@@ -65,6 +70,23 @@ export function parseKeyLines(text: string): string[] {
  *  (`mint_rollback_failed`, #5429): the row is final for this modal (#5646 F1). */
 export function keyKeptByServer(status: KeyRowStatus): boolean {
   return status.kind === "failed" && status.keyStored === true;
+}
+
+/**
+ * The name and monogram a row shows (#5467 S5). A passed row is stored, so it
+ * shows the stored key's values: the key list's entry once it has one, else the
+ * add response's. It never falls back to the draft fields, which would bring
+ * back a name the user has since cleared in the editor.
+ */
+export function keyRowIdentity(
+  row: KeyRow,
+  stored: Pick<RedactedApiKey, "label" | "monogram"> | undefined
+): { name: string; monogram?: AccountMonogram } {
+  if (row.status.kind !== "passed") {
+    return { name: row.name, monogram: row.monogram };
+  }
+  const source = stored ?? row.status;
+  return { name: source.label ?? "", monogram: source.monogram };
 }
 
 /** True when a row still has work for Done: a key, no pass yet, no test in
@@ -192,12 +214,29 @@ export function addErrorLeftKeyStored(err: unknown): boolean {
 }
 
 /**
+ * Did a failed add get no complete answer (#5467 S1)? A dropped connection
+ * (`NetworkError`, which ApiClient puts on a fetch that failed, #5409), the
+ * request's own timeout, or a cancel: the request may have reached the server,
+ * so the key may be stored. A bare `TypeError` is a code bug, not a dropped
+ * connection, so it does not count.
+ */
+export function addErrorGotNoAnswer(err: unknown): boolean {
+  return (
+    err instanceof NetworkError ||
+    err instanceof RequestTimeoutError ||
+    (err instanceof Error && err.message === REQUEST_CANCELLED_MESSAGE)
+  );
+}
+
+/**
  * Map a failed add (validate, then store) to the row text (R6). `uiNode` names
  * the vault the key would have gone to. A row becomes `passed` only on success,
  * so the row stays unsaved. Every server answer but a failed mint rollback
- * (#5429), where the server kept the key, left the vault unchanged; a request
- * that got no complete answer (a dropped connection or a client timeout) may or
- * may not have stored the key.
+ * (#5429), where the server kept the key, left the vault unchanged. A request
+ * that got no complete answer may or may not have stored the key, so its text
+ * says so and the key list is refreshed (`useApiKeyActions`). Any other failure
+ * (an expired session, an error thrown before the request was sent) shows its
+ * own message (#5467 S1).
  */
 export function describeAddKeyError(err: unknown, uiNode: string): string {
   if (err instanceof ApiError) {
@@ -226,6 +265,14 @@ export function describeAddKeyError(err: unknown, uiNode: string): string {
     if (message) return `${message} · not saved`;
     return `${uiNode} answered ${err.status} · not saved`;
   }
-  // No answer at all (a network error): the vault could not be reached.
-  return `Could not reach ${uiNode} · not saved`;
+  if (addErrorGotNoAnswer(err)) {
+    return `No answer from ${uiNode} · it may have been saved · check the key list`;
+  }
+  // Drop one trailing period so "Please sign in again." reads cleanly before
+  // the "· not saved" tail.
+  const message =
+    err instanceof Error ? err.message.trim().replace(/\.$/, "") : "";
+  return message
+    ? `${message} · not saved`
+    : "Could not add the key · not saved";
 }

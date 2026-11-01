@@ -383,10 +383,21 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       const result = await registry.spawnOnNode(nodeId, spawnBody);
 
       if (result.type === "error") {
-        // The peer never accepted it — the 502 IS the caller's error, so no
+        // The peer never accepted it — the error IS the caller's answer, so no
         // placeholder may linger as a second, stale signal.
         if (spawnCorrelationId) dismissPendingSpawn(spawnCorrelationId);
-        return c.json(result, 502);
+        // Issue #5879: a peer's coded refusal (e.g. 409 account_exhausted with
+        // its exhaustion detail) keeps its status, as on the keyed path above.
+        // Only a refusal status passes through (security review F3: a peer's
+        // 401 would make the web client sign the user out); the rest stay 502.
+        const { status, ...answer } = result;
+        const passed =
+          status !== undefined &&
+          answer.code !== undefined &&
+          PASSED_REFUSAL_STATUSES.has(status)
+            ? status
+            : 502;
+        return c.json(answer, passed as ContentfulStatusCode);
       }
       return c.json(result);
     }

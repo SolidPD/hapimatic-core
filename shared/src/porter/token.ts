@@ -16,12 +16,21 @@
  * (K4). `waiting` = minted, not yet uploaded; `received` = the source machine
  * uploaded its archive and a plan was staged; `expired` = past the TTL before an
  * upload landed, or the upload leg ran out of failed attempts first (#5228; its
- * `expiresAt` can then still be in the future). `received` is terminal-happy:
- * once the upload is consumed a later status read stays `received` even past the
- * token TTL (the staged plan has its own 30-min staging TTL, independent of the
- * token).
+ * `expiresAt` can then still be in the future). The two expiries share the
+ * `expired` state, so an older cached web bundle still stops polling, and are
+ * told apart by {@link PorterTokenExpiredReason} (#5708). `received` is
+ * terminal-happy: once the upload is consumed a later status read stays
+ * `received` even past the token TTL (the staged plan has its own 30-min staging
+ * TTL, independent of the token).
  */
 export type PorterTokenState = "waiting" | "received" | "expired";
+
+/**
+ * Why a token reads `expired` (#5708): `ttl` = the token's TTL passed before an
+ * upload landed; `exhausted` = its upload leg ran out of failed attempts. The
+ * page shows its own text for each.
+ */
+export type PorterTokenExpiredReason = "ttl" | "exhausted";
 
 /**
  * K1 — the mint response. Returned by `POST /api/porter/token`.
@@ -54,8 +63,9 @@ export interface PorterTokenResponse {
  * parameter predates #5601, when the plan summary was server-only and the web
  * kept a hand copy; the summary is now the shared `ImportPlanSummary`
  * (`./importWire.ts`), which the web passes in (`web/src/types/porter.ts`).
- * The server builds this response through its own `PorterTokenStatusView`
- * (`server/src/porter/porterToken.ts`), not through this generic.
+ * The server builds this response from its own `PorterTokenStatusView`
+ * (`server/src/porter/porterToken.ts`) and checks the body against this type
+ * (`satisfies PorterTokenStatus`, #5708).
  */
 export interface PorterTokenStatus<Plan = unknown> {
   state: PorterTokenState;
@@ -63,6 +73,8 @@ export interface PorterTokenStatus<Plan = unknown> {
   expiresAt: number;
   /** How many times the fetch leg has been served (0–5); page-visible over-fetch signal. */
   fetchCount: number;
+  /** Present iff `state === "expired"`: which expiry it was (#5708). */
+  expiredReason?: PorterTokenExpiredReason;
   /** Present once `state === "received"`: the staged import plan for review. */
   plan?: Plan;
   /**

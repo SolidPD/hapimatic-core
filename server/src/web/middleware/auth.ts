@@ -5,6 +5,7 @@ import { jwtVerify } from "jose";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { CatalogEntry } from "@hapi/protocol";
 import { COMPANION_TOKEN_PREFIX } from "@hapi/protocol/companion";
+import { HEALTH_READ_TOKEN_PREFIX } from "../../config/healthReadToken";
 
 export type WebAppEnv = {
   Variables: {
@@ -76,6 +77,17 @@ export function createAuthMiddleware(
     if (token.startsWith(COMPANION_TOKEN_PREFIX)) {
       return c.json(
         { error: "Companion pairing tokens are not valid on this route" },
+        401
+      );
+    }
+
+    // Issue #5444: a health read token (`hhr_…`) is valid only on the
+    // health-read routes (`HEALTH_READ_PATHS`), which are mounted before this
+    // middleware with their own check. Refuse it by name so the monitoring
+    // sweep's credential can never reach any other JWT route.
+    if (token.startsWith(HEALTH_READ_TOKEN_PREFIX)) {
+      return c.json(
+        { error: "Health read tokens are valid only on health-read routes" },
         401
       );
     }

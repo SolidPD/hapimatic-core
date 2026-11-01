@@ -206,6 +206,88 @@ export function apiErrorNotification(args: {
   };
 }
 
+/** #3612: the usage-window reset-nudge lifecycle points the user is told about. */
+export type UsageWindowNudgePhase =
+  | "usage-window-scheduled"
+  | "usage-window-ended";
+
+/** "3h 12m" / "45m" / "<1m" — a delay the title can state without a timezone. */
+function formatDelay(ms: number): string {
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 1) return "<1m";
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours === 0) return `${rest}m`;
+  return rest === 0 ? `${hours}h` : `${hours}h ${rest}m`;
+}
+
+const UTC_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+] as const;
+
+/**
+ * "02:45 UTC on Nov 1" — readable UTC to the minute. The server cannot know the
+ * reader's timezone, so it states UTC plainly instead of a raw ISO stamp.
+ */
+function formatUtcMinute(epochMs: number): string {
+  const d = new Date(epochMs);
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${hh}:${mm} UTC on ${UTC_MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}`;
+}
+
+/**
+ * #3612: a session locked by a usage window (the 5-hour or weekly cap).
+ * `usage-window-scheduled` tells the user when the session will be resumed, so
+ * a capped session never waits silently; `usage-window-ended` says the reset
+ * came but the session had stopped, so it was not resumed. Kind `api-error`,
+ * so it follows the API-error notification preference. The scheduled title
+ * leads with the delay because the inbox shows one truncated line and the time
+ * is the fact the reader needs (PM ruling 2026-10-31). One row per reset time
+ * (`resetAt`, the window's reset, not the jittered resume): a re-arm for the
+ * same reset coalesces, while a rescheduled nudge (a later reset) gets a fresh
+ * row. `resumesAt` is the jittered resume time, epoch ms, for a client that
+ * wants the local time.
+ */
+export function usageWindowNudgeNotification(args: {
+  sessionId: string;
+  phase: UsageWindowNudgePhase;
+  resumesAt: number;
+  /** The window's reset time — the dedupe key. Defaults to `resumesAt`. */
+  resetAt?: number;
+  delayMs?: number;
+  window?: string;
+}): ProducerNotification {
+  const scheduled = args.phase === "usage-window-scheduled";
+  return {
+    kind: "api-error",
+    title: scheduled
+      ? `Auto-resume in ${formatDelay(args.delayMs ?? 0)} — usage limit reached`
+      : "Usage limit reset, but the session has stopped — reconnect it to resume",
+    body: `${scheduled ? "Resumes" : "Reset"} at ${formatUtcMinute(args.resumesAt)}`,
+    severity: scheduled ? "info" : "warn",
+    sessionId: args.sessionId,
+    dedupeKey: `api-error:${args.phase}:${args.sessionId}:${args.resetAt ?? args.resumesAt}`,
+    context: defined({
+      phase: args.phase,
+      errorType: "rate_limit_error",
+      resumesAt: args.resumesAt,
+      window: args.window,
+    }),
+  };
+}
+
 /**
  * The account-unrefreshable title when no node is named: the shared
  * `ACCOUNT_UNREFRESHABLE_MESSAGE`, the web's `ACCOUNT_UNREFRESHABLE_TOAST_MESSAGE`.

@@ -99,6 +99,22 @@ export class ClaudeModelCatalogService {
     }
   }
 
+  /**
+   * The catalog without waiting on Anthropic (issue #6028) — for the spawn path,
+   * which must never stall on a live fetch (`FETCH_TIMEOUT_MS`). Serves the
+   * cached catalog of any age, else {@link FALLBACK_CLAUDE_MODELS}. When the
+   * cache is missing or past `CACHE_TTL_MS` and no failure cooldown is active,
+   * it starts a background {@link getModels} so a later read serves the refreshed cache.
+   */
+  peekModels(): ClaudeModelsResponse {
+    const now = Date.now();
+    const stale = !this.cache || now - this.cache.at >= CACHE_TTL_MS;
+    if (stale && now >= this.cooldownUntil) void this.getModels();
+    return this.cache
+      ? { models: this.cache.models, source: "cache" }
+      : { models: FALLBACK_CLAUDE_MODELS, source: "fallback" };
+  }
+
   /** Dedupe concurrent live fetches (many tabs opening the create page at once). */
   private fetchLive(): Promise<ClaudeModelInfo[]> {
     if (this.inflight) return this.inflight;

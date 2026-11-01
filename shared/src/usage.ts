@@ -40,15 +40,17 @@ export const RateLimitSchema = z
 export type RateLimit = z.infer<typeof RateLimitSchema>;
 
 /**
- * Extra-usage credit pool (US dollars) from `oauth/usage`. `monthly_limit` is
- * the dollar cap, `used_credits` the dollars consumed this month, `utilization`
- * the 0–100 percentage of the cap used.
+ * Extra-usage credit pool from `oauth/usage` (the legacy flat fields). The
+ * amounts are in CENTS (verified live 2026-07-08: `decimal_places: 2`,
+ * `used_credits: 5131` ⇒ $51.31; see `centsToUsd` in the web card).
+ * `monthly_limit` is the cap, `used_credits` the amount consumed this month,
+ * `utilization` the 0–100 percentage of the cap used.
  */
 export const ExtraUsageSchema = z
   .object({
     is_enabled: z.boolean(),
-    monthly_limit: z.number().nullable(), // $ monthly cap
-    used_credits: z.number().nullable(), // $ used this month
+    monthly_limit: z.number().nullable(), // monthly cap, cents
+    used_credits: z.number().nullable(), // used this month, cents
     utilization: z.number().nullable(), // 0–100 percentage
   })
   .passthrough();
@@ -467,6 +469,129 @@ const MIN_REMAINING_MS = 60 * 1000;
 // duplicating `100`. An account whose 5-hour OR overall-weekly window is at/above
 // this level is fully unusable until reset — the least-attractive score.
 export const HARD_LOCK_UTILIZATION = 100;
+
+/** The window a {@link HardLock} sits on (issue #5879). */
+export type HardLockWindow = "five_hour" | "seven_day" | "weekly_scoped";
+
+/**
+ * A rate-limit window that is at its cap until `resetsAt` (issue #5879). `model`
+ * names the model a `weekly_scoped` lock applies to (its `display_name`), and is
+ * `null` for the account-wide `five_hour` / `seven_day` windows.
+ */
+export interface HardLock {
+  window: HardLockWindow;
+  model: string | null;
+  utilization: number;
+  resetsAt: string;
+}
+
+/**
+ * The window that makes an account unusable right now, or `null` (issue #5879) —
+ * the ONE predicate the spawn refusal, the web picker and the usage panel share.
+ *
+ * Decided on the RAW windows, never on `score === 100`: the pacing score reaches
+ * 100 before a window is full (a five-hour window at ~99 % with its 0.99 target),
+ * and it ignores model-scoped weekly windows by design.
+ *
+ * A window locks only when its utilization is at/above
+ * {@link HARD_LOCK_UTILIZATION} AND its `resets_at` parses to a time after `now`.
+ * A null, unparseable or past reset is not a lock: utilization only drops at the
+ * reset, so a cached ≥ 100 with a future reset is still locked, while one whose
+ * reset has passed may already be usable (fail-open).
+ *
+ * Checks `five_hour` and `seven_day` always; a `limits[]` entry with
+ * `kind === "weekly_scoped"` only when `opts.modelFamily` matches its
+ * `scope.model.display_name` (case-insensitive, read from `percent`). An account
+ * with extra usage or overage enabled is never locked — it can keep serving past
+ * 100 %. When several windows lock, the one that resets LAST is returned (it
+ * decides when the account becomes usable again).
+ */
+export function findHardLock(
+  utilization: Utilization | null | undefined,
+  opts?: { modelFamily?: string | null; now?: number }
+): HardLock | null {
+  if (!utilization) return null;
+  if (
+    utilization.extra_usage?.is_enabled === true ||
+    utilization.spend?.enabled === true
+  ) {
+    return null;
+  }
+  const now = opts?.now ?? Date.now();
+  const locks: HardLock[] = [];
+  const consider = (
+    window: HardLockWindow,
+    model: string | null,
+    pct: number | null | undefined,
+    resetsAt: string | null | undefined
+  ): void => {
+    if (typeof pct !== "number" || !Number.isFinite(pct)) return;
+    if (pct < HARD_LOCK_UTILIZATION) return;
+    if (!resetsAt) return;
+    const resetMs = Date.parse(resetsAt);
+    if (!Number.isFinite(resetMs) || resetMs <= now) return;
+    locks.push({ window, model, utilization: pct, resetsAt });
+  };
+  consider(
+    "five_hour",
+    null,
+    utilization.five_hour?.utilization,
+    utilization.five_hour?.resets_at
+  );
+  consider(
+    "seven_day",
+    null,
+    utilization.seven_day?.utilization,
+    utilization.seven_day?.resets_at
+  );
+  const family = opts?.modelFamily?.toLowerCase();
+  if (family) {
+    for (const entry of utilization.limits ?? []) {
+      const name = entry?.scope?.model?.display_name;
+      if (
+        entry?.kind === "weekly_scoped" &&
+        typeof name === "string" &&
+        name.toLowerCase() === family
+      ) {
+        consider("weekly_scoped", name, entry.percent, entry.resets_at);
+      }
+    }
+  }
+  if (locks.length === 0) return null;
+  return locks.reduce((latest, lock) =>
+    Date.parse(lock.resetsAt) > Date.parse(latest.resetsAt) ? lock : latest
+  );
+}
+
+/** {@link findHardLock} for the account-wide windows only (the 5-hour and weekly
+ *  windows, no model's own window). */
+export function findAccountWideHardLock(
+  utilization: Utilization | null | undefined,
+  now?: number
+): HardLock | null {
+  return findHardLock(utilization, { modelFamily: null, now });
+}
+
+/**
+ * {@link findHardLock} for one usage row, deciding only when its meters are
+ * known (`ok` / `rate_limited`). An unread or degraded row is never locked
+ * (fail-open) — the rule the server's spawn refusal applies, shared by the
+ * account picker, the New Session default and the usage panel (#5879). Pass the
+ * spawn's `modelFamily` to include that model's `weekly_scoped` window, as the
+ * server does; without one only the account-wide windows count.
+ */
+export function findUsageRowHardLock(
+  row: Pick<AccountUsage, "status" | "utilization"> | null | undefined,
+  opts?: { modelFamily?: string | null; now?: number }
+): HardLock | null {
+  if (!row || (row.status !== "ok" && row.status !== "rate_limited")) {
+    return null;
+  }
+  return findHardLock(row.utilization, {
+    modelFamily: opts?.modelFamily ?? null,
+    now: opts?.now,
+  });
+}
 
 /**
  * Options for {@link computeUtilizationScore}. An injectable-clock seam so the weekly-pace

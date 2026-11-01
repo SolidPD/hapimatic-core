@@ -140,10 +140,13 @@ export type {
 
 /**
  * #5601 (D4): what this server's commit returns. The wire type keeps `notices`
- * optional because a server that predates #5202 omitted it; this one always
- * sends it.
+ * and `notImported` optional because a server that predates #5202 / #5625
+ * omitted them; this one always sends both.
  */
-export type EmittedImportResult = ImportResult & { notices: Omission[] };
+export type EmittedImportResult = ImportResult & {
+  notices: Omission[];
+  notImported: Omission[];
+};
 
 /**
  * The two-phase Configuration Porter import core (issue #2343, epic #2339 Sub D).
@@ -262,10 +265,15 @@ export interface ImportPlan {
   policySkips: Omission[];
   /**
    * #5202 (U10): the importer's notices — an item imported or reported with a
-   * note, not a refusal — the SAME objects as in `omissions`. Rendered as their
-   * own group ("Imported with a note").
+   * note, not a refusal — the SAME objects as in `omissions`. Includes the
+   * `notImported` subset; the rest renders as "Imported with a note".
    */
   notices: Omission[];
+  /**
+   * #5625: the subset of `notices` whose item the import did not write, the
+   * SAME objects as in `notices` and `omissions`. Rendered as "Not imported".
+   */
+  notImported: Omission[];
   /** #4156: lets the commit keep an excluded include's original CLAUDE.md reference. */
   claudeMdRewrite?: ReturnType<typeof planClaudeMd>["rewrite"];
   pluginRemediation: string[];
@@ -807,13 +815,14 @@ export async function planImport(
         ...claudeMdOmissions,
         ...(claudeMdPlan?.notices ?? []),
         ...scriptPlan.skipped,
-        ...scriptPlan.notices,
+        ...scriptPlan.notImported,
         ...hookHolds,
         ...tenant.notices,
         ...tenant.skipped,
       ],
       // A #5178 / #4331 hold is a refusal; a missing carried script is a
-      // notice (#5202 U13: planSettingsScripts returns the two apart).
+      // not-imported notice (#5202 U13, #5625: planSettingsScripts returns
+      // the two apart).
       policySkips: [
         ...sectionOmissions,
         ...claudeMdOmissions,
@@ -821,7 +830,8 @@ export async function planImport(
         ...hookHolds,
         ...tenant.skipped,
       ],
-      notices: [...(claudeMdPlan?.notices ?? []), ...scriptPlan.notices],
+      notices: [...(claudeMdPlan?.notices ?? []), ...scriptPlan.notImported],
+      notImported: [...scriptPlan.notImported],
       claudeMdRewrite: claudeMdPlan?.rewrite,
       pluginRemediation,
       pluginDescriptorPresent: Boolean(tenant.manifest.plugins),
@@ -1144,6 +1154,8 @@ async function runCommit(
         ),
         ...heldNotices,
       ],
+      // #5625: a held item was not written, so its notice is also "Not imported".
+      notImported: [...heldNotices],
     };
 
     // #2465 (Sub G) — gated plugin install execution. Runs strictly AFTER commit

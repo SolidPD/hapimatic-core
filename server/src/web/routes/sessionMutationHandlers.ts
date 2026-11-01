@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { AccountExhaustion } from "@hapi/protocol";
 import { z } from "zod";
 import type { Context, Hono } from "hono";
 import { defineCapability, sessionNameSchema } from "@hapi/protocol";
@@ -62,7 +63,14 @@ export type ProxyResult =
   // (e.g. "at_capacity") so a federated session's coded failure reaches the hub
   // client. Optional + additive — consumers that ignore it are unaffected;
   // absent on a genuine transport fault (proxyToNode's catch).
-  | { type: "error"; message: string; status: number; code?: string };
+  | {
+      type: "error";
+      message: string;
+      status: number;
+      code?: string;
+      // Issue #5879: a peer's validated `account_exhausted` detail (rebind proxy).
+      exhaustion?: AccountExhaustion;
+    };
 
 /**
  * The client-side proxy primitive. `SessionService.proxyToNode` matches this

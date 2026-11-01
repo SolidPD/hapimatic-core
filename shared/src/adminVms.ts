@@ -525,6 +525,10 @@ export type ReconcileRepairRequest = z.infer<
  */
 export const HEALTH_CHECKS = [
   "reachability",
+  // #5444: which credential the sweep read this VM with — `ok` only when the VM
+  // accepted its read-only health token; `owner-token` while a row still holds
+  // the pre-#5444 owner access_token.
+  "monitor-credential",
   "disk",
   "mem",
   "binary-version",

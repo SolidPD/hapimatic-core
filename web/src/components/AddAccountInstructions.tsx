@@ -13,10 +13,16 @@ type AddAccountInstructionsProps = {
    * Defaults to `"anthropic"` — the Anthropic copy is BYTE-IDENTICAL to the
    * pre-#3806 output, so every existing caller + the existing test are unaffected.
    * `"openai"` / `"google"` render the host-side Codex / Gemini instructions
-   * shown in the Accounts page's provider sections until the in-app add flow
-   * (#3807) lands. [ER 2026-09-19: K1]
+   * the Accounts page's "Other ways to add an account" popover shows for those
+   * sections (#4466 R10). [ER 2026-09-19: K1]
    */
   provider?: ProviderId;
+  /**
+   * #4466: whether the OpenAI steps end with "Or use “+ Add” on this page".
+   * Defaults to `true` (the popover). The "+ Add" modal's own fallback passes
+   * `false`, because it shows only when in-app sign-in is unavailable there.
+   */
+  showInAppStep?: boolean;
 };
 
 /**
@@ -25,12 +31,13 @@ type AddAccountInstructionsProps = {
  * extended to non-Anthropic providers by #3806 / epic #3345).
  *
  * The Anthropic variant (the default) is the `claude /login` OAuth flow, reused by
- * BOTH the `AccountSelectorEmptyState` "Log in on the host" help panel and the
- * Account Usage page's "How to add a new account" collapsible section, so the copy
- * lives in exactly one place (R4 — no duplication). The `provider` prop adds the
- * OpenAI (Codex) and Google Gemini host-side procedures for the new provider
- * sections; the in-app add flow for those is #3807 (until it lands, the empty
- * state shows these host-side steps).
+ * the `AccountSelectorEmptyState` "Log in on the host" help panel and the
+ * Accounts page's "Other ways to add an account" popover (#4466 R10), so the
+ * copy lives in exactly one place (R4 — no duplication). The `provider` prop
+ * adds the OpenAI (Codex) and Google Gemini host-side procedures, which the
+ * popover shows for those sections; the in-app add is each section's "+ Add".
+ * The "+ Add" modal's OpenAI fallback (`NodeLoginList`) also renders the OpenAI
+ * steps, without the "+ Add" step (`showInAppStep={false}`).
  *
  * Presentational and dependency-free. Renders ONLY the intro paragraph + the
  * numbered step list as a bare fragment — the heading, "Back" button, padding,
@@ -41,6 +48,7 @@ type AddAccountInstructionsProps = {
 export function AddAccountInstructions({
   intro = "You can also add an account by logging in directly on the target machine:",
   provider = "anthropic",
+  showInAppStep = true,
 }: AddAccountInstructionsProps) {
   if (provider === "openai") {
     return (
@@ -56,10 +64,12 @@ export function AddAccountInstructions({
             <code className="text-[var(--app-fg)]">~/.codex</code> login as this
             node&apos;s OpenAI account.
           </li>
-          <li>
-            An in-app add flow (API key + device auth, into a per-account
-            credential dir) is coming in a follow-up.
-          </li>
+          {showInAppStep && (
+            <li>
+              Or use &ldquo;+ Add&rdquo; on this page: ChatGPT sign-in or a
+              Codex API key, on any node.
+            </li>
+          )}
         </ol>
       </>
     );

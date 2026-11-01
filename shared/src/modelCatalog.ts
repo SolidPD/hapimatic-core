@@ -167,3 +167,59 @@ export function getDefaultCatalogModel(
   const sorted = sortByReleaseDesc(models);
   return sorted.find(m => parseModelId(m.id).family === "opus") ?? sorted[0];
 }
+
+/** Lowercased, trimmed pin with any trailing `[1m]` removed; `undefined` when empty. */
+function normalizeModelPin(
+  value: string | null | undefined
+): string | undefined {
+  let v = value?.trim().toLowerCase() ?? "";
+  while (v.endsWith("[1m]")) v = v.slice(0, -"[1m]".length).trimEnd();
+  return v ? v : undefined;
+}
+
+/**
+ * The effort levels the model a spawn pins supports, read from a model catalog
+ * (issue #6028). `source` is where `models` came from (`ClaudeModelsResponse`).
+ *
+ * A `rawModel` wins over a `modelMode`, matching the spawn. Resolution order:
+ * exact id → the newest dated id `<id>-YYYYMMDD` (the live catalog lists Haiku
+ * 4.5 only as `claude-haiku-4-5-20251001`) → an exact id in
+ * {@link FALLBACK_CLAUDE_MODELS} → a bare family name (`opus`, `haiku`, …) as the
+ * newest model of that family, but never against the fallback, because the
+ * binary's aliases point at models a stale fallback lacks → `undefined`.
+ * `undefined` also covers the Default model (no pin): the binary picks it.
+ */
+export function resolveModelEffortLevels(
+  models: ClaudeModelInfo[],
+  source: ClaudeModelsResponse["source"],
+  pin: { rawModel?: string | null; modelMode?: string | null }
+): EffortLevel[] | undefined {
+  const target =
+    normalizeModelPin(pin.rawModel) ?? normalizeModelPin(pin.modelMode);
+  if (!target || target === "default") return undefined;
+
+  if ((KNOWN_FAMILIES as readonly string[]).includes(target)) {
+    if (source === "fallback") return undefined;
+    const newest = sortByReleaseDesc(models).find(
+      m => parseModelId(m.id).family === target
+    );
+    return newest ? [...newest.effortLevels] : undefined;
+  }
+
+  const exact = models.find(m => m.id.toLowerCase() === target);
+  if (exact) return [...exact.effortLevels];
+
+  const dated = sortByReleaseDesc(
+    models.filter(m => {
+      const id = m.id.toLowerCase();
+      return (
+        id.startsWith(`${target}-`) &&
+        /^\d{8}$/.test(id.slice(target.length + 1))
+      );
+    })
+  )[0];
+  if (dated) return [...dated.effortLevels];
+
+  const fallback = FALLBACK_CLAUDE_MODELS.find(m => m.id === target);
+  return fallback ? [...fallback.effortLevels] : undefined;
+}

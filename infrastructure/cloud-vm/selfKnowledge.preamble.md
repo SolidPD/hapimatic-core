@@ -53,7 +53,7 @@ A Hapimatic session is an independent Claude Code process with its own context w
 access. From within one you can drive others:
 
 - `hapi api sessions list` — all sessions on this node (+ their state)
-- `hapi api sessions spawn --dir <path>` — start a new independent session
+- the `spawn_session` MCP tool — start a new independent session (find the machine id with `hapi_call` GET `/api/machines`)
 - `hapi api sessions send <id> "<prompt>"` — send a prompt to a session
 - `hapi api sessions messages <id>` — read a session's output/progress
 - `hapi api sessions abort <id>` — stop a running session

@@ -10,6 +10,10 @@ export interface Settings {
   machineIdConfirmedByServer?: boolean;
   daemonAutoStartWhenRunningHappy?: boolean;
   cliApiToken?: string;
+  /** Issue #5444: the monitoring sweep's read-only credential (`hhr_…`). Minted
+   *  and verified by `config/healthReadToken.ts`; accepted only on the
+   *  health-read routes; never logged, never returned over HTTP. */
+  healthReadToken?: string;
   /** Issue #1955: node-local provider API keys (the secrets-vault store). Holds
    *  plaintext secrets at rest — settings.json is written 0600 (see writeSettings).
    *  Returned only as RedactedApiKey over the HTTP API (never the raw `key`).

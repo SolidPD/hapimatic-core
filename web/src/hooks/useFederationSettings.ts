@@ -24,8 +24,19 @@ import type {
  * precedent — and an immediate PUT can never be lost to an unmount the way a
  * pending debounce can. The `epoch` guard drops any stale response (mount
  * hydrate or an older PUT) that resolves after a newer toggle.
+ *
+ * `refetchOnFocus` (#4467, ruling G-3 A; default OFF): re-read the view on
+ * window `focus` and when the document becomes visible, so an open page picks
+ * up a peer node's change. A refetch is dropped when any write of this hook
+ * instance is in flight (at its start or its end) or the epoch moved. The
+ * Preferences page keeps it off: its value hooks keep their own generation
+ * counter and never bump this epoch, so a refetch there could overwrite a
+ * local edit.
  */
-export function useFederationSettings(api: ApiClient | null): {
+export function useFederationSettings(
+  api: ApiClient | null,
+  opts: { refetchOnFocus?: boolean } = {}
+): {
   /** True once the mount hydrate settled (success OR degrade). */
   hydrated: boolean;
   /** The latest server view; null before hydration or with no api. */
@@ -46,8 +57,12 @@ export function useFederationSettings(api: ApiClient | null): {
   const [view, setView] = useState<FederationSettingsView | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const epochRef = useRef(0);
+  // Writes (setInherit / setValue PUTs) still in flight; a refetch that
+  // overlaps one is dropped so it cannot undo an optimistic edit.
+  const pendingRef = useRef(0);
   const apiRef = useRef(api);
   apiRef.current = api;
+  const refetchOnFocus = opts.refetchOnFocus === true;
 
   useEffect(() => {
     if (!api) return;
@@ -70,6 +85,36 @@ export function useFederationSettings(api: ApiClient | null): {
     };
   }, [api]);
 
+  useEffect(() => {
+    if (!api || !refetchOnFocus) return;
+    let cancelled = false;
+    const refetch = () => {
+      if (pendingRef.current > 0) return;
+      const epoch = epochRef.current;
+      void api
+        .getFederationSettings()
+        .then(fresh => {
+          if (cancelled || epochRef.current !== epoch) return;
+          if (pendingRef.current > 0) return;
+          setView(fresh);
+          setHydrated(true);
+        })
+        .catch(() => {
+          /* best-effort: the current view stays until the next focus */
+        });
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") refetch();
+    };
+    window.addEventListener("focus", refetch);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", refetch);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [api, refetchOnFocus]);
+
   const inheritFor = useCallback(
     (key: FederationSettingKey) => view?.inheritFlags[key] !== false,
     [view]
@@ -89,6 +134,7 @@ export function useFederationSettings(api: ApiClient | null): {
       );
       const client = apiRef.current;
       if (!client) return;
+      pendingRef.current += 1;
       void client
         .putFederationSetting(key, { inherit })
         .then(fresh => {
@@ -97,6 +143,9 @@ export function useFederationSettings(api: ApiClient | null): {
         })
         .catch(() => {
           /* best-effort: the optimistic flag stays; the next hydrate reconciles */
+        })
+        .finally(() => {
+          pendingRef.current -= 1;
         });
     },
     []
@@ -113,6 +162,7 @@ export function useFederationSettings(api: ApiClient | null): {
     );
     const client = apiRef.current;
     if (!client) return;
+    pendingRef.current += 1;
     void client
       .putFederationSetting(key, { value })
       .then(fresh => {
@@ -121,6 +171,9 @@ export function useFederationSettings(api: ApiClient | null): {
       })
       .catch(() => {
         /* best-effort: the optimistic value stays; the next hydrate reconciles */
+      })
+      .finally(() => {
+        pendingRef.current -= 1;
       });
   }, []);
 

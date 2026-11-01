@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
  * #4924 — let a replacement service worker take over as soon as the user taps
- * the update bar.
+ * the update banner (the update bar until #3277).
  *
- * When the bar's tap posts `SKIP_WAITING`, Chromium activates the waiting
+ * When the banner's tap posts `SKIP_WAITING`, Chromium activates the waiting
  * worker only once the OUTGOING worker has no event in flight, or after five
  * minutes (`IsReadyToActivate` / `kMaxLameDuckTime` in
  * content/browser/service_worker/service_worker_registration.cc). A Workbox

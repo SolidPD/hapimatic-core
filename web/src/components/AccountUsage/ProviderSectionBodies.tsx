@@ -2,15 +2,19 @@
 /**
  * The OpenAI (Codex) and Google Gemini section bodies of the Accounts page
  * (`/account-usage`), moved out of `routes/account-usage.tsx` by #3982 to keep the
- * route under its `max-lines` cap. #4466 builds the Gemini key cards on these
- * exports (it imports `GoogleUsageCounter` from here), so keep the names stable.
+ * route under its `max-lines` cap. #4466 puts both on the shared card contract:
+ * OpenAI account cards then OpenAI key cards; Gemini key cards (each joined to
+ * its Google usage row) then muted per-node auth lines. Adding lives in the
+ * section header's "+ Add" pill, not here.
  */
-import { useState } from "react";
+import { useContext, useState } from "react";
+import { LOCAL_NODE_ID } from "@hapi/protocol";
 import type {
   NodeProviderAuthState,
   OpenAiAuthState,
   ProviderAccountUsage,
 } from "@hapi/protocol";
+import type { RedactedApiKey } from "@hapi/protocol/schemas";
 import {
   DndContext,
   closestCenter,
@@ -26,12 +30,15 @@ import {
   arrayMove,
 } from "@dnd-kit/sortable";
 import type { ApiClient } from "@/api/client";
-import { Button } from "@/components/ui/button";
-import { AddAccountInstructions } from "@/components/AddAccountInstructions";
-import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
 import { UsageBar } from "@/components/AccountUsage/UsageBar";
+import { ArcsView } from "@/components/AccountUsage/views/ArcsView";
+import { ChipsView } from "@/components/AccountUsage/views/ChipsView";
+import { buildUsageColumns } from "@/components/AccountUsage/views/usageMeters";
+import { UsageViewContext } from "@/components/AccountUsage/views/UsageViewContext";
 import { SortableAccountCard } from "@/components/AccountUsage/SortableAccountCard";
 import { ProviderAccountCard } from "@/components/AccountUsage/ProviderAccountCard";
+import { ApiKeyCard } from "@/components/AccountUsage/ApiKeyCard";
+import type { AccountNodeItem } from "@/components/AccountUsage/AccountNodeRow";
 import {
   DRAG_ACTIVATION,
   GuardedPointerSensor,
@@ -102,6 +109,10 @@ export function ProviderDetailRow(props: {
  */
 export function OpenAiUsageMeter(props: { usage: ProviderAccountUsage }) {
   const { usage } = props;
+  // #4467: the OpenAI section's usage view, dispatched at the one site that
+  // creates this card's meter element. The `unknown` hint and the "as of" line
+  // render the same in every view (R1).
+  const usageView = useContext(UsageViewContext) ?? "bars";
   if (usage.status === "unknown") {
     return (
       <p
@@ -114,13 +125,26 @@ export function OpenAiUsageMeter(props: { usage: ProviderAccountUsage }) {
   }
   const fiveHour = usage.utilization.five_hour?.utilization ?? null;
   const weekly = usage.utilization.seven_day?.utilization ?? null;
+  const columns =
+    usageView === "bars"
+      ? null
+      : buildUsageColumns(usage.utilization, "openai");
   return (
     <div
       className="mt-2 flex flex-col gap-1.5"
       data-testid="openai-usage-meter"
+      data-usage-view={usageView}
     >
-      <UsageBar label="5-hour" value={fiveHour} />
-      <UsageBar label="Weekly" value={weekly} />
+      {columns && usageView === "arcs" ? (
+        <ArcsView columns={columns} />
+      ) : columns ? (
+        <ChipsView columns={columns} />
+      ) : (
+        <>
+          <UsageBar label="5-hour" value={fiveHour} />
+          <UsageBar label="Weekly" value={weekly} />
+        </>
+      )}
       {(usage.status === "stale" || usage.status === "error") && (
         <span
           className="text-[length:var(--text-caption)] text-[var(--app-hint)]"
@@ -139,9 +163,31 @@ export function OpenAiUsageMeter(props: { usage: ProviderAccountUsage }) {
  * the rolling today / this-week totals from the derived counter. Token classes
  * mirror the sibling provider rows (no new hex/px literal).
  */
-export function GoogleUsageCounter(props: { usage: ProviderAccountUsage }) {
+export function GoogleUsageCounter(props: {
+  usage: ProviderAccountUsage;
+  /** #4466: the two detail rows only — inside a key card, which is already the
+   *  card layer and already names the key. */
+  bare?: boolean;
+}) {
   const { usage } = props;
   const spend = usage.tokenSpend;
+  const rows = (
+    <>
+      <ProviderDetailRow
+        label="Today"
+        value={`${(spend?.tokensToday ?? 0).toLocaleString()} tokens`}
+        testId="google-usage-today"
+      />
+      <ProviderDetailRow
+        label="This week"
+        value={`${(spend?.tokensThisWeek ?? 0).toLocaleString()} tokens`}
+        testId="google-usage-week"
+      />
+    </>
+  );
+  if (props.bare) {
+    return <div data-testid="google-usage-counter-bare">{rows}</div>;
+  }
   return (
     <div
       className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
@@ -155,16 +201,7 @@ export function GoogleUsageCounter(props: { usage: ProviderAccountUsage }) {
           tokens used (no limit known)
         </span>
       </div>
-      <ProviderDetailRow
-        label="Today"
-        value={`${(spend?.tokensToday ?? 0).toLocaleString()} tokens`}
-        testId="google-usage-today"
-      />
-      <ProviderDetailRow
-        label="This week"
-        value={`${(spend?.tokensThisWeek ?? 0).toLocaleString()} tokens`}
-        testId="google-usage-week"
-      />
+      {rows}
     </div>
   );
 }
@@ -238,12 +275,20 @@ export function OpenAiSectionBody(props: {
   // account (federation-merged, keyed by accountUuid). Each renders as a
   // ProviderAccountCard; its auth-state detail is joined by accountUuid.
   openaiUsage: ProviderAccountUsage[];
-  /** #3982: `usage.machines` labels → the node ids a NodeChip can target. */
-  resolveNodes: (machines: string[]) => { nodeId: string; nodeLabel: string }[];
+  /** #4466 R6: one account's node-row items (A's read merged with `machines`). */
+  resolveNodeItems: (usage: ProviderAccountUsage) => AccountNodeItem[];
+  /** #4466 R9a: this node's OpenAI vault keys, rendered after the accounts. */
+  keys: RedactedApiKey[];
+  /** The node serving this UI (where a vault key is stored). */
+  localNode: { nodeId?: string; nodeLabel: string };
+  /** #4466 R12: the page's expand/collapse-all reaches every card. */
+  allExpanded: boolean;
+  genId: number;
+  /** #4466 R8: open the single-account removal for this account. */
+  onRemove?: (usage: ProviderAccountUsage) => void;
   /** #3982: drag start/end, so the page's pull-to-refresh stays gated. */
   onDragActiveChange?: (active: boolean) => void;
 }) {
-  const [wizardOpen, setWizardOpen] = useState(false);
   // #3982: the OpenAI section's own per-device drag order (a sibling key of the
   // Anthropic one). orderByCustom appends accounts the stored order lacks.
   const [customOrder, setCustomOrder] = useState<string[]>(() =>
@@ -283,6 +328,22 @@ export function OpenAiSectionBody(props: {
       }
     }
   }
+  // D2: a host login only reads as one once its node's auth state is in. While
+  // that read is loading or failed, or the node is unreachable, a host login looks
+  // like any store record, so a card offers Remove only when every node its
+  // removal would target answered `ok`. A label that resolves to no node is never
+  // a removal target (the modal says so), so it does not withhold Remove. The UI
+  // host's row may carry the LOCAL_NODE_ID sentinel.
+  const okNodeIds = new Set(
+    props.nodes.filter(n => n.status === "ok").map(n => n.nodeId)
+  );
+  const authKnownOn = (items: AccountNodeItem[]): boolean =>
+    items.every(
+      i =>
+        i.nodeId === undefined ||
+        okNodeIds.has(i.nodeId) ||
+        (i.nodeId === props.localNode.nodeId && okNodeIds.has(LOCAL_NODE_ID))
+    );
   const onDragEnd = (e: DragEndEvent) => {
     props.onDragActiveChange?.(false);
     const { active, over } = e;
@@ -299,50 +360,21 @@ export function OpenAiSectionBody(props: {
 
   const anyRows =
     cards.length > 0 ||
+    props.keys.length > 0 ||
     props.nodes.some(n => n.status === "ok" && n.openai.length > 0);
   const allReachableNoLogin =
     !anyRows && props.nodes.every(n => n.status === "ok");
-  // #4464: the in-app "Add account" opens the OpenAI "+ Add" modal — ChatGPT
-  // device-auth or a Codex API-key login on the node the user picks (the UI
-  // host by default), plus OpenAI vault keys.
-  const addButton = (
-    <div className="flex justify-end">
-      <Button
-        type="button"
-        size="sm"
-        onClick={() => setWizardOpen(true)}
-        data-testid="openai-add-account"
-      >
-        Add account
-      </Button>
-    </div>
-  );
-  const wizard = wizardOpen ? (
-    <AddToProviderModal
-      isOpen
-      onClose={() => setWizardOpen(false)}
-      api={props.api}
-      provider="openai"
-    />
-  ) : null;
 
   if (allReachableNoLogin) {
-    // Every node reachable, no Codex login anywhere → host-side add instructions
-    // (the on-host fallback) PLUS the in-app add for the local node (#3807).
+    // #4466 R10: the add paths live in the header's "+ Add" pill and the
+    // "Other ways to add" popover; the empty section is one muted line.
     return (
-      <div className="flex flex-col gap-3">
-        <div
-          className="flex flex-col gap-2 text-[length:var(--text-body)]"
-          data-testid="provider-section-openai-empty"
-        >
-          <AddAccountInstructions
-            provider="openai"
-            intro="No Codex (OpenAI) login on this node yet:"
-          />
-        </div>
-        {addButton}
-        {wizard}
-      </div>
+      <p
+        className="text-[length:var(--text-body)] text-[var(--app-hint)]"
+        data-testid="provider-section-openai-empty"
+      >
+        No OpenAI account on any node yet — use + Add
+      </p>
     );
   }
   return (
@@ -365,15 +397,19 @@ export function OpenAiSectionBody(props: {
                 const isHost =
                   hostUuids.has(usage.accountUuid) &&
                   !accountUuids.has(usage.accountUuid);
+                const nodeItems = props.resolveNodeItems(usage);
+                const removable = !isHost && authKnownOn(nodeItems);
                 return (
                   <SortableAccountCard
-                    key={usage.accountUuid}
+                    key={`${usage.accountUuid}:${props.genId}`}
                     id={usage.accountUuid}
                   >
                     {({ dragHandle }) => (
                       <ProviderAccountCard
                         usage={usage}
                         email={auth?.email}
+                        plan={auth?.plan}
+                        mode={auth?.mode}
                         sourceLabel={
                           isHost
                             ? OPENAI_SOURCE_LABEL.host
@@ -384,13 +420,17 @@ export function OpenAiSectionBody(props: {
                         }
                         readOnly={isHost}
                         api={props.api}
-                        nodes={props.resolveNodes(usage.machines)}
+                        nodeItems={nodeItems}
                         dragHandle={dragHandle}
+                        defaultExpanded={props.allExpanded}
+                        onRemove={
+                          props.onRemove && removable
+                            ? () => props.onRemove?.(usage)
+                            : undefined
+                        }
                       >
                         {auth && (
-                          <div className="mt-1.5">
-                            <OpenAiLoginDetails row={auth} showEmail={false} />
-                          </div>
+                          <OpenAiLoginDetails row={auth} showEmail={false} />
                         )}
                         <OpenAiUsageMeter usage={usage} />
                       </ProviderAccountCard>
@@ -402,6 +442,17 @@ export function OpenAiSectionBody(props: {
           </SortableContext>
         </DndContext>
       )}
+      {/* R9a: the OpenAI vault keys follow the accounts — outside the drag
+          context, in vault order. */}
+      {props.keys.map(key => (
+        <ApiKeyCard
+          key={`${key.id}:${props.genId}`}
+          apiKey={key}
+          api={props.api}
+          localNode={props.localNode}
+          defaultExpanded={props.allExpanded}
+        />
+      ))}
       {props.nodes.map(node => {
         const nodeLabel = props.resolveNodeLabel(node.nodeId);
         if (node.status !== "ok") {
@@ -441,10 +492,49 @@ export function OpenAiSectionBody(props: {
           </div>
         );
       })}
-      {addButton}
-      {wizard}
     </div>
   );
+}
+
+/**
+ * #4466 R9b: a peer node's Gemini key, known only from its Google usage row (the
+ * key list is the UI host's vault), shaped as a key for its read-only card. The
+ * card shows no status, masked key or date, so those carry neutral values.
+ */
+function peerKeyFromUsage(row: ProviderAccountUsage): RedactedApiKey {
+  return {
+    id: row.accountUuid,
+    provider: "gemini",
+    accountUuid: row.accountUuid,
+    label: row.nickname?.trim() || row.displayLabel,
+    maskedKey: "",
+    createdAt: "",
+    status: "none",
+  };
+}
+
+/**
+ * #4466 R9b: the Google usage rows that are a PEER node's key — rows whose
+ * `accountUuid` matches no local key and whose `machines` names a node other
+ * than the UI host. An unmatched row that names only the UI host belongs to a
+ * key just removed here and is dropped. Shared by the section body and the
+ * section header's key count.
+ */
+export function geminiPeerRows(
+  rows: ProviderAccountUsage[],
+  keys: RedactedApiKey[],
+  uiHostLabel: string
+): { row: ProviderAccountUsage; peer: string }[] {
+  const keyUuids = new Set(
+    keys.map(k => k.accountUuid).filter((u): u is string => Boolean(u))
+  );
+  const out: { row: ProviderAccountUsage; peer: string }[] = [];
+  for (const row of rows) {
+    if (keyUuids.has(row.accountUuid)) continue;
+    const peer = row.machines.find(m => m !== uiHostLabel);
+    if (peer) out.push({ row, peer });
+  }
+  return out;
 }
 
 export function GeminiSectionBody(props: {
@@ -453,28 +543,64 @@ export function GeminiSectionBody(props: {
   currentNodeId: string;
   api: ApiClient | null;
   // Issue #3809: the Google providerUsage[] counter rows (account-keyed, not
-  // node-keyed like the auth rows), rendered at the top of the section.
+  // node-keyed like the auth rows). #4466 R9b joins each to its key card.
   googleUsageRows: ProviderAccountUsage[];
+  /** #4466 R9a: this node's gemini/google vault keys. */
+  keys: RedactedApiKey[];
+  /** The node serving this UI (where a vault key is stored). */
+  localNode: { nodeId?: string; nodeLabel: string };
+  /** #4466 R12: the page's expand/collapse-all reaches every card. */
+  allExpanded: boolean;
+  genId: number;
 }) {
-  // #4464: ONE "Add key" button opens the Gemini "+ Add" modal (keys only). It
-  // writes THIS node's local vault (POST /api/api-keys — there is no federation
-  // key store until #1996); a peer node's row keeps the #3806 host-side
-  // instruction.
-  const [addOpen, setAddOpen] = useState(false);
+  // R9b: each Gemini key appears once. A usage row whose accountUuid matches a
+  // local key feeds that key's card; the rest are peer keys (geminiPeerRows).
+  const usageByUuid = new Map(
+    props.googleUsageRows.map(row => [row.accountUuid, row])
+  );
+  const peerRows = geminiPeerRows(
+    props.googleUsageRows,
+    props.keys,
+    props.localNode.nodeLabel
+  );
+  const peerNodes = new Set(peerRows.map(p => p.peer));
+
   return (
     <div className="flex flex-col gap-3">
-      {/* Issue #3809: the derived Google token-spend counters (account-keyed),
-          shown above the per-node auth rows. A count row is never a % bar. */}
-      {props.googleUsageRows.length > 0 && (
-        <div
-          className="flex flex-col gap-2"
-          data-testid="google-usage-counters"
-        >
-          {props.googleUsageRows.map(u => (
-            <GoogleUsageCounter key={u.accountUuid} usage={u} />
+      {props.keys.length > 0 || peerRows.length > 0 ? (
+        <div className="flex flex-col gap-2" data-testid="gemini-key-cards">
+          {props.keys.map(key => {
+            const usage = key.accountUuid
+              ? usageByUuid.get(key.accountUuid)
+              : undefined;
+            return (
+              <ApiKeyCard
+                key={`${key.id}:${props.genId}`}
+                apiKey={key}
+                api={props.api}
+                localNode={props.localNode}
+                defaultExpanded={props.allExpanded}
+              >
+                {usage ? <GoogleUsageCounter usage={usage} bare /> : undefined}
+              </ApiKeyCard>
+            );
+          })}
+          {peerRows.map(({ row, peer }) => (
+            <ApiKeyCard
+              key={`${row.accountUuid}:${props.genId}`}
+              apiKey={peerKeyFromUsage(row)}
+              api={props.api}
+              localNode={props.localNode}
+              defaultExpanded={props.allExpanded}
+              readOnlyRemote={{ nodeLabel: peer }}
+            >
+              <GoogleUsageCounter usage={row} bare />
+            </ApiKeyCard>
           ))}
         </div>
-      )}
+      ) : null}
+      {/* R9c: each node's Gemini auth that is not a listed vault key, as a muted
+          detail line beneath the key list. */}
       {props.nodes.map(node => {
         const nodeLabel = props.resolveNodeLabel(node.nodeId);
         if (node.status !== "ok") {
@@ -488,64 +614,54 @@ export function GeminiSectionBody(props: {
         }
         const g = node.google;
         const isLocal = node.nodeId === props.currentNodeId;
+        // An unconfigured node (no auth chosen, nothing bound) is EMPTY, not an
+        // auth to describe. A peer that is empty and shows no key card here
+        // reads "No Gemini key on <node> yet"; the UI host's add is "+ Add".
+        const empty =
+          g == null ||
+          (!g.bound &&
+            (g.selectedAuthType === "none" ||
+              g.selectedAuthType === "unknown"));
+        // A vault API key normally shows as a key card — the UI host's from its
+        // vault, a peer's from its Google usage row. When no card stands for
+        // this node's key (a peer on an older binary that mints no account, a
+        // failed usage read), the auth line keeps the node visible.
+        const keyCardShown = isLocal
+          ? props.keys.length > 0
+          : peerNodes.has(nodeLabel);
+        const showLine =
+          !empty &&
+          g != null &&
+          (g.selectedAuthType !== "api-key" ||
+            g.keySource !== "vault" ||
+            !keyCardShown);
+        const peerEmpty = !isLocal && empty && !peerNodes.has(nodeLabel);
+        if (!showLine && !peerEmpty) return null;
         return (
-          <div key={node.nodeId} className="flex flex-col gap-2">
-            {g && (
-              <div
-                className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2"
+          <div key={node.nodeId} className="flex flex-col gap-1">
+            {showLine && g ? (
+              <p
+                className="text-[length:var(--text-body-dense)] text-[var(--app-hint)]"
                 data-testid="gemini-node-row"
               >
-                <div className="mb-1 flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-[length:var(--text-label-strong)] font-medium text-[var(--app-fg)]">
-                    {nodeLabel}
-                  </span>
-                  <span className="shrink-0 text-[length:var(--text-caption)] text-[var(--app-hint)]">
-                    {GEMINI_KEYSOURCE_LABEL[g.keySource] ?? g.keySource}
-                  </span>
-                </div>
-                <ProviderDetailRow
-                  label="Auth type"
-                  value={
-                    GEMINI_AUTH_LABEL[g.selectedAuthType] ?? g.selectedAuthType
-                  }
-                  testId="gemini-auth-type"
-                />
-              </div>
-            )}
-            {!isLocal && !g?.bound && (
-              // A peer node with no bound Gemini key → host-side instruction
-              // (federation key persistence is #1996's; R4).
-              <div
-                className="flex flex-col gap-2 text-[length:var(--text-body)]"
+                {`${nodeLabel}: `}
+                <span data-testid="gemini-auth-type">
+                  {GEMINI_AUTH_LABEL[g.selectedAuthType] ?? g.selectedAuthType}
+                </span>
+                {` · ${GEMINI_KEYSOURCE_LABEL[g.keySource] ?? g.keySource}`}
+              </p>
+            ) : null}
+            {peerEmpty ? (
+              <p
+                className="text-[length:var(--text-body-dense)] text-[var(--app-hint)]"
                 data-testid="provider-section-google-peer-empty"
               >
-                <AddAccountInstructions
-                  provider="google"
-                  intro={`No Gemini key bound on ${nodeLabel} yet:`}
-                />
-              </div>
-            )}
+                No Gemini key on {nodeLabel} yet
+              </p>
+            ) : null}
           </div>
         );
       })}
-      <div className="flex justify-end">
-        <Button
-          type="button"
-          size="sm"
-          onClick={() => setAddOpen(true)}
-          data-testid="gemini-add-key"
-        >
-          Add key
-        </Button>
-      </div>
-      {addOpen && (
-        <AddToProviderModal
-          isOpen
-          onClose={() => setAddOpen(false)}
-          api={props.api}
-          provider="google"
-        />
-      )}
     </div>
   );
 }

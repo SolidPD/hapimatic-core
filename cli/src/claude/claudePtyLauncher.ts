@@ -19,7 +19,7 @@ import {
   RefusalDetector,
   buildRefusalUserMessage,
 } from "./utils/refusalDetector";
-import { RateLimitDetector } from "./utils/rateLimitDetector";
+import { createSessionRateLimitDetector } from "./services/sessionRateLimitDetector";
 import { TurnEndDetector } from "./utils/turnEndDetector";
 import { claudePty, type ClaudePtyHandle } from "./claudePty";
 import {
@@ -207,27 +207,11 @@ export async function claudePtyLauncher(
     }
   );
 
-  // Issue #1647: detect the 429 session-limit and flip the session into the
-  // rate-limited state (which also clears `thinking` — a rate-limited turn fires
-  // no Stop hook under tmux/pty, so the #1611 latch would otherwise stick).
-  const rateLimitDetector = new RateLimitDetector(
-    (sessionId, info) => {
-      session.setRateLimited({
-        resetText: info.resetText,
-        resetAt: info.resetAt,
-        since: Date.now(),
-      });
-    },
-    // Issue #3235: clear the chip on the FALLING edge (genuine forward progress).
-    // onThinkingChange no longer clears `rateLimited`, so this is the resume-path
-    // clear; teardown clears it separately in the `finally` below.
-    () => session.setRateLimited(null),
-    // Issue #4936: an API spend cap / user-set spend limit never latches the
-    // chip (it is not a usage window), so clear `thinking` at that turn
-    // boundary here — TurnEndDetector skips synthetic records and no Stop hook
-    // fires on an API-error turn under tmux/pty.
-    () => session.onThinkingChange(false)
-  );
+  // Issues #1647 / #3235 / #4936: the shared transcript-launcher wiring (#6065).
+  // The rising edge flips the session into the rate-limited state (which also
+  // clears `thinking`: a rate-limited turn fires no Stop hook under tmux/pty),
+  // the falling edge clears the chip, and a spend cap clears `thinking`.
+  const rateLimitDetector = createSessionRateLimitDetector(session);
 
   // Issue #1742: clear `thinking` on a clean turn-end the same way the SDK
   // launcher does (stream `result` → updateThinking(false)). The Stop hook
@@ -581,6 +565,10 @@ export async function claudePtyLauncher(
     }
 
     await scanner.cleanup();
+    // #6065: a scan in flight during cleanup can still deliver a 429 after the
+    // clear above (runScan does not re-check `stopped` once it has read the
+    // file), so clear once more now that no scan can run.
+    session.setRateLimited(null);
 
     resolveExitFuture();
   }

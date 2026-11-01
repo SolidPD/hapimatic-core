@@ -4,6 +4,7 @@ import { defineCapability } from "@hapi/protocol";
 import {
   FeedbackRequestSchema,
   FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES,
+  FEEDBACK_MAX_REQUEST_BYTES,
 } from "@hapi/protocol/schemas";
 import type {
   FeedbackAttachment,
@@ -27,6 +28,7 @@ import {
   createSinkForwardKick,
   type FeedbackSinkConfig,
 } from "../../feedback/sinkForward";
+import type { ErrorLogger } from "../../logging/errorLogger";
 
 /**
  * Deep-scrub every string leaf of the composed metadata (R4 defense-in-depth).
@@ -51,6 +53,38 @@ function scrubMetadata(metadata: FeedbackMetadata): FeedbackMetadata {
   return scrubDeep(metadata) as FeedbackMetadata;
 }
 
+/**
+ * The request body as UTF-8 text, or `null` once more than `maxBytes` have
+ * arrived (issue #2951 L2). It pulls the body stream one chunk at a time and
+ * cancels it at the cap, so the read holds at most the cap plus one chunk (the
+ * final concat and decode briefly copy it); `c.req.text()` or `c.req.json()`
+ * would buffer a chunked body of any size
+ * before its length could be checked. Same shape as the gateway's
+ * `readCappedText` (`gateway/src/lib/readCappedBody.ts`, #5744). A request with
+ * no body reads as `""`.
+ */
+async function readCappedText(
+  raw: Request,
+  maxBytes: number
+): Promise<string | null> {
+  const stream = raw.body;
+  if (!stream) return "";
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
 export interface PersistAndSendInput {
   namespace: string;
   category: FeedbackEntryCategory;
@@ -68,6 +102,31 @@ export interface PersistAndSendResult {
   delivery: "sent" | "skipped" | "error";
 }
 
+export interface PersistAndSendOptions {
+  /**
+   * Raises a failed send as a centralized `feedback-email` error (issue #2952):
+   * an `error_logs` row, and a Sentry event where the server runs with a DSN.
+   * Absent or null keeps the plain `console.error`.
+   */
+  errorLogger?: ErrorLogger | null;
+}
+
+/**
+ * The Sentry-facing message for a failed send. It carries only the transport
+ * and the HTTP status, never the row id or the transport's response text, so
+ * a sustained outage groups into one Sentry issue (the server client groups
+ * by message). The full error stays in the row and the `error_logs` context.
+ */
+export function feedbackEmailFailureMessage(
+  transport: FeedbackSenderConfig["transport"],
+  error: string
+): string {
+  const status = error.match(/HTTP (\d{3})/)?.[1];
+  return status
+    ? `feedback email send failed (${transport}, HTTP ${status})`
+    : `feedback email send failed (${transport}, threw)`;
+}
+
 /**
  * The feedback pipeline's persist-then-send core (R7, R10), shared by
  * `POST /api/feedback` and the support escalation (`routes/support.ts`, issue
@@ -78,7 +137,8 @@ export interface PersistAndSendResult {
 export async function persistAndSendFeedback(
   store: Store,
   senderConfig: FeedbackSenderConfig,
-  input: PersistAndSendInput
+  input: PersistAndSendInput,
+  options: PersistAndSendOptions = {}
 ): Promise<PersistAndSendResult> {
   const attachmentRefs = input.attachments.map(att => ({
     filename: att.filename,
@@ -110,19 +170,71 @@ export async function persistAndSendFeedback(
     metadata: input.metadata,
     attachments: input.attachments.length > 0 ? input.attachments : undefined,
   };
-  const email = buildFeedbackEmail(emailInput);
-  const result = await sendFeedbackEmail(senderConfig, email, emailInput);
-  if (result.status === "sent") {
-    store.feedback.updateEmailStatus(entry.id, true, null);
-  } else if (result.status === "error") {
-    console.error(
-      `[feedback] email send failed for ${entry.id}: ${result.error}`
-    );
-    store.feedback.updateEmailStatus(entry.id, false, result.error);
-  } else {
-    console.log(`[feedback] email skipped for ${entry.id}: ${result.reason}`);
+  // Issue #2951 F3: everything after the persist is caught here. The row is
+  // already saved, so a throw from the email build, the send, or an
+  // `updateEmailStatus` write must not reach the caller: a 500 for a saved
+  // submission makes the user retry and store the same feedback twice. The
+  // catch never writes to the store (the store may be what failed), and the
+  // row keeps `emailed = 0`. `delivery` reports the send outcome even when the
+  // status write after it is what threw.
+  let delivery: PersistAndSendResult["delivery"] = "error";
+  try {
+    const email = buildFeedbackEmail(emailInput);
+    const result = await sendFeedbackEmail(senderConfig, email, emailInput);
+    delivery = result.status;
+    if (result.status === "sent") {
+      store.feedback.updateEmailStatus(entry.id, true, null);
+    } else if (result.status === "error") {
+      // Issue #2952: raise the alert BEFORE the status write, so a status-write
+      // fault can never skip it (the K6 contract with #2951).
+      if (options.errorLogger) {
+        options.errorLogger.error(
+          feedbackEmailFailureMessage(senderConfig.transport, result.error),
+          {
+            category: "feedback-email",
+            namespace: input.namespace,
+            context: { feedbackId: entry.id, error: result.error },
+          }
+        );
+      } else {
+        console.error(
+          `[feedback] email send failed for ${entry.id}: ${result.error}`
+        );
+      }
+      store.feedback.updateEmailStatus(entry.id, false, result.error);
+    } else {
+      console.log(`[feedback] email skipped for ${entry.id}: ${result.reason}`);
+    }
+  } catch (e) {
+    // Issue #6015 S2: the tail throw reaches Sentry through ErrorLogger, with
+    // `persist: false` because `error_logs` shares the SQLite connection that
+    // may have just failed (the #3631 busy_timeout class). The message carries
+    // only the transport and the send outcome, so it groups in Sentry; the
+    // Error's stack and the row id ride in the stack and context. Without a
+    // logger, the journal line keeps the Error itself, so it keeps its stack.
+    if (options.errorLogger) {
+      options.errorLogger.error(
+        `feedback post-persist tail failed (${senderConfig.transport}, send outcome: ${delivery})`,
+        {
+          category: "feedback-email",
+          namespace: input.namespace,
+          stack: e instanceof Error ? (e.stack ?? null) : null,
+          context: {
+            feedbackId: entry.id,
+            delivery,
+            error: e instanceof Error ? e.message : String(e),
+          },
+          persist: false,
+        }
+      );
+    } else {
+      console.error(
+        `[feedback] post-persist tail failed for ${entry.id} (send outcome: ${delivery}):`,
+        e
+      );
+    }
   }
-  return { id: entry.id, delivery: result.status };
+  return { id: entry.id, delivery };
 }
 
 /** Options for {@link createFeedbackRoutes} (issue #2910 K2 contract). */
@@ -141,6 +253,11 @@ export interface FeedbackRoutesOptions {
    * the reconciler.
    */
   sinkConfig?: FeedbackSinkConfig | null;
+  /**
+   * Raises a failed feedback email as a centralized `feedback-email` error
+   * (issue #2952). Absent or null keeps the plain `console.error`.
+   */
+  errorLogger?: ErrorLogger | null;
 }
 
 /**
@@ -200,7 +317,36 @@ export function createFeedbackRoutes(
     async c => {
       const namespace = c.get("namespace");
 
-      const json = await c.req.json().catch(() => null);
+      // Issue #2951 L2: refuse an over-cap body before it is buffered or parsed.
+      // The Content-Length check turns away an honest oversize upload at once;
+      // the capped read covers a chunked body or a lying header by counting the
+      // bytes as they arrive and cancelling the stream past the cap.
+      const declaredLength = Number(c.req.header("content-length") ?? "0");
+      if (
+        Number.isFinite(declaredLength) &&
+        declaredLength > FEEDBACK_MAX_REQUEST_BYTES
+      ) {
+        return c.json({ error: "Payload too large" }, 413);
+      }
+      let raw: string | null;
+      try {
+        raw = await readCappedText(c.req.raw, FEEDBACK_MAX_REQUEST_BYTES);
+      } catch (e) {
+        // A body stream that errors (the client dropped mid-upload) is
+        // malformed, as it was under `c.req.json().catch(() => null)`: a 400.
+        // Logged, so a server-side read fault is not mistaken for bad input.
+        console.warn("[feedback] request body read failed:", e);
+        raw = "";
+      }
+      if (raw === null) {
+        return c.json({ error: "Payload too large" }, 413);
+      }
+      let json: unknown = null;
+      try {
+        json = JSON.parse(raw);
+      } catch {
+        json = null;
+      }
       const parsed = FeedbackRequestSchema.safeParse(json);
       if (!parsed.success) {
         return c.json(
@@ -254,14 +400,19 @@ export function createFeedbackRoutes(
         });
       }
 
-      const { id } = await persistAndSendFeedback(store, senderConfig, {
-        namespace,
-        category: data.category,
-        description,
-        submitterEmail: data.submitterEmail ?? null,
-        metadata,
-        attachments: emailAttachments,
-      });
+      const { id } = await persistAndSendFeedback(
+        store,
+        senderConfig,
+        {
+          namespace,
+          category: data.category,
+          description,
+          submitterEmail: data.submitterEmail ?? null,
+          metadata,
+          attachments: emailAttachments,
+        },
+        { errorLogger: options.errorLogger }
+      );
       void kickSinkForward(id);
 
       return c.json({ id }, 201);

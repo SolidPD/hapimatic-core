@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { spawn as nodeSpawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { Hono } from "hono";
@@ -133,6 +133,11 @@ export interface UpdateRoutesOptions {
   /** Cache TTL in ms (default 5 min). */
   cacheTtlMs?: number;
   /**
+   * How long `POST /update-check` answers 409 `check_busy` after a launch
+   * (default 15 s, issue #3277). Tests pass 0 to re-launch at once.
+   */
+  checkCooldownMs?: number;
+  /**
    * Session source for `sessionImpact` (issue #2589). Late-bound getter, like the
    * sibling routes. When absent/null the `sessionImpact` field is omitted (R6).
    */
@@ -145,6 +150,16 @@ export interface UpdateRoutesOptions {
 }
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * `POST /update-check` single-flight window (issue #3277). `launchUpdater` resolves
+ * when `systemd-run` exits, while the transient unit keeps running the `oci` fetch,
+ * so the latch is held for a fixed window after launch rather than until the
+ * check finishes. `--check-only` runs before the script's `acquire_lock` and
+ * `fetch_marker` writes the marker with a plain `printf >`, so overlapping checks
+ * must not run.
+ */
+const DEFAULT_CHECK_COOLDOWN_MS = 15 * 1000;
 
 /**
  * Compare two versions using the repo grammar `^(\d+)\.(\d+)\.(\d+)(-[A-Z]{1,2})?$`.
@@ -277,9 +292,13 @@ export function resolveLauncherConfig(
  * Which phase of the split updater to run (issue #3057). `stage` obtains + verifies
  * the staged binary and writes `ready` (no swap); `apply` re-verifies the staged
  * binary and does the destructive swap/restart/health-check; `combined` is the
- * legacy single-shot fetch-and-apply retained for manual callers.
+ * legacy single-shot fetch-and-apply retained for manual callers. `check` (issue
+ * #3277) runs `--check-only` on demand: it fetches the bucket marker, advances the
+ * LOCAL marker and busts this server's `/update-status` cache, like the 6-hourly
+ * timer tick (the audit log records its trigger as `api`, not `timer-check`). It
+ * writes no job state.
  */
-export type UpdaterAction = "stage" | "apply" | "combined";
+export type UpdaterAction = "stage" | "apply" | "combined" | "check";
 
 /**
  * Launch update-hapimatic.sh as a transient systemd --user unit (issue #1006;
@@ -329,7 +348,9 @@ export async function launchUpdater(
       ? ["--stage-only"]
       : action === "apply"
         ? ["--apply-only"]
-        : [];
+        : action === "check"
+          ? ["--check-only"]
+          : [];
 
   const args = [
     "--user",
@@ -499,6 +520,7 @@ export function createUpdateRoutes(
     app.use("/update-stage", authMiddleware);
     app.use("/update-trigger", authMiddleware);
     app.use("/update-cancel-deferral", authMiddleware);
+    app.use("/update-check", authMiddleware);
   }
 
   // POST /update-stage — JWT-required (#3057 R2). Idempotently launches the
@@ -553,6 +575,72 @@ export function createUpdateRoutes(
         return c.json({ error: "launch_failed", exitCode }, 500);
       }
       return c.json({ accepted: true, phase: "staging", jobId: unit }, 202);
+    }
+  );
+
+  // POST /update-check — JWT-required (#3277 R4). The app's Refresh button asks for
+  // an on-demand bucket check: launch `--check-only` (the 6-hourly timer's mode)
+  // through THIS instance's launcher config, so the script's `?refresh=true` curl
+  // busts this server's cache (the timer unit only knows the primary instance).
+  // The check runs only where the updater script exists (the data dir's
+  // update-hapimatic.sh, or HAPI_UPDATE_SCRIPT_PATH), which is the primary; any
+  // other instance gets 501 check_unavailable rather than a 202 for a unit that
+  // would die at once. When the bucket offers a newer updater script, the
+  // script's #3234 self-heal rewrites the auto-update service unit's ExecStart
+  // with this caller's --data-dir/--port, the primary's own. A 202 is launch
+  // acceptance; the client re-reads /update-status a few seconds later. Closure
+  // state, not module state, so each createUpdateRoutes() call (each test)
+  // starts unlatched.
+  const checkCooldownMs = opts.checkCooldownMs ?? DEFAULT_CHECK_COOLDOWN_MS;
+  let checkInFlight = false;
+  let checkLatchedUntil = 0;
+  app.post(
+    "/update-check",
+    cataloged(
+      defineCapability({
+        id: "harness-admin.update-check",
+        domain: "harness-admin",
+        surface: "rest",
+        description:
+          "Check the update bucket for a newer harness version now, instead of waiting for the 6-hourly timer.",
+        whenToUse:
+          "When a user refreshes the app and wants a pending harness update to surface at once.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/update-check",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    async c => {
+      // No script here (a worktree, dev or non-cloud instance): systemd-run would
+      // still exit 0 and the unit would die at once, so say so instead of 202.
+      // No latch is set, so the answer tracks the file on every request.
+      if (!existsSync(launcherCfg.scriptPath)) {
+        return c.json({ error: "check_unavailable" }, 501);
+      }
+      if (checkInFlight || Date.now() < checkLatchedUntil) {
+        return c.json({ error: "check_busy" }, 409);
+      }
+      checkInFlight = true;
+      try {
+        const { ok, exitCode } = await launchUpdater(
+          launcherCfg,
+          "check",
+          `hapi-update-check-${Math.random().toString(36).slice(2, 8)}`
+        );
+        if (!ok) {
+          // No unit is running, so nothing to latch: a retry may launch at once.
+          return c.json({ error: "launch_failed", exitCode }, 500);
+        }
+        checkLatchedUntil = Date.now() + checkCooldownMs;
+        return c.json({ accepted: true }, 202);
+      } finally {
+        checkInFlight = false;
+      }
     }
   );
 

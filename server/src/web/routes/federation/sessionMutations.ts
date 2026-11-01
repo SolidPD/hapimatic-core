@@ -16,6 +16,13 @@ import { getKnownSecretLiterals } from "../../../services/knownSecretLiterals";
 import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
 import { checkCallerNamespace, checkFederationToken } from "./shared";
+import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
+import {
+  ACCOUNT_EXHAUSTED_CODE,
+  checkAccountHeadroom,
+  headroomWarnings,
+  sessionModelFamily,
+} from "../../../accounts/accountHeadroom";
 import { cataloged } from "../../../capabilities/cataloged";
 import { logAndJson } from "../routeErrorHelper";
 import { runCapabilityInvoke } from "../capabilityPolicy";
@@ -61,6 +68,8 @@ export function createSessionMutationRoutes(
 
   const federationAccountSchema = z.object({
     accountUuid: z.string(),
+    // Issue #5879: the hub forwards the caller's override of the headroom check.
+    forceAccount: z.boolean().optional(),
   });
 
   // ─── Node-to-node endpoint: PATCH /federation/sessions/:id (rename) ─
@@ -723,6 +732,34 @@ export function createSessionMutationRoutes(
         );
       }
 
+      // Issue #5879: THIS node owns the session and holds the account, so it
+      // decides headroom — before the kill, so a refusal leaves the session as is.
+      const verdict = await checkAccountHeadroom(
+        {
+          usageService: deps.getUsageService?.() ?? null,
+          accountService: deps.getAccountService(),
+          nodeIdentity: resolveLocalNodeIdentity(deps.federationConfig),
+          errorLogger: deps.errorLogger ?? null,
+        },
+        {
+          accountUuid: parsed.data.accountUuid,
+          modelFamily: sessionModelFamily(session),
+          forceAccount: parsed.data.forceAccount === true,
+        }
+      );
+      if (verdict.kind === "exhausted" && !verdict.forced) {
+        return c.json(
+          {
+            ok: false,
+            error: verdict.message,
+            code: ACCOUNT_EXHAUSTED_CODE,
+            exhaustion: verdict.exhaustion,
+          },
+          409
+        );
+      }
+      const rebindWarnings = headroomWarnings(verdict);
+
       try {
         const result = await engine.switchAccount(
           sessionId,
@@ -743,6 +780,9 @@ export function createSessionMutationRoutes(
               accountUuid: result.accountUuid,
               claudeAccount: result.claudeAccount,
               authBinding: result.authBinding,
+              ...(rebindWarnings.length > 0
+                ? { warnings: rebindWarnings }
+                : {}),
             },
             200
           );

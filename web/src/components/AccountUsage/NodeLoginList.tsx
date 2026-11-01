@@ -5,13 +5,17 @@ import {
   LOCAL_NODE_ID,
   type AccountHealthEntry,
   type NodeAccountHealth,
+  type NodeProviderAuthState,
   type OpenAiAuthState,
 } from "@hapi/protocol";
-import { ApiError, NetworkError, type ApiClient } from "@/api/client";
+import {
+  ApiError,
+  NetworkError,
+  RequestTimeoutError,
+  type ApiClient,
+} from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { ChevronIcon } from "@/components/icons";
-import { NodeBadge } from "@/components/NodeBadge";
-import { AccountChip } from "@/components/session/AccountChip";
 import { AddAccountInstructions } from "@/components/AddAccountInstructions";
 import {
   useAccountLogin,
@@ -20,14 +24,17 @@ import {
 import { useOpenAiLogin } from "@/hooks/mutations/useOpenAiLogin";
 import { useAccountHealth } from "@/hooks/queries/useAccountHealth";
 import { useProviderAuthState } from "@/hooks/queries/useProviderAuthState";
-import { useFederationHealthAvailable } from "@/hooks/queries/useFederationHealthAvailable";
+import {
+  useFederationHealthAvailable,
+  useFederationNodesInfo,
+} from "@/hooks/queries/useFederationHealthAvailable";
 import { queryKeys } from "@/lib/query-keys";
 import {
   IN_VM_SIGN_IN_REQUIRED,
   type InVmLoginStartResponse,
   type OpenAiLoginState,
 } from "@/types/api";
-import { formatRefreshUtc, formatSince } from "./addModalDone";
+import { NodeRow, useIsCompact } from "./NodeLoginRow";
 
 const INPUT_CLASS =
   "w-full rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] px-3 py-2 text-[var(--app-fg)] focus:outline-none focus:ring-2 focus:ring-[var(--app-link)]";
@@ -36,6 +43,13 @@ const INPUT_CLASS =
 export const IN_VM_CHECK_INTERVAL_MS = 4000;
 /** The Codex device-auth status poll (unchanged from #3807's wizard). */
 export const DEVICE_POLL_INTERVAL_MS = 3000;
+/**
+ * #5871: OpenAI's own Linux/macOS installer for the Codex CLI. It places a
+ * standalone `codex` in `~/.local/bin`, which the server's Codex login finds
+ * without a PATH change or a restart.
+ */
+export const CODEX_INSTALL_COMMAND =
+  "curl -fsSL https://chatgpt.com/codex/install.sh | sh";
 
 /**
  * Local pre-check (#3452): a digits-only paste is the shape of the 6-digit
@@ -49,12 +63,15 @@ export const NOT_AN_AUTHORIZATION_CODE_HINT =
   "platform.claude.com page and paste that here (the whole thing, including " +
   "the part after #).";
 
-/** Issue #4349: a failed check that should not end the wait (rate limit, server error, network). */
+/** Issue #4349: a failed check that should not end the wait (rate limit,
+ *  server error, network, or the request's own timeout — #5467 S2: one slow
+ *  answer must not end a sign-in that may still finish). */
 export function isTransientCheckError(err: unknown): boolean {
   if (err instanceof ApiError) return err.status === 429 || err.status >= 500;
   return (
     !(err instanceof Error) ||
     err instanceof NetworkError || // #5409: ApiClient tags fetch failures
+    err instanceof RequestTimeoutError ||
     err.name === "TypeError"
   );
 }
@@ -65,6 +82,22 @@ function errCode(err: unknown): string | undefined {
 
 function errMessage(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback;
+}
+
+/** #6054 SINK-1: Done's failure line for a code exchange whose node the user
+ *  left while it ran. The node change discarded the link, so no line asks for
+ *  the code again; each names the node the code was sent to. */
+function leftNodeDoneError(err: unknown, nodeName: string): string {
+  const c = errCode(err);
+  const text =
+    c === "invalid_code"
+      ? "that code was not accepted · open a new link there"
+      : c === "login_session_lost"
+        ? "the sign-in expired or the node restarted · open a new link there"
+        : c === "login_outcome_unknown" || c === undefined
+          ? "no answer · check its accounts before retrying"
+          : `${errMessage(err, "Login failed.")} · open a new link there`;
+  return `${nodeName}: ${text}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +113,15 @@ export type LoginNode = {
   disabledReason: string | null;
   accounts: AccountHealthEntry[];
   openai: OpenAiAuthState[];
+  /** #5467 S10: the provider-auth row's status for this node; "error" when the
+   *  whole envelope read failed, "loading" while the read has not answered yet
+   *  (#6054 SINK-2), undefined when it answered with no row for the node or
+   *  when no read runs (the Anthropic tab). A non-ok status means `openai` is
+   *  unknown, not empty. */
+  openaiStatus?: NodeProviderAuthState["status"] | "loading";
+  /** #5467 S6: the node's federation role, when federation is on: the UI
+   *  host's own role, or the role the UI host's registry polled for a peer. */
+  role?: "hub" | "node" | "peer";
 };
 
 /**
@@ -107,7 +149,11 @@ export function nodeDisabledReason(
 /**
  * The node rows for the modal: every federation node from #4461's per-node
  * health read (the UI host first, as the server emits it), with the OpenAI
- * logins from the provider-auth envelope joined in by node id.
+ * logins from the provider-auth envelope joined in by node id — and that row's
+ * status, so a failed read is never shown as an empty list (#5467 S10). The
+ * role comes from `GET /api/federation/nodes`, which the modal already reads:
+ * the UI host's is the top-level `role`, a peer's is its polled `info.role`,
+ * keyed by `config.id` (the health envelope's node id) (#5467 S6).
  */
 export function useLoginNodes(
   api: ApiClient | null,
@@ -122,23 +168,59 @@ export function useLoginNodes(
 } {
   const health = useAccountHealth(api, enabled);
   const authState = useProviderAuthState(api, enabled && provider === "openai");
+  const { data: federation } = useFederationNodesInfo(api);
   const currentNodeId = health.localNodeId ?? LOCAL_NODE_ID;
+  // A failed envelope read with no cached data leaves every node's logins
+  // unknown, so each row shows the degraded line rather than an empty list.
+  const envelopeFailed =
+    provider === "openai" &&
+    authState.error !== null &&
+    authState.nodes.length === 0;
+  // #6054 SINK-2: no answer yet (loading, or a first fetch paused offline), so
+  // the logins are unknown, not zero.
+  const envelopeLoading = provider === "openai" && authState.awaitingAnswer;
   const nodes = useMemo(() => {
-    const openaiByNode = new Map<string, OpenAiAuthState[]>();
-    for (const n of authState.nodes) openaiByNode.set(n.nodeId, n.openai);
-    return health.nodes.map(n => ({
-      nodeId: n.nodeId,
-      nodeLabel: n.nodeLabel || n.nodeId,
-      isUiHost:
-        n.isLocal || n.nodeId === currentNodeId || n.nodeId === LOCAL_NODE_ID,
-      status: n.status,
-      disabledReason: nodeDisabledReason(n, provider),
-      accounts: n.accounts.filter(a => a.provider === provider),
-      openai:
-        openaiByNode.get(n.nodeId) ??
-        (n.isLocal ? (openaiByNode.get(LOCAL_NODE_ID) ?? []) : []),
-    }));
-  }, [health.nodes, authState.nodes, currentNodeId, provider]);
+    const authByNode = new Map<string, NodeProviderAuthState>();
+    for (const n of authState.nodes) authByNode.set(n.nodeId, n);
+    const peerRoles = new Map<string, LoginNode["role"]>();
+    if (federation?.enabled) {
+      for (const s of federation.nodes) {
+        if (s.info?.role) peerRoles.set(s.config.id, s.info.role);
+      }
+    }
+    return health.nodes.map((n): LoginNode => {
+      const isUiHost =
+        n.isLocal || n.nodeId === currentNodeId || n.nodeId === LOCAL_NODE_ID;
+      const auth =
+        authByNode.get(n.nodeId) ??
+        (n.isLocal ? authByNode.get(LOCAL_NODE_ID) : undefined);
+      return {
+        nodeId: n.nodeId,
+        nodeLabel: n.nodeLabel || n.nodeId,
+        isUiHost,
+        status: n.status,
+        disabledReason: nodeDisabledReason(n, provider),
+        accounts: n.accounts.filter(a => a.provider === provider),
+        openai: auth?.openai ?? [],
+        openaiStatus:
+          auth?.status ??
+          (envelopeFailed ? "error" : envelopeLoading ? "loading" : undefined),
+        role: !federation?.enabled
+          ? undefined
+          : isUiHost
+            ? federation.role
+            : peerRoles.get(n.nodeId),
+      };
+    });
+  }, [
+    health.nodes,
+    authState.nodes,
+    envelopeFailed,
+    envelopeLoading,
+    currentNodeId,
+    provider,
+    federation,
+  ]);
   return {
     nodes,
     currentNodeId,
@@ -190,6 +272,18 @@ export function useAnthropicLoginStep(
   const [inVm, setInVm] = useState<InVmLoginStartResponse | null>(null);
   const [inVmChecking, setInVmChecking] = useState(false);
   const [saved, setSaved] = useState(0);
+  // #6054 SINK-1: `saved` counts every add, for the footer's "N saved"; the
+  // "Account added" line counts only adds on the node selected now, made since
+  // it was picked: a node change resets it.
+  const [savedHere, setSavedHere] = useState(0);
+  // #6054 SINK-1: Done's failure line for a code exchange whose node the user
+  // left while it ran, named for that node. A node change clears it, and so
+  // does a new sign-in started on that node, as `begin` clears that node's own
+  // error line.
+  const [leftNodeError, setLeftNodeError] = useState<{
+    nodeId: string | null;
+    text: string;
+  } | null>(null);
   // Bumped on every start and every node change: a start that resolves after the
   // node changed (or the modal closed) belongs to a discarded attempt (TR1-e).
   const attemptRef = useRef(0);
@@ -210,11 +304,16 @@ export function useAnthropicLoginStep(
   // R4: a node change discards the started login. The in-VM sign-in is only
   // forgotten locally — the server keeps it resumable (#4349 CR-1).
   const nodeKey = node?.nodeId ?? null;
+  // #6054: the node picked now, read after an await to place a success line.
+  const nodeKeyRef = useRef(nodeKey);
+  nodeKeyRef.current = nodeKey;
   useEffect(() => {
     attemptRef.current += 1;
     clearLink();
     setError(null);
     setInVm(null);
+    setSavedHere(0);
+    setLeftNodeError(null);
     inVmRegisteredRef.current = false;
     inVmStoppedRef.current = false;
   }, [nodeKey, clearLink]);
@@ -227,12 +326,25 @@ export function useAnthropicLoginStep(
   const begin = useCallback(async () => {
     const attempt = ++attemptRef.current;
     setError(null);
+    setLeftNodeError(prev =>
+      prev && prev.nodeId === nodeKeyRef.current ? null : prev
+    );
     clearLink();
     // #4349: Start over forgets the previous in-VM sign-in. Await the cancel: the
     // server resumes an unfinished sign-in, so a start sent first would resume
-    // the one being cancelled.
-    if (inVm && !inVmRegisteredRef.current)
-      await inVmLoginRef.current.cancel(inVm.loginToken);
+    // the one being cancelled. #6028: for the same reason a FAILED cancel must
+    // not fall through to a start — stop and say so, keeping the old sign-in.
+    if (inVm && !inVmRegisteredRef.current) {
+      try {
+        await inVmLoginRef.current.cancel(inVm.loginToken);
+      } catch (err) {
+        if (attempt !== attemptRef.current) return;
+        setError(
+          `The previous sign-in could not be cancelled, so a new one was not started (${errMessage(err, "unknown error")}). Try Start over again.`
+        );
+        return;
+      }
+    }
     if (attempt !== attemptRef.current) return;
     setInVm(null);
     inVmRegisteredRef.current = false;
@@ -280,16 +392,29 @@ export function useAnthropicLoginStep(
     // A check still in flight when Start over runs belongs to the old sign-in;
     // its answer must not land on the new one.
     const attempt = attemptRef.current;
+    const sentTo = nodeKeyRef.current;
     inVmInFlightRef.current = true;
     setInVmChecking(true);
     try {
       const account = await inVmLoginRef.current.check(token);
-      if (attempt !== attemptRef.current) return;
+      if (attempt !== attemptRef.current) {
+        // #5467 S8: the answer belongs to a discarded attempt, so it must not
+        // land on the new one — but an account it found WAS added, so count it
+        // and refresh the page rather than hide it.
+        if (account) {
+          setSaved(s => s + 1);
+          // #6054: its line shows only on the node it was added on.
+          if (nodeKeyRef.current === sentTo) setSavedHere(s => s + 1);
+          onAddedRef.current();
+        }
+        return;
+      }
       if (account && !inVmRegisteredRef.current) {
         inVmRegisteredRef.current = true;
         // A Done pressed before /login finished left "not finished" on screen.
         setError(null);
         setSaved(s => s + 1);
+        setSavedHere(s => s + 1);
         setInVm(null);
         onAddedRef.current();
       }
@@ -342,13 +467,35 @@ export function useAnthropicLoginStep(
       setHint(NOT_AN_AUTHORIZATION_CODE_HINT);
       return 1;
     }
+    // #6054 SINK-1: the node radios stay enabled while Done runs (#5467 D9), so
+    // the answer can arrive after a node change. The token alone routes the
+    // exchange, so it belongs to the node it was sent to, never the new one.
+    const attempt = attemptRef.current;
+    const sentTo = nodeKeyRef.current;
     try {
       await complete({ loginToken, code: trimmed });
+      if (attempt !== attemptRef.current) {
+        // The account WAS added on the node the code was sent to: count it
+        // and refresh the page (as checkInVm's stale branch does, #5467 S8).
+        // Its line shows only if that node is picked again by now.
+        setSaved(s => s + 1);
+        if (nodeKeyRef.current === sentTo) setSavedHere(s => s + 1);
+        onAddedRef.current();
+        return 0;
+      }
       clearLink();
       setSaved(s => s + 1);
+      setSavedHere(s => s + 1);
       onAddedRef.current();
       return 0;
     } catch (err) {
+      if (attempt !== attemptRef.current) {
+        setLeftNodeError({
+          nodeId: sentTo,
+          text: leftNodeDoneError(err, nodeName),
+        });
+        return 1;
+      }
       const c = errCode(err);
       if (c === "invalid_code") {
         setError(
@@ -374,6 +521,12 @@ export function useAnthropicLoginStep(
   }, [clearLink, code, complete, error, inVm, loginToken, nodeName]);
 
   const pending = Boolean(inVm && !inVmRegisteredRef.current);
+  // #5467 S12: the problem lines this step shows now. The modal's banner counts
+  // these live, so a line that clears (a node change, a new link, a finished
+  // sign-in) leaves the count at once.
+  const problemCount =
+    (error !== null || hint !== null ? 1 : 0) +
+    (leftNodeError !== null ? 1 : 0);
   return {
     loginToken,
     authorizeUrl,
@@ -381,6 +534,8 @@ export function useAnthropicLoginStep(
     setCode,
     error,
     hint,
+    leftNodeError,
+    problemCount,
     inVm,
     inVmChecking,
     isStarting,
@@ -389,6 +544,7 @@ export function useAnthropicLoginStep(
     checkInVm,
     runDone,
     saved,
+    savedHere,
     pending,
   };
 }
@@ -433,7 +589,22 @@ export function useOpenAiLoginStep(
   const [codexKey, setCodexKey] = useState("");
   const [codexError, setCodexError] = useState<string | null>(null);
   const [codexBusy, setCodexBusy] = useState(false);
+  // #5871: the node answered that it has no Codex CLI — shown once for both
+  // paths, in place of their generic failure lines.
+  const [codexMissing, setCodexMissing] = useState(false);
+  // #5467 S11: an API-key answer for a node the user has left, shown under that
+  // node's name. Its own state, so the new node's resets (a not-installed
+  // answer, a new key attempt) never wipe a line Done may still count; only the
+  // next node change clears it.
+  const [leftNodeError, setLeftNodeError] = useState<{
+    nodeId: string;
+    text: string;
+  } | null>(null);
   const [saved, setSaved] = useState(0);
+  // #6054: the "Login added" line counts only logins added on the node selected
+  // now, since it was picked (the Anthropic step's rule); `saved` keeps every
+  // add for the footer.
+  const [savedHere, setSavedHere] = useState(0);
   const tokenRef = useRef<{ nodeId: string; token: string } | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Set once the loop has stopped (settled, cancelled, node changed, unmounted):
@@ -469,7 +640,10 @@ export function useOpenAiLoginStep(
       tokenRef.current = null;
       if (state === "ok") {
         void loginRef.current.invalidateAuthState();
+        // A node change cancels device auth, so its success is always for the
+        // node selected now.
         setSaved(s => s + 1);
+        setSavedHere(s => s + 1);
         setDevice({ kind: "done" });
         onAddedRef.current();
       } else if (state === "disabled" || state === "unsupported") {
@@ -494,11 +668,14 @@ export function useOpenAiLoginStep(
       const res = await loginRef.current.status(t.nodeId, t.token);
       if (stoppedRef.current || tokenRef.current !== t) return;
       if (res.state === "pending") {
-        setDevice({
+        // #5467 S14: keep the flag Done set, or "ChatGPT sign-in not finished"
+        // disappears at the next poll while Done still counts it.
+        setDevice(d => ({
           kind: "pending",
           verificationUrl: res.verificationUrl,
           userCode: res.userCode,
-        });
+          ...(d.kind === "pending" && d.unfinished ? { unfinished: true } : {}),
+        }));
         timerRef.current = setTimeout(
           () => void poll(),
           DEVICE_POLL_INTERVAL_MS
@@ -506,18 +683,33 @@ export function useOpenAiLoginStep(
         return;
       }
       settle(res.state);
-    } catch {
-      // A transient status error should not abort the flow — keep polling.
+    } catch (err) {
       if (stoppedRef.current || tokenRef.current !== t) return;
-      timerRef.current = setTimeout(() => void poll(), DEVICE_POLL_INTERVAL_MS);
+      // A rate limit, a server error, a dropped connection or a timeout is
+      // not an answer: keep polling.
+      if (isTransientCheckError(err)) {
+        timerRef.current = setTimeout(
+          () => void poll(),
+          DEVICE_POLL_INTERVAL_MS
+        );
+        return;
+      }
+      // #5467 S2: an error that will not clear (an expired session, a 4xx)
+      // would retry forever. Stop, cancel the attempt, and say why.
+      cancelPending();
+      setDevice({
+        kind: "failed",
+        message: errMessage(err, "Could not check the ChatGPT sign-in."),
+      });
     }
-  }, [settle]);
+  }, [cancelPending, settle]);
 
   const beginDevice = useCallback(async () => {
     cancelPending();
     stoppedRef.current = false;
     const attempt = deviceAttemptRef.current;
     setDevice({ kind: "pending" });
+    setCodexMissing(false);
     const target = nodeId;
     try {
       const res = await loginRef.current.start.mutateAsync({
@@ -531,13 +723,23 @@ export function useOpenAiLoginStep(
           .catch(() => undefined);
         return;
       }
+      if (res.state === "failed" && res.reason === "codex-not-installed") {
+        stop();
+        setDevice({ kind: "idle" });
+        // The notice stands in for the API-key path's failure line as well.
+        setCodexError(null);
+        setCodexMissing(true);
+        return;
+      }
       tokenRef.current = { nodeId: target, token: res.loginToken };
       if (res.state === "pending") {
-        setDevice({
+        // #5467 S14: Done can run while the start is in flight; keep its flag.
+        setDevice(d => ({
           kind: "pending",
           verificationUrl: res.verificationUrl,
           userCode: res.userCode,
-        });
+          ...(d.kind === "pending" && d.unfinished ? { unfinished: true } : {}),
+        }));
         timerRef.current = setTimeout(
           () => void poll(),
           DEVICE_POLL_INTERVAL_MS
@@ -555,11 +757,15 @@ export function useOpenAiLoginStep(
     }
   }, [cancelPending, nodeId, poll, settle, stop]);
 
-  // A node change drops the started device-auth (R4).
+  // A node change drops the started device-auth (R4), and every line shown for
+  // the previous node, the left-node line included (#5467 S11).
   useEffect(() => {
     cancelPending();
     setDevice({ kind: "idle" });
     setCodexError(null);
+    setCodexMissing(false);
+    setLeftNodeError(null);
+    setSavedHere(0);
   }, [nodeId, cancelPending]);
 
   // Closing the modal cancels a pending device-auth (R8); unmount does too.
@@ -572,13 +778,24 @@ export function useOpenAiLoginStep(
    *  A call while one is in flight shares it, so Done never sends the key a
    *  second time. */
   const codexInflightRef = useRef<Promise<boolean> | null>(null);
+  // #5871: the node picked now. An answer for a node the user has since left
+  // is shown under that node's name, never as the new node's notice.
+  const nodeIdRef = useRef(nodeId);
+  nodeIdRef.current = nodeId;
+  const nodeLabel = node?.nodeLabel ?? "This node";
   const runCodexKey = useCallback((): Promise<boolean> => {
     if (codexInflightRef.current) return codexInflightRef.current;
     const key = codexKey.trim();
     if (!key) return Promise.resolve(true);
+    const label = nodeLabel;
+    // #5467 S11: an answer for a node the user has left is shown under that
+    // node's name, in its own state, so the new node's resets keep it.
+    const showLeft = (text: string) =>
+      setLeftNodeError({ nodeId, text: `${label}: ${text}` });
     const run = (async (): Promise<boolean> => {
       setCodexBusy(true);
       setCodexError(null);
+      setCodexMissing(false);
       try {
         const res = await loginRef.current.start.mutateAsync({
           nodeId,
@@ -589,18 +806,40 @@ export function useOpenAiLoginStep(
         setCodexKey(""); // never keep the raw key around
         if (res.state === "ok") {
           setSaved(s => s + 1);
+          // #6054: a login added on a node the user has since left counts,
+          // but shows no line under the new node.
+          if (nodeIdRef.current === nodeId) setSavedHere(s => s + 1);
           onAddedRef.current();
           return true;
         }
-        setCodexError(
+        // If the node changed while the login ran, the node-change effect has
+        // cleared what the new node shows; name the node this answer is for,
+        // because Done still counts the failure and must have a line to show.
+        const left = nodeIdRef.current !== nodeId;
+        if (res.state === "failed" && res.reason === "codex-not-installed") {
+          if (left) {
+            showLeft(
+              "Codex is not installed there. Your existing login is unchanged."
+            );
+          } else {
+            // The notice stands in for the ChatGPT path's failure line too.
+            setDevice(d => (d.kind === "failed" ? { kind: "idle" } : d));
+            setCodexMissing(true);
+          }
+          return false;
+        }
+        const message =
           res.state === "disabled" || res.state === "unsupported"
-            ? "In-app OpenAI login is not available on this node"
-            : "Could not log Codex in with that key. Your existing login is unchanged."
-        );
+            ? `In-app OpenAI login is not available ${left ? "there" : "on this node"}`
+            : "Could not log Codex in with that key. Your existing login is unchanged.";
+        if (left) showLeft(message);
+        else setCodexError(message);
         return false;
       } catch (err) {
         setCodexKey("");
-        setCodexError(errMessage(err, "Failed to add the API key."));
+        const message = errMessage(err, "Failed to add the API key.");
+        if (nodeIdRef.current === nodeId) setCodexError(message);
+        else showLeft(message);
         return false;
       } finally {
         setCodexBusy(false);
@@ -611,13 +850,15 @@ export function useOpenAiLoginStep(
       if (codexInflightRef.current === run) codexInflightRef.current = null;
     });
     return run;
-  }, [codexKey, nodeId]);
+  }, [codexKey, nodeId, nodeLabel]);
 
   /** Done's half (R7): a pending device-auth is one problem; a typed Codex key
    *  is logged in now, and a failure is one problem. A node that cannot take a
-   *  login (R2) gets no request: the typed key is one problem. */
+   *  login (R2) gets no request: the typed key is one problem. So does no node
+   *  at all (#5467 S3): with the nodes still loading or failed to load, the key
+   *  would otherwise go to LOCAL_NODE_ID, which the Log in button refuses. */
   const disabledReason = node?.disabledReason ?? null;
-  const nodeLabel = node?.nodeLabel ?? "This node";
+  const hasNode = node !== null;
   const runDone = useCallback(async (): Promise<number> => {
     let problems = 0;
     if (device.kind === "pending") {
@@ -625,7 +866,10 @@ export function useOpenAiLoginStep(
       problems += 1;
     }
     if (codexKey.trim()) {
-      if (disabledReason) {
+      if (!hasNode) {
+        setCodexError("No node selected · the key was not sent");
+        problems += 1;
+      } else if (disabledReason) {
         setCodexError(`${nodeLabel}: ${disabledReason}`);
         problems += 1;
       } else if (!(await runCodexKey())) {
@@ -633,7 +877,16 @@ export function useOpenAiLoginStep(
       }
     }
     return problems;
-  }, [codexKey, device.kind, disabledReason, nodeLabel, runCodexKey]);
+  }, [codexKey, device.kind, disabledReason, hasNode, nodeLabel, runCodexKey]);
+
+  // #5467 S12: the problems Done reports that are still on screen (the modal's
+  // banner counts them live). A failed ChatGPT sign-in is not one: nothing is
+  // pending, so the next Done closes. The not-installed notice stands in for
+  // the Codex key's line.
+  const problemCount =
+    (device.kind === "pending" && device.unfinished ? 1 : 0) +
+    (codexError !== null || codexMissing ? 1 : 0) +
+    (leftNodeError !== null ? 1 : 0);
 
   return {
     device,
@@ -646,10 +899,14 @@ export function useOpenAiLoginStep(
     codexKey,
     setCodexKey,
     codexError,
+    leftNodeError,
+    problemCount,
     codexBusy,
+    codexMissing,
     runCodexKey,
     runDone,
     saved,
+    savedHere,
     pending: device.kind === "pending",
   };
 }
@@ -657,202 +914,6 @@ export function useOpenAiLoginStep(
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
-
-function accountStatusText(
-  a: AccountHealthEntry,
-  compact: boolean
-): { text: string; tone: "bad" | "muted" } {
-  if (a.authKind === "env-token") return { text: "env token", tone: "muted" };
-  if (a.needsRelogin) {
-    return {
-      text: `re-login · ${formatSince(a, { compact }) ?? ""}`.trim(),
-      tone: "bad",
-    };
-  }
-  if (a.lastRefreshedAt === null)
-    return { text: "never refreshed", tone: "muted" };
-  return {
-    text: `refreshing · last ${formatRefreshUtc(a.lastRefreshedAt, { compact })}`,
-    tone: "muted",
-  };
-}
-
-function nodeSummary(
-  node: LoginNode,
-  provider: "anthropic" | "openai"
-): {
-  text: string;
-  bad: boolean;
-} {
-  const where = node.isUiHost ? "this node" : null;
-  if (provider === "openai") {
-    const n = node.openai.length;
-    const count = `${n} login${n === 1 ? "" : "s"}`;
-    return { text: [where, count].filter(Boolean).join(" · "), bad: false };
-  }
-  const total = node.accounts.length;
-  const dead = node.accounts.filter(a => a.needsRelogin).length;
-  if (dead > 0) {
-    return { text: `${dead} of ${total} accounts need re-login`, bad: true };
-  }
-  const count = `${total} account${total === 1 ? "" : "s"}`;
-  const tail = total > 0 ? "all refreshing" : null;
-  return {
-    text: [where, count, tail].filter(Boolean).join(" · "),
-    bad: false,
-  };
-}
-
-function useIsCompact(): boolean {
-  const [compact, setCompact] = useState(
-    () => typeof window !== "undefined" && window.innerWidth < 480
-  );
-  useEffect(() => {
-    const onResize = () => setCompact(window.innerWidth < 480);
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-  return compact;
-}
-
-function NodeRow(props: {
-  node: LoginNode;
-  provider: "anthropic" | "openai";
-  selected: boolean;
-  onSelect: () => void;
-  resourceHealth: boolean;
-  compact: boolean;
-}) {
-  const { node, provider, selected, compact } = props;
-  const [expanded, setExpanded] = useState(false);
-  const summary = nodeSummary(node, provider);
-  const disabled = node.disabledReason !== null;
-  const radioId = `add-node-${node.nodeId}`;
-  return (
-    <li
-      className={`rounded-md border ${selected ? "border-[var(--app-link)]" : "border-[var(--app-border)]"} bg-[var(--app-secondary-bg)]`}
-      data-testid="add-node-row"
-      data-node-id={node.nodeId}
-      data-disabled={disabled ? "true" : "false"}
-    >
-      <div className="flex items-center gap-2 px-2.5 py-2">
-        <input
-          id={radioId}
-          type="radio"
-          name="add-node"
-          checked={selected}
-          disabled={disabled && !selected}
-          onChange={props.onSelect}
-          className="h-4 w-4 shrink-0 accent-[var(--app-link)]"
-        />
-        <label
-          htmlFor={radioId}
-          className="flex min-w-0 flex-1 items-center gap-2"
-        >
-          <NodeBadge
-            nodeId={node.nodeId}
-            nodeLabel={node.nodeLabel}
-            interactive={false}
-            resourceHealth={props.resourceHealth}
-            labelAsReceived={node.isUiHost}
-            nodeStatus={
-              node.status === "offline" || node.status === "unreachable"
-                ? "offline"
-                : "online"
-            }
-          />
-          <span
-            className={`min-w-0 truncate text-[length:var(--text-body-dense)] ${
-              disabled || summary.bad
-                ? "text-[var(--accent-rose-400)]"
-                : "text-[var(--app-hint)]"
-            }`}
-            data-testid="add-node-summary"
-          >
-            {disabled ? node.disabledReason : summary.text}
-          </span>
-        </label>
-        <Button
-          type="button"
-          variant="ghostStatic"
-          size="bare"
-          aria-expanded={expanded}
-          aria-label={`${expanded ? "Hide" : "Show"} ${node.nodeLabel} accounts`}
-          onClick={() => setExpanded(e => !e)}
-          className="shrink-0 p-1 text-[var(--app-hint)]"
-          data-testid="add-node-expand"
-        >
-          <ChevronIcon className="h-3.5 w-3.5" collapsed={!expanded} />
-        </Button>
-      </div>
-      {expanded && (
-        <ul
-          className="flex flex-col gap-1.5 border-t border-[var(--app-border)] px-2.5 py-2"
-          data-testid="add-node-accounts"
-        >
-          {provider === "anthropic" &&
-            node.accounts.map(a => {
-              const st = accountStatusText(a, compact);
-              return (
-                <li
-                  key={a.accountUuid}
-                  className="flex min-w-0 items-center gap-2"
-                  data-testid="add-node-account"
-                >
-                  <span className="max-w-[45%] shrink-0" title={a.emailAddress}>
-                    <AccountChip
-                      email={a.emailAddress}
-                      label={a.nickname ?? undefined}
-                      monogram={a.monogram ?? undefined}
-                    />
-                  </span>
-                  <span
-                    className={`min-w-0 truncate font-mono text-[length:var(--text-caption)] ${
-                      st.tone === "bad"
-                        ? "text-[var(--accent-rose-400)]"
-                        : "text-[var(--app-hint)]"
-                    }`}
-                  >
-                    {st.text}
-                  </span>
-                </li>
-              );
-            })}
-          {provider === "openai" &&
-            node.openai.map((o, i) => (
-              <li
-                key={`${o.source}:${o.accountUuid ?? i}`}
-                className="flex min-w-0 items-center gap-2 text-[length:var(--text-caption)]"
-                data-testid="add-node-account"
-              >
-                <span className="min-w-0 truncate text-[var(--app-fg)]">
-                  {o.label ?? o.email ?? node.nodeLabel}
-                </span>
-                {o.plan && (
-                  <span className="text-[var(--app-hint)]">{o.plan}</span>
-                )}
-                {o.expiresAt && (
-                  <span className="font-mono text-[var(--app-hint)]">
-                    expires{" "}
-                    {formatRefreshUtc(Date.parse(o.expiresAt), { compact })}
-                  </span>
-                )}
-              </li>
-            ))}
-          {(provider === "anthropic"
-            ? node.accounts.length
-            : node.openai.length) === 0 && (
-            <li className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
-              No{" "}
-              {provider === "anthropic" ? "Claude accounts" : "OpenAI logins"}{" "}
-              on {node.nodeLabel} yet
-            </li>
-          )}
-        </ul>
-      )}
-    </li>
-  );
-}
 
 function CopyButton(props: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
@@ -879,9 +940,23 @@ function CopyButton(props: { text: string; label: string }) {
 function AnthropicStepView(props: {
   step: AnthropicStep;
   node: LoginNode | null;
+  /** #5467 S8: Done is running — no new link or sign-in, and the code is not
+   *  editable. */
+  locked: boolean;
 }) {
-  const { step, node } = props;
+  const { step, node, locked } = props;
   const canStart = Boolean(node && node.disabledReason === null);
+  // #6054 SINK-1: in both views, because Done counts it as a problem and the
+  // in-VM sign-in can open on the UI host while it is still shown.
+  const leftNodeLine = step.leftNodeError && (
+    <div
+      className="rounded-md bg-red-900/20 p-2 text-red-400"
+      role="alert"
+      data-testid="anthropic-left-node-error"
+    >
+      {step.leftNodeError.text}
+    </div>
+  );
   if (step.inVm) {
     return (
       <div className="flex flex-col gap-3" data-testid="in-vm-sign-in">
@@ -922,6 +997,7 @@ function AnthropicStepView(props: {
               type="button"
               variant="ghostStatic"
               onClick={() => void step.begin()}
+              disabled={locked}
               className="h-auto p-0 font-normal text-red-400 underline hover:text-red-400"
             >
               Start over
@@ -941,20 +1017,23 @@ function AnthropicStepView(props: {
         >
           {step.inVmChecking ? "Checking…" : "I've signed in"}
         </Button>
+        {leftNodeLine}
       </div>
     );
   }
   return (
     <div className="flex flex-col gap-3" data-testid="anthropic-login-step">
-      {step.saved > 0 && (
+      {step.savedHere > 0 && (
         <p className="text-[var(--status-ok)]" role="status">
-          {step.saved === 1 ? "Account added" : `${step.saved} accounts added`}
+          {step.savedHere === 1
+            ? "Account added"
+            : `${step.savedHere} accounts added`}
         </p>
       )}
       <Button
         type="button"
         className="w-full"
-        disabled={!canStart || step.isStarting}
+        disabled={!canStart || step.isStarting || locked}
         onClick={() => void step.begin()}
         data-testid="open-sign-in-link"
       >
@@ -1004,6 +1083,7 @@ function AnthropicStepView(props: {
               autoComplete="off"
               spellCheck={false}
               value={step.code}
+              disabled={locked}
               onChange={e => step.setCode(e.target.value)}
               placeholder="Paste the whole code, including the part after #"
               className={INPUT_CLASS}
@@ -1029,20 +1109,62 @@ function AnthropicStepView(props: {
           {step.error}
         </div>
       )}
+      {leftNodeLine}
     </div>
   );
 }
 
-function OpenAiStepView(props: { step: OpenAiStep; node: LoginNode | null }) {
-  const { step, node } = props;
+/**
+ * #5871: the node has no Codex CLI, so neither sign-in path can run there.
+ * Says so, and gives OpenAI's own install command to run on that machine.
+ */
+function CodexNotInstalledNotice(props: { nodeLabel: string }) {
+  const { nodeLabel } = props;
+  return (
+    <div
+      className="flex flex-col gap-2"
+      role="alert"
+      data-testid="codex-not-installed"
+    >
+      <p className="text-[var(--accent-rose-400)]">
+        Codex is not installed on {nodeLabel}, so it cannot sign in there. Your
+        existing login is unchanged.
+      </p>
+      <ol className="list-decimal space-y-2 pl-5 text-[var(--app-hint)]">
+        <li>
+          Open a terminal on {nodeLabel} and run this command:
+          {/* break-words, not break-all: wrap at the spaces. A word is split
+              only when it alone is wider than the box; the URL fits at 393 px. */}
+          <pre className="mt-1 whitespace-pre-wrap break-words rounded-md border border-[var(--app-border)] bg-[var(--app-bg)] p-2 font-mono text-xs text-[var(--app-fg)]">
+            {CODEX_INSTALL_COMMAND}
+          </pre>
+          <div className="mt-1">
+            <CopyButton text={CODEX_INSTALL_COMMAND} label="Copy command" />
+          </div>
+        </li>
+        <li>Come back here and sign in again</li>
+      </ol>
+    </div>
+  );
+}
+
+function OpenAiStepView(props: {
+  step: OpenAiStep;
+  node: LoginNode | null;
+  /** #5467 S8: Done is running — no new sign-in, and the key is not editable. */
+  locked: boolean;
+}) {
+  const { step, node, locked } = props;
   const [keyOpen, setKeyOpen] = useState(false);
   const canStart = Boolean(node && node.disabledReason === null);
   const d = step.device;
   return (
     <div className="flex flex-col gap-3" data-testid="openai-login-step">
-      {step.saved > 0 && (
+      {step.savedHere > 0 && (
         <p className="text-[var(--status-ok)]" role="status">
-          {step.saved === 1 ? "Login added" : `${step.saved} logins added`}
+          {step.savedHere === 1
+            ? "Login added"
+            : `${step.savedHere} logins added`}
         </p>
       )}
       {d.kind === "pending" ? (
@@ -1108,7 +1230,7 @@ function OpenAiStepView(props: { step: OpenAiStep; node: LoginNode | null }) {
         <Button
           type="button"
           className="w-full"
-          disabled={!canStart}
+          disabled={!canStart || locked}
           onClick={() => void step.beginDevice()}
           data-testid="openai-device-start"
         >
@@ -1130,8 +1252,12 @@ function OpenAiStepView(props: { step: OpenAiStep; node: LoginNode | null }) {
           <AddAccountInstructions
             provider="openai"
             intro="Add the OpenAI account by logging in directly on the target machine:"
+            showInAppStep={false}
           />
         </div>
+      )}
+      {step.codexMissing && (
+        <CodexNotInstalledNotice nodeLabel={node?.nodeLabel ?? "this node"} />
       )}
       <div className="flex flex-col gap-1.5">
         <Button
@@ -1161,7 +1287,7 @@ function OpenAiStepView(props: { step: OpenAiStep; node: LoginNode | null }) {
                 autoComplete="off"
                 spellCheck={false}
                 value={step.codexKey}
-                disabled={step.codexBusy}
+                disabled={step.codexBusy || locked}
                 onChange={e => step.setCodexKey(e.target.value)}
                 className={INPUT_CLASS}
                 style={{ fontSize: "16px" }}
@@ -1170,22 +1296,37 @@ function OpenAiStepView(props: { step: OpenAiStep; node: LoginNode | null }) {
               <Button
                 type="button"
                 variant="outline"
-                disabled={!canStart || !step.codexKey.trim() || step.codexBusy}
+                disabled={
+                  !canStart || !step.codexKey.trim() || step.codexBusy || locked
+                }
                 onClick={() => void step.runCodexKey()}
                 data-testid="codex-key-submit"
               >
                 {step.codexBusy ? "…" : "Log in"}
               </Button>
             </div>
-            {step.codexError && (
-              <p
-                className="text-[length:var(--text-caption)] text-[var(--accent-rose-400)]"
-                role="alert"
-              >
-                {step.codexError}
-              </p>
-            )}
           </div>
+        )}
+        {/* #5467 S13: outside the panel. Done sends a typed key even when the
+            panel is collapsed, so a failure it counts must stay visible. */}
+        {step.codexError && (
+          <p
+            className="text-[length:var(--text-caption)] text-[var(--accent-rose-400)]"
+            role="alert"
+            data-testid="codex-key-error"
+          >
+            {step.codexError}
+          </p>
+        )}
+        {/* #5467 S11: an answer for a node the user has left. */}
+        {step.leftNodeError && (
+          <p
+            className="text-[length:var(--text-caption)] text-[var(--accent-rose-400)]"
+            role="alert"
+            data-testid="codex-left-node-error"
+          >
+            {step.leftNodeError.text}
+          </p>
         )}
       </div>
     </div>
@@ -1211,7 +1352,11 @@ export function NodeLoginList(props: {
   unknownNodeId?: string;
   anthropic?: AnthropicStep;
   openai?: OpenAiStep;
+  /** #5467 S8: Done is running; the login step's text inputs and the controls
+   *  that start a sign-in are locked. */
+  locked?: boolean;
 }) {
+  const locked = props.locked ?? false;
   const resourceHealth = useFederationHealthAvailable(props.api);
   const compact = useIsCompact();
   const selected =
@@ -1263,10 +1408,14 @@ export function NodeLoginList(props: {
         </ul>
       )}
       {props.provider === "anthropic" && props.anthropic && (
-        <AnthropicStepView step={props.anthropic} node={selected} />
+        <AnthropicStepView
+          step={props.anthropic}
+          node={selected}
+          locked={locked}
+        />
       )}
       {props.provider === "openai" && props.openai && (
-        <OpenAiStepView step={props.openai} node={selected} />
+        <OpenAiStepView step={props.openai} node={selected} locked={locked} />
       )}
     </section>
   );

@@ -161,7 +161,10 @@ function ResultView({
 
       <ImportParityReport result={result} />
 
-      <ImportResultNotices notices={result.notices ?? []} />
+      <ImportResultNotices
+        notices={result.notices ?? []}
+        notImported={result.notImported ?? []}
+      />
 
       {/* F1 — per-account MCP write status, not a single host-level truth. */}
       <div>
@@ -1128,11 +1131,12 @@ export function PorterImportPanel({
                 </section>
               )}
 
-              {/* #4156: policy refusals, notices (#5202), then the rest. */}
+              {/* #4156: policy refusals, not imported (#5625), notices (#5202), then the rest. */}
               <ImportOmissions
                 omissions={summary.omissions}
                 policySkips={summary.policySkips ?? []}
                 notices={summary.notices ?? []}
+                notImported={summary.notImported ?? []}
               />
             </div>
           )}

@@ -167,6 +167,10 @@ export const FederationNodeInfoSchema = z.object({
   // (fail-open by design; the daemon gate is unchanged). [ER 2026-10-01: K3]
   recommendedConcurrent: z.number().int().optional(),
   capSource: DaemonCapSourceSchema.optional(),
+  // Issue #6028: the node daemon's resolved spawn default effort, so the hub's
+  // Create page names a REMOTE target's default. Optional — a pre-#6028 peer
+  // omits it and the label keeps the shared default (stale-peer safe, #536).
+  defaultEffort: EffortLevelSchema.optional(),
 });
 
 export type FederationNodeInfo = z.infer<typeof FederationNodeInfoSchema>;
@@ -196,9 +200,9 @@ export const FederationSpawnBodySchema = z.object({
   directory: z.string().min(1),
   agent: z.enum(["claude", "codex", "gemini", "opencode"]).optional(),
   yolo: z.boolean().optional(),
-  /** Issue #1262: opt-in to spawn-time port claim. When omitted, the
-   *  receiving federation route defaults to `true` for backward compat with
-   *  older peers that don't send the field. */
+  /** Issue #1262/#1683: opt-in to spawn-time port claim. When omitted, the
+   *  receiving federation route defaults to `false` (claim-at-deploy;
+   *  `peerSpawn.ts` uses `claimPort ?? false`). */
   claimPort: z.boolean().optional(),
   sessionType: z.enum(["simple", "worktree"]).optional(),
   worktreeName: z.string().optional(),
@@ -222,6 +226,11 @@ export const FederationSpawnBodySchema = z.object({
    *  node's default account. Validated as a UUID to match the sibling local
    *  spawnBodySchema (#1455). */
   accountUuid: z.string().uuid().optional(),
+  /** Issue #5879: bypass the receiving node's account-headroom refusal (409
+   *  `account_exhausted`) for the `accountUuid` above. A plain z.object strips
+   *  an un-enumerated key at the hub forwarder AND the receiver, so it must be
+   *  listed here to reach the peer. Harmless (schema-dropped) on older peers. */
+  forceAccount: z.boolean().optional(),
   /** Issue #2822 (epic #2478 D2a): managed-peer attribution — link the spawned
    *  session to its parent (the spawning PM). Mirrors the local spawnBodySchema
    *  (#2479), with one asymmetry: the hub forward (webClient.ts) resolves a

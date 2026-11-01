@@ -34,7 +34,7 @@
  * opened from inside the fullscreen prompt editor). Before that it was a raw
  * `createPortal` overlay like the MCP-detail modal in `AssistantChat/StatusBar.tsx`.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   EFFORT_LEVEL_LABELS,
@@ -86,10 +86,12 @@ import {
 import {
   API_KEY_CHIP_IDENTITY,
   apiKeyCredentialLabel,
+  isClaudeFlavor,
   useSessionAccountEmail,
 } from "@/hooks/queries/useSessionAccountEmail";
 import { useAccounts } from "@/hooks/queries/useAccounts";
 import { useAccountUsage } from "@/hooks/queries/useAccountUsage";
+import { useAccountsUsageView } from "@/hooks/useAccountsUsageView";
 import { useAccountActions } from "@/hooks/mutations/useAccountActions";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
@@ -237,19 +239,26 @@ export function EditSessionParamsModal(props: EditSessionParamsModalProps) {
 }
 
 /** The editable (live-plane) draft. Launcher / safeMode are deliberately absent
- *  (E9) — read from `current` only, for field gating + the copied command. */
+ *  (E9) — read from `current` only, for field gating + the copied command.
+ *  Issue #5660: every field holds ONLY the user's own pick in this modal — an
+ *  absent field (or an absent MCP key) means "no pick", and the form shows the
+ *  session's LIVE value instead (`shown`). Nothing is seeded from the session,
+ *  so a change made outside the open modal (another tab, the CLI, a rate-limit
+ *  auto-switch) never reads as staged and Apply never reverts it. */
 type Draft = {
-  modelMode: ModelMode;
-  effort: EffortLevel | undefined;
-  rawModel: string;
-  permissionMode: PermissionMode;
-  /** name → enabled. Seeded from the session's live MCP status. */
+  modelMode?: ModelMode;
+  /** `undefined` is a real pick ("Default"); "no pick" is the key being absent. */
+  effort?: EffortLevel | undefined;
+  rawModel?: string;
+  permissionMode?: PermissionMode;
+  /** name → enabled, for the servers the user toggled here only. */
   mcpDesired: Record<string, boolean>;
   /** Epic #3285 round 14 (item 7) → issue #4823: the STAGED payment method — an
-   *  account or an API key. Seeded from the session's binding; differs from
-   *  `current.paymentMethod` only after the user picks another account or key —
-   *  "Apply changes" performs the switch. One field, so an account and a key can
-   *  never be staged together. */
+   *  account or an API key the user picked in this modal; "Apply changes"
+   *  performs the switch. One field, so an account and a key can never be
+   *  staged together. Issue #5660: `null` until a pick — it is NOT seeded from
+   *  the session, so a switch made outside the open modal (e.g.
+   *  autoSwitchOnRateLimit) never reads as staged and Apply never reverts it. */
   paymentMethod: PaymentMethod | null;
 };
 
@@ -262,6 +271,13 @@ function EditSessionParamsForm({
 }: EditSessionParamsModalProps) {
   const flavor = session.metadata?.flavor ?? null;
   const agent = toAgentType(flavor);
+  // Issue #5660: the modal's Claude-only gating (the Claude model/effort row,
+  // its catalog query, the API-key group) follows the Account row's resolver,
+  // NOT `agent` — `toAgentType` reads an unknown flavor (e.g. a tier-2 CLI) as
+  // claude, while the resolver and the server's relaunch rule read it as not
+  // Claude. `agent` stays the AgentType union for `deriveFormState` and the
+  // copied command.
+  const claudeSession = isClaudeFlavor(flavor);
   const projectDir = session.metadata?.path;
 
   const actions = useSessionActions(api, session.id, flavor);
@@ -308,29 +324,34 @@ function EditSessionParamsForm({
     return map;
   }, [mcp.servers, mcp.disabledServers]);
 
-  const [draft, setDraft] = useState<Draft>(() => ({
-    modelMode: current.modelMode,
-    effort: current.effort,
-    rawModel: current.rawModel,
-    permissionMode: current.permissionMode,
-    mcpDesired: currentMcp,
-    paymentMethod: current.paymentMethod,
-  }));
-  // Reconcile the draft's MCP map once the (async) MCP status arrives, WITHOUT
-  // clobbering user edits: only add servers the draft has never seen.
-  useEffect(() => {
-    setDraft(d => {
-      let changed = false;
-      const next = { ...d.mcpDesired };
-      for (const [name, enabled] of Object.entries(currentMcp)) {
-        if (!(name in next)) {
-          next[name] = enabled;
-          changed = true;
-        }
+  const [draft, setDraft] = useState<Draft>({
+    mcpDesired: {},
+    paymentMethod: null,
+  });
+  // What the form shows and Apply diffs: the user's pick, else the live value.
+  const shown = useMemo(
+    () => ({
+      modelMode: draft.modelMode ?? current.modelMode,
+      rawModel: draft.rawModel ?? current.rawModel,
+      effort: "effort" in draft ? draft.effort : current.effort,
+      permissionMode: draft.permissionMode ?? current.permissionMode,
+      mcpDesired: { ...currentMcp, ...draft.mcpDesired },
+      // The binding the row, the picker marker and the meters follow.
+      paymentMethod: draft.paymentMethod ?? current.paymentMethod,
+    }),
+    [draft, current, currentMcp]
+  );
+  // The servers whose shown state differs from the live status — what Apply
+  // sends (setMcpDesired merges into the existing set).
+  const mcpDelta = useMemo(() => {
+    const delta: Record<string, boolean> = {};
+    for (const [name, enabled] of Object.entries(shown.mcpDesired)) {
+      if (currentMcp[name] !== undefined && currentMcp[name] !== enabled) {
+        delta[name] = enabled;
       }
-      return changed ? { ...d, mcpDesired: next } : d;
-    });
-  }, [currentMcp]);
+    }
+    return delta;
+  }, [shown, currentMcp]);
 
   const [error, setError] = useState<string | null>(null);
   const [accountModalOpen, setAccountModalOpen] = useState(false);
@@ -362,13 +383,14 @@ function EditSessionParamsForm({
     draft.paymentMethod != null &&
     !samePaymentMethod(draft.paymentMethod, current.paymentMethod);
   const stagedKind = accountStaged ? draft.paymentMethod?.kind : undefined;
-  const draftAccountUuid =
-    draft.paymentMethod?.kind === "account"
-      ? draft.paymentMethod.accountUuid
+  // The pick, else the session's LIVE binding (#5660 — not the binding at open).
+  const shownAccountUuid =
+    shown.paymentMethod?.kind === "account"
+      ? shown.paymentMethod.accountUuid
       : undefined;
-  const draftApiKeyId =
-    draft.paymentMethod?.kind === "api-key"
-      ? draft.paymentMethod.apiKeyId
+  const shownApiKeyId =
+    shown.paymentMethod?.kind === "api-key"
+      ? shown.paymentMethod.apiKeyId
       : undefined;
   const { accounts } = useAccounts(
     api,
@@ -376,12 +398,11 @@ function EditSessionParamsForm({
   );
   const stagedAccount =
     stagedKind === "account"
-      ? accounts.find(a => a.accountUuid === draftAccountUuid)
+      ? accounts.find(a => a.accountUuid === shownAccountUuid)
       : undefined;
 
   // Issue #4823: the node's Anthropic vault keys, offered beside the accounts
   // for a Claude session (keys are node-local, so a remote session lists none).
-  const claudeSession = agent === "claude";
   const { data: vaultKeys } = useApiKeys(api, {
     enabled: claudeSession && (accountModalOpen || stagedKind === "api-key"),
   });
@@ -391,7 +412,7 @@ function EditSessionParamsForm({
   );
   const stagedKey =
     stagedKind === "api-key"
-      ? anthropicKeys.find(k => k.id === draftApiKeyId)
+      ? anthropicKeys.find(k => k.id === shownApiKeyId)
       : undefined;
   // The row names the STAGED binding while one is pending: a staged key shows
   // no email (an account switch's email must not linger beside it).
@@ -403,10 +424,10 @@ function EditSessionParamsForm({
   // Issue #4523 (D-4523-4): the usage meters follow the binding the Account row
   // SHOWS — the staged one while a change is pending, else the session's own. A
   // key binds no account (#4568 / #4823), so a shown key gets no meters and no
-  // usage query (R8). Gate on the resolver, not `agent`: `toAgentType` reads an
-  // unknown flavor as claude, and the CLI stamps `metadata.accountUuid` for every
+  // usage query (R8). Gate on the resolver (the rule `claudeSession` also
+  // follows, #5660), and the CLI stamps `metadata.accountUuid` for every
   // flavor — a disabled query still returns cached rows, so the LOOKUP is gated
-  // too. `draftAccountUuid` is the current account's uuid until a pick is
+  // too. `shownAccountUuid` is the current account's uuid until a pick is
   // staged; the email follows the staged kind (NOT `shownEmail`, which falls
   // back to the current account while a staged account is still loading). An
   // errored usage query renders no block (R5): TanStack keeps the last rows
@@ -421,10 +442,19 @@ function EditSessionParamsForm({
     meterTarget && usageError == null
       ? findAccountUsage(
           usage,
-          draftAccountUuid,
+          shownAccountUuid,
           stagedKind === "account" ? stagedAccount?.emailAddress : accountEmail
         )
       : undefined;
+  // Issue #4600: the block renders the Anthropic usage view the Accounts page
+  // chose (the federation setting, re-read on focus). The hook runs on every
+  // open (rules of hooks); the meter gate goes into its client, so a non-Claude
+  // session or a shown key reads no preference. The view reaches the block only
+  // as a prop: a usage-view context provider here would also reach the staged
+  // account picker below, which must stay Bars (#4467 R8).
+  const { viewFor: usageViewFor } = useAccountsUsageView(
+    meterTarget ? api : null
+  );
 
   // Issue #4823 (R6): the keys group is disabled — with the reason — when the
   // server would refuse a key target. Launcher: the RAW recorded kind (a missing
@@ -457,7 +487,7 @@ function EditSessionParamsForm({
     directoryHasGitRepo: false,
     directoryIsGitRepo: undefined,
     sessionTypeUserSelected: false,
-    permissionMode: draft.permissionMode,
+    permissionMode: shown.permissionMode,
     // E9: launcher / safeMode are not editable here — gate on the session's own.
     safeMode: current.safeMode,
     launcher: current.launcher,
@@ -466,9 +496,9 @@ function EditSessionParamsForm({
     accountsCount: 0,
     agentSupportsOpenRouter: false,
     selectedModel: "",
-    selectedModelMode: draft.modelMode,
-    selectedEffort: draft.effort ?? "",
-    selectedRawModel: draft.rawModel,
+    selectedModelMode: shown.modelMode,
+    selectedEffort: shown.effort ?? "",
+    selectedRawModel: shown.rawModel,
     // #3348: the edit modal does not re-select a gemini/codex native model
     // (a codex model change recreates the session — ruling D2(a)); it DISPLAYS
     // the active model. Pass empty so the derivation's `fields.{gemini,codex}Model`
@@ -488,20 +518,15 @@ function EditSessionParamsForm({
   // Which editable fields diverge from the session's current params.
   const changedFields = useMemo(() => {
     const s = new Set<EditableField>();
-    if (draft.modelMode !== current.modelMode) s.add("modelMode");
-    if (draft.rawModel !== current.rawModel) s.add("rawModel");
-    if (draft.effort !== current.effort) s.add("effort");
-    if (draft.permissionMode !== current.permissionMode)
+    if (shown.modelMode !== current.modelMode) s.add("modelMode");
+    if (shown.rawModel !== current.rawModel) s.add("rawModel");
+    if (shown.effort !== current.effort) s.add("effort");
+    if (shown.permissionMode !== current.permissionMode)
       s.add("permissionMode");
-    for (const [name, enabled] of Object.entries(draft.mcpDesired)) {
-      if (currentMcp[name] !== undefined && currentMcp[name] !== enabled) {
-        s.add("mcp");
-        break;
-      }
-    }
+    if (Object.keys(mcpDelta).length > 0) s.add("mcp");
     if (accountStaged) s.add("account");
     return s;
-  }, [draft, current, currentMcp, accountStaged]);
+  }, [shown, current, mcpDelta, accountStaged]);
 
   const hasChanges = changedFields.size > 0;
 
@@ -527,13 +552,14 @@ function EditSessionParamsForm({
   // — live catalog when available, the shared static heuristic otherwise — via
   // the same resolver the ModelModePicker's effort submenu uses.
   const { api: appApi } = useAppContext();
+  const claudeModelRow = fields.modelMode.visible && claudeSession;
   const { models: claudeModels } = useClaudeModels(appApi, {
-    enabled: fields.modelMode.visible,
+    enabled: claudeModelRow,
   });
   const effortLevels = effortLevelsForCurrent(
-    draft.modelMode,
+    shown.modelMode,
     session.resolvedModel,
-    draft.rawModel || undefined,
+    shown.rawModel || undefined,
     claudeModels
   );
   // R4 (pass 2, E6 `settings-modal.html`): the Account row shows the shared
@@ -545,10 +571,10 @@ function EditSessionParamsForm({
   // select. Its value is the draft's raw model id; a mode-only session (set via
   // the in-chat picker, no raw id) selects its mode entry; "" is Default (mode
   // default + no raw id).
-  const modelSelectValue = draft.rawModel
-    ? draft.rawModel
-    : draft.modelMode !== "default"
-      ? `${MODE_OPTION_PREFIX}${draft.modelMode}`
+  const modelSelectValue = shown.rawModel
+    ? shown.rawModel
+    : shown.modelMode !== "default"
+      ? `${MODE_OPTION_PREFIX}${shown.modelMode}`
       : "";
   // The session's pin can carry a context-tier suffix ("claude-opus-5-5[1m]")
   // that catalog ids never have, so it matched no catalog entry and showed up
@@ -576,19 +602,19 @@ function EditSessionParamsForm({
       machineId: "local",
       directory: projectDir ?? "",
       agent,
-      yolo: isYoloEquivalentMode(draft.permissionMode),
+      yolo: isYoloEquivalentMode(shown.permissionMode),
       // E9: the copied command still carries the session's launcher + safe-mode
       // flags — read from the session, since they are no longer editable here.
       safeMode: current.safeMode || undefined,
       launcher: current.launcher,
-      modelMode: draft.modelMode !== "default" ? draft.modelMode : undefined,
-      effort: draft.effort || undefined,
-      rawModel: draft.rawModel || undefined,
+      modelMode: shown.modelMode !== "default" ? shown.modelMode : undefined,
+      effort: shown.effort || undefined,
+      rawModel: shown.rawModel || undefined,
     };
     const display: SpawnDisplayContext = {
       machineLabel: nodeLabel ?? "this machine",
     };
-    const enabledMcp = Object.entries(draft.mcpDesired)
+    const enabledMcp = Object.entries(shown.mcpDesired)
       .filter(([, enabled]) => enabled)
       .map(([name]) => name)
       .sort();
@@ -597,30 +623,21 @@ function EditSessionParamsForm({
 
   async function applyLivePlaneChanges() {
     if (changedFields.has("modelMode"))
-      await actions.setModelMode(draft.modelMode);
+      await actions.setModelMode(shown.modelMode);
     if (changedFields.has("rawModel"))
-      await actions.setSessionRawModel(draft.rawModel);
-    if (changedFields.has("effort") && draft.effort)
-      await actions.setSessionEffort(draft.effort);
+      await actions.setSessionRawModel(shown.rawModel);
+    if (changedFields.has("effort") && shown.effort)
+      await actions.setSessionEffort(shown.effort);
     if (changedFields.has("permissionMode"))
-      await actions.setPermissionMode(draft.permissionMode);
-    if (changedFields.has("mcp")) {
-      // Send only the changed servers — setMcpDesired merges into the existing set.
-      const delta: Record<string, boolean> = {};
-      for (const [name, enabled] of Object.entries(draft.mcpDesired)) {
-        if (currentMcp[name] !== undefined && currentMcp[name] !== enabled) {
-          delta[name] = enabled;
-        }
-      }
-      if (Object.keys(delta).length > 0) await actions.setMcpDesired(delta);
-    }
+      await actions.setPermissionMode(shown.permissionMode);
+    if (changedFields.has("mcp")) await actions.setMcpDesired(mcpDelta);
     // Round 14: the account switch goes LAST — it restarts the session, and the
     // live-plane fields above must already be persisted on the record first.
     // Issue #4823: the staged payment method may be an account OR an API key.
-    if (changedFields.has("account") && draftAccountUuid)
-      await accountActions.selectAccount(draftAccountUuid);
-    else if (changedFields.has("account") && draftApiKeyId)
-      await accountActions.selectApiKey(draftApiKeyId);
+    if (changedFields.has("account") && shownAccountUuid)
+      await accountActions.selectAccount(shownAccountUuid);
+    else if (changedFields.has("account") && shownApiKeyId)
+      await accountActions.selectApiKey(shownApiKeyId);
   }
 
   async function handleApply() {
@@ -635,7 +652,8 @@ function EditSessionParamsForm({
   }
 
   // R5: MCP toggle handlers passed to the extracted McpServersSection — the
-  // draft (mcpDesired) stays the single source of MCP truth here.
+  // draft records only the servers the user toggled (#5660); `shown` overlays
+  // them on the live MCP status.
   const setMcpServer = (name: string, enabled: boolean) =>
     setDraft(d => ({
       ...d,
@@ -766,7 +784,7 @@ function EditSessionParamsForm({
               {/* `compactLabel` (round 10): "Permission Mode" stays on ONE line
                 inside the 118px column, info icon pinned to the column's right. */}
               <PermissionModeSelector
-                permissionMode={draft.permissionMode}
+                permissionMode={shown.permissionMode}
                 flavor={agent}
                 isDisabled={fields.permissionMode.disabled}
                 compactLabel
@@ -783,7 +801,12 @@ function EditSessionParamsForm({
             the E9 grid and its fixed right column are untouched. Account-global
             usage, the same envelope as the Account Usage page; nothing renders
             without an envelope, for a non-Claude session or a shown key. */}
-          {accountUsage && <SessionAccountUsageMeters usage={accountUsage} />}
+          {accountUsage && (
+            <SessionAccountUsageMeters
+              usage={accountUsage}
+              view={usageViewFor("anthropic")}
+            />
+          )}
 
           {/* Row 2 (E9 → round 10) — Model | Effort (Claude only). TWO native
             drop-downs, each under its OWN heading. Model = the Create page's
@@ -795,7 +818,7 @@ function EditSessionParamsForm({
             model supports (live catalog, static fallback). Effort sits in the
             SAME fixed narrow column as Permission Mode above, so the two share
             a left edge. */}
-          {fields.modelMode.visible && (
+          {claudeModelRow && (
             <div className="flex items-start gap-2" data-testid="config-row-2">
               <div className="min-w-0 flex-1">
                 <FormField label="Model">
@@ -831,12 +854,12 @@ function EditSessionParamsForm({
                     {/* A raw id the live catalog does not list (custom /
                       retired) stays selectable so the select never shows a
                       wrong value. */}
-                    {draft.rawModel &&
+                    {shown.rawModel &&
                       !claudeModels.some(
-                        m => catalogOptionValue(m.id) === draft.rawModel
+                        m => catalogOptionValue(m.id) === shown.rawModel
                       ) && (
-                        <option value={draft.rawModel}>
-                          {formatModelName(draft.rawModel)}
+                        <option value={shown.rawModel}>
+                          {formatModelName(shown.rawModel)}
                         </option>
                       )}
                     {claudeModels.map(m => (
@@ -854,7 +877,7 @@ function EditSessionParamsForm({
               >
                 <FormField label="Effort">
                   <UiSelect
-                    value={draft.effort ?? ""}
+                    value={shown.effort ?? ""}
                     disabled={fields.modelMode.disabled}
                     data-testid="config-effort-select"
                     onChange={e =>
@@ -879,7 +902,7 @@ function EditSessionParamsForm({
           )}
 
           {/* #3348: non-claude ACTIVE-model display (read-only). The claude Row 2
-            above is gated by fields.modelMode.visible (the claude-modes catalog);
+            above is gated by claudeModelRow (the claude-modes catalog, Claude flavor);
             gemini/codex show their ACTIVE model here instead — sourced from the
             spawn selection recorded on metadata.nativeModel (a flavor whose CLI
             does not report resolvedModel to Hapimatic). A codex model change
@@ -893,7 +916,7 @@ function EditSessionParamsForm({
             (per-flavor respawn base + flavor-aware relaunch delegate) is what
             unlocks an in-place codex model switch; until then the honest
             "recreate" copy from #3348 Task 5 stands. */}
-          {agent !== "claude" && (
+          {!claudeSession && (
             <div
               className="flex flex-col gap-1"
               data-testid="config-native-model"
@@ -922,7 +945,7 @@ function EditSessionParamsForm({
           {fields.mcpServers.visible && (
             <McpServersSection
               mcp={mcp}
-              desired={draft.mcpDesired}
+              desired={shown.mcpDesired}
               disabled={fields.mcpServers.disabled}
               onToggleServer={setMcpServer}
               onSetAll={setAllMcpServers}
@@ -1018,7 +1041,7 @@ function EditSessionParamsForm({
         addTargetNodeId={effectiveNodeId ?? undefined}
         currentAccountEmail={shownEmail}
         sessionFlavor={flavor}
-        selectedAccountUuid={draftAccountUuid}
+        selectedAccountUuid={shownAccountUuid}
         onSelect={uuid =>
           setDraft(d => ({
             ...d,
@@ -1028,7 +1051,7 @@ function EditSessionParamsForm({
         // Issue #4823: the node's Anthropic keys beside the accounts (Claude
         // sessions only). A pick stages the key; Apply performs the switch.
         apiKeys={claudeSession ? anthropicKeys : undefined}
-        selectedApiKeyId={draftApiKeyId ?? null}
+        selectedApiKeyId={shownApiKeyId ?? null}
         onSelectApiKey={
           claudeSession
             ? apiKeyId =>

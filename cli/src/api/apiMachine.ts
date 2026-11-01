@@ -493,6 +493,13 @@ export class ApiMachineClient {
           // wire payload (#1262 trap — un-listed here, the daemon reads undefined
           // and never runs the un-pinned optimal-pick, so R1 fails silently).
           autoSelectOptimalAccount,
+          // Issue #6028: destructure the server-stamped model effort levels
+          // (#1262 trap — un-listed here, the daemon only has its static lookup).
+          modelEffortLevels,
+          // Issue #6028 (board-26 PM ruling PM-2): destructure the federation
+          // `claudePath` (#933). rpcGateway sends it and the daemon's tmux path
+          // exports it as HAPI_CLAUDE_PATH, but this hop dropped it (#1262 trap).
+          claudePath,
         } = params || {};
 
         if (!directory) {
@@ -585,6 +592,13 @@ export class ApiMachineClient {
           // spawnSession (#1262 trap — omit it and the daemon never runs the
           // un-pinned optimal-pick). `undefined`/`false` ⇒ NO pick (#3023 unchanged).
           autoSelectOptimalAccount,
+          // Issue #6028: forward the pinned model's supported effort levels so the
+          // daemon fits its spawn default to the model. Guarded by
+          // apiMachine.spawnEffort.test.ts.
+          modelEffortLevels,
+          // Issue #6028 (PM-2): forward the federation `claudePath` (#933), which
+          // this hop silently dropped. Guarded by apiMachine.spawnEffort.test.ts.
+          claudePath,
         });
 
         switch (result.type) {

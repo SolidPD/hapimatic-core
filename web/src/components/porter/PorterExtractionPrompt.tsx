@@ -211,6 +211,7 @@ export function PorterExtractionPrompt({
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const tokenState = status.data?.state;
+  const uploadsExhausted = status.data?.expiredReason === "exhausted";
   // #3447 (K8): per-OS command tabs. The selected OS defaults to the UA-detected
   // tab and is overridable via the `os` prop; this state is the SINGLE OS source
   // (D #3449 consumes the same selected value).
@@ -463,13 +464,18 @@ export function PorterExtractionPrompt({
                 </div>
               )}
 
+              {/* #5708: an upload leg that ran out of attempts also reads
+                  `expired`; its reason gets its own text. An older server sends
+                  no reason, which keeps the TTL text. */}
               {tokenState === "expired" && (
                 <p
                   data-testid="oneliner-expired"
+                  data-reason={uploadsExhausted ? "exhausted" : "ttl"}
                   className="text-[length:var(--text-body-dense)] text-[var(--app-hint)]"
                 >
-                  This link expired before it was used. Generate a new link to
-                  try again.
+                  {uploadsExhausted
+                    ? "This link stopped accepting uploads after repeated failed attempts. The source machine kept the archive. Upload it in the panel below to see why it was refused, or generate a new link to try again."
+                    : "This link expired before it was used. Generate a new link to try again."}
                 </p>
               )}
 

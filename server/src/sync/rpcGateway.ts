@@ -354,12 +354,12 @@ export class RpcGateway {
           // silently drop the false value → the daemon's reused-window path would
           // always respawn-kill, defeating the re-attach guard.
           killLivePane: opts.killLivePane,
-          // Issue #3611: forward the resolved optimal-account opt-in (set on `opts`
-          // by syncEngine.spawnSession from the server preference mirror) through
-          // this first field-by-field RPC hop (the #1262 trap — un-enumerated
-          // fields are silently dropped, so the daemon would never run the
-          // un-pinned optimal-pick). undefined/false ⇒ NO pick (#3023 unchanged, R3).
+          // #3611 / #6028: server-stamped facts (set on `opts` by spawnSession) —
+          // the optimal-account opt-in (undefined/false ⇒ NO pick, #3023, R3) and
+          // the pinned model's effort levels — on this field-by-field hop (#1262
+          // trap). modelEffortLevels guard: syncEngine.spawnEffort.test.ts.
           autoSelectOptimalAccount: opts.autoSelectOptimalAccount,
+          modelEffortLevels: opts.modelEffortLevels,
         },
         SPAWN_RPC_TIMEOUT_MS
       );

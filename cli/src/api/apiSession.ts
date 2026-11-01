@@ -87,6 +87,76 @@ export function openTerminal(
   );
 }
 
+/**
+ * #4682: how many delivered user-message ids a wrapper remembers. A message's
+ * seq is not stable (the server's #952 late-arrival insert shifts later rows
+ * up by one), so a re-served row is recognised by its id. The shift is
+ * bounded by the late CLI writes that land after a message (a disconnect's
+ * buffered emits), which this covers with margin.
+ */
+export const DELIVERED_USER_MESSAGE_ID_CAP = 1000;
+
+/** #4682 (R13): retry bounds for a failed backfill pass while connected. */
+export const BACKFILL_RETRY_MIN_MS = 1000;
+export const BACKFILL_RETRY_MAX_MS = 30_000;
+
+export type ApiSessionClientOptions = {
+  /**
+   * #4682: the seq after which this wrapper takes delivery of user messages,
+   * from `POST /cli/sessions`. `null` (an older server) keeps the legacy
+   * backfill start.
+   */
+  deliveryFloorSeq?: number | null;
+  /** Backfill retry bounds; tests shorten them. */
+  backfillRetryMs?: { min: number; max: number };
+};
+
+/**
+ * #4682: a user record this wrapper's own side wrote (a prompt typed in the
+ * terminal, a task notification). The agent already saw it, so it is never
+ * handed back as input. Only `ApiSessionClient` writes `sentFrom: "cli"`; the
+ * server's send path never does (server/src/sync/sentFrom.ts).
+ */
+export function isWrapperAuthoredUserMessage(message: UserMessage): boolean {
+  return message.meta?.sentFrom === "cli";
+}
+
+/** #4682 (R13): 1 s, 2 s, 4 s … capped at `maxMs`. */
+export function backfillRetryDelayMs(
+  failures: number,
+  minMs: number,
+  maxMs: number
+): number {
+  return Math.min(maxMs, minMs * 2 ** Math.max(0, failures - 1));
+}
+
+/** An insertion-ordered set of ids that drops the oldest past `cap`. */
+export class RecentIdSet {
+  private readonly ids = new Set<string>();
+
+  constructor(private readonly cap: number) {}
+
+  has(id: string): boolean {
+    return this.ids.has(id);
+  }
+
+  add(id: string): void {
+    this.ids.add(id);
+    if (this.ids.size > this.cap) {
+      const oldest = this.ids.values().next().value;
+      if (oldest !== undefined) {
+        this.ids.delete(oldest);
+      }
+    }
+  }
+
+  get size(): number {
+    return this.ids.size;
+  }
+}
+
+type IncomingMessage = { id?: string; seq?: number; content: unknown };
+
 export class ApiSessionClient extends EventEmitter {
   private readonly token: string;
   readonly sessionId: string;
@@ -108,8 +178,28 @@ export class ApiSessionClient extends EventEmitter {
   private pendingMessages: UserMessage[] = [];
   private pendingMessageCallback: ((message: UserMessage) => void) | null =
     null;
+  /** Highest message seq handled; the live path drops anything at or below. */
   private lastSeenMessageSeq: number | null = null;
-  private backfillInFlight: Promise<void> | null = null;
+  /**
+   * #4682: seq up to which the backfill knows it has read everything. A live
+   * frame advances it only in steady state (connected, no backfill
+   * outstanding), so a live message never makes a later pass skip rows that
+   * were stored during an outage.
+   */
+  private backfillCursorSeq: number | null = null;
+  /** #4682: seq after which this wrapper takes delivery (`null`: legacy). */
+  private readonly deliveryFloorSeq: number | null;
+  /** #4682 (R5): ids of user messages already handed to the agent. */
+  private readonly deliveredUserMessageIds = new RecentIdSet(
+    DELIVERED_USER_MESSAGE_ID_CAP
+  );
+  private backfillLoop: Promise<void> | null = null;
+  /** #4682 (R14): live frames held while a backfill pass runs. */
+  private heldLiveMessages: IncomingMessage[] = [];
+  private backfillRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private backfillFailures = 0;
+  private readonly backfillRetryMs: { min: number; max: number };
+  private closed = false;
   private needsBackfill = false;
   private hasConnectedOnce = false;
   readonly rpcHandlerManager: RpcHandlerManager;
@@ -125,7 +215,11 @@ export class ApiSessionClient extends EventEmitter {
    */
   private readonly sessionRecord: Session;
 
-  constructor(token: string, session: Session) {
+  constructor(
+    token: string,
+    session: Session,
+    options: ApiSessionClientOptions = {}
+  ) {
     super();
     this.token = token;
     this.sessionId = session.id;
@@ -134,6 +228,15 @@ export class ApiSessionClient extends EventEmitter {
     this.metadataVersion = session.metadataVersion;
     this.agentState = session.agentState;
     this.agentStateVersion = session.agentStateVersion;
+    // #4682: any message at or below the floor existed before this wrapper
+    // attached, so it is never new input. Both cursors start there.
+    this.deliveryFloorSeq = options.deliveryFloorSeq ?? null;
+    this.lastSeenMessageSeq = this.deliveryFloorSeq;
+    this.backfillCursorSeq = this.deliveryFloorSeq;
+    this.backfillRetryMs = options.backfillRetryMs ?? {
+      min: BACKFILL_RETRY_MIN_MS,
+      max: BACKFILL_RETRY_MAX_MS,
+    };
 
     this.rpcHandlerManager = new RpcHandlerManager({
       scopePrefix: this.sessionId,
@@ -171,10 +274,12 @@ export class ApiSessionClient extends EventEmitter {
     this.socket.on("connect", () => {
       logger.debug("Socket connected successfully");
       this.rpcHandlerManager.onSocketConnect(this.socket);
-      if (this.hasConnectedOnce) {
-        this.needsBackfill = true;
+      // #4682 (R8): with a delivery floor every connect backfills, the first
+      // included, so a message stored between attach and the room join is
+      // not lost. Without one (an older server) only a reconnect does.
+      if (this.hasConnectedOnce || this.deliveryFloorSeq !== null) {
+        this.requestBackfill();
       }
-      void this.backfillIfNeeded();
       this.hasConnectedOnce = true;
     });
 
@@ -199,6 +304,9 @@ export class ApiSessionClient extends EventEmitter {
       if (this.hasConnectedOnce) {
         this.needsBackfill = true;
       }
+      // #4682 (R13): the next connect requests a pass; a retry timer would
+      // only fire against a dead socket.
+      this.clearBackfillRetry();
     });
 
     this.socket.on("connect_error", error => {
@@ -301,7 +409,13 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         if (data.body.t === "new-message") {
-          this.handleIncomingMessage(data.body.message);
+          // #4682 (R14): while a backfill pass runs, hold live frames so the
+          // agent gets the outage's older messages first.
+          if (this.backfillLoop) {
+            this.heldLiveMessages.push(data.body.message);
+          } else {
+            this.handleIncomingMessage(data.body.message, "live");
+          }
           return;
         }
 
@@ -386,112 +500,230 @@ export class ApiSessionClient extends EventEmitter {
     }
   }
 
-  private handleIncomingMessage(message: {
-    seq?: number;
-    content: unknown;
-  }): void {
+  /**
+   * #4682: decide whether one stored message reaches the agent.
+   *
+   * - At or below the delivery floor: it existed before this wrapper attached.
+   * - Live and not newer than the cursor: a duplicate frame (the pre-#4682
+   *   gate).
+   * - Backfilled and not newer than the cursor: still taken when its id was
+   *   never delivered, because a live frame can move the cursor past rows a
+   *   failed pass had not fetched yet (R11).
+   * - A user record this wrapper's side wrote is never input (R4).
+   * - A user message is handed over at most once per id (R5): the server's
+   *   #952 insert can re-serve a delivered row at a higher seq.
+   */
+  private handleIncomingMessage(
+    message: IncomingMessage,
+    source: "live" | "backfill"
+  ): void {
     const seq = typeof message.seq === "number" ? message.seq : null;
+    let isNew = true;
     if (seq !== null) {
-      if (this.lastSeenMessageSeq !== null && seq <= this.lastSeenMessageSeq) {
+      if (this.deliveryFloorSeq !== null && seq <= this.deliveryFloorSeq) {
         return;
       }
-      this.lastSeenMessageSeq = seq;
+      isNew = this.lastSeenMessageSeq === null || seq > this.lastSeenMessageSeq;
+      if (isNew) {
+        this.lastSeenMessageSeq = seq;
+        if (source === "live" && this.isBackfillSteady()) {
+          this.backfillCursorSeq = seq;
+        }
+      } else if (source === "live" || message.id === undefined) {
+        return;
+      }
     }
 
     const userResult = UserMessageSchema.safeParse(message.content);
-    if (userResult.success) {
-      this.enqueueUserMessage(userResult.data);
+    if (!userResult.success) {
+      if (isNew) {
+        this.emit("message", message.content);
+      }
       return;
     }
-
-    this.emit("message", message.content);
+    if (isWrapperAuthoredUserMessage(userResult.data)) {
+      logger.debug("[API] Skipped a user record this wrapper's side wrote", {
+        id: message.id,
+        seq,
+        source,
+      });
+      return;
+    }
+    if (message.id !== undefined) {
+      if (this.deliveredUserMessageIds.has(message.id)) {
+        logger.debug("[API] Skipped an already-delivered user message", {
+          id: message.id,
+          seq,
+          source,
+        });
+        return;
+      }
+      this.deliveredUserMessageIds.add(message.id);
+    }
+    this.enqueueUserMessage(userResult.data);
   }
 
-  private async backfillIfNeeded(): Promise<void> {
-    if (!this.needsBackfill) {
+  /**
+   * No backfill pending or running, so a live frame may advance the backfill
+   * cursor. A disconnect sets `needsBackfill`, so after one this stays false
+   * until the next pass has run.
+   */
+  private isBackfillSteady(): boolean {
+    return !this.needsBackfill && this.backfillLoop === null;
+  }
+
+  /**
+   * #4682 (R12): ask for a backfill pass. A request that lands while a pass is
+   * running is not merged into it: that pass's reads may predate this outage,
+   * so the running loop runs one more pass after it.
+   */
+  private requestBackfill(): void {
+    this.needsBackfill = true;
+    this.clearBackfillRetry();
+    if (this.backfillLoop || this.closed) {
       return;
     }
-    try {
-      await this.backfillMessages();
+    this.backfillLoop = this.runBackfillLoop().finally(() => {
+      this.backfillLoop = null;
+    });
+  }
+
+  private async runBackfillLoop(): Promise<void> {
+    while (this.needsBackfill && this.socket.connected && !this.closed) {
       this.needsBackfill = false;
-    } catch (error) {
-      logger.debug("[API] Backfill failed", error);
-      this.needsBackfill = true;
+      try {
+        await this.backfillMessages();
+        this.backfillFailures = 0;
+      } catch (error) {
+        logger.debug("[API] Backfill failed", error);
+        this.needsBackfill = true;
+        this.backfillFailures += 1;
+        this.drainHeldLiveMessages();
+        this.scheduleBackfillRetry();
+        return;
+      }
+      this.drainHeldLiveMessages();
     }
   }
 
-  private async backfillMessages(): Promise<void> {
-    if (this.backfillInFlight) {
-      await this.backfillInFlight;
+  /**
+   * #4682 (R14): hand over the live frames held during a pass, in order. Each
+   * frame is guarded like the `update` handler that held it: a consumer that
+   * throws must not drop the frames after it or end the wrapper.
+   */
+  private drainHeldLiveMessages(): void {
+    const held = this.heldLiveMessages;
+    this.heldLiveMessages = [];
+    for (const message of held) {
+      try {
+        this.handleIncomingMessage(message, "live");
+      } catch (error) {
+        logger.debug("[API] Error handling a held live message", { error });
+      }
+    }
+  }
+
+  /** #4682 (R13): retry a failed pass while the socket stays connected. */
+  private scheduleBackfillRetry(): void {
+    if (this.closed || !this.socket.connected) {
       return;
     }
+    const delay = backfillRetryDelayMs(
+      this.backfillFailures,
+      this.backfillRetryMs.min,
+      this.backfillRetryMs.max
+    );
+    this.backfillRetryTimer = setTimeout(() => {
+      this.backfillRetryTimer = null;
+      this.requestBackfill();
+    }, delay);
+    this.backfillRetryTimer.unref?.();
+  }
 
-    const startSeq = this.lastSeenMessageSeq ?? 0;
-    if (startSeq === 0) {
+  private clearBackfillRetry(): void {
+    if (this.backfillRetryTimer) {
+      clearTimeout(this.backfillRetryTimer);
+      this.backfillRetryTimer = null;
+    }
+  }
+
+  /** One backfill pass: read every message after the backfill cursor. */
+  private async backfillMessages(): Promise<void> {
+    const startSeq = this.backfillCursorSeq ?? 0;
+    if (this.deliveryFloorSeq === null && this.backfillCursorSeq === null) {
       logger.debug(
         "[API] Backfilling from beginning (no last-seen message sequence)"
       );
+    } else {
+      logger.debug(`[API] Backfilling after seq ${startSeq}`, {
+        deliveryFloorSeq: this.deliveryFloorSeq,
+      });
     }
 
     const limit = 200;
-    const run = async () => {
-      let cursor = startSeq;
-      while (true) {
-        const response = await axios.get(
-          `${configuration.serverUrl}/cli/sessions/${encodeURIComponent(this.sessionId)}/messages`,
-          {
-            params: { afterSeq: cursor, limit },
-            headers: {
-              Authorization: `Bearer ${this.token}`,
-              "Content-Type": "application/json",
-            },
-            timeout: 15_000,
-          }
-        );
-
-        const parsed = CliMessagesResponseSchema.safeParse(response.data);
-        if (!parsed.success) {
-          throw new Error("Invalid /cli/sessions/:id/messages response");
+    let cursor = startSeq;
+    while (!this.closed) {
+      const response = await axios.get(
+        `${configuration.serverUrl}/cli/sessions/${encodeURIComponent(this.sessionId)}/messages`,
+        {
+          // #4682 (R15): a wrapper with a floor asks for afterSeq exactly.
+          // Without one (it attached to an older server), a from-zero read
+          // leaves the server's first-connect floor in force.
+          params:
+            this.deliveryFloorSeq === null
+              ? { afterSeq: cursor, limit }
+              : { afterSeq: cursor, limit, exactCursor: 1 },
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 15_000,
         }
+      );
 
-        const messages = parsed.data.messages;
-        if (messages.length === 0) {
-          break;
-        }
-
-        let maxSeq = cursor;
-        for (const message of messages) {
-          if (typeof message.seq === "number") {
-            if (message.seq > maxSeq) {
-              maxSeq = message.seq;
-            }
-          }
-          this.handleIncomingMessage(message);
-        }
-
-        const observedSeq = this.lastSeenMessageSeq ?? maxSeq;
-        const nextCursor = Math.max(maxSeq, observedSeq);
-        if (nextCursor <= cursor) {
-          logger.debug("[API] Backfill stopped due to non-advancing cursor", {
-            cursor,
-            maxSeq,
-            observedSeq,
-          });
-          break;
-        }
-
-        cursor = nextCursor;
-        if (messages.length < limit) {
-          break;
-        }
+      if (this.closed) {
+        // A page that lands after close() is not handed to the agent. Live
+        // frames held during the pass are still drained: they arrived before
+        // close() and would have been handed over live.
+        break;
       }
-    };
 
-    this.backfillInFlight = run().finally(() => {
-      this.backfillInFlight = null;
-    });
+      const parsed = CliMessagesResponseSchema.safeParse(response.data);
+      if (!parsed.success) {
+        throw new Error("Invalid /cli/sessions/:id/messages response");
+      }
 
-    await this.backfillInFlight;
+      const messages = parsed.data.messages;
+      if (messages.length === 0) {
+        break;
+      }
+
+      let maxSeq = cursor;
+      for (const message of messages) {
+        if (message.seq > maxSeq) {
+          maxSeq = message.seq;
+        }
+        this.handleIncomingMessage(message, "backfill");
+      }
+
+      // #4682 (L1): advance by this page only. A live frame never moves the
+      // read past rows the pass has not fetched.
+      if (maxSeq <= cursor) {
+        logger.debug("[API] Backfill stopped due to non-advancing cursor", {
+          cursor,
+          maxSeq,
+        });
+        break;
+      }
+      cursor = maxSeq;
+      this.backfillCursorSeq = Math.max(
+        this.backfillCursorSeq ?? cursor,
+        cursor
+      );
+      if (messages.length < limit) {
+        break;
+      }
+    }
   }
 
   sendClaudeSessionMessage(body: RawJSONLines): void {
@@ -926,6 +1158,8 @@ export class ApiSessionClient extends EventEmitter {
   }
 
   close(): void {
+    this.closed = true;
+    this.clearBackfillRetry();
     this.rpcHandlerManager.onSocketDisconnect();
     this.terminalManager.closeAll();
     this.socket.disconnect();

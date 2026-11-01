@@ -47,6 +47,7 @@
     "emojilib": "^4.0.3",
     "hast-util-to-jsx-runtime": "^2.3.6",
     "lucide-react": "^1.7.0",
+    "modern-screenshot": "^4.6.7",
     "pdfjs-dist": "^5.5.207",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",

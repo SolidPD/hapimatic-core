@@ -20,6 +20,12 @@
  *   - Global toggle (read FRESH per decision) + per-session override (R6)
  *   - Federation: only the OWNING node recovers a given session (R8)
  *
+ * #3612 adds a second path for a usage-window lock (the 5-hour or weekly cap):
+ * on the `rateLimited` rising edge (#3618's published seam, wired in
+ * `index.ts`) it schedules ONE nudge at the reset time instead of the ladder,
+ * and suppresses the ladder for that session while the nudge is armed. With no
+ * usable reset time it schedules nothing and the ladder runs as before.
+ *
  * Event-driven (subscribe + setTimeout), NOT poll-based — structurally similar
  * to StallWatchdogService minus the poll loop. All per-session state is
  * in-memory and resets on restart (acceptable per the epic).
@@ -28,17 +34,47 @@
 import type { SyncEngine, Session, SyncEvent } from "../sync/syncEngine";
 import type { NodeRegistry } from "../federation/nodeRegistry";
 import type { ErrorLogger } from "../logging/errorLogger";
-import { apiErrorNotification } from "../notifications/producerNotifications";
+import {
+  apiErrorNotification,
+  usageWindowNudgeNotification,
+} from "../notifications/producerNotifications";
+import { sessionModelFamily } from "../accounts/accountHeadroom";
 import type { AutoRecoveryConfig } from "../config/autoRecoveryConfig";
 import { readAutoRecoverPreferences } from "../web/routes/preferences";
 import { PROGRAMMATIC_SENT_FROM } from "../sync/sentFrom";
+import { isLocalMode } from "./autoSwitchOnRateLimit";
 import {
   canonicalizeErrorType,
   isRecoverByDefaultClass,
   isTerminalClass,
 } from "@hapi/protocol/apiErrorClasses";
+import {
+  findUsageRowHardLock,
+  type AccountUsage,
+  type HardLockWindow,
+} from "@hapi/protocol";
 
 const ROLLING_HOUR_MS = 3_600_000;
+
+/** #3612: the API class a usage-window 429 is normalized to. */
+const USAGE_WINDOW_CLASS = "rate_limit_error";
+const FIVE_HOUR_MS = 5 * ROLLING_HOUR_MS;
+const WEEK_MS = 7 * 24 * ROLLING_HOUR_MS;
+/**
+ * #3612 R5: the longest a reset can be away, per window. A reset beyond its
+ * window's length is a bad value, so the ladder handles the lock. The session's
+ * own reset gets the 5-hour bound because `rateLimited` does not say which
+ * window it belongs to. Since #6065 the CLI value is Claude Code's structured
+ * reset when the record carries one, else a date-aware text parse, so the bound
+ * now only declines a weekly reset more than 5 hours out. Such a reset gets a
+ * nudge only when the account snapshot holds that lock.
+ */
+const WINDOW_LENGTH_MS: Record<HardLockWindow | "session", number> = {
+  five_hour: FIVE_HOUR_MS,
+  seven_day: WEEK_MS,
+  weekly_scoped: WEEK_MS,
+  session: FIVE_HOUR_MS,
+};
 
 /**
  * #2485 (Sub-Issue B): the durable `auto-recovery-*` category family for the
@@ -86,6 +122,20 @@ const RECOVERY_LOG = {
   skipRemote: "auto-recovery-skip-remote",
   skipNoSession: "auto-recovery-skip-no-session",
   skipUserActivity: "auto-recovery-skip-user-activity",
+  // #6065 (D7): the user drives a local-mode session from its terminal; any
+  // message would switch it to remote and abort that terminal session.
+  skipLocalMode: "auto-recovery-skip-local-mode",
+  // #3612: the usage-window reset nudge. Skips that share a cause with the
+  // ladder (remote owner, no session, preference, class opt-out) reuse the
+  // ladder's categories with `context.trigger: "usage-window"`.
+  usageWindowScheduled: "auto-recovery-usage-window-scheduled",
+  usageWindowRescheduled: "auto-recovery-usage-window-rescheduled",
+  usageWindowDispatched: "auto-recovery-usage-window-dispatched",
+  usageWindowSkip: "auto-recovery-usage-window-skip",
+  usageWindowEnded: "auto-recovery-usage-window-ended",
+  usageWindowFallback: "auto-recovery-usage-window-fallback",
+  ladderSuppressed: "auto-recovery-ladder-suppressed-usage-window",
+  ladderReplayed: "auto-recovery-ladder-replayed-usage-window",
 } as const;
 
 type ApiErrorEvent = Extract<SyncEvent, { type: "api-error" }>;
@@ -119,6 +169,63 @@ interface SessionRecoveryState {
   pendingTimer: ReturnType<typeof setTimeout> | null;
   /** R9 success-window timer awaiting the "recovered" verdict. */
   successTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * #3612: the usage-window reset nudge. Its own field, never `pendingTimer`:
+   * the ladder clears `pendingTimer` before it schedules, so sharing it would
+   * let each path cancel the other. Cleared by `clearTimers`, not by
+   * `clearPending`. While it is set, the ladder is suppressed for the session.
+   */
+  usageWindowTimer: ReturnType<typeof setTimeout> | null;
+  /** #3612: the reset time the armed nudge is for (dedup key with the session). */
+  usageWindowResetAt: number | null;
+  /** #3612: the account the armed nudge's session is bound to (stagger index). */
+  usageWindowAccount: string | null;
+  /** #3612 R5: the nudge already moved once to a later reset; it will not again. */
+  usageWindowRescheduled: boolean;
+  /**
+   * #3612 W13: the exhausted event the ladder skipped because a nudge was armed,
+   * with the seq watermark of the FIRST skip. Suppression is a deferral, never a
+   * drop: if the nudge ends without sending its prompt (cancelled, skipped,
+   * session gone), this replays into the ladder so it runs exactly as it would
+   * have without the nudge — later. Dropped when the nudge sends its prompt.
+   * Not cleared by `clearUsageWindow` (re-arming must keep it).
+   */
+  deferredLadder: {
+    errorType: string;
+    errorSeq: number;
+    namespace: string | undefined;
+  } | null;
+}
+
+/** #3612: where a usage-window reset time came from. */
+interface ResolvedReset {
+  resetAt: number;
+  source: "account" | "session";
+  window: HardLockWindow | "session";
+}
+
+/**
+ * #3612: what the usage-window nudge needs beyond the ladder's dependencies.
+ * Optional so every existing construction is unchanged; without `usageService`
+ * the nudge falls back to the session's own parsed reset time.
+ */
+export interface AutoRecoveryUsageWindowDeps {
+  /** The shared usage cache. Read with `getLatest()` only, never a refresh. */
+  usageService?: { getLatest(): AccountUsage[] | null } | null;
+  /** Test seam — clock. Defaults to Date.now. */
+  now?: () => number;
+  /** Test seam — the [0, 1) source for the jitter. Defaults to Math.random. */
+  random?: () => number;
+  /**
+   * Test-only observer, fired with the delay the nudge asked `setTimeout` for
+   * and the reset time it targets — the same contract as `onCooldownScheduled`.
+   * Never set in production. Side-effect-free and must not throw.
+   */
+  onUsageWindowNudgeScheduled?: (
+    sessionId: string,
+    delayMs: number,
+    resetAt: number
+  ) => void;
 }
 
 export class AutoRecoveryService {
@@ -149,8 +256,14 @@ export class AutoRecoveryService {
       sessionId: string,
       attemptIndex: number,
       cooldownMs: number
-    ) => void
+    ) => void,
+    /** #3612: usage-window nudge dependencies (optional, last). */
+    private readonly usageWindow: AutoRecoveryUsageWindowDeps = {}
   ) {}
+
+  private now(): number {
+    return this.usageWindow.now?.() ?? Date.now();
+  }
 
   start(): void {
     if (this.unsubscribe) return; // already started
@@ -189,7 +302,11 @@ export class AutoRecoveryService {
 
   // ---------- R1/R5: subscription guard + policy decision ----------
 
-  private async handleApiError(event: ApiErrorEvent): Promise<void> {
+  private async handleApiError(
+    event: ApiErrorEvent,
+    /** #3612 W13: a replayed deferred event keeps its original seq watermark (R3). */
+    errorSeqOverride?: number
+  ): Promise<void> {
     // Defensive runtime narrowing (LC-1): B's payload nests {phase, errorType}
     // under `data`. The discriminated union gives static safety, but guard at
     // runtime against schema drift between B's merge and C's consumption.
@@ -345,6 +462,30 @@ export class AutoRecoveryService {
       return;
     }
 
+    // #3612 Task 2b(a): a usage-window nudge is armed for this session, so the
+    // reset time owns its recovery — the ladder would retry a locked account at
+    // 60 s / 5 min / 15 min and give up long before the reset. Only an ARMED
+    // nudge suppresses: a lock with no usable reset time arms nothing, and the
+    // ladder runs as before (R5). The event is DEFERRED, not dropped (W13): if
+    // the nudge ends without sending its prompt, it replays into the ladder.
+    const armed = this.states.get(sessionId);
+    if (armed?.usageWindowTimer) {
+      armed.deferredLadder ??= {
+        errorType: data.errorType,
+        errorSeq: this.syncEngine.getMaxSeq(sessionId),
+        namespace: event.namespace,
+      };
+      this.errorLogger.info(
+        "recovery ladder suppressed: usage-window nudge armed",
+        {
+          category: RECOVERY_LOG.ladderSuppressed,
+          sessionId,
+          context: { at: "schedule", errorType: data.errorType },
+        }
+      );
+      return;
+    }
+
     const state = this.getOrCreateState(sessionId);
     const now = Date.now();
 
@@ -374,7 +515,7 @@ export class AutoRecoveryService {
     // Record exhaustion + capture the seq watermark (R3). getMaxSeq is a small
     // per-session monotonic int — NOT a timestamp.
     state.lastExhaustionAt = now;
-    state.errorSeq = this.syncEngine.getMaxSeq(sessionId);
+    state.errorSeq = errorSeqOverride ?? this.syncEngine.getMaxSeq(sessionId);
 
     // Prune BEFORE the caps so both are "per rolling hour", not lifetime.
     state.attempts = state.attempts.filter(a => a.at > now - ROLLING_HOUR_MS);
@@ -442,9 +583,20 @@ export class AutoRecoveryService {
     this.clearPending(state);
     const errorSeq = state.errorSeq;
     const namespace = event.namespace;
+    // #3612 W13: the rung carries its own class (a later deferral keeps it) and
+    // whether it is a replay (a replayed rung only re-prompts a live session).
+    const rung = {
+      errorType: data.errorType,
+      replayed: errorSeqOverride !== undefined,
+    };
     state.pendingTimer = setTimeout(() => {
       state.pendingTimer = null;
-      void this.dispatchRecoveryPrompt(sessionId, errorSeq ?? 0, namespace);
+      void this.dispatchRecoveryPrompt(
+        sessionId,
+        errorSeq ?? 0,
+        namespace,
+        rung
+      );
     }, cooldown);
   }
 
@@ -453,10 +605,69 @@ export class AutoRecoveryService {
   private async dispatchRecoveryPrompt(
     sessionId: string,
     errorSeq: number,
-    namespace: string | undefined
+    namespace: string | undefined,
+    /** #3612 W13: the rung's class, and whether it replays a deferred event. */
+    rung: { errorType: string; replayed: boolean }
   ): Promise<void> {
     const state = this.states.get(sessionId);
     if (!state) return;
+
+    // #3612 Task 2b(b): the rising edge can land AFTER the exhausted event (the
+    // keepAlive carrying the latch can lose the race to the error report), so a
+    // rung scheduled before the nudge was armed is caught here. The first rung
+    // is 60 s, which is always later than the latch. A rung is NOT cancelled on
+    // the rising edge itself: if #3618 switches the account, the cleared edge
+    // disarms the nudge and this rung becomes the post-switch re-prompt #3618
+    // R7 relies on. If the rung fires while the nudge is still armed, it is
+    // deferred like a schedule-time skip (W13), so a later cancel replays it.
+    if (state.usageWindowTimer) {
+      state.deferredLadder ??= {
+        errorType: rung.errorType,
+        errorSeq,
+        namespace,
+      };
+      this.errorLogger.info(
+        "recovery ladder suppressed: usage-window nudge armed",
+        {
+          category: RECOVERY_LOG.ladderSuppressed,
+          sessionId,
+          context: { at: "dispatch" },
+        }
+      );
+      return;
+    }
+
+    // #3612 W13: a replayed rung can come hours after its error. It re-prompts
+    // only a session that is running again — after a #3618 switch the restart
+    // is long done — and never one that has since ended (D2: no respawn, and no
+    // false "recovered" for a session that is gone).
+    if (rung.replayed && !this.syncEngine.getSession(sessionId)?.active) {
+      this.errorLogger.info(
+        "recovery skipped: replayed rung for a session that is not active",
+        {
+          category: RECOVERY_LOG.usageWindowSkip,
+          sessionId,
+          context: { reason: "replay-inactive" },
+        }
+      );
+      state.lastExhaustionAt = null;
+      state.errorSeq = null;
+      return;
+    }
+
+    // #6065 (D7): never prompt a local-mode session. A message makes the local
+    // launcher switch to remote mode and abort the user's terminal session.
+    // Read at dispatch time, because the mode can change during the cooldown.
+    const current = this.syncEngine.getSession(sessionId);
+    if (current && isLocalMode(current)) {
+      this.errorLogger.info("recovery skipped: session is in local mode", {
+        category: RECOVERY_LOG.skipLocalMode,
+        sessionId,
+        context: { at: "dispatch" },
+      });
+      this.abortPendingRecovery(state);
+      return;
+    }
 
     // R3 authoritative re-check at dispatch time: abort if the user has spoken
     // since the exhausted event. This is the load-bearing safety guard.
@@ -473,11 +684,7 @@ export class AutoRecoveryService {
         "recovery skipped: user activity since exhaustion",
         { category: RECOVERY_LOG.skipUserActivity, sessionId }
       );
-      // Abort, reset the exhaustion tracking but keep the attempt history for
-      // rolling-hour accounting.
-      this.clearPending(state);
-      state.lastExhaustionAt = null;
-      state.errorSeq = null;
+      this.abortPendingRecovery(state);
       return;
     }
 
@@ -534,6 +741,419 @@ export class AutoRecoveryService {
     }, this.config.successWindowMs);
   }
 
+  // ---------- #3612: usage-window reset nudge ----------
+
+  /**
+   * #3612: the `rateLimited` rising-edge observer (#3618's published seam,
+   * wired in `index.ts`). Never throws — the seam is synchronous and the policy
+   * reads the preference file, so errors are contained here.
+   */
+  onUsageWindowRisingEdge(sessionId: string, session?: Session): void {
+    void this.scheduleUsageWindowNudge(sessionId, session).catch(err => {
+      this.errorLogger.error(err instanceof Error ? err.message : String(err), {
+        category: RECOVERY_LOG.usageWindowSkip,
+        sessionId,
+        context: { reason: "error" },
+      });
+    });
+  }
+
+  /**
+   * #3612: schedule ONE nudge at the session's usage-window reset time, plus
+   * the account stagger and jitter (R1, R6). Schedules nothing — so the ladder
+   * keeps the lock — when the reset time is missing or out of range (R5).
+   */
+  async scheduleUsageWindowNudge(
+    sessionId: string,
+    session?: Session
+  ): Promise<void> {
+    // R7: only the owning node acts. The seam fires before any switch policy,
+    // so this is not inherited from it.
+    if (this.registry && this.registry.findNodeForSession(sessionId) !== null) {
+      this.errorLogger.info("recovery skipped: session is remote-owned", {
+        category: RECOVERY_LOG.skipRemote,
+        sessionId,
+        context: { trigger: "usage-window" },
+      });
+      return;
+    }
+    const current = session ?? this.syncEngine.getSession(sessionId);
+    if (!current) {
+      this.errorLogger.info("recovery skipped: session not found", {
+        category: RECOVERY_LOG.skipNoSession,
+        sessionId,
+        context: { trigger: "usage-window" },
+      });
+      return;
+    }
+    // #6065 (D7): never arm a nudge for a local-mode session. Arming tells the
+    // user "Auto-resume in …", which a terminal-driven session must not be
+    // promised; the fire-time check catches a switch to local mode later.
+    if (isLocalMode(current)) {
+      this.errorLogger.info("usage-window nudge not scheduled: local mode", {
+        category: RECOVERY_LOG.usageWindowSkip,
+        sessionId,
+        context: { reason: "local-mode" },
+      });
+      return;
+    }
+    if (!(await this.usageWindowAllowed(sessionId, current))) return;
+
+    const now = this.now();
+    const reset = this.resolveReset(current, now);
+    if (!reset) {
+      this.errorLogger.info(
+        "usage-window nudge not scheduled: no usable reset time — ladder keeps the lock",
+        {
+          category: RECOVERY_LOG.usageWindowFallback,
+          sessionId,
+          context: { sessionResetAt: current.rateLimited?.resetAt ?? null },
+        }
+      );
+      return;
+    }
+
+    const state = this.getOrCreateState(sessionId);
+    // Dedup: a repeated rising edge for the same reset while the nudge is armed
+    // is a no-op. A clear → re-arm cycle (a keepAlive gap nulls `rateLimited`,
+    // the next keepAlive restores it) cancels on the clear and re-arms here; its
+    // notification coalesces on the reset time.
+    if (state.usageWindowTimer && state.usageWindowResetAt === reset.resetAt) {
+      this.errorLogger.info("usage-window nudge already scheduled", {
+        category: RECOVERY_LOG.usageWindowSkip,
+        sessionId,
+        context: { reason: "dedup", resetAt: reset.resetAt },
+      });
+      return;
+    }
+    this.clearUsageWindow(state);
+    this.armUsageWindow(sessionId, current, state, reset, now, false);
+  }
+
+  /**
+   * #3612: cancel the nudge — the latch cleared (recovered, switched, or ended).
+   * Any ladder work the nudge deferred replays now (W13): after a #3618 switch
+   * that is the re-prompt R7 relies on, and after a user's own message the
+   * ladder's dispatch-time check aborts it.
+   */
+  cancelUsageWindowNudge(sessionId: string): void {
+    const state = this.states.get(sessionId);
+    if (!state?.usageWindowTimer) return;
+    this.clearUsageWindow(state);
+    this.errorLogger.info("usage-window nudge cancelled: rate limit cleared", {
+      category: RECOVERY_LOG.usageWindowSkip,
+      sessionId,
+      context: { reason: "cleared" },
+    });
+    this.replayDeferredLadder(sessionId, state, "cancelled");
+  }
+
+  /**
+   * #3612 W13: hand a deferred exhausted event back to the ladder, keeping its
+   * original seq watermark. The nudge is disarmed first, so the ladder is not
+   * suppressed again; its own gates and caps apply as usual.
+   */
+  private replayDeferredLadder(
+    sessionId: string,
+    state: SessionRecoveryState,
+    reason: string
+  ): void {
+    const deferred = state.deferredLadder;
+    if (!deferred) return;
+    state.deferredLadder = null;
+    this.errorLogger.info("recovery ladder resumed: usage-window nudge ended", {
+      category: RECOVERY_LOG.ladderReplayed,
+      sessionId,
+      context: { reason, errorSeq: deferred.errorSeq },
+    });
+    void this.handleApiError(
+      {
+        type: "api-error",
+        sessionId,
+        namespace: deferred.namespace,
+        data: { phase: "exhausted", errorType: deferred.errorType },
+      } as ApiErrorEvent,
+      deferred.errorSeq
+    );
+  }
+
+  /**
+   * #3612 R4: the ladder's own three gates, read FRESH — the per-class opt-out
+   * for `rate_limit_error` is an absolute veto, then the master toggle and the
+   * per-session override.
+   */
+  private async usageWindowAllowed(
+    sessionId: string,
+    session: Session
+  ): Promise<boolean> {
+    const pref = await readAutoRecoverPreferences(this.settingsFile);
+    if (pref.classOverrides?.[USAGE_WINDOW_CLASS] === false) {
+      this.errorLogger.info(
+        `recovery skipped: class "${USAGE_WINDOW_CLASS}" opted out`,
+        {
+          category: RECOVERY_LOG.skipClassOptOut,
+          sessionId,
+          context: { trigger: "usage-window", class: USAGE_WINDOW_CLASS },
+        }
+      );
+      return false;
+    }
+    if (!this.shouldRecover(session, pref.enabled)) {
+      this.errorLogger.info("recovery skipped: disabled by preference", {
+        category: RECOVERY_LOG.skipDisabled,
+        sessionId,
+        context: {
+          trigger: "usage-window",
+          globalEnabled: pref.enabled,
+          sessionOverride: session.autoRecoverFromApiError ?? null,
+        },
+      });
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * #3612 R2/R5: the reset time to wait for. The account's own lock from the
+   * cached usage snapshot comes first — the same `findUsageRowHardLock` the
+   * spawn refusal uses, including the session model's weekly window — because
+   * it knows which window is locked. The session value (structured or
+   * date-aware since #6065) is the fallback. A reset closer than `resetNudgeMinLeadMs` or beyond its
+   * window's length is not usable.
+   */
+  private resolveReset(session: Session, now: number): ResolvedReset | null {
+    const account = this.accountReset(session, now);
+    if (account) return account;
+    const resetAt = session.rateLimited?.resetAt;
+    if (typeof resetAt !== "number" || !Number.isFinite(resetAt)) return null;
+    return this.inRange(resetAt, "session", now)
+      ? { resetAt, source: "session", window: "session" }
+      : null;
+  }
+
+  /** #3612: the session's bound account's lock, from the cached snapshot. */
+  private accountReset(session: Session, now: number): ResolvedReset | null {
+    const accountUuid = session.metadata?.accountUuid;
+    if (!accountUuid) return null;
+    let rows: AccountUsage[] | null = null;
+    try {
+      rows = this.usageWindow.usageService?.getLatest() ?? null;
+    } catch {
+      return null; // an unreadable cache is no data — fall back
+    }
+    const row = rows?.find(r => r.accountUuid === accountUuid);
+    const lock = findUsageRowHardLock(row, {
+      modelFamily: sessionModelFamily(session),
+      now,
+    });
+    if (!lock) return null;
+    const resetAt = Date.parse(lock.resetsAt);
+    return this.inRange(resetAt, lock.window, now)
+      ? { resetAt, source: "account", window: lock.window }
+      : null;
+  }
+
+  private inRange(
+    resetAt: number,
+    window: ResolvedReset["window"],
+    now: number
+  ): boolean {
+    const lead = resetAt - now;
+    return (
+      lead >= this.config.resetNudgeMinLeadMs &&
+      lead <= WINDOW_LENGTH_MS[window]
+    );
+  }
+
+  /**
+   * #3612 R6: arm the nudge. Sessions on one account share its reset time, so
+   * the k-th armed session on that account waits k account-stagger steps
+   * longer; the random jitter spreads accounts that reset together.
+   */
+  private armUsageWindow(
+    sessionId: string,
+    session: Session,
+    state: SessionRecoveryState,
+    reset: ResolvedReset,
+    now: number,
+    rescheduled: boolean
+  ): void {
+    const accountUuid = session.metadata?.accountUuid ?? null;
+    let index = 0;
+    if (accountUuid) {
+      for (const [id, other] of this.states) {
+        if (
+          id !== sessionId &&
+          other.usageWindowTimer &&
+          other.usageWindowAccount === accountUuid
+        ) {
+          index++;
+        }
+      }
+    }
+    const random = this.usageWindow.random?.() ?? Math.random();
+    const delayMs = Math.max(
+      0,
+      Math.round(
+        reset.resetAt -
+          now +
+          index * this.config.resetNudgeAccountStaggerMs +
+          random * this.config.resetNudgeJitterMs
+      )
+    );
+
+    state.usageWindowResetAt = reset.resetAt;
+    state.usageWindowAccount = accountUuid;
+    state.usageWindowRescheduled = rescheduled;
+    // One live timer per session, whatever the caller did first.
+    if (state.usageWindowTimer) clearTimeout(state.usageWindowTimer);
+    state.usageWindowTimer = setTimeout(() => {
+      state.usageWindowTimer = null;
+      void this.fireUsageWindowNudge(sessionId).catch(err => {
+        this.errorLogger.error(
+          err instanceof Error ? err.message : String(err),
+          { category: "auto-recovery-dispatch-failed", sessionId }
+        );
+      });
+    }, delayMs);
+
+    this.usageWindow.onUsageWindowNudgeScheduled?.(
+      sessionId,
+      delayMs,
+      reset.resetAt
+    );
+    this.errorLogger.info(
+      `usage-window nudge ${rescheduled ? "rescheduled" : "scheduled"} in ${delayMs}ms`,
+      {
+        category: rescheduled
+          ? RECOVERY_LOG.usageWindowRescheduled
+          : RECOVERY_LOG.usageWindowScheduled,
+        sessionId,
+        context: {
+          resetAt: reset.resetAt,
+          source: reset.source,
+          window: reset.window,
+          delayMs,
+          accountIndex: index,
+        },
+      }
+    );
+    // Finding D (#4936 → here): a capped session tells the user when it will
+    // resume, instead of waiting silently.
+    this.syncEngine.notifyUser(
+      usageWindowNudgeNotification({
+        sessionId,
+        phase: "usage-window-scheduled",
+        resumesAt: now + delayMs,
+        resetAt: reset.resetAt,
+        delayMs,
+        window: reset.window,
+      })
+    );
+  }
+
+  /**
+   * #3612: the reset time arrived. Resume the session only when it is still
+   * running, still latched, idle, and allowed; move once to a later reset when
+   * the account is still locked (R5); never respawn a stopped session (D2).
+   * Every exit that does not send the prompt replays any deferred ladder work
+   * (W13); only a sent prompt drops it. The stopped-session branch is a guard:
+   * a session that ends normally clears its latch first, which cancels here.
+   */
+  private async fireUsageWindowNudge(sessionId: string): Promise<void> {
+    const state = this.states.get(sessionId);
+    if (!state) return;
+    const resetAt = state.usageWindowResetAt;
+    const rescheduled = state.usageWindowRescheduled;
+    const skip = (reason: string): void => {
+      this.clearUsageWindow(state);
+      this.errorLogger.info(`usage-window nudge skipped: ${reason}`, {
+        category: RECOVERY_LOG.usageWindowSkip,
+        sessionId,
+        context: { reason, resetAt },
+      });
+      this.replayDeferredLadder(sessionId, state, reason);
+    };
+
+    const session = this.syncEngine.getSession(sessionId);
+    if (!session) return skip("no-session");
+    if (!session.active) {
+      // D2: `sendMessage` resumes a live turn and cannot revive a dead child.
+      // Record it and tell the user; respawning is left to them.
+      this.clearUsageWindow(state);
+      this.errorLogger.info(
+        "usage-window reset reached but the session is not active — not respawned",
+        {
+          category: RECOVERY_LOG.usageWindowEnded,
+          sessionId,
+          context: { resetAt },
+        }
+      );
+      this.syncEngine.notifyUser(
+        usageWindowNudgeNotification({
+          sessionId,
+          phase: "usage-window-ended",
+          resumesAt: resetAt ?? this.now(),
+          resetAt: resetAt ?? undefined,
+        })
+      );
+      this.replayDeferredLadder(sessionId, state, "ended");
+      return;
+    }
+    // The latch cleared without an observed edge (normally `cancel` ran).
+    if (!session.rateLimited) return skip("cleared");
+    if (!(await this.usageWindowAllowed(sessionId, session))) {
+      this.clearUsageWindow(state);
+      // The replay runs the deferred event's OWN class gates: a rate_limit_error
+      // stays quiet; a deferred overloaded_error rung may still run.
+      this.replayDeferredLadder(sessionId, state, "disallowed");
+      return;
+    }
+    // #6065 (D7): the user drives a local-mode session; a nudge would switch it
+    // to remote and abort their terminal session. The replayed ladder rung is
+    // skipped at its own dispatch for the same reason.
+    if (isLocalMode(session)) return skip("local-mode");
+    // A turn is running, so the session is already working again.
+    if (session.thinking) return skip("busy");
+
+    const now = this.now();
+    if (!rescheduled) {
+      const later = this.accountReset(session, now);
+      if (later) {
+        this.armUsageWindow(sessionId, session, state, later, now, true);
+        return;
+      }
+    }
+
+    this.clearUsageWindow(state);
+    try {
+      // Direct engine call with a programmatic sender, like the ladder, so the
+      // nudge is never mistaken for user input.
+      await this.syncEngine.sendMessage(sessionId, {
+        text: this.config.resetNudgePrompt,
+        sentFrom: "auto-recovery",
+      });
+    } catch (err) {
+      this.errorLogger.error(err instanceof Error ? err.message : String(err), {
+        category: "auto-recovery-dispatch-failed",
+        sessionId,
+        context: { trigger: "usage-window" },
+      });
+      // The prompt never landed, so the ladder takes the lock back.
+      this.replayDeferredLadder(sessionId, state, "dispatch-failed");
+      return;
+    }
+    // The nudge was the recovery; the ladder work it deferred is no longer owed.
+    state.deferredLadder = null;
+    // One nudge only. If the account is still locked, the new 429's exhausted
+    // event finds no armed nudge and the ladder takes over as the backstop.
+    this.errorLogger.info("usage-window nudge dispatched", {
+      category: RECOVERY_LOG.usageWindowDispatched,
+      sessionId,
+      context: { resetAt },
+    });
+  }
+
   // ---------- R3: live user-input tracking ----------
 
   private handleMessageReceived(event: MessageReceivedEvent): void {
@@ -557,9 +1177,7 @@ export class AutoRecoveryService {
     // is an optimization over the authoritative dispatch-time re-check.
     if (this.isUserInput(event.message.content)) {
       // User took control before cooldown elapsed — cancel the pending recovery.
-      this.clearPending(state);
-      state.lastExhaustionAt = null;
-      state.errorSeq = null;
+      this.abortPendingRecovery(state);
     }
   }
 
@@ -613,6 +1231,11 @@ export class AutoRecoveryService {
         lastRecoveryPromptAt: null,
         pendingTimer: null,
         successTimer: null,
+        usageWindowTimer: null,
+        usageWindowResetAt: null,
+        usageWindowAccount: null,
+        usageWindowRescheduled: false,
+        deferredLadder: null,
       };
       this.states.set(sessionId, state);
     }
@@ -624,6 +1247,17 @@ export class AutoRecoveryService {
     if (state.successTimer) clearTimeout(state.successTimer);
     state.pendingTimer = null;
     state.successTimer = null;
+    this.clearUsageWindow(state);
+    state.deferredLadder = null; // stop() / abandon: nothing is owed any more
+  }
+
+  /** #3612: disarm the usage-window nudge and forget what it was for. */
+  private clearUsageWindow(state: SessionRecoveryState): void {
+    if (state.usageWindowTimer) clearTimeout(state.usageWindowTimer);
+    state.usageWindowTimer = null;
+    state.usageWindowResetAt = null;
+    state.usageWindowAccount = null;
+    state.usageWindowRescheduled = false;
   }
 
   /**
@@ -662,6 +1296,17 @@ export class AutoRecoveryService {
       clearTimeout(state.pendingTimer);
       state.pendingTimer = null;
     }
+  }
+
+  /**
+   * Abort a pending recovery: cancel the dispatch timer and reset the
+   * exhaustion tracking, but keep the attempt history for rolling-hour
+   * accounting.
+   */
+  private abortPendingRecovery(state: SessionRecoveryState): void {
+    this.clearPending(state);
+    state.lastExhaustionAt = null;
+    state.errorSeq = null;
   }
 
   /**

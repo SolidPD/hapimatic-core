@@ -5,13 +5,17 @@ import type { Omission } from "@hapi/protocol/porter";
  * #4156 — the import review's omission lists, split out of
  * PorterImportPanel.tsx (its 1,500-line max-lines cap, #2077).
  *
- * Three groups, by PRODUCER rather than by parsing `surface` (the exporter's
- * `CLAUDE.md include @…` and the importer's `CLAUDE.md include …` share a
- * prefix): the importer's policy refusals (`summary.policySkips`), its notices
- * (`summary.notices`, #5202 U10), then everything else — `summary.omissions`
- * minus both. Since #5202 (U8) the server sends `omissions` complete so a
- * client that renders only `omissions` still shows every row; this component
- * subtracts the other two groups so each row renders once.
+ * Four groups, by PRODUCER rather than by parsing `surface` or `reason` (the
+ * exporter's `CLAUDE.md include @…` and the importer's `CLAUDE.md include …`
+ * share a prefix): the importer's policy refusals (`summary.policySkips`), the
+ * notices whose item it did not write (`summary.notImported`, #5625), its other
+ * notices (`summary.notices` minus `notImported`, #5202 U10), then everything
+ * else — `summary.omissions` minus `policySkips` and `notices`. Since #5202
+ * (U8) the server sends `omissions` complete so a client that renders only
+ * `omissions` still shows every row, and `notImported` is a subset of
+ * `notices`; this component subtracts each group from the next so each row
+ * renders once. A server that predates #5625 sends no `notImported`, and the
+ * render is the three groups it always was.
  *
  * Rows are keyed by index: `surface` repeats by design (the exporter records
  * every missing include under one `claudeMd.include` surface, and several
@@ -77,10 +81,12 @@ export function ImportOmissions({
   omissions,
   policySkips,
   notices = [],
+  notImported = [],
 }: {
   omissions: readonly Omission[];
   policySkips: readonly Omission[];
   notices?: readonly Omission[];
+  notImported?: readonly Omission[];
 }) {
   return (
     <>
@@ -90,8 +96,13 @@ export function ImportOmissions({
         testId="import-policy-skips"
       />
       <OmissionGroup
+        title="Not imported"
+        rows={notImported}
+        testId="import-not-imported"
+      />
+      <OmissionGroup
         title="Imported with a note"
-        rows={notices}
+        rows={withoutRows(notices, notImported)}
         testId="import-notices"
       />
       <OmissionGroup
@@ -103,17 +114,30 @@ export function ImportOmissions({
   );
 }
 
-/** #5202 (U12): the commit result's notes, in the review's notice style. */
+/**
+ * #5202 (U12): the commit result's notes, in the review's notice style. #5625:
+ * a note whose item the commit held back (`notImported`, a subset of
+ * `notices`) is listed under "Not imported" instead.
+ */
 export function ImportResultNotices({
   notices,
+  notImported = [],
 }: {
   notices: readonly Omission[];
+  notImported?: readonly Omission[];
 }) {
   return (
-    <OmissionGroup
-      title="Imported with a note"
-      rows={notices}
-      testId="import-result-notices"
-    />
+    <>
+      <OmissionGroup
+        title="Not imported"
+        rows={notImported}
+        testId="import-result-not-imported"
+      />
+      <OmissionGroup
+        title="Imported with a note"
+        rows={withoutRows(notices, notImported)}
+        testId="import-result-notices"
+      />
+    </>
   );
 }

@@ -10,7 +10,10 @@ import {
   MaxConcurrencyPreferenceSchema,
   MAX_CONCURRENCY_DEFAULT,
 } from "@hapi/protocol/schemas";
-import { getDaemonCapacity } from "../../utils/daemonControlClient";
+import {
+  getDaemonCapacity,
+  getDaemonSpawnDefaults,
+} from "../../utils/daemonControlClient";
 import {
   clampMaxConcurrency,
   readMaxConcurrency,
@@ -110,7 +113,16 @@ export function createNodeCapacityRoutes(opts: {
       })
     ),
     async c => {
-      const capacity = await getDaemonCapacity();
+      // Issue #6028: the spawn defaults come from a sibling daemon endpoint, read
+      // alongside the gate count; a failure there just omits the field.
+      const [capacity, defaults] = await Promise.all([
+        getDaemonCapacity(),
+        getDaemonSpawnDefaults(),
+      ]);
+      const spawnDefaults =
+        "error" in defaults
+          ? {}
+          : { spawnDefaults: { effort: defaults.effort } };
       if ("error" in capacity) {
         // Unknown ≠ block. Typed null payload, HTTP 200 (R5).
         return c.json({
@@ -118,6 +130,7 @@ export function createNodeCapacityRoutes(opts: {
           maxConcurrent: null,
           recommendedConcurrent: null,
           capSource: null,
+          ...spawnDefaults,
         });
       }
       // #4417: carry the warn-at count + resolved source. Both optional on the wire —
@@ -128,6 +141,7 @@ export function createNodeCapacityRoutes(opts: {
         maxConcurrent: capacity.maxConcurrent,
         recommendedConcurrent: capacity.recommendedConcurrent ?? null,
         capSource: capacity.capSource ?? null,
+        ...spawnDefaults,
       });
     }
   );

@@ -24,6 +24,7 @@ import {
   type SettingsSyncService,
 } from "../../services/settingsSyncService";
 import {
+  ACCOUNTS_USAGE_VIEW_DEFAULT,
   AUTO_RECOVER_DEFAULT_ENABLED,
   AUTO_SELECT_OPTIMAL_ACCOUNT_DEFAULT_ENABLED,
   AUTO_SWITCH_ON_RATE_LIMIT_DEFAULT_ENABLED,
@@ -1020,14 +1021,12 @@ export function createPreferencesRoutes(
   );
 
   // ── Federation-global settings 🌐 view + per-key patch (#2624, B) ───────
-  // Browser-facing (JWT-mounted) surface for the per-setting inherit toggle
-  // [expert-review 2026-08-05: 2624-1] — the fed-token receiver in
-  // routes/federation/settingsSync.ts is unreachable by the browser's JWT.
+  // The browser's JWT surface [expert-review 2026-08-05: 2624-1]: the fed-token
+  // receiver in routes/federation/settingsSync.ts is unreachable by the JWT.
 
   // The per-key A-default fallbacks buildView needs (R5), hoisted so the GET and
-  // the PUT cannot drift (#4548 — previously two identical literals). A
-  // federation-native key (terminalKeyboardExpanded, #5127's shareApiKeysByDefault)
-  // has no A-local storage, so its fallback is the shared default constant.
+  // PUT cannot drift (#4548). A federation-native key (terminalKeyboardExpanded,
+  // shareApiKeysByDefault, accountsUsageView) falls back to its shared default.
   async function federationView(block: FederationSettingsBlock) {
     return buildView(block, {
       chatSections: await readChatSections(settingsFile),
@@ -1035,6 +1034,7 @@ export function createPreferencesRoutes(
       timeLogTimezone: await readLocalTimeLogTimezone(settingsFile),
       terminalKeyboardExpanded: TERMINAL_KEYBOARD_EXPANDED_DEFAULT,
       shareApiKeysByDefault: SHARE_API_KEYS_BY_DEFAULT_DEFAULT,
+      accountsUsageView: ACCOUNTS_USAGE_VIEW_DEFAULT,
     });
   }
 

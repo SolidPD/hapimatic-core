@@ -28,6 +28,7 @@
     "./extensions/git-rpc/manifestShared": "./src/extensions/git-rpc/manifestShared.ts",
     "./extensions/telegram-miniapp/manifestShared": "./src/extensions/telegram-miniapp/manifestShared.ts",
     "./extensions/session-notes/manifestShared": "./src/extensions/session-notes/manifestShared.ts",
+    "./githubConnection": "./src/githubConnection.ts",
     "./githubFailureReason": "./src/githubFailureReason.ts",
     "./gitRoot": "./src/gitRoot.ts",
     "./graph/compile": "./src/graph/compile/index.ts",

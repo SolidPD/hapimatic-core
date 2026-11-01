@@ -48,6 +48,9 @@ export function ProviderModelFields(props: {
   api: ApiClient | null;
   rawModel: string;
   effort: EffortLevel | "";
+  /** Issue #6028: the target node's resolved spawn default effort (undefined =
+   *  unknown — an older daemon or peer). Names the Effort "default" option. */
+  nodeDefaultEffort?: EffortLevel;
   onRawModelChange: (value: string) => void;
   onEffortChange: (value: EffortLevel | "") => void;
   /** Issue #3348: gemini native model ("" = Auto) + its setter. */
@@ -103,6 +106,7 @@ export function ProviderModelFields(props: {
           api={props.api}
           rawModel={props.rawModel}
           effort={props.effort}
+          nodeDefaultEffort={props.nodeDefaultEffort}
           isDisabled={props.fields.rawModel.disabled}
           onRawModelChange={props.onRawModelChange}
           onEffortChange={props.onEffortChange}

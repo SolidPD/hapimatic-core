@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { EffortLevel } from "@hapi/protocol";
 import type { ApiClient } from "@/api/client";
 import { useDaemonCapacity } from "@/hooks/queries/useDaemonCapacity";
 
@@ -18,6 +19,10 @@ export interface SpawnCapacity {
   effectiveCount: number | null;
   recommended: number | null;
   max: number | null;
+  /** Issue #6028: the target node's resolved spawn default effort (the daemon's
+   *  `/spawn-defaults`, read through the same local poll / remote summary).
+   *  Undefined = unknown (an older daemon or peer). */
+  defaultEffort?: EffortLevel;
 }
 
 /** The selected spawn target's capacity inputs. Remote nodes carry the federation
@@ -30,6 +35,7 @@ export type SpawnCapacityTarget =
         effectiveCount?: number;
         recommendedConcurrent?: number;
         maxConcurrent?: number;
+        defaultEffort?: EffortLevel;
       };
     }
   | null;
@@ -78,6 +84,7 @@ export function useSpawnCapacity(
       effectiveCount: target.node.effectiveCount ?? null,
       recommended: target.node.recommendedConcurrent ?? null,
       max: target.node.maxConcurrent ?? null,
+      defaultEffort: target.node.defaultEffort,
     };
   }
   if (isLocal && local.data) {
@@ -85,6 +92,7 @@ export function useSpawnCapacity(
       effectiveCount: local.data.effectiveCount,
       recommended: local.data.recommendedConcurrent,
       max: local.data.maxConcurrent,
+      defaultEffort: local.data.spawnDefaults?.effort,
     };
   }
   return { effectiveCount: null, recommended: null, max: null };

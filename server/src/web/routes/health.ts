@@ -7,6 +7,8 @@ import { getGlobalSessionsP95Ms } from "../../metrics/sessionsMetrics";
 import { getSocketCounts } from "../../metrics/socketMetrics";
 import { gatherSystemHealth } from "../../metrics/systemHealth";
 import { createAuthMiddleware } from "../middleware/auth";
+import { createHealthReadAuthMiddleware } from "../middleware/healthReadAuth";
+import type { HealthReadTokenVerifier } from "../../config/healthReadToken";
 import type { ErrorLogger } from "../../logging/errorLogger";
 
 // The system-health metric-gathering logic was extracted to
@@ -46,10 +48,13 @@ export interface HealthResponse {
  * - `/system-health` returns host metadata (hostname, CPU, memory, disk)
  *   that should not be readable by unauthenticated callers (#1062 M-3).
  *   When `jwtSecret` is provided, JWT auth is enforced on that route only.
+ *   When a `healthReadVerifier` is also provided, the route additionally
+ *   accepts the monitoring sweep's read-only health token on GET/HEAD (#5444).
  */
 export function createHealthRoutes(
   jwtSecret?: Uint8Array,
-  errorLogger?: ErrorLogger | null
+  errorLogger?: ErrorLogger | null,
+  healthReadVerifier?: HealthReadTokenVerifier
 ): Hono {
   const app = new Hono();
 
@@ -97,8 +102,20 @@ export function createHealthRoutes(
   // JWT auth here is a defense-in-depth hardening with no UX cost.
   // Mounted BEFORE the global /api/* JWT middleware, so we apply auth inline
   // for this specific route.
+  // #5444: with a verifier, the route also accepts the monitoring sweep's
+  // read-only health token (`hhr_…`), which every other route refuses. It is
+  // listed in HEALTH_READ_PATHS (middleware/healthReadAuth.ts).
   if (jwtSecret) {
-    app.use("/system-health", createAuthMiddleware(jwtSecret, errorLogger));
+    app.use(
+      "/system-health",
+      healthReadVerifier
+        ? createHealthReadAuthMiddleware({
+            jwtSecret,
+            errorLogger,
+            verifier: healthReadVerifier,
+          })
+        : createAuthMiddleware(jwtSecret, errorLogger)
+    );
   }
   app.get(
     "/system-health",

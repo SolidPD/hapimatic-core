@@ -21,7 +21,7 @@ import {
 import { configuration } from "@/configuration";
 import { getAuthToken } from "@/api/auth";
 import { ApiMachineClient } from "./apiMachine";
-import { ApiSessionClient } from "./apiSession";
+import { ApiSessionClient, type ApiSessionClientOptions } from "./apiSession";
 import type { AccountCaptureNotice } from "@/accounts/credentialsWatcher";
 
 export class ApiClient {
@@ -31,11 +31,16 @@ export class ApiClient {
 
   private constructor(private readonly token: string) {}
 
+  /**
+   * Attach to (or create) the session record. `deliveryFloorSeq` is the seq
+   * after which this wrapper takes delivery of user messages (#4682), or
+   * `null` from an older server that does not send it.
+   */
   async getOrCreateSession(opts: {
     tag: string;
     metadata: Metadata;
     state: AgentState | null;
-  }): Promise<Session> {
+  }): Promise<{ session: Session; deliveryFloorSeq: number | null }> {
     const response = await axios.post<CreateSessionResponse>(
       `${configuration.serverUrl}/cli/sessions`,
       {
@@ -71,7 +76,7 @@ export class ApiClient {
       return parsedAgentState.success ? parsedAgentState.data : null;
     })();
 
-    return {
+    const session: Session = {
       id: raw.id,
       namespace: raw.namespace,
       seq: raw.seq,
@@ -88,6 +93,10 @@ export class ApiClient {
       todos: raw.todos,
       permissionMode: raw.permissionMode,
       modelMode: raw.modelMode,
+    };
+    return {
+      session,
+      deliveryFloorSeq: parsed.data.deliveryFloorSeq ?? null,
     };
   }
 
@@ -145,8 +154,11 @@ export class ApiClient {
     };
   }
 
-  sessionSyncClient(session: Session): ApiSessionClient {
-    return new ApiSessionClient(this.token, session);
+  sessionSyncClient(
+    session: Session,
+    options?: ApiSessionClientOptions
+  ): ApiSessionClient {
+    return new ApiSessionClient(this.token, session, options);
   }
 
   machineSyncClient(machine: Machine): ApiMachineClient {

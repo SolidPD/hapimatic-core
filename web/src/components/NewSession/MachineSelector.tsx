@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { RefreshCw } from "lucide-react";
-import type { FederationNodeStatus } from "@hapi/protocol";
+import type { EffortLevel, FederationNodeStatus } from "@hapi/protocol";
 import type { DaemonCapSource } from "@hapi/protocol/schemas";
 import { PCB_TOOLCHAIN_TAG } from "@hapi/protocol";
 import type { Machine } from "@/types/api";
@@ -31,6 +31,9 @@ export type RemoteNode = {
   // Undefined for a pre-#4417 peer → no warning / source "remote".
   recommendedConcurrent?: number;
   capSource?: DaemonCapSource;
+  /** #6028: the node daemon's resolved spawn default effort — names the Effort
+   *  "default" option for a remote target. Undefined for a pre-#6028 peer. */
+  defaultEffort?: EffortLevel;
 };
 
 /**

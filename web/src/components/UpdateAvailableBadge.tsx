@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Dialog,
   DialogContent,
@@ -15,8 +22,13 @@ import {
   useStageUpdate,
   useTriggerUpdate,
   useCancelDeferral,
+  requestUpdateCheck,
   type UpdateMode,
+  type UpdateStatus,
 } from "@/hooks/useUpdateStatus";
+import { errorReporter } from "@/lib/error-reporter";
+import { queryKeys } from "@/lib/query-keys";
+import { reloadWhenVisible } from "@/lib/safe-reload";
 import {
   activateSwUpdate,
   isSwUpdatePending,
@@ -25,15 +37,28 @@ import {
 } from "@/lib/sw-update";
 
 /**
- * The single mint-green update bar (issue #3057) — the ONE surface for both the
- * VM binary-update pipeline (#1006/#2589) and the service-worker asset refresh
- * (#1793). It replaces the old two-bar UX (a yellow "Update available" badge
- * stacked over a green "New version — Reload" banner) with one truthful,
- * phase-aware bar rendered below the title bar in BrandedFrame.
+ * The update-availability flow (issue #3057, relocated by #3277) — ONE truthful,
+ * phase-aware flow for both the VM binary-update pipeline (#1006/#2589) and the
+ * service-worker asset refresh (#1793). Until #3277 it was a single mint bar below
+ * the title bar; it is now three mounts that share one phase:
+ *
+ *  - {@link UpdateReloadEngine} — headless, mounted in BrandedFrame for as long as
+ *    the app chrome is up. It owns the always-on effects: the first-seen server
+ *    version, the once-guarded terminal reload, its stall timer, and the SW
+ *    activation. They run whether or not the settings drawer is open (#3277 R5).
+ *  - the gear count — {@link useUpdateAlertCount} feeds the shared `CountBadge`
+ *    on the header's settings gear, shown whenever the banner has a row. Signed
+ *    out, BrandedFrame shows no count: the drawer only mounts after sign-in.
+ *  - {@link UpdateDrawerBanner} — the tap-to-update banner and its confirm dialog,
+ *    inside the settings drawer under its "Settings" heading.
+ *
+ * All three take their phase from {@link derivePhase}, fed by the shared
+ * `updateStatus` query and a page-scoped store (the terminal-reload flags and the
+ * acknowledged failure), so the badge and the banner never disagree.
  *
  * ## Lifecycle (durable two-phase updater)
  *
- * The bar's phase comes from `/api/update-status`'s durable `job` record — NOT
+ * The phase comes from `/api/update-status`'s durable `job` record — NOT
  * from a resolved mutation, since an HTTP 202 is launch acceptance, not
  * completion (expert-review S-1). The flow:
  *
@@ -43,7 +68,7 @@ import {
  *
  *  - **available:** versioned copy; the first click starts the non-disruptive
  *    download (`useStageUpdate`) — it does NOT open the confirm dialog yet (R2).
- *  - **staging:** a spinner rides the bar for the whole durable staging phase;
+ *  - **staging:** a spinner rides the banner for the whole durable staging phase;
  *    duplicate starts are disabled (R2).
  *  - **ready:** the existing #2589 restart/session dialog opens — automatically
  *    if this click initiated the stage, or on a later click if the update was
@@ -55,14 +80,17 @@ import {
  *  - **succeeded:** the terminal reload waits for the target server to be healthy,
  *    then asks the SW to check for the new worker and activates it through the
  *    visibility-guarded path (R5/R8). A persisted "reloaded-for" flag makes this
- *    fire exactly once — the post-reload page stays quiet (no reload loop). It
- *    fires only in a page that first saw the server on an older version, and a
- *    stalled reload turns into a tappable "reload to finish" bar (#4924).
- *  - **failed / timeout:** one actionable bar with retry/error copy; the update
+ *    fire once per update target — the post-reload page stays quiet (no reload
+ *    loop) — and a per-mount latch keyed to the target keeps a same-page double
+ *    fire out while still letting a second update applied in the same open page
+ *    reload (#5651). It fires only in a page that first saw the server on an
+ *    older version, and a stalled reload turns into a tappable "reload to
+ *    finish" row (#4924).
+ *  - **failed / timeout:** one actionable row with retry/error copy; the update
  *    is never silently hidden nor falsely reported complete (R7).
  *
  * A standalone SW-only refresh (fresh static assets, no pipeline update) renders
- * the SAME bar with truthful GENERIC copy (never the old version number) and a
+ * the SAME banner with truthful GENERIC copy (never the old version number) and a
  * single click that activates safely (R1/R8).
  */
 
@@ -86,17 +114,17 @@ function markReloadedFor(version: string): void {
     localStorage.setItem(RELOADED_KEY, version);
   } catch {
     // A disabled/full store just means the once-guard degrades to per-mount; the
-    // terminalFiredRef still prevents a same-mount double reload.
+    // terminalFiredForRef still prevents a same-mount double reload of one target.
   }
 }
 
 /**
  * The first real server version this PAGE saw (#4924). Module scope, not a ref:
- * the app remounts the bar during its auth bootstrap, and a per-mount ref would
+ * the app remounts BrandedFrame during its auth bootstrap, and a per-mount ref would
  * forget what the page loaded against. It resets on reload, the only point at
  * which the page can pick up new assets. A page that first saw the server already
  * on a job's target loaded after that update, so it starts no reload flow; if it
- * still runs an older precached shell, the sw-only bar offers the new worker.
+ * still runs an older precached shell, the banner's sw-only row offers the new worker.
  */
 let firstServerVersion: string | null = null;
 const REAL_VERSION = /^\d+\.\d+\.\d+/;
@@ -107,9 +135,78 @@ function noteServerVersion(version: string | undefined): void {
   }
 }
 
+/**
+ * Page-scoped UI state (#3277). It lived in the single bar's `useState` until the
+ * bar was split: the engine writes it, and the badge and the banner read it, but
+ * they mount in different places (the banner only while the drawer is open), so it
+ * moved to module scope like `firstServerVersion`. It resets on reload, which is
+ * where the terminal-reload flow ends.
+ */
+interface UpdateUiState {
+  /** The terminal reload started: the engine asked for the new worker. */
+  reloadInFlight: boolean;
+  /** The new worker did not arrive within SW_ACTIVATE_TIMEOUT_MS. */
+  reloadStalled: boolean;
+  /** The user acknowledged a rolled-back failure that left nothing to re-stage. */
+  failureDismissed: boolean;
+}
+
+const INITIAL_UI_STATE: UpdateUiState = {
+  reloadInFlight: false,
+  reloadStalled: false,
+  failureDismissed: false,
+};
+let uiState: UpdateUiState = INITIAL_UI_STATE;
+const uiListeners = new Set<() => void>();
+
+function setUiState(patch: Partial<UpdateUiState>): void {
+  const keys = Object.keys(patch) as (keyof UpdateUiState)[];
+  if (keys.every(key => uiState[key] === patch[key])) return;
+  uiState = { ...uiState, ...patch };
+  for (const listener of uiListeners) listener();
+}
+
+function subscribeUiState(listener: () => void): () => void {
+  uiListeners.add(listener);
+  return () => {
+    uiListeners.delete(listener);
+  };
+}
+
+function getUiState(): UpdateUiState {
+  return uiState;
+}
+
+/** Reactive read of the page-scoped update UI state (#3277). */
+export function useUpdateUiState(): UpdateUiState {
+  return useSyncExternalStore(subscribeUiState, getUiState, getUiState);
+}
+
 /** Test-only reset of the page-scoped state (mirrors resetSwUpdateForTests). */
 export function resetUpdateBadgeStateForTests(): void {
   firstServerVersion = null;
+  uiState = INITIAL_UI_STATE;
+  for (const listener of uiListeners) listener();
+  for (const t of handoffTimers) clearTimeout(t);
+  handoffTimers = [];
+  try {
+    sessionStorage.removeItem(REFRESH_HANDOFF_KEY);
+  } catch {
+    // no store, nothing to clear
+  }
+}
+
+/**
+ * Whether a new service worker is waiting. The signal is one-shot and can fire
+ * before a surface mounts, so read the latch on mount AND subscribe (R9).
+ */
+function useSwPending(): boolean {
+  const [swPending, setSwPending] = useState(isSwUpdatePending);
+  useEffect(() => {
+    if (isSwUpdatePending()) setSwPending(true);
+    return onSwUpdateAvailable(() => setSwPending(true));
+  }, []);
+  return swPending;
 }
 
 type BarPhase =
@@ -123,45 +220,99 @@ type BarPhase =
   | "sw-only"
   | null;
 
-export function UpdateAvailableBadge() {
-  const { data, refetch } = useUpdateStatus();
-  const stage = useStageUpdate();
-  const trigger = useTriggerUpdate();
-  const cancelDeferral = useCancelDeferral();
+interface PhaseInputs {
+  data: UpdateStatus | undefined;
+  swPending: boolean;
+  reloadInFlight: boolean;
+  failureDismissed: boolean;
+}
 
-  const [dialogOpen, setDialogOpen] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [swPending, setSwPending] = useState(isSwUpdatePending);
-  const [awaitingReady, setAwaitingReady] = useState(false);
-  const [reloadInFlight, setReloadInFlight] = useState(false);
-  const [reloadStalled, setReloadStalled] = useState(false);
-  const [dismissedFailure, setDismissedFailure] = useState(false);
-  const terminalFiredRef = useRef(false);
+/** Whether the durable job record is for the version the server offers now. */
+function isJobForLatest(data: UpdateStatus | undefined): boolean {
+  return (
+    data?.job?.phase !== undefined &&
+    data.job.targetVersion === data.latestVersion
+  );
+}
 
-  // R9 mount-race latch + later events: a waiting SW can be signalled before this
-  // mounts (the event is one-shot), so read the latch on mount AND subscribe.
-  useEffect(() => {
-    if (isSwUpdatePending()) setSwPending(true);
-    return onSwUpdateAvailable(() => setSwPending(true));
-  }, []);
+/**
+ * The single effective phase, priority-ordered. The gear badge and the drawer
+ * banner both reach it through {@link useUpdatePhase}, so the badge shows exactly
+ * when the banner has a row.
+ */
+export function derivePhase({
+  data,
+  swPending,
+  reloadInFlight,
+  failureDismissed,
+}: PhaseInputs): BarPhase {
+  const jobPhase = data?.job?.phase;
+  const available = data?.updateAvailable === true;
+  const jobIsForLatest = isJobForLatest(data);
+  if (data?.deferred?.pending === true) return "pending";
+  // #3737 defect #4: guard `applying` the same way the `failed` branch below is guarded
+  // (`jobIsForLatest || !available`) so a stale/foreign-target applying job never masks a
+  // genuinely-newer available update. During a real apply `target === latest`, so
+  // `jobIsForLatest` holds and the healthy "Updating…" flow is unchanged; a leftover applying
+  // for an older target falls through to `available` instead of pinning a permanent spinner.
+  if (jobPhase === "applying" && (jobIsForLatest || !available))
+    return "applying";
+  // #4924: a waiting worker must still surface here — after a stalled tap the
+  // page reloads onto the same old worker with `reloaded-for` already set.
+  if (jobPhase === "succeeded" && jobIsForLatest)
+    return reloadInFlight ? "reloading" : swPending ? "sw-only" : null;
+  if (
+    jobPhase === "failed" &&
+    !failureDismissed &&
+    (jobIsForLatest || !available)
+  )
+    return "failed";
+  if (jobPhase === "staging" && jobIsForLatest) return "staging";
+  if (available && jobPhase === "ready" && jobIsForLatest) return "ready";
+  if (available) return "available";
+  if (reloadInFlight) return "reloading";
+  if (swPending) return "sw-only";
+  return null;
+}
+
+/**
+ * The phase for `data`, from the same SW latch and page-scoped store every
+ * surface reads. The badge and the banner both call this, so they cannot feed
+ * {@link derivePhase} different inputs.
+ */
+function useUpdatePhase(data: UpdateStatus | undefined): BarPhase {
+  const swPending = useSwPending();
+  const { reloadInFlight, failureDismissed } = useUpdateUiState();
+  return derivePhase({ data, swPending, reloadInFlight, failureDismissed });
+}
+
+/**
+ * The gear badge's count (#3277): 1 whenever the banner has a row (to tap, or
+ * spinning while an update stages, applies or reloads), else 0.
+ * The status is single-instance today; a fleet view would sum here.
+ */
+export function useUpdateAlertCount(): number {
+  const { data } = useUpdateStatus();
+  return useUpdatePhase(data) === null ? 0 : 1;
+}
+
+/**
+ * Headless (#3277 R5): the update flow's always-on effects. Mount it once, in a
+ * place that stays mounted while the app chrome is up (BrandedFrame), never in
+ * the drawer, or an applied update would only finish reloading with the drawer open.
+ */
+export function UpdateReloadEngine(): null {
+  const { data } = useUpdateStatus();
+  const swPending = useSwPending();
+  const { reloadInFlight } = useUpdateUiState();
+  // The target the terminal effect last acted on (#5651). Keyed to the target, not
+  // a boolean: the load-time early returns use it up for update T, and a later
+  // update T2 in the same mount must still start its reload flow.
+  const terminalFiredForRef = useRef<string | null>(null);
 
   const jobPhase = data?.job?.phase;
   const target = data?.job?.targetVersion;
-  const available = data?.updateAvailable === true;
-  const pendingDeferral = data?.deferred?.pending === true;
-  const latest = data?.latestVersion;
   const current = data?.currentVersion;
-  const sessionImpact = data?.sessionImpact;
-  const machine = data?.machineName?.trim() || "this instance";
-  const jobIsForLatest = jobPhase !== undefined && target === latest;
-
-  // The initiating click opens the confirm dialog once staging reaches `ready` (R3).
-  useEffect(() => {
-    if (awaitingReady && jobPhase === "ready" && jobIsForLatest) {
-      setDialogOpen(true);
-      setAwaitingReady(false);
-    }
-  }, [awaitingReady, jobPhase, jobIsForLatest]);
 
   // Declared BEFORE the terminal effect so the first data render records the
   // version before the terminal check reads it (effects run in order).
@@ -169,25 +320,25 @@ export function UpdateAvailableBadge() {
     noteServerVersion(current);
   }, [current]);
 
-  // Completion → drive the terminal reload EXACTLY once (R5/R6/R8). We only reload
-  // when the browser is actually stale: the server now runs the job's target AND
-  // this page first saw it on another version (#4924 — `job.json` is never
-  // deleted, so a `succeeded` record outlives its update and must not start a
-  // reload in a page that loaded afterwards). A persisted "reloaded-for" flag also
+  // Completion → drive the terminal reload once per target (R5/R6/R8, #5651). We
+  // only reload when the browser is actually stale: the server now runs the job's
+  // target AND this page first saw it on another version (#4924 — `job.json` is
+  // never deleted, so a `succeeded` record outlives its update and must not start
+  // a reload in a page that loaded afterwards). A persisted "reloaded-for" flag also
   // records that this browser already started the reload flow for the target, so
-  // it never re-fires; a page still on the old worker gets the sw-only bar instead.
+  // it never re-fires; a page still on the old worker gets the sw-only row instead.
   useEffect(() => {
     const completed =
       !!target &&
       current === target &&
       (jobPhase === "succeeded" || jobPhase === "applying");
-    if (!completed || terminalFiredRef.current) return;
-    terminalFiredRef.current = true;
+    if (!completed || terminalFiredForRef.current === target) return;
+    terminalFiredForRef.current = target;
     if (firstServerVersion === target) {
       // This page loaded after the update, so it starts no reload flow. It may
       // still run an older shell from the outgoing worker's precache (a reload
       // during the restart), so look for the new worker once: if one installs,
-      // the manual sw-only bar offers it.
+      // the banner's manual sw-only row offers it.
       requestSwUpdateCheck();
       return;
     }
@@ -196,57 +347,74 @@ export function UpdateAvailableBadge() {
       return;
     }
     markReloadedFor(target); // mark BEFORE reloading so the reloaded page is quiet
-    setReloadInFlight(true);
+    setUiState({ reloadInFlight: true });
     requestSwUpdateCheck(); // ask the SW machinery for the new worker (self-clearing)
   }, [jobPhase, target, current]);
 
   // The stall timer lives in its own effect (#4924): inside the terminal effect it
   // was cleared by that effect's cleanup when the phase moved from `applying` to
-  // `succeeded`, and the early return on terminalFiredRef never re-armed it, so
-  // the bar spun on "Update complete — reloading…" with no way out.
+  // `succeeded`, and the early return on the terminal latch never re-armed it, so
+  // the bar spun on "Update complete — reloading…" with no way out. An engine
+  // that remounts mid-reload re-arms it, since the flag is page-scoped (#3277).
   useEffect(() => {
     if (!reloadInFlight) return;
-    const t = setTimeout(() => setReloadStalled(true), SW_ACTIVATE_TIMEOUT_MS);
+    const t = setTimeout(
+      () => setUiState({ reloadStalled: true }),
+      SW_ACTIVATE_TIMEOUT_MS
+    );
     return () => clearTimeout(t);
   }, [reloadInFlight]);
 
   // A waiting SW appeared during the terminal flow → activate it through the
   // visibility-guarded path (never a raw location.reload — R8, #1793/#3053).
+  // The engine subscribes for itself: the banner may not be mounted when it lands.
   useEffect(() => {
     if (reloadInFlight && swPending) activateSwUpdate();
   }, [reloadInFlight, swPending]);
 
-  // ── Derive the single effective bar phase (priority-ordered) ────────────────
-  let phase: BarPhase = null;
-  if (pendingDeferral) phase = "pending";
-  // #3737 defect #4: guard `applying` the same way the `failed` branch below is guarded
-  // (`jobIsForLatest || !available`) so a stale/foreign-target applying job never masks a
-  // genuinely-newer available update. During a real apply `target === latest`, so
-  // `jobIsForLatest` holds and the healthy "Updating…" flow is unchanged; a leftover applying
-  // for an older target falls through to `available` instead of pinning a permanent spinner.
-  else if (jobPhase === "applying" && (jobIsForLatest || !available))
-    phase = "applying";
-  // #4924: a waiting worker must still surface here — after a stalled tap the
-  // page reloads onto the same old worker with `reloaded-for` already set.
-  else if (jobPhase === "succeeded" && jobIsForLatest)
-    phase = reloadInFlight ? "reloading" : swPending ? "sw-only" : null;
-  else if (
-    jobPhase === "failed" &&
-    !dismissedFailure &&
-    (jobIsForLatest || !available)
-  )
-    phase = "failed";
-  else if (jobPhase === "staging" && jobIsForLatest) phase = "staging";
-  else if (available && jobPhase === "ready" && jobIsForLatest) phase = "ready";
-  else if (available) phase = "available";
-  else if (reloadInFlight) phase = "reloading";
-  else if (swPending) phase = "sw-only";
+  return null;
+}
+
+/**
+ * The tap-to-update banner and its confirm dialog (#3277 R3), rendered in the
+ * settings drawer below the "Settings" heading. It owns no terminal effect: the
+ * engine does.
+ */
+export function UpdateDrawerBanner() {
+  const { data, refetch } = useUpdateStatus();
+  const stage = useStageUpdate();
+  const trigger = useTriggerUpdate();
+  const cancelDeferral = useCancelDeferral();
+  const phase = useUpdatePhase(data);
+  const { reloadStalled } = useUpdateUiState();
+
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [awaitingReady, setAwaitingReady] = useState(false);
+
+  const jobPhase = data?.job?.phase;
+  const target = data?.job?.targetVersion;
+  const available = data?.updateAvailable === true;
+  const pendingDeferral = data?.deferred?.pending === true;
+  const sessionImpact = data?.sessionImpact;
+  const machine = data?.machineName?.trim() || "this instance";
+  const jobIsForLatest = isJobForLatest(data);
+
+  // The initiating click opens the confirm dialog once staging reaches `ready` (R3).
+  // Closing the drawer mid-staging unmounts this, so the dialog then waits for a
+  // later tap on the `ready` row instead of opening by itself.
+  useEffect(() => {
+    if (awaitingReady && jobPhase === "ready" && jobIsForLatest) {
+      setDialogOpen(true);
+      setAwaitingReady(false);
+    }
+  }, [awaitingReady, jobPhase, jobIsForLatest]);
 
   if (phase === null) return null;
 
   const busy = stage.isPending || trigger.isPending || cancelDeferral.isPending;
-  // #4924: once the terminal reload has stalled, the bar says "reload to finish"
-  // and must take the tap (a spinning bar is disabled and its click handler
+  // #4924: once the terminal reload has stalled, the row says "reload to finish"
+  // and must take the tap (a spinning row is disabled and its click handler
   // returns early).
   const spinning =
     phase === "staging" ||
@@ -316,14 +484,16 @@ export function UpdateAvailableBadge() {
 
   const retry = async () => {
     setError(null);
-    setDismissedFailure(false);
+    setUiState({ failureDismissed: false });
     if (available) {
       // A staged/apply failure that left the marker → re-stage (the actionable path).
       await beginStage();
     } else {
       // An apply that rolled back and consumed the marker → nothing to re-stage.
       // Acknowledge the failure (the instance is safely on the prior version).
-      setDismissedFailure(true);
+      // Page-scoped, so the gear badge clears too and reopening the drawer does
+      // not bring the row back (#3277).
+      setUiState({ failureDismissed: true });
     }
   };
 
@@ -376,19 +546,19 @@ export function UpdateAvailableBadge() {
 
   return (
     <>
-      {/* Placement (issue #1793 follow-up): a SLIM, full-width mint band in normal
-          document flow *below the title bar* — NOT a `fixed top-0 … z-50` overlay
-          (that covered the title bar and made the action unclickable, and is the
-          notch hazard #2779 documents). Keep this flowed and low-padding. The mint
-          comes from the theme-driven `bg-accent` token — never the hardcoded
-          #5ae6ab / the old #f59e0b amber (design-token swap contract). */}
+      {/* Placement (#3277): a rounded, full-width row inside the settings drawer,
+          below its pinned "Settings" heading — it replaced the persistent band
+          below the title bar. The drawer is a fixed 300px wide, so the copy wraps
+          left-aligned. The mint comes from the theme-driven `bg-accent` token —
+          never the hardcoded #5ae6ab / the old #f59e0b amber (design-token swap
+          contract). `BareButton` keeps a spinning row focusable but inert (#3462). */}
       <BareButton
         type="button"
         onClick={onBarClick}
         disabled={spinning}
         title={label}
         aria-label={label}
-        className="flex w-full items-center justify-center gap-1.5 whitespace-normal bg-accent px-3 py-1 text-xs font-semibold text-[var(--palette-accent-fg)] shadow-sm disabled:opacity-90"
+        className="flex w-full items-center gap-2 whitespace-normal rounded-lg bg-accent px-3 py-2 text-left text-xs font-semibold text-[var(--palette-accent-fg)] shadow-sm disabled:opacity-90"
       >
         {spinning ? (
           <Spinner size="sm" label={null} className="!text-inherit" />
@@ -547,4 +717,138 @@ export function UpdateAvailableBadge() {
       </Dialog>
     </>
   );
+}
+
+/**
+ * When the page reloaded by Refresh re-reads `/api/update-status`, in ms after it
+ * mounts (#3277).
+ */
+export const REFRESH_RECHECK_DELAYS_MS = [3000, 8000] as const;
+
+/** Longest Refresh waits for the server to accept the check before reloading anyway. */
+export const REFRESH_CHECK_WAIT_MS = 4000;
+
+/** A hand-off older than this belongs to an abandoned reload, not this page. */
+const REFRESH_HANDOFF_MAX_AGE_MS = 60 * 1000;
+
+/** Tab-scoped note from the Refresh click to the page it reloads into (#3277). */
+const REFRESH_HANDOFF_KEY = `hapi:update-recheck::${
+  typeof window !== "undefined" ? window.location.origin : ""
+}`;
+
+/**
+ * The reload, behind an object so tests can observe it (jsdom cannot navigate).
+ * It goes through `reloadWhenVisible` (#1793): Refresh can wait up to
+ * {@link REFRESH_CHECK_WAIT_MS} for the server, and a PWA backgrounded in that
+ * window must not reload while hidden (the blank-shell case).
+ */
+export const pageReload = {
+  reload: (): void => reloadWhenVisible("app-refresh"),
+};
+
+/**
+ * Re-read timers of the reloaded page. Module scope, not a ref: BrandedFrame
+ * remounts during the auth bootstrap (#4924), and that remount must not cancel
+ * them. They run on the app's one query client, which outlives the remount.
+ */
+let handoffTimers: ReturnType<typeof setTimeout>[] = [];
+
+function writeRefreshHandoff(): void {
+  try {
+    sessionStorage.setItem(REFRESH_HANDOFF_KEY, String(Date.now()));
+  } catch {
+    // A disabled store only costs the follow-up re-reads; the next poll still runs.
+  }
+}
+
+/** Read and clear the hand-off; true when a recent Refresh reloaded this page. */
+function takeRefreshHandoff(): boolean {
+  try {
+    const raw = sessionStorage.getItem(REFRESH_HANDOFF_KEY);
+    if (raw === null) return false;
+    sessionStorage.removeItem(REFRESH_HANDOFF_KEY);
+    const at = Number(raw);
+    return Number.isFinite(at) && Date.now() - at <= REFRESH_HANDOFF_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The app Refresh button (#3277 R4; Matt's ruling U1 keeps the reload). Signed in,
+ * it asks the server to check the update bucket (`POST /api/update-check`) and waits
+ * up to {@link REFRESH_CHECK_WAIT_MS} for the server to accept it; signed out it
+ * skips that, since the route needs a JWT. Then it leaves a tab-scoped hand-off
+ * and reloads the app. The reloaded page picks the hand-off up and, 3 s and 8 s
+ * after it mounts, asks for a new service worker and re-reads `/api/update-status`:
+ * the 202 only means the check launched, and the script takes a few seconds
+ * (unmeasured) to fetch the bucket marker before it busts the server's status
+ * cache, so the reloaded page's first read can still see the old answer. A pending update then surfaces on the
+ * gear badge and in the drawer banner; if both re-reads miss, the next poll does.
+ */
+export function useAppRefreshUpdateCheck(signedIn: boolean): () => void {
+  const queryClient = useQueryClient();
+  const busyRef = useRef(false);
+
+  useEffect(() => {
+    if (!takeRefreshHandoff()) return;
+    for (const t of handoffTimers) clearTimeout(t);
+    handoffTimers = REFRESH_RECHECK_DELAYS_MS.map(delay =>
+      setTimeout(() => {
+        requestSwUpdateCheck();
+        void queryClient.invalidateQueries({
+          queryKey: queryKeys.updateStatus,
+        });
+      }, delay)
+    );
+  }, [queryClient]);
+
+  return useCallback(() => {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    const reload = () => {
+      writeRefreshHandoff();
+      pageReload.reload();
+    };
+    if (!signedIn) {
+      reload();
+      return;
+    }
+    // The check must be launched before this page goes away, but a slow or
+    // unreachable server must not hold the reload hostage, and a rejected check
+    // (no credential, launch failure) still reloads. A rejected or still-pending
+    // check is reported through the durable outbox, since the reload clears the
+    // console; a 501 (no updater script off the primary) resolves and is
+    // expected, so it is not reported.
+    let settled = false;
+    const accepted = requestUpdateCheck().then(
+      () => {
+        settled = true;
+      },
+      (err: unknown) => {
+        settled = true;
+        console.warn("[update-check] not started", err);
+        errorReporter.reportBeforeReload({
+          message: "Update check from Refresh did not start",
+          category: "update-check",
+          severity: "warn",
+          context: err instanceof Error ? err.message : String(err),
+        });
+      }
+    );
+    const waited = new Promise<void>(resolve =>
+      setTimeout(resolve, REFRESH_CHECK_WAIT_MS)
+    );
+    void Promise.race([accepted, waited]).then(() => {
+      if (!settled) {
+        errorReporter.reportBeforeReload({
+          message: "Update check still pending at the Refresh wait cap",
+          category: "update-check",
+          severity: "info",
+          context: `${REFRESH_CHECK_WAIT_MS} ms`,
+        });
+      }
+      reload();
+    });
+  }, [signedIn]);
 }

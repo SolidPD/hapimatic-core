@@ -13,6 +13,7 @@ import type { ClaudePtyRegistry } from "../../claudePtyRegistry";
 import type { SocketServer, SocketWithData } from "../../socketTypes";
 import type { ErrorLogger } from "../../../logging/errorLogger";
 import type { MessageWriteRetryQueue } from "./messageWriteRetryQueue";
+import { recordFirstCliConnect } from "./cliConnectFloors";
 import { registerMachineHandlers } from "./machineHandlers";
 import { registerRpcHandlers } from "./rpcHandlers";
 import {
@@ -146,6 +147,11 @@ export function registerCliHandlers(
   const sessionId = typeof auth?.sessionId === "string" ? auth.sessionId : null;
   if (sessionId && resolveSessionAccess(sessionId).ok) {
     socket.join(`session:${sessionId}`);
+    // #4682 (R15): the floor an old wrapper's from-zero backfill is served
+    // from. This listener runs before any packet from the client is
+    // processed, so the floor never includes the client's flushed buffered
+    // writes. Never throws.
+    recordFirstCliConnect(store, sessionId);
 
     // Cancel any pending disconnect grace timer — this session reconnected. (Issue #849)
     const pendingTimer = disconnectGraceTimers.get(sessionId);

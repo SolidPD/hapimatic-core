@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { GitHubFailureReason } from "@hapi/protocol/githubFailureReason";
+import { asGitHubConnectionStatus } from "@hapi/protocol/githubConnection";
 import type { GitHubAccountResult, GitHubRepoResult } from "./githubCli";
 import type { FetchImpl, RestIssueResult } from "./githubRest";
 
@@ -7,10 +8,12 @@ import type { FetchImpl, RestIssueResult } from "./githubRest";
  * VM-side client for the gateway GitHub read broker (issue #3013).
  *
  * 🔴 WHY THIS EXISTS: #2672 branch A removed the VM-resident `GH_TOKEN`, so the
- * read-only GitHub listings that authenticated via it went dark on a cloud VM (no
- * `gh`, no token). This module restores them WITHOUT a VM-resident credential: it
+ * read-only GitHub listings that authenticated via it went dark on a cloud VM (`gh` is
+ * installed but has no credential). This module restores them WITHOUT a VM-resident credential: it
  * calls the gateway broker (`gateway/src/routes/githubBroker.ts`), which performs the
- * GitHub REST call with ITS OWN read-only credential and returns shaped results. No
+ * GitHub REST call — since #4793 with the user's OWN linked GitHub App token, held on the
+ * gateway (issue reads fall back to the operator's broker credential, for public repositories
+ * only, when no usable link supplies a token) — and returns shaped results. No
  * GitHub token ever reaches the VM (R2). This is a transport, exactly like the `gh`
  * and token-REST transports — added strictly as the no-local-token fallback, so a host
  * that DOES have a token (RP1, CI) is byte-unchanged (CLAUDE.md → Fallback Preservation).
@@ -111,6 +114,35 @@ interface BrokerEnvelope {
  * or unparseable JSON all degrade to `broker_unavailable` — the token never appears in a
  * thrown/returned message (the throw is swallowed whole).
  */
+/**
+ * #4793: the gateway's `reason` on a "not configured" 503 (`BROKER_NOT_CONFIGURED` in
+ * gateway/src/routes/githubBroker.ts; the VM cannot import the gateway, so the literal is repeated).
+ */
+const GATEWAY_NOT_CONFIGURED = "not_configured";
+
+/**
+ * The reason behind a non-2xx broker answer: `broker_not_configured` when the gateway says its
+ * GitHub App is not set up yet (an answer, not an outage), else `broker_unavailable`. An older
+ * gateway, an unreadable body or any other status stays `broker_unavailable`.
+ */
+async function failureReason(response: Response): Promise<GitHubFailureReason> {
+  try {
+    const body = (await response.json()) as { reason?: unknown } | null;
+    return body?.reason === GATEWAY_NOT_CONFIGURED
+      ? "broker_not_configured"
+      : "broker_unavailable";
+  } catch {
+    return "broker_unavailable";
+  }
+}
+
+/**
+ * A broker call gives up after this long. Account reads are not cached on a broker host (#4793),
+ * so a hung gateway would otherwise stall every Create page and Settings visit; the budget leaves
+ * room for the gateway's own GitHub round trips behind a repository or issue read.
+ */
+export const BROKER_FETCH_TIMEOUT_MS = 20_000;
+
 async function brokerFetch(
   path: string,
   env: Record<string, string | undefined>,
@@ -126,13 +158,14 @@ async function brokerFetch(
   try {
     response = await fetchImpl(`${config.baseUrl}${path}`, {
       headers: { authorization: `Bearer ${config.token}` },
+      signal: AbortSignal.timeout(BROKER_FETCH_TIMEOUT_MS),
     });
   } catch {
     // Swallow the throw whole: a fetch rejection can embed the request (and the
     // Authorization header) in its message.
     return { ok: false, reason: "broker_unavailable" };
   }
-  if (!response.ok) return { ok: false, reason: "broker_unavailable" };
+  if (!response.ok) return { ok: false, reason: await failureReason(response) };
   try {
     return { ok: true, envelope: (await response.json()) as BrokerEnvelope };
   } catch {
@@ -157,17 +190,48 @@ function interpretEnvelope<T>(
   return { ok: false, reason: mapBrokerReason(envelope.reason) };
 }
 
-/** The broker credential's own identity (mirrors `fetchAccountViaRest`, minus token). */
-export async function fetchAccountViaBroker(
+/**
+ * Map one broker account entry onto {@link GitHubAccountResult}, keeping only known fields of the
+ * right type ("never trust the gateway's shape" — a malformed entry is dropped, not passed on).
+ */
+function toAccount(raw: unknown): GitHubAccountResult | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.login !== "string" || r.login === "") return null;
+  const account: GitHubAccountResult = {
+    login: r.login,
+    name: typeof r.name === "string" ? r.name : null,
+  };
+  if (typeof r.email === "string") account.email = r.email;
+  if (typeof r.isDefault === "boolean") account.isDefault = r.isDefault;
+  const status = asGitHubConnectionStatus(r.status);
+  if (status) account.status = status;
+  return account;
+}
+
+/**
+ * The GitHub accounts the VM's users linked on hapimatic.com (#4793), default first, each with its
+ * email, status and default mark. The WHOLE list: an empty list is a SUCCESS (`ok: true`, no
+ * accounts — the Create page then offers "Connect GitHub"), never `broker_unavailable`, which is
+ * a real outage (finding 4793-5). The gateway never lists its own credential here (R8).
+ */
+export async function fetchAccountsViaBroker(
   env: Record<string, string | undefined> = process.env,
   fetchImpl: FetchImpl = fetch
-): Promise<GitHubBrokerResult<GitHubAccountResult>> {
+): Promise<GitHubBrokerResult<GitHubAccountResult[]>> {
   const result = await brokerFetch("/accounts", env, fetchImpl);
-  return interpretEnvelope(result, e =>
-    Array.isArray(e.accounts)
-      ? (e.accounts[0] as GitHubAccountResult | undefined)
-      : undefined
-  );
+  return interpretEnvelope(result, e => {
+    if (!Array.isArray(e.accounts)) return undefined;
+    const accounts = e.accounts
+      .map(toAccount)
+      .filter((a): a is GitHubAccountResult => a !== null);
+    // Default first, order otherwise kept (the gateway already sends them so; this keeps the
+    // Create page's "first account" auto-select on the default whatever the gateway's version).
+    return [
+      ...accounts.filter(a => a.isDefault === true),
+      ...accounts.filter(a => a.isDefault !== true),
+    ];
+  });
 }
 
 /** Repos accessible to `account` via the broker (mirrors `fetchReposViaRest`). */

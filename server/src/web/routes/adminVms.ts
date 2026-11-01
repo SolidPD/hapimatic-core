@@ -43,7 +43,7 @@ import {
   maskSecretLine,
   maskSecretText,
   operatorActor,
-  parseInventoryAccessTokens,
+  parseInventoryTokens,
   parseSecretEnvValues,
   type AuditAction,
   type AuditLog,
@@ -83,7 +83,8 @@ import {
  *
  * ## 🔴 The inventory endpoint is an ALLOWLIST, never a blocklist
  *
- * The fleet inventory records a per-VM `access_token`. `toSanitizedEntry` reads
+ * The fleet inventory records a per-VM `health_token` (or, before #5444, the owner
+ * `access_token`). `toSanitizedEntry` reads
  * ONLY `{name, url, disk_threshold_pct}` and the OUTPUT is re-validated against
  * the `.strict()` `VmInventoryEntry` schema — so a token can never serialize out
  * even if a future inventory field is added (mirrors the server's
@@ -260,7 +261,8 @@ function toJobStatus(rec: JobRecord): JobStatusResponse {
 
 /**
  * Allowlist ONE raw inventory record to the sanitized entry. Reads only the
- * three UI-rendered fields — never `access_token`, `bucket`, or `namespace`.
+ * three UI-rendered fields — never `health_token`, `access_token`, `bucket`, or
+ * `namespace`.
  * The OUTPUT is re-validated by the caller against the `.strict()` schema.
  */
 function toSanitizedEntry(record: unknown): VmInventoryEntry {
@@ -452,7 +454,8 @@ export function createAdminVmRoutes(
   });
 
   // ── R4: collect the value-maskable secret set for live-log masking ──────────
-  // Sourced from the operator infra env file + the fleet inventory `access_token`s.
+  // Sourced from the operator infra env file + the fleet inventory's per-VM tokens
+  // (`access_token`, and `health_token` since #5444).
   // Read per SSE connection / per dry-run (always fresh; inventory can change).
   // A missing/unreadable source is non-fatal — the value-independent NAME=value +
   // pattern + entropy layers still fire. NEVER logs the file it reads.
@@ -468,9 +471,7 @@ export function createAdminVmRoutes(
       }
     }
     try {
-      values.push(
-        ...parseInventoryAccessTokens(await readInventory(inventoryPath))
-      );
+      values.push(...parseInventoryTokens(await readInventory(inventoryPath)));
     } catch {
       /* inventory absent — fine */
     }
@@ -713,8 +714,8 @@ export function createAdminVmRoutes(
   // A DISTINCT read-only route (ruling D2(a)) over Sub F's append-only ledger;
   // `vmParity` on the inventory entry is G1's (#3557) and is not touched here.
   // The inventory is consulted ONLY as a membership filter (which subdomains the
-  // fleet knows) — no inventory field reaches the response, so `access_token`
-  // cannot. Reads two local files (the ledger and the fleet inventory): no ssh /
+  // fleet knows) — no inventory field reaches the response, so neither
+  // `health_token` nor `access_token` can. Reads two local files (the ledger and the fleet inventory): no ssh /
   // oci / per-VM fetch in the request path.
   app.get(
     "/admin-vms/parity-history",

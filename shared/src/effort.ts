@@ -34,10 +34,10 @@ export const EFFORT_LEVEL_LABELS: Record<EffortLevel, string> = {
  * explicit effort pin (issue #2506, ruling D4 / sub-fork D1a — DISPLAY-ONLY).
  *
  * The `claude` binary chooses its own reasoning-effort budget when `--effort` is
- * omitted, and that choice is NOT introspectable from Hapimatic: the CLI sends
- * no flag on a default session (`cli/src/claude/sdk/types.ts:227` — "Omitted →
- * no --effort flag"; the spawn stays byte-identical), and Anthropic's
- * `/v1/models` exposes no default-effort field. So this is Hapimatic's ASSERTED
+ * omitted, and that choice is NOT introspectable from Hapimatic: a session with
+ * no recorded pin (a resume, or a session from before #5879) ran with no
+ * `--effort` flag (`cli/src/claude/sdk/types.ts:227` — "Omitted → no --effort
+ * flag"), and Anthropic's `/v1/models` exposes no default-effort field. So this is Hapimatic's ASSERTED
  * default, for DISPLAY ONLY — it never adds an `--effort` send site and never
  * changes the wire. Its sole purpose is to let the UI show a concrete effort
  * (F2 — "never blank") instead of an empty field when none was chosen.
@@ -46,8 +46,73 @@ export const EFFORT_LEVEL_LABELS: Record<EffortLevel, string> = {
  * hardcoding that was ruled out as brittle — directive D3). If Claude Code's
  * default reasoning budget is known to differ, change THIS one line; re-verify
  * on a Claude Code upgrade (same maintenance class as EFFORT_LEVELS / OR-4).
+ *
+ * Issue #5879: since the daemon now sends `--effort` on every fresh claude spawn
+ * ({@link SPAWN_DEFAULT_EFFORT_LEVEL}), a session without a recorded pin is a
+ * legacy session (or a resumed one that predates the default), or (#6028) one
+ * on a model that takes no effort — this constant still describes what a legacy
+ * session ran, so it stays "high".
  */
 export const DEFAULT_EFFORT_LEVEL: EffortLevel = "high";
+
+/**
+ * Hapimatic's spawn default (issue #5879, Matt's 2026-10-27 rule: "xhigh unless
+ * the user explicitly chooses another level"). The daemon sends it as `--effort`
+ * on a fresh claude spawn that names no effort, unless a node override applies —
+ * see {@link resolveSpawnEffort}. Unlike {@link DEFAULT_EFFORT_LEVEL} this is a
+ * value that is actually sent, so the session records it in `metadata.effort`.
+ */
+export const SPAWN_DEFAULT_EFFORT_LEVEL: EffortLevel = "xhigh";
+
+/** Where {@link resolveSpawnEffort} found the level it returned. */
+export type SpawnEffortSource = "body" | "env" | "settings" | "default";
+
+/** The result of {@link resolveSpawnEffort}. */
+export interface ResolvedSpawnEffort {
+  level: EffortLevel;
+  source: SpawnEffortSource;
+  /** Each non-empty, out-of-catalog value that was skipped, in tier order. */
+  rejected: Array<{
+    source: Exclude<SpawnEffortSource, "default">;
+    value: string;
+  }>;
+}
+
+function asEffortLevel(value: unknown): EffortLevel | null {
+  return typeof value === "string" &&
+    (EFFORT_LEVELS as readonly string[]).includes(value)
+    ? (value as EffortLevel)
+    : null;
+}
+
+/**
+ * Resolve the effort a fresh claude spawn launches with (issue #5879). Priority:
+ * an explicit spawn-body `effort` > env `HAPI_DEFAULT_EFFORT` > `settings.json`
+ * `defaultEffort` > {@link SPAWN_DEFAULT_EFFORT_LEVEL}. Env beats settings, the
+ * same order as the launcher resolver (`launcherResolver.ts`). An invalid value
+ * at any tier is recorded in `rejected` and falls through to the next tier, so a
+ * typo never blocks a spawn. This is the one precedence chain: a per-harness
+ * default store (#4227) adds its tier here rather than a second mechanism.
+ */
+export function resolveSpawnEffort(input: {
+  explicit?: unknown;
+  env?: unknown;
+  settings?: unknown;
+}): ResolvedSpawnEffort {
+  const rejected: ResolvedSpawnEffort["rejected"] = [];
+  const tiers: Array<[Exclude<SpawnEffortSource, "default">, unknown]> = [
+    ["body", input.explicit],
+    ["env", input.env],
+    ["settings", input.settings],
+  ];
+  for (const [source, raw] of tiers) {
+    if (raw === undefined || raw === null || raw === "") continue;
+    const level = asEffortLevel(raw);
+    if (level) return { level, source, rejected };
+    rejected.push({ source, value: String(raw) });
+  }
+  return { level: SPAWN_DEFAULT_EFFORT_LEVEL, source: "default", rejected };
+}
 
 /**
  * The full display label for the asserted default effort (e.g. "High").
@@ -64,7 +129,8 @@ export function getDefaultEffortLabel(): string {
  * alias — anything else (incl. "default") resolves to `null`, treated as the
  * permissive full-catalog case below.
  */
-type EffortFamily = "opus" | "sonnet" | "fable" | "haiku";
+export type ModelFamily = "opus" | "sonnet" | "fable" | "haiku";
+type EffortFamily = ModelFamily;
 
 /**
  * Model→effort-support map (OR-2). The binary's `modelSupportsEffort()` is NOT
@@ -98,6 +164,18 @@ function resolveEffortFamily(
 }
 
 /**
+ * The Claude model family named by a model-mode or a raw model id (e.g.
+ * `"claude-opus-5-5"` → `"opus"`), or `null` for `"default"`/unknown input.
+ * Issue #5879: the spawn headroom check uses it to find the model-scoped weekly
+ * window (`limits[].kind === "weekly_scoped"`) that applies to a spawn.
+ */
+export function resolveModelFamily(
+  rawModelOrMode: string | undefined | null
+): ModelFamily | null {
+  return resolveEffortFamily(rawModelOrMode);
+}
+
+/**
  * The effort levels a given model/mode should offer in the UI. For an unknown
  * or "default" input this returns the full catalog (permissive — the binary
  * ignores an unsupported level, and a default-mode session usually resolves to
@@ -121,4 +199,38 @@ export function modelSupportsEffort(
   level: EffortLevel
 ): boolean {
   return getEffortLevelsForModel(rawModelOrMode).includes(level);
+}
+
+/**
+ * Fit an effort level to the levels a model supports (issue #6028). The daemon
+ * clamps its spawn default with it and the New Session label uses it to name
+ * that default, so the two agree whenever they read the same catalog.
+ *
+ * - `supported === undefined` → support is unknown: `level` unchanged.
+ * - `supported` empty → the model takes no effort: `null` (send no `--effort`).
+ * - `level` supported → `level`.
+ * - otherwise the highest supported level ranked below `level`, else the lowest
+ *   supported level. The binary maps an unsupported `xhigh`/`max` to `high`, so
+ *   for the `xhigh` default this matches what the binary would run. Only when no
+ *   supported level ranks below `level` does it return a higher one (the lowest).
+ *
+ * Feed it the live catalog's per-model `effortLevels`, never the static family
+ * map above — that map disagrees with the catalog (e.g. Sonnet 4.6 lacks `xhigh`).
+ */
+export function clampEffortToModel(
+  level: EffortLevel,
+  supported: readonly EffortLevel[] | undefined
+): EffortLevel | null {
+  if (supported === undefined) return level;
+  if (supported.length === 0) return null;
+  if (supported.includes(level)) return level;
+  const rank = EFFORT_LEVELS.indexOf(level);
+  let below: EffortLevel | null = null;
+  let lowest: EffortLevel | null = null;
+  for (const candidate of EFFORT_LEVELS) {
+    if (!supported.includes(candidate)) continue;
+    lowest ??= candidate;
+    if (EFFORT_LEVELS.indexOf(candidate) < rank) below = candidate;
+  }
+  return below ?? lowest;
 }

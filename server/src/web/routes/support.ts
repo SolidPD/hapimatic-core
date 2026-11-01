@@ -42,6 +42,7 @@ import { createRateLimiter } from "../middleware/rateLimit";
 import { cataloged } from "../../capabilities/cataloged";
 import type { FeedbackSenderConfig } from "../../feedback/feedbackSender";
 import type { SupportChannelConfig } from "../../config/serverSettings";
+import type { ErrorLogger } from "../../logging/errorLogger";
 import { persistAndSendFeedback, type PersistAndSendInput } from "./feedback";
 import {
   materializeSupportWorkspace,
@@ -88,6 +89,11 @@ export interface SupportRouteOptions {
   getSecretLiterals: () => readonly string[];
   /** The resolved launcher kind (`GET /api/launcher/status`'s value). */
   getLauncherKind: () => string;
+  /**
+   * Raises a failed escalation email as a centralized `feedback-email` error
+   * (issue #2952), the same alert `POST /api/feedback` raises.
+   */
+  errorLogger?: ErrorLogger | null;
   /** Test seam: this host's name (default `os.hostname()`). */
   getHostname?: () => string;
   /** Test seam: Telegram delivery (default: the Bot API `sendDocument`). */
@@ -450,7 +456,8 @@ export function createSupportRoutes(
       const result = await persistAndSendFeedback(
         opts.store,
         opts.feedbackSender,
-        entry
+        entry,
+        { errorLogger: opts.errorLogger }
       );
       return c.json(
         { id: result.id, delivered: result.delivery === "sent" },

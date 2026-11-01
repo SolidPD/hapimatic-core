@@ -334,7 +334,7 @@ export const shellSingleQuote = shellEscape;
  * `spawnCommand` is the already-escaped command that runs claude AFTER the env
  * file is sourced+removed. It differs per launcher:
  * - remote (`claudeTmuxRemote.ts`): `exec '<claudePath>' '<arg>' ...`
- * - local/daemon (`claudeTmuxLauncher.ts`): `claude '<arg>' ...` (bare, PATH-resolved)
+ * - daemon→wrapper hop (`tmuxSpawnAdapter.ts`): the wrapper's own launch command
  *
  * Pure + exported for unit testing.
  */
@@ -350,11 +350,60 @@ export function buildTmuxEnvFileCommand(opts: {
    * whose pane starts every session kind's wrapper.
    */
   subscriptionClaudePane?: boolean;
+  /**
+   * #5963: names the `unset` clears after {@link paneEnvUnsetNames}'s, de-duplicated.
+   * The tmux launcher passes the active scrub set. Omitted by the daemon→wrapper
+   * hop: its pane command starts `bash <script>` under the same filter
+   * (`buildPaneInitialCommand`), and that non-login bash reads no login dotfile
+   * that could export a name back.
+   */
+  extraUnsetNames?: readonly string[];
 }): { fullCommand: string; envFileBody: string } {
+  // #5847: the env file never exports an AGENT_FORBIDDEN_ENV_VARS member, so no
+  // caller can hand one to a pane (the same promise buildLauncherEnv enforces by
+  // re-stripping after `extra`). No current caller passes one.
   const envFileBody =
     Object.entries(opts.launcherEnv)
+      .filter(([key]) => !AGENT_FORBIDDEN_ENV_VARS.has(key))
       .map(([key, value]) => `export ${key}=${shellSingleQuote(String(value))}`)
       .join("\n") + "\n";
+  // The per-pane unset runs BEFORE the env file is sourced, so it removes only
+  // inherited contamination; see paneEnvUnsetNames for why each name is in it.
+  const unsetNames = new Set([
+    ...paneEnvUnsetNames(opts),
+    ...(opts.extraUnsetNames ?? []),
+  ]);
+  const unsetClause = `unset ${[...unsetNames].join(" ")} && `;
+  const fullCommand =
+    unsetClause +
+    `cd ${shellSingleQuote(opts.cwd)} && ` +
+    `. ${shellSingleQuote(opts.envFilePath)} && ` +
+    `rm -f ${shellSingleQuote(opts.envFilePath)} && ` +
+    opts.spawnCommand;
+  return { fullCommand, envFileBody };
+}
+
+/**
+ * The variable names a tmux pane's shell `unset`s before it starts a launcher,
+ * in the order the unset clause lists them: the per-pane unset in
+ * {@link buildTmuxEnvFileCommand}. Without `subscriptionClaudePane` it equals
+ * the sandbox-OFF global-table scrub set (`buildServerGlobalScrubSet(false)`,
+ * `TmuxManager.ts`). The outer layer of the daemon's pane command
+ * (`buildPaneInitialCommand` in `tmuxSpawnAdapter.ts`), `ensureSession`'s
+ * `control` pane and the tmux launcher's window use `paneEnvScrubNames`
+ * (`TmuxManager.ts`) through `env -u`: this list without
+ * `subscriptionClaudePane` first, then the rest of the active scrub set. So with
+ * the sandbox off the outer layer names that list, and with it on it also covers
+ * `SECRET_ENV_VARS` (#5919, #5942, #5951, #5963). The tmux launcher's chain passes
+ * the same active set as `extraUnsetNames`, because its login shell runs after
+ * the filter.
+ *
+ * References the imported sets only inside its body, because of the
+ * TmuxManager ↔ launcherShared import cycle (see `omniboxServerEnvStrip`).
+ */
+export function paneEnvUnsetNames(
+  opts: { subscriptionClaudePane?: boolean } = {}
+): string[] {
   // #1692 (load-bearing): per-pane scrub of every SDK_SIGNAL_ENV_VARS member.
   // The shared `hapimatic-remote` tmux server snapshots the environment of its
   // FIRST creator; if that was an SDK-context process, CLAUDE_CODE_ENTRYPOINT=
@@ -395,20 +444,30 @@ export function buildTmuxEnvFileCommand(opts: {
   // #4884 (PM ruling): a subscription Claude pane also clears an inherited
   // ANTHROPIC_BASE_URL (`subscriptionClaudePane`); the wrapper hop keeps it for
   // key sessions.
-  const unsetNames = new Set([
-    ...SDK_SIGNAL_ENV_VARS,
-    ...BINDING_ENV_VARS,
-    ...API_KEY_HELPER_OUTRANKING_ENV_VARS,
-    ...(opts.subscriptionClaudePane ? SUBSCRIPTION_SESSION_STRIP_ENV_VARS : []),
-  ]);
-  const unsetClause = `unset ${[...unsetNames].join(" ")} && `;
-  const fullCommand =
-    unsetClause +
-    `cd ${shellSingleQuote(opts.cwd)} && ` +
-    `. ${shellSingleQuote(opts.envFilePath)} && ` +
-    `rm -f ${shellSingleQuote(opts.envFilePath)} && ` +
-    opts.spawnCommand;
-  return { fullCommand, envFileBody };
+  //
+  // #5847: the unset ALSO covers AGENT_FORBIDDEN_ENV_VARS, for both consumers. A
+  // tmux server an older daemon started (KillMode=process keeps it alive) holds
+  // the federation token in its global table, and the daemon→wrapper pane
+  // inherited it — so the wrapper, its web terminal and its local-mode Claude
+  // child all received it. The env file exports none of them, so nothing
+  // re-applies one after the unset.
+  //
+  // #5919/#5942/#5943: the daemon's pane command filters these names, plus the
+  // rest of the active scrub set, out of `bash <script>` and the idle `bash` left
+  // after the wrapper exits (`env -u`, see paneEnvScrubNames in TmuxManager.ts),
+  // so neither inherits a variable a failed global-table scrub missed. The
+  // wrapper's own values come from its env file, so its environment is unchanged.
+  return [
+    ...new Set([
+      ...SDK_SIGNAL_ENV_VARS,
+      ...BINDING_ENV_VARS,
+      ...API_KEY_HELPER_OUTRANKING_ENV_VARS,
+      ...AGENT_FORBIDDEN_ENV_VARS,
+      ...(opts.subscriptionClaudePane
+        ? SUBSCRIPTION_SESSION_STRIP_ENV_VARS
+        : []),
+    ]),
+  ];
 }
 
 /**

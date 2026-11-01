@@ -17,6 +17,7 @@ import { hookCoverageRecordSchema } from "./messageHookConfig";
 import { SPEND_LIMIT_VARIANTS } from "./apiErrorClasses";
 import { AccountMonogramSchema } from "./accountMonogram";
 import { StoredNotificationSchema } from "./notifications";
+import { ProviderIdSchema } from "./providerAuthState";
 
 export const PermissionModeSchema = z.enum(PERMISSION_MODES);
 /** Issue #2346: the Claude-only permission-mode subset (no codex modes). The
@@ -1822,6 +1823,24 @@ export type ShareApiKeysByDefaultPreference = z.infer<
 export const SHARE_API_KEYS_BY_DEFAULT_DEFAULT: ShareApiKeysByDefaultPreference =
   { enabled: false };
 
+// The Accounts page's usage view per provider section (#4467, epic #4460 G).
+// A federation-native key like `terminalKeyboardExpanded`. The record is
+// PARTIAL (`z.partialRecord`): zod 4 checks an enum-keyed `z.record`
+// exhaustively, which would reject `{ anthropic: "arcs" }`. An absent provider
+// renders Bars. The schema is strict, so a new view id or provider id is a wire
+// change: an older node drops the whole record until the lockstep deploy.
+export const USAGE_VIEW_IDS = ["bars", "arcs", "chips"] as const;
+export const UsageViewIdSchema = z.enum(USAGE_VIEW_IDS);
+export type UsageViewId = z.infer<typeof UsageViewIdSchema>;
+export const AccountsUsageViewPreferenceSchema = z.partialRecord(
+  ProviderIdSchema,
+  UsageViewIdSchema
+);
+export type AccountsUsageViewPreference = z.infer<
+  typeof AccountsUsageViewPreferenceSchema
+>;
+export const ACCOUNTS_USAGE_VIEW_DEFAULT: AccountsUsageViewPreference = {};
+
 // ── Federation-global settings layer (#2624, epic #2622 Sub-Issue B) ──
 //
 // The generic per-node settings model: each registered setting has a
@@ -1842,12 +1861,15 @@ export const SHARE_API_KEYS_BY_DEFAULT_DEFAULT: ShareApiKeysByDefaultPreference 
 // A-local `settings.json` storage, only the per-node first-paint cache #4516 owns
 // in the browser. `shareApiKeysByDefault` (#5127) is federation-native too: the
 // initial state of the add forms' "Make available to all nodes" checkbox.
+// `accountsUsageView` (#4467) is federation-native: each Accounts-page provider
+// section's usage view (Bars / Arcs / Chips).
 export const FEDERATION_SETTING_KEYS = [
   "chatSections",
   "defaultOutputStyle",
   "timeLogTimezone",
   "terminalKeyboardExpanded",
   "shareApiKeysByDefault",
+  "accountsUsageView",
 ] as const;
 export type FederationSettingKey = (typeof FEDERATION_SETTING_KEYS)[number];
 
@@ -2031,6 +2053,14 @@ export const DaemonCapacitySchema = z.object({
   recommendedConcurrent: z.number().int().optional(),
   /** Which resolver layer decided the cap (#4417). OPTIONAL for an older daemon. */
   capSource: DaemonCapSourceSchema.optional(),
+  /**
+   * Issue #6028: the node's resolved spawn defaults, read from the daemon's
+   * `/spawn-defaults` (not from the gate's `/effective-count`). `effort` is the
+   * level a fresh claude spawn gets before the per-model fit (env
+   * `HAPI_DEFAULT_EFFORT` > settings `defaultEffort` > xhigh). OPTIONAL: an
+   * older daemon has no such endpoint, and the UI keeps the shared default.
+   */
+  spawnDefaults: z.object({ effort: EffortLevelSchema }).optional(),
 });
 
 export type DaemonCapacity = z.infer<typeof DaemonCapacitySchema>;
@@ -3010,6 +3040,19 @@ export const FEEDBACK_MAX_ATTACHMENTS = 5;
 export const FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES = 10 * 1024 * 1024; // 10 MB across all attachments
 
 /**
+ * Byte cap on the whole `POST /api/feedback` request body (issue #2951 L2), read
+ * against the streamed bytes before `JSON.parse`. It must stay at or above
+ * `ceil(FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES × 4/3) + 1 MiB` (about 14.3 MiB): a
+ * full 10 MiB attachment set is about 13.3 MiB of base64, and the text fields add
+ * well under 100 KB, so a lower cap would refuse the largest legitimate submission.
+ * Set equal to the gateway relay's `FEEDBACK_RELAY_MAX_BODY_BYTES`
+ * (`gateway/src/lib/feedbackEmail.ts`), which receives the same attachments; the
+ * gateway does not import this package and keeps its own copy, so change both
+ * together.
+ */
+export const FEEDBACK_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+
+/**
  * A single feedback attachment (issue #2665). `data` is the base64-encoded file
  * bytes; the authoritative byte-size cap (FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES) is
  * enforced SERVER-SIDE after decode — the generous string bound here only rejects
@@ -3028,14 +3071,27 @@ export const FeedbackAttachmentSchema = z
   .strict();
 export type FeedbackAttachment = z.infer<typeof FeedbackAttachmentSchema>;
 
+/**
+ * A feedback submitter's email address (issue #2951 L3). The definition
+ * `POST /api/feedback` and the web feedback composer share: the route rejects a
+ * present malformed value with 400, and the composer
+ * (`web/src/lib/feedbackMetadata.ts`) sends `null` for any identity that fails
+ * it, so a non-email login never turns into a refused submission. Zod's email
+ * pattern is anchored, so a value that passes cannot carry CR/LF into the
+ * plain-text `From:` line. The support escalation (`routes/support.ts`) and the
+ * gateway relay (`gateway/src/lib/feedbackEmail.ts`) do not use it yet.
+ */
+export const FeedbackSubmitterEmailSchema = z.email().max(320);
+
 /** Request body for POST /api/feedback. Bounded lengths on every free-text
  *  field, mirroring the errorReports discipline (server/src/web/routes/errorReports.ts). */
 export const FeedbackRequestSchema = z.object({
   description: z.string().min(1).max(5000),
   category: FeedbackCategorySchema,
   metadata: FeedbackMetadataSchema,
-  /** Login username ≡ account email (epic Design Decision D2); null when unauthenticated. */
-  submitterEmail: z.string().max(320).nullable(),
+  /** The submitter's email address, or null/omitted (epic Design Decision D2).
+   *  Must pass `FeedbackSubmitterEmailSchema`; a malformed value is a 400. */
+  submitterEmail: FeedbackSubmitterEmailSchema.nullish(),
   route: z.string().max(500).optional(),
   appVersion: z.string().max(200).optional(),
   /** Optional user-attached files (issue #2665). Carried base64-in-payload

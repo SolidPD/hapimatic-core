@@ -297,7 +297,8 @@ export const cliCatalogEntries = [
     domain: "session-lifecycle",
     surface: "cli",
     description: "Spawn a new session on the local node or a federated node.",
-    whenToUse: "To spawn a session via `hapi api sessions spawn`.",
+    whenToUse:
+      "To spawn from a shell, run `~/scripts/hapi-spawn.sh` instead: it checks capacity and account headroom, and a raw-spawn guard blocks direct calls.",
     invocation: { kind: "cli", command: "api sessions spawn" },
     auth: "cli-token",
     riskTier: "mutating",

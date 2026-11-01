@@ -26,6 +26,7 @@ import {
   ScrollText, // Transcripts (#3839)
   Compass, // Getting started (#3865, nested under Preferences)
   LifeBuoy, // Help (#4371)
+  Plug, // Connectors (#4793)
   type LucideIcon,
 } from "lucide-react";
 import { AccentChip } from "@/components/ui/AccentChip";
@@ -41,6 +42,7 @@ import {
   usePorterStatus,
 } from "@/hooks/queries/usePorterStatus";
 import { getStorageKey } from "@/lib/storage-keys";
+import { useGitHubConnectionsVisible } from "@/components/settings/sections/GitHubConnectionsSection";
 
 /**
  * SettingsLandingPage — the Settings drawer's landing page (Sub-Issue B, #1036;
@@ -90,6 +92,7 @@ type AdminRoute =
   | "/settings/transcripts"
   | "/settings/preferences"
   | "/settings/notifications"
+  | "/settings/connectors"
   | "/settings/about"
   | "/settings/extensions"
   | "/settings/configuration"
@@ -157,6 +160,15 @@ const ADMIN_SECTIONS: SectionGroup[] = [
             hash: "api-keys",
           },
         ],
+      },
+      {
+        // #4793 (PM ruling D-4793-6): the GitHub accounts linked on hapimatic.com.
+        // Broker-host only (see the filter below); #2724 adds its keys to the page.
+        key: "connectors",
+        label: "Connectors",
+        icon: Plug,
+        accent: "var(--accent-violet-400)",
+        to: "/settings/connectors",
       },
       {
         key: "timelog",
@@ -434,6 +446,11 @@ export default function SettingsLandingPage() {
   // keeps the cached `exposed` (stale-while-error, #5212).
   const porterExposed = isPorterExposed(usePorterStatus(api));
 
+  // #4793: the Connectors row shows only on a broker-backed cloud VM (or when its
+  // broker failed to answer). Hidden while the accounts query loads and on any other
+  // host, where there is nothing to connect (finding 4793-14).
+  const connectorsVisible = useGitHubConnectionsVisible().visible;
+
   return (
     <div data-testid="settings-landing-root" className="flex flex-col pb-2">
       {ADMIN_SECTIONS.map(group => {
@@ -450,7 +467,9 @@ export default function SettingsLandingPage() {
               ? feedbackEnabled
               : item.key === "configuration"
                 ? porterExposed
-                : true
+                : item.key === "connectors"
+                  ? connectorsVisible
+                  : true
         );
         if (visibleItems.length === 0) return null;
         const groupCollapsed = Boolean(collapse.groups[group.heading]);

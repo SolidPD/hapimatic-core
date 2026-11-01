@@ -66,7 +66,11 @@ import {
   resolveRemoteSessionDisplayName,
 } from "./launcherShared";
 import { shellEscape, assertSpawnCommandLength } from "@/utils/shellEscape";
-import { TmuxManager } from "@/tmux/TmuxManager";
+import {
+  TmuxManager,
+  buildFilteredLoginShellCommand,
+  paneEnvScrubNames,
+} from "@/tmux/TmuxManager";
 import { remoteLauncherWindowTarget } from "@/tmux/windowOwnership";
 import type { OwnedWindowTarget } from "@/tmux/windowOwnership";
 import {
@@ -337,10 +341,11 @@ export function buildTmuxRemoteSpawnCommand(opts: {
   cwd: string;
   args: string[];
   envFilePath: string;
+  sandboxOn?: boolean;
 }): { fullCommand: string; envFileBody: string } {
   // Delegate the security-critical env-file skeleton (body + cd/source/rm) to
-  // the shared helper so it cannot drift from the local/daemon launcher
-  // (claudeTmuxLauncher.ts). This launcher's spawn command `exec`s the resolved
+  // the shared helper so it cannot drift from the daemon→wrapper hop
+  // (tmuxSpawnAdapter.ts). This launcher's spawn command `exec`s the resolved
   // claudePath so the pane pid tracks claude directly.
   const spawnCommand = `exec ${shellQuote(opts.claudePath)} ${opts.args
     .map(shellQuote)
@@ -354,6 +359,13 @@ export function buildTmuxRemoteSpawnCommand(opts: {
     // tmux launcher refuses key sessions, #4568), so it also clears an inherited
     // ANTHROPIC_BASE_URL.
     subscriptionClaudePane: true,
+    // #5963: the window's `env -u` filter runs before its `bash -l` reads the
+    // login dotfiles, which can export a name back. This chain runs after them,
+    // so it clears the active scrub set again. With the sandbox off that set is
+    // already in the list; with it on this adds SECRET_ENV_VARS.
+    extraUnsetNames: paneEnvScrubNames(
+      opts.sandboxOn ?? configuration.omniboxSandboxEnabled
+    ),
   });
   // #3748 (Sub H): this launcher hands `fullCommand` to `tmux send-keys` as a
   // single literal (no `-l`, no temp-script mitigation), so an over-long command
@@ -414,17 +426,28 @@ function makeFifo(fifoPath: string, mode: string = "600"): Promise<void> {
 export async function createOrReplaceRemoteWindow(
   tmux: TmuxManager,
   windowName: string,
-  cwd: string
+  cwd: string,
+  sandboxOn: boolean = configuration.omniboxSandboxEnabled
 ): Promise<CreateWindowResult> {
   // #1585: the kill-stale-then-recreate logic now lives in
-  // TmuxManager.createOrReplaceWindow (the single shared primitive behind all
-  // three window-creation sites). This thin wrapper delegates so the remote
+  // TmuxManager.createOrReplaceWindow (the single shared primitive behind
+  // both window-creation sites). This thin wrapper delegates so the remote
   // launcher's call site AND its real-tmux regression test
   // (claudeTmuxRemote.spawn.test.ts) remain unchanged.
   // #1609: the CreateWindowResult is returned (no longer discarded) so the
   // caller can use the race-free window index for all post-create operations,
   // bypassing the name-based list-windows path that is stale on tmux 3.4+.
-  return tmux.createOrReplaceWindow({ name: windowName, cwd });
+  // #5963: the window starts a filtered bash, not the raw default shell. The
+  // send-keys chain is POSIX, so fish or tcsh would never run it, and a raw shell
+  // keeps the global table for the pane's life. tmux runs this one string through
+  // `default-shell -c`, which every shell tested parses the same way and which
+  // holds the table only until its `exec`. The command only starts a shell, so
+  // pipe-pane still attaches before claude starts.
+  return tmux.createOrReplaceWindow({
+    name: windowName,
+    cwd,
+    command: buildFilteredLoginShellCommand(sandboxOn),
+  });
 }
 
 /**
@@ -530,8 +553,7 @@ export async function claudeTmuxRemote(
 
   // R2 — env build via the scrubbed buildLauncherEnv. The shell-command
   // prefix below is built from this env, so SDK_SIGNAL_ENV_VARS cannot
-  // leak through. Local-mode `claudeTmuxLauncher.ts` Task 11 fix mirrors
-  // this pattern.
+  // leak through.
   const launcherEnv = buildLauncherEnv(opts.claudeEnvVars);
 
   // R14 (#1429): per-attempt suffix varies the window name, FIFO path, AND the
@@ -692,7 +714,20 @@ export async function claudeTmuxRemote(
   opts.abort.addEventListener("abort", abortListener);
   cleanups.push(detachAbortListener);
 
+  const removeEnvFile = () => {
+    try {
+      unlinkSync(envFilePath);
+    } catch {
+      // Already removed (shell rm -f'd it, or never created) — ignore.
+    }
+  };
+
   const killWindowInternal = async () => {
+    // #5963: a chain that stopped early has not consumed the env file (a dotfile
+    // making a name in its `unset` readonly, say), and the exit poll may never
+    // run the cleanup stack after a kill: `display-message` on a missing window
+    // answers for the session's current window, so the window still reads alive.
+    removeEnvFile();
     try {
       await tmux.killWindow(windowTarget);
     } catch (err) {
@@ -721,13 +756,7 @@ export async function claudeTmuxRemote(
       // ENOENT is the happy path here.
     }
     writeFileSync(envFilePath, envFileBody, { mode: 0o600, flag: "wx" });
-    cleanups.push(() => {
-      try {
-        unlinkSync(envFilePath);
-      } catch {
-        // Already removed (shell rm -f'd it, or never created) — ignore.
-      }
-    });
+    cleanups.push(removeEnvFile);
 
     // 1) Pre-existing FIFO leftover (from a crashed prior run) — unlink so
     //    mkfifo doesn't EEXIST. Failures here are non-fatal; if the path
@@ -883,10 +912,10 @@ export async function claudeTmuxRemote(
       }
     });
 
-    // 7) Send-keys the full claude command + Enter. The `exec` prefix in
-    //    fullCommand replaces the shell with the claude process so the
-    //    pane's pid (used by isWindowAlive) tracks claude directly, not
-    //    the parent shell.
+    // 7) Send-keys the full claude command + Enter. The shell reading it is the
+    //    filtered bash from step 4 (#5963). The `exec` prefix in fullCommand
+    //    replaces that shell with the claude process so the pane's pid (used by
+    //    isWindowAlive) tracks claude directly, not the parent shell.
     const sentOk = await tmux.sendKeys({
       target: windowTarget,
       keys: fullCommand,

@@ -26,6 +26,7 @@ import {
   describeAddKeyError,
   describeValidKey,
   keyKeptByServer,
+  keyRowIdentity,
   parseKeyLines,
   rowNeedsAdd,
   vaultProviderFor,
@@ -167,7 +168,7 @@ export function useKeyRows(
             : {}),
         });
         // The key is stored: drop the raw secret from state — the row shows the
-        // masked key from here on.
+        // masked key from here on, and the stored name and monogram (#5467 S5).
         setStatus(
           {
             kind: "passed",
@@ -175,14 +176,17 @@ export function useKeyRows(
             maskedKey: stored.maskedKey,
             modelCount: stored.lastValidation?.modelCount,
             modelCountCapped: stored.lastValidation?.modelCountCapped,
+            label: stored.label,
+            monogram: stored.monogram,
           },
           true
         );
         return true;
       } catch (err) {
         // #5429: the server kept this key (its rollback failed), so refresh the
-        // key list — the row tells the user to remove it, and the list on the
-        // page only refreshes on a successful add.
+        // key list — the row tells the user to remove it. The shared `add`
+        // mutation also refreshes it on a kept key (#4466 R18); this second
+        // refresh is harmless.
         const keyStored = addErrorLeftKeyStored(err);
         if (keyStored) {
           void queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys });
@@ -252,6 +256,12 @@ export function useKeyRows(
   const savedCount = rows.filter(r => r.status.kind === "passed").length;
   const pendingCount = rows.filter(rowNeedsAdd).length;
   const testingCount = rows.filter(r => r.status.kind === "testing").length;
+  // #5467 S9/S12: a row whose key the server kept is final and cannot be fixed
+  // here, so it is counted apart from the failed rows Done can retry.
+  const keptCount = rows.filter(r => keyKeptByServer(r.status)).length;
+  const failedCount = rows.filter(
+    r => r.status.kind === "failed" && !keyKeptByServer(r.status)
+  ).length;
   return {
     rows,
     update,
@@ -261,6 +271,8 @@ export function useKeyRows(
     savedCount,
     pendingCount,
     testingCount,
+    keptCount,
+    failedCount,
     shareAcrossNodes,
     setShareAcrossNodes,
   };
@@ -297,14 +309,21 @@ function KeyMonogramPill(props: {
  * The section always writes the UI host node's vault, whatever node the login
  * radio selects. #5127: an Anthropic key can be made available to the other
  * nodes (the batch's checkbox); it still stays stored on this node.
+ *
+ * `locked` (#5467 S8): Done is running. Every input in this section is locked,
+ * the sharing checkbox included, because Done adds only the rows it found when
+ * it started, sends each key with the sharing choice of that moment, and closes
+ * the modal when they pass, so anything changed meanwhile would be dropped
+ * without notice.
  */
 export function KeyEntryRows(props: {
   api: ApiClient | null;
   provider: ProviderId;
   uiNodeLabel: string;
   keyRows: KeyRowsApi;
+  locked?: boolean;
 }) {
-  const { api, provider, uiNodeLabel, keyRows } = props;
+  const { api, provider, uiNodeLabel, keyRows, locked = false } = props;
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
@@ -328,6 +347,9 @@ export function KeyEntryRows(props: {
     editingRow?.status.kind === "passed"
       ? storedById.get(editingRow.status.id)
       : undefined;
+  const editingIdentity = editingRow
+    ? keyRowIdentity(editingRow, editingStored)
+    : undefined;
 
   return (
     <section className="flex flex-col gap-2" data-testid="add-modal-keys">
@@ -346,12 +368,14 @@ export function KeyEntryRows(props: {
         {keyRows.rows.map(row => {
           const passed = row.status.kind === "passed" ? row.status : null;
           const stored = passed ? storedById.get(passed.id) : undefined;
-          const name = stored?.label ?? row.name;
-          const monogram = stored?.monogram ?? row.monogram;
+          // #5467 S5: a passed row shows the stored values only.
+          const { name, monogram } = keyRowIdentity(row, stored);
           const testing = row.status.kind === "testing";
           // #5646 F1: the server kept this row's key after a failed add, so
           // the row is final: its key, name, monogram and Test controls lock.
           const keptKey = keyKeptByServer(row.status);
+          // #5467 S8: a row in flight, a kept key, or a running Done.
+          const rowLocked = testing || keptKey || locked;
           return (
             <li
               key={row.rowId}
@@ -365,7 +389,7 @@ export function KeyEntryRows(props: {
                   variant="ghostStatic"
                   size="bare"
                   aria-label="Edit name and monogram"
-                  disabled={testing || keptKey}
+                  disabled={rowLocked}
                   onClick={() => setEditing(row.rowId)}
                   className="shrink-0"
                   data-testid="key-row-monogram"
@@ -382,7 +406,7 @@ export function KeyEntryRows(props: {
                   placeholder="Name"
                   maxLength={API_KEY_NAME_MAX_CHARS}
                   value={name}
-                  readOnly={Boolean(passed) || testing || keptKey}
+                  readOnly={Boolean(passed) || rowLocked}
                   onChange={e =>
                     keyRows.update(row.rowId, { name: e.target.value })
                   }
@@ -404,7 +428,7 @@ export function KeyEntryRows(props: {
                     autoComplete="off"
                     spellCheck={false}
                     value={row.key}
-                    disabled={testing || keptKey}
+                    disabled={rowLocked}
                     onChange={e =>
                       keyRows.update(row.rowId, { key: e.target.value })
                     }
@@ -426,7 +450,7 @@ export function KeyEntryRows(props: {
                     size="sm"
                     variant="outline"
                     className="w-14 shrink-0"
-                    disabled={testing || keptKey || row.key.trim() === ""}
+                    disabled={rowLocked || row.key.trim() === ""}
                     onClick={() => void keyRows.addRow(row.rowId)}
                     data-testid="key-row-test"
                   >
@@ -465,6 +489,7 @@ export function KeyEntryRows(props: {
           variant="ghostStatic"
           size="bare"
           aria-expanded={pasteOpen}
+          disabled={locked}
           onClick={() => setPasteOpen(o => !o)}
           className="flex items-center justify-start gap-1.5 self-start font-normal text-[var(--app-link)]"
         >
@@ -480,6 +505,7 @@ export function KeyEntryRows(props: {
               autoComplete="off"
               spellCheck={false}
               value={pasteText}
+              disabled={locked}
               onChange={e => setPasteText(e.target.value)}
               className={`${INPUT_CLASS} font-mono`}
               style={{ fontSize: "16px" }}
@@ -489,7 +515,7 @@ export function KeyEntryRows(props: {
               size="sm"
               variant="outline"
               className="self-end"
-              disabled={pasteText.trim() === ""}
+              disabled={locked || pasteText.trim() === ""}
               onClick={() => {
                 keyRows.addFromPaste(pasteText);
                 setPasteText("");
@@ -506,6 +532,7 @@ export function KeyEntryRows(props: {
           <ShareAcrossNodesCheckbox
             checked={keyRows.shareAcrossNodes}
             onChange={keyRows.setShareAcrossNodes}
+            disabled={locked}
           />
           <p className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
             Stored on {uiNodeLabel}
@@ -521,8 +548,8 @@ export function KeyEntryRows(props: {
           api={api}
           open
           onClose={() => setEditing(null)}
-          nickname={editingStored?.label ?? (editingRow.name || undefined)}
-          monogram={editingStored?.monogram ?? editingRow.monogram}
+          nickname={editingIdentity?.name || undefined}
+          monogram={editingIdentity?.monogram}
           fallback={providerName}
           subject={
             editingRow.status.kind === "passed"

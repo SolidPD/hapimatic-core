@@ -194,6 +194,15 @@ export const extensionsMetadata: readonly ExtensionMetadata[] = [
     runtimes: ["cli"],
   },
   {
+    id: "catalog.harness-strands",
+    displayName: "Strands Agents",
+    description: "AWS's open-source Strands Agents CLI (ACP server, MCP, Agent Skills, subagents; Claude on Amazon Bedrock by default).",
+    version: "0.1.0",
+    defaultEnabled: true,
+    requiredAtBuild: false,
+    runtimes: ["cli"],
+  },
+  {
     id: "builtin.voice-input",
     displayName: "Voice Input",
     description: "Dictate into the prompt box with a free on-node speech engine (NVIDIA Parakeet via sherpa-onnx).",

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useRef, useState } from "react";
-import { Bell, LogOut } from "lucide-react";
+import { Bell, LogOut, Mail } from "lucide-react";
 import { AccentChip } from "@/components/ui/AccentChip";
 import { IconExpandToggle } from "@/components/ui/IconExpandToggle";
 import { CardHeaderTrigger } from "@/components/ui/CardHeaderTrigger";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { CountBadge } from "@/components/ui/CountBadge";
 import {
   Card,
   CardHeader,
@@ -345,6 +346,44 @@ function BadgeEntry() {
         <Badge variant="destructive">destructive</Badge>
         <Badge variant="mint">mint</Badge>
         <Badge variant="subscription">subscription</Badge>
+      </SpecimenRow>
+    </CatalogEntry>
+  );
+}
+
+function CountBadgeEntry() {
+  return (
+    <CatalogEntry id="count-badge" title="CountBadge" kind="primitive">
+      <SpecimenRow label="counts on --destructive (hidden at 0 · 99+ cap)">
+        <Specimen caption="0 (renders nothing)">
+          <CountBadge count={0} />
+        </Specimen>
+        <Specimen caption="3">
+          <CountBadge count={3} />
+        </Specimen>
+        <Specimen caption="42">
+          <CountBadge count={42} />
+        </Specimen>
+        <Specimen caption="150 → 99+">
+          <CountBadge count={150} />
+        </Specimen>
+        <Specimen caption="12, max 9 → 9+">
+          <CountBadge count={12} max={9} />
+        </Specimen>
+      </SpecimenRow>
+      <SpecimenRow label="overlaid on an icon (lower-right)">
+        <Specimen caption="envelope · 3">
+          <span className="inline-flex items-end">
+            <Mail size={16} />
+            <CountBadge count={3} className="relative top-0.5 -ml-2" />
+          </span>
+        </Specimen>
+        <Specimen caption="envelope · 99+">
+          <span className="inline-flex items-end">
+            <Mail size={16} />
+            <CountBadge count={120} className="relative top-0.5 -ml-2" />
+          </span>
+        </Specimen>
       </SpecimenRow>
     </CatalogEntry>
   );
@@ -963,6 +1002,7 @@ export function PrimitiveEntries() {
       <IconExpandToggleEntry />
       <CardHeaderTriggerEntry />
       <BadgeEntry />
+      <CountBadgeEntry />
       <CardEntry />
       <DialogEntry />
       <DropdownMenuEntry />

@@ -1,6 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { FeedbackSubmitterEmailSchema } from "@hapi/protocol/schemas";
 import type { ApiClient } from "@/api/client";
 import type { FeedbackMetadata } from "@/types/api";
+
+/**
+ * The submitter email to send for a candidate identity, or `null` when the
+ * candidate is not an email address (issue #2951 L3). The server refuses a
+ * present malformed `submitterEmail` with 400 and the form has no email field,
+ * so passing a non-email identity through would refuse the submission on every
+ * retry. A Telegram login, for one, supplies a Telegram handle as its username.
+ */
+export function toSubmitterEmail(
+  candidate: string | null | undefined
+): string | null {
+  if (candidate == null) return null;
+  return FeedbackSubmitterEmailSchema.safeParse(candidate).success
+    ? candidate
+    : null;
+}
 
 /**
  * Composed feedback payload metadata + the resolved submitter email (issue
@@ -21,7 +38,10 @@ export interface ComposeFeedbackOptions {
   route: string;
   /** App version from `useVersion()` (R3). */
   appVersion?: string;
-  /** Authenticated login username ≡ account email (epic D2). */
+  /** The authenticated login's username. Used as the submitter email only when
+   *  it is an email address; no login path issues one today (a Telegram login
+   *  carries a handle; access-token and gateway sign-ins carry none), so the
+   *  session's account email, read only inside a session view, is the source. */
   loginUsername?: string | null;
   /** When inside a session view, the session id — adds the session block (R3). */
   sessionId?: string | null;
@@ -91,7 +111,7 @@ export async function composeFeedbackMetadata(
   }
 
   // Session block — ONLY inside a session view (R3).
-  let submitterEmail: string | null = loginUsername ?? null;
+  let submitterEmail = toSubmitterEmail(loginUsername);
   if (sessionId) {
     try {
       const { session } = await api.getSession(sessionId);
@@ -113,8 +133,10 @@ export async function composeFeedbackMetadata(
         effort: m?.effort ?? undefined,
         rawModel: m?.rawModel ?? undefined,
       };
-      // Enrich the submitter email from the session's bound account when present.
-      if (m?.claudeAccount?.email) submitterEmail = m.claudeAccount.email;
+      // Enrich the submitter email from the session's bound account when it is
+      // an email address.
+      const accountEmail = toSubmitterEmail(m?.claudeAccount?.email);
+      if (accountEmail) submitterEmail = accountEmail;
     } catch {
       // The session couldn't be read — record "no active session" and continue.
       metadata.session = "no active session";

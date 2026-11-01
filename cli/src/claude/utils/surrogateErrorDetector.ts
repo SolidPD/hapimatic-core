@@ -35,6 +35,7 @@
 
 import type { RawJSONLines } from "../types";
 import { logger } from "@/ui/logger";
+import { isSyntheticAssistantRecord } from "./apiLimitSignal";
 
 /**
  * The precise server-side error substrings that identify a surrogate-pair JSON
@@ -172,6 +173,8 @@ function matchSurrogate400(message: RawJSONLines): string | null {
  * A turn-terminating success signal that resets the consecutive counter:
  *  - a result message (SDK converts to system/subtype:"result") with is_error falsy
  *  - a normal assistant message (NOT an API error) — real model output
+ * A record Claude Code wrote itself (`model: "<synthetic>"`, e.g. "No response
+ * requested.") is not model output, so it is never a success signal (#6065).
  */
 function isSuccessSignal(message: RawJSONLines): boolean {
   const msg = message as Record<string, unknown>;
@@ -181,6 +184,9 @@ function isSuccessSignal(message: RawJSONLines): boolean {
     msg.is_error !== true
   ) {
     return true;
+  }
+  if (isSyntheticAssistantRecord(message)) {
+    return false;
   }
   if (msg.type === "assistant" && msg.isApiErrorMessage !== true) {
     return true;

@@ -39,12 +39,37 @@ export interface AutoRecoveryConfig {
    * R4 persistent-overload give-up fires.
    */
   requestAbortGuard: number;
+  /**
+   * #3612: the most random delay added to a usage-window reset nudge, so
+   * sessions on accounts that reset at the same instant do not all resume
+   * together. Each nudge waits `resetAt + index × resetNudgeAccountStaggerMs +
+   * random × resetNudgeJitterMs`.
+   */
+  resetNudgeJitterMs: number;
+  /**
+   * #3612: the gap between nudges for sessions bound to the SAME account. The
+   * lock is per account while the nudge is per session, so N sessions on one
+   * account share one reset time; the k-th one waits k × this value longer.
+   */
+  resetNudgeAccountStaggerMs: number;
+  /**
+   * #3612 R5: a reset closer than this is left to the ladder, whose first rung
+   * is 60 s; it also bounds how soon a mis-parsed reset could fire.
+   */
+  resetNudgeMinLeadMs: number;
+  /** #3612: the prompt a usage-window reset nudge sends. */
+  resetNudgePrompt: string;
 }
 
 /** R7 default recovery prompt — conservative "pick up where you left off". */
 export const DEFAULT_RECOVERY_PROMPT =
   "An API overload error interrupted the previous response. Please pick up " +
   "where you left off without re-explaining what you've done.";
+
+/** #3612 default reset-nudge prompt. The overload prompt would misname the cause. */
+export const DEFAULT_RESET_NUDGE_PROMPT =
+  "Your usage limit has reset. Please pick up where you left off without " +
+  "re-explaining what you've done.";
 
 function getDefaults(): AutoRecoveryConfig {
   return {
@@ -53,6 +78,10 @@ function getDefaults(): AutoRecoveryConfig {
     defaultPrompt: DEFAULT_RECOVERY_PROMPT,
     successWindowMs: 900_000, // 15 min — MUST exceed the ~10-min SDK retry latency (R9)
     requestAbortGuard: 2,
+    resetNudgeJitterMs: 60_000, // up to 1 min of random spread
+    resetNudgeAccountStaggerMs: 120_000, // 2 min between sessions on one account
+    resetNudgeMinLeadMs: 60_000, // the ladder's first rung
+    resetNudgePrompt: DEFAULT_RESET_NUDGE_PROMPT,
   };
 }
 
@@ -99,6 +128,22 @@ export async function loadAutoRecoveryConfig(
       typeof ar.requestAbortGuard === "number"
         ? ar.requestAbortGuard
         : defaults.requestAbortGuard,
+    resetNudgeJitterMs:
+      typeof ar.resetNudgeJitterMs === "number"
+        ? ar.resetNudgeJitterMs
+        : defaults.resetNudgeJitterMs,
+    resetNudgeAccountStaggerMs:
+      typeof ar.resetNudgeAccountStaggerMs === "number"
+        ? ar.resetNudgeAccountStaggerMs
+        : defaults.resetNudgeAccountStaggerMs,
+    resetNudgeMinLeadMs:
+      typeof ar.resetNudgeMinLeadMs === "number"
+        ? ar.resetNudgeMinLeadMs
+        : defaults.resetNudgeMinLeadMs,
+    resetNudgePrompt:
+      typeof ar.resetNudgePrompt === "string"
+        ? ar.resetNudgePrompt
+        : defaults.resetNudgePrompt,
   };
 }
 

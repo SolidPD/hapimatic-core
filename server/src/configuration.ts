@@ -23,6 +23,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getOrCreateCliApiToken } from "./config/cliApiToken";
+import { getOrCreateHealthReadToken } from "./config/healthReadToken";
 import { parseAllowlist, wildcardAllowlistWarning } from "./config/googleOAuth";
 import { getSettingsFile } from "./config/settings";
 import {
@@ -217,6 +218,20 @@ class Configuration {
       tokenResult.source,
       tokenResult.isNew
     );
+
+    // 6. Mint the monitoring sweep's read-only health token (issue #5444). Only
+    // whether it was created is logged, never the value. A failure here must
+    // not stop the server: the health-read verifier then refuses every token.
+    try {
+      const health = await getOrCreateHealthReadToken(dataDir);
+      console.log(
+        `[Server] Health read token: ${health.created ? "generated" : "loaded"} (${getSettingsFile(dataDir)})`
+      );
+    } catch (error) {
+      console.warn(
+        `[Server] Health read token could not be minted; health-read requests will be refused: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
 
     return config;
   }

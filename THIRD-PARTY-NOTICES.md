@@ -4,7 +4,7 @@
 
 The Hapimatic core is licensed under the GNU Affero General Public License v3.0 only (see `LICENSE` and `NOTICE`). The `hapi` executable also contains, or downloads on request, the third-party software listed below. Each component is used under its own license, reproduced here as shipped by its authors. The machine-readable software bill of materials is `sbom/hapimatic-core.cdx.json`.
 
-This file covers the 617 npm packages in the core's runtime dependency closure (a superset of what the bundlers emit) and the non-npm components, and reproduces the notice for the happy-cli code in the `cli` package. Build tools that are not distributed are listed in the SBOM but need no notice here.
+This file covers the 618 npm packages in the core's runtime dependency closure (a superset of what the bundlers emit) and the non-npm components, and reproduces the notice for the happy-cli code in the `cli` package. Build tools that are not distributed are listed in the SBOM but need no notice here.
 
 ## Code derived from happy-cli
 
@@ -6765,6 +6765,22 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
+```
+
+### modern-screenshot@4.6.7 (MIT)
+
+`LICENSE`:
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2021-present wxm
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 ### ms@2.0.0 (MIT)

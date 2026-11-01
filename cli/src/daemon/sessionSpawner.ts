@@ -96,6 +96,11 @@ import {
   cloneRepoForSpawn,
 } from "./sessionSpawnerHelpers";
 import type { ProviderId } from "@hapi/protocol";
+import { EFFORT_LEVELS } from "@hapi/protocol";
+import {
+  fitSpawnEffortToModel,
+  resolveNodeSpawnEffort,
+} from "./nodeSpawnDefaults";
 import type {
   SpawnSessionOptions,
   SessionTypeDowngrade,
@@ -797,22 +802,51 @@ export function createSessionSpawner(
       VALID_SPAWN_MODEL_MODES.includes(options.modelMode)
         ? options.modelMode
         : undefined;
-    // Issue #2456: reasoning-effort level, validated against the effort catalog
-    // (inlined to mirror VALID_SPAWN_MODEL_MODES above). An out-of-catalog value
-    // is dropped → no --hapi-effort → binary default (byte-identical spawn).
-    const VALID_SPAWN_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
-    const spawnEffort =
-      typeof options.effort === "string" &&
-      VALID_SPAWN_EFFORT_LEVELS.includes(options.effort)
-        ? options.effort
-        : undefined;
     // Issue #2456: a specific pinned raw Claude model id ("More models"). Free-
     // form — accept any non-empty string (the binary warns-and-defaults on an
-    // unknown model, exactly like effort).
+    // unknown model, exactly like effort). Parsed before the effort default so
+    // the #6028 model fit can read it.
     const spawnRawModel =
       typeof options.rawModel === "string" && options.rawModel.trim().length > 0
         ? options.rawModel.trim()
         : undefined;
+    // Issue #2456: reasoning-effort level, validated against the effort catalog.
+    // Issue #5879 (three-point spawn checklist, point 3): a FRESH claude spawn
+    // that names no valid effort launches with the node default — env
+    // HAPI_DEFAULT_EFFORT (this daemon's unit) > settings.json defaultEffort >
+    // xhigh — so it records a real level in metadata.effort instead of running
+    // an unknown binary default. A respawn/resume (`resumeSessionId`) keeps what
+    // its server-side caller re-threads from the session's metadata, and a
+    // non-claude agent is unchanged (its effort axis is separate, #3348).
+    let spawnEffort: string | undefined =
+      typeof options.effort === "string" &&
+      (EFFORT_LEVELS as readonly string[]).includes(options.effort)
+        ? options.effort
+        : undefined;
+    if (agent === "claude" && !resumeSessionId) {
+      const resolved = await resolveNodeSpawnEffort(options.effort);
+      for (const r of resolved.rejected) {
+        logger.warn(
+          `[DAEMON RUN] Ignoring invalid effort "${r.value}" from ${r.source} (#5879)`
+        );
+      }
+      // Issue #6028: fit the default to the pinned model so the session records
+      // the effort the binary actually runs (it remaps an unsupported level and
+      // applies none to a model without effort). `null` ⇒ send no --effort.
+      const fitted = fitSpawnEffortToModel(resolved, {
+        modelEffortLevels: options.modelEffortLevels,
+        rawModel: spawnRawModel,
+        modelMode: spawnModelMode,
+      });
+      spawnEffort = fitted.level ?? undefined;
+      logger.info(
+        `[DAEMON RUN] Spawn effort: ${fitted.level ?? "none"} (source=${resolved.source}${
+          fitted.clampedFrom
+            ? `, clamped from ${fitted.clampedFrom} for model ${spawnRawModel ?? spawnModelMode ?? "default"} via ${fitted.levelsSource} levels`
+            : ""
+        }) (#5879, #6028)`
+      );
+    }
     // Issue #3348: bundled non-claude native model selection. Interpreted per
     // AGENT below: gemini → GEMINI_MODEL env (direct path); codex ChatGPT-token →
     // config.toml `model`/`model_reasoning_effort` bake (BOTH spawn paths). Free-
@@ -2682,6 +2716,16 @@ export function createSessionSpawner(
       }
       if (spawnModelMode) {
         args.push("--hapi-model-mode", spawnModelMode);
+      }
+      // Issue #5879 (in-path fix of #2456): the direct (non-tmux) path forwards
+      // the effort + raw-model pins too — before this only the tmux adapter did
+      // (tmuxSpawnAdapter.ts), so a node without HAPI_TMUX_PERSISTENCE silently
+      // dropped them. claude-only, like the parse in commands/claude.ts.
+      if (agent === "claude" && spawnEffort) {
+        args.push("--hapi-effort", spawnEffort);
+      }
+      if (agent === "claude" && spawnRawModel) {
+        args.push("--hapi-raw-model", spawnRawModel);
       }
       // Issue #2155: role-scoped `@`-include profile — claude-only (`@`-includes
       // are a claude concept). Hapimatic-internal flag; runClaude merges the

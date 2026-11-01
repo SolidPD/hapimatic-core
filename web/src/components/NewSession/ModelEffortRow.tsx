@@ -4,7 +4,8 @@ import { UiSelect } from "./controls";
 import {
   EFFORT_LEVELS,
   EFFORT_LEVEL_LABELS,
-  DEFAULT_EFFORT_LEVEL,
+  SPAWN_DEFAULT_EFFORT_LEVEL,
+  clampEffortToModel,
   getDefaultCatalogModel,
   type EffortLevel,
 } from "@hapi/protocol";
@@ -22,7 +23,10 @@ import { useClaudeModels } from "@/hooks/queries/useClaudeModels";
  *   appear automatically — no static list to maintain.
  * - **Effort** (narrow, right): the reasoning-effort levels the SELECTED model
  *   supports (gated by the catalog's per-model `effortLevels`); unsupported
- *   levels render disabled. "Default" = the binary default (no `--effort`).
+ *   levels render disabled. "Default" sends no `--effort` pin, so the node's
+ *   spawn default applies (`xhigh` unless the node sets one — issue #5879), fitted
+ *   to the selected model by the daemon; the option's label names that level
+ *   (issue #6028).
  *
  * Both are definitive at launch (threaded into the spawn payload) — see
  * `formState`/`spawnCommand`.
@@ -33,6 +37,10 @@ export function ModelEffortRow(props: {
   rawModel: string;
   /** Selected effort level, `""` = Default. */
   effort: EffortLevel | "";
+  /** Issue #6028: the target node's resolved spawn default (env
+   *  `HAPI_DEFAULT_EFFORT` > settings `defaultEffort` > xhigh), from the daemon.
+   *  Undefined = unknown (an older daemon or peer) → the shared default. */
+  nodeDefaultEffort?: EffortLevel;
   isDisabled: boolean;
   onRawModelChange: (id: string) => void;
   onEffortChange: (level: EffortLevel | "") => void;
@@ -46,18 +54,21 @@ export function ModelEffortRow(props: {
   // default = the catalog's newest Opus (the entitled default a Max account
   // resolves to); effort default = Hapimatic's asserted default effort, gated to
   // the selected model's real support so a no-effort model (Haiku) shows "None".
+  // Issue #5879: the default a fresh spawn gets is the daemon's spawn default
+  // (`xhigh`), not the in-session display default, and the label says so.
+  // Issue #6028: that default is the TARGET node's (env / settings / xhigh), and
+  // the daemon fits it to the selected model with the same shared function, so
+  // the label names the level the session records (both read a model catalog). The
+  // Default model is not clamped — the binary picks that model, as the daemon does.
   const defaultModel = getDefaultCatalogModel(models);
   const defaultModelLabel = defaultModel?.displayName ?? "Default";
+  const nodeDefault = props.nodeDefaultEffort ?? SPAWN_DEFAULT_EFFORT_LEVEL;
   const defaultEffortLabel = (() => {
-    if (!selected) return EFFORT_LEVEL_LABELS[DEFAULT_EFFORT_LEVEL];
-    const levels = selected.effortLevels;
-    if (levels.length === 0) return "None";
-    if (levels.includes(DEFAULT_EFFORT_LEVEL))
-      return EFFORT_LEVEL_LABELS[DEFAULT_EFFORT_LEVEL];
-    const highest = levels[levels.length - 1];
-    return highest
-      ? EFFORT_LEVEL_LABELS[highest]
-      : EFFORT_LEVEL_LABELS[DEFAULT_EFFORT_LEVEL];
+    const named = (level: EffortLevel) =>
+      `${EFFORT_LEVEL_LABELS[level]} (default)`;
+    if (!selected) return named(nodeDefault);
+    const fitted = clampEffortToModel(nodeDefault, selected.effortLevels);
+    return fitted === null ? "None" : named(fitted);
   })();
 
   return (

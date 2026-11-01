@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate, useLocation } from "@tanstack/react-router";
 import {
   Settings as SettingsIcon,
@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { BareButton } from "@/components/ui/BareButton";
+import { CountBadge } from "@/components/ui/CountBadge";
 import { useVersion } from "@/hooks/useVersion";
 import { formatEasternDateTime } from "@/utils/easternTime";
 import {
@@ -17,12 +18,19 @@ import {
 import { useIsDevInstance } from "@/hooks/useIsDevInstance";
 import { SplitScreenIcon } from "@/components/icons";
 import { SPLIT_MIN_WIDTH } from "@/lib/layout-thresholds";
-import { UpdateAvailableBadge } from "@/components/UpdateAvailableBadge";
+import {
+  UpdateReloadEngine,
+  useAppRefreshUpdateCheck,
+  useUpdateAlertCount,
+} from "@/components/UpdateAvailableBadge";
 import { useOptionalAppContext } from "@/lib/app-context";
+import { useFeedbackPreflight } from "@/hooks/queries/useFeedbackPreflight";
+import { useFeedbackNewCount } from "@/hooks/queries/useFeedbackNewCount";
 import { FeedbackModal } from "@/components/FeedbackModal";
 import { AppShell } from "@/components/layouts/AppShell";
 import { HapimaticWordmark } from "@/components/brand/HapimaticWordmark";
 import { useThreadFullscreen } from "@/lib/thread-fullscreen-context";
+import { TitleBarNodeChip } from "@/components/TitleBarNodeChip";
 
 function RefreshIcon(props: { className?: string }) {
   return (
@@ -118,6 +126,33 @@ export function BrandedFrame({
   // #4776: bumped on each wordmark tap so the wordmark replays its bridge.
   const [wordmarkReplay, setWordmarkReplay] = useState(0);
   const appCtx = useOptionalAppContext();
+  // #2913: the unread-feedback badge on the footer envelope. Both hooks run
+  // unconditionally (appCtx is null in the pre-auth frames). The counts poll is
+  // gated on the operator preflight, so a non-operator instance never requests
+  // it; any closed, failed or loading state renders no badge (fail-closed).
+  const feedbackApi = appCtx?.api ?? null;
+  const feedbackEnabled =
+    useFeedbackPreflight(feedbackApi).data?.enabled === true;
+  const { newCount } = useFeedbackNewCount(feedbackApi, {
+    enabled: feedbackEnabled,
+  });
+  const feedbackBadgeCount =
+    feedbackEnabled && newCount !== null && newCount > 0 ? newCount : 0;
+  const feedbackAriaLabel =
+    feedbackBadgeCount > 0
+      ? `Send feedback — ${feedbackBadgeCount} new feedback ${feedbackBadgeCount === 1 ? "item" : "items"}`
+      : "Send feedback";
+  // #3277: the update alert lives on the settings gear (badge) and in the drawer
+  // (banner), and Refresh also asks the server to check the update bucket. The
+  // pre-auth frames (no app context) show no count, because the drawer that holds
+  // the banner only mounts after sign-in, and skip the check, which needs a JWT.
+  const pendingUpdateCount = useUpdateAlertCount();
+  const updateAlertCount = appCtx?.api ? pendingUpdateCount : 0;
+  const settingsLabel =
+    updateAlertCount > 0
+      ? `Settings — ${updateAlertCount} update${updateAlertCount === 1 ? "" : "s"} available`
+      : "Settings";
+  const refreshUpdateCheck = useAppRefreshUpdateCheck(Boolean(appCtx?.api));
   const pathname = useLocation({ select: location => location.pathname });
   const feedbackSessionSeg = pathname.startsWith("/sessions/")
     ? pathname.slice("/sessions/".length).split("/")[0]
@@ -132,6 +167,11 @@ export function BrandedFrame({
   // app-bar content (back arrow · wordmark · icons) but keep AppShell's safe-area
   // band (operator ruling D1=(a)). SessionChat sets this flag only in single view.
   const { threadFullscreen } = useThreadFullscreen();
+  // #4468: the title-bar node chip measures these three boxes.
+  const headerRowRef = useRef<HTMLDivElement>(null);
+  const backArrowRef = useRef<HTMLDivElement>(null);
+  const wordmarkLinkRef = useRef<HTMLAnchorElement>(null);
+  const hasBackArrow = Boolean(showBackButton && onBack);
 
   // Version timestamp is stored as UTC; render it in Eastern Time so the
   // footer reads in Eastern regardless of the viewing device's timezone.
@@ -168,10 +208,14 @@ export function BrandedFrame({
         ) : (
           <div className="px-1 py-1 border-b-2 border-[var(--brand-accent)]/40">
             {/* Inner container constrained to content width for icon alignment */}
-            <div className="mx-auto w-full max-w-content flex items-center justify-center relative">
+            <div
+              ref={headerRowRef}
+              className="mx-auto w-full max-w-content flex items-center justify-center relative"
+            >
               {/* Left side - Back button (conditionally rendered) */}
-              {showBackButton && onBack && (
+              {hasBackArrow && (
                 <div
+                  ref={backArrowRef}
                   className="absolute top-1/2 -translate-y-1/2 z-10"
                   style={{
                     left: isIPadMultitasking
@@ -204,6 +248,7 @@ export function BrandedFrame({
                   escape hatch — including from the not-found view. The external
                   GitHub link is dropped here; it returns at /settings/about (#1041). */}
                 <Link
+                  ref={wordmarkLinkRef}
                   to="/"
                   onClick={() => {
                     // #3280 R6 reset first, then (#4776) replay the bridge.
@@ -283,12 +328,15 @@ export function BrandedFrame({
                       </BareButton>
                     </div>
                   )}
-                  {/* col-2 — Refresh (unchanged) */}
+                  {/* col-2 — Refresh: asks the server to check the update bucket,
+                    then reloads the app; the reloaded page re-reads the update
+                    status so a pending update shows on the gear badge and in the
+                    drawer banner (#3277 R4, Matt's ruling U1). */}
                   <div className="icon-col-2">
                     <Button
                       type="button"
                       variant="ghost"
-                      onClick={() => window.location.reload()}
+                      onClick={refreshUpdateCheck}
                       className="h-auto rounded-full p-1.5 text-white/60 transition-colors hover:bg-white/10 hover:text-white"
                       title="Refresh app"
                       aria-label="Refresh app"
@@ -312,27 +360,57 @@ export function BrandedFrame({
                         })
                       }
                       data-testid="settings-menu-button"
-                      title="Settings"
-                      aria-label="Settings"
+                      // #3277: the label replaces the button's computed name, so
+                      // it carries the badge's count for assistive tech.
+                      title={settingsLabel}
+                      aria-label={settingsLabel}
                       className="h-auto rounded-full p-1.5 text-white/60 transition-colors hover:bg-white/10 hover:text-white"
                     >
-                      <SettingsIcon className="h-5 w-5" />
+                      {/* #3277 R2: the update count overlays the gear's
+                        lower-right corner. The icon's own wrapper is the
+                        positioning context, so the badge tracks the icon and
+                        never moves the button. The shared CountBadge is placed
+                        absolutely here, not in the footer's in-flow way: the
+                        gear is a fixed 32px icon slot, which an in-flow badge
+                        would widen (D14). */}
+                      <span className="relative inline-flex">
+                        <SettingsIcon className="h-5 w-5" />
+                        <CountBadge
+                          count={updateAlertCount}
+                          className="absolute -bottom-1 -right-1"
+                        />
+                      </span>
                     </Button>
                   </div>
                 </div>
               </div>
+              {/* #4468: the UI host node's chip, centered between the screen
+                edge and the wordmark. Last in the row so its siblings' refs
+                (wordmark, back arrow) are set before its first layout pass;
+                this row's own ref is attached after it, so the chip measures
+                again once mounted. Absolutely positioned, so the order does
+                not move it. Gated on the app context because NodeBadge needs
+                it and the pre-auth frames have none. */}
+              {appCtx?.api ? (
+                <TitleBarNodeChip
+                  containerRef={headerRowRef}
+                  wordmarkRef={wordmarkLinkRef}
+                  backArrowRef={backArrowRef}
+                  hasBackArrow={hasBackArrow}
+                  isIPadMultitasking={isIPadMultitasking}
+                />
+              ) : null}
             </div>
           </div>
         )
       }
       belowHeader={
-        /* Issue #3057: the SINGLE mint-green update bar — full-width row below the
-           title bar (mobile-safe; avoids the title-row icon cluster). It owns BOTH
-           the VM binary-update pipeline (#1006/#2589) AND the service-worker asset
-           refresh (#1793) — the old separate green "New version — Reload" band
-           (UpdateAvailableBanner) was folded in here and removed. Renders null
-           unless an update is available/staged or a fresh SW is waiting. */
-        <UpdateAvailableBadge />
+        /* #3277: no persistent bar below the title bar any more. The update alert
+           is the red count on the settings gear plus the banner inside the
+           settings drawer; this headless engine stays mounted with the frame so an
+           applied update finishes its once-guarded reload (and activates the new
+           service worker) whether or not the drawer is open. It renders nothing. */
+        <UpdateReloadEngine />
       }
       footer={
         versionInfo ? (
@@ -375,12 +453,27 @@ export function BrandedFrame({
                   type="button"
                   variant="ghostStatic"
                   onClick={() => setFeedbackOpen(true)}
-                  aria-label="Send feedback"
+                  aria-label={feedbackAriaLabel}
                   title="Send feedback"
                   data-testid="feedback-button"
                   className="inline-flex h-auto items-center gap-1 p-0 text-xs font-normal text-white/50 transition-colors hover:text-white active:text-white"
                 >
-                  <MailIcon size={16} />
+                  {/* #2913: the badge overlays the icon's lower-right corner.
+                      It stays in the inline flow (`-ml-2` pulls it over the
+                      icon's right half, `top-0.5` drops it 2px below the
+                      bottom edge), so its own width pushes the "Feedback"
+                      word and the "•" separator aside at any digit count
+                      and `99+` never hides the envelope. */}
+                  <span
+                    data-testid="feedback-icon-wrap"
+                    className="inline-flex items-end"
+                  >
+                    <MailIcon size={16} />
+                    <CountBadge
+                      count={feedbackBadgeCount}
+                      className="relative top-0.5 -ml-2"
+                    />
+                  </span>
                   <span className="hidden sm:inline">Feedback</span>
                 </Button>
                 {/* #4371 (operator ruling 4371-D1 = C): Help beside Feedback,

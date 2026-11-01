@@ -9,9 +9,11 @@ import { queryKeys } from "@/lib/query-keys";
  * `useVersion`) — the server reads its LOCAL staged-update marker.
  * `useTriggerUpdate` POSTs the AUTH-required `/api/update-trigger`.
  *
- * Both are CONTEXT-FREE (plain `fetch`, no `useAppContext`) because
- * `UpdateAvailableBadge` lives in `BrandedFrame`, which renders in both
- * authed and pre-auth (loading/login) states where `AppContext` is absent.
+ * Both are CONTEXT-FREE (plain `fetch`, no `useAppContext`) because the update
+ * surfaces in `UpdateAvailableBadge.tsx` mount in `BrandedFrame` (the reload
+ * engine and the gear badge, #3277) and in `SettingsDrawer` (the banner), and
+ * `BrandedFrame` renders in authed and pre-auth (loading/login) states alike,
+ * where `AppContext` is absent.
  * The trigger reads the token from localStorage the same way the auth layer
  * stores it (`hapi_access_token::<origin>`).
  */
@@ -79,7 +81,7 @@ export interface UpdateStatus {
   deferred?: DeferredState | null;
   /**
    * Durable two-phase-updater lifecycle state, or null when no job record exists
-   * (issue #3057). The single bar keys its spinner (`staging`/`applying`), the
+   * (issue #3057). The update banner keys its spinner (`staging`/`applying`), the
    * restart-confirmation dialog (`ready`), and the terminal reload (`succeeded`)
    * off this — never off a resolved mutation (a 202 is launch acceptance, not
    * completion).
@@ -192,7 +194,7 @@ export function useUpdateStatus() {
         return failSafe();
       }
     },
-    // Phase-aware cadence (#3057): poll rapidly while staging/applying so the bar
+    // Phase-aware cadence (#3057): poll rapidly while staging/applying so the banner
     // reflects `ready`/`succeeded` promptly, moderately while a deferral is pending,
     // and at the idle 5-min cadence otherwise (aligns with the server marker cache).
     refetchInterval: query => {
@@ -270,9 +272,9 @@ export interface StageUpdateResult {
 }
 
 /**
- * Start the non-disruptive download/stage (issue #3057 R2). The single bar's first
- * click calls this — it downloads + integrity/signature-verifies the update WITHOUT
- * touching the running binary, so the bar can show a spinner during staging and only
+ * Start the non-disruptive download/stage (issue #3057 R2). The update banner's
+ * first tap calls this — it downloads + integrity/signature-verifies the update WITHOUT
+ * touching the running binary, so the banner can show a spinner during staging and only
  * open the restart-confirmation dialog once the polled job phase reaches `ready`.
  * Uses the SAME JWT-mint path as {@link useTriggerUpdate} (the route is JWT-guarded).
  */
@@ -295,10 +297,49 @@ export function useStageUpdate() {
       return (await res.json()) as StageUpdateResult;
     },
     onSuccess: () => {
-      // Pull fresh status so the bar picks up `staging` (then `ready`) promptly.
+      // Pull fresh status so the banner picks up `staging` (then `ready`) promptly.
       void queryClient.invalidateQueries({ queryKey: queryKeys.updateStatus });
     },
   });
+}
+
+/** Response of `POST /api/update-check` (issue #3277). */
+export interface UpdateCheckResult {
+  accepted: boolean;
+  /** True when a check was launched within the last 15 s (409 `check_busy`). */
+  busy?: boolean;
+  /**
+   * True when this instance has no updater script (501 `check_unavailable`), so no
+   * check runs here; only the primary instance of a cloud VM has one.
+   */
+  unavailable?: boolean;
+}
+
+/**
+ * Ask the server to check the update bucket now (issue #3277 R4) — the app's
+ * Refresh button calls this. The route runs the same `--check-only` the 6-hourly
+ * timer runs, so a 202 is launch acceptance: the caller re-reads
+ * `/api/update-status` a few seconds later to see the result. A 409 `check_busy`
+ * means a check was launched within the last 15 s, which serves the caller just as
+ * well. A 501 `check_unavailable` means this instance has no updater script, so it
+ * resolves `{ accepted: false, unavailable: true }` rather than throwing.
+ * Uses the SAME JWT-mint path as {@link useTriggerUpdate} (the route is JWT-guarded).
+ *
+ * @throws {Error} when there is no stored credential, the exchange is rejected,
+ *   or the server could not launch the check.
+ */
+export async function requestUpdateCheck(): Promise<UpdateCheckResult> {
+  const jwt = await mintUpdateJwt();
+  const res = await fetch("/api/update-check", {
+    method: "POST",
+    headers: { authorization: `Bearer ${jwt}` },
+  });
+  if (res.status === 409) return { accepted: true, busy: true };
+  if (res.status === 501) return { accepted: false, unavailable: true };
+  if (!res.ok) {
+    throw new Error(`Couldn't start the update check (HTTP ${res.status}).`);
+  }
+  return (await res.json()) as UpdateCheckResult;
 }
 
 /**

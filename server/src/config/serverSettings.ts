@@ -300,22 +300,42 @@ export function resolveOperatorInstanceEnabled(
 /**
  * The operator node's gateway credential: `FEEDBACK_INBOX_URL` (the gateway
  * origin, trailing slashes dropped) + `FEEDBACK_INBOX_TOKEN` (the shared
- * operator bearer, ruling D12). Null when either is unset; `"invalid"` when the
- * URL is not http(s). The one parse both the sink (#2911) and the inbox (#2912)
- * use, so the two cannot disagree about whether a node is configured.
+ * operator bearer, ruling D12). Null when both are unset; `{ missing }` naming
+ * the unset one when only one is set (issue #5798), so a typo in one env line is
+ * logged instead of read as "not an operator node"; `"invalid"` when the URL is
+ * not http(s). A blank value counts as unset. The one parse both the sink
+ * (#2911) and the inbox (#2912) use, so the two cannot disagree about whether a
+ * node is configured.
  */
 function readOperatorInboxEnv(
   env: Record<string, string | undefined>
-): { baseUrl: string; token: string } | "invalid" | null {
+):
+  | { baseUrl: string; token: string }
+  | { missing: "FEEDBACK_INBOX_URL" | "FEEDBACK_INBOX_TOKEN" }
+  | "invalid"
+  | null {
   const inboxUrl = env.FEEDBACK_INBOX_URL?.trim();
   const token = env.FEEDBACK_INBOX_TOKEN?.trim();
-  if (!inboxUrl || !token) return null;
+  if (!inboxUrl && !token) return null;
+  if (!inboxUrl) return { missing: "FEEDBACK_INBOX_URL" };
+  if (!token) return { missing: "FEEDBACK_INBOX_TOKEN" };
   let baseUrl = inboxUrl;
   while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
   if (!/^https?:\/\/[^/]/.test(baseUrl) || !URL.canParse(baseUrl)) {
     return "invalid";
   }
   return { baseUrl, token };
+}
+
+/** The half-set log text: names the unset variable and the set one, never a value. */
+function halfSetInboxMessage(
+  missing: "FEEDBACK_INBOX_URL" | "FEEDBACK_INBOX_TOKEN"
+): string {
+  const set =
+    missing === "FEEDBACK_INBOX_URL"
+      ? "FEEDBACK_INBOX_TOKEN"
+      : "FEEDBACK_INBOX_URL";
+  return `${missing} is not set but ${set} is — set both or neither`;
 }
 
 /** Where an operator instance reads the central inbox (issue #2912, epic #2909 Sub C). */
@@ -340,6 +360,12 @@ export function resolveFeedbackInboxConfig(
   if (inbox === "invalid") {
     console.error(
       "[feedback-inbox] FEEDBACK_INBOX_URL is not an http(s) URL — the inbox stays closed"
+    );
+    return null;
+  }
+  if (inbox !== null && "missing" in inbox) {
+    console.error(
+      `[feedback-inbox] ${halfSetInboxMessage(inbox.missing)} — the inbox stays closed`
     );
     return null;
   }
@@ -382,10 +408,14 @@ const SINK_URL_SUFFIX = "/feedback-sink";
  *    `FEEDBACK_INBOX_TOKEN` (the shared operator bearer, ruling D12). The node
  *    names itself with its federation node id (else the hostname). Wins when
  *    both branches are configured, so an operator cloud VM forwards as operator.
+ *    Only one of the two set is logged and is null (#5798): the node never
+ *    falls back to forwarding as a customer.
  *  - Customer VM: `FEEDBACK_RELAY_URL` ending in `/feedback-relay` +
  *    `FEEDBACK_RELAY_TOKEN`; the sink is the sibling `/feedback-sink` route and
- *    the gateway derives the origin from the token. Any other URL shape is null:
- *    a token is never sent to a guessed origin.
+ *    the gateway derives the origin from the token. With the token set, a
+ *    missing URL or any other URL shape is logged and null (#6072): a token is
+ *    never sent to a guessed origin. A URL with no token is silent, because the
+ *    GitHub broker reads the same URL on a broker-only VM.
  *
  * Null means no forwarding. Rows stay pending, so a later fix forwards them.
  * Independent of `HAPI_OPERATOR_INSTANCE`, which only gates the read routes.
@@ -398,6 +428,14 @@ export function resolveFeedbackSinkConfig(
   if (inbox === "invalid") {
     console.error(
       "[feedback-sink] FEEDBACK_INBOX_URL is not an http(s) URL — feedback is not forwarded"
+    );
+    return null;
+  }
+  if (inbox !== null && "missing" in inbox) {
+    // Issue #5798: a half-set operator pair is an operator node with a typo,
+    // never a customer node — so no fall-through to the relay arm below.
+    console.error(
+      `[feedback-sink] ${halfSetInboxMessage(inbox.missing)}; feedback is not forwarded`
     );
     return null;
   }
@@ -425,17 +463,29 @@ export function resolveFeedbackSinkConfig(
   }
   const relayUrl = env.FEEDBACK_RELAY_URL?.trim();
   const relayToken = env.FEEDBACK_RELAY_TOKEN?.trim();
-  if (relayUrl && relayToken && relayUrl.endsWith(RELAY_URL_SUFFIX)) {
-    return {
-      url: relayUrl.slice(0, -RELAY_URL_SUFFIX.length) + SINK_URL_SUFFIX,
-      token: relayToken,
-      originKind: "customer",
-      originInstanceId: null,
-      originLabel: null,
-      appVersion: VERSION,
-    };
+  // Issue #6072: only a set token makes this a relay pair. A URL alone is a
+  // valid broker-only VM (the GitHub broker reads it too), so it stays silent.
+  if (!relayToken) return null;
+  if (!relayUrl) {
+    console.error(
+      "[feedback-sink] FEEDBACK_RELAY_URL is not set but FEEDBACK_RELAY_TOKEN is — feedback is not forwarded"
+    );
+    return null;
   }
-  return null;
+  if (!relayUrl.endsWith(RELAY_URL_SUFFIX)) {
+    console.error(
+      `[feedback-sink] FEEDBACK_RELAY_URL does not end in ${RELAY_URL_SUFFIX} (no trailing slash) — feedback is not forwarded`
+    );
+    return null;
+  }
+  return {
+    url: relayUrl.slice(0, -RELAY_URL_SUFFIX.length) + SINK_URL_SUFFIX,
+    token: relayToken,
+    originKind: "customer",
+    originInstanceId: null,
+    originLabel: null,
+    appVersion: VERSION,
+  };
 }
 
 /**

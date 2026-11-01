@@ -7,6 +7,7 @@ import {
   TimeLogTimezoneSchema,
   TerminalKeyboardExpandedPreferenceSchema,
   ShareApiKeysByDefaultPreferenceSchema,
+  AccountsUsageViewPreferenceSchema,
   FEDERATION_SETTING_KEYS,
   FederationSettingsBlockSchema,
   FederationSettingsSyncSchema,
@@ -104,6 +105,11 @@ export const SETTING_REGISTRY: Record<
   // SHARE_API_KEYS_BY_DEFAULT_DEFAULT (off).
   shareApiKeysByDefault: {
     schema: ShareApiKeysByDefaultPreferenceSchema,
+  },
+  // Federation-native (#4467): the Accounts page's per-provider usage view
+  // (Bars / Arcs / Chips). No A-local storage; unset ⇒ every section is Bars.
+  accountsUsageView: {
+    schema: AccountsUsageViewPreferenceSchema,
   },
 };
 

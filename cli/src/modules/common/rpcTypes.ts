@@ -163,6 +163,12 @@ export interface SpawnSessionOptions {
    *  (deliberate scope-out). Threaded field-by-field through every spawn hop (the
    *  #1262 trap); any un-enumerated hop silently drops it. */
   autoSelectOptimalAccount?: boolean;
+  /** Issue #6028: the effort levels the pinned model supports, stamped by the
+   *  server from its model catalog (`syncEngine.spawnSession`). Wire-typed — the
+   *  daemon validates each entry against the effort catalog. Present (even `[]`)
+   *  ⇒ authoritative; absent ⇒ the daemon uses its static fallback lookup. Only
+   *  a fresh claude spawn's default effort is clamped to it. */
+  modelEffortLevels?: string[];
 }
 
 /**

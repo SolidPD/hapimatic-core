@@ -78,9 +78,20 @@ const SWITCH_LOG = {
   // #4568 (R6): the session bills an API key — auto-switch never moves a session
   // onto or off a key (its 429 is the key's own limit, not a subscription cap).
   skipApiKey: "auto-switch-skip-api-key",
+  // #6065 (D7): a local-mode session belongs to its terminal — a switch would
+  // archive (kill) the process the user is driving, so leave it alone.
+  skipLocalMode: "auto-switch-skip-local-mode",
   observerError: "auto-switch-observer-error",
   error: "auto-switch-error",
 } as const;
+
+/**
+ * #6065 (D7): true while the user drives the session from its terminal (local
+ * mode, `agentState.controlledByUser`, set by the CLI's mode-change handler).
+ */
+export function isLocalMode(session: Pick<Session, "agentState">): boolean {
+  return session.agentState?.controlledByUser === true;
+}
 
 /**
  * `switchAccount` error codes reached BEFORE the session was killed (the session
@@ -127,6 +138,38 @@ export interface AutoSwitchOnRateLimitDeps {
   onCleared?: (sessionId: string, session: Session | undefined) => void;
   /** Test seam — deterministic clock for cooldown/window math. Defaults to Date.now. */
   now?: () => number;
+}
+
+/** One consumer of the published edge seam. */
+export type EdgeObserver = (
+  sessionId: string,
+  session: Session | undefined
+) => void;
+
+/**
+ * #3612 (ruling D3): the seam is one optional slot per edge, and it has several
+ * consumers (#3612, #3023, #3666). `index.ts` keeps one list per edge and
+ * passes `composeEdgeObservers(list)` to the slot, so each consumer PUSHES onto
+ * the list instead of assigning the slot over another one. Every observer runs
+ * even when an earlier one throws; the first error is rethrown afterwards so
+ * the seam's `safeObserve` still logs it.
+ */
+export function composeEdgeObservers(
+  observers: readonly EdgeObserver[]
+): EdgeObserver {
+  return (sessionId, session) => {
+    let firstError: unknown = null;
+    let failed = false;
+    for (const observe of observers) {
+      try {
+        observe(sessionId, session);
+      } catch (err) {
+        if (!failed) firstError = err;
+        failed = true;
+      }
+    }
+    if (failed) throw firstError;
+  };
 }
 
 /**
@@ -330,6 +373,17 @@ export class AutoSwitchOnRateLimitService {
         );
         return;
       }
+      // (a2) #6065 (D7): never auto-switch a local-mode session — "the terminal
+      // owns a local-mode session's process" (accountRestart.ts), and a switch
+      // archives that process. The chip still shows; the user decides.
+      if (isLocalMode(session)) {
+        this.info(
+          SWITCH_LOG.skipLocalMode,
+          id,
+          "session is in local mode (terminal-controlled)"
+        );
+        return;
+      }
       // (b) R4 federation: only the OWNING node acts. findNodeForSession returns
       // null for LOCAL sessions. Defense-in-depth (bridged remote events never
       // reach the publisher) — keep it anyway.
@@ -410,6 +464,15 @@ export class AutoSwitchOnRateLimitService {
         SWITCH_LOG.skipInactive,
         id,
         "session no longer active at execution"
+      );
+      return;
+    }
+    // #6065 (D7): the mode can flip while queued — re-check at the attempt point.
+    if (isLocalMode(session)) {
+      this.info(
+        SWITCH_LOG.skipLocalMode,
+        id,
+        "session switched to local mode before execution"
       );
       return;
     }

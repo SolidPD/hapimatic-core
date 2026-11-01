@@ -34,6 +34,7 @@
 
 import type { RawJSONLines } from "../types";
 import { logger } from "@/ui/logger";
+import { isSyntheticAssistantRecord } from "./apiLimitSignal";
 
 /**
  * Substrings that identify an auth-class API error in message text. Matched
@@ -165,6 +166,8 @@ function matchAuthError(message: RawJSONLines): string | null {
  * SurrogateErrorDetector.isSuccessSignal):
  *  - a result message with is_error falsy
  *  - a normal assistant message (NOT an API error) — real model output
+ * A record Claude Code wrote itself (`model: "<synthetic>"`, e.g. "No response
+ * requested.") is not model output, so it is never a success signal (#6065).
  */
 function isSuccessSignal(message: RawJSONLines): boolean {
   const msg = message as Record<string, unknown>;
@@ -174,6 +177,9 @@ function isSuccessSignal(message: RawJSONLines): boolean {
     msg.is_error !== true
   ) {
     return true;
+  }
+  if (isSyntheticAssistantRecord(message)) {
+    return false;
   }
   if (msg.type === "assistant" && msg.isApiErrorMessage !== true) {
     return true;

@@ -3,19 +3,28 @@
  * SessionAccountUsageMeters (#4523) — the Session Configuration modal's usage
  * block: the selected account's meters, from the SAME envelope the Account Usage
  * page and the account picker render (`GET /api/federation/accounts/usage`), in
- * the page's bar view (`views/BarsView.tsx`).
+ * the page's views (`views/BarsView.tsx`, and Arcs / Chips since #4600).
  *
  * The block is account-GLOBAL usage — the federation merge lets a healthy row
  * beat a degraded duplicate — so it never stands in for the session node's
  * credential health (R6; per-node health is #4461 / #4466). Like the picker, it
  * passes no `history`, so no projection line renders.
+ *
+ * #4600: the healthy arm renders the account's chosen usage view (Arcs / Chips /
+ * Bars) from the `view` prop, never from `UsageViewContext` — a provider around
+ * the modal would also reach the staged account picker, which must stay Bars
+ * (#4467 R8).
  */
 import type { AccountUsage } from "@hapi/protocol";
+import type { UsageViewId } from "@hapi/protocol/schemas";
 import { STATUS_MESSAGE } from "@/components/AccountUsage/AccountUsageCard";
 import {
   BarsView,
   deriveBarsMeters,
 } from "@/components/AccountUsage/views/BarsView";
+import { ArcsView } from "@/components/AccountUsage/views/ArcsView";
+import { ChipsView } from "@/components/AccountUsage/views/ChipsView";
+import { buildUsageColumns } from "@/components/AccountUsage/views/usageMeters";
 
 /**
  * The usage row for an account: the row whose `accountUuid` matches, else the
@@ -41,8 +50,11 @@ export function findAccountUsage(
 
 export function SessionAccountUsageMeters({
   usage,
+  view,
 }: {
   usage: AccountUsage | undefined;
+  /** The Anthropic usage view (#4600); unset or unknown renders Bars. */
+  view?: UsageViewId;
 }) {
   // No envelope for the account (loading, errored, not listed) → no block (R5).
   if (!usage) return null;
@@ -50,13 +62,24 @@ export function SessionAccountUsageMeters({
   // Same arm rule as the card (#2608): meters for `ok`, and for a `rate_limited`
   // row that still carries preserved meters (with the transient flag on top).
   const { hasMeterData } = deriveBarsMeters(usage.utilization);
+  // #4600: the card's dispatch rule (#4467 Task 7) — Arcs / Chips only with a
+  // meter to draw; Bars otherwise, which keeps its "No usage data this period."
+  // line for a meter-less row in every view.
+  const degraded =
+    usage.status !== "ok" && !(usage.status === "rate_limited" && hasMeterData);
+  const effective =
+    !degraded && hasMeterData && (view === "arcs" || view === "chips")
+      ? view
+      : "bars";
 
   return (
     <div
       data-testid="config-account-usage"
       data-usage-status={usage.status}
+      data-usage-view={degraded ? undefined : effective}
       className="rounded-md border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3"
     >
+      {/* Inline (not `degraded`) so `usage.status` narrows for STATUS_MESSAGE. */}
       {usage.status !== "ok" &&
       !(usage.status === "rate_limited" && hasMeterData) ? (
         // A degraded envelope: one status line, no bars and no Retry — the
@@ -74,7 +97,17 @@ export function SessionAccountUsageMeters({
               {STATUS_MESSAGE.rate_limited}
             </p>
           )}
-          <BarsView account={usage} />
+          {effective === "arcs" ? (
+            <ArcsView
+              columns={buildUsageColumns(usage.utilization, "anthropic")}
+            />
+          ) : effective === "chips" ? (
+            <ChipsView
+              columns={buildUsageColumns(usage.utilization, "anthropic")}
+            />
+          ) : (
+            <BarsView account={usage} />
+          )}
         </>
       )}
     </div>

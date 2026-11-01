@@ -19,6 +19,13 @@ import type { WebAppEnv } from "../../middleware/auth";
 import { isSafeMachinePath } from "../../../utils/pathSecurity";
 import { expandTilde } from "../../../utils/expandTilde";
 import { validateApiKeySpawn } from "../machines";
+import { resolveModelFamily, type SpawnWarning } from "@hapi/protocol";
+import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
+import {
+  ACCOUNT_EXHAUSTED_CODE,
+  checkAccountHeadroom,
+  headroomWarnings,
+} from "../../../accounts/accountHeadroom";
 import type { FederationDeps } from "./shared";
 import { checkFederationToken, notifyOriginatingHub } from "./shared";
 
@@ -70,6 +77,7 @@ export async function spawnForPeer(
     emoji,
     originatingNodeId,
     accountUuid,
+    forceAccount,
     parentSessionId,
     parentRelationship,
     safeMode,
@@ -139,6 +147,58 @@ export async function spawnForPeer(
     }
     // A key whose home is this node comes back as its bare vault id.
     apiKeyId = resolved.canonicalRef;
+  }
+
+  // Issue #5879 (three-point spawn checklist, point 2): THIS node holds the
+  // account and its usage, so it decides — synchronously, BEFORE the accept, so
+  // a refusal reaches the hub's caller at once and nothing is spawned (the same
+  // shape as the #5127 key check above; no background report is sent for it).
+  // The read is deadline-bounded (2.5 s), well under the hub's 10 s timeout.
+  const spawnWarnings: SpawnWarning[] = [];
+  let pinnedAccount:
+    | {
+        accountUuid: string;
+        email: string | null;
+        source: "requested" | "forced";
+      }
+    | undefined;
+  const flavor = agent ?? "claude";
+  if (
+    accountUuid &&
+    apiKeyId === undefined &&
+    (flavor === "claude" || flavor === "opencode")
+  ) {
+    const verdict = await checkAccountHeadroom(
+      {
+        usageService: deps.getUsageService?.() ?? null,
+        accountService: deps.getAccountService(),
+        nodeIdentity: resolveLocalNodeIdentity(deps.federationConfig),
+        errorLogger: deps.errorLogger ?? null,
+      },
+      {
+        accountUuid,
+        modelFamily: resolveModelFamily(rawModel ?? modelMode),
+        forceAccount: forceAccount === true,
+      }
+    );
+    if (verdict.kind === "exhausted" && !verdict.forced) {
+      return c.json(
+        {
+          type: "error",
+          code: ACCOUNT_EXHAUSTED_CODE,
+          message: verdict.message,
+          exhaustion: verdict.exhaustion,
+        },
+        409
+      );
+    }
+    spawnWarnings.push(...headroomWarnings(verdict));
+    pinnedAccount = {
+      accountUuid,
+      email: verdict.email,
+      source:
+        verdict.kind === "exhausted" && verdict.forced ? "forced" : "requested",
+    };
   }
 
   // Read claudePath from this node's own federation config (issue #933).
@@ -297,6 +357,11 @@ export async function spawnForPeer(
     `[perf][spawn] stage=remote-accept dir=${directory} node=${originatingNodeId ?? ""}`,
     { category: "perf" }
   );
-  // Return immediately — the hub polls for the new session.
-  return c.json({ type: "accepted" });
+  // Return immediately — the hub polls for the new session. Issue #5879: the
+  // accept carries the headroom warnings and the pinned account, when any.
+  return c.json({
+    type: "accepted",
+    ...(spawnWarnings.length > 0 ? { warnings: spawnWarnings } : {}),
+    ...(pinnedAccount ? { account: pinnedAccount } : {}),
+  });
 }

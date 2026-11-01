@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { logger } from "@/ui/logger";
-import { SECRET_ENV_VARS } from "@/sandbox/secretEnvVars";
+import {
+  AGENT_FORBIDDEN_ENV_VARS,
+  SECRET_ENV_VARS,
+} from "@/sandbox/secretEnvVars";
 import { TerminalMirror } from "./TerminalMirror";
 import type {
   TerminalErrorPayload,
@@ -54,8 +57,12 @@ const DEFAULT_MAX_TERMINALS = 4;
 // — a billing-signal var the agent paths manage via SDK_SIGNAL_ENV_VARS, hence
 // excluded from SECRET_ENV_VARS — added back here to preserve the pre-#1734
 // web-terminal behavior exactly.
+// #5847: AGENT_FORBIDDEN_ENV_VARS (the federation token, the onboarding vars)
+// joins the filter too. That set is ungated everywhere, and a wrapper started in
+// a pane of a tmux server an older daemon froze could carry the federation token.
 const SENSITIVE_ENV_KEYS = new Set<string>([
   ...SECRET_ENV_VARS,
+  ...AGENT_FORBIDDEN_ENV_VARS,
   "ANTHROPIC_API_KEY",
 ]);
 
