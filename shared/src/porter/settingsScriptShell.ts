@@ -113,9 +113,11 @@ export function settingsScriptNormalizeJq(): string {
  * - `HOME`, `STAGING`, `WORK` and `SETTINGS_JSON` (a compact JSON OBJECT) set;
  * - `SSCRIPT_SECTIONS` set to the folder where the section folders were staged
  *   (a reference into one is that section's to carry);
- * - `record_omission <surface> <reason>`, `physical_path` and
- *   `has_credential_part` (`./credentialNamesShell`) and `porter_walk_link`
- *   (`./linkWalkShell`, #4188) defined;
+ * - `record_omission <surface> <reason>`, `physical_path`,
+ *   `has_credential_part`, `holds_path` and (#6063) `root_content_refusal`
+ *   (`credentialLinkFunctionLines()`, `./credentialNamesShell`) and
+ *   `porter_walk_link` (`./linkWalkShell`, #4188) defined, and
+ *   `CONFIG_ROOT_PHYS` set (empty when there is no config root);
  * - nothing at `$STAGING/settings-scripts` yet.
  *
  * The folder is created only when the first script is carried, so an empty
@@ -135,6 +137,8 @@ export function settingsScriptLoopLines(): string[] {
     "# D3: the literal <home>/.claude/ prefix becomes $HOME/.claude/ in the two values.",
     `SETTINGS_JSON="$(printf '%s' "$SETTINGS_JSON" | jq -c --arg home "$HOME/.claude/" '${settingsScriptNormalizeJq()}' 2>/dev/null || printf '%s' "$SETTINGS_JSON")"`,
     `printf '%s' "$SETTINGS_JSON" | jq -c ${settingsScriptClassifierArgs()} '${settingsScriptClassifierJq()}' >| "$WORK/sscript-rows.jsonl"`,
+    "# #6063: the physical $HOME/.claude, the root a reference resolves against.",
+    '_sshome="$(physical_path "$HOME/.claude")" || _sshome=""',
     "while IFS= read -r _ssrow; do",
     '  [ -n "$_ssrow" ] || continue',
     '  _sskey="$(printf \'%s\' "$_ssrow" | jq -r .key)"',
@@ -208,6 +212,23 @@ export function settingsScriptLoopLines(): string[] {
     `      record_omission "$_sssurf" '${r.linkUnchecked}'`,
     "      continue",
     "    fi",
+    "    # #6063: a link whose target lies inside the config root, or inside",
+    "    # $HOME/.claude (the root it resolves against), outside the section folders",
+    "    # is carried only when the target is a top-level file of $HOME/.claude, as",
+    "    # a direct reference is (statusline.sh -> statusline-v2.sh ships); a shell",
+    "    # snapshot or a plugin's script is refused. A target held under another",
+    "    # spelling of a root keeps its / and is refused. The $HOME/.claude test is",
+    "    # by text and -ef only (no mount probe).",
+    "    _ssin=0",
+    '    root_content_refusal "$_ssphys"; if [ "$_rckind" = r ]; then _ssin=1; fi',
+    '    if [ "$_ssin" -eq 0 ] && [ -n "$_sshome" ] && [ "$_sshome" != "${CONFIG_ROOT_PHYS:-}" ] && holds_path "$_sshome" "$_ssphys"; then',
+    '      _sssub="${_ssphys#"$_sshome"/}"',
+    `      case "\${_sssub%%/*}" in ${SETTINGS_SCRIPT_SECTION_FOLDERS.join("|")}) ;; *) _ssin=1 ;; esac`,
+    "    fi",
+    '    if [ "$_ssin" -eq 1 ]; then',
+    '      case "$_ssphys" in "$_sshome"/*/*) ;; "$_sshome"/?*) _ssin=0 ;; esac',
+    "    fi",
+    `    if [ "$_ssin" -eq 1 ]; then record_omission "$_sssurf" '${r.linkIntoRoot}'; continue; fi`,
     "  fi",
     "  # D2: a script that holds a known credential token is not carried (grep -q:",
     "  # the match is never printed). 0 = a match, 1 = none; anything else could",

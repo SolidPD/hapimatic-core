@@ -100,6 +100,11 @@ export const claudeCommand: CommandDefinition = {
         // runClaude's effort state, which reaches the claude child as --effort
         // (via the launcher argv). Consumes the next token like --hapi-model-mode.
         options.effort = args[++i];
+      } else if (arg === "--hapi-node-default-effort") {
+        // Issue #6070: Hapimatic-internal (NOT forwarded to the claude child) —
+        // the node's pre-fit default effort when the spawn's effort was defaulted;
+        // runClaude records it so a model switch can re-fit the effort.
+        options.nodeDefaultEffort = args[++i];
       } else if (arg === "--hapi-raw-model") {
         // Issue #2456: Hapimatic-internal — seeds runClaude's currentModel with a
         // specific pinned raw model id (precedence over --hapi-model-mode).

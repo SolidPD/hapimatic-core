@@ -451,6 +451,17 @@ export const MetadataSchema = z
      *  reconnect) so the effort survives a restart. Absence = no effort pin
      *  (binary default). Optional: legacy/default-effort sessions won't have it. */
     effort: EffortLevelSchema.optional(),
+    /** Issue #6070: the node's spawn default effort (env `HAPI_DEFAULT_EFFORT` >
+     *  settings `defaultEffort` > xhigh, BEFORE the model fit) that this session's
+     *  effort follows. Present ⇒ the effort was defaulted, not picked, so a model
+     *  switch re-fits it to the new model (`refitNodeDefaultEffort`,
+     *  `shared/src/effort.ts`); any explicit effort pick clears it. Written
+     *  CLI-side (the single metadata writer, #2434), and server-side only for a
+     *  disconnected session's staged change. A lenient string, not
+     *  `EffortLevelSchema`, because a failed metadata parse nulls the WHOLE
+     *  metadata (`sessionCache.ts`); validate with `isEffortLevel` before use.
+     *  Absent ⇒ never re-fitted (legacy session or an explicit effort). */
+    nodeDefaultEffort: z.string().optional(),
     /** Issue #2456: a specific pinned Claude model id (e.g. "claude-opus-4-6")
      *  selected via "More models". Distinct from `modelMode` (family quick-pick)
      *  — this is the raw `--model <id>` axis. Its display `modelMode` stays

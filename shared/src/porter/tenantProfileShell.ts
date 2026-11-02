@@ -7,13 +7,16 @@
  *
  * The lines run inside the bash exporter and rely on its helpers and state:
  * `record_omission`, `prune_credential_names`, `physical_path`,
- * `has_credential_part`, `$CONFIG_ROOT`, `$STAGING`, `$WORK`, `$_cnl` (a
- * newline) and, for the premium filter, `$_kmc` / `$_desc` from Step 8.
+ * `has_credential_part`, `root_content_refusal` (#6063), `$CONFIG_ROOT`,
+ * `$CONFIG_ROOT_PHYS`, `$STAGING`, `$WORK`, `$_cnl` (a newline) and, for the
+ * premium filter, `$_kmc` / `$_desc` from Step 8.
  *
  * NODE-FREE: string builders only.
  */
 import {
   ARCHIVE_CREDENTIAL_OMISSION_REASON,
+  ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON,
+  ARCHIVE_LINK_LOOP_OMISSION_REASON,
   ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
   bashSingleQuote,
 } from "./exportShared";
@@ -89,6 +92,13 @@ export function memoryStagingShellLines(excludeFlags: string): string[] {
     `      _mrefuse='${ARCHIVE_CREDENTIAL_OMISSION_REASON}'`,
     '    elif [ -z "$_mphys" ]; then',
     `      _mrefuse='${ARCHIVE_LINK_UNCHECKED_OMISSION_REASON}'`,
+    "    else",
+    "      # #6063: one that names the config root or a folder above it (projects -> .,",
+    "      # projects -> ~) would read every folder there as a project; one into the root",
+    "      # outside the section folders (projects -> plugins) would ship that as memory.",
+    '      root_content_refusal "$_mphys" d',
+    `      if [ "$_rckind" = l ]; then _mrefuse='${ARCHIVE_LINK_LOOP_OMISSION_REASON}'`,
+    `      elif [ "$_rckind" = r ]; then _mrefuse='${ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON}'; fi`,
     "    fi",
     "  fi",
     '  if [ -n "$_mrefuse" ]; then',

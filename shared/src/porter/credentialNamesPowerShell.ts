@@ -23,6 +23,7 @@ import {
   DIMENSION_DIRS,
   HOOK_TREE_EXCLUSION_PATTERNS,
   psq,
+  ROOT_BELOW_SH,
   ROOT_HOLDS_SH,
 } from "./exportShared";
 import {
@@ -96,9 +97,18 @@ export function credentialNamesPowerShellLines(): string[] {
  * change a path. It holds no `'`, so it sits in a PowerShell single-quoted
  * string unchanged, and no `exit`, `&&` or `||`, which the R2 rules keep out of
  * the PowerShell body (`exit` would end the caller's console under `irm | iex`).
+ * A byte-order mark, or any preamble a profile's `$OutputEncoding` writes, turns
+ * the first word into a command, so the line opens with `t=;` and assigns `t`
+ * again after it: an inherited `t` is never the path checked, and a preamble
+ * can no longer leave `t` empty (#6093). Then `set +e +C`: where `/bin/sh` is
+ * bash it imports an exported `SHELLOPTS`, and its `errexit` or `noclobber`
+ * must not change the answer (#6093 F1). Nothing after the reset can stop on
+ * errexit; the reset keeps every stdin probe's opening the same. A preamble
+ * under an inherited `errexit` still stops bash at the first word with 127,
+ * before the reset runs, and `holdsPath` reads any status but 1 as held.
  */
-const SAME_FOLDER_SH =
-  't=$HAPI_PORTER_EF_T; a=$HAPI_PORTER_EF_A; r=1; while :; do case $a in /*) ;; *) break ;; esac; if [ "$t" -ef "$a" ]; then r=0; break; fi; case $a in /) break ;; esac; a=${a%/*}; if [ -z "$a" ]; then a=/; fi; done; [ "$r" = 0 ]';
+export const SAME_FOLDER_SH =
+  't=; t=$HAPI_PORTER_EF_T; set +e +C; a=$HAPI_PORTER_EF_A; r=1; while :; do case $a in /*) ;; *) break ;; esac; if [ "$t" -ef "$a" ]; then r=0; break; fi; case $a in /) break ;; esac; a=${a%/*}; if [ -z "$a" ]; then a=/; fi; done; [ "$r" = 0 ]';
 
 /**
  * #5953: the `sh` script `holdsConfigRoot` runs off Windows, on its stdin, the
@@ -111,14 +121,20 @@ const SAME_FOLDER_SH =
  * `-exec`, or whose `test` lacks `-ef` (a one-entry check on the root itself
  * finds out), or one that dies (exit above 1). An empty path in either variable
  * also ends with 0: `find ""` fails with exit 1 and no hit, which would read as
- * "not held", and a byte-order mark in front of the script turns its first
- * word into a command, leaving `t` empty. So `t=` stays first. A folder below
- * the target it cannot read (exit 1, no hit) is not walked, as in the bash
- * twin. Like {@link SAME_FOLDER_SH}, the paths travel in the environment and
- * the script holds no `'`, `exit`, `&&` or `||`.
+ * "not held". A byte-order mark in front of the script turns its first word
+ * into a command, so the line opens with `t=;` and assigns `t` again after it:
+ * an inherited `t` is never the path checked (#6093). Then `set +e +C`: where
+ * `/bin/sh` is bash it imports an exported `SHELLOPTS`, and under `errexit` a
+ * walk `find` that exits 1 (a folder it cannot read) or the capability check
+ * would end the script with 1, "not held", for a folder that holds the root
+ * (#6093 F1). A preamble under an inherited `errexit` stops bash at the first
+ * word with 127, before the reset runs, which the caller reads as held. A
+ * folder below the target it cannot read (exit 1, no hit) is not
+ * walked, as in the bash twin. Like {@link SAME_FOLDER_SH}, the paths travel in
+ * the environment and the script holds no `'`, `exit`, `&&` or `||`.
  */
-const ROOT_MOUNT_SH =
-  't=$HAPI_PORTER_EF_T; a=$HAPI_PORTER_EF_A; h=1; if [ -n "$t" ]; then if [ -n "$a" ]; then c=$(find "$a" -prune -samefile "$a" -exec test {} -ef "$a" \\; -print 2>/dev/null); if [ "$c" = "$a" ]; then o=$(find "$t" -samefile "$a" -exec test {} -ef "$a" \\; -print -prune 2>/dev/null); s=$?; if [ -z "$o" ]; then if [ "$s" -le 1 ]; then h=0; fi; fi; fi; fi; fi; [ "$h" = 1 ]';
+export const ROOT_MOUNT_SH =
+  't=; t=$HAPI_PORTER_EF_T; set +e +C; a=$HAPI_PORTER_EF_A; h=1; if [ -n "$t" ]; then if [ -n "$a" ]; then c=$(find "$a" -prune -samefile "$a" -exec test {} -ef "$a" \\; -print 2>/dev/null); if [ "$c" = "$a" ]; then o=$(find "$t" -samefile "$a" -exec test {} -ef "$a" \\; -print -prune 2>/dev/null); s=$?; if [ -z "$o" ]; then if [ "$s" -le 1 ]; then h=0; fi; fi; fi; fi; fi; [ "$h" = 1 ]';
 
 /**
  * #5955: the C# `winFolderId` compiles with `Add-Type`, at most once per session
@@ -188,10 +204,20 @@ const WIN_FOLDER_ID_CS = [
  * not place a path in the root: off Windows it runs {@link ROOT_HOLDS_SH} (the
  * script the bash twin runs) through `/bin/sh` and judges each in-root entry
  * that is the same file (a bind mount of a folder inside the root) as the
- * text-contained path it is. They rely on
- * `isCredentialName` (above) and on the main block's `$ON_WINDOWS`,
- * `$STAGING`, `$STG_FULL`, `$CONFIG_ROOT_PHYS` and (for `rootHoldsTarget`)
- * `$WORK`.
+ * text-contained path it is. #6062 added `rootHeldBelow`, the twin of the
+ * bash `root_held_below`, which `linkIntoRoot` asks for a folder link's target
+ * when `rootHoldsTarget` finds nothing: off Windows it runs
+ * {@link ROOT_BELOW_SH} (the script the bash twin runs), which looks strictly
+ * BELOW the target for an entry that is the same file as a root entry (another
+ * mount, or a hard link), and judges each such entry by its in-root path; the
+ * linked-`hooks/` gate asks it directly. It also added `linkAbove`, the twin of
+ * the bash `under_link` read from a base, which the hook registration walk
+ * uses to judge a script reached through any folder link on its own physical
+ * path (a path that climbs out of the root is walked from its own filesystem
+ * root, #6062 fix round 1). They rely on `isCredentialName` (above) and on the main block's
+ * `$ON_WINDOWS`, `$STAGING`, `$STG_FULL`, `$CONFIG_ROOT_PHYS`, `$WORK` (for
+ * `rootHoldsTarget` and `rootHeldBelow`) and `$TAR_IS_GNU` (for
+ * `rootHeldBelow`).
  */
 export function linkCheckPowerShellLines(): string[] {
   return [
@@ -236,12 +262,14 @@ export function linkCheckPowerShellLines(): string[] {
     "    # kernel reads as part of a name (the #4332 gap). It sets",
     "    # $script:ppCred when a link it follows has a credential-bearing part in",
     "    # its name or its target, even when the physical path no longer shows one",
-    "    # (~/.ssh -> ~/Dropbox/keys), and $script:ppProc (returning $null) when the",
-    "    # walk reaches /proc; a caller that needs them must read them right after",
-    "    # its call, since the next call resets both.",
+    "    # (~/.ssh -> ~/Dropbox/keys), $script:ppProc (returning $null) when the",
+    "    # walk reaches /proc, and $script:ppMissing (returning $null) when an entry",
+    "    # on the walk does not exist (a dangling link, #6063); a caller that needs",
+    "    # them must read them right after its call, since the next call resets all.",
     "    function physicalPath($p) {",
     "      $script:ppCred = $false",
     "      $script:ppProc = $false",
+    "      $script:ppMissing = $false",
     "      $pinfo = $null; $pdrive = $null",
     "      try { $p = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($p, [ref]$pinfo, [ref]$pdrive) } catch { return $null }",
     "      if ($pinfo.Name -ne 'FileSystem') { return $null }",
@@ -269,7 +297,7 @@ export function linkCheckPowerShellLines(): string[] {
     "        # refused too (fail-closed; the bash twin's case is case-sensitive).",
     "        if (($next -eq '/proc') -or $next.StartsWith('/proc/')) { $script:ppProc = $true; return $null }",
     "        $it = Get-Item -LiteralPath $next -Force -ErrorAction SilentlyContinue",
-    "        if (-not $it) { return $null }",
+    "        if (-not $it) { $script:ppMissing = $true; return $null }",
     "        if ($it.Attributes -band [IO.FileAttributes]::ReparsePoint) {",
     "          $hops++",
     "          if ($hops -gt 40) { return $null }",
@@ -651,6 +679,68 @@ export function linkCheckPowerShellLines(): string[] {
     "      }",
     "      return $false",
     "    }",
+    "    # #6062: true when an entry strictly below the physical folder $phys, which",
+    "    # holdsPath leaves outside the root, is the same file as a root entry that",
+    "    # linkIntoRoot refuses (a folder with 'd', a file with ''): another mount",
+    "    # of a root folder or file placed below the target, or a hard link of a",
+    "    # root file there; also true when that cannot be answered (fail closed).",
+    "    # Off Windows /bin/sh runs ROOT_BELOW_SH, the script the bash twin runs,",
+    "    # with the listing in $WORK/root-inodes: it prints d<path> or f<path> per",
+    "    # match, or ? when it cannot answer. One answer per physical folder per",
+    "    # run, in an ordinal dictionary (an @{} key ignores case, so a cached",
+    "    # /mnt/area would answer for /mnt/Area). The caller's",
+    "    # PSNativeCommandUseErrorActionPreference is turned off here, as in",
+    "    # holdsPath. On Windows there is no bind mount (an NTFS hard link is",
+    "    # #6077's): false. The bash twin is root_held_below.",
+    "    $script:RHB_CACHE = New-Object 'System.Collections.Generic.Dictionary[string,bool]' -ArgumentList ([StringComparer]::Ordinal)",
+    "    function rootHeldBelow($phys) {",
+    "      if ($ON_WINDOWS) { return $false }",
+    "      if ((-not $phys) -or (-not $CONFIG_ROOT_PHYS) -or (-not [IO.Directory]::Exists($phys))) { return $false }",
+    "      if (holdsPath $CONFIG_ROOT_PHYS $phys) { return $false }",
+    "      if ($script:RHB_CACHE.ContainsKey($phys)) { return $script:RHB_CACHE[$phys] }",
+    "      $PSNativeCommandUseErrorActionPreference = $false",
+    "      $psep = [string][IO.Path]::DirectorySeparatorChar",
+    "      $rpre = $CONFIG_ROOT_PHYS.TrimEnd($psep) + $psep",
+    "      $env:HAPI_PORTER_EF_T = $phys; $env:HAPI_PORTER_EF_A = $CONFIG_ROOT_PHYS; $env:HAPI_PORTER_EF_S = (Join-Path $WORK 'root-inodes'); $env:HAPI_PORTER_EF_P = $(if ($TAR_IS_GNU) { '1' } else { '0' })",
+    "      $rbout = @('?')",
+    `      try { $rbout = @('${ROOT_BELOW_SH}' | & '/bin/sh'); if ($LASTEXITCODE -ne 0) { $rbout = @('?') } } catch { $rbout = @('?') }`,
+    "      finally { $env:HAPI_PORTER_EF_T = $null; $env:HAPI_PORTER_EF_A = $null; $env:HAPI_PORTER_EF_S = $null; $env:HAPI_PORTER_EF_P = $null }",
+    "      $ans = $false",
+    "      foreach ($rbe in $rbout) {",
+    "        # ?, or a piece of a name with a newline in it: the answer cannot be read.",
+    "        $rbs = [string]$rbe",
+    "        if ($rbs.Length -lt 2) { $ans = $true; break }",
+    "        $rbk = $rbs.Substring(0, 1); $rbp = $rbs.Substring(1)",
+    "        if ((($rbk -cne 'd') -and ($rbk -cne 'f')) -or (-not $rbp.StartsWith($rpre, [StringComparison]::Ordinal))) { $ans = $true; break }",
+    "        if (-not (pathExists $rbp)) { $ans = $true; break }",
+    "        if (linkIntoRoot $rbp $(if ($rbk -ceq 'd') { 'd' } else { '' })) { $ans = $true; break }",
+    "      }",
+    "      $script:RHB_CACHE[$phys] = $ans",
+    "      return $ans",
+    "    }",
+    "    # #6062: true when a part of $rel (a '/'-separated path below $base) other",
+    "    # than its last is a link, a reparse point that is no cloud-files",
+    "    # placeholder, on the path this script's copy reads: the joined path is",
+    "    # collapsed with GetFullPath first, as physicalPath and the copy read it,",
+    "    # so '.' and '..' are text (hooks/../x.py is x.py, which passes through no",
+    "    # link, though the kernel would follow hooks), and a '..' that climbs",
+    "    # above $base and comes back (../.claude/hooks/x.py under a root named",
+    "    # .claude) is walked from $base like any other (fix round 1, CR-1). False",
+    "    # for an empty $rel or one that ends outside $base. The bash twin is",
+    "    # under_link, which reads the path as the kernel does, as bash's copy does.",
+    "    function linkAbove($base, $rel) {",
+    "      if (-not $rel) { return $false }",
+    "      $lcmp = if ($ON_WINDOWS) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }",
+    "      try { $bfull = [IO.Path]::GetFullPath($base).TrimEnd('\\', '/'); $full = [IO.Path]::GetFullPath((Join-Path $bfull $rel)) } catch { return $false }",
+    "      # Below the root, walk from the root; a path that climbs out of it (.claude/../lnk/...) walks from its own filesystem root, as bash refuses it.",
+    "      if ($full.StartsWith($bfull + [IO.Path]::DirectorySeparatorChar, $lcmp)) { $p = $bfull } else { $p = [IO.Path]::GetPathRoot($full); if (-not $p) { return $false } }",
+    "      $parts = $full.Substring($p.TrimEnd('\\', '/').Length).Split([char[]]@('/', '\\'), [StringSplitOptions]::RemoveEmptyEntries)",
+    "      for ($i = 0; $i -lt $parts.Count - 1; $i++) {",
+    "        $p = Join-Path $p $parts[$i]",
+    "        if ((isReparseItem $p) -and (-not (isCloudPlaceholder $p))) { return $true }",
+    "      }",
+    "      return $false",
+    "    }",
     "    # #5934: true when the physical path $phys lies inside the config root but",
     "    # not in an exported section folder, or in one under a name that folder's",
     "    # copy leaves out (a hook tree's own names below hooks/): the normal export",
@@ -668,7 +758,9 @@ export function linkCheckPowerShellLines(): string[] {
     "      $rpre = $CONFIG_ROOT_PHYS.TrimEnd($psep) + $psep",
     "      # #5985: not held by text or -ef: ask whether an entry below the root is the",
     "      # same file (another mount of a folder inside it).",
-    "      if (-not (holdsPath $CONFIG_ROOT_PHYS $phys)) { return (rootHoldsTarget $phys $mode) }",
+    "      # #6062: a folder link's target may instead HOLD another mount (or a hard",
+    "      # link) of a root entry below it; rootHeldBelow looks there.",
+    "      if (-not (holdsPath $CONFIG_ROOT_PHYS $phys)) { if (rootHoldsTarget $phys $mode) { return $true }; if ($mode -ne 'd') { return $false }; return (rootHeldBelow $phys) }",
     "      # Held under a spelling whose text does not begin with the root's: the root",
     "      # itself is the loop tests' (holdsConfigRoot, the same holdsPath test);",
     "      # anything else is refused whole, since its section cannot be read from",
@@ -737,6 +829,59 @@ export function linkCheckPowerShellLines(): string[] {
     "      if (-not $phys) { return $false }",
     "      $ppar = physicalPath ([IO.Path]::GetDirectoryName($src))",
     "      return [bool]((holdsPath $phys $ppar) -or (holdsConfigRoot $phys))",
+    "    }",
+    "    # #6063: the twin of root_content_refusal, for a path a copy outside the",
+    "    # section folders reads through a link: 'l' when $mode is 'd' and $phys is",
+    "    # the config root or a folder above it (holdsConfigRoot), 'r' when",
+    "    # linkIntoRoot refuses it, else ''. Each caller maps the kind to its omission.",
+    "    function rootContentRefusal($phys, $mode = '') {",
+    "      if (-not $phys) { return '' }",
+    "      if (($mode -eq 'd') -and (holdsConfigRoot $phys)) { return 'l' }",
+    "      if (linkIntoRoot $phys $mode) { return 'r' }",
+    "      return ''",
+    "    }",
+    "    # #6063: true when $p is a file through its links, as bash's [ -f ] reads it",
+    "    # (moved from the Step 3 CLAUDE.md copy, which also asks it before the link",
+    "    # tests). Off Windows the kernel decides with bash's own test, [ -f ]",
+    "    # through the links (#4928), so a dangling backslash target, an unreadable",
+    "    # file behind '::' or /proc, a folder the user cannot search, and a kernel",
+    "    # link bound below 40 each go the way bash goes. It is /bin/sh's builtin, so",
+    "    # no other 'test' on PATH answers, and it starts through",
+    "    # ProcessStartInfo.ArgumentList, which hands the path over unchanged: as a",
+    "    # native argument, Legacy argument passing (the only mode before pwsh 7.3)",
+    "    # drops a '\"' in it, so the test would check another path. On Windows",
+    "    # physicalPath (it reads only links, never the file) still decides; no CI",
+    "    # leg runs that branch. False means not a file (dangling, or a folder);",
+    "    # $null means it cannot be checked: the test cannot run, or on Windows the",
+    "    # walk stopped short of a missing entry (a target-less reparse point that is",
+    "    # no cloud placeholder, more than 40 hops). A caller must refuse $null with",
+    "    # a row, as bash records an unchecked link, never skip it as no file.",
+    "    function isFileThroughLinks($p) {",
+    "      if ($ON_WINDOWS) {",
+    "        $fp = physicalPath $p",
+    "        if (-not $fp) { if ($script:ppMissing) { return $false }; return $null }",
+    "        return [bool]($fp -and (Test-Path -LiteralPath $fp -PathType Leaf))",
+    "      }",
+    "      try {",
+    "        $fT = [Diagnostics.ProcessStartInfo]::new('/bin/sh')",
+    "        $fT.UseShellExecute = $false",
+    "        foreach ($fA in @('-c', '[ -f \"$1\" ]', 'sh', $p)) { $fT.ArgumentList.Add($fA) }",
+    "        $fP = [Diagnostics.Process]::Start($fT); $fP.WaitForExit()",
+    "        return ($fP.ExitCode -eq 0)",
+    "      } catch { return $null }",
+    "    }",
+    "    # #6063: true when $phys is $root plus one name (a top-level entry of $root),",
+    "    # compared as linkIntoRoot compares (any case on Windows, where either slash",
+    "    # separates; only / elsewhere, as the bash twin's case pattern reads it).",
+    "    function isTopLevelIn($root, $phys) {",
+    "      if ((-not $root) -or (-not $phys)) { return $false }",
+    "      $psep = [string][IO.Path]::DirectorySeparatorChar",
+    "      $pcmp = if ($ON_WINDOWS) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }",
+    "      $rpre = $root.TrimEnd($psep) + $psep",
+    "      if (-not $phys.StartsWith($rpre, $pcmp)) { return $false }",
+    "      $rest = $phys.Substring($rpre.Length)",
+    "      $seps = if ($ON_WINDOWS) { [char[]]@('/', '\\') } else { [char[]]@('/') }",
+    "      return [bool](($rest.Length -gt 0) -and ($rest.IndexOfAny($seps) -lt 0))",
     "    }",
   ];
 }

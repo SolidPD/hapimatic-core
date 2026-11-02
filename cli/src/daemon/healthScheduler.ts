@@ -4,8 +4,8 @@
  * `run.ts`'s `startDaemon` closure (issue #2081, Epic #2077 Sub-Issue D).
  *
  * Owns the `maintenanceTick` body (stale-session prune, dead-pane/orphan-MCP
- * reaping, stale-socket cleanup, MCP status poll, rotation-lease heartbeat,
- * idle-refresh backstop) + its MCP-poll failure/backoff state,
+ * reaping, stale-socket cleanup, stale env-file sweep, MCP status poll,
+ * rotation-lease heartbeat, idle-refresh backstop) + its MCP-poll failure/backoff state,
  * and builds + starts the `daemon-maintenance` `SupervisedLoop`.
  * `createHealthScheduler(ctx, clockSeams)` reads the shared state it needs from
  * the injected {@link DaemonContext}, threads the #2079 {@link ClockSeams} into
@@ -36,6 +36,7 @@ import {
   type OrphanMcpDebounce,
 } from "./orphanMcpReaper";
 import { sweepStaleSockets } from "./staleSocketSweep";
+import { sweepStaleEnvFiles } from "./staleEnvFileSweep";
 import { isTmuxPersistenceEnabled } from "./recoveryIntegration";
 import {
   detectTmuxNameChanges,
@@ -442,6 +443,28 @@ export function createHealthScheduler(
         logger.debug("[DAEMON RUN] stale tmux socket sweep error:", error);
         logger.reportCaught(error, {
           category: "daemon-stale-socket-cleanup",
+          severity: "warn",
+        });
+      }
+
+      // Stale env-file sweep (issue #5994). A launch's 0600 env file holds its
+      // token until the launch chain consumes it, and a SIGKILLed wrapper, a
+      // SIGHUP or a hop chain that stopped early leaves it in /tmp. Every daemon
+      // removes own-uid env files older than 10 minutes, which no live launch
+      // still needs. The module logs each removal by path and age.
+      try {
+        const envSweep = sweepStaleEnvFiles();
+        if (envSweep.unlinked.length > 0 || process.env.DEBUG) {
+          logger.debug(
+            `[DAEMON RUN] stale env-file sweep: unlinked=${envSweep.unlinked.length} youngKept=${envSweep.youngKept} foreignKept=${envSweep.foreignKept} errorKept=${envSweep.errorKept} absent=${envSweep.absent} scanned=${envSweep.scanned}`
+          );
+        }
+      } catch (error) {
+        // sweepStaleEnvFiles never throws; this guard keeps a future bug from
+        // aborting the rest of the tick, the heartbeat included.
+        logger.debug("[DAEMON RUN] stale env-file sweep error:", error);
+        logger.reportCaught(error, {
+          category: "daemon-stale-env-file-sweep",
           severity: "warn",
         });
       }

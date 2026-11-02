@@ -81,6 +81,11 @@ export interface TmuxSpawnOptions {
    *  model/effort-switch respawn preserves the selection. */
   effort?: string;
 
+  /** Issue #6070: the pre-fit node default effort this session follows —
+   *  threaded as --hapi-node-default-effort so runClaude records
+   *  metadata.nodeDefaultEffort. Absent for an explicit (body) effort. */
+  nodeDefaultEffort?: string;
+
   /** Issue #2456: a specific pinned raw Claude model id ("More models") —
    *  threaded as --hapi-raw-model; takes precedence over modelMode. */
   rawModel?: string;
@@ -859,6 +864,7 @@ export async function spawnSessionInTmux(
     safeMode = false,
     modelMode,
     effort,
+    nodeDefaultEffort,
     rawModel,
     sessionRole,
     outputStyle,
@@ -1054,6 +1060,7 @@ export async function spawnSessionInTmux(
           safeMode,
           modelMode,
           effort,
+          nodeDefaultEffort,
           rawModel,
           sessionRole,
           outputStyle,
@@ -1145,9 +1152,11 @@ export async function spawnSessionInTmux(
     // YOLO agent via `cat /tmp/hapi-spawn-*.sh` — for the WHOLE session, not just
     // the spawn window (`0o700` is owner-only, but the agent IS the owner uid).
     // Routing through `buildTmuxEnvFileCommand` (the same helper the tmux
-    // launchers use — `claudeTmuxRemote.ts`) shrinks the secrets' on-disk
-    // lifetime to the milliseconds between write and the pre-exec `rm -f`, and
-    // the persistent tmpScript now carries NO token value.
+    // launchers use — `claudeTmuxRemote.ts`) keeps the secrets on disk only
+    // until the pane's shell has started and its chain reaches the pre-exec
+    // `rm -f`. If the chain stops before then (a failed `cd`, say), the
+    // daemon's stale env-file sweep removes the file once it is 10 minutes old
+    // (#5994). The persistent tmpScript now carries NO token value.
     let spawnCommand = `${escapeShellArg(process.execPath)} ${claudeArgs.join(" ")}`;
     // Issue #2646 (OmniBox Phase-1): when the sandbox gate is ON, wrap ONLY the
     // inner agent-launch command in a bwrap fs+PID jail (buildBwrapJailCommand).
@@ -3135,6 +3144,8 @@ export interface BuildCommandOptions {
   safeMode?: boolean;
   modelMode?: string;
   effort?: string;
+  /** Issue #6070: see TmuxSpawnOptions.nodeDefaultEffort. */
+  nodeDefaultEffort?: string;
   rawModel?: string;
   sessionRole?: string;
   outputStyle?: string;
@@ -3180,6 +3191,14 @@ export function buildClaudeCommand(options: BuildCommandOptions): string[] {
   // preserves the selection.
   if (options.effort) {
     args.push("--hapi-effort", options.effort);
+  }
+
+  // Issue #6070: the pre-fit node default this session's effort follows — runClaude
+  // records it as metadata.nodeDefaultEffort so a model switch can re-fit the effort.
+  // Sent even when the fit gave no --hapi-effort (a model that takes no effort). An
+  // EffortLevel literal from the daemon's own resolver, so no shell escaping is needed.
+  if (options.nodeDefaultEffort) {
+    args.push("--hapi-node-default-effort", options.nodeDefaultEffort);
   }
 
   // Issue #2456: specific pinned raw Claude model id ("More models"). Hapimatic-

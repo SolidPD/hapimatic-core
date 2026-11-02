@@ -109,7 +109,11 @@ import {
 import { configuration } from "../configuration";
 import { readRedactedApiKeyById } from "../web/routes/apiKeys";
 import { SessionDeletion } from "./sessionDeletion";
-import { SessionLifecycleOps } from "./sessionLifecycleOps";
+import {
+  SessionLifecycleOps,
+  levelsForModelSwitch,
+  parseEffortRefit,
+} from "./sessionLifecycleOps";
 import {
   SessionRelaunch,
   type RelaunchOverrides,
@@ -332,10 +336,12 @@ export interface SpawnSessionOptions {
 }
 
 /** Issue #6028: maps a spawn's model pin to the effort levels that model supports. */
-type ModelEffortLevelsResolver = (pin: {
+/** Issue #6070: async so the spawn path can wait on an in-flight catalog fetch
+ *  (`ClaudeModelCatalogService.modelsForSpawn`); a plain array still works. */
+export type ModelEffortLevelsResolver = (pin: {
   rawModel?: string;
   modelMode?: string;
-}) => EffortLevel[] | undefined;
+}) => EffortLevel[] | undefined | Promise<EffortLevel[] | undefined>;
 
 /**
  * Minimal structural seam for target-account validation (issue #1456,
@@ -878,6 +884,8 @@ export class SyncEngine {
       handleSessionEnd: payload => this.handleSessionEnd(payload),
       spawnSession: opts => this.spawnSession(opts),
       markRespawning: sid => this.respawnMarks.mark(sid),
+      // Issue #6070: read late — buildWebApp injects the resolver after this.
+      getModelEffortLevelsResolver: () => this.resolveModelEffortLevels,
     });
     // Issue #2149: session-relaunch delegate (launcher / safeMode teardown +
     // respawn). archiveSession + spawnSession stay facade callbacks (test spies on
@@ -2689,7 +2697,28 @@ export class SyncEngine {
     sessionId: string,
     modelMode: string
   ): Promise<SetModelResponse> {
-    return await this.rpcGateway.setModel(sessionId, modelMode);
+    // Issue #6070: the new model's levels for the CLI's re-fit of a defaulted
+    // effort (same helper as applySessionConfig), and the re-fit mirrored onto
+    // the live record. An unknown modelMode string resolves to no levels; the CLI
+    // still validates it and rejects an invalid one.
+    const session = this.sessionCache.getSession(sessionId);
+    const modelEffortLevels = await levelsForModelSwitch(
+      session?.metadata,
+      { modelMode: modelMode as ModelMode },
+      this.resolveModelEffortLevels
+    );
+    const result = await this.rpcGateway.setModel(
+      sessionId,
+      modelMode,
+      modelEffortLevels
+    );
+    const effortRefit = parseEffortRefit(
+      (result as { effortRefit?: unknown } | null)?.effortRefit
+    );
+    if (effortRefit !== undefined) {
+      this.sessionCache.applySessionConfig(sessionId, { effort: effortRefit });
+    }
+    return result;
   }
 
   // Issue #2346: delegate set-permission-mode to the rpcGateway (mirrors mcpToggle).
@@ -3346,14 +3375,24 @@ export class SyncEngine {
     // can fit its spawn default (env / settings / xhigh, resolved daemon-side) to
     // the model. Only a fresh claude spawn resolves a default; a resume re-threads
     // its recorded effort. Fail-open: no resolver, a throw, or an unknown model
-    // stamps nothing; the daemon then uses its static-catalog exact-id lookup.
+    // stamps nothing; the daemon then looks the pin up in its static catalog
+    // (exact id, or a dated pin's undated id since #6070).
+    // Issue #6070: only when there is a default to fit to a pinned model — an
+    // explicit body effort is never clamped (nodeSpawnDefaults.ts) and the Default
+    // model resolves to no levels — so the resolver's boot-window wait
+    // (modelsForSpawn) is never spent on a spawn that cannot use the answer.
+    const pinsModel =
+      Boolean(opts.rawModel) ||
+      (Boolean(opts.modelMode) && opts.modelMode !== "default");
     if (
       this.resolveModelEffortLevels &&
       (opts.agent ?? "claude") === "claude" &&
-      !opts.resumeSessionId
+      !opts.resumeSessionId &&
+      !opts.effort &&
+      pinsModel
     ) {
       try {
-        const levels = this.resolveModelEffortLevels({
+        const levels = await this.resolveModelEffortLevels({
           rawModel: opts.rawModel,
           modelMode: opts.modelMode,
         });

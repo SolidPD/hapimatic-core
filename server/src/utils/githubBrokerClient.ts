@@ -190,6 +190,52 @@ function interpretEnvelope<T>(
   return { ok: false, reason: mapBrokerReason(envelope.reason) };
 }
 
+/** #5973: the longest display name the VM accepts from the gateway, in code points (its own cap). */
+const MAX_DISPLAY_NAME = 255;
+/** #5973: the most `installedOn` logins the VM keeps (the gateway's own cap). */
+const MAX_INSTALLED_ON = 100;
+/** #5973: a GitHub login in the broker's `?account=` charset (gateway routes/githubBroker.ts). */
+const INSTALLED_ON_LOGIN = /^[A-Za-z0-9._-]{1,100}$/;
+
+/**
+ * #5973: controls, bidi formatting, zero-width characters and line separators (the gateway's own
+ * set, lib/githubConnections.ts), removed again here so the VM does not depend on the gateway.
+ */
+const NAME_STRIP =
+  // eslint-disable-next-line no-control-regex -- #5973: stripping control characters is the point
+  /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060\u2066-\u206f\ufeff]/g;
+
+/**
+ * #5973: a display name of at most {@link MAX_DISPLAY_NAME} code points, cleaned and trimmed; null
+ * when it is not a string, is too long, or is empty once cleaned.
+ */
+function toDisplayName(raw: unknown): string | null {
+  if (typeof raw !== "string" || Array.from(raw).length > MAX_DISPLAY_NAME) {
+    return null;
+  }
+  const cleaned = raw.replace(NAME_STRIP, "").trim();
+  return cleaned === "" ? null : cleaned;
+}
+
+/**
+ * #5973: the valid logins of an `installedOn` array, de-duplicated (case-insensitively, first kept)
+ * and capped; undefined when the value is not an array, so the field is omitted.
+ */
+function toInstalledOn(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const seen = new Set<string>();
+  const logins: string[] = [];
+  for (const entry of raw as unknown[]) {
+    if (typeof entry !== "string" || !INSTALLED_ON_LOGIN.test(entry)) continue;
+    const key = entry.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    logins.push(entry);
+    if (logins.length === MAX_INSTALLED_ON) break;
+  }
+  return logins;
+}
+
 /**
  * Map one broker account entry onto {@link GitHubAccountResult}, keeping only known fields of the
  * right type ("never trust the gateway's shape" — a malformed entry is dropped, not passed on).
@@ -200,7 +246,7 @@ function toAccount(raw: unknown): GitHubAccountResult | null {
   if (typeof r.login !== "string" || r.login === "") return null;
   const account: GitHubAccountResult = {
     login: r.login,
-    name: typeof r.name === "string" ? r.name : null,
+    name: toDisplayName(r.name),
   };
   if (typeof r.email === "string") account.email = r.email;
   if (typeof r.isDefault === "boolean") account.isDefault = r.isDefault;
@@ -209,13 +255,16 @@ function toAccount(raw: unknown): GitHubAccountResult | null {
   // #6085: kept only when the gateway sent the boolean `true`. Anything else, including a missing
   // field, is treated as checked (an older gateway sends no flag, so it cannot say).
   if (r.statusUnchecked === true) account.statusUnchecked = true;
+  const installedOn = toInstalledOn(r.installedOn);
+  if (installedOn) account.installedOn = installedOn;
   return account;
 }
 
 /**
  * The GitHub accounts the VM's users linked on hapimatic.com (#4793), default first, each with its
  * email, status and default mark, and `statusUnchecked: true` when GitHub did not confirm that
- * status in time (#6085). The WHOLE list: an empty list is a SUCCESS (`ok: true`, no
+ * status in time (#6085), and its GitHub display name and `installedOn` logins when the gateway sent
+ * them (#5973). The WHOLE list: an empty list is a SUCCESS (`ok: true`, no
  * accounts — the Create page then offers "Connect GitHub"), never `broker_unavailable`, which is
  * a real outage (finding 4793-5). The gateway never lists its own credential here (R8).
  */

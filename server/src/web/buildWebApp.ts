@@ -342,6 +342,13 @@ export function buildWebApp(options: {
    * `rpc: []` (the zero-connected-sessions state of every fresh boot and of CI).
    */
   getRpcRegistry?: () => RpcRegistry | null;
+  /**
+   * Issue #6070: start a live model-catalog fetch at construction so the catalog
+   * is warm before the first spawn. Set by the production server only
+   * (`web/server.ts`); test harnesses that build the app leave it off and make no
+   * live Anthropic call.
+   */
+  warmModelCatalog?: boolean;
 }): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
 
@@ -572,6 +579,10 @@ export function buildWebApp(options: {
     accountService,
     options.errorLogger
   );
+  // Issue #6070: nothing else fetches the catalog until a New Session page loads,
+  // so without this the first spawn after a boot (a peer's, a scheduler's) fits
+  // its effort from the static fallback. getModels() never throws.
+  if (options.warmModelCatalog) void claudeModelCatalog.getModels();
 
   // Per-account nickname store (epic #1855 follow-up). Backs the nickname PATCH
   // route below. File-backed (read fresh per get), so it stays coherent with the
@@ -661,11 +672,11 @@ export function buildWebApp(options: {
 
   // Issue #6028: let spawnSession stamp the pinned model's supported effort
   // levels from THIS node's catalog (one instance — the same one behind
-  // GET /api/claude/models). peekModels() never waits on Anthropic, so a spawn
-  // is never delayed by a live fetch. Wired here, not in index.ts, because this
-  // file owns the catalog.
-  options.getSyncEngine()?.setModelEffortLevelsResolver(pin => {
-    const { models, source } = claudeModelCatalog.peekModels();
+  // GET /api/claude/models). Wired here, not in index.ts, because this file owns
+  // the catalog. Issue #6070: modelsForSpawn() is peekModels() except in the boot
+  // window, where it waits (bounded) on a fetch already in flight.
+  options.getSyncEngine()?.setModelEffortLevelsResolver(async pin => {
+    const { models, source } = await claudeModelCatalog.modelsForSpawn();
     return resolveModelEffortLevels(models, source, pin);
   });
 

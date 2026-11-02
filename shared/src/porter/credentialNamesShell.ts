@@ -21,6 +21,7 @@ import {
   ARCHIVE_EXCLUSION_PATTERNS,
   DIMENSION_DIRS,
   HOOK_TREE_EXCLUSION_PATTERNS,
+  ROOT_BELOW_SH,
   ROOT_HOLDS_SH,
 } from "./exportShared";
 import {
@@ -271,7 +272,17 @@ export function physicalPathFunctionLines(): string[] {
  *   tests those as loops first. Containment is `holds_path` (#5935): a path the
  *   root holds under a spelling its text does not begin with (a bind mount of
  *   the root) is refused whole, since its section cannot be read from its text.
- *   A path neither test places in the root goes to `root_holds_target` (#5985).
+ *   A path neither test places in the root goes to `root_holds_target` (#5985),
+ *   and, with `d` when that finds nothing, to `root_held_below` (#6062).
+ * - `root_held_below <physical folder>` (#6062) is true when an entry strictly
+ *   below the folder is the same file as a root entry that `link_into_root`
+ *   refuses (another mount of a root folder or file placed there, or a hard
+ *   link of a root file), or when that cannot be answered. It runs
+ *   `ROOT_BELOW_SH` (shared with the PowerShell twin) through `/bin/sh`, with
+ *   the listing in `$WORK/root-inodes`, and judges each `d`/`f` line as the
+ *   in-root path it is; a `?`, a `/bin/sh` failure, or any other line refuses.
+ *   One answer per physical folder per run (`_rbyes` / `_rbno`; a path with a
+ *   newline in it is never cached). It is false for a folder the root holds.
  * - `root_holds_target <physical path> [d]` (#5985) is true when an entry below
  *   the root is the same file (one device and inode) as the path and
  *   `link_into_root` refuses that entry's in-root path with the same mode, or
@@ -308,7 +319,9 @@ export function physicalPathFunctionLines(): string[] {
  * - `under_link <root> <path>` is true when a folder between `<root>` and
  *   `<path>` (relative to `<root>`) is a link. A path below a staged link is not
  *   the export's copy: removing it would remove through the link, into the
- *   folder the link names.
+ *   folder the link names. The hook registration walk's last arm (#6062) also
+ *   asks it from the config root, so a registered script reached through any
+ *   folder link is judged on its own physical path.
  * - `under_refused_link <root> <path>` (#5934 fix round 1) is true when a folder
  *   link between `<root>` and `<path>` is one the materialize pass refuses as a
  *   loop or into the root (the tests `materialize_links` applies to a staged
@@ -319,6 +332,14 @@ export function physicalPathFunctionLines(): string[] {
  *   read is passed over: the script's own physical path, below it, fails the
  *   same way (past 40 links too, where the walk stops), and the caller refuses
  *   that first.
+ * - `root_content_refusal <physical path> [d]` (#6063) sets `_rckind` for a
+ *   path that a copy outside the section folders reads through a link: `l` when
+ *   `d` is given and `holds_config_root` holds it (the root or a folder above
+ *   it), `r` when `link_into_root` refuses it, else empty. `CLAUDE.md`, the
+ *   settings scripts, the tenant `projects` folder and the Codex home, skills
+ *   roots and instructions file call it, after their own credential and
+ *   unchecked tests, and each maps the kind to its own omission. It always
+ *   returns 0.
  *
  * Known gaps, tracked in #4332 (not regressions: before #4172 no link was
  * checked for a credential store): `physical_path` reads a link target with
@@ -339,6 +360,8 @@ export function credentialLinkFunctionLines(): string[] {
     "# list of the links read under that folder).",
     "_cnl=$'\\n'",
     "_ctab=$'\\t'",
+    "# #6062: root_held_below's answer per physical folder, for this run.",
+    '_rbyes="$_cnl"; _rbno="$_cnl"',
     ...physicalPathFunctionLines(),
     "# #5862: a folder link whose target is the config root or a folder above its",
     "# physical path copies the root into the archive (history, shell snapshots,",
@@ -410,6 +433,37 @@ export function credentialLinkFunctionLines(): string[] {
     '  done <<< "$_rht" || return 0',
     "  return 1",
     "}",
+    "# #6062: a folder link's target the text, -ef and #5985 tests leave outside",
+    "# the root may HOLD, below it, another mount of a root folder or file",
+    "# (~/.claude/projects bound at /area/proj, skills/m -> /area), renamed or not,",
+    "# or a hard link of a root file: tar -h would cross into it. ROOT_BELOW_SH",
+    "# (shared with the PowerShell twin) prints each such entry's in-root path, d",
+    "# for a folder and f for a file, which link_into_root then judges as #5985",
+    "# judges a match above the target, or ? when it cannot answer (refused: fail",
+    "# closed). One answer per physical folder per run; a path with a newline in",
+    "# it is never cached (it could read as two cached paths).",
+    "root_held_below() { # $1 = a physical folder; true when an entry below it is the same file as a root entry that link_into_root refuses, or when that cannot be answered",
+    '  [ -n "${CONFIG_ROOT_PHYS:-}" ] || return 1',
+    '  [ -d "$1" ] || return 1',
+    '  if holds_path "$CONFIG_ROOT_PHYS" "$1"; then return 1; fi',
+    "  local _rbt _rbe _rbm _rbc=1 _rbr=1",
+    '  case "$1" in *"$_cnl"*) _rbc=0 ;; esac',
+    '  if [ "$_rbc" = 1 ]; then',
+    '    case "$_rbno" in *"$_cnl$1$_cnl"*) return 1 ;; esac',
+    '    case "$_rbyes" in *"$_cnl$1$_cnl"*) return 0 ;; esac',
+    "  fi",
+    `  _rbt="$(HAPI_PORTER_EF_T="$1" HAPI_PORTER_EF_A="$CONFIG_ROOT_PHYS" HAPI_PORTER_EF_S="$WORK/root-inodes" HAPI_PORTER_EF_P="\${_tgnu:-0}" /bin/sh -c '${ROOT_BELOW_SH}')" || _rbt="?"`,
+    '  if [ -n "$_rbt" ]; then',
+    "    while IFS= read -r _rbe; do",
+    "      # ?, or a piece of a name with a newline in it: the answer cannot be read.",
+    '      case "$_rbe" in d"$CONFIG_ROOT_PHYS"/*) _rbm=d ;; f"$CONFIG_ROOT_PHYS"/*) _rbm="" ;; *) _rbr=0; break ;; esac',
+    '      _rbe="${_rbe#?}"',
+    '      if [ ! -e "$_rbe" ] || link_into_root "$_rbe" "$_rbm"; then _rbr=0; break; fi',
+    '    done <<< "$_rbt" || _rbr=0',
+    "  fi",
+    '  if [ "$_rbc" = 1 ]; then if [ "$_rbr" = 0 ]; then _rbyes="$_rbyes$1$_cnl"; else _rbno="$_rbno$1$_cnl"; fi; fi',
+    '  return "$_rbr"',
+    "}",
     "# #5934: a link whose physical target lies inside the config root but outside",
     "# the exported section folders (settings.json, history.jsonl, the shell",
     "# snapshots), or in one under a name that folder's copy leaves out, would",
@@ -417,12 +471,14 @@ export function credentialLinkFunctionLines(): string[] {
     "# refused whole: a copy through it would skip the hooks tree's exclusions.",
     "# Containment is holds_path (#5935), so a target the root holds under another",
     "# spelling is refused too.",
-    "link_into_root() { # $1 = a physical path, $2 = d for a folder link's target; true when the root holds it outside the section folders, in one under a name its copy excludes, or (d) at or below hooks/",
+    "link_into_root() { # $1 = a physical path, $2 = d for a folder link's target; true when the root holds it outside the section folders, in one under a name its copy excludes, or (d) at or below hooks/; for a path outside the root, when a root entry it is (#5985) or (d) one below it (#6062) is refused",
     '  [ -n "$1" ] || return 1',
     '  [ -n "${CONFIG_ROOT_PHYS:-}" ] || return 1',
     "  # #5985: not held by text or -ef: ask whether an entry below the root is the",
     "  # same file (another mount of a folder inside it).",
-    '  if ! holds_path "$CONFIG_ROOT_PHYS" "$1"; then root_holds_target "$1" "${2:-}"; return; fi',
+    "  # #6062: a folder link's target may instead HOLD another mount (or a hard",
+    "  # link) of a root entry below it; root_held_below looks there.",
+    '  if ! holds_path "$CONFIG_ROOT_PHYS" "$1"; then if root_holds_target "$1" "${2:-}"; then return 0; fi; [ "${2:-}" = d ] || return 1; root_held_below "$1"; return; fi',
     "  # Held under a spelling whose text does not begin with the root's: the root",
     "  # itself is the loop tests' (holds_config_root, the same holds_path test);",
     "  # anything else is refused whole, since its section cannot be read from its",
@@ -524,6 +580,19 @@ export function credentialLinkFunctionLines(): string[] {
     '    if link_into_root "$_rfph" d; then _rfkind=r; return 0; fi',
     '    _rfanc="$_rfanc$_rfph$_cnl"',
     "  done",
+    "}",
+    "# #6063: the loop and into-root tests for a path a copy outside the section",
+    "# folders reads through a link (CLAUDE.md, a settings script, the tenant",
+    "# projects folder, a Codex home, skills root or instructions file). With d (a",
+    "# folder) the config root or a folder above it is a loop (l); a path the root",
+    "# holds outside the section folders is into the root (r). Each caller maps the",
+    "# kind to its own omission. It always returns 0, so set -e never ends a run.",
+    "root_content_refusal() { # $1 = a physical path, $2 = d for a folder; sets _rckind to l, r or empty",
+    '  _rckind=""',
+    '  [ -n "$1" ] || return 0',
+    '  if [ "${2:-}" = d ] && holds_config_root "$1"; then _rckind=l; return 0; fi',
+    '  if link_into_root "$1" "${2:-}"; then _rckind=r; fi',
+    "  return 0",
     "}",
   ];
 }

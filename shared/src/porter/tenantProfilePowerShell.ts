@@ -8,8 +8,9 @@
  *
  * The lines run inside the PowerShell exporter's main block and rely on its
  * helpers and state: `recordOmission`, `pruneCredentialNames`,
- * `linkRootRefusal`, `copyTreeExcluding`, `stagedChildren`, `stagedRel`,
- * `removeStaged`, `isKebab`, `$CONFIG_ROOT`, `$STAGING`, `$STG_FULL`,
+ * `linkRootRefusal`, `rootContentRefusal` (#6063), `isReparseItem`,
+ * `isCloudPlaceholder`, `physicalPath`, `copyTreeExcluding`, `stagedChildren`,
+ * `stagedRel`, `removeStaged`, `isKebab`, `$CONFIG_ROOT`, `$STAGING`, `$STG_FULL`,
  * `$HOME_DIR`, `$WORK`, `$TAR` and, for the premium filter, Step 8's
  * `$kmObj`, `$markets` and `$plugs`.
  *
@@ -25,7 +26,11 @@ import {
   type PorterExportProfile,
 } from "./tenantProfile";
 import { archiveHygienePowerShellLines } from "./archiveHygiene";
-import { psq } from "./exportShared";
+import {
+  ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON,
+  ARCHIVE_LINK_LOOP_OMISSION_REASON,
+  psq,
+} from "./exportShared";
 import {
   VM_CLASS_ENV,
   VM_CLASS_MARKER_REL,
@@ -84,6 +89,12 @@ export function memoryStagingPowerShellLines(): string[] {
     "    $projRoot = Join-Path $CONFIG_ROOT 'projects'",
     "    if (($EXPORT_PROFILE -eq 'tenant') -and (Test-Path -LiteralPath $projRoot -PathType Container)) {",
     "      $mref = linkRootRefusal $projRoot",
+    "      # #6063: a projects link that names the config root or a folder above it, or",
+    "      # one into the root outside the section folders, as the bash twin refuses it.",
+    "      if ((-not $mref) -and (isReparseItem $projRoot) -and (-not (isCloudPlaceholder $projRoot))) {",
+    "        $mrk = rootContentRefusal (physicalPath $projRoot) 'd'",
+    `        if ($mrk -eq 'l') { $mref = ${psq(ARCHIVE_LINK_LOOP_OMISSION_REASON)} } elseif ($mrk -eq 'r') { $mref = ${psq(ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON)} }`,
+    "      }",
     `      if ($mref) { recordOmission ${M} $mref }`,
     "      else {",
     "        $projFull = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($projRoot))",

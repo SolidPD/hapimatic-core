@@ -823,8 +823,14 @@ export function createSessionSpawner(
       (EFFORT_LEVELS as readonly string[]).includes(options.effort)
         ? options.effort
         : undefined;
+    // Issue #6070: the node default (pre-fit) this session's effort follows, when
+    // the effort came from a default tier rather than the spawn body. Handed to
+    // the CLI as --hapi-node-default-effort and recorded in
+    // metadata.nodeDefaultEffort, so a later model switch can re-fit it.
+    let spawnNodeDefaultEffort: string | undefined;
     if (agent === "claude" && !resumeSessionId) {
       const resolved = await resolveNodeSpawnEffort(options.effort);
+      if (resolved.source !== "body") spawnNodeDefaultEffort = resolved.level;
       for (const r of resolved.rejected) {
         logger.warn(
           `[DAEMON RUN] Ignoring invalid effort "${r.value}" from ${r.source} (#5879)`
@@ -1759,6 +1765,8 @@ export function createSessionSpawner(
         safeMode,
         modelMode: spawnModelMode,
         effort: spawnEffort,
+        // Issue #6070: the pre-fit node default (absent for a body effort).
+        nodeDefaultEffort: spawnNodeDefaultEffort,
         rawModel: spawnRawModel,
         sessionRole,
         // Issue #2626 (D): forward the per-session output style into the tmux
@@ -2639,6 +2647,16 @@ export function createSessionSpawner(
         };
       }
 
+      // Issue #933 / #6070: explicit claude path from federation config
+      // overrides auto-detection in resolveClaudePath() — the direct-path twin
+      // of the tmux extraEnv above, which until #6070 was the only arm that set it.
+      if (agent === "claude" && claudePath) {
+        extraEnv = {
+          ...extraEnv,
+          HAPI_CLAUDE_PATH: claudePath,
+        };
+      }
+
       // Issue #2155: expose the spawn-time role to in-session telemetry hooks
       // (the direct-spawn analogue of the tmux path's HAPI_SESSION_ROLE inject).
       if (sessionRole) {
@@ -2724,6 +2742,10 @@ export function createSessionSpawner(
       if (agent === "claude" && spawnEffort) {
         args.push("--hapi-effort", spawnEffort);
       }
+      // Issue #6070: the pre-fit node default, even when the fit sent no effort.
+      if (agent === "claude" && spawnNodeDefaultEffort) {
+        args.push("--hapi-node-default-effort", spawnNodeDefaultEffort);
+      }
       if (agent === "claude" && spawnRawModel) {
         args.push("--hapi-raw-model", spawnRawModel);
       }
@@ -2756,6 +2778,12 @@ export function createSessionSpawner(
       if (options.resumeSessionId && agent !== "codex") {
         args.push("--resume", options.resumeSessionId);
         logger.debug(`[DAEMON RUN] Adding --resume ${options.resumeSessionId}`);
+        // Issue #6070 (R12): a branch forks the resumed conversation, as the tmux
+        // path's buildClaudeCommand does; without it a branch on a node without
+        // tmux persistence resumed (and wrote into) the source conversation.
+        if (forkSession) {
+          args.push("--fork-session");
+        }
       }
       const MAX_TAIL_CHARS = 4000;
       let stderrTail = "";

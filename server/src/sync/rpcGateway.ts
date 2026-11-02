@@ -4,12 +4,12 @@ import type {
   SetModelResponse,
   SetPermissionModeResponse,
   EffortLevel,
-  ModelMode,
   PermissionMode,
 } from "@hapi/protocol/types";
 import type { Server } from "socket.io";
 import type { RpcRegistry } from "../socket/rpcRegistry";
 import type { CapabilityMeta } from "../socket/handlers/cli/rpcHandlers";
+import type { ApplySessionConfig } from "@hapi/protocol/schemas";
 import type { SpawnSessionOptions } from "./syncEngine";
 import type { ErrorLogger } from "../logging/errorLogger";
 // Issue #3632: value import (not `import type`) — this predicate is CALLED at
@@ -212,13 +212,16 @@ export class RpcGateway {
   // Issue #2256: set the session model via the landed #2421 runClaude
   // "set-model" RPC handler. The payload field is `modelMode` (enumerated
   // explicitly, never spread — the #1262 trap) — a `{model}` payload would hit
-  // the handler's "set-model requires a modelMode" throw.
+  // the handler's "set-model requires a modelMode" throw. #6070: plus the new
+  // model's levels for the CLI's effort re-fit, omitted when not resolved.
   async setModel(
     sessionId: string,
-    modelMode: string
+    modelMode: string,
+    modelEffortLevels?: EffortLevel[]
   ): Promise<SetModelResponse> {
     return (await this.sessionRpc(sessionId, "set-model", {
       modelMode,
+      ...(modelEffortLevels ? { modelEffortLevels } : {}),
     })) as SetModelResponse;
   }
 
@@ -238,12 +241,8 @@ export class RpcGateway {
 
   async requestSessionConfig(
     sessionId: string,
-    config: {
-      permissionMode?: PermissionMode;
-      modelMode?: ModelMode;
-      effort?: EffortLevel;
-      rawModel?: string;
-    }
+    // #6070: plus the new model's levels for the CLI's effort re-fit.
+    config: ApplySessionConfig & { modelEffortLevels?: EffortLevel[] }
   ): Promise<unknown> {
     return await this.sessionRpc(sessionId, "set-session-config", config);
   }

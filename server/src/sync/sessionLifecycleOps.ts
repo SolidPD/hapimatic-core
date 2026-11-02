@@ -28,10 +28,88 @@ import type {
   PermissionMode,
   Session,
 } from "@hapi/protocol/types";
-import type { SpawnSessionOptions } from "./syncEngine";
+import {
+  FALLBACK_CLAUDE_MODELS,
+  isEffortLevel,
+  refitNodeDefaultEffort,
+  resolveModelEffortLevels,
+} from "@hapi/protocol";
+import type {
+  ModelEffortLevelsResolver,
+  SpawnSessionOptions,
+} from "./syncEngine";
 import type { SessionCache } from "./sessionCache";
 import type { RpcGateway } from "./rpcGateway";
 import type { ErrorLogger } from "../logging/errorLogger";
+
+/**
+ * Issue #6070: the model a session runs after a model change — the
+ * mutual-exclusion rules of the CLI's `set-session-config`: a family pick clears
+ * a specific pin (and "default" is the absence of a pin), a specific pin clears
+ * the family mode, an unchanged axis keeps the session's metadata. (A staged
+ * Default pick in `stageSessionConfig` keeps an existing `rawModel`, which these
+ * rules clear.)
+ */
+export function nextModelPin(
+  metadata: Session["metadata"] | undefined,
+  change: { modelMode?: ModelMode; rawModel?: string }
+): { modelMode?: ModelMode; rawModel?: string } {
+  let modelMode = metadata?.modelMode;
+  let rawModel = metadata?.rawModel;
+  if (change.modelMode !== undefined) {
+    modelMode = change.modelMode === "default" ? undefined : change.modelMode;
+    rawModel = undefined;
+  }
+  if (change.rawModel !== undefined) {
+    rawModel = change.rawModel.length > 0 ? change.rawModel : undefined;
+    modelMode = undefined;
+  }
+  return { modelMode, rawModel };
+}
+
+/**
+ * Issue #6070: on a model change that names no effort, for a claude session whose
+ * effort follows the node default (`metadata.nodeDefaultEffort`), the new model's
+ * effort levels from this node's catalog — sent to the CLI so its re-fit reads
+ * the live catalog, not its static fallback. `undefined` otherwise, and on any
+ * resolver failure (fail-open: the CLI then uses its static lookup).
+ */
+export async function levelsForModelSwitch(
+  metadata: Session["metadata"] | undefined,
+  change: { modelMode?: ModelMode; rawModel?: string; effort?: unknown },
+  resolver: ModelEffortLevelsResolver | null
+): Promise<EffortLevel[] | undefined> {
+  if (change.modelMode === undefined && change.rawModel === undefined) {
+    return undefined;
+  }
+  if (change.effort !== undefined) return undefined;
+  if ((metadata?.flavor ?? "claude") !== "claude") return undefined;
+  if (!isEffortLevel(metadata?.nodeDefaultEffort)) return undefined;
+  if (!resolver) return undefined;
+  // A switch to the Default model pins nothing, so the catalog has no levels to
+  // offer; skip the resolver (and its boot-window wait), as the spawn path does.
+  const pin = nextModelPin(metadata, change);
+  if (pin.modelMode === undefined && pin.rawModel === undefined) {
+    return undefined;
+  }
+  try {
+    return (await resolver(pin)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Issue #6070: the CLI's additive `effortRefit` reply field — the effort a model
+ * switch re-fitted (`null` = the new model takes no effort). `undefined` when
+ * absent or malformed (an older CLI, or no re-fit).
+ */
+export function parseEffortRefit(raw: unknown): EffortLevel | null | undefined {
+  if (!raw || typeof raw !== "object" || !("effort" in raw)) return undefined;
+  const effort = (raw as { effort: unknown }).effort;
+  if (effort === null) return null;
+  return isEffortLevel(effort) ? effort : undefined;
+}
 
 type SpawnSessionResult =
   | { type: "success"; sessionId: string; resolvedName?: string }
@@ -63,6 +141,12 @@ export interface SessionLifecycleOpsDeps {
    * (see `respawnMarks.ts`). Optional — harnesses that omit it still archive.
    */
   markRespawning?: (sessionId: string) => void;
+  /**
+   * Issue #6070: the model-effort resolver, read late (syncEngine receives it
+   * from buildWebApp after constructing this delegate). Optional — absent ⇒ no
+   * levels are sent and the CLI re-fits from its static catalog.
+   */
+  getModelEffortLevelsResolver?: () => ModelEffortLevelsResolver | null;
 }
 
 export class SessionLifecycleOps {
@@ -72,6 +156,7 @@ export class SessionLifecycleOps {
   private readonly handleSessionEnd: HandleSessionEndFn;
   private readonly spawnSession: SpawnSessionFn;
   private readonly markRespawning?: (sessionId: string) => void;
+  private readonly getModelEffortLevelsResolver: () => ModelEffortLevelsResolver | null;
 
   constructor(deps: SessionLifecycleOpsDeps) {
     this.sessionCache = deps.sessionCache;
@@ -80,6 +165,8 @@ export class SessionLifecycleOps {
     this.handleSessionEnd = deps.handleSessionEnd;
     this.spawnSession = deps.spawnSession;
     this.markRespawning = deps.markRespawning;
+    this.getModelEffortLevelsResolver =
+      deps.getModelEffortLevelsResolver ?? (() => null);
   }
 
   /**
@@ -340,12 +427,30 @@ export class SessionLifecycleOps {
       modelMode?: ModelMode;
       effort?: EffortLevel;
       rawModel?: string;
-    }
+    },
+    modelEffortLevels?: EffortLevel[]
   ): Promise<void> {
+    // Issue #6070: a staged model switch re-fits a defaulted effort here, the same
+    // decision the live CLI makes (no CLI is running to make it). `undefined` ⇒
+    // the effort is untouched (explicit effort, no model change, or no marker).
+    let refit: EffortLevel | null | undefined;
     const ok = await this.sessionCache.updateSessionMetadataFields(
       sessionId,
       current => {
         const next = { ...current };
+        refit =
+          config.effort === undefined &&
+          (config.modelMode !== undefined || config.rawModel !== undefined)
+            ? refitNodeDefaultEffort(
+                current.nodeDefaultEffort,
+                modelEffortLevels ??
+                  resolveModelEffortLevels(
+                    FALLBACK_CLAUDE_MODELS,
+                    "fallback",
+                    nextModelPin(current, config)
+                  )
+              )
+            : undefined;
         if (config.modelMode !== undefined) {
           // Mirrors the CLI stamp: "default" CLEARS the pin; a family pin
           // supersedes a specific raw id (the two never both persist).
@@ -370,6 +475,14 @@ export class SessionLifecycleOps {
           } else {
             delete next.effort;
           }
+          // Issue #6070: an explicit pick stops following the node default.
+          delete next.nodeDefaultEffort;
+        } else if (refit !== undefined) {
+          if (refit) {
+            next.effort = refit;
+          } else {
+            delete next.effort;
+          }
         }
         if (config.permissionMode !== undefined) {
           next.permissionMode = config.permissionMode;
@@ -382,7 +495,10 @@ export class SessionLifecycleOps {
         "Failed to save the configuration for the disconnected session"
       );
     }
-    this.sessionCache.applySessionConfig(sessionId, config);
+    this.sessionCache.applySessionConfig(
+      sessionId,
+      refit === undefined ? config : { ...config, effort: refit }
+    );
   }
 
   async applySessionConfig(
@@ -397,15 +513,28 @@ export class SessionLifecycleOps {
     // Round 11 (epic #3285): a disconnected session STAGES the change instead
     // of failing — see stageSessionConfig. Live sessions take the RPC path.
     const target = this.sessionCache.getSession(sessionId);
+    // Issue #6070: the new model's levels for a defaulted effort's re-fit.
+    const modelEffortLevels = await levelsForModelSwitch(
+      target?.metadata,
+      config,
+      this.getModelEffortLevelsResolver()
+    );
     if (target && !target.active) {
-      await this.stageSessionConfig(sessionId, config);
+      await this.stageSessionConfig(sessionId, config, modelEffortLevels);
       // Issue #3769 (Task 1d): a staged (disconnected) session has no live query
       // — the pick applies on respawn, so the method is "config".
       return { method: "config" };
     }
+    // Issue #6070 (in-path): the pins BEFORE the RPC — the CLI writes the new ones
+    // to metadata while handling it, so a restart's rollback must not read them.
+    const before = {
+      modelMode: target?.metadata?.modelMode,
+      rawModel: target?.metadata?.rawModel,
+      effort: target?.metadata?.effort,
+    };
     const result = await this.rpcGateway.requestSessionConfig(
       sessionId,
-      config
+      modelEffortLevels ? { ...config, modelEffortLevels } : config
     );
     if (!result || typeof result !== "object") {
       throw new Error("Invalid response from session config RPC");
@@ -421,14 +550,22 @@ export class SessionLifecycleOps {
       // a model change reached the live SDK query ("sdk") or only the durable pin
       // ("config"). Additive — an old CLI omits it → treated as "config".
       method?: "sdk" | "config";
+      // Issue #6070: the effort a model switch re-fitted (additive).
+      effortRefit?: unknown;
     };
     const applied = obj.applied;
     if (!applied || typeof applied !== "object") {
       throw new Error("Missing applied session config");
     }
     const method: "sdk" | "config" = obj.method === "sdk" ? "sdk" : "config";
+    // Issue #6070: a re-fit to "no effort" arrives as null, which `applied.effort`
+    // (undefined dropped from JSON) cannot express — mirror it explicitly.
+    const effortRefit = parseEffortRefit(obj.effortRefit);
 
-    this.sessionCache.applySessionConfig(sessionId, applied);
+    this.sessionCache.applySessionConfig(
+      sessionId,
+      effortRefit === undefined ? applied : { ...applied, effort: effortRefit }
+    );
 
     // Issue #1633: on the tmux/pty launchers a model-mode change cannot reach
     // the RUNNING claude child — the model is fixed at spawn argv, and the
@@ -451,7 +588,10 @@ export class SessionLifecycleOps {
       const launcherKind =
         this.sessionCache.getSession(sessionId)?.metadata?.launcherKind;
       if (launcherKind === "tmux" || launcherKind === "pty") {
-        const restart = await this.sessionConfigRestart(sessionId, config);
+        const restart = await this.sessionConfigRestart(sessionId, config, {
+          before,
+          effortRefit,
+        });
         if (restart.type === "error") {
           throw new Error(
             `Session config applied, but restarting the session to activate it failed: ${restart.message}`
@@ -494,6 +634,16 @@ export class SessionLifecycleOps {
       modelMode?: ModelMode;
       effort?: EffortLevel;
       rawModel?: string;
+    },
+    opts: {
+      /** Issue #6070 (in-path): the pins before the config RPC — the rollback base. */
+      before: {
+        modelMode?: ModelMode;
+        rawModel?: string;
+        effort?: EffortLevel;
+      };
+      /** Issue #6070: the CLI's re-fit of a defaulted effort (`null` = none). */
+      effortRefit?: EffortLevel | null;
     }
   ): Promise<{ type: "success" } | { type: "error"; message: string }> {
     const session = this.sessionCache.getSession(sessionId);
@@ -576,15 +726,14 @@ export class SessionLifecycleOps {
       // Undefined for legacy/default-style sessions → omitted.
       outputStyle: session.metadata?.outputStyle,
       // Issue #2434: preserve the model pin across the respawn (mirrors
-      // safeMode/launcherKind/sessionRole). Load-bearing for the ROLLBACK
-      // spawn below, which uses `respawnBase` bare: without this it would
-      // respawn unpinned instead of restoring the session's previous model.
-      // The primary spawn overrides this field with the requested mode (see
-      // the spread below), so the explicit change still wins there.
+      // safeMode/launcherKind/sessionRole). The primary spawn overrides this
+      // field with the requested mode (see the spread below), and the rollback
+      // overrides it with `opts.before` (#6070), because by then the CLI has
+      // already rewritten this metadata.
       modelMode: session.metadata?.modelMode,
       // Issue #2456: preserve the effort + raw-model pins across the respawn.
-      // The rollback spawn uses respawnBase bare (previous state); the primary
-      // spawn overrides these with the requested change (see the spread below).
+      // The primary spawn overrides these with the requested change (see the
+      // spread below) and the rollback with `opts.before` (#6070).
       effort: session.metadata?.effort,
       rawModel: session.metadata?.rawModel,
       // Issue #1555: return on child-start, not full cold-MCP boot.
@@ -595,21 +744,22 @@ export class SessionLifecycleOps {
     // requested change(s) over the metadata baseline. modelMode and rawModel are
     // mutually exclusive — a family pick clears any specific pin, and a specific
     // "More models" pin clears the family mode.
-    let nextModelMode = session.metadata?.modelMode;
-    let nextRawModel = session.metadata?.rawModel;
-    if (config.modelMode !== undefined) {
-      // "default" restarts WITHOUT the flag — the session then follows the
-      // normal default-mode resolution (#1506 entitled pin / native default).
-      nextModelMode =
-        config.modelMode === "default" ? undefined : config.modelMode;
-      nextRawModel = undefined;
-    }
-    if (config.rawModel !== undefined) {
-      nextRawModel = config.rawModel.length > 0 ? config.rawModel : undefined;
-      nextModelMode = undefined;
-    }
+    // "default" restarts WITHOUT the flag — the session then follows the normal
+    // default-mode resolution (#1506 entitled pin / native default). The rule is
+    // shared with the #6070 re-fit (nextModelPin).
+    const { modelMode: nextModelMode, rawModel: nextRawModel } = nextModelPin(
+      session.metadata,
+      config
+    );
+    // Issue #6070: an explicit effort wins; else the CLI's re-fit of a defaulted
+    // effort (null ⇒ no --effort), passed in directly because the CLI's metadata
+    // write may not have landed yet; else the recorded effort.
     const nextEffort =
-      config.effort !== undefined ? config.effort : session.metadata?.effort;
+      config.effort !== undefined
+        ? config.effort
+        : opts.effortRefit !== undefined
+          ? (opts.effortRefit ?? undefined)
+          : session.metadata?.effort;
 
     const spawnResult = await this.spawnSession({
       ...respawnBase,
@@ -626,7 +776,16 @@ export class SessionLifecycleOps {
       `sessionConfigRestart ${sessionId}: respawn with modelMode=${nextModelMode ?? "default"}, rawModel=${nextRawModel ?? "none"}, effort=${nextEffort ?? "none"} failed (${spawnResult.message}); rolling back to previous config`,
       { category: "sync", sessionId }
     );
-    const rollback = await this.spawnSession(respawnBase);
+    // Issue #6070 (in-path): roll back to the pins as they were BEFORE the config
+    // RPC; `respawnBase` reads metadata the CLI already rewrote while handling it,
+    // which would respawn the same failing config.
+    const rollbackBase = {
+      ...respawnBase,
+      modelMode: opts.before.modelMode,
+      rawModel: opts.before.rawModel,
+      effort: opts.before.effort,
+    };
+    const rollback = await this.spawnSession(rollbackBase);
     if (rollback.type === "success") {
       return {
         type: "error",

@@ -841,8 +841,10 @@ the bash exporter's own code: it builds \`CLAUDE.md\` and \`claude-includes/\` f
 the config root in a temp directory and archives those, so a \`CLAUDE.md\` or
 \`claude-includes\` you staged is left where it is and is not archived, and it
 rewrites \`claudeMd\` and the include omissions in \`manifest.json\` to match (the
-block always archives the config root's \`CLAUDE.md\` when it is a file, so a
-\`CLAUDE.md\` omission you staged is then dropped).
+block archives the config root's \`CLAUDE.md\` when it is a file that the
+exporters' link tests pass, so a \`CLAUDE.md\` omission you staged is then
+dropped; a \`CLAUDE.md\` that is a link to a credential store, or into the config
+root outside the section folders, is left out with one omission naming why).
 In the same way it builds \`${SETTINGS_SCRIPTS_DIR}/\` from \`$HOME/.claude\`: the
 top-level script that \`statusLine\` or \`apiKeyHelper\` runs, by the exporters'
 rule, so a \`${SETTINGS_SCRIPTS_DIR}\` folder you staged is never archived; and

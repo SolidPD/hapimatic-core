@@ -31,6 +31,11 @@ export interface GitHubAccount {
   status?: GitHubConnectionStatus;
   /** #6085, broker only: GitHub did not confirm `status` in time, so it may be out of date. */
   statusUnchecked?: boolean;
+  /**
+   * #5973, broker only: the account logins the Hapimatic app is installed on that this link could
+   * see when hapimatic.com last read them (a snapshot). Absent when unknown.
+   */
+  installedOn?: string[];
 }
 
 export interface GitHubRepo {

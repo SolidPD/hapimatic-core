@@ -72,6 +72,12 @@ export interface GitHubAccountResult {
    * Present only when true; an older gateway never sends it.
    */
   statusUnchecked?: boolean;
+  /**
+   * #5973, broker only: the account logins the Hapimatic GitHub App is installed on that this link
+   * could see when hapimatic.com last read them (a snapshot, not live). Absent when never read or
+   * from an older gateway; an empty array means installed nowhere.
+   */
+  installedOn?: string[];
 }
 
 /** A repository accessible to a host GitHub account. */

@@ -176,6 +176,8 @@ export async function startWebServer(options: {
     getScorecardStore: options.getScorecardStore,
     getWebhookGapDetector: options.getWebhookGapDetector,
     getRpcRegistry: options.getRpcRegistry,
+    // Issue #6070: the production server warms the model catalog at boot.
+    warmModelCatalog: true,
   });
 
   const socketHandler = options.socketEngine.handler();

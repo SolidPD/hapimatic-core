@@ -6,10 +6,12 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { GitHubAccountAvatar } from "@/components/GitHubAccountAvatar";
+import { GitHubAccountDisplayName } from "@/components/GitHubAccountDisplayName";
 import type { GitHubAccount } from "@/hooks/queries/useGitHubRepos";
 import {
   GITHUB_STATUS_PRESENTATION,
   GITHUB_STATUS_UNCHECKED_NOTE,
+  githubReachText,
   groupGitHubAccountsByLinker,
   isGitHubStatusUnchecked,
 } from "@/lib/githubConnections";
@@ -34,8 +36,12 @@ import {
 export function accountStatusText(account: GitHubAccount): string | null {
   if (!account.status) return null;
   const status = GITHUB_STATUS_PRESENTATION[account.status];
-  return status.action === "relink"
-    ? `${status.label} · re-link in Settings`
+  if (status.action === "relink")
+    return `${status.label} · re-link in Settings`;
+  // #5973: a short reach summary when hapimatic.com sent the installation list.
+  const reach = githubReachText(account, 2);
+  return reach
+    ? `${status.label} · ${reach.charAt(0).toLowerCase()}${reach.slice(1)}`
     : status.label;
 }
 
@@ -200,24 +206,25 @@ export function GitHubAccountSelectorModal(props: {
                       className={`flex min-w-0 flex-1 flex-col ${tone === "hot" ? "opacity-75" : ""}`}
                     >
                       <span className="flex min-w-0 items-center gap-2">
-                        <span className="truncate text-sm font-medium text-[var(--app-fg)]">
+                        {/* #5973: the login and "· Name" share one line; see GitHubAccountDisplayName. */}
+                        <span className="min-w-0 truncate text-sm font-medium text-[var(--app-fg)]">
                           @{account.login}
                         </span>
-                        {account.name && (
-                          <span className="truncate text-[length:var(--text-caption)] text-[var(--app-hint)]">
-                            {account.name}
-                          </span>
-                        )}
+                        <GitHubAccountDisplayName account={account} />
                         {account.isDefault && (
                           <Badge variant="success">Default</Badge>
                         )}
                       </span>
                       {statusText && tone && (
                         <span
-                          className={`flex items-center gap-1.5 truncate text-[length:var(--text-caption)] ${TONE_TEXT[tone]}`}
+                          className={`flex items-start gap-1.5 whitespace-normal text-[length:var(--text-caption)] ${TONE_TEXT[tone]}`}
                         >
                           {/* Decorative: the text beside it carries the status, so the dot is not announced too. */}
-                          <span aria-hidden="true" className="inline-flex">
+                          {/* #5973: the status can wrap to a second line, so the dot sits on the first. */}
+                          <span
+                            aria-hidden="true"
+                            className="inline-flex h-[1lh] shrink-0 items-center"
+                          >
                             <StatusDot status={tone} label={statusText} />
                           </span>
                           {statusText}

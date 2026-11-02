@@ -9,12 +9,15 @@
  *
  * The lines run inside the bash exporter and rely on its helpers and state:
  * `record_omission`, `prune_credential_names`, `physical_path`,
- * `has_credential_part`, `$STAGING`, `$WORK`, `$HOME` and `$_cnl` (a newline).
+ * `has_credential_part`, `root_content_refusal` (#6063), `$CONFIG_ROOT_PHYS`,
+ * `$STAGING`, `$WORK`, `$HOME` and `$_cnl` (a newline).
  *
  * NODE-FREE: string builders only.
  */
 import {
   ARCHIVE_CREDENTIAL_OMISSION_REASON,
+  ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON,
+  ARCHIVE_LINK_LOOP_OMISSION_REASON,
   ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
   bashSingleQuote,
 } from "./exportShared";
@@ -285,6 +288,44 @@ function physicalCheckLines(
 }
 
 /**
+ * #6063: the lines that refuse a checked path `$<out>` (the physical path of
+ * `$<src>`) which reads Claude Code's config root outside the section folders:
+ * with `mode` `d`, a folder that is the root or a folder above it (a loop), or
+ * any path into the root outside the section folders. One omission at
+ * `surface`, then `onRefuse`. The test runs only when `$<src>` was reached
+ * through a link (its physical path differs) or lies inside the root, by text or
+ * by `holds_path` (another spelling: a case variant, a firmlink), because after
+ * #5985 a path outside the root costs a probe of the whole root
+ * (and fails closed on a folder it cannot search), which an ordinary
+ * `~/.agents/skills` must not pay. `skipWhen` is a shell condition under which
+ * the test does not run.
+ */
+function rootContentCheckLines(
+  indent: string,
+  src: string,
+  out: string,
+  mode: "" | "d",
+  surface: string,
+  onRefuse: string,
+  skipWhen?: string
+): string[] {
+  const test = [
+    `_xcg=0; [ "$${src}" = "$${out}" ] || _xcg=1`,
+    `if [ -n "\${CONFIG_ROOT_PHYS:-}" ]; then case "$${out}" in "$CONFIG_ROOT_PHYS"|"$CONFIG_ROOT_PHYS"/*) _xcg=1 ;; esac; fi`,
+    `if [ "$_xcg" -eq 0 ] && [ -n "\${CONFIG_ROOT_PHYS:-}" ] && holds_path "$CONFIG_ROOT_PHYS" "$${out}"; then _xcg=1; fi`,
+    `if [ "$_xcg" -eq 1 ] && [ -n "$${out}" ]; then`,
+    `  root_content_refusal "$${out}"${mode ? " " + mode : ""}`,
+    `  if [ "$_rckind" = l ]; then record_omission ${surface} ${q(ARCHIVE_LINK_LOOP_OMISSION_REASON)}; ${onRefuse}`,
+    `  elif [ "$_rckind" = r ]; then record_omission ${surface} ${q(ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON)}; ${onRefuse}; fi`,
+    "fi",
+  ];
+  const lines = skipWhen
+    ? [`if ! { ${skipWhen}; }; then`, ...test.map(l => "  " + l), "fi"]
+    : test;
+  return lines.map(l => indent + l);
+}
+
+/**
  * Step 4d: check the Codex home once (a credential store, or a folder that
  * cannot be resolved, is refused with one omission and nothing is read from
  * it), then stage its instructions as `rules/codex-agents.md` and its user
@@ -308,6 +349,19 @@ export function codexStagingShellLines(excludeFlags: string): string[] {
       q(CODEX_HOME_SURFACE),
       "_xphys=''"
     ),
+    "  # #6063: a home that is Claude Code's config root, or one inside it outside the",
+    "  # section folders (CODEX_HOME=~/.claude/plugins/...), would ship that content",
+    "  # as Codex instructions and skills: refused whole, as is a link to a folder",
+    "  # above the root (a loop). Codex reads only fixed names, so a home above the",
+    "  # root set without a link reads nothing of it.",
+    ...rootContentCheckLines(
+      "  ",
+      "CODEX_ROOT",
+      "_xphys",
+      "d",
+      q(CODEX_HOME_SURFACE),
+      "_xphys=''"
+    ),
     '  if [ -n "$_xphys" ]; then CODEX_PHYS="$_xphys"; CODEX_READ=true; fi',
     "fi",
     'if [ "$CODEX_READ" = true ]; then',
@@ -325,6 +379,18 @@ export function codexStagingShellLines(excludeFlags: string): string[] {
       "_xp",
       q(CODEX_INSTRUCTIONS_SURFACE),
       "_xi=refused; break"
+    ),
+    "      # #6063: a link into the config root outside the section folders is refused,",
+    "      # and AGENTS.md never stands in for it; the root's own CLAUDE.md (a regular",
+    "      # file the export carries as CLAUDE.md anyway) is the one exception.",
+    ...rootContentCheckLines(
+      "      ",
+      "_xf",
+      "_xp",
+      "",
+      q(CODEX_INSTRUCTIONS_SURFACE),
+      "_xi=refused; break",
+      '[ -n "${CONFIG_ROOT_PHYS:-}" ] && [ "$_xp" = "$CONFIG_ROOT_PHYS/CLAUDE.md" ] && [ -f "$_xp" ]'
     ),
     '      [ -f "$_xp" ] || continue',
     '      _xf="$_xp"',
@@ -359,6 +425,16 @@ export function codexStagingShellLines(excludeFlags: string): string[] {
       "    ",
       "_xr",
       "_xrp",
+      q(CODEX_SKILLS_SURFACE),
+      "continue"
+    ),
+    "    # #6063: a skills root that reads the config root outside the section folders",
+    "    # (~/.agents/skills -> a plugin cache's skills) is refused whole.",
+    ...rootContentCheckLines(
+      "    ",
+      "_xr",
+      "_xrp",
+      "d",
       q(CODEX_SKILLS_SURFACE),
       "continue"
     ),

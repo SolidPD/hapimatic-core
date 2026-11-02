@@ -616,6 +616,77 @@ export function validUploadUrl(
 }
 
 /**
+ * #6062 (fix round 1, SEC-1): `awk` that prints `1` when a `<number> <path>`
+ * list holds one path text twice, else `0`. `find` lists each entry once, so
+ * the same text twice means the `ls` that printed it maps different names to
+ * one text (BusyBox prints a control byte as `?`, and under `LC_ALL=C` every
+ * byte outside ASCII; uutils 0.0.24 prints bad UTF-8 as U+FFFD), or that a
+ * newline split a name. A decoy file named with that text, or its folder, is
+ * listed too, so the duplicate is the decoy's signature. A decoy in a sibling
+ * of the target or root itself, through a mangled byte of that path, is
+ * listed by neither; the confirm loop's literal-prefix check catches it.
+ */
+const DUP_TEXT_AWK =
+  'LC_ALL=C awk "\\$0 != \\"e\\" {p = \\$0; sub(/^[0-9]+ /, \\"\\", p); if (p in d) x = 1; d[p] = 1} END {print x + 0}"';
+
+/**
+ * #6062: the config root's listing, once per run, shared by
+ * {@link ROOT_HOLDS_SH} and {@link ROOT_BELOW_SH} (#5985 wrote it inside
+ * `ROOT_HOLDS_SH`; it moved here so both probes splice the same text and the
+ * completeness rules cannot drift). It expects `a` (the root), `s` (the set
+ * path) and `o` (empty while the probe can still answer), and leaves `n`
+ * holding a newline. The `awk` writes `$s.p` to `$HAPI_PORTER_EF_S.p`, so a
+ * caller must export `HAPI_PORTER_EF_S` equal to `$s` (both probes take `s`
+ * from it; a mismatch leaves `$s.p` without its end line, so every probe
+ * answers `?`).
+ *
+ * First, whatever the listing's state: `QUOTING_STYLE`, `CLICOLOR`,
+ * `CLICOLOR_FORCE` and `LS_COLORS` are cleared, because GNU `ls` honours an
+ * inherited `QUOTING_STYLE` even when its output is piped, and a quoted path no
+ * longer names its entry. Then, unless an earlier probe in the run built it
+ * (`$s.ok`) or found it incomplete (`$s.bad`), one `find … -exec ls -di {} +`
+ * pass writes the inode number of the root and of every entry below it to `$s`
+ * (what `ROOT_HOLDS_SH` and `ROOT_BELOW_SH`'s prefilter read) and, from the
+ * same `awk`, `<number> <path>` lines to `$s.p` (what `ROOT_BELOW_SH` joins
+ * on; its first line is the root itself). GNU `ls` left-pads the number, so the
+ * path is what follows the first number and one space. `awk` takes the second
+ * file's name from `ENVIRON`, never `-v`, which would read a backslash in the
+ * work folder's path as an escape. Each list ends with the line `e`. A last
+ * `find -name` records in `$s.nl` whether any name below the root holds a
+ * newline (it splits that path across lines of the listing); its own list ends
+ * with `e` too, and its exit status goes to `$s.nlrc`. `$s.dup` records that
+ * one path text is listed twice ({@link DUP_TEXT_AWK}). The listing is
+ * incomplete (`$s.bad`, so every probe answers `?`) on the error rules
+ * `ROOT_HOLDS_SH` documents, when either list lacks its end line, or when the
+ * newline search exits above 1, loses its end line or cannot be read.
+ */
+function rootListingLines(): string[] {
+  return [
+    'unset QUOTING_STYLE CLICOLOR CLICOLOR_FORCE LS_COLORS; n=$(printf "\\nx"); n=${n%x};',
+    'if [ -z "$o" ]; then if [ ! -f "$s.ok" ]; then if [ ! -f "$s.bad" ];',
+    'then { LC_ALL=C find "$a" -exec ls -di {} + 2> "$s.err"; echo $? > "$s.rc"; }',
+    '| LC_ALL=C awk "BEGIN {p = ENVIRON[\\"HAPI_PORTER_EF_S\\"] \\".p\\"} \\$1 ~ /^[0-9]+\\$/ {print \\$1; q = \\$0; sub(/^ *[0-9]+ ?/, \\"\\", q); print \\$1 \\" \\" q > p} END {print \\"e\\"; print \\"e\\" > p}" > "$s"; r=$(cat "$s.rc"); b=0;',
+    // Answered: only an entry below the root that vanished mid-listing (grep
+    // exits 1 when every line says so; 0 is another error, above 1 no answer).
+    'LC_ALL=C grep -v ": No such file or directory\\$" "$s.err" > /dev/null; if [ $? != 1 ]; then b=1; fi;',
+    'LC_ALL=C grep -vF "$a/" "$s.err" > /dev/null; if [ $? != 1 ]; then b=1; fi;',
+    'if [ "$r" != 0 ]; then if [ ! -s "$s.err" ]; then b=1; fi; fi;',
+    // A list cut short lacks the end line.
+    'if [ "$(tail -n 1 "$s" 2> /dev/null)" != e ]; then b=1; fi;',
+    'if [ "$(tail -n 1 "$s.p" 2> /dev/null)" != e ]; then b=1; fi;',
+    // The newline search: exit 0 or 1 only, and its list ends with e too.
+    '{ LC_ALL=C find "$a" -name "*$n*" -print 2> /dev/null; echo $? > "$s.nlrc"; echo e; } > "$s.nlf"; q=$(cat "$s.nlrc" 2> /dev/null);',
+    'if [ "$q" != 0 ]; then if [ "$q" != 1 ]; then b=1; fi; fi; if [ "$(tail -n 1 "$s.nlf" 2> /dev/null)" != e ]; then b=1; fi;',
+    'LC_ALL=C grep -qvx e "$s.nlf"; q=$?; if [ "$q" = 0 ]; then : > "$s.nl"; fi; if [ "$q" -gt 1 ]; then b=1; fi;',
+    // One path text listed twice (an ls that mangles names prints two
+    // entries alike): the text cannot be trusted, as with a newline.
+    `${DUP_TEXT_AWK} "$s.p" > "$s.dupf"; if [ "$(cat "$s.dupf" 2> /dev/null)" != 0 ]; then : > "$s.dup"; fi;`,
+    'if [ "$b" = 1 ]; then : > "$s.bad"; else : > "$s.ok"; fi; fi; fi;',
+    'if [ -f "$s.bad" ]; then o=?; fi; fi;',
+  ];
+}
+
+/**
  * #5985: the `sh` script both exporters run (bash through `/bin/sh -c`, the
  * PowerShell twin off Windows through `'…' | & '/bin/sh'`) to ask whether a
  * link target that the text and `-ef` parent tests do not place inside the
@@ -665,23 +736,26 @@ export function validUploadUrl(
  * command, so the line opens with `t=;` and assigns `t` again after it: an
  * inherited `t` is never the path checked. One line: the fragments below are
  * joined with spaces.
+ *
+ * Then `set +e +C` (#6093 F1), for both twins: where `/bin/sh` is bash it
+ * imports an exported `SHELLOPTS`, and when the user's environment carries one
+ * the bash exporter's own `set -eu` lands in it too. Under `errexit` the first
+ * `grep` that finds nothing ends the script with no answer, so every link is
+ * refused; under `noclobber` a second lookup in one run cannot overwrite its
+ * `$s.n`, reads the first lookup's numbers, and a target hard-linked into the
+ * root prints nothing (ships). A preamble under an inherited `errexit` stops
+ * bash at the first word with 127, before the reset runs, which the PowerShell
+ * caller reads as `?`.
+ *
+ * #6062: the listing is {@link rootListingLines}, shared with
+ * {@link ROOT_BELOW_SH}, so the root is listed once per run and its
+ * completeness rules exist once; it also counts the listing incomplete when its
+ * path list or its newline search is cut short or dies (see there).
  */
 export const ROOT_HOLDS_SH = [
-  "t=; t=$HAPI_PORTER_EF_T; a=$HAPI_PORTER_EF_A; s=$HAPI_PORTER_EF_S; o=;",
+  "t=; t=$HAPI_PORTER_EF_T; set +e +C; a=$HAPI_PORTER_EF_A; s=$HAPI_PORTER_EF_S; o=;",
   'if [ -z "$t" ]; then o=?; fi; if [ -z "$a" ]; then o=?; fi; if [ -z "$s" ]; then o=?; fi;',
-  // The listing, once per run.
-  'if [ -z "$o" ]; then if [ ! -f "$s.ok" ]; then if [ ! -f "$s.bad" ];',
-  'then { LC_ALL=C find "$a" -exec ls -di {} + 2> "$s.err"; echo $? > "$s.rc"; }',
-  '| LC_ALL=C awk "\\$1 ~ /^[0-9]+\\$/ {print \\$1} END {print \\"e\\"}" > "$s"; r=$(cat "$s.rc"); b=0;',
-  // Answered: only an entry below the root that vanished mid-listing (grep
-  // exits 1 when every line says so; 0 is another error, above 1 no answer).
-  'LC_ALL=C grep -v ": No such file or directory\\$" "$s.err" > /dev/null; if [ $? != 1 ]; then b=1; fi;',
-  'LC_ALL=C grep -vF "$a/" "$s.err" > /dev/null; if [ $? != 1 ]; then b=1; fi;',
-  'if [ "$r" != 0 ]; then if [ ! -s "$s.err" ]; then b=1; fi; fi;',
-  // A list cut short lacks the end line.
-  'if [ "$(tail -n 1 "$s" 2> /dev/null)" != e ]; then b=1; fi;',
-  'if [ "$b" = 1 ]; then : > "$s.bad"; else : > "$s.ok"; fi; fi; fi;',
-  'if [ -f "$s.bad" ]; then o=?; fi; fi;',
+  ...rootListingLines(),
   // The lookup: the target and every folder above it.
   'if [ -z "$o" ]; then set -- "$t"; p=$t;',
   'while :; do case $p in /) break ;; esac; p=${p%/*}; if [ -z "$p" ]; then p=/; fi; set -- "$@" "$p"; done;',
@@ -697,4 +771,148 @@ export const ROOT_HOLDS_SH = [
   'LC_ALL=C grep -vF "$a/" "$s.ferr" > /dev/null; if [ $? != 1 ]; then o=?; fi;',
   'if [ ! -s "$s.ferr" ]; then o=?; fi; fi; if [ -z "$o" ]; then o=$m; fi; fi; fi; fi;',
   'if [ -n "$o" ]; then printf "%s\\n" "$o"; fi',
+].join(" ");
+
+/**
+ * #6062: the `find` operators that skip, below a link's target, the names every
+ * copy excludes ({@link ARCHIVE_EXCLUSION_PATTERNS}), generated so the two
+ * lists cannot drift.
+ */
+const ROOT_BELOW_PRUNE = `\\( ${ARCHIVE_EXCLUSION_PATTERNS.map(p => `-name "${p}"`).join(" -o ")} \\) -prune -o`;
+
+/** #6062: `awk` that turns `ls -di` lines into `<number> <path>` lines, then the end line `e`. */
+const LS_PAIRS_AWK =
+  'LC_ALL=C awk "\\$1 ~ /^[0-9]+\\$/ {q = \\$0; sub(/^ *[0-9]+ ?/, \\"\\", q); print \\$1 \\" \\" q} END {print \\"e\\"}"';
+
+/**
+ * #6062: the `sh` script both exporters run (bash through `/bin/sh -c`, the
+ * PowerShell twin off Windows through `'…' | & '/bin/sh'`) to ask whether an
+ * entry strictly BELOW a folder link's physical target is the same file (one
+ * device and inode) as an entry below the config root: a bind mount of a root
+ * folder or file placed inside the target (`~/.claude/projects` bound at
+ * `/area/proj`, `skills/m -> /area`), renamed or not, or a hard link of a root
+ * file there. #5985's {@link ROOT_HOLDS_SH} looks at the target and the folders
+ * above it, and #5953's probe below it only for the root itself, so neither
+ * sees it, and `tar -h` crosses the mount. Inputs travel in the environment:
+ * `HAPI_PORTER_EF_T` (the target), `HAPI_PORTER_EF_A` (`CONFIG_ROOT_PHYS`),
+ * `HAPI_PORTER_EF_S` (the set path in `$WORK`, shared with `ROOT_HOLDS_SH`) and
+ * `HAPI_PORTER_EF_P` (`1` when the copy's tar is GNU tar). Output: nothing (no
+ * match: ship), one `d<in-root path>` (a folder) or `f<in-root path>` line per
+ * confirmed match, or `?` (it cannot answer: refuse). The caller judges each
+ * match by its in-root path, exactly as #5985 judges a match above the target,
+ * so a bind of `skills/demo` below a target ships and a bind of `projects/` is
+ * refused. A redirect that fails either stops `sh` with a non-zero status and
+ * no output (on the special builtin `:` that writes `$s.ok` / `$s.bad`), which
+ * each caller treats as `?`, or leaves a list without its end line, which
+ * answers `?`. A flag file it cannot write (`$s.btd`, `$s.dupf`) instead marks
+ * the path text untrusted (`?` for an unconfirmed pair), and an unwritten
+ * `$s.nlrc` marks the root listing incomplete.
+ *
+ * It splices in {@link rootListingLines} (the root listed once per run, with
+ * `$s.p` holding `<number> <path>` lines), then lists every entry strictly
+ * below the target with `find "$t/." ! -name . -exec ls -di {} +`: links are not
+ * followed, and starting at `"$t/."` never prunes or lists the target itself
+ * (a target named `cache` is still scanned). With `HAPI_PORTER_EF_P=1` it skips
+ * the names every copy excludes, because under GNU tar an unanchored
+ * `--exclude` drops such a name at any depth, so nothing below one can ship
+ * (`git clone --local` hard-links `.git/objects`). Under bsdtar it prunes
+ * nothing, since bsdtar may not exclude a name nested deeper than one level:
+ * more refusals, never fewer. The root side is never pruned: a match is judged
+ * by its in-root path.
+ *
+ * A number match is a candidate only: inode numbers repeat across volumes. The
+ * target's numbers are matched against the root's with `grep -xF -f` first, and
+ * only on a hit does one `awk` join the two path lists; each pair is then
+ * confirmed with the shell's own `test -ef`, behind a check that it has `-ef`.
+ * A pair with a symlink on either side is not tested with `-ef`, which follows
+ * a link while `ls -di` does not (the link walk tests links). Such a pair, and
+ * a pair `-ef` does not confirm, is another volume's number (no match) when
+ * both its paths exist (the unconfirmed case) and the path text can be
+ * trusted: no name in either listing holds a newline (which splits a path
+ * across lines) and no path text is listed twice ({@link DUP_TEXT_AWK}: an `ls`
+ * that mangles names prints a decoy file or link under the same text as the
+ * entry, fix round 1 SEC-1), and each path text starts with the literal target
+ * or root path (a mangled byte in that path names a sibling folder, which
+ * neither listing holds, so no text repeats). Otherwise it answers `?`. A match on the root
+ * itself answers `?`, and so does a matched root path holding a CR or a
+ * backslash, which the PowerShell caller would read as another path (pwsh
+ * splits its output into lines at a CR as well as a newline, and a path on
+ * `\`, fix round 1 SF-1). Matches build the answer in a variable 256 lines at a time, so a
+ * target holding thousands (a bind of `projects/`) stays linear.
+ *
+ * Fail closed: `?` for an empty, relative or newline-holding target or root; a
+ * relative set path; an incomplete root listing ({@link rootListingLines});
+ * a target listing that exits above 1, exits 1 with no message, reports an
+ * error other than "Permission denied" or "No such file or directory" (`EIO`,
+ * `File name too long`), or reports one that names no path below the target
+ * (a missing `ls`, which `find` reports by name); a newline search that dies;
+ * any list cut short (each ends with the line `e`, which a full disk under
+ * `mawk` loses while it still exits 0); a `test` without `-ef`; a grep that
+ * cannot answer; an unconfirmed pair whose text cannot be trusted; a match on
+ * the root, or on a root path holding a CR or a backslash; and a confirm loop
+ * that does not reach its end line. A folder below the target that `find`
+ * cannot read is not listed: tar cannot read it either, so unless the copy
+ * excludes it by name the copy fails on it (#5953's rule). Every per-call file
+ * is removed first.
+ *
+ * R2 (the PowerShell embedding): no `'`, `exit`, `&&` or `||`, ASCII only, one
+ * line, and the stdin-probe opening `t=; t=$HAPI_PORTER_EF_T; set +e +C;`
+ * (#6093): `t=` first for a byte-order mark, then the reset of an inherited
+ * `errexit` or `noclobber` that bash as `/bin/sh` imports from `SHELLOPTS`.
+ */
+export const ROOT_BELOW_SH = [
+  "t=; t=$HAPI_PORTER_EF_T; set +e +C; a=$HAPI_PORTER_EF_A; s=$HAPI_PORTER_EF_S; w=$HAPI_PORTER_EF_P; o=; c=; cb=; cn=0; h=0; l=0; v=0; u=0; z=0;",
+  'n=$(printf "\\nx"); n=${n%x}; j=$(printf "\\r");',
+  'if [ -z "$t" ]; then o=?; fi; if [ -z "$a" ]; then o=?; fi; if [ -z "$s" ]; then o=?; fi;',
+  "case $t in /*) ;; *) o=? ;; esac; case $a in /*) ;; *) o=? ;; esac; case $s in /*) ;; *) o=? ;; esac;",
+  'case $t$a in *"$n"*) o=? ;; esac;',
+  'if [ -z "$o" ]; then rm -f "$s.bt" "$s.btn" "$s.bhn" "$s.bj" "$s.bterr" "$s.btrc" "$s.btnl" "$s.btd"; fi;',
+  ...rootListingLines(),
+  // The target: every entry strictly below it, links not followed.
+  `if [ -z "$o" ]; then if [ "$w" = 1 ]; then { LC_ALL=C find "$t/." ${ROOT_BELOW_PRUNE} ! -name . -exec ls -di {} + 2> "$s.bterr"; echo $? > "$s.btrc"; } | ${LS_PAIRS_AWK} > "$s.bt";`,
+  `LC_ALL=C find "$t/." ${ROOT_BELOW_PRUNE} -name "*$n*" -print > "$s.btnl" 2> /dev/null; z=$?;`,
+  `else { LC_ALL=C find "$t/." ! -name . -exec ls -di {} + 2> "$s.bterr"; echo $? > "$s.btrc"; } | ${LS_PAIRS_AWK} > "$s.bt";`,
+  'LC_ALL=C find "$t/." -name "*$n*" -print > "$s.btnl" 2> /dev/null; z=$?; fi; if [ "$z" -gt 1 ]; then o=?; fi;',
+  // Exit 0 or 1 only, never 1 without a message; an error line other than a
+  // folder it cannot read or an entry that vanished, or one naming no path
+  // below the target, answers ?.
+  'r=$(cat "$s.btrc" 2> /dev/null); if [ "$r" != 0 ]; then if [ "$r" != 1 ]; then o=?; fi; if [ ! -s "$s.bterr" ]; then o=?; fi; fi;',
+  'LC_ALL=C grep -vE ": (Permission denied|No such file or directory)\\$" "$s.bterr" > /dev/null; if [ $? != 1 ]; then o=?; fi;',
+  'LC_ALL=C grep -vF "$t/" "$s.bterr" > /dev/null; if [ $? != 1 ]; then o=?; fi;',
+  'if [ "$(tail -n 1 "$s.bt" 2> /dev/null)" != e ]; then o=?; fi;',
+  'if [ -s "$s.btnl" ]; then l=1; fi; if [ -f "$s.nl" ]; then l=1; fi;',
+  // A path text listed twice, below the target or below the root (SEC-1).
+  `${DUP_TEXT_AWK} "$s.bt" > "$s.btd"; if [ "$(cat "$s.btd" 2> /dev/null)" != 0 ]; then l=1; fi; if [ -f "$s.dup" ]; then l=1; fi; fi;`,
+  // Capability: the shell's own test has -ef.
+  'if [ -z "$o" ]; then if [ "$a" -ef "$a" ]; then :; else o=?; fi; if [ "$a" -ef "$s" ]; then o=?; fi; fi;',
+  // Prefilter: a target number that is a root number (both lists end with e,
+  // so a hit is a matched line other than e, and the matched list ends with e
+  // too unless it was cut short); no hit, no join.
+  'if [ -z "$o" ]; then LC_ALL=C awk "\\$0 != \\"e\\" {print \\$1} END {print \\"e\\"}" < "$s.bt" > "$s.btn"; if [ "$(tail -n 1 "$s.btn" 2> /dev/null)" != e ]; then o=?; fi; fi;',
+  'if [ -z "$o" ]; then LC_ALL=C grep -xF -f "$s.btn" "$s" > "$s.bhn"; if [ $? -gt 1 ]; then o=?; fi; if [ "$(tail -n 1 "$s.bhn" 2> /dev/null)" != e ]; then o=?; fi; fi;',
+  'if [ -z "$o" ]; then LC_ALL=C grep -qvx e "$s.bhn"; g=$?; if [ "$g" = 0 ]; then h=1; fi; if [ "$g" -gt 1 ]; then o=?; fi; fi;',
+  // The join: for each target entry whose number a root entry has, the
+  // number, the target path and the root path; then the end line.
+  'if [ -z "$o" ]; then if [ "$h" = 1 ]; then LC_ALL=C awk "FILENAME == ARGV[1] {if (\\$0 != \\"e\\") w[\\$1] = 1; next} FILENAME == ARGV[2] {if (\\$0 != \\"e\\") {m = \\$1; if (m in w) {p = \\$0; sub(/^[0-9]+ /, \\"\\", p); r[m] = r[m] \\"\\n\\" p}}; next} \\$0 != \\"e\\" {m = \\$1; if (m in r) {p = \\$0; sub(/^[0-9]+ /, \\"\\", p); k = split(r[m], q, \\"\\n\\"); for (i = 2; i <= k; i++) {print m; print p; print q[i]}}} END {print \\"e\\"}" "$s.bhn" "$s.p" "$s.bt" > "$s.bj";',
+  'if [ "$(tail -n 1 "$s.bj" 2> /dev/null)" != e ]; then o=?; fi; fi; fi;',
+  // The confirm: one device and inode per pair, appended to a variable (an
+  // append to a file could fail and drop a match), 256 lines at a time (one
+  // append per match copies the whole answer each time).
+  'if [ -z "$o" ]; then if [ "$h" = 1 ]; then while IFS= read -r m; do if [ "$m" = e ]; then u=1; break; fi; IFS= read -r x; IFS= read -r y;',
+  // A path text that does not start with the literal target or root path: an
+  // ls that mangles a byte of that path names a sibling folder, which neither
+  // listing holds, so no text repeats (fix round 1, delta review).
+  'case $x in "$t/./"*) ;; *) l=1 ;; esac;',
+  'case $y in "$a"|"$a/"*) ;; *) l=1 ;; esac;',
+  'f=0; if [ -L "$x" ]; then f=1; fi; if [ -L "$y" ]; then f=1; fi;',
+  // A pair of links is unconfirmed too: a decoy link can carry the text.
+  'if [ "$f" = 1 ]; then v=1; fi;',
+  'if [ "$f" = 0 ]; then if [ "$x" -ef "$y" ]; then if [ "$y" = "$a" ]; then o=?; fi;',
+  // A root name holding a CR or a backslash: the PowerShell caller would
+  // read it as another path (SF-1).
+  'case $y in *"$j"*|*\\\\*) o=? ;; esac;',
+  'if [ -d "$y" ]; then cb="${cb}d$y$n"; else cb="${cb}f$y$n"; fi; cn=$((cn + 1)); if [ "$cn" -ge 256 ]; then c="$c$cb"; cb=; cn=0; fi;',
+  'else v=1; if [ ! -e "$x" ]; then o=?; fi; if [ ! -e "$y" ]; then o=?; fi; fi; fi; done < "$s.bj"; c="$c$cb";',
+  'if [ "$u" != 1 ]; then o=?; fi; if [ "$v" = 1 ]; then if [ "$l" = 1 ]; then o=?; fi; fi; fi; fi;',
+  'if [ -n "$o" ]; then printf "%s\\n" "$o"; else printf "%s" "$c"; fi',
 ].join(" ");

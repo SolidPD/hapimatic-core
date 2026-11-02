@@ -967,7 +967,8 @@ export class SessionCache {
     config: {
       permissionMode?: PermissionMode;
       modelMode?: ModelMode;
-      effort?: EffortLevel;
+      /** Issue #6070: `null` clears it (a model switch re-fitted to no effort). */
+      effort?: EffortLevel | null;
       rawModel?: string;
     }
   ): void {
@@ -989,7 +990,7 @@ export class SessionCache {
     }
     // Issue #2456: mirror the effort + raw-model pins onto the live record.
     if (config.effort !== undefined) {
-      session.effort = config.effort;
+      session.effort = config.effort ?? undefined;
     }
     if (config.rawModel !== undefined) {
       session.rawModel = config.rawModel;

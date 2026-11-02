@@ -38,6 +38,12 @@ const ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models?limit=100";
 const CACHE_TTL_MS = 10 * 60 * 1000; // serve a live catalog for 10 minutes
 const FAIL_COOLDOWN_MS = 60 * 1000; // after a failure, wait 60s before retrying live
 const FETCH_TIMEOUT_MS = 8000;
+/**
+ * Issue #6070: the longest a fresh spawn waits on a catalog fetch that is already
+ * in flight before it falls back to the static catalog (see
+ * {@link ClaudeModelCatalogService.modelsForSpawn}).
+ */
+export const SPAWN_CATALOG_WAIT_MS = 3000;
 
 interface CacheEntry {
   at: number;
@@ -100,9 +106,9 @@ export class ClaudeModelCatalogService {
   }
 
   /**
-   * The catalog without waiting on Anthropic (issue #6028) — for the spawn path,
-   * which must never stall on a live fetch (`FETCH_TIMEOUT_MS`). Serves the
-   * cached catalog of any age, else {@link FALLBACK_CLAUDE_MODELS}. When the
+   * The catalog without waiting on Anthropic (issue #6028), used by
+   * {@link modelsForSpawn}, which waits only in the narrow case it documents.
+   * Serves the cached catalog of any age, else {@link FALLBACK_CLAUDE_MODELS}. When the
    * cache is missing or past `CACHE_TTL_MS` and no failure cooldown is active,
    * it starts a background {@link getModels} so a later read serves the refreshed cache.
    */
@@ -113,6 +119,45 @@ export class ClaudeModelCatalogService {
     return this.cache
       ? { models: this.cache.models, source: "cache" }
       : { models: FALLBACK_CLAUDE_MODELS, source: "fallback" };
+  }
+
+  /**
+   * The catalog for a fresh spawn or a model switch's re-fit (issue #6070). Like
+   * {@link peekModels}, except in the boot window: on a catalog that has never
+   * been cached and has never failed a fetch, with the first fetch in flight (the
+   * boot warm, a New Session page load's `GET /api/claude/models`, or an earlier
+   * `peekModels` refresh), it waits up to `maxWaitMs` for that fetch, so the first
+   * spawn after a boot fits its effort from the live catalog the New Session label
+   * reads rather than the static fallback. It never waits on a fetch it starts
+   * itself, and once a fetch has failed it never waits again, so a node whose
+   * fetch keeps failing never stalls a spawn (`peekModels` still starts the
+   * background retry after each cooldown). This revises #6028's "a spawn never
+   * waits" only for that boot window.
+   */
+  async modelsForSpawn(
+    maxWaitMs = SPAWN_CATALOG_WAIT_MS
+  ): Promise<ClaudeModelsResponse> {
+    const inflight = this.inflight;
+    // cooldownUntil is set on a failed fetch and never reset (a success sets the
+    // cache instead), so a non-zero value means "has failed with nothing cached".
+    if (this.cache || !inflight || this.cooldownUntil !== 0) {
+      return this.peekModels();
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        inflight.then(
+          () => undefined,
+          () => undefined
+        ),
+        new Promise<void>(resolve => {
+          timer = setTimeout(resolve, maxWaitMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return this.peekModels();
   }
 
   /** Dedupe concurrent live fetches (many tabs opening the create page at once). */

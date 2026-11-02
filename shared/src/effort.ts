@@ -78,11 +78,20 @@ export interface ResolvedSpawnEffort {
   }>;
 }
 
-function asEffortLevel(value: unknown): EffortLevel | null {
-  return typeof value === "string" &&
+/**
+ * True when `value` is one of {@link EFFORT_LEVELS}. Issue #6070: the guard for
+ * a value that crossed a process or node boundary without a schema parse (a
+ * peer's `/federation/info` `defaultEffort`, a session's `nodeDefaultEffort`).
+ */
+export function isEffortLevel(value: unknown): value is EffortLevel {
+  return (
+    typeof value === "string" &&
     (EFFORT_LEVELS as readonly string[]).includes(value)
-    ? (value as EffortLevel)
-    : null;
+  );
+}
+
+function asEffortLevel(value: unknown): EffortLevel | null {
+  return isEffortLevel(value) ? value : null;
 }
 
 /**
@@ -233,4 +242,24 @@ export function clampEffortToModel(
     if (EFFORT_LEVELS.indexOf(candidate) < rank) below = candidate;
   }
   return below ?? lowest;
+}
+
+/**
+ * Re-fit a defaulted effort to a newly selected model (issue #6070). A session
+ * whose effort came from the node default records that pre-fit level in
+ * `metadata.nodeDefaultEffort`; on a model switch the effort becomes the node
+ * default fitted to the new model, by the same {@link clampEffortToModel} the
+ * daemon uses at spawn.
+ *
+ * - `nodeDefault` not a known level (absent ⇒ the effort was an explicit pick or
+ *   the session predates #6070) → `undefined`: leave the effort alone.
+ * - otherwise → `clampEffortToModel(nodeDefault, supported)`: a level, or `null`
+ *   when the new model takes no effort (send no `--effort`).
+ */
+export function refitNodeDefaultEffort(
+  nodeDefault: unknown,
+  supported: readonly EffortLevel[] | undefined
+): EffortLevel | null | undefined {
+  if (!isEffortLevel(nodeDefault)) return undefined;
+  return clampEffortToModel(nodeDefault, supported);
 }

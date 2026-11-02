@@ -2576,6 +2576,8 @@ export class ApiClient {
       isDefault?: boolean;
       status?: GitHubConnectionStatus;
       statusUnchecked?: boolean;
+      /** #5973: the installation account logins hapimatic.com last read; absent when unknown. */
+      installedOn?: string[];
     }>;
     error?: string;
     /** #2327: machine-readable failure cause when `success` is false. */

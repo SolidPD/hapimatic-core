@@ -71,57 +71,65 @@ export function ModelEffortRow(props: {
     return fitted === null ? "None" : named(fitted);
   })();
 
+  // Issue #6070 (OOS-2): the "(default)" labels need ~183 px of select ("Extra
+  // High (default)" is ~138 px of 14 px text plus 44 px of select padding and
+  // chevron), i.e. a row of ~557 px in this 1:2 split. Below an `@xl` (36rem)
+  // container the two selects stack, so the full label shows on a 393 px phone
+  // and in a narrow desktop split pane; a container query, not a viewport
+  // breakpoint, because New Session also renders inside a split pane.
   return (
-    <div className="flex gap-2">
-      <div className="min-w-0 flex-[2]">
-        <FormField
-          label="Model"
-          tooltip="The model the session starts on — the full live Anthropic catalog. This is a starting point, not a lock; you can switch models in-session afterwards."
-          bookmarkId="model"
-        >
-          <UiSelect
-            value={props.rawModel}
-            onChange={e => props.onRawModelChange(e.target.value)}
-            disabled={props.isDisabled}
-            data-testid="model-catalog-select"
+    <div className="@container">
+      <div className="flex flex-col gap-2 @xl:flex-row">
+        <div className="min-w-0 flex-[2]">
+          <FormField
+            label="Model"
+            tooltip="The model the session starts on — the full live Anthropic catalog. This is a starting point, not a lock; you can switch models in-session afterwards."
+            bookmarkId="model"
           >
-            <option value="">{defaultModelLabel}</option>
-            {models.map(model => (
-              <option key={model.id} value={model.id}>
-                {model.displayName}
-              </option>
-            ))}
-          </UiSelect>
-        </FormField>
-      </div>
-      <div className="min-w-0 flex-1">
-        <FormField
-          label="Effort"
-          tooltip="Reasoning-effort budget for the session. Levels the selected model doesn't support are disabled."
-          bookmarkId="effort"
-        >
-          <UiSelect
-            value={props.effort}
-            onChange={e =>
-              props.onEffortChange(e.target.value as EffortLevel | "")
-            }
-            disabled={props.isDisabled}
-            data-testid="effort-select"
-          >
-            <option value="">{defaultEffortLabel}</option>
-            {EFFORT_LEVELS.map(level => {
-              // Permissive when no specific model is chosen (Default resolves to
-              // a full-effort tier); otherwise gate by the model's capabilities.
-              const supported =
-                !selected || selected.effortLevels.includes(level);
-              return (
-                <option key={level} value={level} disabled={!supported}>
-                  {EFFORT_LEVEL_LABELS[level]}
+            <UiSelect
+              value={props.rawModel}
+              onChange={e => props.onRawModelChange(e.target.value)}
+              disabled={props.isDisabled}
+              data-testid="model-catalog-select"
+            >
+              <option value="">{defaultModelLabel}</option>
+              {models.map(model => (
+                <option key={model.id} value={model.id}>
+                  {model.displayName}
                 </option>
-              );
-            })}
-          </UiSelect>
-        </FormField>
+              ))}
+            </UiSelect>
+          </FormField>
+        </div>
+        <div className="min-w-0 flex-1">
+          <FormField
+            label="Effort"
+            tooltip="Reasoning-effort budget for the session. Levels the selected model doesn't support are disabled."
+            bookmarkId="effort"
+          >
+            <UiSelect
+              value={props.effort}
+              onChange={e =>
+                props.onEffortChange(e.target.value as EffortLevel | "")
+              }
+              disabled={props.isDisabled}
+              data-testid="effort-select"
+            >
+              <option value="">{defaultEffortLabel}</option>
+              {EFFORT_LEVELS.map(level => {
+                // Permissive when no specific model is chosen (Default resolves to
+                // a full-effort tier); otherwise gate by the model's capabilities.
+                const supported =
+                  !selected || selected.effortLevels.includes(level);
+                return (
+                  <option key={level} value={level} disabled={!supported}>
+                    {EFFORT_LEVEL_LABELS[level]}
+                  </option>
+                );
+              })}
+            </UiSelect>
+          </FormField>
+        </div>
       </div>
     </div>
   );

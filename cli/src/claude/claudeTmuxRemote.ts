@@ -43,9 +43,13 @@
  */
 
 import {
-  mkdirSync,
+  closeSync,
   createReadStream,
+  fstatSync,
+  mkdirSync,
+  openSync,
   ReadStream,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -330,8 +334,9 @@ const shellQuote = shellEscape;
  * secret-bearing CLAUDE_CODE_OAUTH_TOKEN (injected under multi-account binding,
  * #1446) included. The env is delivered out-of-band: the caller writes
  * `envFileBody` to a 0600 temp file at `envFilePath`, and the launched shell
- * sources then `rm`s that file before `exec`-ing claude. The token therefore
- * never lands on the launched shell's command line (`ps auxww` /
+ * sources then removes that file (with `command rm`, which skips an `rm`
+ * alias or function, #5993) before `exec`-ing claude. The token
+ * therefore never lands on the launched shell's command line (`ps auxww` /
  * `/proc/<pid>/cmdline`) nor in the tmux pane scrollback — parity with the
  * pty/sdk launchers' `Bun.spawn({ env })` channel (see claudePty.ts).
  */
@@ -466,6 +471,116 @@ export function resolveWindowTargetPreference(
   windowName: string
 ): string | number {
   return index ?? windowName;
+}
+
+/**
+ * One launch attempt's env file, with the identity it had when this process
+ * wrote it: device, inode and change time in nanoseconds (issue #5994).
+ */
+interface LiveEnvFile {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+  ctimeNs: bigint;
+}
+
+/** #5994: every env file an attempt in this process wrote and has not removed. */
+const liveEnvFiles = new Set<LiveEnvFile>();
+let envFileExitListenerRegistered = false;
+
+/**
+ * Write the attempt's 0600 env file and read its identity from the same
+ * descriptor, so the identity cannot belong to a file another process put at the
+ * path in between. `wx` (O_EXCL) refuses a pre-existing path, a symlink
+ * included, so a symlink-redirect fails closed.
+ */
+function writeEnvFile(path: string, body: string): LiveEnvFile {
+  const fd = openSync(path, "wx", 0o600);
+  try {
+    writeFileSync(fd, body);
+    const { dev, ino, ctimeNs } = fstatSync(fd, { bigint: true });
+    return { path, dev, ino, ctimeNs };
+  } catch (err) {
+    // The O_EXCL open created it, so it is ours: never leave part of a token.
+    try {
+      unlinkSync(path);
+    } catch {
+      // Already gone.
+    }
+    throw err;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Remove an env file only if the path still names the file the record
+ * describes, and drop the record. Never throws: it also runs inside
+ * `process.exit`.
+ *
+ * #5994: a respawned wrapper for the same session can write the same attempt-0
+ * path while this one exits (#1581), and a loop re-entry in this process writes
+ * it again while an older handle's cleanup is still to run. On ext4 `/tmp` a
+ * recreated file almost always gets the same inode number back, so dev and inode
+ * alone would match the newer file; the change time in nanoseconds tells the two
+ * apart.
+ */
+function removeEnvFileIfUnchanged(file: LiveEnvFile): void {
+  liveEnvFiles.delete(file);
+  let kept: string | null = null;
+  try {
+    const current = statSync(file.path, { bigint: true });
+    if (
+      current.dev === file.dev &&
+      current.ino === file.ino &&
+      current.ctimeNs === file.ctimeNs
+    ) {
+      unlinkSync(file.path);
+    } else {
+      kept = "is another attempt's env file";
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // ENOENT: the launch chain consumed it.
+    if (code !== "ENOENT") kept = `could not be removed (${code ?? "unknown"})`;
+  }
+  if (kept) {
+    try {
+      logger.debug(`[claudeTmuxRemote] ${file.path} ${kept}; leaving it`);
+    } catch {
+      // The logger rethrows a failed write under DEBUG; nothing may escape here.
+    }
+  }
+}
+
+/**
+ * The module's one `exit` listener: remove every env file still recorded, and
+ * return how many records there were. Exported for the tests, which call it
+ * directly instead of exiting; the count shows which records were released.
+ *
+ * #5994: `cleanupAndExit` ends in `process.exit`, which runs `exit` listeners
+ * but no `finally` and no cleanup stack. Without this, an archive (the
+ * killSession RPC), SIGTERM, SIGINT or an uncaught error during a launch attempt
+ * would leave the token file in `/tmp`. A SIGKILL, or a SIGHUP (the wrapper has
+ * no handler for it), still can; the daemon's stale env-file sweep bounds those.
+ * It is one listener over a set rather than one per call, because a wrapper runs
+ * this launcher an unbounded number of times (retries, relaunches, local→remote
+ * switches) and per-call listeners would pile up.
+ */
+export function removeLiveEnvFiles(): number {
+  const recorded = liveEnvFiles.size;
+  for (const file of liveEnvFiles) {
+    removeEnvFileIfUnchanged(file);
+  }
+  return recorded;
+}
+
+function trackLiveEnvFile(file: LiveEnvFile): void {
+  if (!envFileExitListenerRegistered) {
+    envFileExitListenerRegistered = true;
+    process.on("exit", removeLiveEnvFiles);
+  }
+  liveEnvFiles.add(file);
 }
 
 export async function claudeTmuxRemote(
@@ -714,12 +829,15 @@ export async function claudeTmuxRemote(
   opts.abort.addEventListener("abort", abortListener);
   cleanups.push(detachAbortListener);
 
+  // #5994: set once this attempt has written its env file. Removal drops the
+  // record (by object, never by path) and deletes the file only if the path
+  // still names it, so another attempt's file at the same path survives.
+  let envFile: LiveEnvFile | null = null;
   const removeEnvFile = () => {
-    try {
-      unlinkSync(envFilePath);
-    } catch {
-      // Already removed (shell rm -f'd it, or never created) — ignore.
-    }
+    const file = envFile;
+    if (!file) return;
+    envFile = null;
+    removeEnvFileIfUnchanged(file);
   };
 
   const killWindowInternal = async () => {
@@ -740,10 +858,11 @@ export async function claudeTmuxRemote(
     // 0) Write the launcher env to a 0600 temp file (issue #1505). The launched
     //    shell sources + unlinks it before exec'ing claude, so no env value
     //    (esp. CLAUDE_CODE_OAUTH_TOKEN) appears on any command line or in the
-    //    tmux pane scrollback. `flag: "wx"` (O_EXCL) refuses to follow a
-    //    pre-existing symlink — a symlink-redirect attack fails closed. A stale
-    //    file from a crashed prior run is unlinked first, mirroring the FIFO
-    //    stale-cleanup in step 1 below.
+    //    tmux pane scrollback. `writeEnvFile` opens it `wx` (O_EXCL), which
+    //    refuses to follow a pre-existing symlink — a symlink-redirect attack
+    //    fails closed. A stale file from a crashed prior run is unlinked first,
+    //    mirroring the FIFO stale-cleanup in step 1 below. That stays the
+    //    same-path backstop for a file a SIGKILLed run left (#5994).
     try {
       const s = await stat(envFilePath);
       if (s.isFile()) {
@@ -755,7 +874,8 @@ export async function claudeTmuxRemote(
     } catch {
       // ENOENT is the happy path here.
     }
-    writeFileSync(envFilePath, envFileBody, { mode: 0o600, flag: "wx" });
+    envFile = writeEnvFile(envFilePath, envFileBody);
+    trackLiveEnvFile(envFile);
     cleanups.push(removeEnvFile);
 
     // 1) Pre-existing FIFO leftover (from a crashed prior run) — unlink so

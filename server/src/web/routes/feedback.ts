@@ -106,6 +106,7 @@ export interface PersistAndSendOptions {
   /**
    * Raises a failed send as a centralized `feedback-email` error (issue #2952):
    * an `error_logs` row, and a Sentry event where the server runs with a DSN.
+   * A throw after the persist is raised too, without the row (issue #6015).
    * Absent or null keeps the plain `console.error`.
    */
   errorLogger?: ErrorLogger | null;
@@ -125,6 +126,72 @@ export function feedbackEmailFailureMessage(
   return status
     ? `feedback email send failed (${transport}, HTTP ${status})`
     : `feedback email send failed (${transport}, threw)`;
+}
+
+export interface PostPersistTailFailure {
+  /**
+   * The delivery channel: the email transport, or `telegram`. Typed to the
+   * known channels, because it is part of the Sentry grouping key.
+   */
+  channel: FeedbackSenderConfig["transport"] | "telegram";
+  /** The send outcome reached before the throw. */
+  delivery: PersistAndSendResult["delivery"];
+  namespace: string;
+  feedbackId: string;
+  error: unknown;
+}
+
+/**
+ * Report a throw from the best-effort tail after a feedback row is saved (the
+ * send and its status write, issue #2951 F3). Shared by `persistAndSendFeedback`
+ * and the support escalation's Telegram channel (issue #6015), so the message
+ * Sentry groups by cannot drift between them.
+ *
+ * Issue #6015 S2: the throw reaches Sentry through ErrorLogger, with
+ * `persist: false` because `error_logs` shares the SQLite connection that may
+ * have just failed (the #3631 busy_timeout class). The message carries only the
+ * channel and the send outcome, so it groups in Sentry.
+ *
+ * Issue #6015 D6: the journal line is written every time, logger or not. With
+ * `persist: false` ErrorLogger uses `context` only for the skipped `error_logs`
+ * row (its console line is the message, and Sentry's extras are fixed fields),
+ * so this line is the one place the row id is recorded. It logs the Error
+ * itself, so the journal keeps its stack.
+ *
+ * Never throws: a logger fault is logged and swallowed, so the caller's catch
+ * cannot turn into a 500 for a saved row. Never writes to the store.
+ */
+export function reportPostPersistTailFailure(
+  errorLogger: ErrorLogger | null | undefined,
+  failure: PostPersistTailFailure
+): void {
+  const { channel, delivery, namespace, feedbackId, error } = failure;
+  console.error(
+    `[feedback] post-persist tail failed for ${feedbackId} (send outcome: ${delivery}):`,
+    error
+  );
+  if (!errorLogger) return;
+  try {
+    errorLogger.error(
+      `feedback post-persist tail failed (${channel}, send outcome: ${delivery})`,
+      {
+        category: "feedback-email",
+        namespace,
+        stack: error instanceof Error ? (error.stack ?? null) : null,
+        context: {
+          feedbackId,
+          delivery,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        persist: false,
+      }
+    );
+  } catch (logError) {
+    console.error(
+      `[feedback] ErrorLogger failed to report the post-persist tail failure for ${feedbackId}:`,
+      logError
+    );
+  }
 }
 
 /**
@@ -206,33 +273,13 @@ export async function persistAndSendFeedback(
       console.log(`[feedback] email skipped for ${entry.id}: ${result.reason}`);
     }
   } catch (e) {
-    // Issue #6015 S2: the tail throw reaches Sentry through ErrorLogger, with
-    // `persist: false` because `error_logs` shares the SQLite connection that
-    // may have just failed (the #3631 busy_timeout class). The message carries
-    // only the transport and the send outcome, so it groups in Sentry; the
-    // Error's stack and the row id ride in the stack and context. Without a
-    // logger, the journal line keeps the Error itself, so it keeps its stack.
-    if (options.errorLogger) {
-      options.errorLogger.error(
-        `feedback post-persist tail failed (${senderConfig.transport}, send outcome: ${delivery})`,
-        {
-          category: "feedback-email",
-          namespace: input.namespace,
-          stack: e instanceof Error ? (e.stack ?? null) : null,
-          context: {
-            feedbackId: entry.id,
-            delivery,
-            error: e instanceof Error ? e.message : String(e),
-          },
-          persist: false,
-        }
-      );
-    } else {
-      console.error(
-        `[feedback] post-persist tail failed for ${entry.id} (send outcome: ${delivery}):`,
-        e
-      );
-    }
+    reportPostPersistTailFailure(options.errorLogger, {
+      channel: senderConfig.transport,
+      delivery,
+      namespace: input.namespace,
+      feedbackId: entry.id,
+      error: e,
+    });
   }
   return { id: entry.id, delivery };
 }
@@ -254,8 +301,9 @@ export interface FeedbackRoutesOptions {
    */
   sinkConfig?: FeedbackSinkConfig | null;
   /**
-   * Raises a failed feedback email as a centralized `feedback-email` error
-   * (issue #2952). Absent or null keeps the plain `console.error`.
+   * Raises a failed feedback email, and a throw after the persist, as a
+   * centralized `feedback-email` error (issues #2952, #6015). Absent or null
+   * keeps the plain `console.error`.
    */
   errorLogger?: ErrorLogger | null;
 }

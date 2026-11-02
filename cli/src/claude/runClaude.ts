@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { logger } from "@/ui/logger";
 import { loop } from "@/claude/loop";
-import { AgentState, SessionModelMode } from "@/api/types";
+import { AgentState, SessionModelMode, type Metadata } from "@/api/types";
 import { EnhancedMode, PermissionMode } from "./loop";
 import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { hashObject } from "@/utils/deterministicJson";
@@ -55,7 +55,11 @@ import {
   resolveRawModelForMode,
 } from "@hapi/protocol";
 import type { ModelMode } from "@hapi/protocol/modes";
-import type { EffortLevel } from "@hapi/protocol/effort";
+import { isEffortLevel, type EffortLevel } from "@hapi/protocol/effort";
+import {
+  applyEffortToMetadata,
+  decideEffortOnConfigChange,
+} from "@/claude/utils/sessionEffortPin";
 import {
   EffortLevelSchema,
   ModelModeSchema,
@@ -80,6 +84,11 @@ export interface StartOptions {
    *  "high" | "xhigh" | "max") — seeds the effort state at startup and is
    *  stamped into metadata so a respawn preserves it. */
   effort?: string;
+  /** Issue #6070: the node's pre-fit default effort from
+   *  --hapi-node-default-effort — set by the daemon only when the spawn's effort
+   *  was DEFAULTED (env / settings / xhigh), never for an explicit body effort.
+   *  Stamped as metadata.nodeDefaultEffort so a model switch re-fits the effort. */
+  nodeDefaultEffort?: string;
   /** Issue #2456: a specific pinned raw Claude model id from --hapi-raw-model
    *  ("claude-opus-4-6") — takes precedence over modelMode in the currentModel
    *  resolution below (it is already a resolved id, no mode→model mapping). */
@@ -454,6 +463,22 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       spawnEffortPin = parsedEffort.data;
     }
   }
+  // Issue #6070: the node default this session's effort follows (present ⇒ the
+  // effort was defaulted, so a model switch re-fits it). A fresh spawn carries it
+  // as --hapi-node-default-effort; a respawn carries no flag, and the marker comes
+  // from the stored metadata (`/cli/sessions` returns the existing record for a
+  // known tag). An explicit effort pick clears it (set-session-config below).
+  const spawnNodeDefaultEffortPin: EffortLevel | undefined = isEffortLevel(
+    options.nodeDefaultEffort
+  )
+    ? options.nodeDefaultEffort
+    : undefined;
+  const storedNodeDefaultEffort = session.getMetadata()?.nodeDefaultEffort;
+  let currentNodeDefaultEffort: EffortLevel | undefined =
+    spawnNodeDefaultEffortPin ??
+    (isEffortLevel(storedNodeDefaultEffort)
+      ? storedNodeDefaultEffort
+      : undefined);
 
   // 🔴 Durable launcher + model pin stamp (moved here from above — issue #2456).
   // Stamps launcherKind (#1613) + the spawn model/effort/rawModel pins (#2434/
@@ -473,6 +498,11 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       ? { modelMode: spawnModelModePin }
       : {}),
     ...(spawnEffortPin ? { effort: spawnEffortPin } : {}),
+    // Issue #6070: the pre-fit node default (only on a fresh defaulted spawn; a
+    // respawn keeps the stored marker through the spread above).
+    ...(spawnNodeDefaultEffortPin
+      ? { nodeDefaultEffort: spawnNodeDefaultEffortPin }
+      : {}),
     ...(spawnRawModelPin ? { rawModel: spawnRawModelPin } : {}),
     // Issue #2626: stamp the per-session output style CLI-side in the SAME
     // atomic write (same clobber-race rationale as the model pins) so the
@@ -730,7 +760,40 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         modelMode?: unknown;
         effort?: unknown;
         rawModel?: unknown;
+        /** Issue #6070: the new model's levels, server-stamped from its catalog. */
+        modelEffortLevels?: unknown;
       };
+
+      // Issue #6070: decide the effort outcome ONCE, before any metadata write, so
+      // the model branches below can fold it into their own (single) write — a
+      // separate queued write could still be in flight when the server's tmux/pty
+      // restart kills this process. Explicit effort → set it and drop the
+      // node-default marker; a model switch on a defaulted effort → re-fit it.
+      const effortModelChanged =
+        config.modelMode !== undefined || config.rawModel !== undefined;
+      const effortNextPin: { rawModel?: string; modelMode?: string } =
+        typeof config.rawModel === "string" && config.rawModel.length > 0
+          ? { rawModel: config.rawModel }
+          : config.modelMode !== undefined
+            ? { modelMode: resolveModelMode(config.modelMode) }
+            : { rawModel: currentRawModel, modelMode: currentModelMode };
+      const effortDecision = decideEffortOnConfigChange({
+        effort: config.effort,
+        modelChanged: effortModelChanged,
+        nodeDefault: currentNodeDefaultEffort,
+        modelEffortLevels: config.modelEffortLevels,
+        pin: effortNextPin,
+      });
+      if (effortDecision.kind !== "none") {
+        currentEffort = effortDecision.effort ?? undefined;
+        if (effortDecision.kind === "explicit") {
+          currentNodeDefaultEffort = undefined;
+        }
+      }
+      const foldEffort = (metadata: Metadata): Metadata =>
+        effortDecision.kind === "none"
+          ? metadata
+          : applyEffortToMetadata(metadata, effortDecision);
 
       // Issue #3769 (ruling D6): capture the model BEFORE any branch mutates it,
       // so the shared applyModelInPlace applier below fires the live SDK switch
@@ -801,7 +864,8 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
           // version — clear the rawModel pin so the two axes never both persist.
           delete next.rawModel;
           currentRawModel = undefined;
-          return next;
+          // Issue #6070: the effort outcome rides this same write.
+          return foldEffort(next);
         });
       }
 
@@ -829,25 +893,19 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
           } else {
             delete next.rawModel;
           }
-          return next;
+          // Issue #6070: the effort outcome rides this same write.
+          return foldEffort(next);
         });
       }
 
       // Issue #2456: reasoning-effort change. Validated against EffortLevelSchema;
       // an empty/invalid value CLEARS the effort pin (falls back to binary default).
-      // Written CLI-side (same clobber-race reason as modelMode above).
-      if (config.effort !== undefined) {
-        const parsed = EffortLevelSchema.safeParse(config.effort);
-        currentEffort = parsed.success ? parsed.data : undefined;
-        session.updateMetadata(currentMetadata => {
-          const next = { ...currentMetadata };
-          if (currentEffort) {
-            next.effort = currentEffort;
-          } else {
-            delete next.effort;
-          }
-          return next;
-        });
+      // Written CLI-side (same clobber-race reason as modelMode above). Issue
+      // #6070: decided above (an explicit pick also drops nodeDefaultEffort); a
+      // model branch already folded it into its write, so write here only for an
+      // effort-only change.
+      if (effortDecision.kind !== "none" && !effortModelChanged) {
+        session.updateMetadata(foldEffort);
       }
 
       syncSessionModes();
@@ -893,6 +951,12 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         // /model,/effort,/raw-model routes as {ok:true, method}. Old clients
         // ignore it (the `applied` envelope is unchanged).
         method,
+        // Issue #6070: additive — present only when a model switch re-fitted the
+        // effort, so the server's tmux/pty restart respawns with it (`null` = no
+        // effort; JSON keeps null where `applied.effort` would drop undefined).
+        ...(effortDecision.kind === "refit"
+          ? { effortRefit: { effort: effortDecision.effort } }
+          : {}),
       };
     },
     SET_SESSION_CONFIG_META
@@ -917,11 +981,27 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       if (!payload || typeof payload !== "object") {
         throw new Error("Invalid set-model payload");
       }
-      const { modelMode } = payload as { modelMode?: unknown };
+      const { modelMode, modelEffortLevels } = payload as {
+        modelMode?: unknown;
+        /** Issue #6070: the new model's levels, server-stamped from its catalog. */
+        modelEffortLevels?: unknown;
+      };
       if (modelMode === undefined) {
         throw new Error("set-model requires a modelMode");
       }
       const resolvedModelMode = resolveModelMode(modelMode);
+      // Issue #6070: a set-model never names an effort, so the outcome is a re-fit
+      // of a defaulted effort or nothing; it rides the model write below.
+      const effortDecision = decideEffortOnConfigChange({
+        effort: undefined,
+        modelChanged: true,
+        nodeDefault: currentNodeDefaultEffort,
+        modelEffortLevels,
+        pin: { modelMode: resolvedModelMode },
+      });
+      if (effortDecision.kind !== "none") {
+        currentEffort = effortDecision.effort ?? undefined;
+      }
       // Issue #3769: capture before the durable resync mutates currentModel, so
       // the shared applier's change-gate fires the live switch only on an actual
       // change (re-selecting the same model → method:"config").
@@ -938,7 +1018,9 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         // A family/mode selection supersedes a specific pinned version (#2456).
         delete next.rawModel;
         currentRawModel = undefined;
-        return next;
+        return effortDecision.kind === "none"
+          ? next
+          : applyEffortToMetadata(next, effortDecision);
       });
       syncSessionModes();
 
@@ -971,7 +1053,15 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       return {
         ok: true,
         method,
-        applied: { modelMode: currentModelMode, rawModel: currentRawModel },
+        applied: {
+          modelMode: currentModelMode,
+          rawModel: currentRawModel,
+          // Issue #6070: the effort after any re-fit (additive; passthrough schema).
+          effort: currentEffort,
+        },
+        ...(effortDecision.kind === "refit"
+          ? { effortRefit: { effort: effortDecision.effort } }
+          : {}),
       };
     },
     SET_MODEL_META

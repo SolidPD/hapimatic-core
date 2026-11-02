@@ -43,7 +43,11 @@ import { cataloged } from "../../capabilities/cataloged";
 import type { FeedbackSenderConfig } from "../../feedback/feedbackSender";
 import type { SupportChannelConfig } from "../../config/serverSettings";
 import type { ErrorLogger } from "../../logging/errorLogger";
-import { persistAndSendFeedback, type PersistAndSendInput } from "./feedback";
+import {
+  persistAndSendFeedback,
+  reportPostPersistTailFailure,
+  type PersistAndSendInput,
+} from "./feedback";
 import {
   materializeSupportWorkspace,
   supportWorkspacePath,
@@ -91,12 +95,17 @@ export interface SupportRouteOptions {
   getLauncherKind: () => string;
   /**
    * Raises a failed escalation email as a centralized `feedback-email` error
-   * (issue #2952), the same alert `POST /api/feedback` raises.
+   * (issue #2952), the same alert `POST /api/feedback` raises, and a throw
+   * after the row is saved on either channel (issue #6015).
    */
   errorLogger?: ErrorLogger | null;
   /** Test seam: this host's name (default `os.hostname()`). */
   getHostname?: () => string;
-  /** Test seam: Telegram delivery (default: the Bot API `sendDocument`). */
+  /**
+   * Test seam: Telegram delivery (default: the Bot API `sendDocument`, which
+   * never throws). An injected one may throw; the route catches it after the
+   * row is saved and answers `delivered: false` (issue #6015).
+   */
   sendTelegram?: (args: {
     botToken: string;
     chatId: string;
@@ -429,28 +438,49 @@ export function createSupportRoutes(
       };
 
       if (opts.channel.kind === "telegram") {
-        // Persist first (transport off), then post to the operator's chat.
+        // Persist first (transport off), then post to the operator's chat. The
+        // persist stays outside the guard below: a throw there saved no row,
+        // so it still answers 500.
         const { id } = await persistAndSendFeedback(
           opts.store,
           { ...opts.feedbackSender, transport: "off" },
-          entry
+          entry,
+          { errorLogger: opts.errorLogger }
         );
-        const sent =
-          opts.telegramBotToken && opts.channel.telegramChatId
-            ? await sendTelegram({
-                botToken: opts.telegramBotToken,
-                chatId: opts.channel.telegramChatId,
-                caption: description,
-                filename: ESCALATION_ATTACHMENT_NAME,
-                text: composed.text,
-              })
-            : ({ ok: false, error: "Telegram is not configured" } as const);
-        opts.store.feedback.updateEmailStatus(
-          id,
-          sent.ok,
-          sent.ok ? null : sent.error
-        );
-        return c.json({ id, delivered: sent.ok }, 201);
+        // Issue #6015 S1, the #2951 F3 guard: the row is saved, so a throw from
+        // the post or its status write must not answer 500, because the user
+        // would retry and the operator would get the escalation twice. The
+        // catch never writes to the store (the store may be what failed).
+        // `delivery` reports the post's outcome even when the status write
+        // after it is what threw. A failed post raises no alert (#2952).
+        let delivery: "sent" | "error" = "error";
+        try {
+          const sent =
+            opts.telegramBotToken && opts.channel.telegramChatId
+              ? await sendTelegram({
+                  botToken: opts.telegramBotToken,
+                  chatId: opts.channel.telegramChatId,
+                  caption: description,
+                  filename: ESCALATION_ATTACHMENT_NAME,
+                  text: composed.text,
+                })
+              : ({ ok: false, error: "Telegram is not configured" } as const);
+          delivery = sent.ok ? "sent" : "error";
+          opts.store.feedback.updateEmailStatus(
+            id,
+            sent.ok,
+            sent.ok ? null : sent.error
+          );
+        } catch (e) {
+          reportPostPersistTailFailure(opts.errorLogger, {
+            channel: "telegram",
+            delivery,
+            namespace,
+            feedbackId: id,
+            error: e,
+          });
+        }
+        return c.json({ id, delivered: delivery === "sent" }, 201);
       }
 
       const result = await persistAndSendFeedback(

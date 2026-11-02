@@ -318,6 +318,32 @@ export const SUBSCRIPTION_SESSION_STRIP_ENV_VARS: ReadonlySet<string> = new Set(
 export const shellSingleQuote = shellEscape;
 
 /**
+ * The first line of every env file {@link buildTmuxEnvFileCommand} writes (#5992).
+ *
+ * The tmux launcher's window runs `bash -l`, which reads the login dotfiles
+ * before it runs the typed chain. A dotfile that turns on `set -x`, `set -v`, or
+ * a DEBUG trap under `set -T` makes the `.` of the env file echo each
+ * `export NAME='value'` line into the pane, and `onTmuxOutput` forwards the pane
+ * to every web client viewing the session. `BASH_XTRACEFD` sends the same trace
+ * to a file. This line turns all of them off before the first `export`, so it
+ * must stay first. Its `2>/dev/null` hides only the xtrace of its own commands
+ * on stderr: `set -v`, a DEBUG trap that prints to stdout, and `BASH_XTRACEFD`
+ * can still show the guard's own commands, which hold no value. A plain DEBUG
+ * trap and a RETURN trap print nothing from the file.
+ *
+ * Nothing restores the options: the window launcher `exec`s claude straight
+ * after the `rm`, and the daemon hop's one-line script ends when the wrapper
+ * exits. `trap - DEBUG` is bash syntax. Both callers source the file under bash
+ * (the window's `bash -l`; the daemon hop's `#!/bin/bash` script, run without
+ * `-e`). The file also sources under `bash --posix` and dash, but dash has no
+ * DEBUG trap, so the guard's `trap` fails there: under `dash -e` that stops the
+ * shell silently, and a file holding only the guard (an empty env) returns the
+ * failure, so the `&&` chain stops before the `rm`.
+ * A dotfile function or alias named `set` or `trap` is out of scope.
+ */
+export const ENV_FILE_TRACE_GUARD = "{ set +xv; trap - DEBUG; } 2>/dev/null";
+
+/**
  * Build the tmux command string + matching 0600 env-file body for a launcher
  * that delivers its environment OUT-OF-BAND (issue #1505).
  *
@@ -327,9 +353,11 @@ export const shellSingleQuote = shellEscape;
  * `/proc/<pid>/cmdline` of the launched shell AND into the tmux pane
  * scrollback. This helper instead returns an `envFileBody` (the caller writes
  * it to a 0600 temp file at `envFilePath`) and a `fullCommand` that sources
- * then `rm`s that file before running claude. No env VALUE ever appears on the
- * command line or in scrollback -- parity with the pty/sdk launchers'
- * `Bun.spawn({ env })` channel.
+ * then removes that file (with `command rm`, which skips an `rm` alias or
+ * function, #5993) before running claude. No env VALUE ever appears
+ * on the command line or in scrollback -- parity with the pty/sdk launchers'
+ * `Bun.spawn({ env })` channel. The file opens with {@link ENV_FILE_TRACE_GUARD},
+ * so a login dotfile's echo option cannot print a value while it is sourced (#5992).
  *
  * `spawnCommand` is the already-escaped command that runs claude AFTER the env
  * file is sourced+removed. It differs per launcher:
@@ -362,11 +390,16 @@ export function buildTmuxEnvFileCommand(opts: {
   // #5847: the env file never exports an AGENT_FORBIDDEN_ENV_VARS member, so no
   // caller can hand one to a pane (the same promise buildLauncherEnv enforces by
   // re-stripping after `extra`). No current caller passes one.
+  // #5992: the trace guard is the first line, ahead of every export.
   const envFileBody =
-    Object.entries(opts.launcherEnv)
-      .filter(([key]) => !AGENT_FORBIDDEN_ENV_VARS.has(key))
-      .map(([key, value]) => `export ${key}=${shellSingleQuote(String(value))}`)
-      .join("\n") + "\n";
+    [
+      ENV_FILE_TRACE_GUARD,
+      ...Object.entries(opts.launcherEnv)
+        .filter(([key]) => !AGENT_FORBIDDEN_ENV_VARS.has(key))
+        .map(
+          ([key, value]) => `export ${key}=${shellSingleQuote(String(value))}`
+        ),
+    ].join("\n") + "\n";
   // The per-pane unset runs BEFORE the env file is sourced, so it removes only
   // inherited contamination; see paneEnvUnsetNames for why each name is in it.
   const unsetNames = new Set([
@@ -378,7 +411,14 @@ export function buildTmuxEnvFileCommand(opts: {
     unsetClause +
     `cd ${shellSingleQuote(opts.cwd)} && ` +
     `. ${shellSingleQuote(opts.envFilePath)} && ` +
-    `rm -f ${shellSingleQuote(opts.envFilePath)} && ` +
+    // #5993: the tmux window's interactive login bash expands an `rm` alias from
+    // a login dotfile when it parses the typed line, and runs an `rm` function;
+    // the daemon hop's bash imports an exported one or reads one from BASH_ENV.
+    // Either could move the token file instead of deleting it. `command` skips
+    // both. It does not skip an `rm` earlier on PATH, set with `hash -p` or
+    // loaded as a builtin, nor an alias or function that replaces `command`
+    // itself (docs/internal/architecture/sessions.md).
+    `command rm -f ${shellSingleQuote(opts.envFilePath)} && ` +
     opts.spawnCommand;
   return { fullCommand, envFileBody };
 }

@@ -38,25 +38,26 @@ import {
  * this string is the prose for surfaces that only render `error`.
  */
 
+/**
+ * The one pattern for a GitHub name (`owner`, `repo`, `account`): never exactly
+ * `.` or `..` (#6109), because `encodeURIComponent` leaves them unchanged and
+ * the URL parser then resolves them as dot segments, retargeting the request.
+ * Real dotted names (`.github`, `my.repo`) still pass. COPIED VERBATIM from
+ * `gateway/src/routes/githubBroker.ts`; the gateway's parity test
+ * (`githubBroker.test.ts`) reads this line as text, so keep it on one line.
+ */
+export const GITHUB_NAME_PATTERN = /^(?!\.\.?$)[a-zA-Z0-9._-]+$/;
+
 const issueParamsSchema = z.object({
-  owner: z
-    .string()
-    .min(1)
-    .regex(/^[a-zA-Z0-9._-]+$/),
-  repo: z
-    .string()
-    .min(1)
-    .regex(/^[a-zA-Z0-9._-]+$/),
+  owner: z.string().min(1).regex(GITHUB_NAME_PATTERN),
+  repo: z.string().min(1).regex(GITHUB_NAME_PATTERN),
   number: z.coerce.number().int().min(1),
 });
 
 // Issue #1953 (A6): the GitHub-account selector validates the `account` query
 // param the same way the issue routes validate owner/repo names.
 const accountParamsSchema = z.object({
-  account: z
-    .string()
-    .min(1)
-    .regex(/^[a-zA-Z0-9._-]+$/),
+  account: z.string().min(1).regex(GITHUB_NAME_PATTERN),
 });
 
 /**
@@ -363,8 +364,16 @@ export function remoteDirectoryIsGitRepo(
 export function createGitHubRoutes(options?: {
   getNodeRegistry?: () => NodeRegistry | null;
   errorLogger?: ErrorLogger | null;
+  /**
+   * Test seam (#6109): the `gh` runner, REST fetch and env for the repo-issues, accounts and
+   * repos routes. Unset in production, where each call uses its real default. `Bun.spawn`
+   * hands a child the environment the process started with, not later `process.env`
+   * edits, so a test cannot make `gh` hermetic by editing env; it injects a runner instead.
+   */
+  githubDeps?: GitHubFetchDeps;
 }): Hono<WebAppEnv> {
   const errorLogger = options?.errorLogger ?? null;
+  const githubDeps = options?.githubDeps;
   const app = new Hono<WebAppEnv>();
 
   /**
@@ -471,7 +480,13 @@ export function createGitHubRoutes(options?: {
       let directoryIsGitRepo: boolean | undefined;
 
       if (repoParam) {
-        if (!/^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(repoParam)) {
+        // #6109: each half is a GitHub name, so `../..` is refused here rather
+        // than forwarded to the broker or `gh`.
+        const parts = repoParam.split("/");
+        if (
+          parts.length !== 2 ||
+          !parts.every(part => GITHUB_NAME_PATTERN.test(part))
+        ) {
           return c.json(
             {
               success: false,
@@ -561,7 +576,7 @@ export function createGitHubRoutes(options?: {
 
       // #2327: `gh` first, token-backed REST second. The response envelope below
       // is UNCHANGED — this route already reported failure honestly.
-      const issues = await listOpenIssues(repoName, errorLogger);
+      const issues = await listOpenIssues(repoName, errorLogger, githubDeps);
       if (!issues) {
         return c.json({
           success: false,
@@ -643,7 +658,7 @@ export function createGitHubRoutes(options?: {
         return c.json({ success: true, accounts: result.accounts });
       }
 
-      const result = await fetchGitHubAccounts(errorLogger);
+      const result = await fetchGitHubAccounts(errorLogger, githubDeps);
       if (!result.ok) {
         return c.json({
           success: false,
@@ -733,7 +748,7 @@ export function createGitHubRoutes(options?: {
         return c.json({ success: true, account, repos: result.repos });
       }
 
-      const result = await fetchGitHubRepos(account, errorLogger);
+      const result = await fetchGitHubRepos(account, errorLogger, githubDeps);
       if (!result.ok) {
         return c.json({
           success: false,

@@ -20,6 +20,8 @@
  */
 import {
   ARCHIVE_CREDENTIAL_OMISSION_REASON,
+  ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON,
+  ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
   CLAUDE_MD_INCLUDE_GREP,
   CLAUDE_MD_INCLUDE_NOT_FOUND_REASON_PREFIX,
   CLAUDE_MD_INCLUDE_NOT_FOUND_SURFACE,
@@ -32,8 +34,8 @@ import {
   TAR_ENV_SCRUB_SHELL_LINES,
 } from "./exportShared";
 import {
+  credentialLinkFunctionLines,
   credentialPathsFunctionLines,
-  physicalPathFunctionLines,
 } from "./credentialNamesShell";
 import {
   PORTER_WALK_LINK_FUNCTION,
@@ -55,11 +57,23 @@ import { PORTER_SCHEMA_VERSION } from "./version";
  * The bash lines that copy CLAUDE.md to `$STAGING/CLAUDE.md`, package its
  * `@`-includes into `$STAGING/claude-includes/`, and set `$CLAUDE_MD_JSON`. The
  * caller runs them inside `if [ -f "$CONFIG_ROOT/CLAUDE.md" ]; then … fi` with
- * `CONFIG_ROOT`, `STAGING`, a `record_omission <surface> <reason>` function and
- * `porter_walk_link` (`./linkWalkShell`, defined once per script) in scope,
- * under `set -eu` (bash 3.2 safe), and with nothing already at
- * `$STAGING/CLAUDE.md` or `$STAGING/claude-includes` (a `cp` onto a staged
- * symlink, or into a linked folder, would write through it).
+ * `CONFIG_ROOT`, `CONFIG_ROOT_PHYS`, `STAGING`, `WORK`, a
+ * `record_omission <surface> <reason>` function, `porter_walk_link`
+ * (`./linkWalkShell`, defined once per script) and the link tests
+ * (`credentialLinkFunctionLines()`: `physical_path`, `has_credential_part`,
+ * `link_into_root`, `root_content_refusal`) in scope, under `set -eu` (bash 3.2
+ * safe), and with nothing already at `$STAGING/CLAUDE.md` or
+ * `$STAGING/claude-includes` (a `cp` onto a staged symlink, or into a linked
+ * folder, would write through it). A caller that leaves a link test undefined
+ * would ship the file: `command not found` in an `if` reads as false.
+ *
+ * #6063: a `CLAUDE.md` that is a link gets the staged-link tests first
+ * (credential store, unchecked, then `link_into_root` through
+ * `root_content_refusal`); a refusal is one {@link CLAUDE_MD_NOT_A_FILE_SURFACE}
+ * omission with an archive reason, and no `claudeMd` and no include. An include
+ * whose physical folder is a credential store (or that is reached through a
+ * link naming one, or whose physical path cannot be read) is refused the same
+ * way; its own name stays the #4154 rule's.
  * Extracted from `exportScript.ts` Step 3 (#4164); `buildExportScript` and the
  * Step 11 block embed these lines verbatim.
  *
@@ -85,6 +99,27 @@ import { PORTER_SCHEMA_VERSION } from "./version";
  */
 export function claudeMdIncludeLoopLines(): string[] {
   return [
+    "  # #6063: a CLAUDE.md that is a link gets the tests a staged link gets",
+    "  # (materialize_links), in its order: a credential store, a target that cannot",
+    "  # be checked, then a target inside the config root outside the section folders",
+    "  # (settings.json, history.jsonl, the shell snapshots). A refusal is one",
+    "  # CLAUDE.md omission, with no claudeMd and no include; nothing is read through",
+    "  # the link. The root's own CLAUDE.md is no link, so it is never tested (a",
+    "  # config root that is itself a link keeps it).",
+    "  _cmwhy=''",
+    '  if [ -L "$CONFIG_ROOT/CLAUDE.md" ]; then',
+    '    _cmrc=0; _cmphys="$(physical_path "$CONFIG_ROOT/CLAUDE.md")" || _cmrc=$?',
+    `    if [ "$_cmrc" -eq 3 ]; then _cmwhy='${ARCHIVE_CREDENTIAL_OMISSION_REASON}'`,
+    `    elif [ -z "$_cmphys" ]; then _cmwhy='${ARCHIVE_LINK_UNCHECKED_OMISSION_REASON}'`,
+    `    elif has_credential_part "$_cmphys"; then _cmwhy='${ARCHIVE_CREDENTIAL_OMISSION_REASON}'`,
+    "    else",
+    '      root_content_refusal "$_cmphys"',
+    `      if [ "$_rckind" = r ]; then _cmwhy='${ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON}'; fi`,
+    "    fi",
+    "  fi",
+    '  if [ -n "$_cmwhy" ]; then',
+    `  record_omission '${CLAUDE_MD_NOT_A_FILE_SURFACE}' "$_cmwhy"`,
+    "  else",
     '  cp -p "$CONFIG_ROOT/CLAUDE.md" "$STAGING/CLAUDE.md"',
     "  _includes='[]'",
     '  mkdir -p "$STAGING/claude-includes"',
@@ -152,6 +187,25 @@ export function claudeMdIncludeLoopLines(): string[] {
     `        *) record_omission "$_isurf" '${CLAUDE_MD_INCLUDE_SKIP_REASONS.linkTargetNotMarkdown}'; continue ;;`,
     "      esac",
     "    fi",
+    "    # #6063: an include whose physical folder is a credential store, reached",
+    "    # through a link of its own or a linked folder above it (docs -> ~/.aws),",
+    "    # or through a link whose name or target names a store, is refused, as is one",
+    "    # whose physical path cannot be read. The include's own name stays the #4154",
+    "    # rule's (an include named .env.md ships, #4172), so only its folder is",
+    "    # tested.",
+    "    # The walked source is the file the copy reads, so its physical path is the one",
+    "    # tested (a link in the walked chain is the walk's, never a credential name).",
+    '    _iprc=0; _iphys="$(physical_path "$_isrc")" || _iprc=$?',
+    "    # The folder that holds the include's final target (/ for one at the top).",
+    '    _ipdir="${_iphys%/*}"; [ -n "$_ipdir" ] || _ipdir=/',
+    '    if [ "$_iprc" -eq 3 ] || { [ -n "$_iphys" ] && has_credential_part "$_ipdir"; }; then',
+    `      record_omission "$_isurf" '${ARCHIVE_CREDENTIAL_OMISSION_REASON}'`,
+    "      continue",
+    "    fi",
+    '    if [ -z "$_iphys" ]; then',
+    `      record_omission "$_isurf" '${ARCHIVE_LINK_UNCHECKED_OMISSION_REASON}'`,
+    "      continue",
+    "    fi",
     '    mkdir -p "$STAGING/claude-includes/$(dirname -- "$_inc")"',
     '    cp -p "$_isrc" "$STAGING/claude-includes/$_inc"',
     '    _includes="$(printf \'%s\' "$_includes" | jq -c --arg p "claude-includes/$_inc" \'. + [$p]\')"',
@@ -159,6 +213,7 @@ export function claudeMdIncludeLoopLines(): string[] {
     "$_mdincs",
     "INCLUDES_EOF",
     '  CLAUDE_MD_JSON="$(jq -cn --argjson inc "$_includes" \'{path: "CLAUDE.md", includes: $inc}\')"',
+    "  fi",
   ];
 }
 
@@ -338,7 +393,10 @@ export function manifestModeLines(cleared: string): string[] {
  * Past those checks it (1) builds `CLAUDE.md` and `claude-includes/` in a temp
  * directory (a `CLAUDE.md` that is not a file through its links is skipped, as
  * the exporters skip it, and recorded as one {@link CLAUDE_MD_NOT_A_FILE_SURFACE}
- * omission) and (#4172) lists, reading only, every file or folder staged under
+ * omission; #6063: a `CLAUDE.md` that is a link the exporters' link tests
+ * refuse is left out the same way, with one omission naming why, and the
+ * summary says so; the block defines those tests and `CONFIG_ROOT_PHYS` for the
+ * shared lines) and (#4172) lists, reading only, every file or folder staged under
  * a section folder or `hooks` whose name is credential-bearing (the bash
  * exporter's own lines, {@link credentialPathsFunctionLines}), (2) rewrites
  * `manifest.json`'s `claudeMd` (dropped when the config root has no CLAUDE.md,
@@ -655,7 +713,10 @@ export function buildIncludeCheckShellFragment(
     '  jq -cn --arg s "$1" --arg r "$2" \'{surface: $s, reason: $r}\' >> "$OMISSIONS"',
     "}",
     ...credentialPathsFunctionLines(),
-    ...physicalPathFunctionLines(),
+    "# #6063: the exporter's link tests (physical_path, link_into_root,",
+    "# root_content_refusal), which the CLAUDE.md, include and settings-script",
+    "# lines call: an undefined one would read as false in an if, and ship.",
+    ...credentialLinkFunctionLines(),
     "# #4188: the one link walk, which the include and settings-script lines call.",
     ...porterWalkLinkLines(),
     "# Build CLAUDE.md and claude-includes with the bash exporter's own lines. They",
@@ -666,15 +727,31 @@ export function buildIncludeCheckShellFragment(
     'mkdir "$BUILD"',
     "CLAUDE_MD_JSON=null",
     "_mdskipped=0",
+    "_mdrefused=0",
+    "# #6063: the CLAUDE.md lines and the link tests read the config root by its",
+    "# physical path, as the bash exporter does after its cd -P, so a link above",
+    "# the root (a root under ~/.docker -> /srv/cfg) is never read as one in the",
+    "# CLAUDE.md chain. physical_path prints the path even when it returns 3, so",
+    "# || : keeps it, as the exporter does (empty when there is no config root:",
+    "# then no link is into it). The root as given is restored for the summary.",
+    'CONFIG_ROOT_PHYS=""; _ckroot="$CONFIG_ROOT"',
+    'if [ -d "$CONFIG_ROOT" ]; then',
+    '  _croot="$(CDPATH= cd -- "$CONFIG_ROOT" 2>/dev/null && pwd -P && printf x)" || _croot=\'\'',
+    '  _croot="${_croot%x}"; _croot="${_croot%?}"',
+    '  if [ -n "$_croot" ]; then CONFIG_ROOT="$_croot"; fi',
+    '  CONFIG_ROOT_PHYS="$(physical_path "$CONFIG_ROOT")" || :',
+    "fi",
     'if [ -f "$CONFIG_ROOT/CLAUDE.md" ]; then',
     '  STAGING="$BUILD"',
     ...loop,
+    '  if [ -n "$_cmwhy" ]; then _mdrefused=1; fi',
     "# #4235: a CLAUDE.md that exists but is not a file through its links is",
     "# skipped, as the exporters skip it, and named in the omissions.",
     'elif [ -e "$CONFIG_ROOT/CLAUDE.md" ] || [ -L "$CONFIG_ROOT/CLAUDE.md" ]; then',
     `  record_omission '${CLAUDE_MD_NOT_A_FILE_SURFACE}' '${CLAUDE_MD_NOT_A_FILE_REASON}'`,
     "  _mdskipped=1",
     "fi",
+    'CONFIG_ROOT="$_ckroot"',
     "# #4172: the credential-bearing names staged under the section folders and",
     "# hooks (find only reads here). The manifest names each as an omission, and",
     "# the temp tree below leaves them out; nothing staged is removed.",
@@ -697,12 +774,14 @@ export function buildIncludeCheckShellFragment(
     "# dropped, so the manifest names no member the archive leaves out. The",
     "# new manifest is written to a temp file here and renamed over manifest.json.",
     "# #5260 (TC-1): a CLAUDE.md omission is dropped when CLAUDE.md is packaged.",
+    "# #6063: so is every staged one when the link tests refuse CLAUDE.md (this",
+    "# run's own omission names why), so a rerun records a refused CLAUDE.md once.",
     "_step='rewriting manifest.json'",
     `TMP_MANIFEST="$(mktemp "$HERE/.hapi-porter-manifest.XXXXXX")"`,
-    `jq --argjson cm "$CLAUDE_MD_JSON" --slurpfile om "$OMISSIONS" --slurpfile co "$WORK/credential-omissions.jsonl" --arg pre '${CLAUDE_MD_INCLUDE_SURFACE_PREFIX}' --arg nf '${CLAUDE_MD_INCLUDE_NOT_FOUND_SURFACE}' --arg cms '${CLAUDE_MD_NOT_A_FILE_SURFACE}' --arg cmr '${CLAUDE_MD_NOT_A_FILE_REASON}' --argjson st "$SETTINGS_JSON" --argjson ss "$SETTINGS_SCRIPTS_JSON" --arg spre '${SETTINGS_SCRIPT_SURFACE_PREFIX}' '`,
+    `jq --argjson cm "$CLAUDE_MD_JSON" --argjson mdref "$_mdrefused" --slurpfile om "$OMISSIONS" --slurpfile co "$WORK/credential-omissions.jsonl" --arg pre '${CLAUDE_MD_INCLUDE_SURFACE_PREFIX}' --arg nf '${CLAUDE_MD_INCLUDE_NOT_FOUND_SURFACE}' --arg cms '${CLAUDE_MD_NOT_A_FILE_SURFACE}' --arg cmr '${CLAUDE_MD_NOT_A_FILE_REASON}' --argjson st "$SETTINGS_JSON" --argjson ss "$SETTINGS_SCRIPTS_JSON" --arg spre '${SETTINGS_SCRIPT_SURFACE_PREFIX}' '`,
     "  (if $cm == null then del(.claudeMd) else .claudeMd = $cm end)",
     "  | .settings = $st | .settingsScripts = $ss",
-    "  | .omissions = ([(.omissions // [])[] | select(((.surface | tostring) | startswith($pre) | not) and (.surface != $nf) and ((.surface != $cms) or (.reason != $cmr))) | select(($cm == null) or ((.surface | tostring) != $cms)) | select(((.surface | tostring) | startswith($spre)) | not) | select(. as $o | any($co[]; . == $o) | not)] + $om + $co)",
+    "  | .omissions = ([(.omissions // [])[] | select(((.surface | tostring) | startswith($pre) | not) and (.surface != $nf) and ((.surface != $cms) or (.reason != $cmr))) | select((($cm == null) and ($mdref == 0)) or ((.surface | tostring) != $cms)) | select(((.surface | tostring) | startswith($spre)) | not) | select(. as $o | any($co[]; . == $o) | not)] + $om + $co)",
     "  | ($co | map(.surface)) as $cut",
     `  | reduce (${CREDENTIAL_ENTRY_FIELDS.map(f => `"${f}"`).join(", ")}) as $f (.;`,
     '      if (.[$f] | type) == "array"',
@@ -945,6 +1024,8 @@ export function buildIncludeCheckShellFragment(
     "# The summary names the config root it read (#4235).",
     'if [ "$_mdskipped" -eq 1 ]; then',
     '  _src="the config root ($CONFIG_ROOT) has a CLAUDE.md that is not a file through its links, so the archive has neither CLAUDE.md nor claude-includes (see manifest.json omissions)"',
+    'elif [ "$_mdrefused" -eq 1 ]; then',
+    '  _src="the config root ($CONFIG_ROOT) has a CLAUDE.md that is a link the link tests refuse (a credential store, a target that cannot be checked, or a file inside the config root), so the archive has neither CLAUDE.md nor claude-includes (see manifest.json omissions)"',
     'elif [ "$CLAUDE_MD_JSON" = null ]; then',
     '  _src="the config root ($CONFIG_ROOT) has no CLAUDE.md, so the archive has neither CLAUDE.md nor claude-includes"',
     "else",

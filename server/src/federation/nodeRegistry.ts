@@ -49,7 +49,7 @@ import type {
   ClaudeAccountInfo,
   DaemonCapSource,
 } from "@hapi/protocol/schemas";
-import type { EffortLevel } from "@hapi/protocol/effort";
+import { isEffortLevel, type EffortLevel } from "@hapi/protocol/effort";
 import type { SSEManager } from "../sse/sseManager";
 import type { PeerStore } from "../store/peerStore";
 import type { CachedRemoteSessions, NodeRegistryOptions } from "./types";
@@ -3058,7 +3058,12 @@ export class NodeRegistry {
       maxConcurrent: s.info?.maxConcurrent,
       recommendedConcurrent: s.info?.recommendedConcurrent,
       capSource: s.info?.capSource,
-      defaultEffort: s.info?.defaultEffort,
+      // Issue #6070: fetchNodeInfo only casts the peer body, so validate here —
+      // an out-of-catalog level from a skewed peer is dropped (the Create page
+      // then names the shared default) instead of reaching the web client.
+      defaultEffort: isEffortLevel(s.info?.defaultEffort)
+        ? s.info.defaultEffort
+        : undefined,
     }));
   }
 

@@ -183,11 +183,14 @@ function normalizeModelPin(
  *
  * A `rawModel` wins over a `modelMode`, matching the spawn. Resolution order:
  * exact id → the newest dated id `<id>-YYYYMMDD` (the live catalog lists Haiku
- * 4.5 only as `claude-haiku-4-5-20251001`) → an exact id in
- * {@link FALLBACK_CLAUDE_MODELS} → a bare family name (`opus`, `haiku`, …) as the
- * newest model of that family, but never against the fallback, because the
- * binary's aliases point at models a stale fallback lacks → `undefined`.
- * `undefined` also covers the Default model (no pin): the binary picks it.
+ * 4.5 only as `claude-haiku-4-5-20251001`) → for a dated pin, its undated id
+ * (issue #6070; before the first live fetch `models` IS the fallback, so this is
+ * the tier that resolves `claude-haiku-4-5-20251001` then) → an exact id in
+ * {@link FALLBACK_CLAUDE_MODELS}, then the dated pin's undated id there (#6070:
+ * for a live or cached list that lacks the model) → a bare family name (`opus`, `haiku`, …) as the newest
+ * model of that family, but never against the fallback, because the binary's
+ * aliases point at models a stale fallback lacks → `undefined`. `undefined`
+ * also covers the Default model (no pin): the binary picks it.
  */
 export function resolveModelEffortLevels(
   models: ClaudeModelInfo[],
@@ -220,6 +223,17 @@ export function resolveModelEffortLevels(
   )[0];
   if (dated) return [...dated.effortLevels];
 
-  const fallback = FALLBACK_CLAUDE_MODELS.find(m => m.id === target);
+  // Issue #6070: a dated snapshot is the same model as its undated id.
+  const undated = target.replace(/-\d{8}$/, "");
+  if (undated !== target) {
+    const base = models.find(m => m.id.toLowerCase() === undated);
+    if (base) return [...base.effortLevels];
+  }
+
+  const fallback =
+    FALLBACK_CLAUDE_MODELS.find(m => m.id === target) ??
+    (undated !== target
+      ? FALLBACK_CLAUDE_MODELS.find(m => m.id === undated)
+      : undefined);
   return fallback ? [...fallback.effortLevels] : undefined;
 }

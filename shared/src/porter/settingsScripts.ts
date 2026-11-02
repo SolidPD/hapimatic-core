@@ -34,6 +34,7 @@
  */
 import {
   ARCHIVE_CREDENTIAL_OMISSION_REASON,
+  ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON,
   ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
   DIMENSION_DIRS,
   SECRET_TOKEN_PREFIX_GROUP,
@@ -158,7 +159,9 @@ export function settingsScriptSurface(
  * The exporters' omission reasons. ASCII, with no quote, `$`, backslash or
  * backtick, so each embeds verbatim in a single-quoted bash or PowerShell
  * literal (the #4154 rule). A credential-bearing name, and a link chain that
- * passes through one (PM ruling B1), reuse the #4172 reasons.
+ * passes through one (PM ruling B1), reuse the #4172 reasons. A link whose
+ * target lies inside a config root outside the section folders, and is not a
+ * top-level file of `$HOME/.claude`, reuses the #5934 reason (#6063).
  */
 export const SETTINGS_SCRIPT_SKIP_REASONS = {
   notCanonical:
@@ -173,6 +176,7 @@ export const SETTINGS_SCRIPT_SKIP_REASONS = {
     "not exported: the reference is a symbolic link whose target is not a script file",
   linkThroughCredential: ARCHIVE_CREDENTIAL_OMISSION_REASON,
   linkUnchecked: ARCHIVE_LINK_UNCHECKED_OMISSION_REASON,
+  linkIntoRoot: ARCHIVE_LINK_INTO_ROOT_OMISSION_REASON,
   unreadable: "not exported: the script could not be read",
   looksLikeCredential:
     "not exported: the script appears to contain a credential, so recreate it on the destination",

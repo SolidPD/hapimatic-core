@@ -52,8 +52,8 @@ export type GitHubAccountAction = "configure" | "install" | "relink";
 /**
  * How each link status reads (Settings → Connectors and the Create page picker share it, so the
  * two never word a status differently). `tone` is the `StatusDot` / text colour; `detail` is the
- * line under the status in Settings, worded from the status alone because the VM never sees which
- * accounts the app is installed on (that list is the #4789 follow-up, D-4793-8).
+ * line under the status in Settings, worded from the status alone. A connected account whose
+ * installation list hapimatic.com sent shows {@link githubReachText} in place of `detail` (#5973).
  */
 export const GITHUB_STATUS_PRESENTATION: Record<
   GitHubConnectionStatus,
@@ -112,6 +112,61 @@ export function isGitHubStatusUnchecked(account: {
   statusUnchecked?: boolean;
 }): boolean {
   return account.status !== undefined && account.statusUnchecked === true;
+}
+
+/**
+ * #5973: the verb of the reach line (decision D10, Matt's pick at the render sign-off). "Installed
+ * on" is literally true even for an "Only select repositories" install, which "Reaches" is not.
+ * One constant, so the wording changes in one place.
+ */
+export const GITHUB_REACH_VERB = "Installed on";
+
+/**
+ * #5973: the account's GitHub display name to show beside `@login`, or null when it has none, it
+ * is blank, or it only repeats the login (case-insensitively, so never "@alice · alice").
+ */
+export function githubDisplayName(account: {
+  login: string;
+  name: string | null;
+}): string | null {
+  const name = account.name?.trim();
+  if (!name) return null;
+  return name.toLowerCase() === account.login.toLowerCase() ? null : name;
+}
+
+/** #5973: "a", "a and b", "a, b, and c" (the Oxford comma). */
+function joinNames(names: readonly string[]): string {
+  if (names.length <= 2) return names.join(" and ");
+  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
+/**
+ * #5973: the reach line of a linked account, "Installed on alice-gh and acme-labs", or null. Only a
+ * `connected` account with a non-empty `installedOn` has one: the list is a snapshot from
+ * hapimatic.com's last read, so it is never worded as live. The account's own login comes first
+ * when it is listed, then the rest in the order received. At most `max` names, then "and N more".
+ */
+export function githubReachText(
+  account: {
+    login: string;
+    status?: GitHubConnectionStatus;
+    installedOn?: readonly string[];
+  },
+  max: number
+): string | null {
+  if (account.status !== "connected" || !account.installedOn?.length) {
+    return null;
+  }
+  const own = account.login.toLowerCase();
+  const ordered = [
+    ...account.installedOn.filter(l => l.toLowerCase() === own),
+    ...account.installedOn.filter(l => l.toLowerCase() !== own),
+  ];
+  const limit = Math.max(1, max);
+  const shown = ordered.slice(0, limit);
+  const rest = ordered.length - shown.length;
+  const names = rest > 0 ? [...shown, `${rest} more`] : shown;
+  return `${GITHUB_REACH_VERB} ${joinNames(names)}`;
 }
 
 /**

@@ -8,6 +8,7 @@ import { ArrowUpRight, Plus } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { GitHubAccountAvatar } from "@/components/GitHubAccountAvatar";
+import { GitHubAccountDisplayName } from "@/components/GitHubAccountDisplayName";
 import {
   GITHUB_ACCOUNT_ACTIONS,
   GITHUB_MANAGE_HREF,
@@ -15,6 +16,7 @@ import {
   GITHUB_STATUS_PRESENTATION,
   GITHUB_STATUS_UNCHECKED_NOTE,
   githubConnectHref,
+  githubReachText,
   groupGitHubAccountsByLinker,
   isGitHubStatusUnchecked,
 } from "@/lib/githubConnections";
@@ -91,6 +93,9 @@ function AccountRow(props: { account: GitHubAccount }) {
     : null;
   const action = status ? GITHUB_ACCOUNT_ACTIONS[status.action] : null;
   const quiet = status?.action === "configure";
+  // #5973: the display name and the reach line appear only when hapimatic.com sent them; without
+  // them the row reads exactly as before.
+  const reach = githubReachText(account, 3);
   return (
     <li
       className="flex items-center gap-3 border-t border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3.5 py-3 first:border-t-0"
@@ -99,14 +104,14 @@ function AccountRow(props: { account: GitHubAccount }) {
       <GitHubAccountAvatar login={account.login} />
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <span className="truncate text-sm font-semibold text-[var(--app-fg)]">
-            @{account.login}
-          </span>
-          {account.name && (
-            <span className="truncate text-[length:var(--text-caption)] text-[var(--app-hint)]">
-              {account.name}
+          {/* #5973: the login and "· Name" share one line (GitHubAccountDisplayName says how they
+              share it); the Default badge wraps. */}
+          <span className="flex min-w-0 max-w-full items-center gap-2">
+            <span className="min-w-0 truncate text-sm font-semibold text-[var(--app-fg)]">
+              @{account.login}
             </span>
-          )}
+            <GitHubAccountDisplayName account={account} />
+          </span>
           {account.isDefault && <Badge variant="success">Default</Badge>}
         </div>
         {status && (
@@ -122,7 +127,7 @@ function AccountRow(props: { account: GitHubAccount }) {
         )}
         {status && (
           <span className="text-[length:var(--text-caption)] text-[var(--app-hint)]">
-            {status.detail}
+            {reach ?? status.detail}
           </span>
         )}
         {/* #6085: hapimatic.com could not confirm this status with GitHub in time. A plain line:
