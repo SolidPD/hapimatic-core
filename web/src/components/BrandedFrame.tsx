@@ -24,9 +24,14 @@ import {
   useUpdateAlertCount,
 } from "@/components/UpdateAvailableBadge";
 import { useOptionalAppContext } from "@/lib/app-context";
+import { getClientVersion, getVersionMismatch } from "@/lib/app-version";
 import { useFeedbackPreflight } from "@/hooks/queries/useFeedbackPreflight";
 import { useFeedbackNewCount } from "@/hooks/queries/useFeedbackNewCount";
 import { FeedbackModal } from "@/components/FeedbackModal";
+import {
+  markFeedbackOpenPhase,
+  startFeedbackOpenTrace,
+} from "@/lib/feedbackOpenTrace";
 import { AppShell } from "@/components/layouts/AppShell";
 import { HapimaticWordmark } from "@/components/brand/HapimaticWordmark";
 import { useThreadFullscreen } from "@/lib/thread-fullscreen-context";
@@ -178,11 +183,22 @@ export function BrandedFrame({
   const { date, time } = versionInfo?.timestamp
     ? formatEasternDateTime(versionInfo.timestamp)
     : { date: "", time: "" };
+  // #3491: `/api/version` is the SERVER's version. When this bundle was built
+  // from another one (a previous deploy's bundle served by an already-registered
+  // service worker), show both, so the footer never reports a version the page
+  // is not running. The server timestamp is dropped then: it dates the server.
+  const versionMismatch = getVersionMismatch(
+    getClientVersion(),
+    versionInfo?.version
+  );
+  const versionText = versionMismatch
+    ? `client v${versionMismatch.client} · server v${versionMismatch.server}`
+    : `v${versionInfo?.version ?? ""}`;
 
   const handleCopyVersion = async () => {
     if (!versionInfo) return;
     try {
-      await navigator.clipboard.writeText(`v${versionInfo.version}`);
+      await navigator.clipboard.writeText(versionText);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -434,9 +450,11 @@ export function BrandedFrame({
             >
               {copied ? (
                 "Copied!"
+              ) : versionMismatch ? (
+                versionText
               ) : (
                 <>
-                  v{versionInfo.version}
+                  {versionText}
                   {date ? ` • ${date}` : ""}
                   {time ? ` • ${time}` : ""}
                 </>
@@ -452,7 +470,17 @@ export function BrandedFrame({
                 <Button
                   type="button"
                   variant="ghostStatic"
-                  onClick={() => setFeedbackOpen(true)}
+                  onClick={() => {
+                    // #6190: trace the open from the tap, so an open that
+                    // blocks during render still leaves a trace.
+                    startFeedbackOpenTrace({
+                      appVersion: versionInfo?.version,
+                      viewport: `${window.innerWidth}x${window.innerHeight}`,
+                      inSession: Boolean(feedbackSessionId),
+                    });
+                    markFeedbackOpenPhase("requested");
+                    setFeedbackOpen(true);
+                  }}
                   aria-label={feedbackAriaLabel}
                   title="Send feedback"
                   data-testid="feedback-button"

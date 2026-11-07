@@ -1,3 +1,4 @@
 # Issue #4349: pin the VM class for every server test (see src/test/tenantModeDefault.ts).
 [test]
-preload = ["./src/test/tenantModeDefault.ts"]
+# Issue #6158: remove scratch run dirs a killed earlier run left (see src/test/scratchRoot.ts).
+preload = ["./src/test/tenantModeDefault.ts", "./src/test/scratchSweep.ts"]

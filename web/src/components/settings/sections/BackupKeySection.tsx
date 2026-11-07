@@ -4,6 +4,11 @@ import { KeyRound, ShieldAlert } from "lucide-react";
 import { useAppContext } from "@/lib/app-context";
 import { useBackupIdentityStatus } from "@/hooks/queries/useBackupIdentityStatus";
 import { useRevealBackupIdentity } from "@/hooks/mutations/useRevealBackupIdentity";
+import { backupPromptVariant } from "@/components/backup/BackupFirstRunPrompt";
+import {
+  BACKUP_NO_KEY_COPY,
+  BACKUP_PASSPHRASE_URL,
+} from "@/components/backup/backupPolicyCopy";
 import { Button } from "@/components/ui/button";
 
 /**
@@ -75,12 +80,21 @@ export function BackupKeySection() {
           <h2 className="text-[length:var(--text-caption)] font-medium uppercase tracking-wide text-[var(--app-hint)]">
             Backup encryption key
           </h2>
-          <p className="text-[length:var(--text-body)] text-[var(--app-hint)]">
-            This VM holds the private key that decrypts your encrypted backups.
-            You can view it <strong>exactly once</strong>, here — after you save
-            it and confirm, it is deleted from the VM and can never be shown
-            again. Nobody else, including the operator, ever sees or keeps it.
-          </p>
+          {backupPromptVariant(status, false) === "no-key" ? (
+            <p className="text-[length:var(--text-body)] text-[var(--app-hint)]">
+              {BACKUP_NO_KEY_COPY.lead}
+            </p>
+          ) : (
+            !isLoading && (
+              <p className="text-[length:var(--text-body)] text-[var(--app-hint)]">
+                This VM holds the private key that decrypts your encrypted
+                backups. You can view it <strong>exactly once</strong>, here —
+                after you save it and confirm, it is deleted from the VM and can
+                never be shown again. Nobody else, including the operator, ever
+                sees or keeps it.
+              </p>
+            )
+          )}
 
           {isLoading ? (
             <p className="text-[length:var(--text-label-strong)] text-[var(--app-hint)]">
@@ -170,6 +184,7 @@ export function BackupKeySection() {
                 disabled={reveal.isPending}
                 className="h-auto self-start px-4 py-2 text-[length:var(--text-label-strong)] text-[var(--app-bg)]"
                 data-testid="backup-key-reveal-button"
+                data-guide="backup-reveal"
               >
                 {reveal.isPending ? "Revealing…" : "Reveal my backup key"}
               </Button>
@@ -203,6 +218,26 @@ export function BackupKeySection() {
                   Public recipient: <code>{status.recipient}</code>
                 </p>
               )}
+            </div>
+          ) : status?.recipient ? (
+            /* #6211: a passphrase VM holds no key to reveal, and this is the only
+               place the wizard's Backup key step can point at. */
+            <div
+              className="flex flex-col gap-2 rounded-md border border-[var(--app-border)] p-3"
+              data-testid="backup-key-passphrase"
+            >
+              <p className="text-[length:var(--text-body)] text-[var(--app-fg)]">
+                {BACKUP_NO_KEY_COPY.noRecovery}
+              </p>
+              <a
+                href={BACKUP_PASSPHRASE_URL}
+                target="_blank"
+                rel="noreferrer"
+                data-guide="backup-reveal"
+                className="self-start text-[length:var(--text-body)] text-[var(--app-accent)] underline"
+              >
+                {BACKUP_NO_KEY_COPY.link}
+              </a>
             </div>
           ) : (
             /* Nothing generated yet on this VM. */

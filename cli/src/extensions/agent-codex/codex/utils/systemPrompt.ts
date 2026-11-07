@@ -9,6 +9,7 @@
 import { trimIdent } from "@/utils/trimIdent";
 import { configuration } from "@/configuration";
 import { renderTier0, capabilityCatalogIndex } from "@hapi/protocol";
+import { buildDocsPointer } from "@/utils/hapimaticDocsPointer";
 
 /**
  * Title instruction for Codex to call the hapi MCP tool.
@@ -28,7 +29,18 @@ export const TITLE_INSTRUCTION = trimIdent(`
  * instruction + the rendered capability catalog; with HAPI_CAPABILITY_TIER0=0
  * the pre-H title instruction alone (R8). The catalog travels through the TOML
  * escaper (codexMcpConfig.ts `escapeTomlString`) on the way to the CLI (R5a).
+ *
+ * Issue #6219: the docs pointer (where this machine's Hapimatic documentation
+ * is) follows in both cases. This const is evaluated once per Codex session
+ * process (the Codex runner is imported dynamically), after the server wrote
+ * the docs, so reading the docs stamp here is current.
  */
-export const codexSystemPrompt = configuration.capabilityTier0Enabled
+const codexBasePrompt = configuration.capabilityTier0Enabled
   ? TITLE_INSTRUCTION + "\n\n" + renderTier0(capabilityCatalogIndex)
   : TITLE_INSTRUCTION;
+
+const codexDocsPointer = buildDocsPointer();
+
+export const codexSystemPrompt = codexDocsPointer
+  ? codexBasePrompt + "\n\n" + codexDocsPointer
+  : codexBasePrompt;

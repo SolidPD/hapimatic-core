@@ -101,6 +101,31 @@ export class UsageHistoryStore {
     }));
   }
 
+  /**
+   * Every account's snapshots of one window in `[fromMs, toMs)`, ascending by
+   * account then time (the throughput quota model's daily rows, #6164).
+   */
+  listByLimit(
+    limitKey: string,
+    fromMs: number,
+    toMs: number
+  ): UsageSnapshotRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT account_uuid, limit_key, utilization, sampled_at
+         FROM usage_snapshots
+         WHERE limit_key = ? AND sampled_at >= ? AND sampled_at < ?
+         ORDER BY account_uuid ASC, sampled_at ASC`
+      )
+      .all(limitKey, fromMs, toMs) as DbUsageSnapshotRow[];
+    return rows.map(r => ({
+      accountUuid: r.account_uuid,
+      limitKey: r.limit_key,
+      utilization: r.utilization,
+      sampledAt: r.sampled_at,
+    }));
+  }
+
   /** Delete snapshots older than `days`. Returns the number of rows removed. */
   pruneOlderThan(days: number): number {
     const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;

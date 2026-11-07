@@ -39,13 +39,18 @@ export interface SessionAliveResult {
 }
 
 /**
- * Issue #4823: the five metadata fields that make up a session's credential
+ * Issue #4823: the metadata fields that make up a session's credential
  * binding — captured before a payment-method switch and handed back to
  * `restoreSessionBinding` on rollback. An absent field was absent originally.
  */
 export type SessionBindingSnapshot = Pick<
   Metadata,
-  "accountUuid" | "claudeAccount" | "authBinding" | "apiKeyId" | "apiKeyMasked"
+  | "accountUuid"
+  | "claudeAccount"
+  | "authBinding"
+  | "apiKeyId"
+  | "apiKeyMasked"
+  | "apiKeyPlacedBy"
 >;
 
 /** A heartbeat the cache ignores (bad time, archive guard, unknown session). */
@@ -108,6 +113,22 @@ export class SessionCache {
   private onForceKill?: (sessionId: string) => void;
 
   /**
+   * Issue #6264: a gap this long between `expireInactive` ticks (three 5 s tick
+   * periods) means the server itself was blocked, so the time a session spent
+   * "inactive" during the gap proves nothing about the session — no heartbeat
+   * could be processed. The tick after such a gap moves each force-kill clock
+   * forward by the gap's excess over one normal tick: inactive time before the
+   * stall still counts, the stall itself does not. Shifting rather than
+   * restarting means a stall that recurs every few minutes delays a kill but
+   * can never prevent it.
+   */
+  private static readonly STALL_RESET_MS = 15_000;
+  /** The `expireInactive` tick period (`SyncEngine`'s inactivity timer). */
+  private static readonly EXPECTED_TICK_MS = 5_000;
+  private lastExpireTickAt: number | null = null;
+  private onStallReset?: (gapMs: number, inactiveSessions: number) => void;
+
+  /**
    * Issue #1680: tmux/pty launcher sessions tolerate a wider heartbeat gap
    * before expireInactive flips them inactive. Their CLI wrapper process can be
    * descheduled under CPU load (busy Pi 5, up to 10 concurrent sessions + a
@@ -136,9 +157,13 @@ export class SessionCache {
   constructor(
     private readonly store: Store,
     private readonly publisher: EventPublisher,
-    options?: { onForceKill?: (sessionId: string) => void }
+    options?: {
+      onForceKill?: (sessionId: string) => void;
+      onStallReset?: (gapMs: number, inactiveSessions: number) => void;
+    }
   ) {
     this.onForceKill = options?.onForceKill;
+    this.onStallReset = options?.onStallReset;
   }
 
   getSessions(): Session[] {
@@ -168,6 +193,20 @@ export class SessionCache {
       return undefined;
     }
     return session;
+  }
+
+  /**
+   * Issue #5819: look up a session by its tag in any namespace. Tags are random
+   * and unique; the only caller (the spawn choke point's placement re-check) uses
+   * it to ADD a refusal, never to grant access.
+   */
+  getSessionByTag(tag: string): Session | undefined {
+    for (const session of this.sessions.values()) {
+      if (session.tag === tag) {
+        return session;
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -493,6 +532,12 @@ export class SessionCache {
     modelMode?: ModelMode;
     // Issue #2456: live reasoning-effort level (drives the in-session effort tag).
     effort?: string;
+    // Issue #6166: the effort the Claude process applies (`null` = it sends
+    // none), the model the read-back reported and the effort the measured query
+    // was launched with. Absent = not measured.
+    appliedEffort?: string | null;
+    appliedModel?: string;
+    appliedForEffort?: string | null;
     // Composer-chip pin integrity: pinned raw model id riding the keepAlive tick.
     // Always-assign contract: `null` = the pin was cleared (family-mode pick), so
     // a stale id is dropped; absent (old CLI binary) = leave the record untouched.
@@ -545,6 +590,9 @@ export class SessionCache {
     const previousPermissionMode = session.permissionMode;
     const previousModelMode = session.modelMode;
     const previousEffort = session.effort;
+    const previousAppliedEffort = session.appliedEffort;
+    const previousAppliedModel = session.appliedModel;
+    const previousAppliedForEffort = session.appliedForEffort;
     const previousRawModel = session.rawModel;
     const previousResolvedModel = session.resolvedModel;
     const previousContextWindowTokens = session.contextWindowTokens;
@@ -621,6 +669,15 @@ export class SessionCache {
     if (payload.effort !== undefined) {
       session.effort = payload.effort as Session["effort"];
     }
+    // Issue #6166: the applied effort is an observation of the live process —
+    // in-memory only. ALWAYS-ASSIGN (the blockedOnTuiPrompt contract): the CLI
+    // sends the fields only while it holds a measurement of its running query,
+    // so a tick without them (a new query not yet read, a query that ended, a
+    // local-mode process, or a CLI that never measures) clears the record.
+    // `null` ("Claude sends no effort") is kept.
+    session.appliedEffort = payload.appliedEffort;
+    session.appliedModel = payload.appliedModel;
+    session.appliedForEffort = payload.appliedForEffort;
     // Composer-chip pin integrity: the pinned raw model self-heals from the
     // keepAlive tick (mirrors effort); `null` clears a stale pin.
     if (payload.rawModel !== undefined) {
@@ -673,6 +730,9 @@ export class SessionCache {
       previousPermissionMode !== session.permissionMode ||
       previousModelMode !== session.modelMode ||
       previousEffort !== session.effort ||
+      previousAppliedEffort !== session.appliedEffort ||
+      previousAppliedModel !== session.appliedModel ||
+      previousAppliedForEffort !== session.appliedForEffort ||
       previousRawModel !== session.rawModel ||
       previousResolvedModel !== session.resolvedModel ||
       previousContextWindowTokens !== session.contextWindowTokens ||
@@ -733,6 +793,9 @@ export class SessionCache {
           permissionMode: session.permissionMode,
           modelMode: session.modelMode,
           effort: session.effort,
+          appliedEffort: session.appliedEffort,
+          appliedModel: session.appliedModel,
+          appliedForEffort: session.appliedForEffort,
           rawModel: session.rawModel,
           resolvedModel: session.resolvedModel,
           contextWindowTokens: session.contextWindowTokens,
@@ -832,6 +895,12 @@ export class SessionCache {
     // Issue #4383 (dead-session clear): a disconnected session must not show a
     // stale agents badge. ABSENT on the record (K11); explicit null on the emit.
     session.backgroundAgents = undefined;
+    // Issue #6166 (dead-session clear): the applied effort described the process
+    // that just ended; the next process reports its own. The web refetches the
+    // record on this event, so clearing the record is enough.
+    session.appliedEffort = undefined;
+    session.appliedModel = undefined;
+    session.appliedForEffort = undefined;
     session.thinkingAt = t;
 
     // Record archive guard so heartbeats arriving after disconnect
@@ -860,6 +929,13 @@ export class SessionCache {
     // closed (reduced from 30s historically). tmux/pty launcher sessions get a
     // wider grace window per Issue #1680 — see TMUX_PTY_INACTIVE_TOLERANCE_MS.
     const SDK_SESSION_TIMEOUT_MS = 10_000;
+
+    // #6264: was the server itself blocked since the previous tick?
+    const stallGapMs =
+      this.lastExpireTickAt === null ? 0 : now - this.lastExpireTickAt;
+    const afterStall = stallGapMs > SessionCache.STALL_RESET_MS;
+    this.lastExpireTickAt = now;
+    let stallResets = 0;
 
     for (const session of this.sessions.values()) {
       if (session.active) {
@@ -900,6 +976,12 @@ export class SessionCache {
         session.rateLimited = null;
         // Issue #4383 (dead-session clear): same for the agents badge.
         session.backgroundAgents = undefined;
+        // Issue #6166 (dead-session clear): a CLI that died without a
+        // session-end leaves no process to describe; a live CLI that was only
+        // falsely expired re-sends its measurement on the next tick.
+        session.appliedEffort = undefined;
+        session.appliedModel = undefined;
+        session.appliedForEffort = undefined;
         this.publisher.emit({
           type: "session-updated",
           sessionId: session.id,
@@ -922,6 +1004,15 @@ export class SessionCache {
         !this.orphanedSessions.has(session.id)
       ) {
         this.firstInactiveAt.set(session.id, now);
+      } else if (afterStall && this.firstInactiveAt.has(session.id)) {
+        // #6264: the clock ran while no heartbeat could be processed — take
+        // the stall out of it.
+        const since = this.firstInactiveAt.get(session.id) as number;
+        this.firstInactiveAt.set(
+          session.id,
+          Math.min(now, since + stallGapMs - SessionCache.EXPECTED_TICK_MS)
+        );
+        stallResets += 1;
       }
 
       // Escalation: if inactive for >5 minutes, trigger force kill
@@ -939,6 +1030,8 @@ export class SessionCache {
         this.onForceKill(session.id);
       }
     }
+
+    if (afterStall) this.onStallReset?.(stallGapMs, stallResets);
 
     // Clean up expired archive guards
     for (const [sid, archivedAt] of this.recentlyArchivedAt) {
@@ -1081,10 +1174,12 @@ export class SessionCache {
     // keeps this blob (it discards the child's fresh metadata), so a key that
     // survived here would ride the next respawn beside the new account and the
     // spawn choke point would refuse the two-credential payload.
+    // Issue #5819: the cross-node placement marker goes with the key binding.
     return this.updateSessionMetadataFields(sessionId, current => {
       const {
         apiKeyId: _droppedApiKeyId,
         apiKeyMasked: _droppedApiKeyMasked,
+        apiKeyPlacedBy: _droppedApiKeyPlacedBy,
         ...rest
       } = current;
       return {
@@ -1109,6 +1204,9 @@ export class SessionCache {
    *
    * Never key material: `displayIdentity` is the vault label (else the masked
    * key), the same value the daemon's `computeAuthBinding` stamps at spawn.
+   *
+   * Issue #5819: also drops `apiKeyPlacedBy` — a key chosen on this node is a
+   * local binding, so a later unshare no longer blocks its relaunch.
    */
   async updateSessionApiKeyBinding(
     sessionId: string,
@@ -1123,6 +1221,7 @@ export class SessionCache {
       const {
         accountUuid: _droppedAccountUuid,
         claudeAccount: _droppedClaudeAccount,
+        apiKeyPlacedBy: _droppedApiKeyPlacedBy,
         ...rest
       } = current;
       return {
@@ -1136,8 +1235,8 @@ export class SessionCache {
 
   /**
    * Issue #4823 (R5): restore a session's credential binding to an exact earlier
-   * snapshot — the rollback of a failed payment-method switch. Drops all five
-   * binding fields, then re-sets exactly the ones the snapshot carried, so ONE
+   * snapshot — the rollback of a failed payment-method switch. Drops every
+   * binding field (#5819: the placement marker too), then re-sets exactly the ones the snapshot carried, so ONE
    * writer restores an account-bound, key-bound or unbound (host-credential)
    * original without per-kind branches and can never leave two kinds mixed.
    */
@@ -1152,6 +1251,7 @@ export class SessionCache {
         authBinding: _b,
         apiKeyId: _k,
         apiKeyMasked: _m,
+        apiKeyPlacedBy: _p,
         ...rest
       } = current;
       return {
@@ -1170,6 +1270,9 @@ export class SessionCache {
           : {}),
         ...(original.apiKeyMasked !== undefined
           ? { apiKeyMasked: original.apiKeyMasked }
+          : {}),
+        ...(original.apiKeyPlacedBy !== undefined
+          ? { apiKeyPlacedBy: original.apiKeyPlacedBy }
           : {}),
       };
     });

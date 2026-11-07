@@ -9,8 +9,7 @@ import {
 } from "@hapi/protocol";
 import {
   SPEND_LIMIT_VARIANTS,
-  canonicalizeErrorType,
-  classifyApiLimitSignal,
+  reclassifyExhaustedApiError,
   type SpendLimitVariant,
 } from "@hapi/protocol/apiErrorClasses";
 import { configuration } from "../../configuration";
@@ -1138,34 +1137,30 @@ export function createCliRoutes(
                 }
               }
 
-              // #4936 version-skew re-check: a tmux/pty session keeps the CLI
-              // binary it was spawned with, so after a deploy an older CLI still
-              // reports a spend cap as `rate_limit_error` / `unknown`. Re-run
-              // the SAME shared classifier on what it sent (status + the first
-              // 500 chars of the rendered text, which hold the whole cap
-              // sentence) and upgrade a match to the terminal class.
-              if (
-                phase === "exhausted" &&
-                canonicalizeErrorType(errorType) !== "spend_limit_error"
-              ) {
-                const recheck = classifyApiLimitSignal({
-                  status: apiErrorStatus,
-                  errorCode,
-                  text: innerText,
-                });
-                if (recheck.kind === "spend-limit") {
-                  errorType = "spend_limit_error";
-                  limitVariant = recheck.variant;
-                  resumesAt = recheck.resumesAt ?? undefined;
-                }
+              // #4936 version skew + API key budgets: re-check an exhausted
+              // report against what it carried (`reclassifyExhaustedApiError`).
+              const upgraded =
+                phase === "exhausted"
+                  ? reclassifyExhaustedApiError({
+                      errorType,
+                      status: apiErrorStatus,
+                      errorCode,
+                      text: innerText,
+                    })
+                  : null;
+              if (upgraded) errorType = upgraded.errorType;
+              if (upgraded?.errorType === "spend_limit_error") {
+                limitVariant = upgraded.limitVariant;
+                resumesAt = upgraded.resumesAt ?? undefined;
               }
 
               // TODO(#4912): legacy api-error SyncEvent, kept for one release
               // so a pre-#4915 web client still toasts. Remove its SSE/web
               // delivery once Sub C (#4915) has shipped for a release. Server
               // consumers: AutoRecoveryService + OrphanGrantObserver +
-              // SpendLimitNoticeObserver + sessionStateWaiter — keep the
-              // internal event or migrate them first.
+              // SpendLimitNoticeObserver + ApiKeyCreditObserver +
+              // sessionStateWaiter — keep the internal event or migrate them
+              // first.
               engine.handleRealtimeEvent({
                 type: "api-error",
                 sessionId: resolved.session.id,

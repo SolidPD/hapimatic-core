@@ -50,6 +50,7 @@ import {
   persistCustomOrder,
 } from "@/lib/accountSort";
 import { formatRelativeTime } from "@/lib/sessionHelpers";
+import { pickUseFirstKeyId } from "@/lib/apiKeyBudget";
 
 // ── Non-Anthropic provider sections (issue #3806, epic #3345) ───────────────
 // The OpenAI + Google Gemini sections render per-node DERIVED rows from the
@@ -289,6 +290,8 @@ export function OpenAiSectionBody(props: {
   /** #3982: drag start/end, so the page's pull-to-refresh stays gated. */
   onDragActiveChange?: (active: boolean) => void;
 }) {
+  // API key budgets: the OpenAI key whose credit is most at risk of expiring.
+  const useFirstId = pickUseFirstKeyId(props.keys, Date.now());
   // #3982: the OpenAI section's own per-device drag order (a sibling key of the
   // Anthropic one). orderByCustom appends accounts the stored order lacks.
   const [customOrder, setCustomOrder] = useState<string[]>(() =>
@@ -451,6 +454,7 @@ export function OpenAiSectionBody(props: {
           api={props.api}
           localNode={props.localNode}
           defaultExpanded={props.allExpanded}
+          useFirst={key.id === useFirstId}
         />
       ))}
       {props.nodes.map(node => {

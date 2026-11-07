@@ -951,6 +951,21 @@ export default function AdminFeedbackPage() {
                   {lastOutcome.text}
                 </p>
               )}
+            {!inbox.isLoading && inbox.skipped > 0 && (
+              // #5858 R3: rows this node, or the gateway, could not read are
+              // left out and counted — said here, so the skip is never silent.
+              <p
+                role="status"
+                data-testid="feedback-inbox-skipped"
+                className={MUTED_TEXT}
+              >
+                {inbox.skipped === 1
+                  ? "1 row could not be shown: this node or the gateway could not read it."
+                  : `${inbox.skipped} rows could not be shown: this node or the gateway could not read them.`}{" "}
+                If this node is older than the gateway, update it; otherwise
+                check the gateway log.
+              </p>
+            )}
             {inbox.isLoading ? (
               <p data-testid="feedback-loading" className={MUTED_TEXT}>
                 Loading…

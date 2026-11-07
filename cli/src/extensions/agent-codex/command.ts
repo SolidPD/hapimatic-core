@@ -7,6 +7,17 @@ import type { CommandDefinition } from "@/commands/types";
 import type { CodexPermissionMode } from "@hapi/protocol/types";
 import { CODEX_TMUX_RESUME_FLAG } from "./codex/codexTmuxLauncher";
 
+/**
+ * Issue #6218: parse the daemon's `--hapi-permission-mode` starting-mode seed.
+ * Only `read-only` and `safe-yolo` are accepted: `yolo` is `--yolo`'s job and
+ * `default` needs no seed.
+ */
+export function parseCodexPermissionSeed(
+  value: string | undefined
+): CodexPermissionMode | undefined {
+  return value === "read-only" || value === "safe-yolo" ? value : undefined;
+}
+
 export const codexCommand: CommandDefinition = {
   name: "codex",
   requiresRuntimeAssets: true,
@@ -25,11 +36,16 @@ export const codexCommand: CommandDefinition = {
         resumeCodexSessionId?: string;
       } = {};
       const unknownArgs: string[] = [];
+      let permissionSeed: CodexPermissionMode | undefined;
 
       for (let i = 0; i < commandArgs.length; i++) {
         const arg = commandArgs[i];
         if (arg === "--started-by") {
           options.startedBy = commandArgs[++i] as "daemon" | "terminal";
+        } else if (arg === "--hapi-permission-mode") {
+          // Issue #6218: Hapimatic-internal (NOT forwarded to the codex binary)
+          // — the daemon's starting-mode seed; --yolo outranks it below.
+          permissionSeed = parseCodexPermissionSeed(commandArgs[++i]);
         } else if (arg === "--hapi-model") {
           // Issue #1733: OpenRouter model id threaded from the daemon.
           options.model = commandArgs[++i];
@@ -47,6 +63,7 @@ export const codexCommand: CommandDefinition = {
           unknownArgs.push(arg);
         }
       }
+      options.permissionMode ??= permissionSeed;
       if (unknownArgs.length > 0) {
         options.codexArgs = unknownArgs;
       }

@@ -117,6 +117,7 @@ function assertArchivesExist(
   const archives = [
     join(projectRoot, "tools", "archives", `difftastic-${platformDir}.tar.gz`),
     join(projectRoot, "tools", "archives", `ripgrep-${platformDir}.tar.gz`),
+    join(projectRoot, "tools", "archives", `git-lfs-${platformDir}.tar.gz`),
   ];
 
   for (const archive of archives) {

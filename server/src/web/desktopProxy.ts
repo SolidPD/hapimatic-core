@@ -19,6 +19,12 @@
 // The server relays browser-WS ↔ websockify-WS frames verbatim; websockify (the
 // #2519-validated reference bridge) owns the RFB↔TCP translation.
 //
+// READINESS (#6214): the unit is Type=simple, so `systemctl start` returns seconds
+// before websockify listens. The proxy dials the backend through `dialUntilReady`
+// (desktopReadiness.ts) until it opens, under one deadline that also bounds the
+// start, and closes the browser socket with DESKTOP_CLOSE_START_FAILED when the
+// desktop genuinely cannot start.
+//
 // SECURITY (R2): the desktop is reachable ONLY through this JWT-gated proxy;
 // websockify + Xvnc bind 127.0.0.1 only (desktop-session.sh). The auth boundary
 // is: a valid HS256 {uid,ns} JWT for a session in the token's namespace, on a
@@ -26,9 +32,14 @@
 
 import { jwtVerify } from "jose";
 import { z } from "zod";
+import { DESKTOP_CLOSE_START_FAILED } from "@hapi/protocol";
 import { readVmTier } from "@hapi/protocol/tenantMode";
 import type { ServerWebSocket } from "bun";
 import type { Store } from "../store";
+import {
+  dialUntilReady,
+  type DesktopReadinessOptions,
+} from "./desktopReadiness";
 
 /**
  * Discriminated WS-data variant for a desktop connection — mirrors
@@ -62,6 +73,15 @@ const DESKTOP_TIER_ALLOWLIST = (
  * binds 127.0.0.1:6080). Overridable for tests. */
 const WEBSOCKIFY_URL =
   process.env.HAPI_DESKTOP_WEBSOCKIFY_URL ?? "ws://127.0.0.1:6080/websockify";
+
+/** One deadline for the whole start — `systemctl start` plus the wait for the
+ * backend (#6214). desktop-session.sh reaches websockify within ~17 s at worst, or
+ * exits 1, which the liveness check reports long before this. */
+const DESKTOP_READY_TIMEOUT_MS = 30_000;
+
+/** Browser frames held while the backend is not yet open. noVNC sends nothing
+ * before the server's RFB greeting, so a real client queues 0 bytes. */
+const DESKTOP_MAX_QUEUED_BYTES = 256 * 1024;
 
 /**
  * Read the VM's persisted tier (written by provision.sh Phase 9.7 to
@@ -175,6 +195,10 @@ export async function authenticateDesktopUpgrade(opts: {
  * this starts it on the first desktop connection and stops it after the last one
  * disconnects + an idle grace period, so an idle VM carries none of the ~½ GB.
  * `systemctl --user` control mirrors server/src/systemJobs/reconciler.ts.
+ *
+ * `ensureStarted` resolving does NOT mean the backend is listening: the unit is
+ * Type=simple, so it reads `active` the moment the script forks. The proxy waits
+ * for the backend itself (#6214) and uses `isActive` to fail fast if the unit stops.
  */
 export class DesktopLifecycle {
   private readonly unit: string;
@@ -226,7 +250,11 @@ export class DesktopLifecycle {
     }
   }
 
-  private async isActive(): Promise<boolean> {
+  /** Is the unit running? After a successful `systemctl start` the start job has
+   * completed, so the unit reads `active` (Type=simple) or has already failed. A
+   * false here can also be another instance's idle stop of the same unit on this
+   * VM, which the viewer then shows as "could not start". */
+  async isActive(): Promise<boolean> {
     const r = await this.run(["is-active", "--quiet", this.unit]);
     return r.code === 0;
   }
@@ -263,8 +291,64 @@ export class DesktopLifecycle {
 type DesktopConn = {
   backend: WebSocket | null;
   queue: (string | Buffer)[];
+  queuedBytes: number;
+  /** The backend is open and the relay is wired. */
+  ready: boolean;
   closed: boolean;
+  /** Aborted when the connection ends, which stops the readiness wait. */
+  abort: AbortController;
 };
+
+/** Close a socket, ignoring one that is already closing. */
+function closeQuietly(sock: WebSocket): void {
+  try {
+    sock.close();
+  } catch {
+    /* already closing */
+  }
+}
+
+/**
+ * Open one WebSocket to the backend: resolve once it is open, reject if it fails
+ * first or `signal` aborts. Its listeners are removed on open, so a later abort of
+ * `signal` (the attempt timeout and the 30 s deadline keep running after the
+ * backend opens) never touches a live backend.
+ */
+function dialWebSocket(url: string, signal: AbortSignal): Promise<WebSocket> {
+  return new Promise<WebSocket>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const sock = new WebSocket(url);
+    sock.binaryType = "arraybuffer";
+    const cleanup = (): void => {
+      sock.removeEventListener("open", onOpen);
+      sock.removeEventListener("close", onFail);
+      sock.removeEventListener("error", onFail);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onOpen = (): void => {
+      cleanup();
+      resolve(sock);
+    };
+    // A refused connect fires `error` then `close`; either one ends the attempt.
+    const onFail = (): void => {
+      cleanup();
+      closeQuietly(sock);
+      reject(new Error("backend connection failed before it opened"));
+    };
+    const onAbort = (): void => {
+      cleanup();
+      closeQuietly(sock);
+      reject(signal.reason);
+    };
+    sock.addEventListener("open", onOpen);
+    sock.addEventListener("close", onFail);
+    sock.addEventListener("error", onFail);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /**
  * The raw-WS relay. Handed the authenticated browser ServerWebSocket by the
@@ -280,10 +364,21 @@ export class DesktopProxyHandler {
   >();
   private readonly lifecycle: DesktopLifecycle;
   private readonly backendUrl: string;
+  private readonly readyTimeoutMs: number;
+  private readonly readiness: DesktopReadinessOptions;
 
-  constructor(opts?: { lifecycle?: DesktopLifecycle; backendUrl?: string }) {
+  constructor(opts?: {
+    lifecycle?: DesktopLifecycle;
+    backendUrl?: string;
+    /** Test seam: the deadline for the whole start (default 30 s). */
+    readyTimeoutMs?: number;
+    /** Test seam: backoff, attempt timeout and liveness interval. */
+    readiness?: DesktopReadinessOptions;
+  }) {
     this.lifecycle = opts?.lifecycle ?? new DesktopLifecycle();
     this.backendUrl = opts?.backendUrl ?? WEBSOCKIFY_URL;
+    this.readyTimeoutMs = opts?.readyTimeoutMs ?? DESKTOP_READY_TIMEOUT_MS;
+    this.readiness = opts?.readiness ?? {};
   }
 
   /** Live desktop connection count (for tests + observability). */
@@ -292,23 +387,40 @@ export class DesktopProxyHandler {
   }
 
   handleOpen(ws: ServerWebSocket<DesktopWsData>): void {
-    const conn: DesktopConn = { backend: null, queue: [], closed: false };
+    const conn: DesktopConn = {
+      backend: null,
+      queue: [],
+      queuedBytes: 0,
+      ready: false,
+      closed: false,
+      abort: new AbortController(),
+    };
     this.conns.set(ws, conn);
-    // Fire-and-forget: ensure the desktop is running, then wire the backend. The
-    // browser socket is already open; early browser frames queue until the
-    // backend connects.
-    void this.lifecycle
-      .ensureStarted()
-      .then(() => {
-        if (conn.closed) return;
-        this.connectBackend(ws, conn);
-      })
-      .catch(err => {
-        this.closeBoth(ws, conn, 1011, "desktop_start_failed");
-        console.error(
-          `[desktop] failed to start the desktop stack for session ${ws.data.sessionId}: ${String(err)}`
+    // One deadline covers the start AND the wait for the backend (#6214). It fires
+    // even when an attempt hangs without any socket event.
+    const signal = AbortSignal.any([
+      conn.abort.signal,
+      AbortSignal.timeout(this.readyTimeoutMs),
+    ]);
+    signal.addEventListener(
+      "abort",
+      () => {
+        if (conn.ready || conn.closed) return;
+        this.failStart(
+          ws,
+          conn,
+          "desktop_start_timeout",
+          `the desktop backend did not open within ${this.readyTimeoutMs} ms`
         );
-      });
+      },
+      { once: true }
+    );
+    // Fire-and-forget: the browser socket is already open; early browser frames
+    // queue until the backend connects. `start` never rejects; the catch is the
+    // last line so nothing can escape as an unhandled rejection (#4051).
+    void this.start(ws, conn, signal).catch((err: unknown) => {
+      this.failStart(ws, conn, "desktop_start_failed", String(err));
+    });
   }
 
   handleMessage(
@@ -322,40 +434,97 @@ export class DesktopProxyHandler {
       // Verbatim relay browser → websockify (binary RFB preserved). `message` is
       // string | Buffer; Buffer is an ArrayBufferView, so no cast is needed.
       backend.send(message);
-    } else {
-      conn.queue.push(message);
+      return;
     }
+    conn.queuedBytes +=
+      typeof message === "string"
+        ? Buffer.byteLength(message)
+        : message.byteLength;
+    if (conn.queuedBytes > DESKTOP_MAX_QUEUED_BYTES) {
+      this.closeBoth(ws, conn, 1009, "desktop_queue_overflow");
+      return;
+    }
+    conn.queue.push(message);
   }
 
   handleWsClose(ws: ServerWebSocket<DesktopWsData>): void {
     const conn = this.conns.get(ws);
     if (!conn) return;
-    conn.closed = true;
-    try {
-      conn.backend?.close();
-    } catch {
-      /* already closing */
-    }
-    this.conns.delete(ws);
-    this.lifecycle.noteClosed(this.conns.size);
+    this.endConn(conn, "browser_closed");
+    this.release(ws);
   }
 
-  private connectBackend(
+  /** Start the unit, wait for the backend, then wire the relay. Never rejects. */
+  private async start(
     ws: ServerWebSocket<DesktopWsData>,
-    conn: DesktopConn
-  ): void {
-    const backend = new WebSocket(this.backendUrl);
-    backend.binaryType = "arraybuffer";
-    conn.backend = backend;
-    backend.addEventListener("open", () => {
-      for (const frame of conn.queue) {
-        backend.send(frame);
-      }
-      conn.queue = [];
+    conn: DesktopConn,
+    signal: AbortSignal
+  ): Promise<void> {
+    try {
+      await this.lifecycle.ensureStarted();
+    } catch (err) {
+      this.failStart(ws, conn, "desktop_start_failed", String(err));
+      return;
+    }
+    if (conn.closed || signal.aborted) return;
+
+    let livenessErrorLogged = false;
+    const outcome = await dialUntilReady({
+      ...this.readiness,
+      dial: s => dialWebSocket(this.backendUrl, s),
+      release: closeQuietly,
+      isAlive: () => this.lifecycle.isActive(),
+      onLivenessError: err => {
+        if (livenessErrorLogged) return;
+        livenessErrorLogged = true;
+        console.error(
+          `[desktop] could not check the desktop unit for session ${ws.data.sessionId}: ${String(err)}`
+        );
+      },
+      signal,
     });
+
+    switch (outcome.kind) {
+      case "ready":
+        this.attachBackend(ws, conn, outcome.backend);
+        if (outcome.attempts > 1) {
+          console.log(
+            `[desktop] backend ready for session ${ws.data.sessionId} after ${outcome.elapsedMs} ms (${outcome.attempts} attempts)`
+          );
+        }
+        return;
+      case "unit_inactive":
+        this.failStart(
+          ws,
+          conn,
+          "desktop_start_failed",
+          "the desktop unit stopped while the backend was starting"
+        );
+        return;
+      case "aborted":
+        // Whoever aborted (browser close, deadline, queue overflow) already closed.
+        return;
+      default: {
+        const unhandled: never = outcome;
+        return unhandled;
+      }
+    }
+  }
+
+  private attachBackend(
+    ws: ServerWebSocket<DesktopWsData>,
+    conn: DesktopConn,
+    backend: WebSocket
+  ): void {
+    if (conn.closed) {
+      closeQuietly(backend);
+      return;
+    }
+    conn.backend = backend;
+    conn.ready = true;
     backend.addEventListener("message", (ev: MessageEvent) => {
       // websockify → browser, verbatim (binary RFB frames). ev.data is `any`
-      // (arraybuffer for binary frames per binaryType above).
+      // (arraybuffer for binary frames per binaryType in dialWebSocket).
       try {
         ws.send(ev.data);
       } catch {
@@ -368,6 +537,28 @@ export class DesktopProxyHandler {
     backend.addEventListener("error", () => {
       this.closeBoth(ws, conn, 1011, "backend_error");
     });
+    for (const frame of conn.queue) {
+      backend.send(frame);
+    }
+    conn.queue = [];
+    conn.queuedBytes = 0;
+    if (backend.readyState !== WebSocket.OPEN) {
+      this.closeBoth(ws, conn, 1000, "backend_closed");
+    }
+  }
+
+  /** The desktop could not start: log the cause and tell the browser (4001). */
+  private failStart(
+    ws: ServerWebSocket<DesktopWsData>,
+    conn: DesktopConn,
+    reason: "desktop_start_failed" | "desktop_start_timeout",
+    detail: string
+  ): void {
+    if (conn.closed) return;
+    console.error(
+      `[desktop] could not start the desktop for session ${ws.data.sessionId} (${reason}): ${detail}`
+    );
+    this.closeBoth(ws, conn, DESKTOP_CLOSE_START_FAILED, reason);
   }
 
   private closeBoth(
@@ -377,17 +568,28 @@ export class DesktopProxyHandler {
     reason: string
   ): void {
     if (conn.closed) return;
-    conn.closed = true;
-    try {
-      conn.backend?.close();
-    } catch {
-      /* noop */
-    }
+    this.endConn(conn, reason);
     try {
       ws.close(code, reason);
     } catch {
       /* noop */
     }
+    this.release(ws);
+  }
+
+  /** End a connection: stop the readiness wait, drop queued frames, and close
+   * the backend. Shared by both teardown paths (browser close and closeBoth). */
+  private endConn(conn: DesktopConn, reason: string): void {
+    conn.closed = true;
+    conn.abort.abort(reason);
+    conn.queue = [];
+    conn.queuedBytes = 0;
+    if (conn.backend) closeQuietly(conn.backend);
+  }
+
+  /** Forget the connection and let the lifecycle schedule its idle stop. The
+   * delete makes this run at most once per connection. */
+  private release(ws: ServerWebSocket<DesktopWsData>): void {
     if (this.conns.delete(ws)) {
       this.lifecycle.noteClosed(this.conns.size);
     }

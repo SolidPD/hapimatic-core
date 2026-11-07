@@ -25,11 +25,13 @@
  * - Self-permission refusal (R6): a session cannot approve or deny its OWN
  *   permission request through this channel.
  * - Caller-mode floor (R8, operator ruling NEW-3842-1 = b, 2026-10-01): a
- *   session whose live permission mode is not a bypass mode cannot spawn a
- *   `yolo` peer (any spawn without an explicit `yolo: false`, because the daemon
- *   spawns in YOLO mode unless `yolo` is exactly `false`), create or update a
- *   schedule (scheduled sessions always run in
- *   the bypass mode), or answer any session's permission request. A bypass-mode
+ *   session whose live permission mode is not a bypass mode cannot change its
+ *   node's default spawn permission mode (#6218), create or update a schedule
+ *   (scheduled sessions always run in the bypass mode), or answer any session's
+ *   permission request. Its spawns meet a RANK floor (#6218, ruling D5-a,
+ *   `floorAgentSpawnPosture`): an explicit posture above its own mode's rank is
+ *   refused, and an omitted one (the node default — an omitted `yolo` is no
+ *   longer YOLO by itself) is clamped down to its rank. A bypass-mode
  *   caller (an orchestrating PM session) is unaffected. Fails closed: a caller
  *   the server cannot resolve, or one with no live mode, is refused.
  * - Send and archive floors (#5616, operator ruling CK1 = option 1 on D1..D10):
@@ -70,6 +72,11 @@ import {
   isYoloEquivalentMode,
   KNOWN_AGENT_IDS,
 } from "@hapi/protocol";
+import {
+  clampSpawnPermissionMode,
+  spawnPermissionRank,
+  spawnPostureRank,
+} from "@hapi/protocol/modes";
 import type { PermissionMode } from "@hapi/protocol/types";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { Session, SyncEngine } from "../../sync/syncEngine";
@@ -235,6 +242,63 @@ export function refuseAgentEscalation(
   if (classifyCaller(c, engine) === "pass") return null;
   return escalationRefused(c, ESCALATION_REFUSED_ERROR);
 }
+
+/** A resolved spawn posture, as `resolveSpawnPosture` returns it. */
+export type SpawnPostureRequest = {
+  yolo: boolean;
+  permissionMode?: PermissionMode;
+};
+
+/**
+ * #6218 (operator ruling D5-a, amends NEW-3842-1 = b): the spawn route's
+ * agent-escalation floor, a RANK floor over the EFFECTIVE posture
+ * (`spawnPermissionRank`: prompting modes 0, accept / safe-YOLO 1, YOLO 2).
+ *
+ * - No header (the web UI, and the `hapi api` CLI, which never sends one on a
+ *   spawn) or a bypass-mode caller: the posture is returned unchanged.
+ * - A caller that cannot be resolved or has no live mode: refused for any
+ *   posture above rank 0 (fail closed); a rank-0 posture proceeds.
+ * - Any other caller (its mode is its rank): an EXPLICIT posture above its
+ *   rank is refused 403 `agent_escalation_refused`; an OMITTED posture (the
+ *   node default) above its rank is clamped down to its rank for the harness
+ *   (`clampSpawnPermissionMode`), so a prompting agent that names no posture
+ *   gets a prompting peer and is never refused for omitting one.
+ *
+ * Returns the posture to spawn with, or the 403 response.
+ */
+export function floorAgentSpawnPosture(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null,
+  requested: SpawnPostureRequest,
+  opts: { explicit: boolean; flavor: string }
+): SpawnPostureRequest | Response {
+  const caller = classifyCaller(c, engine);
+  if (caller === "pass") return requested;
+  const rank = spawnPostureRank(requested);
+  if (caller === "unknown" || caller === "refuse") {
+    return rank > 0
+      ? escalationRefused(c, ESCALATION_REFUSED_ERROR)
+      : requested;
+  }
+  // classifyCaller only returns a CallerView with a live, non-bypass mode.
+  const callerRank = spawnPermissionRank(
+    caller.permissionMode as PermissionMode
+  );
+  if (rank <= callerRank) return requested;
+  if (opts.explicit) {
+    return escalationRefused(c, SPAWN_RANK_REFUSED_ERROR);
+  }
+  const permissionMode = clampSpawnPermissionMode(
+    requested.permissionMode ?? "bypassPermissions",
+    callerRank,
+    opts.flavor
+  );
+  return { yolo: isYoloEquivalentMode(permissionMode), permissionMode };
+}
+
+/** #6218 (D5-a): the refusal text for an explicit posture above the caller's. */
+const SPAWN_RANK_REFUSED_ERROR =
+  "A session cannot spawn a peer in a more permissive mode than its own through the capability channel";
 
 /**
  * The permission approve/deny routes' combined floor: the self-permission

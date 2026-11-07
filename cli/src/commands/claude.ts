@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { z } from "zod";
 import { SessionRoleSchema } from "@hapi/protocol/schemas";
 import type { StartOptions } from "@/claude/runClaude";
+import { parseSpawnPermissionSeed } from "@/claude/spawnPermissionSeed";
 import { configuration } from "@/configuration";
 import { readDaemonBuildSkew } from "@/daemon/controlClient";
 import { authAndSetupMachineIfNeeded } from "@/ui/auth";
@@ -83,6 +84,12 @@ export const claudeCommand: CommandDefinition = {
       } else if (arg === "--dangerously-skip-permissions") {
         options.permissionMode = "bypassPermissions";
         unknownArgs.push(arg);
+      } else if (arg === "--hapi-permission-mode") {
+        // Issue #6218: Hapimatic-internal (NOT forwarded to the claude child) —
+        // the daemon's starting-mode seed. Only a non-bypass Claude mode is
+        // accepted: bypass is `--yolo`'s job, and a saved posture outranks the
+        // seed in runClaude. Consumes the next token like --hapi-effort.
+        options.spawnPermissionMode = parseSpawnPermissionSeed(args[++i]);
       } else if (arg === "--safe-mode") {
         // Issue #1633: explicit branch — the catch-all below would slurp a
         // following non-dash token as this boolean flag's value. The flag is

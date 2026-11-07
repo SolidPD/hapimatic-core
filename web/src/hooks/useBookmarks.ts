@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Bookmark, BookmarkListResponse } from "@hapi/protocol";
 import { useAppContext } from "@/lib/app-context";
@@ -104,7 +104,12 @@ function clearLegacyBookmarks(storageKey: string): void {
 export function useBookmarks(sessionId: string): UseBookmarksResult {
   const { api } = useAppContext();
   const queryClient = useQueryClient();
-  const bookmarksKey = queryKeys.bookmarks(sessionId);
+  // Issue #6208: one key array per session, so the callbacks and the migration
+  // effect below that depend on it keep their identity across renders.
+  const bookmarksKey = useMemo(
+    () => queryKeys.bookmarks(sessionId),
+    [sessionId]
+  );
 
   const query = useQuery({
     queryKey: bookmarksKey,
@@ -176,6 +181,13 @@ export function useBookmarks(sessionId: string): UseBookmarksResult {
     ...optimisticLifecycle<void>(() => []),
   });
 
+  // Issue #6208: `useMutation` returns a new result object every render, but
+  // its `mutate` is stable. Depending on `mutate` keeps the callbacks stable,
+  // which keeps the chat context value (and every message) from re-rendering.
+  const { mutate: putBookmark } = putMutation;
+  const { mutate: deleteBookmark } = deleteMutation;
+  const { mutate: clearBookmarks } = clearMutation;
+
   const toggleBookmark = useCallback(
     (
       messageId: string,
@@ -204,9 +216,9 @@ export function useBookmarks(sessionId: string): UseBookmarksResult {
           (a, b) => Math.abs(a.offsetPx - off) - Math.abs(b.offsetPx - off)
         );
       if (nearby.length > 0) {
-        deleteMutation.mutate(nearby[0].id);
+        deleteBookmark(nearby[0].id);
       } else {
-        putMutation.mutate({
+        putBookmark({
           messageId,
           blockId: bid,
           offsetPx: off,
@@ -214,7 +226,7 @@ export function useBookmarks(sessionId: string): UseBookmarksResult {
         });
       }
     },
-    [queryClient, bookmarksKey, deleteMutation, putMutation]
+    [queryClient, bookmarksKey, deleteBookmark, putBookmark]
   );
 
   const isBookmarked = useCallback(
@@ -231,8 +243,8 @@ export function useBookmarks(sessionId: string): UseBookmarksResult {
   );
 
   const clearAll = useCallback(() => {
-    clearMutation.mutate();
-  }, [clearMutation]);
+    clearBookmarks();
+  }, [clearBookmarks]);
 
   // R5 migration — one-time localStorage → server, per session.
   const migratedSessions = useRef<Set<string>>(new Set());
@@ -260,11 +272,9 @@ export function useBookmarks(sessionId: string): UseBookmarksResult {
     })();
   }, [sessionId, query.isSuccess, query.data, api, queryClient, bookmarksKey]);
 
-  return {
-    bookmarks,
-    toggleBookmark,
-    isBookmarked,
-    clearAll,
-    isLoading: query.isLoading,
-  };
+  const isLoading = query.isLoading;
+  return useMemo(
+    () => ({ bookmarks, toggleBookmark, isBookmarked, clearAll, isLoading }),
+    [bookmarks, toggleBookmark, isBookmarked, clearAll, isLoading]
+  );
 }

@@ -92,6 +92,25 @@ function extractParentName(parentMessages: DecryptedMessage[]): string | null {
   return null;
 }
 
+// Issue #6208: one fallback per session id for a branch with no recorded
+// creation time, so recomputing the message list (on every new message) does
+// not hand the branch separator a new timestamp each time.
+const fallbackBranchStartTimes = new Map<string, number>();
+
+/** When the branch began: `branchCreatedAt`, else a stable per-session fallback. */
+export function branchStart(
+  sessionId: string,
+  branchCreatedAt: number | null | undefined
+): number {
+  if (branchCreatedAt != null) return branchCreatedAt;
+  let at = fallbackBranchStartTimes.get(sessionId);
+  if (at === undefined) {
+    at = Date.now();
+    fallbackBranchStartTimes.set(sessionId, at);
+  }
+  return at;
+}
+
 /**
  * Computes a structured summary from the parent session's messages
  * and the current (branch) session's metadata.
@@ -140,5 +159,15 @@ export function useBranchSummary(
       linkedIssue: session.linkedIssue ?? null,
       messageCount: parentMessages.length,
     };
-  }, [session, parentMessages]);
+    // Issue #6208: depend on the fields read above, not the whole session —
+    // a poll that only moves `activeAt` must not rebuild the summary (and
+    // through it the branch separator and the whole thread).
+  }, [
+    session.parentSessionId,
+    session.branchLabel,
+    session.emoji,
+    session.metadata?.path,
+    session.linkedIssue,
+    parentMessages,
+  ]);
 }

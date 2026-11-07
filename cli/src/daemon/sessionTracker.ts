@@ -161,6 +161,28 @@ export const resolveCapacity = async (): Promise<ResolvedCapacity> => {
 export const resolveMaxConcurrent = async (): Promise<number> =>
   (await resolveCapacity()).max;
 
+/**
+ * The tracked session holding the slot `id` names, if any: a TrackedSession whose
+ * tmuxSessionId / persistedHapiSessionId / happySessionId equals it. The PID half of
+ * the own-slot credit (#2299); `computeEffectiveCount` also credits the session's
+ * still-active window once its PID has left the map, and reports either as `credited`.
+ */
+export function findTrackedSessionById(
+  sessions: Iterable<TrackedSession>,
+  id: string
+): TrackedSession | undefined {
+  for (const s of sessions) {
+    if (
+      s.tmuxSessionId === id ||
+      s.persistedHapiSessionId === id ||
+      s.happySessionId === id
+    ) {
+      return s;
+    }
+  }
+  return undefined;
+}
+
 /** The daemon's effective-count snapshot — the SAME shape the spawn gate and the
  *  `/effective-count` control endpoint consume (#1477). `recommended` + `source`
  *  (#4417) travel from the SAME `resolveCapacity()` call as `max`. */
@@ -175,6 +197,12 @@ export interface EffectiveCountResult {
   source: CapSource;
   /** #5202 (U3): which memory figure fed the formula (shown by `hapi daemon status`). */
   memInputSource: MemInputSource;
+  /**
+   * True when `creditHapiSessionId` named a slot that was counted (its tracked PID,
+   * or its still-active window after the PID left the map) and the slot was credited.
+   * The memory gate (#6156) exempts exactly these respawns.
+   */
+  credited: boolean;
 }
 
 /**
@@ -222,16 +250,16 @@ export function createSessionTracker(ctx: DaemonContext) {
     // tmux term below (the reused window the respawn re-attaches to; fall back to
     // the id itself, which is the new-window default name — tmuxSpawnAdapter).
     let creditWindowName: string | undefined;
+    let credited = false;
     if (creditHapiSessionId) {
-      const tracked = Array.from(pidToTrackedSession.values()).find(
-        s =>
-          s.tmuxSessionId === creditHapiSessionId ||
-          s.persistedHapiSessionId === creditHapiSessionId ||
-          s.happySessionId === creditHapiSessionId
+      const tracked = findTrackedSessionById(
+        pidToTrackedSession.values(),
+        creditHapiSessionId
       );
       if (tracked) {
         // Holds a tracked PID slot — credit it (clamped >=0, OR-2 guard).
         trackedPids = Math.max(0, trackedPids - 1);
+        credited = true;
         creditWindowName = tracked.tmuxWindow ?? creditHapiSessionId;
       } else {
         // Not in the PID map (already gone), but its reused window may still be
@@ -265,6 +293,7 @@ export function createSessionTracker(ctx: DaemonContext) {
             w.name === creditWindowName
           ) {
             creditedWindowSeen = true;
+            credited = true;
             continue;
           }
           activeWindowCount++;
@@ -292,6 +321,7 @@ export function createSessionTracker(ctx: DaemonContext) {
       recommended: cap.recommended,
       source: cap.source,
       memInputSource: computeMachineInputs().memInputSource,
+      credited,
     };
   };
 

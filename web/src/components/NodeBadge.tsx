@@ -65,8 +65,9 @@ import {
  * against the configured node states), so the colors are identical on every
  * node's UI and do NOT reshuffle when a node drops. There is no gray "local
  * hub" color any more — the local node takes its slot like any other. When the
- * list is unavailable (standalone / 503) or does not carry this node, fall back
- * to the djb2 hash of the id into the same ten entries.
+ * list is unavailable (a failed read, or a standalone node or spoke on a server
+ * built before #6217, where the poll is skipped) or does not carry this node,
+ * fall back to the djb2 hash of the id into the same ten entries.
  *
  * STATUS: a connectivity-OFFLINE node renders the retired hub gray — chip AND
  * the project-header band — so it reads as "grayed out" next to live nodes;
@@ -208,7 +209,9 @@ function readRememberedNodeIds(): string[] | null {
  * The node ids to rank against: the live health list once it has answered
  * (remembered for the next load), else the remembered list, else — still
  * loading with nothing remembered — null ("unknown": pending tone). A settled
- * query with no usable list (503 / standalone) yields [] → the hash fallback.
+ * or skipped query with no usable list (a failed read, or a standalone node or
+ * spoke on a server built before #6217, where the poll is skipped) yields [] →
+ * the hash fallback.
  */
 function useKnownNodeIds(health: {
   nodes: FederationNodeHealth[];
@@ -292,7 +295,8 @@ export function useNodeTone(
   nodeStatus: "online" | "degraded" | "offline" | undefined
 ): NodeTone | null {
   const { api } = useAppContext();
-  // #5180 F12: no aggregator (standalone or spoke) → no poll, so no 503.
+  // #5180 F12: no aggregator (a server built before #6217 on a standalone or
+  // spoke) → no poll, so no 503.
   const healthAvailable = useFederationHealthAvailable(api);
   const health = useFederationHealthNodes(
     nodeId && healthAvailable ? api : null
@@ -336,8 +340,9 @@ export function NodeBadge({
   interactive?: boolean;
   /**
    * #4468 Task 2 (added by #4464, the first lander): `false` skips the ~30 s
-   * resource-health poll, for a node without a health aggregator (federation
-   * disabled, or a spoke with role `node`), which would only answer 503.
+   * resource-health poll, for a node without a health aggregator (a standalone
+   * node or a spoke with role `node`, on a server built before #6217), which
+   * would only answer 503.
    */
   resourceHealth?: boolean;
   /**
@@ -384,9 +389,9 @@ export function NodeBadge({
   const [healthOpen, setHealthOpen] = useState(false);
   // Resource-health poll (issue #3662): one ~30s TanStack-Query, deduped across
   // ALL badges (not per-badge). Pass a null api when there is no nodeId so a
-  // standalone/spoke deployment (every badge nodeId-less) never polls a 503 on
-  // top of the aggregate already polled elsewhere (enabled: Boolean(api)). These
-  // hooks sit ABOVE the `!nodeId` early return for rules-of-hooks.
+  // nodeId-less badge never polls on top of the aggregate already polled
+  // elsewhere (enabled: Boolean(api)). These hooks sit ABOVE the `!nodeId`
+  // early return for rules-of-hooks.
   const { api } = useAppContext();
   // #5180 F12: `resourceHealth` is the caller's switch; this is the install's.
   const healthAvailable = useFederationHealthAvailable(api);
@@ -423,10 +428,10 @@ export function NodeBadge({
   //      asserts unreachability; the registry trips offline after ~3 failed polls,
   //      always before the aggregator's 60-90s grace, so a dead node reaches black
   //      on this clock first);
-  //   2. resource health unavailable (503/standalone/spoke, no entry for this
-  //      nodeId, or online:false = "no fresh sample") → fall back to today's
-  //      connectivity-only coloring (R5 — no regression; resource-`offline` never
-  //      paints a reachable node black);
+  //   2. resource health unavailable (the poll skipped or failed, no entry for
+  //      this nodeId, or online:false = "no fresh sample") → fall back to
+  //      today's connectivity-only coloring (R5 — no regression;
+  //      resource-`offline` never paints a reachable node black);
   //   3. health available (online === true ⇔ status in healthy..critical) →
   //      worst-of(connectivity, resource) via `severityToColor` (a
   //      `var(--status-sev-*)` string applied through `style`, the #1037 parity

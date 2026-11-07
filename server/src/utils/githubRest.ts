@@ -30,8 +30,14 @@ import type { GitHubAccountResult, GitHubRepoResult } from "./githubCli";
 
 const GITHUB_API_BASE = "https://api.github.com";
 
-/** Matches the `gh repo list --limit 200` ceiling the CLI path uses. */
-const REST_REPO_LIMIT = 200;
+/**
+ * The repository ceiling, shared by every transport — the `gh` path in
+ * `githubCli.ts`, this REST path, and the gateway broker's copy — so the picker
+ * lists the same set whichever one answers (#6312). Most recently pushed first;
+ * the push filter runs before the cut. Organization and collaborator repositories
+ * reach the old 200 quickly, and the picker's search only sees what was loaded.
+ */
+export const REST_REPO_LIMIT = 500;
 
 /** Matches the `gh issue list --limit 200` ceiling the CLI path uses (#2391). */
 const REST_ISSUE_LIMIT = 200;
@@ -47,8 +53,8 @@ const REST_ISSUE_LIMIT = 200;
  */
 const REST_ISSUE_MAX_PAGES = 5;
 
-/** GitHub's max page size; two pages cover {@link REST_REPO_LIMIT}. */
-const REST_PER_PAGE = 100;
+/** GitHub's max page size; five pages cover {@link REST_REPO_LIMIT}. */
+export const REST_PER_PAGE = 100;
 
 /**
  * The reasons THIS transport can produce, as a subset of the shared enum.
@@ -193,6 +199,12 @@ interface RestRepo {
   private?: boolean;
   pushed_at?: string | null;
   default_branch?: string | null;
+  /** #6326: the picker's created-date sorts and fork / archived filters. */
+  created_at?: string | null;
+  archived?: boolean;
+  fork?: boolean;
+  /** What the authenticated caller may do; GitHub omits it for an unauthenticated read. */
+  permissions?: { push?: boolean } | null;
 }
 
 /**
@@ -215,7 +227,7 @@ export async function fetchAccountViaRest(
 /** Map one REST repository object onto the shared result shape. */
 function mapRestRepo(raw: RestRepo): GitHubRepoResult | null {
   if (!raw?.full_name || !raw.name) return null;
-  return {
+  const repo: GitHubRepoResult = {
     nameWithOwner: raw.full_name,
     name: raw.name,
     description: raw.description ?? null,
@@ -223,46 +235,110 @@ function mapRestRepo(raw: RestRepo): GitHubRepoResult | null {
     pushedAt: raw.pushed_at ?? null,
     defaultBranch: raw.default_branch ?? null,
   };
+  // #6326: copy a field only when GitHub reported it. Absent is not `false`: the picker
+  // hides a filter whose field no row carries rather than offering a toggle that does nothing.
+  if (typeof raw.created_at === "string") repo.createdAt = raw.created_at;
+  if (typeof raw.archived === "boolean") repo.isArchived = raw.archived;
+  if (typeof raw.fork === "boolean") repo.isFork = raw.fork;
+  return repo;
+}
+
+/**
+ * One page of the authenticated identity's repositories: every repository it owns,
+ * collaborates on, or reaches through organization membership (#6312). Shared with
+ * the `gh` transport, which calls the same path through `gh api`.
+ */
+export function selfReposPath(page: number): string {
+  return `/user/repos?per_page=${REST_PER_PAGE}&page=${page}&sort=pushed&affiliation=owner,collaborator,organization_member`;
+}
+
+/** One mapped page of repositories, plus what the caller needs to page and warn. */
+export interface WritableRepoPage {
+  /** The page's repositories the caller may push to, mapped to the shared shape. */
+  repos: GitHubRepoResult[];
+  /** The RAW row count before filtering — pagination stops on a short raw page. */
+  rawCount: number;
+  /** False when the page had rows but none carried `permissions` (nothing could be filtered). */
+  permissionsReported: boolean;
+}
+
+/**
+ * One repository listing (#6326): the repositories the caller may push to, plus whether the
+ * listing stopped at {@link REST_REPO_LIMIT} with more available. The push filter runs before
+ * the cut, so a truncated listing can hold FEWER than the limit — only this flag says so.
+ */
+export interface RepoListing {
+  repos: GitHubRepoResult[];
+  truncated: boolean;
+}
+
+/**
+ * Map one raw `GET /…/repos` page, dropping every repository whose `permissions`
+ * explicitly deny push (#6312). A repository with NO `permissions` object is kept:
+ * a transport that omits the field must never empty the picker.
+ *
+ * 🔴 Page on `rawCount`, never on `repos.length` — a page that loses rows to the
+ * filter is still a full page, and stopping there would silently truncate the list.
+ */
+export function collectWritableRepos(pageItems: unknown): WritableRepoPage {
+  if (!Array.isArray(pageItems)) {
+    return { repos: [], rawCount: 0, permissionsReported: true };
+  }
+  const repos: GitHubRepoResult[] = [];
+  let permissionsReported = pageItems.length === 0;
+  for (const raw of pageItems as Array<RestRepo | null>) {
+    if (raw?.permissions && typeof raw.permissions === "object") {
+      permissionsReported = true;
+    }
+    if (raw?.permissions?.push === false) continue;
+    const mapped = raw ? mapRestRepo(raw) : null;
+    if (mapped) repos.push(mapped);
+  }
+  return { repos, rawCount: pageItems.length, permissionsReported };
 }
 
 /**
  * List the repositories accessible to `account` (`GET /user/repos` when it is
  * the authenticated identity — which is what includes private repos — otherwise
- * `GET /users/{account}/repos`).
+ * `GET /users/{account}/repos`), keeping only those the caller may push to.
  *
- * Pages until {@link REST_REPO_LIMIT} so the ceiling matches the `gh repo list
- * --limit 200` the CLI path uses; a short page ends pagination early.
+ * Pages until {@link REST_REPO_LIMIT}, the ceiling every transport shares; a short
+ * raw page ends pagination early.
  */
 export async function fetchReposViaRest(
   token: string,
   account: string,
   authenticatedLogin: string | null,
   fetchImpl: FetchImpl = fetch
-): Promise<GitHubRestResult<GitHubRepoResult[]>> {
+): Promise<GitHubRestResult<RepoListing>> {
   const isSelf =
     authenticatedLogin !== null &&
     account.toLowerCase() === authenticatedLogin.toLowerCase();
 
   const repos: GitHubRepoResult[] = [];
   const maxPages = Math.ceil(REST_REPO_LIMIT / REST_PER_PAGE);
+  let truncated = false;
 
   for (let page = 1; page <= maxPages; page++) {
     const path = isSelf
-      ? `/user/repos?per_page=${REST_PER_PAGE}&page=${page}&sort=pushed&affiliation=owner,collaborator,organization_member`
+      ? selfReposPath(page)
       : `/users/${encodeURIComponent(account)}/repos?per_page=${REST_PER_PAGE}&page=${page}&sort=pushed`;
 
     const result = await githubRequest<RestRepo[]>(path, token, fetchImpl);
     if (!result.ok) return result;
-    const pageItems = Array.isArray(result.data) ? result.data : [];
-    for (const raw of pageItems) {
-      const mapped = mapRestRepo(raw);
-      if (mapped) repos.push(mapped);
-    }
-    // A short page means there is nothing left to fetch.
-    if (pageItems.length < REST_PER_PAGE) break;
+    const pageResult = collectWritableRepos(result.data);
+    repos.push(...pageResult.repos);
+    // A short RAW page means there is nothing left to fetch.
+    if (pageResult.rawCount < REST_PER_PAGE) break;
+    // #6326: the last page we may read came back full, so there may be more past the ceiling.
+    if (page === maxPages) truncated = true;
   }
+  if (repos.length > REST_REPO_LIMIT) truncated = true;
 
-  return { ok: true, data: repos.slice(0, REST_REPO_LIMIT) };
+  return {
+    ok: true,
+    data: { repos: repos.slice(0, REST_REPO_LIMIT), truncated },
+  };
 }
 
 /** One issue, in the shape the issue routes already produce from `gh`. */

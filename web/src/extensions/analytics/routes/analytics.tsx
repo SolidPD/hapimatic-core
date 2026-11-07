@@ -30,6 +30,7 @@ import { AnomalyDetector } from "../components/AnomalyDetector";
 import { TokenBudget } from "../components/TokenBudget";
 import { SessionProfiles } from "../components/SessionProfiles";
 import { ComparisonView } from "../components/ComparisonView";
+import { ThroughputPanel } from "../components/throughput/ThroughputPanel";
 
 const TIME_RANGES: Array<{ label: string; value: string; ms: number }> = [
   { label: "24h", value: "24h", ms: 24 * 60 * 60 * 1000 },
@@ -69,11 +70,14 @@ export default function AnalyticsPage(props?: { onBack?: () => void }) {
   // bounds) stay stable across unrelated re-renders and don't drive an
   // infinite refetch loop. selectedRange is a stable dependency for a fixed
   // timeRange (find over a module-level constant array).
-  const { startTime, comparisonPeriods } = useMemo(() => {
+  const { startTime, comparisonPeriods, throughputRange } = useMemo(() => {
     const now = Date.now();
     const periodMs = selectedRange?.ms ?? 7 * 24 * 60 * 60 * 1000;
     return {
       startTime: selectedRange ? now - selectedRange.ms : undefined,
+      // Issue #6164: the Throughput tab's window (the server snaps it to whole
+      // UTC days); sampled with the same clock so its query keys stay stable.
+      throughputRange: { from: now - periodMs, to: now },
       comparisonPeriods: {
         period1Start: now - 2 * periodMs,
         period1End: now - periodMs,
@@ -195,17 +199,20 @@ export default function AnalyticsPage(props?: { onBack?: () => void }) {
 
           {/* Tabs */}
           <Tabs.Root defaultValue="overview">
-            <Tabs.List className="mb-4 flex gap-1 border-b border-[var(--app-border)]">
+            {/* Scrolls on its own at phone width (five tabs pass 393px), so
+                opening a tab never scrolls the whole page sideways (#6164). */}
+            <Tabs.List className="mb-4 flex gap-1 overflow-x-auto border-b border-[var(--app-border)] scrollbar-none">
               {[
                 { value: "overview", label: "Overview" },
                 { value: "performance", label: "Performance" },
                 { value: "intelligence", label: "Intelligence" },
                 { value: "compare", label: "Compare" },
+                { value: "throughput", label: "Throughput" },
               ].map(tab => (
                 <Tabs.Trigger
                   key={tab.value}
                   value={tab.value}
-                  className="border-b-2 border-transparent px-3 py-2 text-xs font-medium text-[var(--app-muted)] transition-colors hover:text-[var(--app-fg)] data-[state=active]:border-[#5ae6ab] data-[state=active]:text-[#5ae6ab]"
+                  className="shrink-0 whitespace-nowrap border-b-2 border-transparent px-3 py-2 text-xs font-medium text-[var(--app-muted)] transition-colors hover:text-[var(--app-fg)] data-[state=active]:border-[#5ae6ab] data-[state=active]:text-[#5ae6ab]"
                 >
                   {tab.label}
                 </Tabs.Trigger>
@@ -352,6 +359,11 @@ export default function AnalyticsPage(props?: { onBack?: () => void }) {
                   period2Label={currLabel}
                 />
               </section>
+            </Tabs.Content>
+
+            {/* Throughput Tab (issue #6164) — its queries run only while open */}
+            <Tabs.Content value="throughput">
+              <ThroughputPanel api={api} range={throughputRange} />
             </Tabs.Content>
           </Tabs.Root>
         </div>

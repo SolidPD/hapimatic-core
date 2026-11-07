@@ -120,7 +120,7 @@ export type FormStateInput = {
    * shows on a remote target.
    */
   remoteSharedKeysAvailable?: boolean;
-  /** True when the selected target advertises `gateway:openrouter` (#1733). */
+  /** True when the selected target can use OpenRouter: it advertises `gateway:openrouter` (#1733), or is a local target holding the key (#6211). */
   agentSupportsOpenRouter: boolean;
   /** Selected OpenRouter model id (`""` = none); only meaningful for codex + openrouter. */
   selectedModel: string;
@@ -249,6 +249,9 @@ export type FormState = {
   effective: {
     agent: AgentType;
     yolo: boolean;
+    /** Issue #6218: the selected permission mode, sent on the wire whenever it
+     *  is not YOLO-equivalent (`buildSpawnInput`). */
+    permissionMode: PermissionMode;
     /** `false` when `agent !== "claude"`. */
     safeMode: boolean;
     /** `undefined` when `agent !== "claude"`. */
@@ -409,10 +412,17 @@ export function deriveFormState(input: FormStateInput): FormState {
         // #5127 (D9): a remote target shows the selector only for its shared
         // keys (remote accounts are #4425's; the node default is used).
         // (and while a key is picked, so the pick stays visible).
+        // #6211 ruling 12: opencode's field is a disabled placeholder that never
+        // lists keys, so while a picker on this form chooses opencode's key it
+        // would read "No accounts available" beside that key; it is not shown then.
         visible:
-          !input.isRemoteTarget ||
-          input.remoteSharedKeysAvailable === true ||
-          keyBound,
+          (!input.isRemoteTarget ||
+            input.remoteSharedKeysAvailable === true ||
+            keyBound) &&
+          !(
+            input.agent === "opencode" &&
+            (showOpencodePicker || showOpenRouterPicker)
+          ),
         // #3808 Task 5: enabled for every account-binding agent (claude/codex/gemini),
         // not just Claude; opencode (gateway keys) stays disabled + "API Key".
         disabled: busy || !agentBindsAccount,
@@ -466,9 +476,11 @@ export function deriveFormState(input: FormStateInput): FormState {
     },
     effective: {
       agent: input.agent,
-      // #1951 A4: collapse the selected permission mode to the existing spawn
-      // `yolo` boolean (epic A1–A5 frontend-only — the wire still carries `yolo`).
+      // #1951 A4 / #6218: the wire carries both — `yolo` (the YOLO-equivalent
+      // collapse) and, for any other pick, the mode itself, so accept and plan
+      // start in that mode instead of `default`.
       yolo: isYoloEquivalentMode(input.permissionMode),
+      permissionMode: input.permissionMode,
       safeMode: isClaude ? input.safeMode : false,
       // #4568: a key-bound session's launcher is SDK, whatever was picked before.
       launcher: keyBound ? "sdk" : isClaude ? input.launcher : undefined,

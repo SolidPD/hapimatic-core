@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { validateSessionName, SESSION_NAME_MAX_LENGTH } from "@hapi/protocol";
+import { isPinchZoomed } from "@/lib/pinchZoom";
 
 type RenameSessionDialogProps = {
   isOpen: boolean;
@@ -29,6 +30,12 @@ export function RenameSessionDialog(props: RenameSessionDialogProps) {
   // Handle iOS virtual keyboard visibility using visualViewport API
   const updateKeyboardOffset = useCallback(() => {
     if (!window.visualViewport) return;
+
+    // #6213: a pinch-zoom is not a keyboard; no offset while zoomed.
+    if (isPinchZoomed(window.visualViewport)) {
+      setKeyboardOffset(0);
+      return;
+    }
 
     const viewportHeight = window.visualViewport.height;
     const windowHeight = window.innerHeight;

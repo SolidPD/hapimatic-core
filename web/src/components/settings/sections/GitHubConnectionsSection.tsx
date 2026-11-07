@@ -193,6 +193,7 @@ export function GitHubConnectionsSection() {
           <a
             className="inline-flex h-9 items-center rounded-md bg-accent px-3 text-sm font-medium text-[var(--palette-accent-fg)] no-underline"
             href={githubConnectHref(thisPageUrl())}
+            data-guide="github-connect"
           >
             Connect GitHub
           </a>

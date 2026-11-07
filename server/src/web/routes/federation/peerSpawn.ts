@@ -15,6 +15,7 @@ import {
   FederationSpawnBodySchema,
   type FederationApiKeySpawnBody,
 } from "@hapi/protocol";
+import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import type { WebAppEnv } from "../../middleware/auth";
 import { isSafeMachinePath } from "../../../utils/pathSecurity";
 import { expandTilde } from "../../../utils/expandTilde";
@@ -68,6 +69,7 @@ export async function spawnForPeer(
     directory,
     agent,
     yolo,
+    permissionMode,
     claimPort,
     sessionType,
     worktreeName,
@@ -116,6 +118,7 @@ export async function spawnForPeer(
   // is not shared, …) reaches the hub's caller at once and nothing is spawned.
   // No background report is sent for it: the hub returns this answer.
   let apiKeyId: string | undefined;
+  let apiKeyPlacedBy: string | undefined;
   if (mode === "api-key") {
     const ref = (parsed.data as FederationApiKeySpawnBody).apiKeyId;
     const invalid = validateApiKeySpawn({
@@ -147,6 +150,16 @@ export async function spawnForPeer(
     }
     // A key whose home is this node comes back as its bare vault id.
     apiKeyId = resolved.canonicalRef;
+    // Issue #5819: another node is placing this session here on one of THIS
+    // node's keys. Record that with the binding, so every later relaunch
+    // re-checks the key is still shared. The marker is set for every bare
+    // canonical ref and never depends on a peer-supplied field: the federation
+    // token is shared by every peer and `originatingNodeId` is optional, so it
+    // only names the placer for display. A key homed on a third node needs no
+    // marker, because its home re-checks sharing on every call.
+    if (!isQualifiedApiKeyRef(apiKeyId)) {
+      apiKeyPlacedBy = originatingNodeId || "peer";
+    }
   }
 
   // Issue #5879 (three-point spawn checklist, point 2): THIS node holds the
@@ -225,6 +238,10 @@ export async function spawnForPeer(
       directory,
       agent,
       yolo,
+      // Issue #6218: forward the starting permission mode on the peer-incoming
+      // hop (#1262 trap). With `yolo` also omitted, this node's own default
+      // spawn permission mode preference applies at `spawnSession`.
+      permissionMode,
       claimPort: claimPort ?? false,
       sessionType,
       worktreeName,
@@ -279,6 +296,9 @@ export async function spawnForPeer(
       // Issue #5127: the API-key binding on the peer-incoming hop (#1262 trap —
       // un-enumerated here, the session would bill this node's default).
       ...(apiKeyId !== undefined ? { apiKeyId } : {}),
+      // Issue #5819: the cross-node placement marker (#1262 trap — un-enumerated
+      // here, an unshare would never stop this session's relaunches).
+      ...(apiKeyPlacedBy !== undefined ? { apiKeyPlacedBy } : {}),
       claudePath,
     })
     // Issue #2150: a REJECTED spawn takes the same failure branch below (log

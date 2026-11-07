@@ -123,6 +123,9 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* `hidden` still scrolls under scrollIntoView, which a #hash link or the
+   * onboarding wizard's highlight calls, and that slid the header up. */
+  overflow: clip;
 }
 
 /* iOS PWA Keyboard Gap Fix
@@ -489,6 +492,30 @@ textarea[placeholder*="notes"] {
 
 @media (prefers-reduced-motion: reduce) {
   .create-ring-pulse {
+    animation: none;
+  }
+}
+
+/* #6211: the control the first-run wizard's current step points at. An outline, so
+   it takes no layout space and the real page does not move under the user. */
+@keyframes guide-active-pulse {
+  0%,
+  100% {
+    outline-color: var(--app-accent);
+  }
+  50% {
+    outline-color: color-mix(in srgb, var(--app-accent) 35%, transparent);
+  }
+}
+
+[data-guide-active] {
+  outline: 2px solid var(--app-accent);
+  outline-offset: 2px;
+  animation: guide-active-pulse 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-guide-active] {
     animation: none;
   }
 }

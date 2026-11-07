@@ -2,8 +2,10 @@
 import { feature } from "bun:bundle";
 
 import difftasticArchiveLicense from "../../tools/archives/difftastic-LICENSE" assert { type: "file" };
+import gitLfsArchiveLicense from "../../tools/archives/git-lfs-LICENSE" assert { type: "file" };
 import ripgrepArchiveLicense from "../../tools/archives/ripgrep-LICENSE" assert { type: "file" };
 import difftasticLicense from "../../tools/licenses/difftastic-LICENSE" assert { type: "file" };
+import gitLfsLicense from "../../tools/licenses/git-lfs-LICENSE" assert { type: "file" };
 import ripgrepLicense from "../../tools/licenses/ripgrep-LICENSE" assert { type: "file" };
 
 export interface EmbeddedAsset {
@@ -20,8 +22,10 @@ function asset(relativePath: string, sourcePath: string): EmbeddedAsset {
 
 const COMMON_ASSETS: EmbeddedAsset[] = [
   asset("tools/archives/difftastic-LICENSE", difftasticArchiveLicense),
+  asset("tools/archives/git-lfs-LICENSE", gitLfsArchiveLicense),
   asset("tools/archives/ripgrep-LICENSE", ripgrepArchiveLicense),
   asset("tools/licenses/difftastic-LICENSE", difftasticLicense),
+  asset("tools/licenses/git-lfs-LICENSE", gitLfsLicense),
   asset("tools/licenses/ripgrep-LICENSE", ripgrepLicense),
 ];
 
@@ -30,11 +34,15 @@ async function selectEmbeddedAssets(): Promise<EmbeddedAsset[]> {
     const [
       { default: difftasticArm64Darwin },
       { default: ripgrepArm64Darwin },
+      { default: gitLfsArm64Darwin },
     ] = await Promise.all([
       import("../../tools/archives/difftastic-arm64-darwin.tar.gz", {
         assert: { type: "file" },
       }),
       import("../../tools/archives/ripgrep-arm64-darwin.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/git-lfs-arm64-darwin.tar.gz", {
         assert: { type: "file" },
       }),
     ]);
@@ -45,36 +53,50 @@ async function selectEmbeddedAssets(): Promise<EmbeddedAsset[]> {
         difftasticArm64Darwin
       ),
       asset("tools/archives/ripgrep-arm64-darwin.tar.gz", ripgrepArm64Darwin),
+      asset("tools/archives/git-lfs-arm64-darwin.tar.gz", gitLfsArm64Darwin),
     ];
   }
 
   if (feature("HAPI_TARGET_DARWIN_X64")) {
-    const [{ default: difftasticX64Darwin }, { default: ripgrepX64Darwin }] =
-      await Promise.all([
-        import("../../tools/archives/difftastic-x64-darwin.tar.gz", {
-          assert: { type: "file" },
-        }),
-        import("../../tools/archives/ripgrep-x64-darwin.tar.gz", {
-          assert: { type: "file" },
-        }),
-      ]);
+    const [
+      { default: difftasticX64Darwin },
+      { default: ripgrepX64Darwin },
+      { default: gitLfsX64Darwin },
+    ] = await Promise.all([
+      import("../../tools/archives/difftastic-x64-darwin.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/ripgrep-x64-darwin.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/git-lfs-x64-darwin.tar.gz", {
+        assert: { type: "file" },
+      }),
+    ]);
     return [
       ...COMMON_ASSETS,
       asset("tools/archives/difftastic-x64-darwin.tar.gz", difftasticX64Darwin),
       asset("tools/archives/ripgrep-x64-darwin.tar.gz", ripgrepX64Darwin),
+      asset("tools/archives/git-lfs-x64-darwin.tar.gz", gitLfsX64Darwin),
     ];
   }
 
   if (feature("HAPI_TARGET_LINUX_ARM64")) {
-    const [{ default: difftasticArm64Linux }, { default: ripgrepArm64Linux }] =
-      await Promise.all([
-        import("../../tools/archives/difftastic-arm64-linux.tar.gz", {
-          assert: { type: "file" },
-        }),
-        import("../../tools/archives/ripgrep-arm64-linux.tar.gz", {
-          assert: { type: "file" },
-        }),
-      ]);
+    const [
+      { default: difftasticArm64Linux },
+      { default: ripgrepArm64Linux },
+      { default: gitLfsArm64Linux },
+    ] = await Promise.all([
+      import("../../tools/archives/difftastic-arm64-linux.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/ripgrep-arm64-linux.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/git-lfs-arm64-linux.tar.gz", {
+        assert: { type: "file" },
+      }),
+    ]);
     return [
       ...COMMON_ASSETS,
       asset(
@@ -82,40 +104,55 @@ async function selectEmbeddedAssets(): Promise<EmbeddedAsset[]> {
         difftasticArm64Linux
       ),
       asset("tools/archives/ripgrep-arm64-linux.tar.gz", ripgrepArm64Linux),
+      asset("tools/archives/git-lfs-arm64-linux.tar.gz", gitLfsArm64Linux),
     ];
   }
 
   if (feature("HAPI_TARGET_LINUX_X64")) {
-    const [{ default: difftasticX64Linux }, { default: ripgrepX64Linux }] =
-      await Promise.all([
-        import("../../tools/archives/difftastic-x64-linux.tar.gz", {
-          assert: { type: "file" },
-        }),
-        import("../../tools/archives/ripgrep-x64-linux.tar.gz", {
-          assert: { type: "file" },
-        }),
-      ]);
+    const [
+      { default: difftasticX64Linux },
+      { default: ripgrepX64Linux },
+      { default: gitLfsX64Linux },
+    ] = await Promise.all([
+      import("../../tools/archives/difftastic-x64-linux.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/ripgrep-x64-linux.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/git-lfs-x64-linux.tar.gz", {
+        assert: { type: "file" },
+      }),
+    ]);
     return [
       ...COMMON_ASSETS,
       asset("tools/archives/difftastic-x64-linux.tar.gz", difftasticX64Linux),
       asset("tools/archives/ripgrep-x64-linux.tar.gz", ripgrepX64Linux),
+      asset("tools/archives/git-lfs-x64-linux.tar.gz", gitLfsX64Linux),
     ];
   }
 
   if (feature("HAPI_TARGET_WIN32_X64")) {
-    const [{ default: difftasticX64Win32 }, { default: ripgrepX64Win32 }] =
-      await Promise.all([
-        import("../../tools/archives/difftastic-x64-win32.tar.gz", {
-          assert: { type: "file" },
-        }),
-        import("../../tools/archives/ripgrep-x64-win32.tar.gz", {
-          assert: { type: "file" },
-        }),
-      ]);
+    const [
+      { default: difftasticX64Win32 },
+      { default: ripgrepX64Win32 },
+      { default: gitLfsX64Win32 },
+    ] = await Promise.all([
+      import("../../tools/archives/difftastic-x64-win32.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/ripgrep-x64-win32.tar.gz", {
+        assert: { type: "file" },
+      }),
+      import("../../tools/archives/git-lfs-x64-win32.tar.gz", {
+        assert: { type: "file" },
+      }),
+    ]);
     return [
       ...COMMON_ASSETS,
       asset("tools/archives/difftastic-x64-win32.tar.gz", difftasticX64Win32),
       asset("tools/archives/ripgrep-x64-win32.tar.gz", ripgrepX64Win32),
+      asset("tools/archives/git-lfs-x64-win32.tar.gz", gitLfsX64Win32),
     ];
   }
 

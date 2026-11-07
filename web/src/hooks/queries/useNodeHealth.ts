@@ -22,8 +22,9 @@ function isHttpStatus(error: unknown, status: number): boolean {
 
 /**
  * The detail page stops polling once the health endpoint reports
- * health-disabled (503): a standalone/spoke deployment never enables
- * federation health mid-session, so re-polling would be pure waste. Any other
+ * health-disabled (503): a server with no health aggregator (one built before
+ * #6217; from #6217 every node runs one, local-only on a standalone or spoke)
+ * never gains one mid-session, so re-polling would be pure waste. Any other
  * state (success, 404 unknown-node, generic error) keeps the 30s cadence.
  *
  * Exported as a pure function so the poll-stop is unit-testable without fake
@@ -38,7 +39,7 @@ export type UseNodeHealthResult = {
   isLoading: boolean;
   /** 404 — the nodeId is not in the registry (drives the R2 empty state). */
   isNotFound: boolean;
-  /** 503 — federation health is not enabled (standalone/spoke steady state). */
+  /** 503 — the server runs no health aggregator (a server built before #6217). */
   isDisabled: boolean;
   /** Any other (non-404, non-503) error. */
   isError: boolean;

@@ -34,8 +34,8 @@ export type SystemHealthDisplay = {
  *
  * LOCKED HOOK CONTRACT (coordinated with #1043) — returns `{ color, label, target }`:
  * - FED mode (`pref === "FED"`): color = aggregate worst-case severity, with a
- *   D5 LOCAL-health fallback when the aggregate is unavailable (503 steady-state
- *   on standalone/spoke deployments, or any error); gray `unknown` only when
+ *   D5 LOCAL-health fallback when the aggregate is unavailable (a 503 from a
+ *   server built before #6217, or any error); gray `unknown` only when
  *   local health is ALSO unavailable.
  * - Per-node mode: color = that node's status.
  * - `label` = "FED", else the node label's first 3 chars AS-IS (no uppercasing).
@@ -67,7 +67,7 @@ export function useSystemHealthDisplayTarget(
     } else {
       // D5 fallback — aggregate unavailable: derive from LOCAL health.
       // localHealthStatus is "unknown" (gray) only when local health is also
-      // unavailable, preserving today's standalone behavior.
+      // unavailable, preserving the pre-#6217 standalone behavior.
       color = getStatusColor(localHealthStatus);
     }
   } else {

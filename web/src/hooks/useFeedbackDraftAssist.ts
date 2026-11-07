@@ -34,6 +34,13 @@ export const FEEDBACK_ASSIST_TIMEOUT_MS = 45_000;
  */
 const VERBATIM_OVERLAP_MIN_LEN = 40;
 
+/**
+ * Messages read once per draft request for the transcript scrub (#6190): the
+ * size of the chat's newest page (`useMessages`), which the scrub saw before
+ * the assist's messages observer became cache-only.
+ */
+const PRIOR_CONVERSATION_LIMIT = 50;
+
 const CATEGORY_LABEL: Record<FeedbackCategory, string> = {
   bug: "a bug report",
   feature: "a feature request",
@@ -159,16 +166,36 @@ export function useFeedbackDraftAssist(params: {
   const [draft, setDraft] = useState<string | null>(null);
   const [isDrafting, setIsDrafting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // #6190: the newest messages, read once per draft request outside the query
+  // cache (null while that read is in flight). The scrub needs the prior
+  // conversation even where no messages page is cached (the observer below is
+  // cache-only), and keeping the read out of the cache means it can never
+  // overwrite the prompt's echo.
+  const [fetchedPrior, setFetchedPrior] = useState<DecryptedMessage[] | null>(
+    []
+  );
 
   // In-flight request tracking. Refs (not state) so mutating them never causes
   // a render; the effect below reads `pendingRef.current` fresh on each run.
   const pendingRef = useRef<string | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Poll session state while drafting so `thinking` stays fresh even if an SSE
-  // event is missed (mirrors SessionChat's isActiveSession usage).
-  const { session } = useSession(api, querySessionId, isDrafting);
-  const { messages } = useMessages(api, querySessionId);
+  // #6190: until a draft is requested, read the session's `active` flag from
+  // the cache without fetching, and do not subscribe to its messages at all, so
+  // this hook sends no session/messages request when the form opens (the
+  // diagnostics session read is separate) and does not re-render the chat
+  // behind it. While drafting, fetch and poll the session so
+  // `thinking` stays fresh even if an SSE event is missed (mirrors SessionChat's
+  // isActiveSession usage), and follow its messages CACHE-ONLY: the app-wide SSE
+  // stream upserts the prompt's echo and the reply into that cache. A fetching
+  // observer mounted at the send would refetch every loaded page, and a refetch
+  // that read the server before the prompt landed could overwrite the echo.
+  const { session } = useSession(api, querySessionId, isDrafting, {
+    enabled: isDrafting,
+  });
+  const { messages } = useMessages(api, isDrafting ? querySessionId : null, {
+    enabled: false,
+  });
 
   const available = gateOpen && session?.active === true;
 
@@ -198,6 +225,7 @@ export function useFeedbackDraftAssist(params: {
       setDraft(null);
       setError(null);
       setIsDrafting(true);
+      setFetchedPrior(null);
 
       clearTimer();
       timeoutRef.current = setTimeout(() => {
@@ -208,6 +236,19 @@ export function useFeedbackDraftAssist(params: {
           finish();
         }
       }, FEEDBACK_ASSIST_TIMEOUT_MS);
+
+      // A failed read leaves only the cached messages for the scrub.
+      void Promise.resolve()
+        .then(() =>
+          api.getMessages(sessionId, { limit: PRIOR_CONVERSATION_LIMIT })
+        )
+        .then(
+          res => res?.messages ?? [],
+          (): DecryptedMessage[] => []
+        )
+        .then(prior => {
+          if (pendingRef.current === localId) setFetchedPrior(prior);
+        });
 
       void api
         .sendMessage(sessionId, buildDraftPrompt(notes, category), localId)
@@ -242,14 +283,15 @@ export function useFeedbackDraftAssist(params: {
       .trim();
     if (!replyText) return; // no assistant text yet
     if (session?.thinking === true) return; // still generating — wait
+    if (fetchedPrior === null) return; // the prior-conversation read is in flight
 
-    const priorConversation = messages
+    const priorConversation = [...messages, ...fetchedPrior]
       .filter(m => typeof m.seq === "number" && m.seq < mySeq)
       .map(extractAnyText);
 
     setDraft(scrubDraft(replyText, priorConversation));
     finish();
-  }, [messages, session?.thinking, finish]);
+  }, [messages, fetchedPrior, session?.thinking, finish]);
 
   // Clear in-flight state if the caller disables us (e.g. modal closed) while a
   // request is outstanding, so a stale reply can't populate a reopened modal.

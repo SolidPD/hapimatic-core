@@ -1,5 +1,5 @@
 /**
- * `bun run tools:unpack`: extracts difftastic and ripgrep into cli/tools/unpacked
+ * `bun run tools:unpack`: extracts difftastic, ripgrep and git-lfs into cli/tools/unpacked
  * for a source checkout (the cli tests run it first). Readiness is the compiled
  * binary's own size-manifest check (#5103), so a partial extraction left by a
  * killed run is extracted again (#5125).

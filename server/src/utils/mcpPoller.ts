@@ -124,7 +124,7 @@ function readDisabledServers(projectDir: string): string[] {
   }
 }
 
-function findClaudePath(): string | null {
+export function findClaudePath(): string | null {
   // Check explicit env var
   if (process.env.HAPI_CLAUDE_PATH) {
     const envPath = process.env.HAPI_CLAUDE_PATH;

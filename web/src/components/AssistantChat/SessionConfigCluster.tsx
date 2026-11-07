@@ -14,7 +14,9 @@ import {
   formatModelName,
   MODEL_MODE_LABELS,
   EFFORT_LEVELS,
+  EFFORT_LEVEL_LABELS,
   DEFAULT_EFFORT_LEVEL,
+  clampEffortToModel,
   type PermissionMode,
   type PermissionModeTone,
   type ModelMode,
@@ -150,6 +152,9 @@ const TONE_BOX: Record<PermissionModeTone, string> = {
 const MODEL_BOX_NORMAL =
   "text-[var(--app-link)] bg-[var(--app-link)]/10 border-[var(--app-link)]/30";
 const MODEL_BOX_DOWNGRADED = "text-red-400 bg-red-500/10 border-red-500/30";
+/** Issue #6166: Claude runs a different effort than the session requested. A
+ *  chip tone (not only the effort suffix, which drops at L1 on a phone). */
+const MODEL_BOX_EFFORT_MISMATCH = TONE_BOX.warning;
 
 // Account monogram color + short-name helpers live in the shared
 // `@/components/session/AccountChip` (epic #3285 correction pass 1) so the
@@ -167,6 +172,12 @@ export interface SessionConfigClusterProps {
    *  for a non-claude flavor; undefined for claude. */
   nativeModel?: string;
   effort?: EffortLevel;
+  /** Issue #6166: the effort the Claude process applies (`null` = none; absent =
+   *  not measured), the model the read-back reported, and the effort that
+   *  process was launched with (`null` = none). */
+  appliedEffort?: EffortLevel | null;
+  appliedModel?: string;
+  appliedForEffort?: EffortLevel | null;
   modelDowngraded?: boolean;
   /** Claude account email; undefined for non-Claude (no account chip). */
   accountEmail?: string;
@@ -201,6 +212,9 @@ export function SessionConfigChips(props: {
   /** Issue #3769 (R5): the effort suffix is the model DEFAULT (nothing pinned) —
    *  render it muted as "High (default)" rather than a fabricated pinned "· High". */
   effortIsDefault?: boolean;
+  /** Issue #6166: set when Claude applies a different effort than the session
+   *  requested — the chip takes the warning tone and this text as its title. */
+  effortMismatch?: string;
   modelDowngraded?: boolean;
   accountEmail?: string;
   /** Resolved account nickname (container: `useAccountLabel`); falls back to the
@@ -221,6 +235,7 @@ export function SessionConfigChips(props: {
     modelLabel,
     effortLabel,
     effortIsDefault,
+    effortMismatch,
     modelDowngraded,
     accountEmail,
     accountLabel,
@@ -245,9 +260,20 @@ export function SessionConfigChips(props: {
         {permissionLabel}
       </span>
 
-      {/* Model (+ Effort suffix, dropped at L1) */}
+      {/* Model (+ Effort suffix, dropped at L1). Issue #6166: an effort Claude
+          applies differently from the request takes the warning tone (a
+          downgraded model's red wins). */}
       <span
-        className={`${CHIP_BASE} ${modelDowngraded ? MODEL_BOX_DOWNGRADED : MODEL_BOX_NORMAL} ${dashed}`}
+        className={`${CHIP_BASE} ${
+          modelDowngraded
+            ? MODEL_BOX_DOWNGRADED
+            : effortMismatch
+              ? MODEL_BOX_EFFORT_MISMATCH
+              : MODEL_BOX_NORMAL
+        } ${dashed}`}
+        {...(effortMismatch
+          ? { title: effortMismatch, "aria-label": effortMismatch }
+          : {})}
       >
         {modelLabel}
         {effortLabel && level < 1 ? (
@@ -408,6 +434,9 @@ export function SessionConfigCluster(props: SessionConfigClusterProps) {
     rawModel,
     nativeModel,
     effort,
+    appliedEffort,
+    appliedModel,
+    appliedForEffort,
     modelDowngraded,
     accountEmail,
     apiKeyName,
@@ -458,23 +487,74 @@ export function SessionConfigCluster(props: SessionConfigClusterProps) {
   const modelSupportsEffort =
     effortLevelsForCurrent(modelMode, resolvedModel, rawModel, catalogModels)
       .length > 0;
+  const requestedEffort =
+    effort && EFFORT_LEVELS.includes(effort) ? effort : undefined;
+  // Issue #6166: what the running process applies (read back from Claude). It
+  // is used only while it describes the CURRENT request: the measured process
+  // was launched with the effort now requested. A pick made since then reaches
+  // the process on the next message (the query relaunches), so until then the
+  // chip shows the request, as before #6166. A disconnected or staged session
+  // ignores it — a dead process's level must never describe a new request.
+  const launchMatchesRequest =
+    appliedForEffort !== undefined &&
+    appliedForEffort === (requestedEffort ?? null);
+  const applied: EffortLevel | null | undefined =
+    disconnected ||
+    !launchMatchesRequest ||
+    appliedEffort === undefined ||
+    (appliedEffort !== null && !EFFORT_LEVELS.includes(appliedEffort))
+      ? undefined
+      : appliedEffort;
+  // R7: compare like with like — what the request becomes on the APPLIED model
+  // (Opus 4.6 has no xhigh, so a requested xhigh runs high there by design).
+  // The applied model wins over a raw-model pin: it is what the process runs.
+  const expectedEffort =
+    requestedEffort === undefined
+      ? undefined
+      : clampEffortToModel(
+          requestedEffort,
+          effortLevelsForCurrent(
+            modelMode,
+            resolvedModel,
+            appliedModel ?? rawModel,
+            catalogModels
+          )
+        );
+  const effortMismatch =
+    requestedEffort !== undefined &&
+    applied !== undefined &&
+    applied !== expectedEffort
+      ? `Requested ${EFFORT_LEVEL_LABELS[requestedEffort]}; Claude is running ${
+          applied === null ? "no effort" : EFFORT_LEVEL_LABELS[applied]
+        } (an environment override or the model's supported levels)`
+      : undefined;
+  // The suffix names the APPLIED level once it is measured (never "(default)":
+  // it is what runs); `null` means the process sends none, so no suffix.
+  // Otherwise today's label: the request, else the model default.
   const effortLabel =
-    effort && EFFORT_LEVELS.includes(effort)
-      ? COMPACT_EFFORT_LABELS[effort]
-      : modelSupportsEffort
-        ? COMPACT_EFFORT_LABELS[DEFAULT_EFFORT_LEVEL]
-        : undefined;
+    applied !== undefined
+      ? applied === null
+        ? undefined
+        : COMPACT_EFFORT_LABELS[applied]
+      : requestedEffort
+        ? COMPACT_EFFORT_LABELS[requestedEffort]
+        : modelSupportsEffort
+          ? COMPACT_EFFORT_LABELS[DEFAULT_EFFORT_LEVEL]
+          : undefined;
   // Issue #3769 (R5): the suffix is the MODEL DEFAULT (nothing pinned) when no
   // effort is pinned but the model supports effort. The chip renders it as a
   // muted "High (default)" — never a fabricated pinned "· High" (#2506 D1a binds:
   // the default must be shown, but marked AS a default).
   const effortIsDefault =
-    !(effort && EFFORT_LEVELS.includes(effort)) && modelSupportsEffort;
+    applied === undefined &&
+    requestedEffort === undefined &&
+    modelSupportsEffort;
 
   // Width-affecting content — the ladder re-evaluates whenever this changes. The
   // default variant renders " (default)", so include it in the measure key
-  // (#3769: level 0 gets longer than the plain pinned label).
-  const measureKey = `${permissionLabel}|${modelLabel}|${effortLabel ?? ""}${effortIsDefault ? " (default)" : ""}|${chipEmail ?? ""}${chipLabel ?? ""}|${mcpStatus.connectedCount}|${mcpStatus.hostedCount}|${mcpStatus.needsAuthCount}|${mcpStatus.failedCount}`;
+  // (#3769: level 0 gets longer than the plain pinned label). #6166: the
+  // mismatch tone is part of the key too.
+  const measureKey = `${permissionLabel}|${modelLabel}|${effortLabel ?? ""}${effortIsDefault ? " (default)" : ""}${effortMismatch ? "|mismatch" : ""}|${chipEmail ?? ""}${chipLabel ?? ""}|${mcpStatus.connectedCount}|${mcpStatus.hostedCount}|${mcpStatus.needsAuthCount}|${mcpStatus.failedCount}`;
   const { chipsRef, level } = useOverflowLadder(measureKey);
 
   const handleOpenMcpDetail = () => {
@@ -513,6 +593,7 @@ export function SessionConfigCluster(props: SessionConfigClusterProps) {
         modelLabel={modelLabel}
         effortLabel={effortLabel}
         effortIsDefault={effortIsDefault}
+        effortMismatch={effortMismatch}
         modelDowngraded={modelDowngraded}
         accountEmail={chipEmail}
         accountLabel={chipLabel}

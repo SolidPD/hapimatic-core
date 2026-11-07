@@ -68,8 +68,9 @@ export function nodeStatusRank(status: FederationNodeHealthStatus): number {
 /**
  * Classify a single dimension value into a severity using the lower-edge
  * threshold bands. Null handling is dimension-aware (#1519): a null `latency`
- * (the local node has no network hop) stays "healthy", but a null/non-finite
- * resource dimension (cpu/ram/disk) means its collector FAILED and is surfaced
+ * (the local node has no network hop) stays "healthy", and so does a null `cpu`,
+ * which means no 1-60 s sample window exists yet (#6156). A null/non-finite
+ * `ram`/`disk`, or a non-finite `cpu`, means its collector FAILED and is surfaced
  * as "critical" — a failed sample must never hide behind a "healthy" reading.
  */
 export function classifyDimension(
@@ -77,6 +78,9 @@ export function classifyDimension(
   value: number | null,
   thresholds: FederationHealthThresholds
 ): FederationHealthSeverity {
+  // #6156: a null CPU means no 1-60 s sample window exists yet (the first
+  // seconds after a server start), not a failed collector, so it is neutral.
+  if (value == null && dimension === "cpu") return "healthy";
   if (value == null || !Number.isFinite(value)) {
     return dimension === "latency" ? "healthy" : "critical";
   }
@@ -314,6 +318,12 @@ export interface HealthAggregatorOptions {
   fetchPeerMetrics: (url: string) => Promise<SystemHealthMetrics>;
   localNodeId: string;
   localNodeLabel: string;
+  /**
+   * Node id for the job-registry row; defaults to `localNodeId`. A standalone
+   * node keys its health by "local" (the id the web uses) but its jobs by
+   * "standalone", like every other loop in the process (#6217).
+   */
+  jobNode?: string;
   alertGenerator: AlertEvaluator;
   /** Read accessor for the alert feed (the AlertGenerator's ring buffer). */
   alertSource: AlertSource;
@@ -346,7 +356,7 @@ export class HealthAggregator {
     // sample() unit of work.
     this.loop = new SupervisedLoop({
       name: "health-aggregator",
-      node: opts.localNodeId,
+      node: opts.jobNode ?? opts.localNodeId,
       intervalMs: opts.config.healthPollIntervalMs,
       immediate: true, // sample immediately on start (preserves prior behavior)
       now: this.getNow,

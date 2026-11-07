@@ -1,6 +1,7 @@
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig, type Plugin, type UserConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const base = process.env.VITE_BASE_URL || "/";
@@ -35,7 +36,50 @@ if (process.env.SENTRY_AUTH_TOKEN && !isDev) {
 const iconsPath = isDev ? "icons" : "icons-production";
 const appName = isDev ? "Hapimatic DEV" : "Hapimatic";
 
-export default defineConfig({
+/**
+ * The version the bundle embeds as `__APP_VERSION__` (#3491) — the `VERSION` in
+ * `server/src/version.generated.ts`, which is what `/api/version` serves.
+ * Never `web/package.json` (`0.1.0`): the client and server must share the
+ * `1.0.xxxx` scheme or every client reads as out of date. The release build
+ * (`build:single-exe:all`) never regenerates that file, so it is the one
+ * version both sides share at build time.
+ */
+function readAppVersion(): string {
+  const generated = readFileSync(
+    resolve(__dirname, "../server/src/version.generated.ts"),
+    "utf-8"
+  );
+  const match = generated.match(/export const VERSION = '([^']+)'/);
+  if (!match) {
+    throw new Error(
+      "[app-version] server/src/version.generated.ts has no VERSION literal"
+    );
+  }
+  return match[1];
+}
+
+/**
+ * A production build refuses a version.generated.ts that disagrees with the
+ * root package.json (the #1375/#3444 desync): `build:single-exe` regenerates the
+ * file AFTER building the web, so its server would report the package.json
+ * version while this bundle embedded the stale one, and every browser would show
+ * a false "client X · server Y". The dev server only warns.
+ */
+function checkAppVersionParity(version: string, failOnMismatch: boolean): void {
+  const rootPackage = JSON.parse(
+    readFileSync(resolve(__dirname, "../package.json"), "utf-8")
+  ) as { version?: string };
+  if (rootPackage.version === version) return;
+  const message =
+    `[app-version] server/src/version.generated.ts says ${version} but ` +
+    `package.json says ${rootPackage.version}. Run ` +
+    "`bun run server/scripts/generate-version-info.ts` (or a version:* script).";
+  if (failOnMismatch) throw new Error(message);
+  console.warn(message);
+}
+
+/** Everything but the per-build `define` (#3491). */
+const sharedConfig: UserConfig = {
   server: {
     host: true,
     allowedHosts: ["hapidev.weishu.me"],
@@ -138,4 +182,18 @@ export default defineConfig({
     // served as /assets/*.map HTTP responses to end users.
     sourcemap: !!process.env.SENTRY_AUTH_TOKEN && !isDev,
   },
+};
+
+export default defineConfig(({ command }) => {
+  const appVersion = readAppVersion();
+  checkAppVersionParity(appVersion, command === "build");
+  return {
+    ...sharedConfig,
+    // #3491: the bundle's own version, so the footer and the update flow can tell
+    // a stale precached bundle from the server it talks to. Mirrored in
+    // vitest.config.ts; read through getClientVersion() (@/lib/app-version).
+    define: {
+      __APP_VERSION__: JSON.stringify(appVersion),
+    },
+  };
 });

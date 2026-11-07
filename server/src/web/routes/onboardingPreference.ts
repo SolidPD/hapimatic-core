@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { Hono } from "hono";
 import { defineCapability } from "@hapi/protocol";
-import { OnboardingStatePatchSchema } from "@hapi/protocol/schemas";
+import {
+  OnboardingStatePatchSchema,
+  type OnboardingState,
+} from "@hapi/protocol/schemas";
 import { cataloged } from "../../capabilities/cataloged";
+import type { ErrorLogger } from "../../logging/errorLogger";
 import type { WebAppEnv } from "../middleware/auth";
 import {
   effectiveOnboardingState,
   mergeOnboardingPatch,
+  newOnboardingOutcomes,
   readOnboardingState,
   updateOnboardingState,
 } from "../../config/onboardingState";
+
+/** ErrorLogger category of the per-step funnel rows (#6211 R18). */
+export const ONBOARDING_FUNNEL_LOG_CATEGORY = "onboarding-funnel";
 
 const UNREADABLE_ERROR =
   "The settings file cannot be read; the onboarding state was not changed.";
@@ -23,7 +31,9 @@ const UNREADABLE_ERROR =
  * a value that does not parse), so nothing but a stamped or explicitly written
  * `pending` opens the tour. PUT merges a patch over the effective state
  * (`mergeOnboardingPatch`: a dismissal never demotes `completed`), serialized
- * per settings file so overlapping requests cannot lose an update.
+ * per settings file so overlapping requests cannot lose an update. Each outcome it
+ * newly records writes one info row carrying the step, the outcome and the provider
+ * kind only (#6211 R18). The rows stay on this VM.
  * Both answer 503 when the settings file exists but cannot be parsed — that file
  * holds the instance's secrets and must not be rewritten with this one key.
  *
@@ -31,7 +41,8 @@ const UNREADABLE_ERROR =
  * the auth mechanism).
  */
 export function createOnboardingPreferenceRoutes(
-  settingsFile: string
+  settingsFile: string,
+  opts: { errorLogger?: ErrorLogger | null } = {}
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
 
@@ -45,7 +56,7 @@ export function createOnboardingPreferenceRoutes(
         description:
           "Read this instance's in-app onboarding tour state (pending, dismissed or completed, plus the last step reached).",
         whenToUse:
-          "When the web app decides whether to present the first-run tour, or which label the Settings entry shows.",
+          "When the web app decides whether to present the first-run tour.",
         invocation: {
           kind: "rest",
           method: "GET",
@@ -73,7 +84,7 @@ export function createOnboardingPreferenceRoutes(
         domain: "ui",
         surface: "rest",
         description:
-          "Record progress through this instance's in-app onboarding tour (the step reached, a dismissal, or completion).",
+          "Record progress through this instance's first-run onboarding wizard: the step reached, a step's outcome, a close, a restart, or completion.",
         whenToUse:
           "When the user advances, skips or finishes the first-run tour.",
         invocation: {
@@ -102,11 +113,21 @@ export function createOnboardingPreferenceRoutes(
       }
 
       const patch = parsed.data;
-      const result = await updateOnboardingState(settingsFile, stored =>
-        mergeOnboardingPatch(effectiveOnboardingState(stored), patch)
-      );
+      let before: OnboardingState | undefined;
+      const result = await updateOnboardingState(settingsFile, stored => {
+        before = effectiveOnboardingState(stored);
+        return mergeOnboardingPatch(before, patch);
+      });
       if (result.kind === "unreadable") {
         return c.json({ error: UNREADABLE_ERROR }, 503);
+      }
+      if (before) {
+        for (const row of newOnboardingOutcomes(before, result.state)) {
+          opts.errorLogger?.info("onboarding step recorded", {
+            category: ONBOARDING_FUNNEL_LOG_CATEGORY,
+            context: row,
+          });
+        }
       }
       return c.json(result.state);
     }

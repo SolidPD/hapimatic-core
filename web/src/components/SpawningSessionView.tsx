@@ -26,7 +26,7 @@ import { useNavigate } from "@tanstack/react-router";
 import type { ApiClient } from "@/api/client";
 import { LOCAL_NODE_ID, LOCAL_NODE_LABEL } from "@hapi/protocol";
 import { useSessions } from "@/hooks/queries/useSessions";
-import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
+import { useFederationLocalNode } from "@/hooks/queries/useFederatedSessions";
 import { buildReloginToast } from "@/lib/reloginLink";
 import { useToast } from "@/components/Toast";
 import { LoadingState } from "@/components/LoadingState";
@@ -45,6 +45,8 @@ function failureMessage(code: string | undefined, fallback?: string): string {
       return "Spawn failed — the selected account's token expired. Re-login and try again.";
     case "at_capacity":
       return "Spawn failed — the machine is at its session capacity. Free a slot and try again.";
+    case "insufficient_memory":
+      return "Spawn failed — the machine is low on free memory. Stop an idle session or wait for a job to finish, then try again.";
     default:
       return fallback && fallback.trim().length > 0
         ? fallback
@@ -67,7 +69,7 @@ export function SpawningSessionView({
   const { showToast } = useToast();
   // Issue #4461 (R8): this placeholder is the LOCAL optimistic create, so the
   // node that refused an account_unrefreshable spawn is the UI host.
-  const { localNode } = useFederatedSessions(api);
+  const { localNode } = useFederationLocalNode(api);
 
   // The placeholder row (id === tag === hapiSessionId) while spawning/failed.
   const placeholder = sessions.find(s => s.id === placeholderId);

@@ -18,6 +18,7 @@ import {
 } from "@/agent/projection/mcp";
 import { startHappyServer } from "@/claude/utils/startHappyServer";
 import { configuration } from "@/configuration";
+import { buildDocsPointer } from "@/utils/hapimaticDocsPointer";
 import { renderTier0, capabilityCatalogIndex } from "@hapi/protocol";
 import { getHappyCliCommand } from "@/utils/spawnHappyCLI";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
@@ -27,6 +28,8 @@ import { bootstrapSession } from "@/agent/sessionFactory";
 import { fireSessionEnd, fireSessionStart } from "@/ext/lifecycle";
 import { reportScorecardRun } from "@/agent/scorecardRunReporter";
 import { NO_META_TEARDOWN } from "@/api/rpc/types";
+import type { PermissionMode } from "@hapi/protocol/modes";
+import { stampSpawnPosture } from "./spawnPostureStamp";
 
 function emitReadyIfIdle(props: {
   queueSize: () => number;
@@ -45,15 +48,22 @@ function emitReadyIfIdle(props: {
  * block on the FIRST turn only (issue #3748, Sub H, R6). Gemini/opencode (ACP)
  * have no system-prompt carrier, so Tier-0 rides a leading USER-turn text block;
  * it lands in transcript history and does NOT survive a transcript trim. Gated
- * by the HAPI_CAPABILITY_TIER0 kill-switch (R8). Pure + exported for unit testing.
+ * by the HAPI_CAPABILITY_TIER0 kill-switch (R8). The #6219 docs pointer (built
+ * once by the caller) follows on the same first turn, with or without Tier-0.
+ * `tier0Sent` means "the first-turn blocks were sent". Pure + exported for unit
+ * testing.
  */
 export function buildAgentPromptContent(
   message: string,
-  tier0AlreadySent: boolean
+  tier0AlreadySent: boolean,
+  docsPointer = ""
 ): { content: PromptContent[]; tier0Sent: boolean } {
   const content: PromptContent[] = [];
   if (!tier0AlreadySent && configuration.capabilityTier0Enabled) {
     content.push({ type: "text", text: renderTier0(capabilityCatalogIndex) });
+  }
+  if (!tier0AlreadySent && docsPointer) {
+    content.push({ type: "text", text: docsPointer });
   }
   content.push({ type: "text", text: message });
   return { content, tier0Sent: true };
@@ -85,6 +95,10 @@ export function resolveAcpProvider(
 export async function runAgentSession(opts: {
   agentType: string;
   startedBy?: "daemon" | "terminal";
+  /** Issue #6218: the posture this process was spawned with (`yolo` or
+   *  `default` — these harnesses fix it at spawn), stamped into
+   *  `metadata.permissionMode` so a respawn does not relaunch in YOLO. */
+  permissionMode?: PermissionMode;
 }): Promise<void> {
   const initialState: AgentState = {
     controlledByUser: false,
@@ -95,6 +109,7 @@ export async function runAgentSession(opts: {
     workingDirectory: process.cwd(),
     agentState: initialState,
   });
+  stampSpawnPosture(session, opts.permissionMode);
 
   session.updateAgentState(currentState => ({
     ...currentState,
@@ -311,9 +326,14 @@ export async function runAgentSession(opts: {
         continue;
       }
 
-      // #3748 (Sub H, R6): prepend Tier-0 on the FIRST turn only (see helper).
+      // #3748 (Sub H, R6): prepend Tier-0 on the FIRST turn only (see helper),
+      // and the #6219 docs pointer with it (read once, on that first turn).
       const { content: promptContent, tier0Sent: nextTier0Sent } =
-        buildAgentPromptContent(batch.message, tier0Sent);
+        buildAgentPromptContent(
+          batch.message,
+          tier0Sent,
+          tier0Sent ? "" : buildDocsPointer()
+        );
       tier0Sent = nextTier0Sent;
 
       thinking = true;

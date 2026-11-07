@@ -441,6 +441,9 @@ export class ApiMachineClient {
           approvedNewDirectoryCreation,
           agent,
           yolo,
+          // Issue #6218: the starting permission mode (#1262 trap — un-listed
+          // here, the daemon never emits --hapi-permission-mode).
+          permissionMode,
           claimPort,
           token,
           sessionType,
@@ -463,6 +466,8 @@ export class ApiMachineClient {
           // (#1262 trap — un-listed here, the session spawns on the node default).
           apiKeyId,
           apiKeyMasked,
+          // Issue #5819: the cross-node placement marker (#1262 trap).
+          apiKeyPlacedBy,
           awaitWebhook,
           safeMode,
           launcher,
@@ -513,6 +518,9 @@ export class ApiMachineClient {
           approvedNewDirectoryCreation,
           agent,
           yolo,
+          // Issue #6218: the starting permission mode (#1262 trap — un-listed
+          // here, the daemon never emits --hapi-permission-mode).
+          permissionMode,
           claimPort,
           token,
           sessionType,
@@ -539,6 +547,8 @@ export class ApiMachineClient {
           // (#1262 trap — omit it and the session silently bills the node default).
           apiKeyId,
           apiKeyMasked,
+          // Issue #5819: the cross-node placement marker on the second hop.
+          apiKeyPlacedBy,
           // Issue #1555: forward the await-webhook gate through this second
           // field-by-field RPC hop (rpcGateway → daemon). Same #1262 trap —
           // omit it and the daemon never sees the false value.
@@ -1266,8 +1276,10 @@ async function pathExistsOnDisk(path: string): Promise<boolean> {
  *    resolve to the same host base, so the move never crosses trash dirs);
  *  - an existing destination is refused up front (and `recoverWorktree`
  *    re-checks); nothing is deleted or overwritten — `git worktree move` from
- *    the trash is the only mutation, plus removal of that entry's own
- *    `.meta.json`; no branch is created, renamed or deleted.
+ *    the trash is the only mutation (or, for an entry whose working tree disk
+ *    pressure evicted, #6158, `git worktree add` of its kept branch plus a
+ *    restore of its work-in-progress snapshot), plus removal of that entry's
+ *    own `.meta.json`; no branch is created, renamed or deleted.
  */
 export async function recoverWorktreeForOriginalPath(
   originalPath: unknown

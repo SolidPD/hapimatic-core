@@ -16,6 +16,15 @@ import type { ErrorLogger } from "../logging/errorLogger";
 // spawn time to stamp the owning server's message-hook stage into the RPC.
 import { messageHooksEnabled } from "./messageHooks";
 import { spawnSuccessFromRpc, type SpawnSuccess } from "./spawnSuccess";
+import {
+  isRetriableSpawnFailure,
+  spawnCapacityCause,
+  type SpawnCapacityCause,
+} from "./spawnFailureClass";
+export {
+  isRetriableSpawnFailure,
+  type SpawnFailureKind,
+} from "./spawnFailureClass";
 
 /** Default ack timeout for daemon RPC calls (cleanup, list-directory, etc.). */
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
@@ -266,12 +275,11 @@ export class RpcGateway {
           directory: opts.directory,
           agent: opts.agent ?? "claude",
           yolo: opts.yolo,
-          // Issue #1262: forward `claimPort` through the RPC payload. This
-          // payload is constructed field-by-field (not via spread), so any
-          // field NOT enumerated here is silently dropped on the wire —
-          // which is exactly how the original 1262 worker rollout shipped a
-          // broken propagation chain. Tester verified the regression by
-          // observing `claimed_port: null` on a `claimPort: true` spawn.
+          permissionMode: opts.permissionMode, // #6218 (#1262 trap)
+          // Issue #1262: this payload is built field-by-field (not via spread),
+          // so a field NOT enumerated here is silently dropped on the wire — how
+          // the original 1262 rollout shipped a broken chain (`claimed_port:
+          // null` on a `claimPort: true` spawn).
           claimPort: opts.claimPort,
           sessionType: opts.sessionType,
           worktreeName: opts.worktreeName,
@@ -294,6 +302,7 @@ export class RpcGateway {
           // would spawn the session on the node-default subscription instead.
           apiKeyId: opts.apiKeyId,
           apiKeyMasked: opts.apiKeyMasked,
+          apiKeyPlacedBy: opts.apiKeyPlacedBy, // #5819 placement marker (#1262 trap)
           scheduleId: opts.scheduleId,
           claudePath: opts.claudePath,
           // Issue #1633: field-by-field enumeration (#1262 trap) — un-listed
@@ -1163,6 +1172,11 @@ export class RpcGateway {
     return await this.rpcCall(`${machineId}:${method}`, params, timeoutMs);
   }
 
+  /** #6264: a live `/cli` socket now — a stale terminal archive re-checks it. */
+  hasConnectedCli(sessionId: string): boolean {
+    return this.liveCliSocketId(sessionId) !== null;
+  }
+
   /**
    * Enumerate a session's live RPC capabilities for the #2418 read path.
    * Resolves the session's `/cli` socket via socket.io ROOM membership (room
@@ -1179,27 +1193,22 @@ export class RpcGateway {
   getSessionCapabilities(
     sessionId: string
   ): { name: string; meta?: CapabilityMeta }[] | null {
-    const cliNamespace = this.io.of("/cli");
-    const room = cliNamespace.adapter.rooms.get(`session:${sessionId}`);
-    if (!room || room.size === 0) {
-      return null;
-    }
-    // A session has exactly one live `/cli` socket; take the first that resolves.
-    let socketId: string | null = null;
-    for (const id of room) {
-      if (cliNamespace.sockets.get(id)) {
-        socketId = id;
-        break;
-      }
-    }
-    if (socketId === null) {
-      return null;
-    }
+    const socketId = this.liveCliSocketId(sessionId);
+    if (socketId === null) return null;
     return this.rpcRegistry
       .getMethodsForSocket(socketId)
       .map(({ method, meta }) =>
         meta ? { name: method, meta } : { name: method }
       );
+  }
+
+  private liveCliSocketId(sessionId: string): string | null {
+    const cliNamespace = this.io.of("/cli");
+    const room = cliNamespace.adapter.rooms.get(`session:${sessionId}`);
+    for (const id of room ?? []) {
+      if (cliNamespace.sockets.get(id)) return id;
+    }
+    return null;
   }
 
   private async rpcCall(
@@ -1240,48 +1249,6 @@ export class RpcGateway {
 // Issue #2301: bounded retry / wait-for-slot around spawn (reconnect + switch)
 // ---------------------------------------------------------------------------
 
-/** Issue #2301 (Task 1): how a failed spawn should be treated by the retry loop. */
-export type SpawnFailureKind = "capacity" | "transient-rpc" | "deterministic";
-
-/**
- * Issue #2301 (Task 1, R2): classify a failed spawn result so switchAccount +
- * reconnectSession (and any future call site, e.g. #3618) share ONE source of
- * truth for "is this retriable" — avoiding two skills disagreeing about what
- * "transient" means. Promoted from the #1349 daemon-offline include-idiom (used
- * by cleanupTmuxSession / reapRemoteWindow above).
- *
- * Prefers the daemon's structured error `code` when present (D1): the daemon mints
- * `code:"at_capacity"` for the concurrency-cap rejection (#1772) and it is preserved
- * through the spawn-result chain (#2299 switch-path pre-check re-tag + #2300 Task 2
- * reconnect-failure preservation). Falls back to a message substring test otherwise.
- * Everything not matched is `deterministic` (account_not_found, account_unrefreshable,
- * cwd_missing, unsupported-agent, …) → fail fast, zero retries.
- */
-export function isRetriableSpawnFailure(result: {
-  message?: string;
-  code?: string;
-}): { retriable: boolean; kind: SpawnFailureKind } {
-  // Prefer the structured code (D1).
-  if (result.code === "at_capacity") {
-    return { retriable: true, kind: "capacity" };
-  }
-  const msg = result.message ?? "";
-  // Substring fallback for capacity: the daemon's cap message. Some paths carry
-  // only the message (e.g. pendingSpawns.markSpawnFailed) with no code.
-  if (msg.includes("Too many concurrent sessions")) {
-    return { retriable: true, kind: "capacity" };
-  }
-  // Transient RPC faults — the #1349 include-idiom. rpcCall throws these when the
-  // daemon socket drops under CPU starvation; they are retriable once it recovers.
-  if (
-    msg.includes("RPC handler not registered") ||
-    msg.includes("RPC socket disconnected")
-  ) {
-    return { retriable: true, kind: "transient-rpc" };
-  }
-  return { retriable: false, kind: "deterministic" };
-}
-
 /** Issue #2301 (Task 2): the capacity-retry regime, chosen per call site. */
 export type CapacityRetryMode =
   // Poll until `capacityDeadlineMs` (reconnect — the session is already
@@ -1313,7 +1280,12 @@ export interface SpawnWithRetryOptions {
    * live "waiting for a slot…" status (R4). Emitted once (not per poll) to avoid
    * toast spam — the #2299 pre-kill loop's "announce once" precedent.
    */
-  onWaitingForSlot?: (info: { elapsedMs: number; deadlineMs: number }) => void;
+  onWaitingForSlot?: (info: {
+    elapsedMs: number;
+    deadlineMs: number;
+    /** #6156: the session count, or the node's free memory. */
+    cause: SpawnCapacityCause;
+  }) => void;
   /** Route abort signal (`c.req.raw.signal`) — a client disconnect cancels the wait. */
   signal?: AbortSignal;
   /** Injectable for tests (default real timers). */
@@ -1478,6 +1450,7 @@ export async function spawnWithRetry<T extends SpawnResultLike>(
       opts.onWaitingForSlot?.({
         elapsedMs: now() - start,
         deadlineMs: capacityDeadlineMs,
+        cause: spawnCapacityCause(result),
       });
     }
     const remaining = deadline - now();

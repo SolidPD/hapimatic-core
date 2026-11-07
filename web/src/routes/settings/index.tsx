@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import {
   Network, // Federation Health
+  Waypoints, // Network (the VM's tailnet)
   ServerCog, // VMs
   CalendarClock, // System Jobs
   RefreshCw, // Harness Updates
@@ -24,7 +25,7 @@ import {
   ClipboardList, // Harness Scorecard
   Boxes, // Capabilities (#3752)
   ScrollText, // Transcripts (#3839)
-  Compass, // Getting started (#3865, nested under Preferences)
+  Compass, // Onboarding (#6211, nested under Preferences)
   LifeBuoy, // Help (#4371)
   Plug, // Connectors (#4793)
   type LucideIcon,
@@ -43,6 +44,7 @@ import {
 } from "@/hooks/queries/usePorterStatus";
 import { getStorageKey } from "@/lib/storage-keys";
 import { useGitHubConnectionsVisible } from "@/components/settings/sections/GitHubConnectionsSection";
+import { useTailscaleStatus } from "@/hooks/queries/useTailscaleStatus";
 
 /**
  * SettingsLandingPage — the Settings drawer's landing page (Sub-Issue B, #1036;
@@ -60,7 +62,7 @@ import { useGitHubConnectionsVisible } from "@/components/settings/sections/GitH
  * `?drawer=settings` param, dismissing the drawer.
  *
  * The group headings and the two parent rows with sub-rows — Provider Accounts
- * (Provider API Keys) and Preferences (Getting started) — are collapsible. A parent
+ * (Provider API Keys) and Preferences (Onboarding) — are collapsible. A parent
  * row is a SPLIT control: clicking the row itself (icon, label, empty space)
  * navigates to the page, while its trailing chevron is a SEPARATE button with its
  * own hit area that only expands/collapses the sub-rows. Rows without sub-pages
@@ -93,6 +95,7 @@ type AdminRoute =
   | "/settings/preferences"
   | "/settings/notifications"
   | "/settings/connectors"
+  | "/settings/network"
   | "/settings/about"
   | "/settings/extensions"
   | "/settings/configuration"
@@ -171,6 +174,14 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         to: "/settings/connectors",
       },
       {
+        // #6211 R23: join this VM to a tailnet. Hidden where it is unavailable.
+        key: "network",
+        label: "Network",
+        icon: Waypoints,
+        accent: "var(--accent-sky-400)",
+        to: "/settings/network",
+      },
+      {
         key: "timelog",
         // #4906: the operator's label. #4428 renames the page and route; until it
         // lands the route stays /settings/time-log.
@@ -186,17 +197,14 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         accent: "var(--accent-teal-400)",
         to: "/settings/preferences",
         // #4906: Session Handoff and Backup Key are sections on the page with no
-        // menu row. Getting started keeps its row: #3865 keeps the tour's re-entry
-        // in the Settings drawer.
+        // menu row. Onboarding keeps its row, so Restart is easy to find (#6211).
         children: [
           {
-            // #3865: the in-app first-run tour's re-entry (NOT the gateway
-            // #onboarding section, which keeps its own anchor).
-            key: "getting-started",
-            label: "Getting started",
+            key: "onboarding",
+            label: "Onboarding",
             icon: Compass,
             to: "/settings/preferences",
-            hash: "getting-started",
+            hash: "onboarding",
           },
         ],
       },
@@ -450,6 +458,8 @@ export default function SettingsLandingPage() {
   // broker failed to answer). Hidden while the accounts query loads and on any other
   // host, where there is nothing to connect (finding 4793-14).
   const connectorsVisible = useGitHubConnectionsVisible().visible;
+  // #6211: only an answered `unavailable` hides the row, so a failed read cannot.
+  const networkHidden = useTailscaleStatus(api).data?.state === "unavailable";
 
   return (
     <div data-testid="settings-landing-root" className="flex flex-col pb-2">
@@ -467,9 +477,11 @@ export default function SettingsLandingPage() {
               ? feedbackEnabled
               : item.key === "configuration"
                 ? porterExposed
-                : item.key === "connectors"
-                  ? connectorsVisible
-                  : true
+                : item.key === "network"
+                  ? !networkHidden
+                  : item.key === "connectors"
+                    ? connectorsVisible
+                    : true
         );
         if (visibleItems.length === 0) return null;
         const groupCollapsed = Boolean(collapse.groups[group.heading]);

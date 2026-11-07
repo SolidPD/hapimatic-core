@@ -62,7 +62,10 @@ import { getProjectPath } from "./utils/path";
 import { appendMcpConfigArg } from "./utils/mcpConfig";
 import { buildSystemPrompt } from "./utils/systemPrompt";
 import { getDefaultClaudeCodePath } from "./sdk/utils";
-import { applyPreTrustShim } from "./utils/projectMcpConfig";
+import {
+  applyPreTrustShim,
+  preTrustConfigPath,
+} from "./utils/projectMcpConfig";
 import {
   FORBIDDEN_CLAUDE_ARGS,
   buildLauncherEnv,
@@ -624,8 +627,13 @@ export async function claudeTmuxRemote(
 
   // R8/R9/R10 — pre-trust shim. Surgical alternative to
   // --dangerously-skip-permissions, scoped to the cwd. Fast path returns in
-  // <2ms for warm cwds.
-  await applyPreTrustShim(opts.path);
+  // <2ms for warm cwds. #6211: a session bound to CLAUDE_CONFIG_DIR reads that dir's
+  // config, not ~/.claude.json, so that is the one to write, and a dir with none yet
+  // gets one (a tenant VM may have no ~/.claude.json at all).
+  const boundConfigPath = preTrustConfigPath(opts.claudeEnvVars);
+  await applyPreTrustShim(opts.path, boundConfigPath, {
+    createIfMissing: boundConfigPath !== undefined,
+  });
 
   // Build claude args — mirrors the construction logic in `claudePty.ts`
   // so the user-visible behavior is identical regardless of launcher.

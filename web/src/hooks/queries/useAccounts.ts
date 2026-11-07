@@ -70,6 +70,9 @@ export function useAccounts(
    * seed is still running (`"pending"`); `null` otherwise or on an older server. */
   onboardingRegistration: OnboardingRegistration;
   isLoading: boolean;
+  /** #6211: the read has returned. `isLoading` is false while a first fetch is
+   *  paused offline, when the empty list above is not an answer (#6054 SINK-2). */
+  answered: boolean;
   error: string | null;
   refetch: () => Promise<unknown>;
 } {
@@ -93,6 +96,7 @@ export function useAccounts(
     envCredentialPresent: query.data?.envCredentialPresent ?? false,
     onboardingRegistration: query.data?.onboardingRegistration ?? null,
     isLoading: query.isLoading,
+    answered: query.isSuccess,
     error:
       query.error instanceof Error
         ? query.error.message

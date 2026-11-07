@@ -745,7 +745,13 @@ export function createGitHubRoutes(options?: {
             repos: [],
           });
         }
-        return c.json({ success: true, account, repos: result.repos });
+        // #6326: forward the peer's `truncated` (absent from an older peer → complete).
+        return c.json({
+          success: true,
+          account,
+          repos: result.repos,
+          truncated: result.truncated === true,
+        });
       }
 
       const result = await fetchGitHubRepos(account, errorLogger, githubDeps);
@@ -763,6 +769,8 @@ export function createGitHubRoutes(options?: {
         account,
         repos: result.data,
         source: result.source,
+        // #6326: the listing stopped at the cap with more repositories available.
+        truncated: result.truncated === true,
       });
     }
   );

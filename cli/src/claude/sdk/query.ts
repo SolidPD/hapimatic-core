@@ -9,13 +9,16 @@ import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
 import { Stream } from "./stream";
 import {
+  type AppliedSettings,
   type QueryOptions,
   type QueryPrompt,
   type SDKMessage,
   type ControlResponseHandler,
   type SDKControlRequest,
   type ControlRequest,
+  type ContextUsageDetailPayload,
   type ContextUsagePayload,
+  type GetContextUsageRequest,
   type SDKControlResponse,
   type CanCallToolCallback,
   type CanUseToolControlRequest,
@@ -34,6 +37,7 @@ import { buildSdkSpawnEnv } from "@/claude/launcherShared";
 import { killProcessByChildProcess } from "@/utils/process";
 import { readProcStatus } from "@/claude/utils/exitDiagnostics";
 import type { Writable } from "node:stream";
+import { isEffortLevel } from "@hapi/protocol/effort";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
 import { logger } from "@/ui/logger";
 import { appendMcpConfigArg } from "../utils/mcpConfig";
@@ -214,6 +218,54 @@ export function classifyChildExit(
 }
 
 /**
+ * Issue #6170: how long a `detail: "full"` get_context_usage may wait for
+ * Claude Code. Below the server's 30 s RPC timeout (`rpcGateway.ts`), so a
+ * request the caller has already given up on never stays pending here.
+ */
+export const CONTEXT_USAGE_DETAIL_TIMEOUT_MS = 25_000;
+
+/**
+ * Read the get_context_usage payload, which sits at
+ * control_response.response.response (the same double-nest the can_use_tool
+ * response uses). Throws on a malformed shape so a per-turn caller's catch
+ * keeps the last-known value. Issue #1469.
+ */
+function readContextUsageReply(
+  res: SDKControlResponse["response"]
+): Record<string, unknown> & { model: string; maxTokens: number } {
+  const data = (res as { response?: unknown }).response as
+    | Record<string, unknown>
+    | undefined;
+  if (
+    !data ||
+    typeof data.maxTokens !== "number" ||
+    typeof data.model !== "string"
+  ) {
+    throw new Error("get_context_usage returned an unexpected payload shape");
+  }
+  return data as Record<string, unknown> & {
+    model: string;
+    maxTokens: number;
+  };
+}
+
+/** The five fields every caller relies on, with #1469's fallbacks. */
+function normalizeContextUsage(
+  data: Record<string, unknown> & { model: string; maxTokens: number }
+): ContextUsagePayload {
+  return {
+    model: data.model,
+    maxTokens: data.maxTokens,
+    rawMaxTokens:
+      typeof data.rawMaxTokens === "number"
+        ? data.rawMaxTokens
+        : data.maxTokens,
+    totalTokens: typeof data.totalTokens === "number" ? data.totalTokens : 0,
+    percentage: typeof data.percentage === "number" ? data.percentage : 0,
+  };
+}
+
+/**
  * Query class manages Claude Code process interaction
  */
 export class Query implements AsyncIterableIterator<SDKMessage> {
@@ -288,10 +340,12 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
 
             if (message.type === "control_response") {
               const controlResponse = message as SDKControlResponse;
-              const handler = this.pendingControlResponses.get(
-                controlResponse.response.request_id
-              );
+              const requestId = controlResponse.response.request_id;
+              const handler = this.pendingControlResponses.get(requestId);
               if (handler) {
+                // Issue #6166 (in-path): a request gets one answer, so drop
+                // its handler now instead of holding it until the child exits.
+                this.pendingControlResponses.delete(requestId);
                 handler(controlResponse.response);
               }
               continue;
@@ -309,10 +363,22 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
 
             this.inputStream.enqueue(message);
           } catch (e) {
-            logger.debug(
-              `[Query] Failed to parse stdout line: ${e instanceof Error ? e.message : e}`
-            );
-            logger.debug(`[Query] Raw line: ${line}`);
+            // Issue #6166: a control_response can carry a get_settings answer —
+            // the merged settings, env blocks included, which can hold secrets —
+            // so neither its raw line nor the error (a JSON parse error quotes
+            // the offending token) reaches the log; the error class does.
+            if (line.includes('"control_response"')) {
+              logger.debug(
+                `[Query] Failed to handle a control_response line (${
+                  e instanceof Error ? e.name : typeof e
+                }; ${line.length} chars, content redacted)`
+              );
+            } else {
+              logger.debug(
+                `[Query] Failed to parse stdout line: ${e instanceof Error ? e.message : e}`
+              );
+              logger.debug(`[Query] Raw line: ${line}`);
+            }
           }
         }
       }
@@ -377,41 +443,84 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
    * Fetch Claude Code's authoritative context-usage snapshot via the
    * get_context_usage SDK control_request. Unlike mcpToggle (which discards
    * the response), this RETURNS the slim first-order payload — the effective
-   * context window (maxTokens) and live usage. Requires an active query
-   * (Claude Code returns no_active_query when idle); callers fire it on a
-   * turn boundary where a query is provably active. Issue #1469.
+   * context window (maxTokens) and live usage. Claude Code answers whenever
+   * its stdin reader runs, between turns too; there is no idle refusal (the
+   * `no_active_query` code is Hapimatic's own, for "no Claude process
+   * attached"). Sends no `detail`, exactly as before #6170. Issue #1469.
    */
   async getContextUsage(): Promise<ContextUsagePayload> {
     if (!this.childStdin) {
       throw new Error("getContextUsage requires --input-format stream-json");
     }
 
+    const request: GetContextUsageRequest = { subtype: "get_context_usage" };
+    const res = await this.request(request, this.childStdin);
+    return normalizeContextUsage(readContextUsageReply(res));
+  }
+
+  /**
+   * Issue #6170: the full get_context_usage reply (`detail: "full"`) — every
+   * category, memory file, MCP tool and server instruction, agent, skill and
+   * message part Claude Code reports, passed through unchanged with the five
+   * {@link getContextUsage} fields normalized on top. Bounded by
+   * CONTEXT_USAGE_DETAIL_TIMEOUT_MS so a reply that never comes cannot outlive
+   * the server's 30 s RPC timeout.
+   */
+  async getContextUsageDetail(): Promise<ContextUsageDetailPayload> {
+    if (!this.childStdin) {
+      throw new Error(
+        "getContextUsageDetail requires --input-format stream-json"
+      );
+    }
+
+    const request: GetContextUsageRequest = {
+      subtype: "get_context_usage",
+      detail: "full",
+    };
+    const res = await this.request(request, this.childStdin, {
+      timeoutMs: CONTEXT_USAGE_DETAIL_TIMEOUT_MS,
+    });
+    const data = readContextUsageReply(res);
+    return { ...data, ...normalizeContextUsage(data) };
+  }
+
+  /**
+   * Read the effort and model the Claude process actually applies, via the
+   * get_settings control request (issue #6166) — after a CLAUDE_CODE_EFFORT_LEVEL
+   * override (process env or a settings.json env block) and after a model remaps
+   * a level it lacks. It needs no `initialize` request. Returns ONLY
+   * `{ effort, model }`: the answer's `effective` and `sources` carry the merged
+   * settings, `env` blocks included, which can hold secrets, so the raw answer is
+   * never logged or stored. An older binary answers the unknown subtype with an
+   * error control_response, which rejects here. No timeout: the answer can queue
+   * behind a permission prompt. A clean exit rejects a pending request
+   * (cleanupControllers); an aborted or crashed child leaves it unsettled, which
+   * is harmless only because the caller never awaits it (readBackAppliedEffort).
+   */
+  async getAppliedSettings(): Promise<AppliedSettings> {
+    if (!this.childStdin) {
+      throw new Error("getAppliedSettings requires --input-format stream-json");
+    }
+
     const res = await this.request(
-      { subtype: "get_context_usage" } as ControlRequest,
+      { subtype: "get_settings" } as ControlRequest,
       this.childStdin
     );
-    // The usage payload is nested at control_response.response.response — the
-    // same double-nest the can_use_tool response uses. Parse defensively and
-    // throw on a malformed shape so the caller's catch retains last-known.
-    const data = (res as { response?: unknown }).response as
-      | Partial<ContextUsagePayload>
-      | undefined;
-    if (
-      !data ||
-      typeof data.maxTokens !== "number" ||
-      typeof data.model !== "string"
-    ) {
-      throw new Error("get_context_usage returned an unexpected payload shape");
+    // The settings payload is nested at control_response.response.response, the
+    // same double-nest get_context_usage uses.
+    const payload = (res as { response?: unknown }).response;
+    const applied =
+      payload && typeof payload === "object"
+        ? (payload as { applied?: unknown }).applied
+        : undefined;
+    if (!applied || typeof applied !== "object") {
+      return { effort: undefined, model: undefined };
     }
+    const { effort, model } = applied as { effort?: unknown; model?: unknown };
     return {
-      model: data.model,
-      maxTokens: data.maxTokens,
-      rawMaxTokens:
-        typeof data.rawMaxTokens === "number"
-          ? data.rawMaxTokens
-          : data.maxTokens,
-      totalTokens: typeof data.totalTokens === "number" ? data.totalTokens : 0,
-      percentage: typeof data.percentage === "number" ? data.percentage : 0,
+      effort:
+        effort === null ? null : isEffortLevel(effort) ? effort : undefined,
+      model: typeof model === "string" && model.length > 0 ? model : undefined,
     };
   }
 
@@ -469,11 +578,14 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
   }
 
   /**
-   * Send control request to Claude process
+   * Send control request to Claude process. With `timeoutMs`, an unanswered
+   * request is dropped and rejects with code `timeout` (#6170); without it the
+   * request waits for a reply or the process exit, as before.
    */
   private request(
     request: ControlRequest,
-    childStdin: Writable
+    childStdin: Writable,
+    opts?: { timeoutMs?: number }
   ): Promise<SDKControlResponse["response"]> {
     const requestId = Math.random().toString(36).substring(2, 15);
     const sdkRequest: SDKControlRequest = {
@@ -483,7 +595,23 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
     };
 
     return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      if (opts?.timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          this.pendingControlResponses.delete(requestId);
+          reject(
+            new SdkRequestError(
+              `Control request ${request.subtype} timed out after ${opts.timeoutMs} ms`,
+              "timeout"
+            )
+          );
+        }, opts.timeoutMs);
+      }
       this.pendingControlResponses.set(requestId, response => {
+        // A reply settles the request: forget it so the map holds only
+        // requests still waiting (cleanupControllers drains those on exit).
+        this.pendingControlResponses.delete(requestId);
+        if (timer !== undefined) clearTimeout(timer);
         if (response.subtype === "success") {
           resolve(response);
         } else {

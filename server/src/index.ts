@@ -21,10 +21,14 @@ import { Store } from "./store";
 import { TelemetryStore } from "./store/telemetryStore";
 import { setCapabilityTelemetrySink } from "./capabilities/cataloged";
 import { writeBootSelfKnowledge } from "./capabilities/selfKnowledgeBootWriter";
+import { writeBootNodeDocs } from "./support/nodeDocs";
 import { ScorecardStore } from "./store/scorecardStore";
 import { TurnWriteService } from "./store/turns/turnWriteService";
 import { TurnErrorMirrorService } from "./store/turns/turnErrorMirror";
-import { TurnLifecycle } from "./sync/turnLifecycle";
+import {
+  TurnLifecycle,
+  type OrphanWatermarkUnresolved,
+} from "./sync/turnLifecycle";
 import {
   createParseStep,
   lastMessageTsMs,
@@ -40,6 +44,7 @@ import { SyncEngine, type SyncEvent } from "./sync/syncEngine";
 import { QueueDrainObserver } from "./sync/queueDrainObserver";
 import { OrphanGrantObserver } from "./sync/orphanGrantObserver";
 import { SpendLimitNoticeObserver } from "./sync/spendLimitNoticeObserver";
+import { ApiKeyCreditObserver } from "./sync/apiKeyCreditObserver";
 import { createOrphanGrantStep } from "./sync/orphanGrantStep";
 import { createCostStep } from "./sync/costStep";
 import { NotificationHub } from "./notifications/notificationHub";
@@ -50,6 +55,7 @@ import { NotifyPmNotifier } from "./notifications/notifier";
 import { loadSessionFatalConfig } from "./config/sessionFatalConfig";
 import { startWebServer } from "./web/server";
 import { readAutoSelectOptimalAccountPreference } from "./web/routes/preferences";
+import { readDefaultSpawnPermissionModePreference } from "./web/routes/spawnPermissionPreference";
 import { getOrCreateJwtSecret } from "./config/jwtSecret";
 import { createSocketServer } from "./socket/server";
 import { MessageWriteRetryQueue } from "./socket/handlers/cli/messageWriteRetryQueue";
@@ -131,19 +137,21 @@ import { HealthAggregator } from "./federation/healthAggregator";
 import { AlertGenerator } from "./federation/alertGenerator";
 import { AlertRingBuffer } from "./federation/alertRingBuffer";
 import {
+  createLocalOnlyHealthAggregator,
+  resolveHealthAggregatorSettings,
+} from "./federation/healthAggregatorSetup";
+import {
+  CPU_SAMPLER_INTERVAL_MS,
   gatherSystemHealth,
+  recordCpuSample,
   SystemHealthMetricsSchema,
   type SystemHealthMetrics,
 } from "./metrics/systemHealth";
 import { parseEnvInt } from "./utils/rateLimitCounter";
-import {
-  DEFAULT_FEDERATION_HEALTH_THRESHOLDS,
-  FederationHealthThresholdsSchema,
-  JobRegistry,
-  SupervisedLoop,
-} from "@hapi/protocol";
+import { JobRegistry, SupervisedLoop } from "@hapi/protocol";
 import { getSettingsFile, readSettingsOrThrow } from "./config/settings";
 import * as transcriptIndexer from "./services/transcriptIndexer";
+import * as throughput from "./throughput";
 import * as turnMirrorWiring from "./federation/turnMirrorWiring";
 import { JobAlertRouter } from "./systemJobs/jobAlertRouter";
 import {
@@ -198,6 +206,7 @@ let syncEngine: SyncEngine | null = null;
 let queueDrainObserver: QueueDrainObserver | null = null;
 let orphanGrantObserver: OrphanGrantObserver | null = null;
 let spendNoticeObserver: SpendLimitNoticeObserver | null = null;
+let apiKeyCreditObserver: ApiKeyCreditObserver | null = null;
 let initiativeEventObserver: InitiativeEventObserver | null = null;
 let webhookGapDetector: WebhookGapDetector | null = null;
 let turnWriteService: TurnWriteService | null = null;
@@ -238,6 +247,7 @@ let remoteTerminalProxy: RemoteTerminalProxy | null = null;
 // #1963: index.ts maintenance loops are supervised (self-heal + registry rows).
 let cleanupLoop: SupervisedLoop | null = null;
 let walCheckpointLoop: SupervisedLoop | null = null;
+let cpuSamplerLoop: SupervisedLoop | null = null; // #6156
 let notificationPurgeLoop: SupervisedLoop | null = null; // #4913
 let feedbackSinkLoop: SupervisedLoop | null = null; // #2911
 let notificationService: NotificationService | null = null;
@@ -438,14 +448,28 @@ async function main() {
     // Archive session after CLI disconnect grace timeout (Issue #849)
     onArchiveSession: sessionId => {
       // #1603: CLI-disconnect-grace archive is a TERMINAL archive (no respawn
-      // follows) — reap the launcher's hapimatic-remote window B.
-      void syncEngine?.archiveSession(sessionId, { reapRemoteWindow: true });
+      // follows) — reap the launcher's hapimatic-remote window B. #6264: catch
+      // a rejection — Bun exits the process on an unhandled one.
+      syncEngine
+        ?.archiveSession(sessionId, { reapRemoteWindow: true })
+        .catch(error =>
+          errorLogger?.warn(
+            `CLI-disconnect grace: archiveSession failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+            { category: "socket", sessionId }
+          )
+        );
     },
     // Federation: late-bound getters for terminal proxy (hub only)
     getRemoteTerminalProxy: () => remoteTerminalProxy,
     findNodeForSession: sessionId =>
       nodeRegistry?.findNodeForSession(sessionId) ?? null,
   });
+
+  // Issue #5819 (D5 = B): stamp the cross-node placement marker on sessions
+  // another node placed here before the fix. Runs once per database, after this
+  // node's own federation id is known (jobNodeId) and BEFORE the SyncEngine
+  // loads its session cache, so their relaunches re-check the key is shared.
+  store.backfillApiKeyPlacement(jobNodeId === "standalone" ? null : jobNodeId);
 
   syncEngine = new SyncEngine(
     store,
@@ -499,6 +523,14 @@ async function main() {
   orphanGrantObserver.start();
   spendNoticeObserver = new SpendLimitNoticeObserver(syncEngine, errorLogger);
   spendNoticeObserver.start();
+  // API key budgets: a session's "credit balance is too low" stamps its vault
+  // key, so the key's card says "Out of credit" for certain.
+  apiKeyCreditObserver = new ApiKeyCreditObserver(
+    syncEngine,
+    config.settingsFile,
+    errorLogger
+  );
+  apiKeyCreditObserver.start();
 
   // Skill-revamp 3.2 (#2157): the peer-session event observer — the push half of
   // the event-driven PM queue (R4). DEFAULT DISABLED (R7): start() no-ops unless
@@ -679,6 +711,13 @@ async function main() {
   syncEngine.setAutoSelectOptimalAccountReader(() =>
     readAutoSelectOptimalAccountPreference(settingsFile)
   );
+  // Issue #6218: inject the node's default spawn permission mode so
+  // `spawnSession` resolves a request that names no posture (no `yolo`, no
+  // `permissionMode`) to it. Same wiring site and rationale as #3611 above; the
+  // reader fails closed to the shared non-YOLO default and never throws.
+  syncEngine.setDefaultSpawnPermissionModeReader(() =>
+    readDefaultSpawnPermissionModePreference(settingsFile)
+  );
   const federationConfig = loadFederationConfig(settings);
   const federationApiToken = getFederationApiToken(settings);
 
@@ -838,8 +877,45 @@ async function main() {
         costStep: createCostStep(store.getRawDb()),
         // Issue #2248: close orphaned turns at the transcript's last-message
         // timestamp (a strict lower-bound duration) instead of NULL. Fail-open —
-        // `lastMessageTsMs` returns null on any read failure → the sweep floors.
-        orphanWatermarkResolver: ctx => lastMessageTsMs(ctx),
+        // no watermark (missing file, no timestamp) → the sweep floors.
+        // #6264: on a large transcript the read is bounded. A read that could not
+        // reach the watermark (a cap hit) or could not read the file is
+        // "unresolved", not "no watermark": the sweep leaves the duration NULL
+        // for the exact backfill instead of a permanent floor, and it is logged
+        // with session + seq.
+        orphanWatermarkResolver: ctx => {
+          let unresolved: OrphanWatermarkUnresolved | null = null;
+          const wm = lastMessageTsMs({
+            ...ctx,
+            onCapHit: hit => {
+              unresolved = { unresolved: hit.reason };
+              errorLogger?.warn(
+                "orphan watermark: transcript tail cap reached — duration left for the backfill",
+                {
+                  category: "turns-lifecycle",
+                  sessionId: ctx.hapiSessionId ?? null,
+                  context: { seq: ctx.seq ?? null, ...hit },
+                }
+              );
+            },
+            onReadError: error => {
+              unresolved = { unresolved: "read-error" };
+              errorLogger?.warn(
+                "orphan watermark: transcript read failed — duration left for the backfill",
+                {
+                  category: "turns-lifecycle",
+                  sessionId: ctx.hapiSessionId ?? null,
+                  context: {
+                    seq: ctx.seq ?? null,
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  },
+                }
+              );
+            },
+          });
+          return wm === null && unresolved !== null ? unresolved : wm;
+        },
         // Issue #3563: orphaned-grant detection at finalize (the `interrupted` /
         // raw-`errored` abort leg + the R3 clean-end drop). Reads the RAW
         // `event.outcome`; delegates post/drop to the engine (which owns the mint
@@ -979,48 +1055,10 @@ async function main() {
       // READS nodeRegistry.getNodeStates() — it never touches pollNode() (the
       // session-sync hot path). Samples the local node in-process and polls
       // each remote peer's /api/federation/node-metrics with the fed token.
-      const healthPollIntervalMs = parseEnvInt(
-        process.env.HAPI_FED_HEALTH_POLL_MS,
-        30_000
-      );
-      const healthFetchTimeoutMs = parseEnvInt(
-        process.env.HAPI_FED_HEALTH_FETCH_TIMEOUT_MS,
-        8_000
-      );
-      const offlineGraceMult = parseEnvInt(
-        process.env.HAPI_FED_HEALTH_OFFLINE_GRACE_MULT,
-        2
-      );
-      const tsRetentionMinutes = parseEnvInt(
-        process.env.HAPI_FED_HEALTH_TS_RETENTION_MIN,
-        60
-      );
-      const alertCapacity = parseEnvInt(
-        process.env.HAPI_FED_ALERT_BUFFER_CAPACITY,
-        1_000
-      );
-      let healthThresholds = DEFAULT_FEDERATION_HEALTH_THRESHOLDS;
-      if (process.env.HAPI_FED_HEALTH_THRESHOLDS) {
-        try {
-          const parsed = FederationHealthThresholdsSchema.safeParse(
-            JSON.parse(process.env.HAPI_FED_HEALTH_THRESHOLDS)
-          );
-          if (parsed.success) {
-            healthThresholds = parsed.data;
-          } else {
-            console.warn(
-              "[Federation] HAPI_FED_HEALTH_THRESHOLDS invalid shape — using defaults"
-            );
-          }
-        } catch {
-          console.warn(
-            "[Federation] HAPI_FED_HEALTH_THRESHOLDS not valid JSON — using defaults"
-          );
-        }
-      }
+      const healthSettings = resolveHealthAggregatorSettings();
       const healthFedToken = federationApiToken;
       const alertGenerator = new AlertGenerator(
-        new AlertRingBuffer(alertCapacity)
+        new AlertRingBuffer(healthSettings.alertCapacity)
       );
       healthAggregator = new HealthAggregator({
         getNodeStates: () => nodeRegistry?.getNodeStates() ?? [],
@@ -1032,7 +1070,7 @@ async function main() {
           }
           const res = await fetch(url, {
             headers,
-            signal: AbortSignal.timeout(healthFetchTimeoutMs),
+            signal: AbortSignal.timeout(healthSettings.fetchTimeoutMs),
           });
           if (!res.ok) {
             throw new Error(`node-metrics HTTP ${res.status}`);
@@ -1053,12 +1091,7 @@ async function main() {
         localNodeLabel: federationConfig.nodeLabel,
         alertGenerator,
         alertSource: alertGenerator,
-        config: {
-          healthPollIntervalMs,
-          offlineGraceMs: offlineGraceMult * healthPollIntervalMs,
-          tsRetentionMinutes,
-          thresholds: healthThresholds,
-        },
+        config: healthSettings.config,
         jobRegistry,
       });
       healthAggregator.start();
@@ -1067,6 +1100,26 @@ async function main() {
         `[Federation] NodeRegistry + terminal proxy + peer announcer initialized (${federationConfig.role})`
       );
     }
+  }
+
+  // #6217: every node shows its own health. A standalone install (federation
+  // off — every customer VM) and a spoke (role "node") build no aggregator
+  // above, so run a local-only one: it samples this node in-process, keeps its
+  // time series and alerts, and never polls a peer.
+  if (!healthAggregator) {
+    const localIdentity = resolveLocalNodeIdentity(federationConfig);
+    console.log(
+      `[Health] Local-only health aggregator for ${localIdentity.nodeId} (no federation peers)`
+    );
+    healthAggregator = createLocalOnlyHealthAggregator({
+      gatherLocalMetrics: gatherSystemHealth,
+      localNodeId: localIdentity.nodeId,
+      localNodeLabel: localIdentity.nodeLabel,
+      jobNode: jobNodeId,
+      settings: resolveHealthAggregatorSettings(),
+      jobRegistry,
+    });
+    healthAggregator.start();
   }
 
   // Auto-recovery service (#1234, Epic #1231 Sub-Issue C). Constructed AFTER
@@ -1157,6 +1210,13 @@ async function main() {
   // user-vs-operator. Fail-soft by construction (never throws), and `await`-ed so
   // the single small write completes before `listen`, off the request hot path.
   await writeBootSelfKnowledge({ errorLogger });
+
+  // #6219: write the docs of the running version to <HAPI_HOME>/docs/, so every
+  // session on this node can read them from disk (the cli names the folder in
+  // each session's instructions). Same model as the self-knowledge write above:
+  // unconditional, fresh after every update by construction, fail-soft (a docs
+  // defect logs and never stops boot), and before `listen`.
+  writeBootNodeDocs({ dataDir: config.dataDir, version: VERSION, errorLogger });
 
   // #2624 (Sub-Issue B): federation-global settings store + replicator.
   // Constructed unconditionally (mirrors E) so reads work standalone; the
@@ -1391,7 +1451,31 @@ async function main() {
     },
   });
   walCheckpointLoop.start();
+
+  // #6156: keep a recent CPU sample so every health poller gets a 1-60 s window
+  // (calculateCpuUsage returns null without one, never a fake 0).
+  cpuSamplerLoop = new SupervisedLoop({
+    name: "cpu-sampler",
+    node: jobNodeId,
+    intervalMs: CPU_SAMPLER_INTERVAL_MS,
+    immediate: true,
+    registry: jobRegistry,
+    tick: () => recordCpuSample(),
+  });
+  cpuSamplerLoop.start();
   transcriptIndexer.start({ config, jobNodeId, jobRegistry, syncEngine });
+  // Issue #6164 (A1): throughput telemetry loops + the routes' summary service.
+  throughput.start({
+    config,
+    settings,
+    federationConfig,
+    jobNodeId,
+    jobRegistry,
+    store,
+    usageService,
+    getNodeRegistry: () => nodeRegistry,
+    errorLogger,
+  });
 
   turnMirrorWiring.startTurnMirrorPull({
     federationConfig,
@@ -1498,7 +1582,9 @@ async function main() {
     feedbackSinkLoop?.stop();
     notificationPurgeLoop?.stop();
     walCheckpointLoop?.stop();
+    cpuSamplerLoop?.stop();
     transcriptIndexer.stop();
+    throughput.stop(); // issue #6164
     turnMirrorWiring.stopTurnMirrorPull(); // issue #4614
     // #1271: the Telegram bot's stop() moved into the extension's
     // `host.lifecycle.onShutdown` hook, drained further down this handler.
@@ -1540,6 +1626,7 @@ async function main() {
     queueDrainObserver?.stop();
     orphanGrantObserver?.stop();
     spendNoticeObserver?.stop();
+    apiKeyCreditObserver?.stop();
     initiativeEventObserver?.stop();
     syncEngine?.stop();
     sseManager?.stop();

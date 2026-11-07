@@ -62,6 +62,7 @@ import { FileLockTimeoutError } from "@/utils/fileLock";
 import { isTmuxPersistenceEnabled } from "./recoveryIntegration";
 import {
   harnessSupportsPersistence,
+  harnessSupportsPermissionModeSeed,
   harnessSupportsSessionRole,
   harnessSupportsOutputStyle,
 } from "./harnessGates";
@@ -96,7 +97,11 @@ import {
   cloneRepoForSpawn,
 } from "./sessionSpawnerHelpers";
 import type { ProviderId } from "@hapi/protocol";
-import { EFFORT_LEVELS } from "@hapi/protocol";
+import {
+  EFFORT_LEVELS,
+  isYoloEquivalentMode,
+  resolveSpawnPosture,
+} from "@hapi/protocol";
 import {
   fitSpawnEffortToModel,
   resolveNodeSpawnEffort,
@@ -109,6 +114,12 @@ import type {
 import type { TrackedSession } from "./types";
 import type { DaemonContext } from "./daemonContext";
 import type { SessionTracker } from "./sessionTracker";
+import {
+  INSUFFICIENT_MEMORY_CODE,
+  checkSpawnMemoryAdmission,
+  createSpawnReservations,
+  formatInsufficientMemoryMessage,
+} from "./memoryAdmission";
 import { getSpawnPaused } from "./spawnPauseState";
 
 /**
@@ -221,16 +232,30 @@ export function createSessionSpawner(
   const { pidToTrackedSession, pidToAwaiter, shellPidToTrackedSession } = ctx;
   const { computeEffectiveCount, onChildExited, isTmuxWindowWrapperAlive } =
     tracker;
+  // #6156 (S4): fresh spawns this daemon admitted in the last 60 s, each holding a
+  // one-session memory reservation until the new session has grown.
+  const spawnReservations = createSpawnReservations();
 
   // Spawn a new session (sessionId reserved for future --resume functionality)
   // Issue #5202 (U2): the body below records a silent worktree → simple
   // downgrade in `downgrade`; this wrapper puts it on a success result, so the
   // many success returns inside the body need no per-site change.
+  // #6156 (S4): the body also records its memory reservation in `reservation`, and
+  // a spawn that does not succeed gives it back, so a spawn refused by a later
+  // guard (rate limit, blocked cwd, worktree, webhook) holds no memory it never used.
   const spawnSession = async (
     requested: SpawnSessionOptions
   ): Promise<SpawnSessionResult> => {
     const downgrade: { value?: SessionTypeDowngrade } = {};
-    const result = await spawnSessionBody(requested, downgrade);
+    const reservation: { release?: () => void } = {};
+    let result: SpawnSessionResult;
+    try {
+      result = await spawnSessionBody(requested, downgrade, reservation);
+    } catch (err) {
+      reservation.release?.();
+      throw err;
+    }
+    if (result.type !== "success") reservation.release?.();
     return result.type === "success" && downgrade.value
       ? { ...result, sessionTypeDowngrade: downgrade.value }
       : result;
@@ -238,7 +263,8 @@ export function createSessionSpawner(
 
   const spawnSessionBody = async (
     requested: SpawnSessionOptions,
-    downgrade: { value?: SessionTypeDowngrade }
+    downgrade: { value?: SessionTypeDowngrade },
+    reservation: { release?: () => void }
   ): Promise<SpawnSessionResult> => {
     logger.debugLargeJson("[DAEMON RUN] Spawning session", requested);
     // Issue #4349 (R3): a TENANT VM never injects CLAUDE_CODE_OAUTH_TOKEN into a Claude session —
@@ -278,6 +304,9 @@ export function createSessionSpawner(
       // first spawn, carried on a respawn). Resolved against the vault below.
       apiKeyId,
       apiKeyMasked: expectedApiKeyMasked,
+      // Issue #5819: set when another node placed this session here on one of
+      // this node's keys — the vault path below then requires the key shared.
+      apiKeyPlacedBy,
       scheduleId,
       claudePath,
       awaitWebhook,
@@ -318,8 +347,13 @@ export function createSessionSpawner(
     // SDK launcher. Resolved HERE, before the un-pinned veto, the capacity gate and
     // any worktree/tmux work, so a refusal leaves nothing behind. The key itself is
     // never read into this process's output: only its id and mask travel on.
-    let apiKeyBinding: { id: string; masked: string; label: string } | null =
-      null;
+    let apiKeyBinding: {
+      id: string;
+      masked: string;
+      label: string;
+      /** Issue #5819: the cross-node placement marker (vault path only). */
+      placedBy?: string;
+    } | null = null;
     if (apiKeyId) {
       if (requestedAccountUuid || options.token) {
         logger.warn(
@@ -385,6 +419,9 @@ export function createSessionSpawner(
           apiKeyId: vaultKeyId,
           expectedMasked: expectedApiKeyMasked,
           apiKeys: keySettings.apiKeys,
+          // Issue #5819: a session another node placed here may only launch on
+          // this node's key while the key is still shared.
+          requireShared: Boolean(apiKeyPlacedBy),
         });
         if (!resolution.ok) {
           logger.warn(
@@ -400,6 +437,7 @@ export function createSessionSpawner(
           id: vaultKeyId,
           masked: resolution.masked,
           label: resolution.label,
+          ...(apiKeyPlacedBy ? { placedBy: apiKeyPlacedBy } : {}),
         };
         logger.info(
           `[DAEMON RUN] API-key spawn: bills vault key "${resolution.label}" (${resolution.masked}) — no account, no instance token, SDK launcher (#4568)`
@@ -686,6 +724,7 @@ export function createSessionSpawner(
       trackedPids: activeSessionCount,
       activeTmuxWindows: tmuxWindowCount,
       max: maxConcurrent,
+      credited: ownSlotCredited,
     } = await computeEffectiveCount(providedHapiSessionId);
     if (effectiveCount >= maxConcurrent) {
       logger.warn(
@@ -701,6 +740,29 @@ export function createSessionSpawner(
         // account_unrefreshable code slot already carried by the spawn path.
         code: "at_capacity",
       };
+    }
+
+    // Guard: live memory headroom (issue #6156, S4). The count cap above is sized
+    // from the machine's memory at startup; this checks what is free now, so a
+    // burst of spawns cannot pass on a node already at its limit. A resume, or a
+    // respawn whose own slot the capacity gate just credited (its tracked PID, or its
+    // still-active window after the PID left the map), replaces a session's own
+    // process and is never refused here.
+    const isOwnRespawn = !!resumeSessionId || ownSlotCredited;
+    if (!isOwnRespawn) {
+      const refusal = checkSpawnMemoryAdmission({
+        recentAccepted: spawnReservations.count(),
+      });
+      if (refusal) {
+        const errorMessage = formatInsufficientMemoryMessage(refusal);
+        logger.warn(`[DAEMON RUN] Session spawn rejected: ${errorMessage}`);
+        return {
+          type: "error",
+          errorMessage,
+          code: INSUFFICIENT_MEMORY_CODE,
+        };
+      }
+      reservation.release = spawnReservations.record();
     }
 
     // Guard: per-scheduler rate limit (defense-in-depth for runaway schedulers).
@@ -764,9 +826,34 @@ export function createSessionSpawner(
     }
 
     // (`agent` + `spawnProvider` hoisted above the un-pinned veto — #3808.)
-    const yolo = options.yolo !== false;
-    // Issue #1633: Safe Mode spawn flag (default OFF — unlike yolo there is
-    // no !== false inversion) + optional explicit model mode (set by the
+    // Issue #6218: an omitted `yolo` is NO LONGER YOLO. The shared resolver
+    // decides the posture: an explicit `yolo` or `permissionMode` as sent (the
+    // server normally sends both, having applied the node's default spawn
+    // permission mode preference at its choke point), and a request with
+    // neither — a daemon-local control-route spawn, or a server that predates
+    // #6218 — gets the shared one-step-below-YOLO default.
+    const posture = resolveSpawnPosture({
+      yolo: options.yolo,
+      permissionMode: options.permissionMode,
+      flavor: agent,
+    });
+    if (!posture.ok) {
+      logger.warn(`[DAEMON RUN] Session spawn rejected: ${posture.error}`);
+      return { type: "error", errorMessage: posture.error };
+    }
+    const yolo = posture.yolo;
+    // The starting-mode seed (`--hapi-permission-mode`), emitted only for a
+    // harness with runtime permission modes and only for a mode other than
+    // `default` (every harness's natural start) and YOLO (`--yolo` carries it).
+    const spawnPermissionMode =
+      posture.permissionMode !== undefined &&
+      posture.permissionMode !== "default" &&
+      !isYoloEquivalentMode(posture.permissionMode) &&
+      harnessSupportsPermissionModeSeed(agent)
+        ? posture.permissionMode
+        : undefined;
+    // Issue #1633: Safe Mode spawn flag (default OFF) + optional explicit
+    // model mode (set by the
     // server's model-switch respawn). Invalid/default model values degrade
     // to undefined — the session then follows normal default-mode
     // resolution (#1506 entitled pin).
@@ -811,13 +898,17 @@ export function createSessionSpawner(
         ? options.rawModel.trim()
         : undefined;
     // Issue #2456: reasoning-effort level, validated against the effort catalog.
-    // Issue #5879 (three-point spawn checklist, point 3): a FRESH claude spawn
-    // that names no valid effort launches with the node default — env
+    // Issue #5879 (three-point spawn checklist, point 3): a claude spawn that
+    // names no valid effort launches with the node default — env
     // HAPI_DEFAULT_EFFORT (this daemon's unit) > settings.json defaultEffort >
     // xhigh — so it records a real level in metadata.effort instead of running
-    // an unknown binary default. A respawn/resume (`resumeSessionId`) keeps what
-    // its server-side caller re-threads from the session's metadata, and a
-    // non-claude agent is unchanged (its effort axis is separate, #3348).
+    // an unknown binary default (medium on Opus 5.5). Issue #6166 (L2-a, reverses
+    // #5879 D7 for this case only): that includes a respawn/resume
+    // (`resumeSessionId`) that names no effort — a legacy session with no
+    // recorded level, a cleared pin, a transcript resume. A resume that
+    // re-threads its recorded level carries it as a body effort and is
+    // unchanged (no marker). A non-claude agent is unchanged (its effort axis is
+    // separate, #3348).
     let spawnEffort: string | undefined =
       typeof options.effort === "string" &&
       (EFFORT_LEVELS as readonly string[]).includes(options.effort)
@@ -828,30 +919,45 @@ export function createSessionSpawner(
     // the CLI as --hapi-node-default-effort and recorded in
     // metadata.nodeDefaultEffort, so a later model switch can re-fit it.
     let spawnNodeDefaultEffort: string | undefined;
-    if (agent === "claude" && !resumeSessionId) {
-      const resolved = await resolveNodeSpawnEffort(options.effort);
-      if (resolved.source !== "body") spawnNodeDefaultEffort = resolved.level;
-      for (const r of resolved.rejected) {
+    if (agent === "claude") {
+      const bodyEffort = spawnEffort;
+      try {
+        const resolved = await resolveNodeSpawnEffort(options.effort);
+        if (resolved.source !== "body") spawnNodeDefaultEffort = resolved.level;
+        for (const r of resolved.rejected) {
+          logger.warn(
+            `[DAEMON RUN] Ignoring invalid effort "${r.value}" from ${r.source} (#5879)`
+          );
+        }
+        // Issue #6028: fit the default to the pinned model so the session records
+        // the effort the binary actually runs (it remaps an unsupported level and
+        // applies none to a model without effort). `null` ⇒ send no --effort.
+        const fitted = fitSpawnEffortToModel(resolved, {
+          modelEffortLevels: options.modelEffortLevels,
+          rawModel: spawnRawModel,
+          modelMode: spawnModelMode,
+        });
+        spawnEffort = fitted.level ?? undefined;
+        logger.info(
+          `[DAEMON RUN] Spawn effort: ${fitted.level ?? "none"} (source=${resolved.source}${
+            fitted.clampedFrom
+              ? `, clamped from ${fitted.clampedFrom} for model ${spawnRawModel ?? spawnModelMode ?? "default"} via ${fitted.levelsSource} levels`
+              : ""
+          }${resumeSessionId ? ", resume" : ""}) (#5879, #6028, #6166)`
+        );
+      } catch (error) {
+        // Issue #6166: a resume is a recovery path (Fallback Preservation Rule),
+        // so a failure resolving the default launches it as before — with its
+        // body effort, or none — instead of failing the respawn.
+        if (!resumeSessionId) throw error;
+        spawnEffort = bodyEffort;
+        spawnNodeDefaultEffort = undefined;
         logger.warn(
-          `[DAEMON RUN] Ignoring invalid effort "${r.value}" from ${r.source} (#5879)`
+          `[DAEMON RUN] Could not resolve the node default effort for a resume; launching with ${bodyEffort ?? "no effort"} (#6166): ${
+            error instanceof Error ? error.message : String(error)
+          }`
         );
       }
-      // Issue #6028: fit the default to the pinned model so the session records
-      // the effort the binary actually runs (it remaps an unsupported level and
-      // applies none to a model without effort). `null` ⇒ send no --effort.
-      const fitted = fitSpawnEffortToModel(resolved, {
-        modelEffortLevels: options.modelEffortLevels,
-        rawModel: spawnRawModel,
-        modelMode: spawnModelMode,
-      });
-      spawnEffort = fitted.level ?? undefined;
-      logger.info(
-        `[DAEMON RUN] Spawn effort: ${fitted.level ?? "none"} (source=${resolved.source}${
-          fitted.clampedFrom
-            ? `, clamped from ${fitted.clampedFrom} for model ${spawnRawModel ?? spawnModelMode ?? "default"} via ${fitted.levelsSource} levels`
-            : ""
-        }) (#5879, #6028)`
-      );
     }
     // Issue #3348: bundled non-claude native model selection. Interpreted per
     // AGENT below: gemini → GEMINI_MODEL env (direct path); codex ChatGPT-token →
@@ -1762,6 +1868,9 @@ export function createSessionSpawner(
         directory: spawnDirectory,
         agent,
         yolo,
+        // Issue #6218: the starting-mode seed rides the persisted claudeArgs, so
+        // a daemon recovery relaunches with it too.
+        permissionMode: spawnPermissionMode,
         safeMode,
         modelMode: spawnModelMode,
         effort: spawnEffort,
@@ -1823,6 +1932,10 @@ export function createSessionSpawner(
             ? {
                 HAPI_API_KEY_ID: apiKeyBinding.id,
                 HAPI_API_KEY_MASKED: apiKeyBinding.masked,
+                // Issue #5819: the wrapper re-checks sharing at every launch.
+                ...(apiKeyBinding.placedBy
+                  ? { HAPI_API_KEY_PLACED_BY: apiKeyBinding.placedBy }
+                  : {}),
               }
             : {}),
           // Issue #1660: per-session launcher override → resolver env tier wins.
@@ -2624,6 +2737,10 @@ export function createSessionSpawner(
           ...extraEnv,
           HAPI_API_KEY_ID: apiKeyBinding.id,
           HAPI_API_KEY_MASKED: apiKeyBinding.masked,
+          // Issue #5819: the cross-node placement marker on the direct arm too.
+          ...(apiKeyBinding.placedBy
+            ? { HAPI_API_KEY_PLACED_BY: apiKeyBinding.placedBy }
+            : {}),
         };
       }
 
@@ -2727,6 +2844,13 @@ export function createSessionSpawner(
       // CLI flag is skipped for opencode.
       if (yolo && agent !== "opencode") {
         args.push("--yolo");
+      }
+      // Issue #6218: the starting permission mode (claude / codex only; see
+      // spawnPermissionMode). Hapimatic-internal, parsed by the agent command,
+      // never forwarded to the child as-is. After --started-by (doctor's
+      // isDaemonStarted reads argv positionally).
+      if (spawnPermissionMode) {
+        args.push("--hapi-permission-mode", spawnPermissionMode);
       }
       // Issue #1633: Safe Mode + explicit model mode (mirror the tmux path)
       if (safeMode) {

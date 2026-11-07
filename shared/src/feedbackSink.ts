@@ -282,10 +282,17 @@ export const FeedbackInboxItemSchema = CentralFeedbackRowSchema.extend({
 });
 export type FeedbackInboxItem = z.infer<typeof FeedbackInboxItemSchema>;
 
-/** `200` body of `GET /feedback-inbox`; `total` counts under the same filters. */
+/**
+ * `200` body of `GET /feedback-inbox`; `total` counts under the same filters.
+ * `skipped` (#5858 R3) counts rows on this page left out because they could not
+ * be read (the gateway's stored row, or a row an older node's schema rejects).
+ * It defaults to 0, so an older gateway's body stays valid and an older node
+ * strips the key.
+ */
 export const FeedbackInboxListSchema = z.object({
   items: z.array(FeedbackInboxItemSchema),
   total: z.number().int().min(0),
+  skipped: z.number().int().min(0).default(0),
 });
 export type FeedbackInboxList = z.infer<typeof FeedbackInboxListSchema>;
 
@@ -331,6 +338,15 @@ export const FeedbackConflictSchema = z.object({
   current: FeedbackInboxItemSchema,
 });
 export type FeedbackConflict = z.infer<typeof FeedbackConflictSchema>;
+
+/**
+ * CANONICAL ONLY — no gateway replica, not in the parity fixtures (#5858 R3).
+ * The instance→browser `200` body of `PATCH /api/feedback/inbox/:id` when the
+ * gateway stored the change but this node cannot read the returned row (the
+ * gateway is newer). The gateway never sends it.
+ */
+export const FeedbackPatchSavedSchema = z.object({ saved: z.literal(true) });
+export type FeedbackPatchSaved = z.infer<typeof FeedbackPatchSavedSchema>;
 
 /**
  * The matrix's per-target requirements, checked before any write: `dismissed`

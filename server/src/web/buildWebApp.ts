@@ -20,10 +20,9 @@
  * and calls this.
  */
 import { Hono } from "hono";
-import { defineCapability, resolveModelEffortLevels } from "@hapi/protocol";
+import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../capabilities/cataloged";
 import { cors } from "hono/cors";
-import { logger } from "hono/logger";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -73,6 +72,9 @@ import {
 import type { AvailabilityContext } from "@hapi/protocol";
 import { SessionService } from "../services/sessionService";
 import { createAccountsRoutes, triggerProviderImport } from "./routes/accounts";
+import { createAccountsNativeLoginCodeRoutes } from "./routes/accountsNativeLoginCode";
+import { createNetworkRoutes } from "./routes/network";
+import { TailscaleJoinService } from "../services/tailscaleJoinService";
 import { readProviderAuthState } from "../services/providerAuthState";
 import { CodexLoginService } from "../services/codexLoginService";
 import { readSettings } from "../config/settings";
@@ -150,6 +152,7 @@ import { liveSessionIdSet } from "../store/fileClaimLifecycle";
 import { createErrorLogRoutes } from "./routes/errorLogs";
 import { createPreferencesRoutes } from "./routes/preferences";
 import { createOnboardingPreferenceRoutes } from "./routes/onboardingPreference";
+import { createSpawnPermissionPreferenceRoutes } from "./routes/spawnPermissionPreference";
 import { createClaudeModelsRoutes } from "./routes/claudeModels";
 import { createOutputStylesRoutes } from "./routes/outputStyles";
 import { createHarnessManifestsRoutes } from "./routes/harnessManifests";
@@ -168,6 +171,10 @@ import { createPorterKeyRoutes } from "./routes/porterKey";
 import { createPorterStatusRoutes } from "./routes/porterStatus";
 import { createPorterExposureGate } from "./middleware/porterExposure";
 import { createRemoteSessionAvailabilityGuard } from "./middleware/remoteSessionAvailability";
+import {
+  createRequestLogger,
+  resolveRequestLogConfig,
+} from "./middleware/requestLog";
 import { createBackupIdentityRoutes } from "./routes/backupIdentity";
 import { createBackupPromptPreferenceRoutes } from "./routes/backupPromptPreference";
 import {
@@ -184,6 +191,11 @@ import {
   createTelemetryRoutes,
   createTelemetryIngestRoute,
 } from "./routes/telemetry";
+import { createThroughputRoutes } from "./routes/throughput";
+import {
+  getThroughputOwnerNamespace,
+  getThroughputSummary,
+} from "../throughput/runtime";
 import {
   createScorecardRoutes,
   createScorecardIngestRoute,
@@ -207,7 +219,6 @@ import { pollMcpStatusOnDemand } from "../utils/mcpPoller";
 import type { Store } from "../store";
 import type { ErrorLogger } from "../logging/errorLogger";
 import { HTTPException } from "hono/http-exception";
-import { scrubString } from "../sentry";
 import { devManifestResponse, MANIFEST_PATH } from "./instanceManifest";
 import {
   createCompanionHelperRoutes,
@@ -432,18 +443,15 @@ export function buildWebApp(options: {
     return c.json({ error: "Internal Server Error" }, 500);
   });
 
-  // #1062 M-2: Hono's default `logger()` prints the full request URL —
-  // including query params — to stdout. If a client sends `?token=...`,
-  // the bearer token lands in the systemd journal. We pass a custom
-  // `printFn` that scrubs known token shapes (?token=, Bearer X, JWT)
-  // from every log line before stdout. See `scrubString` in `sentry.ts`.
-  const scrubbingLogger = (message: string, ...rest: string[]): void => {
-    const scrubbed = rest.map(r =>
-      typeof r === "string" ? scrubString(r) : r
-    );
-    console.log(scrubString(message), ...scrubbed);
-  };
-  app.use("*", logger(scrubbingLogger));
+  // #6158 D1: one line per request, only for status >= 400 or a slow request
+  // (HAPI_REQUEST_LOG / HAPI_REQUEST_LOG_SLOW_MS, read once at boot). Federation
+  // polling used to put ~13,700 lines an hour into the journal and syslog.
+  // Every printed line is scrubbed whole (#1062 M-2) — see requestLog.ts.
+  const requestLogConfig = resolveRequestLogConfig();
+  for (const warning of requestLogConfig.warnings) {
+    console.warn(`[request-log] ${warning}`);
+  }
+  app.use("*", createRequestLogger({ cfg: requestLogConfig }));
 
   // Health check endpoint (no auth required)
   app.get("/health", c => c.json({ status: "ok" }));
@@ -674,11 +682,11 @@ export function buildWebApp(options: {
   // levels from THIS node's catalog (one instance — the same one behind
   // GET /api/claude/models). Wired here, not in index.ts, because this file owns
   // the catalog. Issue #6070: modelsForSpawn() is peekModels() except in the boot
-  // window, where it waits (bounded) on a fetch already in flight.
-  options.getSyncEngine()?.setModelEffortLevelsResolver(async pin => {
-    const { models, source } = await claudeModelCatalog.modelsForSpawn();
-    return resolveModelEffortLevels(models, source, pin);
-  });
+  // window, where it waits (bounded) on a fetch already in flight. Issue #6166: a
+  // resume asks with `wait: false` and reads peekModels() — it never waits.
+  options
+    .getSyncEngine()
+    ?.setModelEffortLevelsResolver(claudeModelCatalog.effortLevelsResolver());
 
   // Issue #3806 (epic #3345): the LOCAL-node provider auth-state reader, shared by
   // the local /api/accounts/provider-auth-state route and the federation
@@ -1228,6 +1236,23 @@ export function buildWebApp(options: {
       errorLogger: options.errorLogger,
     })
   );
+  // #6211: one instance, because it holds the one-join-at-a-time guard.
+  const tailscaleJoinService = new TailscaleJoinService({
+    deviceName: configuration.handoffAudience,
+  });
+  app.route(
+    "/api",
+    createNetworkRoutes({
+      getTailscaleJoinService: () => tailscaleJoinService,
+    })
+  );
+  app.route(
+    "/api",
+    createAccountsNativeLoginCodeRoutes({
+      getLoginService: () => accountLoginService,
+      getUsageService: () => usageService,
+    })
+  );
   app.route(
     "/api",
     createAccountsRoutes({
@@ -1547,7 +1572,18 @@ export function buildWebApp(options: {
   // preferences.ts is at its line ceiling). After the JWT gate, like its sibling.
   app.route(
     "/api",
-    createOnboardingPreferenceRoutes(configuration.settingsFile)
+    createOnboardingPreferenceRoutes(configuration.settingsFile, {
+      errorLogger: options.errorLogger,
+    })
+  );
+  // Issue #6218: the node's default spawn permission mode (its own file, like
+  // onboarding). After the JWT gate; the PUT is agent-escalation floored, so it
+  // needs the SyncEngine to resolve the caller session.
+  app.route(
+    "/api",
+    createSpawnPermissionPreferenceRoutes(configuration.settingsFile, {
+      getSyncEngine: options.getSyncEngine,
+    })
   );
   // Issue #2456: live Claude model catalog (authed).
   app.route("/api", createClaudeModelsRoutes(claudeModelCatalog));
@@ -1594,6 +1630,12 @@ export function buildWebApp(options: {
       // every node's shared keys.
       getFederationConfig: () => options.federationConfig,
       getSharedApiKeyService: () => sharedApiKeyService,
+      // API key budgets: each key's metered spend, from this node's turn ledger.
+      getApiKeySpend: () => (apiKeyId, fromMs, toMs) =>
+        options.store.turns.sumApiKeyCost(apiKeyId, fromMs, toMs),
+      // A key revoked at the provider stops showing "Valid": a list read
+      // re-probes a key whose last result is over six hours old.
+      revalidateStaleKeys: true,
     })
   );
   // Issues #4533 and #5165: the Porter exposure gate — exposed by default;
@@ -1677,6 +1719,16 @@ export function buildWebApp(options: {
       })
     );
   }
+
+  // Issue #6164 (A1): throughput telemetry. Always mounted; the routes answer
+  // 503 until the throughput boot module has started (or when it is disabled).
+  app.route(
+    "/api",
+    createThroughputRoutes({
+      getService: getThroughputSummary,
+      getOwnerNamespace: getThroughputOwnerNamespace,
+    })
+  );
 
   // Issue #3128: scorecard rating + admin read + #3132 export — mounted AFTER
   // the JWT middleware (authenticated web client).

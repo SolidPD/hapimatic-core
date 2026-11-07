@@ -77,7 +77,8 @@ export type HarnessAnalysisResponse =
       analyzed_at: number;
     }
   | { status: "failed" }
-  | { status: "at_capacity" };
+  /** #6156: `cause: "memory"` when the node was low on free memory, not slots. */
+  | { status: "at_capacity"; cause?: "memory" };
 
 /**
  * `POST /api/harness/:harnessId/analyze` (#1772) — the trigger outcome. A duplicate
@@ -86,7 +87,7 @@ export type HarnessAnalysisResponse =
  */
 export type TriggerAnalysisResponse =
   | { status: "analyzing"; session_id?: string }
-  | { status: "at_capacity" }
+  | { status: "at_capacity"; cause?: "memory" }
   | { status: "failed" };
 
 /**

@@ -169,6 +169,32 @@ export function applyTurnsMigrations(db: Database): void {
   // tells a pre-change row from a post-change one.
   addColumnIfMissing(db, "turns", "auth_binding_kind", TURNS_ADD_KIND_SQL);
   addColumnIfMissing(db, "turns", "api_key_id", TURNS_ADD_KEY_ID_SQL);
+  // API key budgets: the Accounts page sums each key's metered spend between
+  // top-ups (`TurnStore.sumApiKeyCost`) on every list read. Partial index — only
+  // API-key turns carry an id. Fail-open like every block here.
+  try {
+    if (tableHasColumns(db, "turns", ["api_key_id"])) {
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_turns_api_key_started ON turns(api_key_id, started_at_ms) WHERE api_key_id IS NOT NULL"
+      );
+    }
+  } catch (error) {
+    console.error(
+      "[Store] Migration failed: idx_turns_api_key_started:",
+      error
+    );
+  }
+
+  // ─────────── per-turn throughput facts (issue #6164, epic #6163 A1) ───────────
+  // Canonical JSON (≤ 2,048 bytes) written ONLY by the node-local throughput
+  // facts loop, by compare-and-set on the row's fingerprint columns and with an
+  // `IS NOT` guard, so an identical rewrite never fires the change-seq trigger.
+  // The #4614 feed ships `SELECT *`, so the column replicates to every peer
+  // mirror with no protocol change. It is deliberately NOT in `TurnRow` /
+  // `rowToTurn` (no existing reader sees it). After Claude Code's 30-day
+  // transcript purge the facts cannot be recomputed: this column (and the
+  // peers' mirrored copies of the row) is all that remains of them.
+  addColumnIfMissing(db, "turns", "throughput_json", TURNS_ADD_FACTS_SQL);
 
   // ───────────────────────── turn_events ─────────────────────────
   // Events inside a turn (sub-agents, hooks, labels, errors, compaction). node_id is
@@ -534,6 +560,19 @@ export function applyTurnsMigrations(db: Database): void {
       error
     );
   }
+  // API key budgets: a key shared with the federation (#5127) is spent by
+  // sessions on other nodes, whose turns arrive here as mirror rows. The key
+  // id lives inside `row_json`, so the per-key spend sum needs an expression
+  // index — the expression must match `TurnStore.sumApiKeyCost` exactly.
+  try {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_turn_mirror_api_key
+         ON turn_mirror(${TURN_MIRROR_API_KEY_EXPR}, started_at_ms)
+         WHERE ${TURN_MIRROR_API_KEY_EXPR} IS NOT NULL`
+    );
+  } catch (error) {
+    console.error("[Store] Migration failed: idx_turn_mirror_api_key:", error);
+  }
 
   // ───────────────────────── Views (R2/R9) ─────────────────────────
   // DROP + CREATE each boot so internal SQL evolves without a version bump. The
@@ -712,6 +751,12 @@ export function applyTurnsMigrations(db: Database): void {
 // ─────────────── per-turn billing attribution (issue #4824) ───────────────
 
 /** The two ledger columns #4824 adds to `turns` and `background_agent_usage`. */
+/** The mirror row's vault key id — the ONE expression both the
+ *  `idx_turn_mirror_api_key` index and `TurnStore.sumApiKeyCost` use, so the
+ *  query can use the index. */
+export const TURN_MIRROR_API_KEY_EXPR =
+  "json_extract(row_json, '$.api_key_id')";
+
 export const BINDING_COLUMNS = ["auth_binding_kind", "api_key_id"] as const;
 
 /** One-time backfill markers (`_migration_markers.key`), one per table. */
@@ -723,6 +768,8 @@ export const AGENTS_BINDING_BACKFILL_MARKER =
 const TURNS_ADD_KIND_SQL =
   "ALTER TABLE turns ADD COLUMN auth_binding_kind TEXT";
 const TURNS_ADD_KEY_ID_SQL = "ALTER TABLE turns ADD COLUMN api_key_id TEXT";
+/** Issue #6164: the A1-owned per-turn facts column. */
+const TURNS_ADD_FACTS_SQL = "ALTER TABLE turns ADD COLUMN throughput_json TEXT";
 const AGENTS_ADD_KIND_SQL =
   "ALTER TABLE background_agent_usage ADD COLUMN auth_binding_kind TEXT";
 const AGENTS_ADD_KEY_ID_SQL =

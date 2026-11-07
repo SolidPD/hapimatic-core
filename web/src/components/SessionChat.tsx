@@ -17,10 +17,9 @@ import type { Suggestion } from "@/hooks/useActiveSuggestions";
 import { normalizeDecryptedMessage } from "@/chat/normalize";
 import { isUserMessage } from "@/lib/messages";
 import {
+  getComposerModelProps,
   getEffectiveEffort,
-  getEffectiveRawModel,
   getSessionTitle,
-  isModelDowngraded,
 } from "@/lib/sessionHelpers";
 import { useSessionAccountEmail } from "@/hooks/queries/useSessionAccountEmail";
 import { EditSessionParamsModal } from "@/components/session";
@@ -56,7 +55,7 @@ import { useModelSwitchVerification } from "@/hooks/useModelSwitchVerification";
 import { useUserMessageNavigation } from "@/hooks/useUserMessageNavigation";
 import { useBookmarks } from "@/hooks/useBookmarks";
 import { useBookmarkNavigation } from "@/hooks/useBookmarkNavigation";
-import { useBranchSummary } from "@/hooks/useBranchSummary";
+import { branchStart, useBranchSummary } from "@/hooks/useBranchSummary";
 import { useTextScale } from "@/hooks/useTextScale";
 import { TextScaleControl } from "@/components/TextScaleControl";
 import { useThreadFullscreenMode } from "@/hooks/useThreadFullscreenMode";
@@ -497,7 +496,7 @@ export function SessionChat(props: {
     const separator: NormalizedMessage = {
       id: `branch-separator-${props.session.id}`,
       localId: null,
-      createdAt: props.session.branchCreatedAt ?? Date.now(),
+      createdAt: branchStart(props.session.id, props.session.branchCreatedAt),
       role: "event",
       isSidechain: false,
       content: branchSummary
@@ -1335,12 +1334,9 @@ export function SessionChat(props: {
               // no longer flash the "High" default or the previous turn's
               // resolvedModel in place of the pinned model.
               effort={getEffectiveEffort(props.session)}
-              rawModel={
-                pendingMode ? undefined : getEffectiveRawModel(props.session)
-              }
-              modelDowngraded={
-                pendingMode ? false : isModelDowngraded(props.session)
-              }
+              // rawModel, modelDowngraded and (#6166) the applied effort, all
+              // hidden while a model change is pending.
+              {...getComposerModelProps(props.session, Boolean(pendingMode))}
               onEffortChange={handleEffortChange}
               onRawModelChange={handleRawModelChange}
               onSwitchToRemote={handleSwitchToRemote}

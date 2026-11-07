@@ -673,7 +673,12 @@ export function createInfrastructureRoutes(
       if (!result.ok) {
         return c.json({ type: "error", message: result.reason });
       }
-      return c.json({ type: "success", repos: result.data });
+      // #6326: `truncated` crosses the boundary so the hub's picker can say "N+".
+      return c.json({
+        type: "success",
+        repos: result.data,
+        truncated: result.truncated === true,
+      });
     }
   );
 

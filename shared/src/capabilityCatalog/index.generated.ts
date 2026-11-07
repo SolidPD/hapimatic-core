@@ -1008,7 +1008,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Abandon a started in-VM sign-in; removes its config dir only while it is still empty, never a credential.",
+    "description": "Abandon a started in-VM sign-in; ends its claude child and removes its config dir, or registers the account when the sign-in had already finished and answers with it.",
     "domain": "accounts",
     "id": "accounts.native-login-cancel",
     "invocation": {
@@ -1022,6 +1022,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the user starts the in-VM sign-in over; closing the dialog keeps the sign-in so a reopened dialog resumes it."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "On a tenant VM, pass a pasted authorization code to the unmodified claude binary signing in here, and register the account if it finished. The code is not stored or logged.",
+    "domain": "accounts",
+    "id": "accounts.native-login-code",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/accounts/native-login/code"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a user adding a Claude account on a tenant VM has opened the sign-in page from native-login/start and pasted the code it showed."
   },
   {
     "auth": "jwt",
@@ -1048,7 +1068,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "On a tenant VM, create an empty per-account Claude config dir (or resume the caller's unfinished one) and return the command to run claude there and sign in with /login.",
+    "description": "On a tenant VM, start or resume a Claude sign-in: create a per-account config dir, start the unmodified binary there, and return its sign-in page plus a terminal command.",
     "domain": "accounts",
     "id": "accounts.native-login-start",
     "invocation": {
@@ -1267,7 +1287,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Set a stored provider key's name and monogram in one write; a Gemini key's Google account shows the same identity.",
+    "description": "Set a stored provider key's name, monogram, sharing, budget and monthly top-up in one write; a Gemini key's Google account shows the same identity.",
     "domain": "accounts",
     "id": "accounts.update-api-key",
     "invocation": {
@@ -4283,7 +4303,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "path": "/api/feedback/inbox/:id"
     },
     "probe": "safe",
-    "riskTier": "readonly",
+    "riskTier": "mutating",
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
@@ -4303,7 +4323,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "path": "/api/feedback/inbox"
     },
     "probe": "safe",
-    "riskTier": "readonly",
+    "riskTier": "mutating",
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
@@ -6100,6 +6120,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When rendering the spawn-capacity meter for the local node."
   },
   {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read this node's default spawn permission mode: the posture a new session starts in when the request names none.",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.default-spawn-permission-mode-preference",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/preferences/default-spawn-permission-mode"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When showing the default spawn permission mode or pre-selecting it on the Create page."
+  },
+  {
     "auth": "federation-token",
     "availability": {
       "scope": "operator"
@@ -6518,6 +6558,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To mark a session's tmux window archived-for-reconnect."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Set this node's default spawn permission mode (default, accept, YOLO or plan; each harness gets its equivalent).",
+    "domain": "machine-daemon",
+    "id": "machine-daemon.set-default-spawn-permission-mode-preference",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/preferences/default-spawn-permission-mode"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user changes the default spawn permission mode in Settings."
   },
   {
     "auth": "cli-token",
@@ -9269,7 +9329,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Read the session's live context-window usage (model, window, token count, percentage).",
+    "description": "Read the session's live context-window usage (model, window, token count, percentage). With { \"detail\": \"full\" } it adds the full per-category breakdown, which is large.",
     "domain": "session-introspection",
     "id": "session-introspection.get-context-usage",
     "invocation": {
@@ -11762,6 +11822,132 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "jwt",
     "availability": {
+      "mountedWhen": "getThroughputSummary",
+      "scope": "user"
+    },
+    "description": "Return throughput cost and tokens per account, session or issue for a window, paged at 200 rows, with each account's weekly-quota runway.",
+    "domain": "telemetry",
+    "id": "telemetry.throughput-breakdown",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/telemetry/throughput/breakdown"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When a user asks which account, session or issue used the most tokens or cost in a period."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "getThroughputSummary",
+      "scope": "user"
+    },
+    "description": "Return one stored weekly throughput digest: its markdown report and the full summary it was computed from.",
+    "domain": "telemetry",
+    "id": "telemetry.throughput-digest",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/telemetry/throughput/digests/:id"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When reading a specific weekly throughput digest."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "getThroughputSummary",
+      "scope": "user"
+    },
+    "description": "List the stored weekly throughput digests: window, headline, report path and whether the PM was notified, newest first.",
+    "domain": "telemetry",
+    "id": "telemetry.throughput-digests",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/telemetry/throughput/digests"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When looking for a past weekly throughput digest."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "getThroughputSummary",
+      "scope": "user"
+    },
+    "description": "Return issues closed in a window with lead time, stage hours, escapes, PRs, CI failures, lanes and cost, as JSON or the 28-column lane-backtest CSV, paged.",
+    "domain": "telemetry",
+    "id": "telemetry.throughput-issues",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/telemetry/throughput/issues"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When analysing delivered issues, lead time or lanes, or exporting the lane-backtest dataset."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "getThroughputSummary",
+      "scope": "user"
+    },
+    "description": "Return the throughput summary for a window: API-equivalent cost and cache split by source, stage, model, node and day, context, waits, delivery, quota and coverage.",
+    "domain": "telemetry",
+    "id": "telemetry.throughput-summary",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/telemetry/throughput/summary"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When reporting fleet cost, throughput or coverage for a period without per-account, session, issue or test detail."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "getThroughputSummary",
+      "scope": "user"
+    },
+    "description": "Return failing test units in a window with their CI catches and agents' own failing runs, sessions and first and last seen, paged at 200 rows.",
+    "domain": "telemetry",
+    "id": "telemetry.throughput-tests",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/telemetry/throughput/tests"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When deciding which tests catch problems in CI or locally, or which ones never fail."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
       "scope": "user"
     },
     "description": "Append a manual clock adjustment (adjust, set, reset, undo, disable, or enable) to the time-tracking ledger.",
@@ -12084,6 +12270,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Join this VM to the user's tailnet with an auth key, through the privileged broker. The key goes only into a 0600 file that is removed afterwards.",
+    "domain": "ui",
+    "id": "ui.network-tailscale-join",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/network/tailscale/join"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user pastes a Tailscale auth key on the Network settings page."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read whether this VM is on a tailnet, its tailnet IP and name, and whether it can join one from here. Never the tailnet owner's identity.",
+    "domain": "ui",
+    "id": "ui.network-tailscale-status",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/network/tailscale"
+    },
+    "probe": "skip",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the Network settings page or the first-run wizard shows the VM's tailnet state."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "The create-session page (working dir, account, repo, harness).",
     "domain": "ui",
     "id": "ui.new-session",
@@ -12116,7 +12342,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "When the web app decides whether to present the first-run tour, or which label the Settings entry shows."
+    "whenToUse": "When the web app decides whether to present the first-run tour."
   },
   {
     "auth": "jwt",
@@ -12276,7 +12502,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Record progress through this instance's in-app onboarding tour (the step reached, a dismissal, or completion).",
+    "description": "Record progress through this instance's first-run onboarding wizard: the step reached, a step's outcome, a close, a restart, or completion.",
     "domain": "ui",
     "id": "ui.set-onboarding-preference",
     "invocation": {

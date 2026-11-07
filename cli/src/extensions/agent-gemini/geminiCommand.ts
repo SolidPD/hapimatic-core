@@ -51,7 +51,12 @@ export const geminiCommand: CommandDefinition = {
       await initializeToken();
       await maybeAutoStartServer();
       await authAndSetupMachineIfNeeded();
-      await runAgentSession({ agentType: "gemini", startedBy });
+      // #6218: record the spawn posture so a respawn does not relaunch in YOLO.
+      await runAgentSession({
+        agentType: "gemini",
+        startedBy,
+        permissionMode: yolo ? "yolo" : "default",
+      });
     } catch (error) {
       console.error(
         chalk.red("Error:"),

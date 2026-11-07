@@ -225,6 +225,21 @@ export function isPermissionMode(value: string): value is PermissionMode {
 }
 
 /**
+ * Narrow an unknown value to a {@link ClaudePermissionMode} (#6218). The node's
+ * default spawn permission mode is stored in Claude-tier vocabulary, and the
+ * daemon's `--hapi-permission-mode` seed for a Claude session must be one, so
+ * the CLI seed parser and the web preference hook share this one guard.
+ */
+export function isClaudePermissionMode(
+  value: unknown
+): value is ClaudePermissionMode {
+  return (
+    typeof value === "string" &&
+    (CLAUDE_PERMISSION_MODES as readonly string[]).includes(value)
+  );
+}
+
+/**
  * The model modes a flavor exposes (issue #3348 — manifest-delegated).
  *
  * 🔴 INVARIANT (blast-radius guard, ruling 1B): only the claude-modes native
@@ -306,11 +321,12 @@ export function isModelModeAllowedForFlavor(
  * Issue #1951 (A4) — spawn-time permission posture helpers.
  *
  * The Create-Session form replaces the binary YOLO toggle with a per-flavor
- * permission-mode dropdown. Under the epic's frontend-only scope (A1–A5), the
- * spawn wire still carries only the `yolo` boolean, so the selected mode is
- * collapsed to that boolean here — `isYoloEquivalentMode` is the single canonical
- * mapping (keeps A2's preview⟷spawn single-source intact). The richer non-YOLO
- * modes remain switchable in-session via the runtime permission switcher.
+ * permission-mode dropdown. `isYoloEquivalentMode` is the single canonical
+ * collapse of a mode to the spawn `yolo` boolean (keeps A2's preview⟷spawn
+ * single-source intact). Issue #6218: the spawn wire now ALSO carries the
+ * selected `permissionMode`, which seeds the CLI's starting mode
+ * (`--hapi-permission-mode`), so a non-YOLO pick such as Claude `acceptEdits`
+ * really starts in that mode instead of collapsing to `default`.
  */
 
 /** Modes that map to the spawn `yolo: true` boolean (full bypass / full yolo). */
@@ -410,4 +426,223 @@ export function resolveSpawnPermissionMode(
     if (yoloOption) return yoloOption;
   }
   return options[0] ?? "default";
+}
+
+/**
+ * Issue #6218 — the default spawn permission posture: one step below YOLO for
+ * each harness (operator direction 2026-11-03). Claude starts in accept
+ * (auto-approves edits, prompts for shell), Codex in safe-YOLO; Gemini and
+ * OpenCode offer only default and YOLO at spawn, so their default is `default`.
+ * This is the ONE definition web, server and daemon read, so their defaults can
+ * never drift (web CLAUDE.md "Frontend/Backend Preference Sync").
+ */
+export const SPAWN_PERMISSION_DEFAULTS: Readonly<
+  Record<AgentFlavor, PermissionMode>
+> = {
+  claude: "acceptEdits",
+  codex: "safe-yolo",
+  gemini: "default",
+  opencode: "default",
+};
+
+/**
+ * The stored default-spawn-permission-mode preference's default value: Claude's
+ * one-step-below-YOLO mode. The preference is a Claude-vocabulary mode (the
+ * Settings radio offers the Claude modes) that
+ * {@link resolveDefaultSpawnPermissionMode} maps onto each harness.
+ */
+export const DEFAULT_SPAWN_PERMISSION_MODE: ClaudePermissionMode =
+  "acceptEdits";
+
+/** The one-step-below-YOLO mode for a flavor; an unknown flavor gets Claude's. */
+export function getDefaultSpawnPermissionMode(
+  flavor?: string | null
+): PermissionMode {
+  return flavor &&
+    Object.prototype.hasOwnProperty.call(SPAWN_PERMISSION_DEFAULTS, flavor)
+    ? SPAWN_PERMISSION_DEFAULTS[flavor as AgentFlavor]
+    : SPAWN_PERMISSION_DEFAULTS.claude;
+}
+
+/** True for a non-`default` one-step-below-YOLO mode of any flavor. */
+function isOneBelowYoloMode(mode: PermissionMode): boolean {
+  return (
+    mode !== "default" &&
+    Object.values(SPAWN_PERMISSION_DEFAULTS).includes(mode)
+  );
+}
+
+/**
+ * Resolve the SYSTEM-DEFAULT spawn permission mode (the node preference, or the
+ * Create page's saved default) for a target flavor (#6218). A YOLO-equivalent
+ * default maps to the flavor's YOLO option; a one-step-below-YOLO default (Claude
+ * `acceptEdits`, Codex `safe-yolo`) maps to the flavor's own one-step-below-YOLO
+ * mode; anything else resolves as {@link resolveSpawnPermissionMode} does.
+ *
+ * Only the system default takes this tier mapping. An explicit pick or a
+ * Create-page bookmark keeps {@link resolveSpawnPermissionMode}'s mapping, so a
+ * user's explicit Claude `acceptEdits` is never widened to Codex `safe-yolo`.
+ */
+export function resolveDefaultSpawnPermissionMode(
+  pref: PermissionMode,
+  flavor?: string | null
+): PermissionMode {
+  if (isYoloEquivalentMode(pref)) {
+    return resolveSpawnPermissionMode(pref, flavor);
+  }
+  if (isOneBelowYoloMode(pref)) {
+    return getDefaultSpawnPermissionMode(flavor);
+  }
+  return resolveSpawnPermissionMode(pref, flavor);
+}
+
+/** The resolved permission posture of one spawn request (#6218). */
+export type SpawnPosture =
+  | {
+      ok: true;
+      /** The spawn-wire `yolo` boolean. */
+      yolo: boolean;
+      /** The starting mode; absent for a legacy explicit `yolo` request. */
+      permissionMode?: PermissionMode;
+    }
+  | { ok: false; error: string };
+
+/**
+ * Resolve a spawn request's permission posture (#6218), at the server spawn
+ * choke point and in the daemon:
+ * - `permissionMode` given → it must be one of the flavor's spawn options;
+ *   `yolo` follows from it, and a contradicting explicit `yolo` is an error.
+ * - `permissionMode` absent, `yolo: true` → YOLO, as before.
+ * - `permissionMode` absent, `yolo: false` → not YOLO with NO starting-mode seed,
+ *   byte-identical to before: the session starts at its saved posture, else
+ *   `default` (a reconnect relies on this).
+ * - both absent → the default, `fallbackMode` (the node preference) or else
+ *   {@link DEFAULT_SPAWN_PERMISSION_MODE}, resolved for the flavor. An omitted
+ *   posture is never YOLO unless the default itself is YOLO.
+ */
+export function resolveSpawnPosture(input: {
+  yolo?: boolean;
+  permissionMode?: PermissionMode;
+  flavor?: string | null;
+  fallbackMode?: PermissionMode;
+}): SpawnPosture {
+  const { yolo, permissionMode, flavor } = input;
+  if (permissionMode !== undefined) {
+    const options = getSpawnPermissionModeOptionsForFlavor(flavor).map(
+      o => o.mode
+    );
+    if (!options.includes(permissionMode)) {
+      return {
+        ok: false,
+        error: `Permission mode "${permissionMode}" is not available for a "${flavor ?? "claude"}" session (choose one of: ${options.join(", ")})`,
+      };
+    }
+    const modeIsYolo = isYoloEquivalentMode(permissionMode);
+    if (yolo !== undefined && yolo !== modeIsYolo) {
+      return {
+        ok: false,
+        error: `yolo: ${yolo} conflicts with permissionMode "${permissionMode}"`,
+      };
+    }
+    return { ok: true, yolo: modeIsYolo, permissionMode };
+  }
+  if (yolo !== undefined) {
+    return { ok: true, yolo };
+  }
+  const mode = resolveDefaultSpawnPermissionMode(
+    input.fallbackMode ?? DEFAULT_SPAWN_PERMISSION_MODE,
+    flavor
+  );
+  return { ok: true, yolo: isYoloEquivalentMode(mode), permissionMode: mode };
+}
+
+/**
+ * Issue #6218 (absorbs #5353 R1-R2): the `yolo` a respawn derives from a
+ * session's saved posture (`metadata.permissionMode`). A saved bypass mode
+ * respawns in YOLO and any other saved mode does not; the CLI then restores the
+ * saved mode. An absent or invalid posture keeps the legacy always-bypass
+ * respawn, so a session recorded before the spawn-time stamp behaves as before.
+ */
+export function respawnYoloFromPosture(saved: unknown): boolean {
+  if (typeof saved === "string" && isPermissionMode(saved)) {
+    return isYoloEquivalentMode(saved);
+  }
+  return true;
+}
+
+/**
+ * Issue #6218 — the posture a NEW session inherits from the session it
+ * continues (a branch, a context-watermark successor). `yolo` follows
+ * {@link respawnYoloFromPosture}; because the new session has no saved posture
+ * of its own, a saved non-bypass mode is also sent as its starting-mode seed
+ * when the target harness can spawn in that mode (otherwise it starts at
+ * `default`, still not YOLO).
+ */
+export function inheritSpawnPosture(
+  saved: unknown,
+  flavor?: string | null
+): { yolo: boolean; permissionMode?: PermissionMode } {
+  const yolo = respawnYoloFromPosture(saved);
+  if (yolo || typeof saved !== "string" || !isPermissionMode(saved)) {
+    return { yolo };
+  }
+  const seeded = resolveSpawnPosture({ permissionMode: saved, flavor });
+  return seeded.ok && seeded.permissionMode
+    ? { yolo: false, permissionMode: seeded.permissionMode }
+    : { yolo: false };
+}
+
+/** Issue #6218 (ruling D5-a): how much a permission mode lets a session do unasked. */
+export type SpawnPermissionRank = 0 | 1 | 2;
+
+/**
+ * Issue #6218 (ruling D5-a) — the rank of a permission mode, for the agent
+ * spawn floor: 0 for the prompting modes (`default`, `plan`, `read-only`), 1 for
+ * the one-step-below-YOLO modes (`acceptEdits`, `safe-yolo`), 2 for YOLO.
+ */
+export function spawnPermissionRank(mode: PermissionMode): SpawnPermissionRank {
+  if (isYoloEquivalentMode(mode)) return 2;
+  return mode === "acceptEdits" || mode === "safe-yolo" ? 1 : 0;
+}
+
+/**
+ * Issue #6218 (ruling D5-a) — the rank of a resolved spawn posture: 2 whenever
+ * `yolo` is true, else its mode's rank, else 0 for a bare `yolo: false` (which
+ * starts at `default` or the saved posture). `yolo: true` wins over the mode so
+ * an inconsistent pair ranks fail-closed; `resolveSpawnPosture` never returns
+ * one.
+ */
+export function spawnPostureRank(posture: {
+  yolo: boolean;
+  permissionMode?: PermissionMode;
+}): SpawnPermissionRank {
+  if (posture.yolo) return 2;
+  return posture.permissionMode !== undefined
+    ? spawnPermissionRank(posture.permissionMode)
+    : 0;
+}
+
+/**
+ * Issue #6218 (ruling D5-a) — clamp a mode down to `maxRank` for a harness: the
+ * mode itself when it is within the rank, else the flavor's highest-ranked
+ * spawn option at or below it, preferring the flavor's default spawn mode and
+ * then `default` within that rank (never `plan` or `read-only` unless the
+ * harness offers nothing else).
+ */
+export function clampSpawnPermissionMode(
+  mode: PermissionMode,
+  maxRank: SpawnPermissionRank,
+  flavor?: string | null
+): PermissionMode {
+  if (spawnPermissionRank(mode) <= maxRank) return mode;
+  const candidates = getSpawnPermissionModeOptionsForFlavor(flavor)
+    .map(o => o.mode)
+    .filter(m => spawnPermissionRank(m) <= maxRank);
+  if (candidates.length === 0) return "default";
+  const top = Math.max(...candidates.map(spawnPermissionRank));
+  const tier = candidates.filter(m => spawnPermissionRank(m) === top);
+  const flavorDefault = getDefaultSpawnPermissionMode(flavor);
+  if (tier.includes(flavorDefault)) return flavorDefault;
+  if (tier.includes("default")) return "default";
+  return tier[0] ?? "default";
 }

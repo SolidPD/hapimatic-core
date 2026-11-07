@@ -2,7 +2,7 @@
 import type { GitHubFailureReason } from "@hapi/protocol/githubFailureReason";
 import { asGitHubConnectionStatus } from "@hapi/protocol/githubConnection";
 import type { GitHubAccountResult, GitHubRepoResult } from "./githubCli";
-import type { FetchImpl, RestIssueResult } from "./githubRest";
+import type { FetchImpl, RepoListing, RestIssueResult } from "./githubRest";
 
 /**
  * VM-side client for the gateway GitHub read broker (issue #3013).
@@ -287,20 +287,49 @@ export async function fetchAccountsViaBroker(
   });
 }
 
+/**
+ * Map one broker repository entry onto {@link GitHubRepoResult} (#6326). A row without a string
+ * `nameWithOwner` and `name` is dropped: the picker keys and searches on them. The pre-#6326
+ * fields pass through as received; the #6326 fields are kept only when correctly typed, so a
+ * skewed gateway can never hide the wrong rows (a string `"true"` is not an archived flag).
+ */
+function toRepo(raw: unknown): GitHubRepoResult | null {
+  if (!raw || typeof raw !== "object") return null;
+  const { createdAt, isArchived, isFork, ...rest } = raw as Record<
+    string,
+    unknown
+  >;
+  if (typeof rest.nameWithOwner !== "string" || typeof rest.name !== "string") {
+    return null;
+  }
+  const repo = rest as unknown as GitHubRepoResult;
+  if (typeof createdAt === "string") repo.createdAt = createdAt;
+  if (typeof isArchived === "boolean") repo.isArchived = isArchived;
+  if (typeof isFork === "boolean") repo.isFork = isFork;
+  return repo;
+}
+
 /** Repos accessible to `account` via the broker (mirrors `fetchReposViaRest`). */
 export async function fetchReposViaBroker(
   account: string,
   env: Record<string, string | undefined> = process.env,
   fetchImpl: FetchImpl = fetch
-): Promise<GitHubBrokerResult<GitHubRepoResult[]>> {
+): Promise<GitHubBrokerResult<RepoListing>> {
   const result = await brokerFetch(
     `/repos?account=${encodeURIComponent(account)}`,
     env,
     fetchImpl
   );
-  return interpretEnvelope(result, e =>
-    Array.isArray(e.repos) ? (e.repos as GitHubRepoResult[]) : undefined
-  );
+  return interpretEnvelope(result, e => {
+    if (!Array.isArray(e.repos)) return undefined;
+    return {
+      repos: e.repos
+        .map(toRepo)
+        .filter((r): r is GitHubRepoResult => r !== null),
+      // #6326: an older gateway sends no flag; it cannot say, so the list reads as complete.
+      truncated: e.truncated === true,
+    };
+  });
 }
 
 /** One issue via the broker (mirrors `fetchIssueViaRest`). */

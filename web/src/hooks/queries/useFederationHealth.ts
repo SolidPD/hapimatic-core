@@ -21,9 +21,9 @@ const EMPTY_ALERTS: FederationAlert[] = [];
 /**
  * Federation-wide aggregate health (worst-case severity). Issue #1445.
  *
- * Graceful by design: on standalone/spoke deployments the endpoint returns 503
- * (no HealthAggregator — steady state), so on any error this returns
- * `{ aggregate: null, isError: true }` rather than throwing. Consumers
+ * Graceful by design: a server with no HealthAggregator (one built before
+ * #6217; from #6217 every node runs one) returns 503, so on any error this
+ * returns `{ aggregate: null, isError: true }` rather than throwing. Consumers
  * (useSystemHealthDisplayTarget) treat a null aggregate as "fall back to local
  * health" per R15/D5.
  */
@@ -80,9 +80,9 @@ export function useFederationNodeHealth(
  * Batch per-node health for the Federation Health Dashboard's Tier-2 cards
  * (issue #1632; #1037 consumer). One request → one entry per node; offline
  * nodes are preserved (status "offline", NOT collapsed to critical — that is
- * aggregation-only semantics). Graceful: on 503 (standalone/spoke deployments
- * with no HealthAggregator) returns `{ nodes: [], isError: true }` rather than
- * throwing, so the dashboard falls back to identity-only cards.
+ * aggregation-only semantics). Graceful: on 503 (a server with no
+ * HealthAggregator, built before #6217) returns `{ nodes: [], isError: true }`
+ * rather than throwing, so the dashboard falls back to identity-only cards.
  */
 export function useFederationHealthNodes(api: ApiClient | null): {
   nodes: FederationNodeHealth[];
@@ -112,7 +112,8 @@ export function useFederationHealthNodes(api: ApiClient | null): {
  * Uses `useInfiniteQuery` (precedent: `useMessages.ts`) so already-loaded pages
  * survive the 30s background refetch — a plain query + manual concat would
  * reset the "load more" pages on every poll. Newest-first; cursor pagination
- * via the server's `nextCursor`. Graceful: on 503 returns empty alerts +
+ * via the server's `nextCursor`. Graceful: on 503 (a server with no
+ * HealthAggregator, built before #6217) returns empty alerts +
  * `isError: true`, never throws.
  */
 export function useFederationAlerts(

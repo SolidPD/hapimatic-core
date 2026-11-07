@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { PermissionMode } from "@hapi/protocol/modes";
+
 export interface SpawnSessionOptions {
   machineId?: string;
   directory: string;
@@ -6,6 +8,11 @@ export interface SpawnSessionOptions {
   approvedNewDirectoryCreation?: boolean;
   agent?: "claude" | "codex" | "gemini" | "opencode";
   yolo?: boolean;
+  /** Issue #6218: the starting permission mode, seeded into the agent as
+   *  `--hapi-permission-mode`. When it and `yolo` are both omitted, the daemon
+   *  applies the shared one-step-below-YOLO default; it never reads an omitted
+   *  `yolo` as YOLO. */
+  permissionMode?: PermissionMode;
   /** Issue #1262: opt-in to spawn-time port claim (default false). When
    *  false/omitted, worktree creation writes `claimed_port: null` and the
    *  port is claimed later via `scripts/hapi-worktree.sh claim` at the time
@@ -58,6 +65,11 @@ export interface SpawnSessionOptions {
    *  characters differ. A replacement ending in the same four characters is not
    *  detected (the mask is the only fingerprint recorded). */
   apiKeyMasked?: string;
+  /** Issue #5819: set when another node placed this session on this node with
+   *  one of this node's keys (a node id, never key material). The daemon then
+   *  refuses a key that is no longer shared, and delivers HAPI_API_KEY_PLACED_BY
+   *  so the wrapper re-checks at every in-process relaunch. */
+  apiKeyPlacedBy?: string;
   /** Issue #1633: launch the claude child with --safe-mode (CLAUDE.md, skills,
    *  hooks, MCP customizations disabled). Hapimatic's own injections are
    *  suppressed by the launchers when the flag is present in claudeArgs. */
@@ -167,7 +179,8 @@ export interface SpawnSessionOptions {
    *  server from its model catalog (`syncEngine.spawnSession`). Wire-typed — the
    *  daemon validates each entry against the effort catalog. Present (even `[]`)
    *  ⇒ authoritative; absent ⇒ the daemon uses its static fallback lookup. Only
-   *  a fresh claude spawn's default effort is clamped to it. */
+   *  a claude spawn's DEFAULT effort is clamped to it — a fresh spawn, or since
+   *  #6166 a resume that names no effort; a body effort is never clamped. */
   modelEffortLevels?: string[];
 }
 

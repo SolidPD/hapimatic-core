@@ -7,7 +7,7 @@
  * convenience for callers that want it). Extracted from the (now deleted)
  * `SystemHealthModal.tsx` private copy and the `NodeDetailDashboard` /
  * `about.tsx` duplicates (issue #3460). The git-rpc Browse formatter
- * (`extensions/git-rpc/routes/files.tsx`) intentionally stays separate — its
+ * (`extensions/git-rpc/browse/BrowseRow.tsx`) intentionally stays separate — its
  * SI-labelled `KB` format is a deliberate #2518 choice (owner ruling W2 / D2-a).
  *
  * The `Math.min(units.length - 1, …)` clamp renders ≥ 1 PiB inputs in TiB — an

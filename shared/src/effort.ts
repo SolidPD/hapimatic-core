@@ -34,10 +34,11 @@ export const EFFORT_LEVEL_LABELS: Record<EffortLevel, string> = {
  * explicit effort pin (issue #2506, ruling D4 / sub-fork D1a — DISPLAY-ONLY).
  *
  * The `claude` binary chooses its own reasoning-effort budget when `--effort` is
- * omitted, and that choice is NOT introspectable from Hapimatic: a session with
- * no recorded pin (a resume, or a session from before #5879) ran with no
- * `--effort` flag (`cli/src/claude/sdk/types.ts:227` — "Omitted → no --effort
- * flag"), and Anthropic's `/v1/models` exposes no default-effort field. So this is Hapimatic's ASSERTED
+ * omitted, and that choice was NOT introspectable from Hapimatic before the
+ * #6166 read-back (`get_settings`, SDK launcher only): a session with no
+ * recorded pin (a session from before #5879) ran with no `--effort` flag
+ * (`cli/src/claude/sdk/types.ts:227` — "Omitted → no --effort flag"), and
+ * Anthropic's `/v1/models` exposes no default-effort field. So this is Hapimatic's ASSERTED
  * default, for DISPLAY ONLY — it never adds an `--effort` send site and never
  * changes the wire. Its sole purpose is to let the UI show a concrete effort
  * (F2 — "never blank") instead of an empty field when none was chosen.
@@ -48,10 +49,14 @@ export const EFFORT_LEVEL_LABELS: Record<EffortLevel, string> = {
  * on a Claude Code upgrade (same maintenance class as EFFORT_LEVELS / OR-4).
  *
  * Issue #5879: since the daemon now sends `--effort` on every fresh claude spawn
- * ({@link SPAWN_DEFAULT_EFFORT_LEVEL}), a session without a recorded pin is a
- * legacy session (or a resumed one that predates the default), or (#6028) one
- * on a model that takes no effort — this constant still describes what a legacy
- * session ran, so it stays "high".
+ * ({@link SPAWN_DEFAULT_EFFORT_LEVEL}), and since #6166 on every resume that
+ * names no effort too, a session without a recorded pin is a legacy session that
+ * has not respawned since, or (#6028) one on a model that takes no effort. The
+ * premise above is now measured (#6166, Claude Code 2.1.302 `get_settings`): a
+ * no-flag Opus 5.5 session runs `medium` and a no-flag Fable 5.1 session `high`,
+ * so "high" is not what every legacy session ran. The value stays "high" (#5879
+ * D10, display-only), and on an SDK session the live `appliedEffort` field (the
+ * read-back) supersedes it once measured.
  */
 export const DEFAULT_EFFORT_LEVEL: EffortLevel = "high";
 

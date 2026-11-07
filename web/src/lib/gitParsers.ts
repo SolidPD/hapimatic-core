@@ -21,6 +21,8 @@ export type GitStatusSummaryV2 = {
   notAdded: string[];
   ignored: string[];
   branch: GitBranchInfo;
+  /** #6224: change lines no pattern could read. Each still counts as a change. */
+  unparsed: string[];
 };
 
 export type DiffFileStat = {
@@ -39,33 +41,35 @@ export type DiffSummary = {
   changed: number;
 };
 
-const BRANCH_OID_REGEX = /^# branch\.oid (.+)$/;
-const BRANCH_HEAD_REGEX = /^# branch\.head (.+)$/;
-const BRANCH_UPSTREAM_REGEX = /^# branch\.upstream (.+)$/;
-const BRANCH_AB_REGEX = /^# branch\.ab \+(\d+) -(\d+)$/;
+// #6224: every line pattern carries the `s` (dotAll) flag. Without it `.` does
+// not match U+2028 / U+2029, so a file name holding one dropped its whole line.
+const BRANCH_OID_REGEX = /^# branch\.oid (.+)$/s;
+const BRANCH_HEAD_REGEX = /^# branch\.head (.+)$/s;
+const BRANCH_UPSTREAM_REGEX = /^# branch\.upstream (.+)$/s;
+const BRANCH_AB_REGEX = /^# branch\.ab \+(\d+) -(\d+)$/s;
 
 const ORDINARY_CHANGE_REGEX =
-  /^1 (.)(.) (.{4}) (\d{6}) (\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) (.+)$/;
+  /^1 (.)(.) (.{4}) (\d{6}) (\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) (.+)$/s;
 const RENAME_COPY_REGEX =
-  /^2 (.)(.) (.{4}) (\d{6}) (\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([RC])(\d{1,3}) (.+)\t(.+)$/;
+  /^2 (.)(.) (.{4}) (\d{6}) (\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([RC])(\d{1,3}) (.+)\t(.+)$/s;
 const UNMERGED_REGEX =
-  /^u (.)(.) (.{4}) (\d{6}) (\d{6}) (\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([0-9a-f]+) (.+)$/;
-const UNTRACKED_REGEX = /^\? (.+)$/;
-const IGNORED_REGEX = /^! (.+)$/;
+  /^u (.)(.) (.{4}) (\d{6}) (\d{6}) (\d{6}) (\d{6}) ([0-9a-f]+) ([0-9a-f]+) ([0-9a-f]+) (.+)$/s;
+const UNTRACKED_REGEX = /^\? (.+)$/s;
+const IGNORED_REGEX = /^! (.+)$/s;
 
 const NUMSTAT_REGEX = /^(\d+|-)\t(\d+|-)\t(.*)$/;
 
 export function parseStatusSummaryV2(statusOutput: string): GitStatusSummaryV2 {
-  const lines = statusOutput
-    .trim()
-    .split("\n")
-    .filter(line => line.length > 0);
+  // #6224: no trim(). A trailing space is part of the last path, and an empty
+  // line is the only thing to drop.
+  const lines = statusOutput.split("\n").filter(line => line.length > 0);
 
   const result: GitStatusSummaryV2 = {
     files: [],
     notAdded: [],
     ignored: [],
     branch: {},
+    unparsed: [],
   };
 
   for (const line of lines) {
@@ -95,40 +99,45 @@ export function parseStatusSummaryV2(statusOutput: string): GitStatusSummaryV2 {
 
     if (line.startsWith("1 ")) {
       const match = ORDINARY_CHANGE_REGEX.exec(line);
-      if (match) {
-        const entry = parseOrdinaryChange(match);
-        if (entry) result.files.push(entry);
-      }
+      const entry = match ? parseOrdinaryChange(match) : null;
+      if (entry) result.files.push(entry);
+      else result.unparsed.push(line);
       continue;
     }
 
     if (line.startsWith("2 ")) {
       const match = RENAME_COPY_REGEX.exec(line);
-      if (match) {
-        const entry = parseRenameCopy(match);
-        if (entry) result.files.push(entry);
-      }
+      const entry = match ? parseRenameCopy(match) : null;
+      if (entry) result.files.push(entry);
+      else result.unparsed.push(line);
       continue;
     }
 
     if (line.startsWith("u ")) {
       const match = UNMERGED_REGEX.exec(line);
-      if (match) {
-        const entry = parseUnmerged(match);
-        if (entry) result.files.push(entry);
-      }
+      const entry = match ? parseUnmerged(match) : null;
+      if (entry) result.files.push(entry);
+      else result.unparsed.push(line);
       continue;
     }
 
     if (line.startsWith("? ")) {
       const match = UNTRACKED_REGEX.exec(line);
       if (match) result.notAdded.push(match[1]);
+      else result.unparsed.push(line);
       continue;
     }
 
     if (line.startsWith("! ")) {
       const match = IGNORED_REGEX.exec(line);
       if (match) result.ignored.push(match[1]);
+      continue;
+    }
+
+    // A header git adds later (`# stash …`) is not a change; anything else is a
+    // change line in a form this parser does not know, and must still count.
+    if (!line.startsWith("# ")) {
+      result.unparsed.push(line);
     }
   }
 
@@ -246,8 +255,12 @@ export function buildGitStatusFiles(
   const unstagedFiles: GitFileStatus[] = [];
 
   for (const file of statusSummary.files) {
-    const parts = file.path.split("/");
-    const fileName = parts[parts.length - 1] || file.path;
+    // #6224: open and show the decoded path, never git's quoted form.
+    const displayPath = unquoteGitPath(file.path);
+    const oldPath =
+      file.from === undefined ? undefined : unquoteGitPath(file.from);
+    const parts = displayPath.split("/");
+    const fileName = parts[parts.length - 1] || displayPath;
     const filePath = parts.slice(0, -1).join("/");
 
     if (file.index !== " " && file.index !== "." && file.index !== "?") {
@@ -256,12 +269,12 @@ export function buildGitStatusFiles(
       stagedFiles.push({
         fileName,
         filePath,
-        fullPath: file.path,
+        fullPath: displayPath,
         status,
         isStaged: true,
         linesAdded: stats.added,
         linesRemoved: stats.removed,
-        oldPath: file.from,
+        oldPath,
       });
     }
 
@@ -271,33 +284,47 @@ export function buildGitStatusFiles(
       unstagedFiles.push({
         fileName,
         filePath,
-        fullPath: file.path,
+        fullPath: displayPath,
         status,
         isStaged: false,
         linesAdded: stats.added,
         linesRemoved: stats.removed,
-        oldPath: file.from,
+        oldPath,
       });
     }
   }
 
   for (const untrackedPath of statusSummary.notAdded) {
-    const cleanPath = untrackedPath.endsWith("/")
-      ? untrackedPath.slice(0, -1)
-      : untrackedPath;
+    const decoded = unquoteGitPath(untrackedPath);
+    // #6224: with --untracked-files=all git lists every untracked file, so a
+    // trailing `/` means a folder git does not descend into: a nested repository.
+    // It used to be skipped, so a folder whose only change was one read as clean.
+    const isDirectory = decoded.endsWith("/");
+    const cleanPath = isDirectory ? decoded.slice(0, -1) : decoded;
     const parts = cleanPath.split("/");
     const fileName = parts[parts.length - 1] || cleanPath;
     const filePath = parts.slice(0, -1).join("/");
 
-    if (untrackedPath.endsWith("/")) {
-      continue;
-    }
-
     unstagedFiles.push({
-      fileName,
+      fileName: isDirectory ? `${fileName}/` : fileName,
       filePath,
       fullPath: cleanPath,
       status: "untracked",
+      isStaged: false,
+      linesAdded: 0,
+      linesRemoved: 0,
+      ...(isDirectory ? { isDirectory: true } : {}),
+    });
+  }
+
+  // #6224: a change line this parser could not read still counts, so Changes
+  // never reads as clean while git reported something.
+  for (const line of statusSummary.unparsed) {
+    unstagedFiles.push({
+      fileName: "Unreadable status line",
+      filePath: line,
+      fullPath: "",
+      status: "unknown",
       isStaged: false,
       linesAdded: 0,
       linesRemoved: 0,
@@ -322,13 +349,15 @@ function parseOrdinaryChange(matches: string[]): GitFileEntryV2 | null {
   };
 }
 
+// Porcelain v2 writes a rename as `<path><TAB><origPath>`: the NEW path comes
+// first (#6224 — these were swapped, so a renamed file showed its old name).
 function parseRenameCopy(matches: string[]): GitFileEntryV2 | null {
   if (!matches[1] || !matches[2] || !matches[11] || !matches[12]) return null;
   return {
     index: matches[1],
     workingDir: matches[2],
-    from: matches[11],
-    path: matches[12],
+    path: matches[11],
+    from: matches[12],
   };
 }
 

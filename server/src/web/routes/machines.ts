@@ -8,9 +8,13 @@ import {
   ModelModeSchema,
   ModelRoutingSchema,
   NativeModelSelectionSchema,
+  PermissionModeSchema,
   SessionRoleSchema,
 } from "@hapi/protocol/schemas";
-import { isModelModeAllowedForFlavor } from "@hapi/protocol/modes";
+import {
+  isModelModeAllowedForFlavor,
+  resolveSpawnPosture,
+} from "@hapi/protocol/modes";
 import { ClaudeRemoteLauncherKindSchema } from "@hapi/protocol/launcherResolver";
 import {
   ExistingBranchSchema,
@@ -33,7 +37,7 @@ import {
   type SpawnWarning,
 } from "@hapi/protocol";
 import { requireMachine } from "./guards";
-import { refuseAgentEscalation } from "./agentEscalation";
+import { floorAgentSpawnPosture } from "./agentEscalation";
 import { logAndJson } from "./routeErrorHelper";
 import { cataloged } from "../../capabilities/cataloged";
 import { createRateLimiter } from "../middleware/rateLimit";
@@ -53,6 +57,11 @@ export const spawnBodySchema = z.object({
   directory: z.string().min(1),
   agent: z.enum(["claude", "codex", "gemini", "opencode"]).optional(),
   yolo: z.boolean().optional(),
+  /** Issue #6218: the starting permission mode. It must be one of the agent's
+   *  spawn options, and an explicit `yolo` must agree with it. When both are
+   *  omitted, the route applies this node's default spawn permission mode
+   *  preference (one step below YOLO unless the operator chose otherwise). */
+  permissionMode: PermissionModeSchema.optional(),
   claimPort: z.boolean().optional(),
   sessionType: z.enum(["simple", "worktree"]).optional(),
   worktreeName: z.string().optional(),
@@ -315,16 +324,39 @@ export function createMachinesRoutes(
         return c.json({ error: message }, 400);
       }
 
-      // #3842 R8 (ruling NEW-3842-1 = b): a session that is not in a bypass
-      // mode cannot start a permission-bypassing peer through this route. Gate on
-      // the daemon's OWN predicate: it spawns in YOLO mode unless `yolo` is
-      // exactly `false` (`cli/src/daemon/sessionSpawner.ts` `options.yolo !==
-      // false`), so an OMITTED `yolo` is a YOLO spawn and must be floored too.
-      // A non-bypass caller therefore has to send `yolo: false` explicitly.
-      if (parsed.data.yolo !== false) {
-        const refusal = refuseAgentEscalation(c, engine);
-        if (refusal) return refusal;
+      const spawnFlavor = parsed.data.agent ?? "claude";
+
+      // Issue #6218: resolve the spawn's EFFECTIVE permission posture here, with
+      // the same node default `spawnSession` would apply, and send it explicitly
+      // (spawnOptions below) so the floor and the spawn can never disagree. An
+      // omitted posture is this node's default spawn permission mode — one step
+      // below YOLO unless the operator chose YOLO — never an implicit YOLO.
+      const postureNamed =
+        parsed.data.yolo !== undefined ||
+        parsed.data.permissionMode !== undefined;
+      const resolved = resolveSpawnPosture({
+        yolo: parsed.data.yolo,
+        permissionMode: parsed.data.permissionMode,
+        flavor: spawnFlavor,
+        // The node default is read only when the request names no posture.
+        fallbackMode: postureNamed
+          ? undefined
+          : await engine.getNodeDefaultSpawnPermissionMode(),
+      });
+      if (!resolved.ok) {
+        return c.json({ error: resolved.error }, 400);
       }
+
+      // #3842 R8 as amended by #6218 (ruling D5-a): an agent caller that is not
+      // in a bypass mode meets a RANK floor over the EFFECTIVE posture — an
+      // explicit posture above its own mode is refused 403, an omitted one (the
+      // node default) is clamped down to its mode. No header and bypass callers
+      // are unaffected.
+      const posture = floorAgentSpawnPosture(c, engine, resolved, {
+        explicit: postureNamed,
+        flavor: spawnFlavor,
+      });
+      if (posture instanceof Response) return posture;
 
       // Issue #2434: reject a model-mode that the requested agent flavor does not
       // support (e.g. `fable` on a Codex spawn) BEFORE any spawn work. Mirrors the
@@ -337,7 +369,6 @@ export function createMachinesRoutes(
       // EVERY mode — including "default" — is rejected on a non-Claude spawn. That
       // is intentional: the Claude axis is meaningless there, and the web client
       // omits the field entirely for non-Claude agents (formState.effective).
-      const spawnFlavor = parsed.data.agent ?? "claude";
       if (
         parsed.data.modelMode !== undefined &&
         !isModelModeAllowedForFlavor(parsed.data.modelMode, spawnFlavor)
@@ -481,7 +512,10 @@ export function createMachinesRoutes(
         machineId,
         directory: parsed.data.directory,
         agent: parsed.data.agent,
-        yolo: parsed.data.yolo,
+        // Issue #6218: the EFFECTIVE posture resolved above (the floor judged it),
+        // sent explicitly so `spawnSession` does not resolve it a second time.
+        yolo: posture.yolo,
+        permissionMode: posture.permissionMode,
         claimPort: parsed.data.claimPort,
         sessionType: parsed.data.sessionType,
         worktreeName: parsed.data.worktreeName,
@@ -655,6 +689,8 @@ export function createMachinesRoutes(
           // precedent), so a client discriminates by `code`, not by string-matching
           // the "Too many concurrent sessions" message.
           result.code === "at_capacity" ||
+          // Issue #6156: the daemon's live-memory refusal is a capacity conflict too.
+          result.code === "insufficient_memory" ||
           // Issue #5879: defense in depth — the headroom refusal happens above,
           // but any future engine-level `account_exhausted` must surface as a 409,
           // never as a 200 with an error body.

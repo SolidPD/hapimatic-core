@@ -37,6 +37,49 @@ export type Tier0Context = Partial<AvailabilityContext>;
 export const TIER0_NEUTRAL_CONTEXT: Tier0Context = Object.freeze({});
 
 /**
+ * The secret exception inside {@link GENERATED_FILES_RULE} (#6223, ruling A1).
+ * The self-knowledge preamble repeats it word for word, because with Tier-0
+ * off the preamble is the only rule a session sees; a test fails if the two
+ * texts differ.
+ */
+export const GENERATED_FILES_SECRET_CLAUSE =
+  "A file holding a secret (a password, token, API key, private key or other " +
+  "credential, `.env` included) stays out of every commit unless the user " +
+  "explicitly asks for it to be committed: keep it on disk and say you left it " +
+  "uncommitted, because a pushed secret stays in history and has to be replaced.";
+
+/**
+ * Where a session puts the files it generates (#6223). It lives here because
+ * Tier-0 is the only text that reaches Claude, Codex, Gemini and OpenCode from
+ * one source. Each clause fixes a failure measured in live headless runs (see
+ * the #6223 directive's rule history), so re-run those before rewording it.
+ */
+export const GENERATED_FILES_RULE =
+  "Always write a file you generate under `GeneratedFiles/` in the folder this " +
+  "session was launched from (create it on first write) unless the user, a " +
+  "skill or the project's own layout says where it goes, because the user finds " +
+  "files in the Files tab, which shows that folder, not in `/tmp` or elsewhere " +
+  "on the drive. Keep scratch files there too, in a subfolder you delete once " +
+  "the task is done, and name the path you wrote in your reply. In a Git repo, " +
+  "always commit each finished file in `GeneratedFiles/` by path without being " +
+  "asked (`git add -f` if an ignore rule catches it) and push it on the current " +
+  "branch, even a default branch, because these files belong in the repo; this " +
+  "changes nothing about how you handle any other file. " +
+  GENERATED_FILES_SECRET_CLAUSE +
+  " The one other exception: in a " +
+  "public repo, commit and then ask before pushing, because a push there " +
+  "publishes immediately and is hard to take back. To tell, run `curl -so " +
+  "/dev/null -w %{http_code} https://api.github.com/repos/OWNER/REPO`: 404 means " +
+  "not public; any other answer, or any other host, counts as public. Keep a " +
+  "file over 100 MiB out of the push, push everything else, and ask whether to " +
+  "put it in Git LFS, naming its size and the possible charge. A yes means Git " +
+  "LFS: `git lfs install --local` (a complaint about an existing hook is fine), " +
+  "`git lfs track` its path, commit it with `.gitattributes` as its own commit, " +
+  "then `git lfs push origin HEAD` before `git push`. If LFS is missing or " +
+  "either push is refused, undo that commit, keep the file on disk and tell the " +
+  "user.";
+
+/**
  * R1a eligibility — FAIL CLOSED. An entry is Tier-0-eligible iff ALL hold:
  * - `availability.scope === "user"` (a missing/`undefined` scope is NOT
  *   user-visible → excluded; never read as "not operator-only");
@@ -131,8 +174,9 @@ function fnv1aHex(input: string): string {
 
 /**
  * Deterministic stamp over exactly the render-relevant projection of the
- * eligible set (id + whenToUse + action), sorted — so the stamp changes when the
- * rendered content would change and is stable otherwise.
+ * eligible set (id + whenToUse + action), sorted — so the stamp changes when an
+ * entry's rendered lines would change and is stable otherwise. The fixed lines in
+ * parts (4) to (7) of the render are outside it: editing one leaves the stamp alone.
  */
 function catalogStamp(eligible: readonly CatalogEntry[]): string {
   const canonical = eligible
@@ -142,13 +186,14 @@ function catalogStamp(eligible: readonly CatalogEntry[]): string {
 }
 
 /**
- * Render the Tier-0 capability block (R1's six parts):
+ * Render the Tier-0 capability block (seven parts):
  *   1. "you are inside Hapimatic" framing + catalog version stamp;
  *   2. plain-language → native-action list from every eligible `whenToUse`;
  *   3. the discovery/MCP tool list, GENERATED from the catalog's `mcp` entries;
  *   4. the one-line auth recipe;
  *   5. the scheduler one-liner (durable scheduled events vs session-local `/loop`);
- *   6. the "capability registry vs catalog" glossary line.
+ *   6. the "capability registry vs catalog" glossary line;
+ *   7. the generated-files rule (#6223).
  */
 export function renderTier0(
   entries: readonly CatalogEntry[],
@@ -202,6 +247,9 @@ export function renderTier0(
       "surface you enumerate and invoke via the `hapi_capabilities` and " +
       "`hapi_invoke` MCP tools."
   );
+
+  // (7) Where generated files go.
+  lines.push(GENERATED_FILES_RULE);
 
   return lines.join("\n");
 }

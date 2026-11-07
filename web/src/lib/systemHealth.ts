@@ -18,7 +18,9 @@
  */
 export interface SystemHealthMetrics {
   cpu: {
-    usagePercent: number;
+    // null when the server has no 1-60 s sample window yet (#6156); unknown,
+    // not idle, and not a failed collector.
+    usagePercent: number | null;
     temperatureF: number | null; // Fahrenheit, null if unavailable
   };
   memory: {
@@ -108,7 +110,10 @@ export function calculateHealthStatus(
     metrics.memory.usagePercent,
     metrics.disk.usagePercent,
   ];
-  const collectorFailed = usageValues.some(v => v === null);
+  // #6156: a null CPU only means no sample window exists yet, so it is left out
+  // of the math (filtered below) without counting as a failed collector.
+  const collectorFailed =
+    metrics.memory.usagePercent === null || metrics.disk.usagePercent === null;
   const finiteValues = usageValues.filter(
     (v): v is number => v !== null && Number.isFinite(v)
   );

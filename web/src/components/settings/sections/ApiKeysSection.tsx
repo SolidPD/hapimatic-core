@@ -177,6 +177,9 @@ export function ApiKeysSection(
         ...(label.trim() ? { label: label.trim() } : {}),
         // #5127 (D7): an Anthropic add always says whether to share it.
         ...(provider === "anthropic" ? { shareAcrossNodes: shareNew } : {}),
+        // #6211 R10: an OpenRouter key added here was stored unchecked. It gets
+        // the validate-then-store the other providers' add rows use (#4463).
+        ...(provider === "openrouter" ? { validate: true } : {}),
       },
       {
         onSuccess: () => {

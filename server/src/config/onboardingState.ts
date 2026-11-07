@@ -17,25 +17,33 @@
  * guard lives in one place. settings.json holds secrets (cliApiToken, apiKeys);
  * `readSettings` returns `null` for a file that exists but does not parse, and
  * such a file must never be rewritten with this one key (it would drop every
- * other key). Nothing but the two file operations sits between the read and the
- * write, because the CLI rewrites the same file under a lock this server does not
- * take (see `maxConcurrency.ts`); every statement in between widens the window in
- * which one of two overlapping writes is lost.
+ * other key).
  *
- * #4056 (open at the time of writing) adds `updateSettings(file, mutate)` to
- * `settings.ts`. When it lands, keep the no-write path: read the key with
- * `readSettings` first and call the helper only for a write that is due — the
- * helper writes on every call.
+ * #6211: that write runs on `updateSettings`, the same per-file chain the API-key
+ * routes use. This module once kept a chain of its own, and the two did not
+ * serialize against each other, so a key added while an onboarding PUT was in
+ * flight could be silently lost. The wizard's Connect step makes that overlap
+ * likely. The CLI still rewrites the same file under a lock this server does not
+ * take (see `maxConcurrency.ts`), so `decide` stays synchronous and free of I/O.
  */
 
 import {
   OnboardingStateSchema,
+  type OnboardingFlowStep,
+  type OnboardingOutcome,
+  type OnboardingProviderKind,
   type OnboardingState,
-  type OnboardingStatePatch,
 } from "@hapi/protocol/schemas";
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { Store } from "../store";
-import { readSettings, writeSettings, type Settings } from "./settings";
+import {
+  readSettings,
+  SettingsUnreadableError,
+  updateSettings,
+  type Settings,
+} from "./settings";
+
+export { mergeOnboardingPatch } from "@hapi/protocol/schemas";
 
 export const ONBOARDING_STATE_KEY = "onboardingState";
 
@@ -86,75 +94,64 @@ export async function readOnboardingState(
 }
 
 /**
- * Merge a client patch over the effective state (the PUT semantics). A finished
- * tour stays finished: a dismissal — skipping a re-run after completion — never
- * demotes `completed`, whatever the client knew when it sent it (a client whose
- * first read failed cannot tell). Every other transition is honoured, including
- * an explicit re-arm to `pending` (the documented test-setup recipe).
+ * #6211 R18: the outcomes a merge newly recorded, each once. Re-sending the same
+ * outcome for a step (a retry, a replayed PUT) is not a new one.
  */
-export function mergeOnboardingPatch(
-  current: OnboardingState,
-  patch: OnboardingStatePatch
-): OnboardingState {
-  const next: OnboardingState = {
-    ...current,
-    ...patch,
-    status: patch.status ?? current.status,
-  };
-  if (current.status === "completed" && patch.status === "dismissed") {
-    next.status = "completed";
+export function newOnboardingOutcomes(
+  before: OnboardingState,
+  after: OnboardingState
+): Array<{
+  step: OnboardingFlowStep;
+  outcome: OnboardingOutcome;
+  provider?: OnboardingProviderKind;
+}> {
+  const found = [];
+  for (const [step, record] of Object.entries(after.flow?.outcomes ?? {})) {
+    const key = step as OnboardingFlowStep;
+    const earlier =
+      before.flow?.run === after.flow?.run
+        ? before.flow?.outcomes[key]
+        : undefined;
+    if (earlier?.outcome === record.outcome) continue;
+    found.push({
+      step: key,
+      outcome: record.outcome,
+      ...(record.provider ? { provider: record.provider } : {}),
+    });
   }
-  return OnboardingStateSchema.parse(next);
+  return found;
 }
 
 /**
- * Per-settings-file promise chain that serializes every read-modify-write of the
- * key in this process (the PUT handler and the boot-time stamp) — the
- * `SettingsSyncService.writeChain` pattern. Without it two overlapping requests
- * (Next then Finish on a double tap or a burst of queued mobile requests) both
- * read the same old state and the second write discards the first: a finished
- * tour could be written back to `pending` and re-present itself.
+ * The single read-modify-write of the key, on the per-file settings chain. Without
+ * serialization two overlapping requests (Next then Finish on a double tap or a
+ * burst of queued mobile requests) both read the same old state and the second
+ * write discards the first: a finished tour could be written back to `pending` and
+ * re-present itself. Stops without writing when the file is unreadable; hands
+ * `decide` what the key holds; writes nothing when `decide` returns nothing;
+ * otherwise sets ONLY `onboardingState` on the object it just read.
  */
-const writeChains = new Map<string, Promise<void>>();
-
-/**
- * The single read-modify-write of the key, serialized per settings file. Reads
- * the file; stops without writing when it is unreadable; hands `decide` what the
- * key holds; writes nothing when `decide` returns nothing; otherwise sets ONLY
- * `onboardingState` on the object it just read and writes the file.
- */
-export function updateOnboardingState(
+export async function updateOnboardingState(
   settingsFile: string,
   decide: (stored: StoredOnboardingState) => OnboardingState | undefined
 ): Promise<OnboardingStateUpdate> {
-  const previous = writeChains.get(settingsFile) ?? Promise.resolve();
-  const run = previous.then(() => readModifyWrite(settingsFile, decide));
-  const tail = run.then(
-    () => undefined,
-    () => undefined
-  );
-  writeChains.set(settingsFile, tail);
-  void tail.then(() => {
-    if (writeChains.get(settingsFile) === tail)
-      writeChains.delete(settingsFile);
-  });
-  return run;
-}
-
-async function readModifyWrite(
-  settingsFile: string,
-  decide: (stored: StoredOnboardingState) => OnboardingState | undefined
-): Promise<OnboardingStateUpdate> {
-  const settings = await readSettings(settingsFile);
-  if (settings === null) return { kind: "unreadable" };
-  const stored = classify(settings);
-  const next = decide(stored);
-  if (next === undefined) {
-    return { kind: "unchanged", state: effectiveOnboardingState(stored) };
+  let result: OnboardingStateUpdate = { kind: "unreadable" };
+  try {
+    await updateSettings(settingsFile, current => {
+      const stored = classify(current);
+      const next = decide(stored);
+      if (next === undefined) {
+        result = { kind: "unchanged", state: effectiveOnboardingState(stored) };
+        return current;
+      }
+      result = { kind: "written", state: next };
+      return { ...current, [ONBOARDING_STATE_KEY]: next } as Settings;
+    });
+  } catch (err) {
+    if (err instanceof SettingsUnreadableError) return { kind: "unreadable" };
+    throw err;
   }
-  (settings as Settings & Record<string, unknown>)[ONBOARDING_STATE_KEY] = next;
-  await writeSettings(settingsFile, settings);
-  return { kind: "written", state: next };
+  return result;
 }
 
 /**

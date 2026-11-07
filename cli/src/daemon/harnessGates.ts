@@ -28,7 +28,10 @@
  * stock-4 are `absent`). Whether an `emulated` axis should ever count as
  * "supported" is deliberately LEFT OPEN as future work — do not decide it here.
  */
-import { tryResolveHarnessManifest } from "@hapi/protocol";
+import {
+  getPermissionModesForFlavor,
+  tryResolveHarnessManifest,
+} from "@hapi/protocol";
 
 /**
  * Whether an agent's sessions survive on the tmux-persistence path.
@@ -76,4 +79,18 @@ export function harnessSupportsOutputStyle(agent: string | undefined): boolean {
     return manifest.outputStyles === "native";
   }
   return agent === "claude" || !agent;
+}
+
+/**
+ * Whether an agent takes a starting permission-mode seed
+ * (`--hapi-permission-mode`, issue #6218): a harness with RUNTIME permission
+ * modes (Claude, Codex) can start in a mode other than its default. Gemini and
+ * OpenCode express their spawn posture through the `yolo` flag alone; their
+ * manifests' extra spawn modes collapse to that flag (#3350), so the manifest
+ * `applicability` axis is deliberately NOT what decides this.
+ */
+export function harnessSupportsPermissionModeSeed(
+  agent: string | undefined
+): boolean {
+  return getPermissionModesForFlavor(agent ?? "claude").length > 0;
 }

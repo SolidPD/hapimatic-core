@@ -7,6 +7,9 @@ docs/
 bun.lock
 claudedocs/
 .worktrees/
+# Files a session generates (issue #6223) are committed as the agent wrote them,
+# so a generated .md or .json must not fail format:check. Never in .gitignore.
+GeneratedFiles/
 # Issue-workflow attachments (uploaded directives, drift reports) — generated
 # by skills, not authored by humans; not worth gating commits on Prettier rules.
 .github/issue-assets/

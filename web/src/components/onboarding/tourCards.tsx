@@ -3,7 +3,7 @@ import type { ReactElement, ReactNode } from "react";
 import type { OnboardingStepId } from "@hapi/protocol/schemas";
 
 /**
- * The T1–T5 cards of the in-app first-run feature tour (#3865, UX_SPEC §3).
+ * The T1–T4 cards of the first-run wizard's Getting started step (#3865, #6211).
  *
  * Passive (OQ-3): each card illustrates a real surface and drives nothing — no
  * links, no live controls, nothing that can mutate state by accident.
@@ -14,9 +14,9 @@ import type { OnboardingStepId } from "@hapi/protocol/schemas";
  * and account e-mails into a shipped product. They are decorative
  * (`aria-hidden`); the card text carries the meaning.
  *
- * T5 (v1) names only surfaces that exist today — provider API keys and
- * model-subscription accounts, both under Settings → Provider Accounts (#4906).
- * The connector checklist (spec §4) is v2 and waits on epic #2716.
+ * T5 retired with #6211, because the wizard's Connect and Connectors steps now
+ * walk the user through the real pages it only described. A stored `lastStep` of
+ * `t5` opens on the last card (`tourIndexOf`).
  */
 export interface TourCard {
   id: OnboardingStepId;
@@ -227,67 +227,6 @@ function UsageIllustration() {
   );
 }
 
-function ConnectIllustration() {
-  const rows = [36, 74];
-  return (
-    <Frame>
-      {rows.map((y, i) => (
-        <g key={y}>
-          <rect
-            x="18"
-            y={y}
-            width="204"
-            height="28"
-            rx="7"
-            className={SURFACE}
-          />
-          {i === 0 ? (
-            <g className="fill-none stroke-[var(--app-fg)] [stroke-width:1.75] [stroke-linecap:round]">
-              <circle cx="33" cy={y + 14} r="5" />
-              <path d={`M38 ${y + 14}h12M46 ${y + 14}v4M49 ${y + 14}v3`} />
-            </g>
-          ) : (
-            <path
-              d="M38 84a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm-7 9a7 7 0 0 1 14 0"
-              className="fill-none stroke-[var(--app-fg)] [stroke-width:1.75] [stroke-linecap:round]"
-            />
-          )}
-          <rect
-            x="56"
-            y={y + 9}
-            width="96"
-            height="5"
-            rx="2.5"
-            className={STRONG}
-          />
-          <rect
-            x="56"
-            y={y + 17}
-            width="62"
-            height="4"
-            rx="2"
-            className={LINE}
-          />
-          <circle
-            cx="206"
-            cy={y + 14}
-            r="6"
-            className="fill-none stroke-[var(--app-hint)] [stroke-width:1.5]"
-          />
-        </g>
-      ))}
-      <rect
-        x="70"
-        y="116"
-        width="100"
-        height="16"
-        rx="8"
-        className="fill-none stroke-[var(--app-border)] [stroke-dasharray:4_3]"
-      />
-    </Frame>
-  );
-}
-
 export const TOUR_CARDS: readonly TourCard[] = [
   {
     id: "t1",
@@ -313,16 +252,10 @@ export const TOUR_CARDS: readonly TourCard[] = [
     body: "Settings → Provider Accounts shows each account's 5-hour and weekly budgets, including per-model limits such as Fable, and when each one resets.",
     Illustration: UsageIllustration,
   },
-  {
-    id: "t5",
-    title: "Connect your services (optional)",
-    body: "Sign in to your model subscriptions and add model-provider API keys under Settings → Provider Accounts — or skip this and do it later. Questions any time: Settings → Help.",
-    Illustration: ConnectIllustration,
-  },
 ];
 
-/** Index of a step ID in the tour; an unknown ID starts at the first card. */
+/** Index of a step ID in the tour; a retired `t5` opens on the last card. */
 export function tourIndexOf(step: OnboardingStepId): number {
   const index = TOUR_CARDS.findIndex(card => card.id === step);
-  return index === -1 ? 0 : index;
+  return index === -1 ? TOUR_CARDS.length - 1 : index;
 }

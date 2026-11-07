@@ -385,6 +385,7 @@ export function PromptEditorBody({
           onSelect={controller.handleCursorChange}
           onKeyDown={controller.handleKeyDown}
           onFocus={controller.onComposeFocus}
+          onPointerDown={controller.onComposeFocus}
           onBlur={controller.kioskMode ? controller.handleImeBlur : undefined}
           onPaste={onPaste}
           onDragOver={onDragOver}

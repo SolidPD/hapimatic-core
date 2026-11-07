@@ -5,6 +5,7 @@ import type { ApiClient } from "@/api/client";
 import type { SessionSummary } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 import { withoutDeletePending } from "@/lib/session-action-pending";
+import { msUntilPollDue } from "@/lib/sessionHeartbeat";
 
 // #3508: module-level stable empty fallback — keeps the pending-query array
 // identity constant across renders (the #3462 render-loop fuel). Pattern:
@@ -23,9 +24,22 @@ const SLOW_MS = 1000;
 const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_CEILING_MS = 5 * 60_000;
 
+/**
+ * Issue #6208: background backstop poll. `workflowBadge` and `messageCount` are
+ * computed when the list is read, and no event carries them; they used to ride
+ * along on the refetch that every session keepalive (about every 10–12 s) triggered. Keepalives
+ * no longer refetch, so a slow poll keeps those fields fresh (same backstop as
+ * the federation list, #1214). TanStack skips it while the tab is hidden. The
+ * interval counts from the last real fetch (`msUntilPollDue`), because the
+ * keepalive `activeAt` patches restart TanStack's timer on every write.
+ */
+const BACKSTOP_POLL_MS = 30_000;
+
 export function useSessions(api: ApiClient | null): {
   sessions: SessionSummary[];
   isLoading: boolean;
+  /** #3491: the list has loaded and the last fetch did not fail (false while paused offline). */
+  isSuccess: boolean;
   error: string | null;
   refetch: () => Promise<unknown>;
   lastFetchMs: number | null;
@@ -65,7 +79,7 @@ export function useSessions(api: ApiClient | null): {
           : BACKOFF_BASE_MS;
         effectiveIntervalRef.current = next;
       } else if (elapsedMs <= SLOW_MS && current !== null) {
-        // Recovering — halve the cap until we get back to event-driven mode.
+        // Recovering — halve the cap until it drops back to the 30 s backstop.
         const next = current / 2;
         effectiveIntervalRef.current = next < BACKOFF_BASE_MS ? null : next;
       }
@@ -80,13 +94,18 @@ export function useSessions(api: ApiClient | null): {
     // #1032: the backoff cap doubles as both a polling interval (so a stuck
     // query is eventually retried) and a floor on how often SSE-driven
     // invalidations can refetch (via staleTime).
-    refetchInterval: () => effectiveIntervalRef.current ?? false,
+    refetchInterval: cached =>
+      msUntilPollDue(
+        effectiveIntervalRef.current ?? BACKSTOP_POLL_MS,
+        cached.state
+      ),
     staleTime: () => effectiveIntervalRef.current ?? 0,
   });
 
   return {
     sessions: query.data?.sessions ?? EMPTY_SESSIONS,
     isLoading: query.isLoading,
+    isSuccess: query.isSuccess,
     error:
       query.error instanceof Error
         ? query.error.message

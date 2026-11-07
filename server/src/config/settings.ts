@@ -103,6 +103,33 @@ export interface Settings {
     /** Per-node opt-out for the turn-ledger mirror pull loop (issue #4614). */
     turnMirrorDisabled?: boolean;
   };
+  /** Throughput telemetry (issue #6164); see `server/src/throughput/config.ts`. */
+  throughput?: {
+    disabled?: boolean;
+    factsEnabled?: boolean;
+    fleetJobs?: boolean;
+    github?: {
+      /** `owner/repo[:ciWorkflow[:trunk]]`, or an object. */
+      repos?: Array<
+        | string
+        | {
+            repo: string;
+            ciWorkflow?: string | null;
+            trunkBranch?: string | null;
+          }
+      >;
+      backfillDays?: number;
+      intervalMinutes?: number;
+      dangerPaths?: string[];
+    };
+    digest?: { cron?: string; timezone?: string };
+    pricing?: { defaultModel?: string };
+    labels?: {
+      checkpoints?: Array<{ stage: string; suffix: string }>;
+      lanePattern?: string;
+      points?: Record<string, number>;
+    };
+  };
 }
 
 export function getSettingsFile(dataDir: string): string {

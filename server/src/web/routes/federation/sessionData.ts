@@ -2,7 +2,16 @@
 import { Hono } from "hono";
 import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
-import { checkFederationToken } from "./shared";
+import { checkCallerNamespaceIfPresent, checkFederationToken } from "./shared";
+import {
+  checkPathContainment,
+  rejectWorkingDirRoot,
+} from "../sessionPathGuards";
+import {
+  buildFileSearchArgs,
+  parseFileSearchOutput,
+  parseHiddenParam,
+} from "../../../extensions/git-rpc/fileSearchArgs";
 import { defineCapability, toSessionSummary } from "@hapi/protocol";
 import { cataloged } from "../../../capabilities/cataloged";
 import type { MessageOrigin } from "../../../sync/sentFrom";
@@ -27,46 +36,10 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
     }
   }
 
-  // issue #2518: server-side path containment re-check for the write/directory
-  // receivers. The receiver must NOT trust the calling peer — mirror how the
-  // read receiver re-guards. The authoritative symlink-hardened check runs
-  // CLI-side in validatePath (the file lives on this node's filesystem).
-  async function guardContainment(
-    sessionPath: string,
-    relPath: string
-  ): Promise<{ error: string; status: 400 | 403 } | null> {
-    const { resolve, sep, isAbsolute } = await import("node:path");
-    if (isAbsolute(relPath)) {
-      return { error: "Absolute paths not allowed", status: 400 };
-    }
-    const resolvedCwd = resolve(sessionPath);
-    const resolvedPath = resolve(resolvedCwd, relPath);
-    if (
-      resolvedPath !== resolvedCwd &&
-      !resolvedPath.startsWith(resolvedCwd + sep)
-    ) {
-      return { error: "Path escapes session working directory", status: 403 };
-    }
-    return null;
-  }
-
-  // issue #2715 (sweep finding 2715-1): the mutating receivers must ALSO reject
-  // the session-cwd ROOT itself — guardContainment permits target == cwd by
-  // design. Pure resolve() string check; the receiver re-guards independently
-  // of the calling peer.
-  async function rejectWorkingDirRoot(
-    sessionPath: string,
-    relPath: string
-  ): Promise<{ error: string; status: 403 } | null> {
-    const { resolve } = await import("node:path");
-    if (resolve(sessionPath, relPath) === resolve(sessionPath)) {
-      return {
-        error: "Cannot target the session working directory root",
-        status: 403,
-      };
-    }
-    return null;
-  }
+  // #6224: the path pre-filters (checkPathContainment, rejectWorkingDirRoot)
+  // are shared with the local routes in ../sessionPathGuards. The receiver still
+  // re-guards independently of the calling peer; the authoritative realpath
+  // check runs CLI-side in validatePath.
 
   // ─── Node-to-node endpoint: GET /federation/sessions ───────────
   app.get(
@@ -182,9 +155,10 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   // (issue #2418) for a session that lives on THIS node. Returns the same
   // {ok,data:{sessionId,capabilities}} envelope the local route returns, so the
   // hub relays the body verbatim. Federation-token-gated only — like the sibling
-  // per-session reads above, no X-Hapi-Caller-Namespace check (the hub's GET
-  // passthrough does not forward it; namespace ownership is asserted hub-side
-  // before proxying to a foreign node).
+  // per-session reads above, no X-Hapi-Caller-Namespace check. The hub's GET
+  // passthrough does not forward it, and the hub cannot assert ownership of a
+  // remote session itself (its cached summary carries no namespace). The session
+  // file-op receivers below check a forwarded namespace (#6224).
   app.get(
     "/federation/sessions/:id/capabilities",
     cataloged(
@@ -547,6 +521,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "GET /federation/sessions/:id/git-status"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -597,6 +578,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "GET /federation/sessions/:id/git-remote-url"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -657,6 +645,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "GET /federation/sessions/:id/git-diff-numstat"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -712,6 +707,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "GET /federation/sessions/:id/git-diff-file"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -775,6 +777,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "GET /federation/sessions/:id/file"
+      );
+      if (namespaceError) return namespaceError;
 
       const filePath = c.req.query("path");
       if (!filePath) {
@@ -849,6 +858,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "PUT /federation/sessions/:id/file"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -872,7 +888,7 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       const expectedHash =
         typeof body?.expectedHash === "string" ? body.expectedHash : null;
 
-      const guardError = await guardContainment(sessionPath, filePath);
+      const guardError = checkPathContainment(sessionPath, filePath);
       if (guardError) {
         return c.json({ error: guardError.error }, guardError.status);
       }
@@ -927,6 +943,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "GET /federation/sessions/:id/directory"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -934,7 +957,7 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       }
 
       const rawPath = c.req.query("path") ?? ".";
-      const guardError = await guardContainment(sessionPath, rawPath);
+      const guardError = checkPathContainment(sessionPath, rawPath);
       if (guardError) {
         return c.json({ error: guardError.error }, guardError.status);
       }
@@ -982,6 +1005,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "GET /federation/sessions/:id/files"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -993,10 +1023,12 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         Math.max(parseInt(c.req.query("limit") ?? "200") || 200, 1),
         500
       );
-      const args = ["--files"];
-      if (query) {
-        args.push("--iglob", `*${query}*`);
-      }
+      // #6224: the shared builder escapes glob metacharacters and adds hidden
+      // files on request; an older hub never sends `hidden`.
+      const args = buildFileSearchArgs({
+        query,
+        hidden: parseHiddenParam(c.req.query("hidden")),
+      });
 
       const result = await runRpc(() =>
         engine.runRipgrep(sessionId, args, sessionPath)
@@ -1008,25 +1040,7 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         });
       }
 
-      const stdout = result.stdout ?? "";
-      const files = stdout
-        .split("\n")
-        .map((line: string) => line.trim())
-        .filter((line: string) => line.length > 0)
-        .slice(0, limit)
-        .map((fullPath: string) => {
-          const parts = fullPath.split("/");
-          const fileName = parts[parts.length - 1] || fullPath;
-          const filePath = parts.slice(0, -1).join("/");
-          return {
-            fileName,
-            filePath,
-            fullPath,
-            fileType: "file" as const,
-          };
-        });
-
-      return c.json({ success: true, files });
+      return c.json(parseFileSearchOutput(result, limit));
     }
   );
 
@@ -1066,6 +1080,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "POST /federation/sessions/:id/directory"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -1080,11 +1101,11 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         return c.json({ error: "Invalid request body" }, 400);
       }
 
-      const guardError = await guardContainment(sessionPath, dirPath);
+      const guardError = checkPathContainment(sessionPath, dirPath);
       if (guardError) {
         return c.json({ error: guardError.error }, guardError.status);
       }
-      const rootError = await rejectWorkingDirRoot(sessionPath, dirPath);
+      const rootError = rejectWorkingDirRoot(sessionPath, dirPath);
       if (rootError) {
         return c.json({ error: rootError.error }, rootError.status);
       }
@@ -1132,6 +1153,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "POST /federation/sessions/:id/rename"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -1154,11 +1182,11 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       }
 
       for (const p of [srcPath, destPath]) {
-        const guardError = await guardContainment(sessionPath, p);
+        const guardError = checkPathContainment(sessionPath, p);
         if (guardError) {
           return c.json({ error: guardError.error }, guardError.status);
         }
-        const rootError = await rejectWorkingDirRoot(sessionPath, p);
+        const rootError = rejectWorkingDirRoot(sessionPath, p);
         if (rootError) {
           return c.json({ error: rootError.error }, rootError.status);
         }
@@ -1211,6 +1239,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "POST /federation/sessions/:id/delete"
+      );
+      if (namespaceError) return namespaceError;
 
       const sessionPath = session.metadata?.path;
       if (!sessionPath) {
@@ -1227,11 +1262,11 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       }
       const recursive = body?.recursive === true;
 
-      const guardError = await guardContainment(sessionPath, targetPath);
+      const guardError = checkPathContainment(sessionPath, targetPath);
       if (guardError) {
         return c.json({ error: guardError.error }, guardError.status);
       }
-      const rootError = await rejectWorkingDirRoot(sessionPath, targetPath);
+      const rootError = rejectWorkingDirRoot(sessionPath, targetPath);
       if (rootError) {
         return c.json({ error: rootError.error }, rootError.status);
       }

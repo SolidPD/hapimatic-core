@@ -239,7 +239,29 @@ export type OrphanWatermarkResolver = (ctx: {
   ccSessionId: string | null;
   workingDirectory: string | null;
   upperBoundMs?: number;
-}) => number | null;
+  /** For logging only — the turn being closed (#6264: a capped read is logged
+   *  with session + seq). */
+  hapiSessionId?: string;
+  seq?: number;
+}) => number | null | OrphanWatermarkUnresolved;
+
+/**
+ * Issue #6264 — the transcript may hold a watermark, but the bounded read could
+ * not reach it (a cap hit) or could not read the file. Unlike `null` (no
+ * watermark at all → a 0-duration floor), the sweep then leaves `duration_ms`
+ * NULL, which the exact offline backfill (`backfill-orphan-durations`, selecting
+ * `duration_ms IS NULL`) resolves later. A floor would be permanent and look
+ * identical to a genuine one.
+ */
+export interface OrphanWatermarkUnresolved {
+  unresolved: "scan-cap" | "parse-budget" | "read-error";
+}
+
+type OrphanClose = {
+  endedAtMs: number;
+  source: "transcript" | "floor" | "unresolved";
+  unresolvedReason?: OrphanWatermarkUnresolved["unresolved"];
+};
 
 const DEFAULT_FINALIZED_CAP = 5000;
 /**
@@ -314,13 +336,11 @@ export class TurnLifecycle {
    * floor — clamped by the shared `clampOrphanWatermark` so the derived
    * `duration_ms` is a strict, non-phantom lower bound. Fail-open — a throwing
    * resolver floors. Returns the close ms + the provenance source (transcript
-   * vs floor).
+   * vs floor), or `unresolved` (#6264) when the duration is left for the exact
+   * backfill.
    */
-  private resolveOrphanClose(turn: TurnRow): {
-    endedAtMs: number;
-    source: "transcript" | "floor";
-  } {
-    let wm: number | null = null;
+  private resolveOrphanClose(turn: TurnRow): OrphanClose {
+    let wm: number | null | OrphanWatermarkUnresolved = null;
     try {
       const nextStart = this.turnStore.getNextTurnStartMs(
         turn.hapiSessionId,
@@ -331,6 +351,8 @@ export class TurnLifecycle {
         ccSessionId: turn.ccSessionId,
         workingDirectory: turn.cwd,
         upperBoundMs: nextStart ?? undefined,
+        hapiSessionId: turn.hapiSessionId,
+        seq: turn.seq,
       });
     } catch (error) {
       this.safeLog(
@@ -340,7 +362,26 @@ export class TurnLifecycle {
       );
       wm = null;
     }
+    if (wm !== null && typeof wm === "object") {
+      return {
+        endedAtMs: turn.startedAtMs,
+        source: "unresolved",
+        unresolvedReason: wm.unresolved,
+      };
+    }
     return clampOrphanWatermark(wm, turn.startedAtMs);
+  }
+
+  /** Mark one turn orphaned at its resolved close (#6264: an unresolved close
+   *  leaves `duration_ms` NULL for the exact backfill). */
+  private markTurnOrphaned(
+    hapiSessionId: string,
+    seq: number,
+    close: OrphanClose
+  ): boolean {
+    return this.turnStore.markOrphaned(hapiSessionId, seq, close.endedAtMs, {
+      durationKnown: close.source !== "unresolved",
+    });
   }
 
   /**
@@ -349,11 +390,8 @@ export class TurnLifecycle {
    * observed completion. Mirrors the `spans_sleep`/`spans_restart` config_snapshot
    * event. Best-effort; never throws.
    */
-  private recordOrphanCloseEvent(
-    turn: TurnRow,
-    endedAtMs: number,
-    source: "transcript" | "floor"
-  ): void {
+  private recordOrphanCloseEvent(turn: TurnRow, close: OrphanClose): void {
+    const { endedAtMs, source } = close;
     try {
       this.turnStore.appendEvents({
         turnId: turn.id,
@@ -365,8 +403,14 @@ export class TurnLifecycle {
             name: "orphan_close",
             payload: {
               watermark_source: source,
-              duration_ms: Math.max(0, endedAtMs - turn.startedAtMs),
+              duration_ms:
+                source === "unresolved"
+                  ? null
+                  : Math.max(0, endedAtMs - turn.startedAtMs),
               ended_at_ms: endedAtMs,
+              ...(close.unresolvedReason
+                ? { unresolved_reason: close.unresolvedReason }
+                : {}),
             },
           },
         ],
@@ -507,7 +551,7 @@ export class TurnLifecycle {
       // wrapped (logParseFailure) and the event is a plain push into the fail-open
       // finalize events array — neither can throw out of finalizeTurn.
       if (parseError != null) {
-        this.logParseFailure(event.sid, parseError, parseSkipped);
+        this.logParseFailure(event.sid, seq, parseError, parseSkipped);
         events.push({
           tsMs: event.endedAtMs,
           kind: "parse_failed",
@@ -568,12 +612,10 @@ export class TurnLifecycle {
           // #2248: close at the last-observed-activity watermark (lower-bound
           // duration) instead of the sweep wall-clock, which would over-count a
           // turn orphaned across a long downtime.
-          const { endedAtMs, source } = this.resolveOrphanClose(turn);
-          if (
-            this.turnStore.markOrphaned(turn.hapiSessionId, turn.seq, endedAtMs)
-          ) {
+          const close = this.resolveOrphanClose(turn);
+          if (this.markTurnOrphaned(turn.hapiSessionId, turn.seq, close)) {
             orphaned += 1;
-            this.recordOrphanCloseEvent(turn, endedAtMs, source);
+            this.recordOrphanCloseEvent(turn, close);
           }
         } catch (error) {
           this.safeLog("turn markOrphaned failed", turn.hapiSessionId, error);
@@ -635,19 +677,12 @@ export class TurnLifecycle {
           const row = rowsBySeq.get(key.seq);
           // Fall back to the sweep clock only when the row is absent (already
           // finalized/orphaned) — markOrphaned then no-ops, so it is never written.
-          const close = row
+          const close: OrphanClose = row
             ? this.resolveOrphanClose(row)
-            : { endedAtMs: this.now(), source: "floor" as const };
-          if (
-            this.turnStore.markOrphaned(
-              key.hapiSessionId,
-              key.seq,
-              close.endedAtMs
-            )
-          ) {
+            : { endedAtMs: this.now(), source: "floor" };
+          if (this.markTurnOrphaned(key.hapiSessionId, key.seq, close)) {
             orphaned += 1;
-            if (row)
-              this.recordOrphanCloseEvent(row, close.endedAtMs, close.source);
+            if (row) this.recordOrphanCloseEvent(row, close);
           }
         } catch (error) {
           this.safeLog(
@@ -802,14 +837,17 @@ export class TurnLifecycle {
    */
   private logParseFailure(
     sessionId: string,
+    seq: number,
     message: string,
     skipped: number
   ): void {
     try {
+      // #6264: `seq` lets `server/scripts/backfill-turns.ts` repair a turn whose
+      // bounded transcript read hit its cap (the message names the cap).
       this.errorLogger.error("transcript parse failed (fail-open R12)", {
         category: "transcript-parse-failed",
         sessionId,
-        context: { error: message, skipped },
+        context: { error: message, skipped, seq },
       });
     } catch {
       // never let a logging failure surface to the caller

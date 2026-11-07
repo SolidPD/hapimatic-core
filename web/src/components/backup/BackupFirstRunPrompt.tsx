@@ -63,7 +63,7 @@ export function backupPromptVariant(
 /**
  * What the onboarding-tour read says for the gate (#4791 R8, LC6). `unknown` is
  * a failed read: it counts as not pending only while this app load has never
- * seen the tour pending, so a blip in the 2 s poll while the tour is open never
+ * seen the tour pending, so a blip in the 30 s poll while the tour is open never
  * reads as the tour having closed.
  */
 type OnboardingGate = "pending" | "clear" | "unknown";
@@ -79,7 +79,7 @@ export function __resetBackupFirstRunPromptForTests(): void {
   presentedThisLoad = false;
 }
 
-const ONBOARDING_PENDING_POLL_MS = 2000;
+export const ONBOARDING_PENDING_POLL_MS = 30_000;
 const SKIP_TOAST_MS = 8000;
 
 /**
@@ -97,7 +97,8 @@ const SKIP_TOAST_MS = 8000;
  * enabled only on `/sessions`, so the app-level observers idle on other routes.
  *
  * LC6 with #3865's tour (epic #4789, operator-confirmed 2026-10-08): the step
- * waits while the tour reads `pending` (re-reading every 2 s so it opens once
+ * waits while the tour reads `pending` (re-reading every 30 s, because #6211's
+ * wizard can stay pending across visits, so it opens once
  * the tour closes; a failed read counts as not pending until the tour has been
  * seen pending, and after that only a successful read releases it); it dispatches
  * `hapi:backup-prompt-open` / `hapi:backup-prompt-close`, which the tour honours;
@@ -105,9 +106,35 @@ const SKIP_TOAST_MS = 8000;
  * skip marker. If the tour opens before the step does, the step holds until the
  * tour's state goes from pending to done, so the two never stack.
  */
+/**
+ * Records that the user skipped saving their backup key, so the prompt does not ask
+ * again. The wizard's Backup key step uses it too (#6211).
+ */
+export function useRecordBackupSkip(api: ApiClient | null) {
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+  return useMutation({
+    mutationFn: async () => {
+      if (!api) throw new Error("No API client");
+      return await api.setBackupPromptPreference({ skipped: true });
+    },
+    onMutate: () => {
+      queryClient.setQueryData<BackupPromptPreference>(
+        queryKeys.backupPromptPreference,
+        { skipped: true }
+      );
+    },
+    onError: () => {
+      showToast(
+        "Couldn't record that you skipped this step; it may appear again next time.",
+        { type: "error" }
+      );
+    },
+  });
+}
+
 export function BackupFirstRunPrompt() {
   const { api } = useAppContext();
-  const queryClient = useQueryClient();
   const { showToast } = useToast();
   const pathname = useLocation({ select: location => location.pathname });
   const hasDrawerParam = useLocation({
@@ -210,24 +237,7 @@ export function BackupFirstRunPrompt() {
     window.dispatchEvent(new CustomEvent(BACKUP_PROMPT_OPEN_EVENT));
   }, [onSessions, hasDrawerParam, tourClear, variant]);
 
-  const recordSkip = useMutation({
-    mutationFn: async () => {
-      if (!api) throw new Error("No API client");
-      return await api.setBackupPromptPreference({ skipped: true });
-    },
-    onMutate: () => {
-      queryClient.setQueryData<BackupPromptPreference>(
-        queryKeys.backupPromptPreference,
-        { skipped: true }
-      );
-    },
-    onError: () => {
-      showToast(
-        "Couldn't record that you skipped this step; it may appear again next time.",
-        { type: "error" }
-      );
-    },
-  });
+  const recordSkip = useRecordBackupSkip(api);
 
   if (!open) return null;
 

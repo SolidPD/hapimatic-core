@@ -6,8 +6,16 @@
  * to notify our HTTP server when sessions change (new session, resume, compact, etc.).
  */
 
-import { join } from "node:path";
-import { writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { join, resolve } from "node:path";
+import {
+  writeFileSync,
+  mkdirSync,
+  unlinkSync,
+  existsSync,
+  lstatSync,
+  realpathSync,
+} from "node:fs";
+import { NODE_DOCS_DIR_NAME, NODE_DOCS_VERSION_FILE } from "@hapi/protocol";
 import { parseApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { configuration } from "@/configuration";
 import { logger } from "@/ui/logger";
@@ -94,7 +102,108 @@ export function buildApiKeyHelperCommand(
 }
 
 /**
+ * Characters refused in the docs path: glob and gitignore metacharacters,
+ * which could make the rule wider than the folder, plus parentheses (as a
+ * precaution) and C0, DEL and C1 control characters. A refused path gets no
+ * rule, so reads prompt as before.
+ */
+const UNSAFE_RULE_PATH_CHARS = /[*?[\]{}()!\\#\x00-\x1f\x7f-\x9f]/;
+
+/**
+ * Whether `dir` is the docs folder Hapimatic wrote: a real directory, not a
+ * symlink, holding the `.docs-version` stamp. #6219's writer treats a `docs`
+ * folder without the stamp as someone else's and leaves it alone; so does
+ * this rule. Never throws.
+ */
+function isNodeDocsDir(dir: string): boolean {
+  try {
+    return (
+      lstatSync(dir).isDirectory() &&
+      existsSync(join(dir, NODE_DOCS_VERSION_FILE))
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Seams for tests; every default reads the real machine. */
+export interface NodeDocsReadRuleDeps {
+  /** `HAPI_HOME` (default: the cli configuration's home dir). */
+  homeDir?: string;
+  /** The platform (default: `process.platform`). */
+  platform?: NodeJS.Platform;
+  /** Resolve symlinks; throws when it cannot (default: `realpathSync`). */
+  realpath?: (path: string) => string;
+  /** Whether a folder is Hapimatic's docs folder (default: `isNodeDocsDir`). */
+  isNodeDocsDir?: (dir: string) => boolean;
+}
+
+/**
+ * Issue #6321: the permission rules that let a session read this node's docs
+ * folder, `<HAPI_HOME>/docs/`, with no prompt in the `default` and
+ * `acceptEdits` modes. Read-only: the rule covers nothing but reads in the
+ * folder, so an Edit or Write there, a mutating Bash command, and any read
+ * outside the folder (its parent, a sibling such as `docs-old`, or a
+ * `docs/../` path, which Claude Code normalises before matching) prompt as
+ * they did before, unless another settings file, the working directory or
+ * the permission mode already allows them. Read-only shell commands such as
+ * `grep` over the folder are allowed, because Claude Code maps them onto Read
+ * rules. Measured on Claude Code 2.1.312.
+ *
+ * `Read(//abs/path/**)` is Claude Code's absolute-path form (`/path` would be
+ * relative to the settings file). A read through a symlink is allowed only
+ * when both the written path and the resolved path are allowed, so a home
+ * that is or sits under a symlink gets a second rule for its realpath. Both
+ * rules name the same folder. The home, not the `docs` folder, is resolved.
+ *
+ * Returns `[]` (no rule; reads prompt as before #6321, and the settings file
+ * is unchanged):
+ * - when `<HAPI_HOME>/docs` is not Hapimatic's docs folder: missing, a symlink,
+ *   or a real directory without the `.docs-version` stamp (a user's own
+ *   `docs/` under a `HAPI_HOME` such as `$HOME` stays behind a prompt);
+ * - on Windows, where the path form is unverified;
+ * - when the path holds a character that would make the rule wider than the
+ *   folder.
+ * Never throws: the settings file is written at
+ * session start (`runClaude.ts`), and a failed realpath drops only the second
+ * rule. `HAPI_HOME` is resolved as #6219's docs pointer resolves it.
+ *
+ * The rule does not depend on `HAPI_DOCS_POINTER`: the stamped folder holds the
+ * public user guide, so letting a session read it is harmless whether or not
+ * its prompt names the folder.
+ */
+export function buildNodeDocsReadRules(
+  deps: NodeDocsReadRuleDeps = {}
+): string[] {
+  if ((deps.platform ?? process.platform) === "win32") return [];
+  const home = resolve(deps.homeDir ?? configuration.happyHomeDir);
+  const docsDir = join(home, NODE_DOCS_DIR_NAME);
+  if (!(deps.isNodeDocsDir ?? isNodeDocsDir)(docsDir)) return [];
+  const dirs = [docsDir];
+  try {
+    const realHome = (deps.realpath ?? realpathSync)(home);
+    if (realHome !== home) dirs.push(join(realHome, NODE_DOCS_DIR_NAME));
+  } catch {
+    // No realpath (the home does not exist yet, or cannot be read): the rule
+    // for the resolved path alone.
+  }
+  if (dirs.some(dir => UNSAFE_RULE_PATH_CHARS.test(dir))) {
+    logger.debug(
+      "[generateHookSettings] Docs folder path holds a pattern character: no docs read rule"
+    );
+    return [];
+  }
+  return [...new Set(dirs.map(dir => `Read(/${dir}/**)`))];
+}
+
+/**
  * Generate a temporary settings file with SessionStart hook configuration.
+ *
+ * Issue #6321: when this node has its docs folder, the file also carries
+ * `permissions.allow` with the read-only rule for it (`buildNodeDocsReadRules`).
+ * Without one, the file is exactly as before #6321. Every launcher
+ * receives this one file, so the rule reaches sdk, pty, tmux and local
+ * sessions, and ACP editor sessions, which build their file here too.
  *
  * Issue #2155: `claudeMdExcludes` carries the resolved role profile's
  * `@`-include exclusions (ruling D3). This settings file is the SINGLE
@@ -160,6 +269,7 @@ export function generateHookSettingsFile(
     outputStyle?: string;
     apiKeyHelper?: string;
     promptCacheTtl?: string;
+    permissions?: { allow: string[] };
   } = {
     hooks: {
       SessionStart: hookEntry,
@@ -170,17 +280,17 @@ export function generateHookSettingsFile(
   };
 
   // Issue #2155: merge the role profile's `@`-include exclusions (ruling D3).
-  // Only add the key when non-empty — an empty exclude list must produce a
-  // settings file byte-identical to the pre-#2155 hooks-only file (fail-open).
+  // Only add the key when non-empty — an empty exclude list omits the key, so
+  // the child loads the full instruction stack (fail-open).
   if (claudeMdExcludes.length > 0) {
     settings.claudeMdExcludes = claudeMdExcludes;
   }
 
   // Issue #2626: inject the per-session output style. Only add the key when a
-  // style is selected — an unset style must produce a settings file
-  // byte-identical to the pre-#2626 file (fail-open, R2), exactly like the
-  // claudeMdExcludes block above. A `--settings` scalar `outputStyle` wins over
-  // `~/.claude/settings.local.json` (Task 1 spike, verified on Claude Code 2.1.x).
+  // style is selected — an unset style omits the key (fail-open, R2), as the
+  // claudeMdExcludes block above does. A `--settings` scalar `outputStyle`
+  // wins over `~/.claude/settings.local.json` (Task 1 spike, verified on
+  // Claude Code 2.1.x).
   if (outputStyle) {
     settings.outputStyle = outputStyle;
   }
@@ -189,8 +299,8 @@ export function generateHookSettingsFile(
   // from the helper's stdout, so the key never enters a process environment;
   // measured on 2.1.280, the helper outranks `CLAUDE_CODE_OAUTH_TOKEN` and the
   // `/login` credentials, and a failing helper yields an empty credential (a
-  // 401), never a login fallback. Only added for a key session — every other
-  // session's file stays byte-identical. Issue #5118: the same gate sets the
+  // 401), never a login fallback. Only added for a key session — no other
+  // session's file carries either key. Issue #5118: the same gate sets the
   // 1-hour cache TTL, so the two keys cannot drift apart (measured on 2.1.280: a
   // `--settings` `promptCacheTtl` is honoured in normal and `--safe-mode`).
   if (apiKeyBinding) {
@@ -198,9 +308,20 @@ export function generateHookSettingsFile(
     settings.promptCacheTtl = API_KEY_SESSION_PROMPT_CACHE_TTL;
   }
 
+  // Issue #6321: let the session read this node's docs folder without a
+  // prompt. Read-only and scoped to exactly that folder; the key is omitted
+  // when this node has no docs folder of its own, or no exact rule can be
+  // written (fail closed: reads prompt as before, and the file is unchanged).
+  // Safe mode drops this whole file (#1633), so a safe-mode session gets no
+  // rule, and its prompt names no docs folder either.
+  const docsReadRules = buildNodeDocsReadRules();
+  if (docsReadRules.length > 0) {
+    settings.permissions = { allow: docsReadRules };
+  }
+
   writeFileSync(filepath, JSON.stringify(settings, null, 4));
   logger.debug(
-    `[generateHookSettings] Created hook settings file: ${filepath}`
+    `[generateHookSettings] Created hook settings file: ${filepath} (${docsReadRules.length} docs read rule(s))`
   );
 
   return filepath;

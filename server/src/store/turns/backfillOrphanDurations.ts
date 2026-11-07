@@ -103,6 +103,10 @@ export function backfillOrphanDurations(
       ccSessionId: row.cc_session_id,
       workingDirectory: row.cwd,
       upperBoundMs: nb?.n ?? undefined,
+      // #6264 R10: this offline repair closes historical mid-file orphans, so it
+      // keeps the exact whole-file watermark. A bounded read could return null
+      // and write a permanent zero-duration floor that this backfill never revisits.
+      exact: true,
     });
     const { endedAtMs, source } = clampOrphanWatermark(wm, floor);
     toApply.push({ row, ended: endedAtMs, source });

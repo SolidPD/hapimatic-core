@@ -39,6 +39,7 @@ import {
 } from "@/accounts/legacyConfigDirMigration";
 import { logger } from "@/ui/logger";
 import { isTenantVm, tenantSignInRequiredMessage } from "@/accounts/tenantMode";
+import { withPermissionModeArg } from "@/claude/spawnPermissionSeed";
 
 /**
  * Multi-account OAuth (epic #1446, Sub-Issue D): per-session account-token
@@ -195,6 +196,13 @@ export interface ApiKeySessionBinding {
    * carries it, so a bare id's binding is unchanged.
    */
   sessionId?: string;
+  /**
+   * Issue #5819: `HAPI_API_KEY_PLACED_BY` — set when another node placed this
+   * session here on one of this node's keys. Read for a bare id only (a key on
+   * another node is re-checked by its home anyway); present ⇒ every launch
+   * requires the vault entry to still be shared.
+   */
+  placedBy?: string;
 }
 
 /** Issue #4568: this process's API-key binding, or `null` for any other session. */
@@ -208,6 +216,8 @@ export function readBoundApiKeyBinding(): ApiKeySessionBinding | null {
   const sessionId = process.env.HAPI_SESSION_ID || undefined;
   if (sessionId && isQualifiedApiKeyRef(apiKeyId))
     binding.sessionId = sessionId;
+  const placedBy = process.env.HAPI_API_KEY_PLACED_BY || undefined;
+  if (placedBy && !isQualifiedApiKeyRef(apiKeyId)) binding.placedBy = placedBy;
   return binding;
 }
 
@@ -237,6 +247,12 @@ export interface ResolveApiKeyDeps {
  * its home, through this host's server, on every (re)launch. A refusal (the
  * home is offline, the key is no longer shared, its mask changed …) throws the
  * message that names the home, and the launch fails the same way.
+ *
+ * Issue #5819: a session another node placed here on one of this node's keys
+ * (`placedBy`) also requires the entry to still be shared, so unticking "Make
+ * available to all nodes" stops its in-process relaunches (mode change, abort,
+ * crash) too. The `apiKeyHelper` is deliberately unchanged: a running session
+ * keeps the key until it stops.
  */
 export async function verifyApiKeyForSession(
   deps: ResolveApiKeyDeps = {}
@@ -274,6 +290,7 @@ export async function verifyApiKeyForSession(
     apiKeyId: binding.apiKeyId,
     expectedMasked: binding.masked,
     apiKeys,
+    requireShared: binding.placedBy !== undefined,
   });
   if (!result.ok) {
     logger.warn(
@@ -899,6 +916,24 @@ export async function buildEntitledModelArgs(
 }
 
 /**
+ * Append `--effort <effort>` to a claude argv (issue #2456; lifted out of
+ * {@link resolveSpawnClaudeArgs} by #6166 so the local launcher uses it too).
+ * A missing effort leaves the args unchanged, and so does an `--effort` already
+ * present (`--effort <level>` or `--effort=<level>`): a user's own passthrough
+ * wins. Returns a new array; the input is never mutated.
+ */
+export function appendEffortArg(
+  args: string[],
+  effort: string | undefined
+): string[] {
+  if (!effort) return args;
+  if (args.some(a => a === "--effort" || a.startsWith("--effort="))) {
+    return args;
+  }
+  return [...args, "--effort", effort];
+}
+
+/**
  * Issue #1608: resolve the final spawn args for the PTY/tmux launchers. Both
  * launchers previously inlined the identical `accountConfigDir ? raw :
  * buildEntitledModelArgs(...)` branch — this DRYs it and creates the test seam
@@ -925,7 +960,10 @@ export async function buildEntitledModelArgs(
  * The `Pick<…>` structural type keeps the helper unit-testable.
  */
 export async function resolveSpawnClaudeArgs(
-  session: Pick<Session, "getModelMode" | "getModel" | "getEffort">,
+  session: Pick<
+    Session,
+    "getModelMode" | "getModel" | "getEffort" | "getPermissionMode"
+  >,
   accountConfigDir: string | null,
   claudeArgs: string[] | undefined,
   deps: ResolveAccountTokenDeps = {}
@@ -937,8 +975,12 @@ export async function resolveSpawnClaudeArgs(
   // to EVERY return path (the binary accepts --effort alongside any --model).
   // Idempotent: skip if a --effort already rode in via the claudeArgs passthrough.
   const effort = session.getEffort();
+  // Issue #6218: the LIVE permission mode reaches the tmux / pty child as
+  // `--permission-mode` on every return path too. It is read per launch, so a
+  // relaunch follows the session's saved mode, not the start-time seed.
+  const permissionMode = session.getPermissionMode();
   const withEffort = (args: string[]): string[] =>
-    effort && !args.includes("--effort") ? [...args, "--effort", effort] : args;
+    withPermissionModeArg(appendEffortArg(args, effort), permissionMode);
 
   // Issue #1633: an EXPLICIT user model selection must reach the child's argv
   // on BOTH paths — before this, nothing ever appended it: the isolated path

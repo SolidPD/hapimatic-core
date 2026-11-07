@@ -46,6 +46,10 @@ export type SocketServerDeps = {
     thinking?: boolean;
     mode?: "local" | "remote";
     effort?: string;
+    // Issue #6166: applied effort read back from Claude (`null` = none).
+    appliedEffort?: string | null;
+    appliedModel?: string;
+    appliedForEffort?: string | null;
     rawModel?: string | null;
     resolvedModel?: string;
     contextWindowTokens?: number;

@@ -130,9 +130,13 @@ export const queryKeys = {
   // Server-side chat bookmarks (issue #3115) — per-session, node-local.
   bookmarks: (sessionId: string) => ["bookmarks", sessionId] as const,
   gitStatus: (sessionId: string) => ["git-status", sessionId] as const,
+  // #6222: the Files tab's status, a child of gitStatus. useBranchInfo caches a
+  // different result shape at gitStatus, so the two need separate entries;
+  // invalidating gitStatus still reaches this one by prefix.
+  gitStatusFiles: (sessionId: string) =>
+    ["git-status", sessionId, "files"] as const,
   // #4469: a fan-out peer's diff against the parent's branch. Kept OFF
-  // gitStatus, which useBranchInfo and useGitStatusFiles already share with
-  // different result shapes.
+  // gitStatus, whose entries hold different result shapes.
   fanOutPeerNumstat: (peerId: string, base: string | null) =>
     ["fan-out-peer-numstat", peerId, base ?? ""] as const,
   fanOutPeerFileDiff: (peerId: string, path: string, base: string | null) =>
@@ -142,11 +146,22 @@ export const queryKeys = {
     ["fan-out-parent-messages", parentId] as const,
   sessionFiles: (sessionId: string, query: string) =>
     ["session-files", sessionId, query] as const,
+  // #6224: every file search of a session, for invalidating by prefix.
+  sessionFileSearches: (sessionId: string) =>
+    ["session-files", sessionId] as const,
   sessionFile: (sessionId: string, path: string) =>
     ["session-file", sessionId, path] as const,
+  // #6224: every file read and every diff of a session, for invalidating by
+  // prefix after a Browse rename or delete (a folder op touches every file
+  // under it).
+  sessionFileReads: (sessionId: string) => ["session-file", sessionId] as const,
+  gitFileDiffs: (sessionId: string) => ["git-file-diff", sessionId] as const,
   // issue #2518: session-scoped directory listing for the VM file browser.
   sessionDirectory: (sessionId: string, path: string) =>
     ["session-directory", sessionId, path] as const,
+  // #6222: every listing of a session, for invalidating by prefix.
+  sessionDirectories: (sessionId: string) =>
+    ["session-directory", sessionId] as const,
   gitFileDiff: (sessionId: string, path: string, staged?: boolean) =>
     ["git-file-diff", sessionId, path, staged ? "staged" : "unstaged"] as const,
   slashCommands: (sessionId: string) => ["slash-commands", sessionId] as const,
@@ -180,6 +195,7 @@ export const queryKeys = {
   heartbeatHistory: ["heartbeat-history"] as const,
   heartbeatInstructions: ["heartbeat-instructions"] as const,
   federationNodes: ["federation-nodes"] as const,
+  tailscaleStatus: ["tailscale-status"] as const,
   federationAllSessions: ["federation-all-sessions"] as const,
   // File Conflict Monitor (#1971): per-repo live claims + umbrella recompute key.
   fileClaims: (repo: string) => ["file-claims", repo] as const,
@@ -261,6 +277,19 @@ export const queryKeys = {
     ] as const,
   telemetrySessionAggregates: (startTime?: number) =>
     ["telemetry-session-aggregates", startTime ?? "all"] as const,
+  // Throughput telemetry (issue #6164) — the Analytics page's Throughput tab.
+  throughputSummary: (from: number, to: number) =>
+    ["throughput-summary", from, to] as const,
+  throughputBreakdown: (
+    dim: string,
+    from: number,
+    to: number,
+    cursor: string
+  ) => ["throughput-breakdown", dim, from, to, cursor] as const,
+  throughputTests: (from: number, to: number) =>
+    ["throughput-tests", from, to] as const,
+  throughputDigests: () => ["throughput-digests"] as const,
+  throughputDigest: (id: string) => ["throughput-digest", id] as const,
   // Harness Scorecard — Settings → Harness Scorecard (issue #3128, epic #3117
   // Sub N). Per-(skill × harness × model) evidence rollup.
   harnessScorecard: ["harness-scorecard"] as const,
@@ -273,6 +302,9 @@ export const queryKeys = {
   // Issue #1671 (epic #1662, Sub I): server-authoritative per-session token stats.
   sessionTokenStats: (sessionId: string) =>
     ["session-token-stats", sessionId] as const,
+  // Issue #6170: the context breakdown modal's full get-context-usage read.
+  sessionContextBreakdown: (sessionId: string) =>
+    ["session-context-breakdown", sessionId] as const,
   // Issue #1672 (epic #1662, Sub J): per-session workflow-state badge + chips.
   sessionWorkflowState: (sessionId: string) =>
     ["session-workflow-state", sessionId] as const,

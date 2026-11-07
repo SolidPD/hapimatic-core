@@ -29,6 +29,7 @@ import {
   useOpenAiLoginStep,
 } from "@/components/AccountUsage/NodeLoginList";
 import { useFederationNodesInfo } from "@/hooks/queries/useFederationHealthAvailable";
+import { clearPendingSignIn } from "@/components/AccountUsage/pendingSignIn";
 
 export type AddToProviderModalProps = {
   isOpen: boolean;
@@ -61,9 +62,16 @@ export type AddToProviderModalProps = {
  * The body mounts only while open, so each opening starts from a clean state.
  */
 export function AddToProviderModal(props: AddToProviderModalProps) {
+  // #6211: every way of closing the modal ends the auto-resume; only a page
+  // reload, which runs none of these, finds the pending sign-in still there.
+  const { onClose: closeModal } = props;
+  const onClose = useCallback(() => {
+    clearPendingSignIn();
+    closeModal();
+  }, [closeModal]);
   return (
-    <Dialog open={props.isOpen} onOpenChange={open => !open && props.onClose()}>
-      {props.isOpen ? <AddToProviderBody {...props} /> : null}
+    <Dialog open={props.isOpen} onOpenChange={open => !open && onClose()}>
+      {props.isOpen ? <AddToProviderBody {...props} onClose={onClose} /> : null}
     </Dialog>
   );
 }

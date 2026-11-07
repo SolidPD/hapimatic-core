@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { z } from "zod";
 import { ExistingBranchSchema, SourceBranchSchema } from "./gitBranches";
+import { PERMISSION_MODES } from "./modes";
 import { optionalSessionNameSchema } from "./sessionName";
 import { ClaudeRemoteLauncherKindSchema } from "./launcherResolver";
 import { isQualifiedApiKeyRef, isUsableNodeIdForSharing } from "./apiKeyRef";
@@ -200,6 +201,11 @@ export const FederationSpawnBodySchema = z.object({
   directory: z.string().min(1),
   agent: z.enum(["claude", "codex", "gemini", "opencode"]).optional(),
   yolo: z.boolean().optional(),
+  /** Issue #6218: the starting permission mode. A plain z.object strips an
+   *  un-enumerated key at the hub forwarder AND here, so it must be listed to
+   *  reach a peer. Omitted with `yolo` too → the RECEIVING node's default
+   *  spawn permission mode preference applies (its `syncEngine.spawnSession`). */
+  permissionMode: z.enum(PERMISSION_MODES).optional(),
   /** Issue #1262/#1683: opt-in to spawn-time port claim. When omitted, the
    *  receiving federation route defaults to `false` (claim-at-deploy;
    *  `peerSpawn.ts` uses `claimPort ?? false`). */

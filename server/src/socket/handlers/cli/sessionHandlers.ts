@@ -34,6 +34,10 @@ type SessionAlivePayload = {
   modelMode?: ModelMode;
   // Issue #2456: live reasoning-effort level → session record → in-session tag.
   effort?: string;
+  // Issue #6166: applied effort read back from Claude (`null` = none).
+  appliedEffort?: string | null;
+  appliedModel?: string;
+  appliedForEffort?: string | null;
   // Composer-chip pin integrity: pinned raw model id; `null` = pin cleared.
   rawModel?: string | null;
   resolvedModel?: string;

@@ -671,6 +671,7 @@ export class AccountRestart {
       authBinding: session.metadata?.authBinding,
       apiKeyId: session.metadata?.apiKeyId,
       apiKeyMasked: session.metadata?.apiKeyMasked,
+      apiKeyPlacedBy: session.metadata?.apiKeyPlacedBy,
     };
 
     // #3087: build the shared respawn base ONCE (post-archive; handleSessionEnd
@@ -733,6 +734,9 @@ export class AccountRestart {
           apiKeyId: resolved.kind === "api-key" ? resolved.apiKeyId : undefined,
           apiKeyMasked:
             resolved.kind === "api-key" ? resolved.apiKeyMasked : undefined,
+          // Issue #5819: a switch target is chosen on this node, so it is a
+          // local binding (persistBinding already dropped the record's marker).
+          apiKeyPlacedBy: undefined,
         }),
       {
         capacityMode: "tail",
@@ -753,6 +757,7 @@ export class AccountRestart {
               context: "account-switch",
               deadlineMs: CAPACITY_TAIL_DEADLINE_MS,
               elapsedMs: info.elapsedMs,
+              cause: info.cause,
             }),
             namespace: session.namespace,
           });

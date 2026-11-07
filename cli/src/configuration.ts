@@ -238,6 +238,17 @@ class Configuration {
    */
   public readonly capabilityTier0Enabled: boolean;
 
+  /**
+   * Issue #6219: the docs pointer's own off switch (`HAPI_DOCS_POINTER`),
+   * independent of {@link capabilityTier0Enabled}: the pointer is appended with
+   * or without Tier-0, so turning Tier-0 off leaves it on. Default **ON**, parsed
+   * the same inverted way: only `0`/`false`/`no` disables it, and every harness
+   * then starts without the pointer (`utils/hapimaticDocsPointer.ts`). Forwarded
+   * into the tmux-persisted worker by `buildSandboxEnv()` exactly as
+   * `HAPI_CAPABILITY_TIER0` is (#1575).
+   */
+  public readonly docsPointerEnabled: boolean;
+
   // tmux session persistence configuration
   public readonly tmuxPersistenceEnabled: boolean;
   public readonly tmuxSessionName: string;
@@ -387,6 +398,12 @@ class Configuration {
     // "normalize" this to truthy-enable.
     this.capabilityTier0Enabled = !["false", "0", "no"].includes(
       process.env.HAPI_CAPABILITY_TIER0?.toLowerCase() || ""
+    );
+
+    // Issue #6219: the docs pointer's off switch, parsed like the Tier-0 one
+    // above (default ON; only `0`/`false`/`no` disables it).
+    this.docsPointerEnabled = !["false", "0", "no"].includes(
+      process.env.HAPI_DOCS_POINTER?.toLowerCase() || ""
     );
 
     // tmux session persistence - enabled via environment variable

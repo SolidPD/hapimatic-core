@@ -7,14 +7,18 @@ import {
   appendFile,
   lstat,
   mkdir,
+  mkdtemp,
   readdir,
   readFile,
   readlink,
   realpath,
+  rename,
   rm,
   stat,
+  statfs,
   writeFile,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -22,7 +26,7 @@ import { WorktreeMetaSchema, trimChars } from "@hapi/protocol";
 import type { ExistingBranch } from "@hapi/protocol/gitBranches";
 
 import { logger } from "@/ui/logger";
-import { withFileLock } from "@/utils/fileLock";
+import { FileLockTimeoutError, withFileLock } from "@/utils/fileLock";
 import { deriveWorktreeBranchName } from "@/utils/id";
 import { logProcessHygieneEvent } from "@/utils/processHygieneEvents";
 import { probeLinkedWorktree } from "@/utils/worktreeEnv";
@@ -39,6 +43,13 @@ import {
   writeWorktreeMeta,
 } from "./worktreeMeta";
 import { resolveWorktreeHostBase } from "./worktreeHostBase";
+import {
+  evictTrashUnderDiskPressure,
+  resolveTrashDiskPct,
+  type EvictableMeta,
+  type StatfsLike,
+  type TrashEntry,
+} from "./worktreeTrashEviction";
 
 const execFileAsync = promisify(execFile);
 
@@ -81,6 +92,15 @@ export type SoftDeleteMetadata = {
    * from the trash meta) never `git branch -D`s a pre-existing branch.
    */
   branchOrigin?: BranchOrigin;
+  /**
+   * #6158: set when disk pressure evicted the holding directory. The branch and
+   * this meta stay; `recoverWorktree` recreates the worktree from the branch.
+   */
+  evictedAt?: string;
+  /** #6158: the `refs/hapimatic-backup/<branch>-wip-*` snapshot of uncommitted work. */
+  wipRef?: string;
+  /** #6158: the evicted holding dir's `.worktree-meta.json` text (it is gitignored). */
+  worktreeMetaJson?: string;
 };
 
 /**
@@ -300,6 +320,11 @@ export async function runGit(
      * `worktree add` uses for its checkout child (#4058, CR-R1).
      */
     repo?: { gitDir: string; workTree: string };
+    /**
+     * Extra variables set after the GIT_* scrub — the trash-eviction snapshot
+     * passes a temporary `GIT_INDEX_FILE` and a committer identity (#6158).
+     */
+    env?: Record<string, string>;
   }
 ): Promise<{ stdout: string; stderr: string }> {
   const timeoutMs = options?.timeoutMs ?? getGitTimeoutMs();
@@ -312,6 +337,7 @@ export async function runGit(
     env.GIT_DIR = options.repo.gitDir;
     env.GIT_WORK_TREE = options.repo.workTree;
   }
+  if (options?.env) Object.assign(env, options.env);
   try {
     const result = await execFileAsync("git", args, {
       cwd,
@@ -844,8 +870,17 @@ async function ensureGitExclude(
   try {
     await mkdir(join(repoRoot, ".git", "info"), { recursive: true });
     await appendFile(excludePath, `\n${pattern}\n`);
-  } catch {
-    // Best effort — don't fail worktree creation over this
+  } catch (error) {
+    // Best effort — don't fail worktree creation over this. Logged because an
+    // unwritten exclude leaves the path showing in `git status` (#6222).
+    const message = error instanceof Error ? error.message : String(error);
+    logger.warn(
+      `[worktree] could not add ${pattern} to ${excludePath} (non-fatal): ${message}`
+    );
+    logger.reportCaught(error, {
+      category: "daemon-worktree-git-exclude",
+      severity: "warn",
+    });
   }
 }
 
@@ -1740,6 +1775,9 @@ export async function createWorktree(options: {
   }
 
   await ensureGitExclude(repoRoot, ".worktrees");
+  // #6222: the sidecar written below is the harness's, not a change in the user's
+  // repo. Unexcluded, a clean repo never reads as clean, and `git add -A` commits it.
+  await ensureGitExclude(repoRoot, ".worktree-meta.json");
 
   const baseName =
     normalizeNameHint(nameHint) ??
@@ -3588,7 +3626,96 @@ export async function cleanupIdleWorktree(
 }
 
 /**
- * Recover a soft-deleted worktree by moving it back from `.trash/` to its original path.
+ * #6158: recreate an evicted trash entry at `originalPath` from its kept branch,
+ * restore its work-in-progress snapshot into the working tree (the index stays
+ * at the branch head) and write its `.worktree-meta.json` back. A snapshot that
+ * cannot be restored is an error: the recreated worktree is removed again, so
+ * the entry stays evicted and the caller keeps its meta (the ref's only record).
+ */
+async function recreateEvictedWorktree(
+  basePath: string,
+  originalPath: string,
+  meta: SoftDeleteMetadata & { wipRef: string }
+): Promise<RecoverResult> {
+  try {
+    await runGit(
+      ["show-ref", "--verify", "--quiet", `refs/heads/${meta.branch}`],
+      basePath
+    );
+  } catch {
+    return {
+      ok: false,
+      error: `The trash entry's working tree was evicted and its branch ${meta.branch} no longer exists`,
+    };
+  }
+  try {
+    await runGit(["worktree", "add", originalPath, meta.branch], basePath, {
+      timeoutMs: getWorktreeAddTimeoutMs(),
+      timeoutEnvHint: "HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS",
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: `git worktree add failed (is ${meta.branch} checked out elsewhere?): ${message}`,
+    };
+  }
+  try {
+    await runGit(
+      ["restore", `--source=${meta.wipRef}`, "--worktree", "--", "."],
+      originalPath
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    let undoError: string | null = null;
+    try {
+      await runGit(["worktree", "remove", "--force", originalPath], basePath, {
+        timeoutMs: getWorktreeAddTimeoutMs(),
+        timeoutEnvHint: "HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS",
+      });
+    } catch (removeError) {
+      if (await pathExists(originalPath)) {
+        undoError =
+          removeError instanceof Error
+            ? removeError.message
+            : String(removeError);
+      }
+    }
+    return {
+      ok: false,
+      error:
+        `Could not restore the work-in-progress snapshot ${meta.wipRef}: ${message}. ` +
+        (undoError === null
+          ? "The entry stays evicted and its trash meta is kept."
+          : `The recreated worktree at ${originalPath} could not be removed again (${undoError}); its trash meta is kept.`),
+    };
+  }
+  if (typeof meta.worktreeMetaJson === "string") {
+    try {
+      await writeFile(
+        join(originalPath, ".worktree-meta.json"),
+        meta.worktreeMetaJson
+      );
+    } catch {
+      // The meta is regenerated by `hapi-worktree.sh start`
+    }
+  }
+  return {
+    ok: true,
+    info: {
+      basePath,
+      worktreePath: originalPath,
+      branch: meta.branch,
+      name: basename(originalPath),
+      createdAt: Date.now(),
+    },
+  };
+}
+
+/**
+ * Recover a soft-deleted worktree by moving it back from `.trash/` to its
+ * original path — or, for an entry whose holding dir disk pressure evicted
+ * (#6158), by recreating it from its kept branch and restoring its snapshot.
  */
 export async function recoverWorktree(options: {
   basePath: string;
@@ -3617,22 +3744,35 @@ export async function recoverWorktree(options: {
       return { ok: false, error: `No metadata found for: ${holdingName}` };
     }
   } else if (branch) {
-    // Search by branch name
+    // Search by branch name. #6158: take the NEWEST matching entry (readdir
+    // order is arbitrary, and oldest-first eviction makes an older entry the
+    // likely evicted one), and skip a malformed meta instead of failing the
+    // whole search.
+    let files: string[];
     try {
-      const files = await readdir(trashDir);
-      for (const file of files) {
-        if (!file.endsWith(".meta.json")) continue;
-        const raw = await readFile(join(trashDir, file), "utf-8");
-        const meta = JSON.parse(raw) as SoftDeleteMetadata;
-        if (meta.branch === branch) {
-          targetMeta = meta;
-          targetHoldingName = file.replace(".meta.json", "");
-          metaPath = join(trashDir, file);
-          break;
-        }
-      }
+      files = await readdir(trashDir);
     } catch {
       return { ok: false, error: "Cannot read trash directory" };
+    }
+    let newestMs = -Infinity;
+    for (const file of files) {
+      if (!file.endsWith(".meta.json")) continue;
+      let meta: SoftDeleteMetadata;
+      try {
+        meta = JSON.parse(
+          await readFile(join(trashDir, file), "utf-8")
+        ) as SoftDeleteMetadata;
+      } catch {
+        continue;
+      }
+      if (meta.branch !== branch) continue;
+      const deletedMs = await trashEntryDeletedMs(meta, join(trashDir, file));
+      if (deletedMs > newestMs) {
+        newestMs = deletedMs;
+        targetMeta = meta;
+        targetHoldingName = file.replace(".meta.json", "");
+        metaPath = join(trashDir, file);
+      }
     }
     if (!targetMeta) {
       return {
@@ -3655,11 +3795,70 @@ export async function recoverWorktree(options: {
     };
   }
 
-  try {
-    await runGit(["worktree", "move", holdingPath, originalPath], basePath);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: `git worktree move failed: ${message}` };
+  const wipRef =
+    typeof targetMeta.wipRef === "string" && targetMeta.wipRef !== ""
+      ? targetMeta.wipRef
+      : null;
+  if (await pathExists(holdingPath)) {
+    try {
+      await runGit(["worktree", "move", holdingPath, originalPath], basePath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const hint = /locked/i.test(message)
+        ? " (a purge holds this entry's lock — retry once it finishes)"
+        : wipRef
+          ? ` (an interrupted eviction recorded its snapshot as ${wipRef})`
+          : "";
+      return {
+        ok: false,
+        error: `git worktree move failed: ${message}${hint}`,
+      };
+    }
+    // #6158: an eviction that was cut off mid-removal (the meta records its
+    // snapshot but no evictedAt) can leave the tree half-deleted yet still
+    // registered, so the move succeeds: restore the snapshot of the intact tree
+    // over it. A restore that fails moves the entry back to the trash, where its
+    // meta (the snapshot's only record) still describes it.
+    if (wipRef && !targetMeta.evictedAt) {
+      try {
+        await runGit(
+          ["restore", `--source=${wipRef}`, "--worktree", "--", "."],
+          originalPath
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        let where =
+          "The entry was moved back to the trash and its meta is kept.";
+        try {
+          await runGit(
+            ["worktree", "move", originalPath, holdingPath],
+            basePath
+          );
+        } catch (moveError) {
+          where = `Moving it back to the trash failed (${moveError instanceof Error ? moveError.message : String(moveError)}), so the tree stays at ${originalPath}; its meta is kept.`;
+        }
+        return {
+          ok: false,
+          error: `Could not restore the work-in-progress snapshot ${wipRef} over the recovered tree: ${message}. ${where}`,
+        };
+      }
+    }
+  } else if (!wipRef) {
+    // #6158: a holding dir that is gone without a recorded snapshot was not
+    // evicted; recreating it from the branch would silently drop its work.
+    return {
+      ok: false,
+      error: `The trash entry's holding directory ${holdingPath} is gone and its meta records no work-in-progress snapshot; nothing was recovered and the meta is kept`,
+    };
+  } else {
+    // #6158: disk pressure evicted the working tree. Recreate it from the kept
+    // branch and restore the work-in-progress snapshot; ignored files
+    // (node_modules, build output) were not kept.
+    const recreated = await recreateEvictedWorktree(basePath, originalPath, {
+      ...targetMeta,
+      wipRef,
+    });
+    if (!recreated.ok) return recreated;
   }
 
   // Clean up metadata file
@@ -3738,6 +3937,12 @@ export async function listSoftDeletedWorktrees(
 export async function purgeExpiredWorktrees(options: {
   basePath: string;
   retentionDays?: number;
+  /** #6158: test seams for the disk-pressure eviction pass. */
+  diskPressure?: {
+    thresholdPct?: number | null;
+    statfs?: (path: string) => Promise<StatfsLike>;
+    lockPath?: string;
+  };
 }): Promise<number> {
   const { basePath, retentionDays = DEFAULT_RETENTION_DAYS } = options;
   // Issue #1558: resolve the host base so recover/list/purge operate on the
@@ -3806,7 +4011,10 @@ export async function purgeExpiredWorktrees(options: {
       continue;
     }
 
-    const deletedTime = new Date(meta.deletedAt).getTime();
+    // #6158: an invalid deletedAt used to read as NaN, and `NaN > cutoff` is
+    // false — the entry was purged (branch included) at once. Age it by the
+    // meta file's mtime instead.
+    const deletedTime = await trashEntryDeletedMs(meta, metaPath);
     if (deletedTime > cutoff) continue;
 
     const holdingName = file.replace(".meta.json", "");
@@ -3848,76 +4056,10 @@ export async function purgeExpiredWorktrees(options: {
       reason: "purge-expired",
     });
 
-    // (b) #3451 capture whether the worktree directory was actually removed. The
-    // pre-#3451 code swallowed this failure and then rm'd the meta
-    // unconditionally, leaking an invisible holding dir (list/recover/purge all
-    // iterate *.meta.json). Now a surviving directory is the only failure state,
-    // and it gates the meta-delete + branch-delete below.
-    let removed = false;
-    let removeError: unknown = null;
-    try {
-      await runGit(["worktree", "remove", "--force", holdingPath], basePath);
-      removed = true;
-    } catch (err) {
-      removeError = err;
-    }
-    if (!removed && !(await pathExists(holdingPath))) {
-      // Already gone (re-entrant purge or a prior partial remove) — removed.
-      removed = true;
-    }
-
-    // (c) #3451 convergence fallback (B-D13 = A — OPERATOR-AUTHORIZED, strictly
-    // scoped). Attempt to converge a stuck holding dir, but ONLY under BOTH
-    // guards: (i) isWithinWorktreeBase rejects `..` and enforces the
-    // <hostBase>/.worktrees/ prefix, and (ii) the path is under
-    // <hostBase>/.worktrees/.trash/ specifically. The operator authorized this
-    // recursive delete on THAT scoping — do not widen it, and derive the path
-    // only from join(trashDir, holdingName) above.
-    if (!removed) {
-      const hostBase = resolveWorktreeHostBase(basePath);
-      const trashRoot = join(hostBase, ".worktrees", TRASH_DIR_NAME);
-      const withinBase = isWithinWorktreeBase(hostBase, holdingPath).valid;
-      const underTrash = resolve(holdingPath).startsWith(trashRoot + sep);
-      if (withinBase && underTrash) {
-        try {
-          const listed = (
-            await runGit(["worktree", "list", "--porcelain"], basePath)
-          ).stdout;
-          const resolvedHolding = resolve(holdingPath);
-          const stillRegistered = listed
-            .split("\n")
-            .some(
-              line =>
-                line === `worktree ${holdingPath}` ||
-                line === `worktree ${resolvedHolding}`
-            );
-          if (!stillRegistered) {
-            // Unregistered: git will never reap it via `worktree remove` — the
-            // directory outlived its registration. rm -rf + prune converges it.
-            await rm(holdingPath, { recursive: true, force: true });
-            await runGit(["worktree", "prune"], basePath);
-          } else if (
-            /locked/i.test(
-              removeError instanceof Error
-                ? removeError.message
-                : String(removeError ?? "")
-            )
-          ) {
-            // Locked worktree: git requires a doubled --force. Manual-lock-only
-            // (nothing in cli/src runs `worktree lock`); kept for completeness.
-            await runGit(
-              ["worktree", "remove", "--force", "--force", holdingPath],
-              basePath
-            );
-          }
-        } catch {
-          // Convergence is best-effort; the re-probe below decides the outcome.
-        }
-        if (!(await pathExists(holdingPath))) {
-          removed = true;
-        }
-      }
-    }
+    // (b)+(c) #3451: remove the holding dir (lock, `remove --force --force`,
+    // the strictly scoped convergence fallback) — shared with the #6158
+    // disk-pressure eviction below.
+    const removed = await removeTrashHoldingDir(basePath, holdingPath);
 
     if (removed) {
       // (Task 3 / R6, #3451) Protect unpushed commits BEFORE deleting the
@@ -3940,12 +4082,26 @@ export async function purgeExpiredWorktrees(options: {
         logger.info(
           `[worktree] purge: branch ${meta.branch} preserved — pre-existing (branchOrigin=existing-local)`
         );
+      } else if (await otherTrashMetaNamesBranch(trashDir, file, meta.branch)) {
+        // #6158: another trash entry still names this branch. Before eviction,
+        // git refused to delete a branch checked out in a holding dir; an
+        // evicted entry has no holding dir, so check the metas explicitly.
+        logger.info(
+          `[worktree] purge: branch ${meta.branch} kept — another trash entry still names it`
+        );
       } else {
         await backupUnpushedBranch(basePath, meta.branch);
         try {
           await runGit(["branch", "-D", meta.branch], basePath);
         } catch {
           // Branch may already be gone
+        }
+        if (meta.wipRef) {
+          try {
+            await runGit(["update-ref", "-d", meta.wipRef], basePath);
+          } catch {
+            // Already gone
+          }
         }
       }
 
@@ -3966,7 +4122,440 @@ export async function purgeExpiredWorktrees(options: {
     reportRetained(holdingPath, meta.branch, "remove-failed");
   }
 
+  // #6158 D4: with the disk at or above the threshold, evict the oldest trash
+  // entries' working trees (after a work-in-progress snapshot). Best effort:
+  // never throws, and never changes the purged count.
+  await evictTrashForDiskPressure(
+    basePath,
+    trashDir,
+    purgeBaseNorm,
+    normPath,
+    options.diskPressure
+  );
+
   return purged;
+}
+
+/**
+ * Remove a trash holding directory: steps (b)+(c) of the #3451 purge, shared
+ * with the #6158 disk-pressure eviction. True when the directory is gone.
+ * `removeTimeout` bounds the `git worktree remove` calls (the eviction passes
+ * the worktree-add budget: deleting a full worktree outlasts the generic one).
+ */
+async function removeTrashHoldingDir(
+  basePath: string,
+  holdingPath: string,
+  removeTimeout?: { timeoutMs: number; timeoutEnvHint: string }
+): Promise<boolean> {
+  // (b) #3451 capture whether the worktree directory was actually removed. The
+  // pre-#3451 code swallowed this failure and then rm'd the meta
+  // unconditionally, leaking an invisible holding dir (list/recover/purge all
+  // iterate *.meta.json). Now a surviving directory is the only failure state,
+  // and it gates the meta-delete + branch-delete below.
+  let removed = false;
+  let removeError: unknown = null;
+  // #6158: lock the entry first, so a concurrent `git worktree move` (TS
+  // recoverWorktree, hapi-worktree.sh recover) refuses instead of moving a
+  // half-deleted tree; a locked worktree needs the doubled --force.
+  let lockedHere = false;
+  try {
+    await runGit(
+      [
+        "worktree",
+        "lock",
+        "--reason",
+        `hapimatic-purge ${process.pid}`,
+        holdingPath,
+      ],
+      basePath
+    );
+    lockedHere = true;
+  } catch {
+    // Unregistered, already locked, or gone — the remove below decides.
+  }
+  try {
+    await runGit(
+      ["worktree", "remove", "--force", "--force", holdingPath],
+      basePath,
+      removeTimeout
+    );
+    removed = true;
+  } catch (err) {
+    removeError = err;
+  }
+  if (!removed && !(await pathExists(holdingPath))) {
+    // Already gone (re-entrant purge or a prior partial remove) — removed.
+    removed = true;
+  }
+
+  // (c) #3451 convergence fallback (B-D13 = A — OPERATOR-AUTHORIZED, strictly
+  // scoped). Attempt to converge a stuck holding dir, but ONLY under BOTH
+  // guards: (i) isWithinWorktreeBase rejects `..` and enforces the
+  // <hostBase>/.worktrees/ prefix, and (ii) the path is under
+  // <hostBase>/.worktrees/.trash/ specifically. The operator authorized this
+  // recursive delete on THAT scoping — do not widen it, and derive the path
+  // only from join(trashDir, holdingName) above.
+  if (!removed) {
+    const hostBase = resolveWorktreeHostBase(basePath);
+    const trashRoot = join(hostBase, ".worktrees", TRASH_DIR_NAME);
+    const withinBase = isWithinWorktreeBase(hostBase, holdingPath).valid;
+    const underTrash = resolve(holdingPath).startsWith(trashRoot + sep);
+    if (withinBase && underTrash) {
+      try {
+        const listed = (
+          await runGit(["worktree", "list", "--porcelain"], basePath)
+        ).stdout;
+        const resolvedHolding = resolve(holdingPath);
+        const stillRegistered = listed
+          .split("\n")
+          .some(
+            line =>
+              line === `worktree ${holdingPath}` ||
+              line === `worktree ${resolvedHolding}`
+          );
+        if (!stillRegistered) {
+          // Unregistered: git will never reap it via `worktree remove` — the
+          // directory outlived its registration. rm -rf + prune converges it.
+          await rm(holdingPath, { recursive: true, force: true });
+          await runGit(["worktree", "prune"], basePath);
+        } else if (
+          /locked/i.test(
+            removeError instanceof Error
+              ? removeError.message
+              : String(removeError ?? "")
+          )
+        ) {
+          // A locked worktree needs the doubled --force. The first attempt above
+          // already passes it (and this function takes its own lock), so this
+          // retry is a #3451 holdover that rarely changes the outcome.
+          await runGit(
+            ["worktree", "remove", "--force", "--force", holdingPath],
+            basePath,
+            removeTimeout
+          );
+        }
+      } catch {
+        // Convergence is best-effort; the re-probe below decides the outcome.
+      }
+      if (!(await pathExists(holdingPath))) {
+        removed = true;
+      }
+    }
+  }
+  if (!removed && lockedHere) {
+    // Do not strand a recoverable entry behind our lock.
+    try {
+      await runGit(["worktree", "unlock", holdingPath], basePath);
+    } catch {
+      // best effort
+    }
+  }
+  return removed;
+}
+
+/** `deletedAt` as epoch ms, or the meta file's mtime when it does not parse (#6158). */
+async function trashEntryDeletedMs(
+  meta: { deletedAt?: unknown },
+  metaPath: string
+): Promise<number> {
+  const parsed =
+    typeof meta.deletedAt === "string" ? Date.parse(meta.deletedAt) : NaN;
+  if (Number.isFinite(parsed)) return parsed;
+  try {
+    return (await stat(metaPath)).mtimeMs;
+  } catch {
+    return Date.now();
+  }
+}
+
+/** True when a trash meta other than `selfFile` names `branch` (#6158). */
+async function otherTrashMetaNamesBranch(
+  trashDir: string,
+  selfFile: string,
+  branch: string
+): Promise<boolean> {
+  let files: string[];
+  try {
+    files = await readdir(trashDir);
+  } catch {
+    return false;
+  }
+  for (const file of files) {
+    if (file === selfFile || !file.endsWith(".meta.json")) continue;
+    try {
+      const other = JSON.parse(
+        await readFile(join(trashDir, file), "utf-8")
+      ) as { branch?: unknown };
+      if (other.branch === branch) return true;
+    } catch {
+      // A malformed meta names nothing
+    }
+  }
+  return false;
+}
+
+/** The host-wide lock that serializes evictions across repo roots and instances. */
+function trashEvictionLockPath(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  return join(tmpdir(), `hapi-worktree-trash-evict-${uid}.lock`);
+}
+
+/**
+ * #6158 D4: snapshot a holding dir's uncommitted + untracked work into a
+ * backup ref with a temporary index (never the worktree's own index, never
+ * `git stash`, whose stack is shared). Null when anything fails.
+ */
+async function snapshotTrashWip(
+  holdingPath: string,
+  branch: string
+): Promise<string | null> {
+  // Every git call is pinned to the holding dir's OWN repository. The holding
+  // dir sits inside the main checkout (`.worktrees/.trash/`), so with its .git
+  // file gone git would walk up and snapshot the main checkout instead.
+  const ceiling = { GIT_CEILING_DIRECTORIES: dirname(holdingPath) };
+  let indexDir: string | undefined;
+  try {
+    const top = (
+      await runGit(["rev-parse", "--show-toplevel"], holdingPath, {
+        env: ceiling,
+      })
+    ).stdout.trim();
+    if (!top || (await realpath(top)) !== (await realpath(holdingPath))) {
+      logger.debug(
+        `[worktree] #6158: not snapshotting ${holdingPath}: git resolves it to ${top || "no repository"}`
+      );
+      return null;
+    }
+    indexDir = await mkdtemp(join(tmpdir(), "hapi-wip-index-"));
+    const env = {
+      ...ceiling,
+      GIT_INDEX_FILE: join(indexDir, "index"),
+      GIT_AUTHOR_NAME: "Hapimatic",
+      GIT_AUTHOR_EMAIL: "hapimatic@localhost",
+      GIT_COMMITTER_NAME: "Hapimatic",
+      GIT_COMMITTER_EMAIL: "hapimatic@localhost",
+    };
+    await runGit(["read-tree", "HEAD"], holdingPath, { env });
+    await runGit(["add", "-A"], holdingPath, { env });
+    // A nested repository (an untracked one, or an initialized submodule) enters the
+    // index as a gitlink only: its files, uncommitted work and own commits all live
+    // inside the holding dir and are NOT in the snapshot. Refuse such an entry, so it
+    // is never evicted. A gitlink path with no .git (an uninitialized submodule)
+    // holds nothing to lose. -z: raw paths, never core.quotePath-quoted.
+    const staged = (
+      await runGit(["ls-files", "-s", "-z"], holdingPath, { env })
+    ).stdout;
+    for (const entry of staged.split("\0")) {
+      const m = /^160000 [0-9a-f]+ \d+\t(.+)$/s.exec(entry);
+      // lstat: a submodule's .git is a file, an untracked repository's a dir.
+      const hasGit =
+        m !== null &&
+        (await lstat(join(holdingPath, m[1], ".git")).then(
+          () => true,
+          () => false
+        ));
+      if (m && hasGit) {
+        logger.debug(
+          `[worktree] #6158: not snapshotting ${holdingPath}: it holds a nested git repository at ${m[1]}`
+        );
+        return null;
+      }
+    }
+    const tree = (
+      await runGit(["write-tree"], holdingPath, { env })
+    ).stdout.trim();
+    const commit = (
+      await runGit(
+        [
+          "commit-tree",
+          tree,
+          "-p",
+          "HEAD",
+          "-m",
+          `hapimatic: trash eviction snapshot of ${branch} (#6158)`,
+        ],
+        holdingPath,
+        { env }
+      )
+    ).stdout.trim();
+    if (!/^[0-9a-f]{40,64}$/.test(commit)) return null;
+    const ref = `refs/hapimatic-backup/${branch}-wip-${Date.now()}`;
+    await runGit(["update-ref", ref, commit], holdingPath, { env: ceiling });
+    return ref;
+  } catch (err) {
+    logger.debug(
+      `[worktree] #6158: work-in-progress snapshot failed for ${holdingPath}: ${err}`
+    );
+    return null;
+  } finally {
+    if (indexDir) {
+      await rm(indexDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+/** #6158 D4: wire the real side effects into the disk-pressure eviction. Never throws. */
+async function evictTrashForDiskPressure(
+  basePath: string,
+  trashDir: string,
+  purgeBaseNorm: string | null,
+  normPath: (p: string | undefined) => Promise<string | null>,
+  seams?: {
+    thresholdPct?: number | null;
+    statfs?: (path: string) => Promise<StatfsLike>;
+    lockPath?: string;
+  }
+): Promise<void> {
+  try {
+    let thresholdPct: number | null;
+    if (seams && "thresholdPct" in seams) {
+      thresholdPct = seams.thresholdPct ?? null;
+    } else {
+      const resolved = resolveTrashDiskPct();
+      if (resolved.warning) logger.warn(`[worktree] ${resolved.warning}`);
+      thresholdPct = resolved.pct;
+    }
+    if (thresholdPct === null) return;
+
+    const result = await evictTrashUnderDiskPressure(
+      { trashDir, thresholdPct },
+      {
+        statfs: seams?.statfs ?? (path => statfs(path)),
+        listCandidates: async () => {
+          const out: TrashEntry[] = [];
+          let files: string[];
+          try {
+            files = await readdir(trashDir);
+          } catch {
+            return out;
+          }
+          for (const file of files) {
+            if (!file.endsWith(".meta.json")) continue;
+            const metaPath = join(trashDir, file);
+            let meta: SoftDeleteMetadata;
+            try {
+              meta = JSON.parse(await readFile(metaPath, "utf-8"));
+            } catch {
+              continue;
+            }
+            if (meta.evictedAt || typeof meta.branch !== "string") continue;
+            // The purge's wrong-root assertion (a), applied before any git op.
+            if (meta.basePath) {
+              const metaBaseNorm = await normPath(meta.basePath);
+              if (
+                purgeBaseNorm === null ||
+                metaBaseNorm === null ||
+                metaBaseNorm !== purgeBaseNorm
+              ) {
+                continue;
+              }
+            }
+            const holdingName = file.replace(".meta.json", "");
+            const holdingPath = join(trashDir, holdingName);
+            if (!(await pathExists(holdingPath))) continue;
+            out.push({
+              holdingName,
+              holdingPath,
+              metaPath,
+              meta: meta as unknown as EvictableMeta,
+              deletedMs: await trashEntryDeletedMs(meta, metaPath),
+            });
+          }
+          return out;
+        },
+        killCwdHolders: async entry => {
+          const killResult = await killProcessesWithCwdUnder(entry.holdingPath);
+          logProcessHygieneEvent({
+            source: "cli-worktree",
+            action: "kill",
+            path: entry.holdingPath,
+            sessionId:
+              typeof entry.meta.sessionId === "string"
+                ? entry.meta.sessionId
+                : undefined,
+            pidsTerminated: killResult.terminated,
+            pidsKilled: killResult.killed,
+            errors: killResult.errors.length ? killResult.errors : undefined,
+            reason: "purge-disk-pressure",
+          });
+        },
+        snapshotWip: entry =>
+          snapshotTrashWip(entry.holdingPath, entry.meta.branch),
+        snapshotExists: async (_entry, ref) => {
+          try {
+            await runGit(
+              ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+              basePath
+            );
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        readWorktreeMeta: async entry => {
+          try {
+            return await readFile(
+              join(entry.holdingPath, ".worktree-meta.json"),
+              "utf-8"
+            );
+          } catch {
+            return null;
+          }
+        },
+        removeHoldingDir: entry =>
+          removeTrashHoldingDir(basePath, entry.holdingPath, {
+            timeoutMs: getWorktreeAddTimeoutMs(),
+            timeoutEnvHint: "HAPI_GIT_WORKTREE_ADD_TIMEOUT_MS",
+          }),
+        writeMeta: async (entry, meta) => {
+          const tmp = `${entry.metaPath}.tmp-${process.pid}`;
+          await writeFile(tmp, JSON.stringify(meta, null, 2));
+          await rename(tmp, entry.metaPath);
+        },
+        withLock: async fn => {
+          try {
+            const value = await withFileLock(
+              {
+                lockPath: seams?.lockPath ?? trashEvictionLockPath(),
+                maxAttempts: 1,
+              },
+              fn
+            );
+            return { acquired: true, value };
+          } catch (err) {
+            if (err instanceof FileLockTimeoutError) {
+              return { acquired: false };
+            }
+            throw err;
+          }
+        },
+        now: () => new Date(),
+      }
+    );
+
+    if (result.evicted.length > 0 || result.kept.length > 0) {
+      logger.reportError({
+        message:
+          `[worktree] disk at ${result.usedBefore}% (threshold ${thresholdPct}%): ` +
+          `evicted ${result.evicted.length} trash worktree(s), kept ${result.kept.length}; ` +
+          `now ${result.usedAfter ?? "?"}%`,
+        category: "daemon-worktree-trash-evicted",
+        severity: "warn",
+        context: JSON.stringify({
+          basePath,
+          thresholdPct,
+          usedBefore: result.usedBefore,
+          usedAfter: result.usedAfter,
+          evicted: result.evicted,
+          kept: result.kept,
+        }),
+      });
+    }
+  } catch (err) {
+    logger.debug(
+      `[worktree] #6158: disk-pressure eviction failed (non-fatal): ${err}`
+    );
+  }
 }
 
 // #2450: single-flight, fire-and-forget trigger for the expired-worktree purge.

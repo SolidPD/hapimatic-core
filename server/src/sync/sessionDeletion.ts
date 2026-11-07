@@ -19,14 +19,48 @@
  * the SAME object references the facade holds (so test spies on
  * `engine.rpcGateway.cleanupTmuxSession` / `engine.mcpBatchCoordinator.clear`
  * still apply).
+ *
+ * Issue #6210 — `detachCleanup` (opt-in, both methods). It changes WHEN the
+ * caller is answered, not the cleanups' order (tmux before worktree). With it,
+ * the record is deleted first, the caller is answered, and tmux then worktree
+ * cleanup continue in a detached chain that logs its failures and never rejects.
+ * Because the caller is already answered, the detached path re-checks for a
+ * session that took the worktree meanwhile and then keeps that worktree.
+ *
+ * Measured reason: on 2026-11-03 a hub sent 55 per-session deletes to one peer.
+ * The peer's 55 concurrent `cleanup-worktree` RPCs ran past the 30 s ack
+ * timeout, so 53 of the 55 deletes answered only after 40 s. The hub's
+ * per-session call gives up at 10 s, so it reported failures for sessions the
+ * peer then deleted.
+ *
+ * Callers that do not pass the option keep awaiting every cleanup exactly as before.
  */
 
+import type { WorktreeMetadata } from "@hapi/protocol/types";
 import type { SessionCache } from "./sessionCache";
 import type { RpcGateway } from "./rpcGateway";
 import type { McpBatchCoordinator } from "./mcpBatchCoordinator";
 import type { Store } from "../store";
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { LoopCronLifecycleCoupler } from "./loopCronLifecycle";
+
+/** One tmux cleanup a bulk delete gathers before the records go (#1349). */
+type BulkTmuxCleanup = {
+  machineId: string;
+  sessionTag: string;
+  serverSessionId: string; // #1628: window-name UUID for the direct reap path
+};
+
+/** One worktree cleanup a bulk delete gathers before the records go (#1349). */
+type BulkWorktreeCleanup = {
+  machineId: string;
+  worktreeInfo: {
+    basePath: string;
+    worktreePath?: string;
+    branch: string;
+    sessionId?: string;
+  };
+};
 
 export interface SessionDeletionDeps {
   sessionCache: SessionCache;
@@ -113,7 +147,10 @@ export class SessionDeletion {
     }
   }
 
-  async deleteSession(sessionId: string): Promise<void> {
+  async deleteSession(
+    sessionId: string,
+    opts?: { detachCleanup?: boolean }
+  ): Promise<void> {
     // Get session metadata to find machineId for tmux cleanup
     const session = this.sessionCache.getSession(sessionId);
     const machineId = session?.metadata?.machineId;
@@ -122,7 +159,41 @@ export class SessionDeletion {
     // The server's sessionId is a UUID, but the daemon stores sessions by the tag
     // (which is the HAPI_SESSION_ID env var passed when spawning)
     const sessionTag = this.sessionCache.getSessionTag(sessionId);
+    const worktree = session?.metadata?.worktree;
 
+    if (opts?.detachCleanup) {
+      // #6210: delete the record and answer the caller now; tmux then worktree
+      // cleanup run after it (see the header). If the record delete throws
+      // (e.g. the session is still active), no cleanup runs at all.
+      await this.sessionCache.deleteSession(sessionId);
+      this.afterSessionDeleted(sessionId);
+      void this.runDeleteCleanups(
+        sessionId,
+        machineId,
+        sessionTag,
+        worktree
+      ).catch(err => this.logDetachedCleanupFailure(err, sessionId));
+      return;
+    }
+
+    await this.runDeleteCleanups(sessionId, machineId, sessionTag, worktree);
+    await this.sessionCache.deleteSession(sessionId);
+    this.afterSessionDeleted(sessionId);
+  }
+
+  /**
+   * #6210: the single delete's tmux cleanup, then its worktree cleanup, moved
+   * verbatim out of `deleteSession`. Neither RPC wrapper throws (rpcGateway
+   * catches and returns `success: false`), and the #1364 sibling check reads
+   * the cache when the worktree step runs, so on the detached path a session
+   * spawned into the same cwd meanwhile still blocks the worktree cleanup.
+   */
+  private async runDeleteCleanups(
+    sessionId: string,
+    machineId: string | undefined,
+    sessionTag: string | null,
+    worktree: WorktreeMetadata | undefined
+  ): Promise<void> {
     // Clean up tmux window if we know the machine and have a valid tag
     if (machineId && sessionTag) {
       // #1628: sessionId (the server UUID) rides along so the daemon can
@@ -157,7 +228,6 @@ export class SessionDeletion {
     }
 
     // Clean up worktree directory + branch if this was a worktree session
-    const worktree = session?.metadata?.worktree;
     if (machineId && worktree?.basePath && worktree?.branch) {
       // #1364: Refuse to destroy the worktree CWD when another live session
       // still owns it (via metadata.path or metadata.worktree.worktreePath).
@@ -191,9 +261,14 @@ export class SessionDeletion {
         );
       }
     }
+  }
 
-    await this.sessionCache.deleteSession(sessionId);
-
+  /**
+   * #6210: the single delete's bookkeeping after the record is gone (loop purge,
+   * claim release, MCP batch state, dedupe prune), moved verbatim out of
+   * `deleteSession` so both the awaited and the detached path run it.
+   */
+  private afterSessionDeleted(sessionId: string): void {
     // #2453 (Task 7): purge this session's bound loops (D1). Fire-and-forget
     // best-effort — the coupler reads loop configs by session_uuid (independent
     // of the just-deleted cache entry) and absorbs its own failures. Delete
@@ -236,23 +311,12 @@ export class SessionDeletion {
 
   async deleteSessions(
     sessionIds: string[],
-    namespace: string
+    namespace: string,
+    opts?: { detachCleanup?: boolean }
   ): Promise<{ deleted: string[]; skipped: string[] }> {
     // Gather tmux cleanup info before deleting from cache
-    const tmuxCleanups: {
-      machineId: string;
-      sessionTag: string;
-      serverSessionId: string; // #1628: window-name UUID for the direct reap path
-    }[] = [];
-    const worktreeCleanups: {
-      machineId: string;
-      worktreeInfo: {
-        basePath: string;
-        worktreePath?: string;
-        branch: string;
-        sessionId?: string;
-      };
-    }[] = [];
+    const tmuxCleanups: BulkTmuxCleanup[] = [];
+    const worktreeCleanups: BulkWorktreeCleanup[] = [];
     for (const id of sessionIds) {
       const session = this.sessionCache.getSession(id);
       const machineId = session?.metadata?.machineId;
@@ -333,6 +397,38 @@ export class SessionDeletion {
       );
     }
 
+    // #6210: the cache delete above is done, so a `detachCleanup` caller is
+    // answered now and the tmux + worktree cleanups below finish in the background.
+    const cleanups = this.runBulkCleanups(
+      tmuxCleanups,
+      worktreeCleanups,
+      opts?.detachCleanup ? sessionIds : undefined
+    );
+    if (opts?.detachCleanup) {
+      void cleanups.catch(err => this.logDetachedCleanupFailure(err));
+    } else {
+      await cleanups;
+    }
+
+    return result;
+  }
+
+  /**
+   * #6210: the bulk delete's cleanup RPCs, moved verbatim out of
+   * `deleteSessions` — tmux for every gathered entry, then worktree, each
+   * settled and logged per entry (#1349).
+   *
+   * `recheckBatch` (the detached path only) re-runs the #1364 external-sibling
+   * check right before the worktree step: the caller has already been answered
+   * and the tmux step can take up to the 30 s RPC timeout, so a session spawned
+   * into one of these worktrees meanwhile must keep it. The awaited path passes
+   * nothing and is unchanged.
+   */
+  private async runBulkCleanups(
+    tmuxCleanups: BulkTmuxCleanup[],
+    worktreeCleanups: BulkWorktreeCleanup[],
+    recheckBatch?: readonly string[]
+  ): Promise<void> {
     // Fire tmux cleanup in parallel and surface failures (#1349).
     // Previously this was `void Promise.allSettled(...)` which discarded
     // failure information — orphan tmux windows accumulated invisibly.
@@ -376,16 +472,36 @@ export class SessionDeletion {
       });
     }
 
+    const worktreeTargets = recheckBatch
+      ? worktreeCleanups.filter(({ worktreeInfo }) => {
+          const { worktreePath, sessionId } = worktreeInfo;
+          if (!worktreePath || !sessionId) return true;
+          const siblings = this.sessionCache
+            .findOtherSessionsByCwd(worktreePath, sessionId)
+            .filter(s => !recheckBatch.includes(s.id));
+          if (siblings.length === 0) return true;
+          this.errorLogger?.warn(
+            `Bulk-delete: skipping worktree cleanup for ${sessionId} — ${siblings.length} session(s) took ${worktreePath} while the delete was finishing`,
+            {
+              category: "sync",
+              sessionId,
+              context: { siblings: siblings.map(s => s.id) },
+            }
+          );
+          return false;
+        })
+      : worktreeCleanups;
+
     // Fire worktree cleanup in parallel and surface failures (#1349 — same
     // observability treatment as tmuxCleanups above).
-    if (worktreeCleanups.length > 0) {
+    if (worktreeTargets.length > 0) {
       const worktreeResults = await Promise.allSettled(
-        worktreeCleanups.map(({ machineId, worktreeInfo }) =>
+        worktreeTargets.map(({ machineId, worktreeInfo }) =>
           this.rpcGateway.cleanupWorktree(machineId, worktreeInfo)
         )
       );
       worktreeResults.forEach((r, i) => {
-        const { machineId, worktreeInfo } = worktreeCleanups[i];
+        const { machineId, worktreeInfo } = worktreeTargets[i];
         if (r.status === "rejected") {
           this.errorLogger?.error(
             `Bulk worktree cleanup rejected for branch ${worktreeInfo.branch}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
@@ -414,7 +530,30 @@ export class SessionDeletion {
         }
       });
     }
+  }
 
-    return result;
+  /**
+   * #6210: the end of every detached cleanup chain. The server registers no
+   * `unhandledRejection` handler and Bun exits on one, so a detached chain must
+   * never reject; its RPC wrappers already turn failures into logged results,
+   * and this catches anything else.
+   */
+  private logDetachedCleanupFailure(err: unknown, sessionId?: string): void {
+    const message = err instanceof Error ? err.message : String(err);
+    if (this.errorLogger) {
+      this.errorLogger.error(
+        `Detached delete cleanup failed${sessionId ? ` for session ${sessionId}` : ""}: ${message}`,
+        {
+          category: "sync-delete",
+          ...(sessionId ? { sessionId } : {}),
+          stack: err instanceof Error ? err.stack : null,
+        }
+      );
+    } else {
+      console.error(
+        `[SessionDeletion] Detached delete cleanup failed:`,
+        message
+      );
+    }
   }
 }

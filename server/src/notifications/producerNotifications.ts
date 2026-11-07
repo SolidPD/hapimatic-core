@@ -340,12 +340,17 @@ export function waitingForSlotNotification(args: {
   context: "reconnect" | "account-switch";
   deadlineMs: number;
   elapsedMs?: number;
+  /** #6156: which limit refused the spawn; the session count when omitted. */
+  cause?: "slots" | "memory";
 }): ProducerNotification {
   const verb =
     args.context === "account-switch" ? "Account switch" : "Reconnect";
   return {
     kind: "waiting-for-slot",
-    title: `${verb} is waiting for a free session slot… (instance at capacity — retrying automatically)`,
+    title:
+      args.cause === "memory"
+        ? `${verb} is waiting for free memory… (node low on memory — retrying automatically)`
+        : `${verb} is waiting for a free session slot… (instance at capacity — retrying automatically)`,
     sessionId: args.sessionId,
     context: defined({
       context: args.context,

@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   FEEDBACK_MAX_ATTACHMENTS,
   FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES,
@@ -15,7 +22,11 @@ import { Button } from "@/components/ui/button";
 import { ImageWithFullscreen } from "@/components/ImageWithFullscreen";
 import { useToast } from "@/components/Toast";
 import type { ApiClient } from "@/api/client";
-import type { FeedbackCategory, FeedbackMetadata } from "@/types/api";
+import type {
+  FeedbackCategory,
+  FeedbackMetadata,
+  SessionResponse,
+} from "@/types/api";
 import {
   composeFeedbackMetadata,
   toSubmitterEmail,
@@ -30,9 +41,46 @@ import {
 import { useFeedbackDraftAssist } from "@/hooks/useFeedbackDraftAssist";
 import { captureViewportPng } from "@/lib/captureScreenshot";
 import { errorReporter } from "@/lib/error-reporter";
+import { queryKeys } from "@/lib/query-keys";
+import {
+  endFeedbackOpenTrace,
+  isFeedbackOpenTraceActive,
+  markFeedbackOpenPhase,
+  reportIncompleteFeedbackOpenTrace,
+  startFeedbackOpenTrace,
+} from "@/lib/feedbackOpenTrace";
 
 const ATTACHMENT_TOTAL_CAP_MB =
   FEEDBACK_MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024;
+
+/**
+ * Delay before reporting an open trace an earlier page left behind (#6190).
+ * Defensive: in the app `errorReporter.initialize` has already run by the time
+ * this form mounts (it renders only once signed in), but a report sent before
+ * it is a no-op, and the delay also keeps the report off the launch path.
+ */
+export const FEEDBACK_TRACE_REPORT_DELAY_MS = 2_000;
+
+/**
+ * Run `callback` after the next paint (the frame, then a task), so work started
+ * on open never delays the form's first frame (#6190). Returns a cancel function.
+ */
+function afterNextPaint(callback: () => void): () => void {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  if (typeof requestAnimationFrame !== "function") {
+    timer = setTimeout(callback, 0);
+    return () => {
+      if (timer !== null) clearTimeout(timer);
+    };
+  }
+  const frame = requestAnimationFrame(() => {
+    timer = setTimeout(callback, 0);
+  });
+  return () => {
+    cancelAnimationFrame(frame);
+    if (timer !== null) clearTimeout(timer);
+  };
+}
 
 /**
  * Image types every supported browser can draw in an `<img>`, so they get a
@@ -90,6 +138,7 @@ export function FeedbackModal({
   loginUsername,
 }: FeedbackModalProps) {
   const { showToast } = useToast();
+  const queryClient = useQueryClient();
   const submit = useSubmitFeedback(api);
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState<FeedbackCategory>("bug");
@@ -143,38 +192,97 @@ export function FeedbackModal({
     if (assistDraft != null) setDescription(assistDraft);
   }, [assistDraft]);
 
-  // Compose the privacy-safe metadata preview whenever the modal opens.
+  // #6190: report, once, an open trace an earlier page left behind (the form
+  // never closed there, e.g. the app froze and was force-quit).
+  useEffect(() => {
+    const timer = setTimeout(
+      () => reportIncompleteFeedbackOpenTrace(),
+      FEEDBACK_TRACE_REPORT_DELAY_MS
+    );
+    return () => {
+      clearTimeout(timer);
+      // Unmounted while open: not a frozen page, so leave no trace behind.
+      endFeedbackOpenTrace();
+    };
+  }, []);
+
+  // #6190: trace this open. The footer button starts the trace on tap; start
+  // here when the form was opened another way.
+  useLayoutEffect(() => {
+    if (!open) return;
+    if (!isFeedbackOpenTraceActive()) {
+      startFeedbackOpenTrace({
+        appVersion,
+        viewport:
+          typeof window !== "undefined"
+            ? `${window.innerWidth}x${window.innerHeight}`
+            : undefined,
+        inSession: Boolean(sessionId),
+      });
+    }
+    markFeedbackOpenPhase("mounted");
+    // Only the open transition starts a trace; the other values are read once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // Compose the privacy-safe metadata preview whenever the modal opens. #6190:
+  // only after the form's first paint, so opening never waits on it; the reads
+  // run in parallel, each with a deadline, so the preview always settles.
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
     setComposing(true);
     setMetadata(null);
-    composeFeedbackMetadata({
-      api,
-      route,
-      sessionId,
-      appVersion,
-      loginUsername,
-    })
-      .then(res => {
-        if (cancelled) return;
-        setMetadata(res.metadata);
-        setSubmitterEmail(res.submitterEmail);
+    const cancelPaintWait = afterNextPaint(() => {
+      if (cancelled) return;
+      markFeedbackOpenPhase("painted");
+      markFeedbackOpenPhase("compose-start");
+      composeFeedbackMetadata({
+        api,
+        route,
+        sessionId,
+        appVersion,
+        loginUsername,
+        // #6190: a slow session read falls back to the copy the app holds.
+        getCachedSession: () =>
+          sessionId
+            ? queryClient.getQueryData<SessionResponse>(
+                queryKeys.session(sessionId)
+              )?.session
+            : undefined,
+        onReadSettled: (read, ok) => {
+          if (!cancelled) {
+            markFeedbackOpenPhase(
+              ok ? (`${read}-settled` as const) : (`${read}-failed` as const)
+            );
+          }
+        },
       })
-      .catch(() => {
-        if (!cancelled) setMetadata({ route } as FeedbackMetadata);
-      })
-      .finally(() => {
-        if (!cancelled) setComposing(false);
-      });
+        .then(res => {
+          if (cancelled) return;
+          setMetadata(res.metadata);
+          setSubmitterEmail(res.submitterEmail);
+        })
+        .catch(() => {
+          if (!cancelled) setMetadata({ route } as FeedbackMetadata);
+        })
+        .finally(() => {
+          if (cancelled) return;
+          setComposing(false);
+          markFeedbackOpenPhase("composed");
+        });
+    });
     return () => {
       cancelled = true;
+      cancelPaintWait();
     };
-  }, [open, api, route, sessionId, appVersion, loginUsername]);
+  }, [open, api, route, sessionId, appVersion, loginUsername, queryClient]);
 
   // Reset the form when the modal closes.
   useEffect(() => {
     if (!open) {
+      // #6190: a clean close deletes the open trace.
+      endFeedbackOpenTrace();
       generationRef.current += 1;
       // A capture still running belongs to the closed form; the next opening
       // must not inherit its busy button.
@@ -439,7 +547,10 @@ export function FeedbackModal({
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={() => assist.requestDraft(description, category)}
+                  onClick={() => {
+                    markFeedbackOpenPhase("assist-requested");
+                    assist.requestDraft(description, category);
+                  }}
                   disabled={assist.isDrafting}
                   data-testid="feedback-assist-button"
                   className="h-auto shrink-0 rounded-md border border-[var(--app-border)] px-2.5 py-1 text-xs font-normal text-[var(--app-fg)] transition-colors hover:bg-[var(--app-subtle-bg)] disabled:cursor-not-allowed disabled:opacity-50"

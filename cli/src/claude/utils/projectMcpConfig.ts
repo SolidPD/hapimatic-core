@@ -203,6 +203,21 @@ export async function applyDisabledServerToggle(
 }
 
 /**
+ * #6211: the config file a session bound to `CLAUDE_CONFIG_DIR` reads, or undefined
+ * for one that reads the default `~/.claude.json`. The shim must write the file the
+ * binary will actually read. A native account's dir holds only what `claude auth
+ * login` wrote, with no `hasCompletedOnboarding`, so a tmux-launcher session bound to
+ * it would otherwise sit at the theme picker, then the trust prompt, on a hidden
+ * screen (measured on 2.1.310: both flags reach the prompt; `theme` is not needed).
+ */
+export function preTrustConfigPath(
+  claudeEnvVars: Record<string, string> | undefined
+): string | undefined {
+  const configDir = claudeEnvVars?.CLAUDE_CONFIG_DIR;
+  return configDir ? join(configDir, ".claude.json") : undefined;
+}
+
+/**
  * Pre-trust shim — write the three trust-acknowledgment fields to
  * `~/.claude.json` BEFORE spawning the tmux launcher, scoped to the specific
  * `projectDir` cwd. Surgical alternative to global
@@ -239,10 +254,14 @@ export async function applyDisabledServerToggle(
  * - {@link ConfigCorruptError} if the existing file cannot be parsed.
  * - {@link ConfigLockTimeoutError} if the lock cannot be acquired in 5s
  *   (R17 informational — already implemented via {@link withFileLock}).
+ * - An `Error` if the file does not exist, unless `options.createIfMissing` is
+ *   set (#6211: a bound account's dir may hold no config yet), which starts from
+ *   an empty one.
  */
 export async function applyPreTrustShim(
   projectDir: string,
-  configPath?: string
+  configPath?: string,
+  options: { createIfMissing?: boolean } = {}
 ): Promise<boolean> {
   // Defense-in-depth path validation (mirror applyDisabledServerToggle).
   // Rejects unsafe projectDir values BEFORE any IO so doomed calls fail
@@ -283,10 +302,11 @@ export async function applyPreTrustShim(
       try {
         raw = await readFile(cfgPath, "utf-8");
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        if (!options.createIfMissing) {
           throw new Error(`Claude config not found at ${cfgPath}`);
         }
-        throw err;
+        raw = "{}";
       }
 
       let config: ReturnType<typeof JSON.parse>;

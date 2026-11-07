@@ -37,8 +37,17 @@ import { logger } from "@/ui/logger";
 export const DEFAULT_SESSION_SLICE = "hapimatic-sessions.slice";
 export const SESSION_SLICE_ENV = "HAPI_SESSION_SLICE";
 
-/** Values of `HAPI_SESSION_SLICE` that turn containment off. */
-const DISABLE_TOKENS = new Set(["off", "0", "false", "no", "none"]);
+/**
+ * The words that turn a switch off — `HAPI_SESSION_SLICE`, the #6156 session ceiling,
+ * the spawn-memory headroom and the slice-pressure watchdog all read this one set.
+ */
+export const DISABLE_TOKENS: ReadonlySet<string> = new Set([
+  "off",
+  "0",
+  "false",
+  "no",
+  "none",
+]);
 
 /**
  * Values of `HAPI_SESSION_SLICE` that mean "on, with the default slice" — the
@@ -116,6 +125,25 @@ export function sliceCgroupSegment(slice: string): string {
     segments.push(`${parts.slice(0, i).join("-")}.slice`);
   }
   return segments.join("/");
+}
+
+/**
+ * The node sessions slice's cgroup directory for `uid` under `cgroupRoot` (no trailing
+ * slash). One formula, because the spawn-admission gate and the slice-pressure watchdog
+ * must read the same slice (#6156).
+ */
+export function nodeSliceCgroupDir(
+  cgroupRoot: string,
+  uid: number,
+  slice: string
+): string {
+  return `${cgroupRoot}/user.slice/user-${uid}.slice/user@${uid}.service/${sliceCgroupSegment(slice)}`;
+}
+
+/** `uid` when the caller passed one (`null` included), else this process's uid. */
+export function resolveUid(uid?: number | null): number | null {
+  if (uid !== undefined) return uid;
+  return typeof process.getuid === "function" ? process.getuid() : null;
 }
 
 /**
@@ -610,4 +638,134 @@ export async function ensureTmuxServerContained(opts: {
     logger.debug(`[SessionSlice] containment check failed: ${error}`);
     return "failed";
   }
+}
+
+/** {@link probeSliceProvisioned}, reused for {@link SLICE_PROBE_CACHE_MS} (the spawn path's probe). */
+export function probeSliceProvisionedCached(
+  slice: string,
+  run: CommandRunner = runCommand
+): Promise<SliceProbe> {
+  return cachedProbe(slice, run);
+}
+
+// --- Per-session memory ceiling (issue #6156, S3) -------------------------------------
+//
+// Every session's processes used to share the tmux server's scope, so one session's
+// tool job could take the whole slice. Each new daemon-spawned session now moves itself
+// into its own transient scope under the instance slice before it starts the wrapper:
+// the pane runs `bash <script>`, and that script's shell forks the wrapper, so moving
+// the shell's own pid (`$$`) puts the whole session tree in the scope. tmux 3.4 moves
+// only the pane's top pid, which is a different process, so there is no race with it.
+// The scope carries a hard MemoryMax and a small MemorySwapMax but no MemoryHigh: a
+// MemoryHigh only throttles, which is the crawl #6156 is about. The move fails open —
+// the session starts as before, with a warning on the pane's stderr.
+
+export const SESSION_MEMORY_CEILING_ENV = "HAPI_SESSION_MEMORY_CEILING_PCT";
+export const DEFAULT_SESSION_MEMORY_CEILING_PCT = 60;
+/** The ceiling never goes below this (or the slice limit, if smaller). */
+export const SESSION_CEILING_FLOOR_BYTES = 2 * 1024 * 1024 * 1024;
+/** Swap a session may use beyond its ceiling before the kernel OOM-kills in its scope. */
+export const SESSION_SWAP_CAP_BYTES = 512 * 1024 * 1024;
+export const SESSION_SCOPE_PREFIX = "hapimatic-session-";
+
+/** The ceiling as a percentage of the slice limit, or `null` when turned off. */
+export function resolveSessionMemoryCeilingPct(
+  env: NodeJS.ProcessEnv = process.env
+): number | null {
+  const raw = env[SESSION_MEMORY_CEILING_ENV]?.trim().toLowerCase();
+  if (raw === undefined || raw === "")
+    return DEFAULT_SESSION_MEMORY_CEILING_PCT;
+  if (DISABLE_TOKENS.has(raw)) return null;
+  const n = Number(raw);
+  if (Number.isInteger(n) && n >= 1 && n <= 100) return n;
+  warnOnce(
+    `ceiling-env:${raw}`,
+    `[SessionSlice] ${SESSION_MEMORY_CEILING_ENV}=${raw} is not 1-100 or off; using ${DEFAULT_SESSION_MEMORY_CEILING_PCT}`
+  );
+  return DEFAULT_SESSION_MEMORY_CEILING_PCT;
+}
+
+/** A session's MemoryMax and MemorySwapMax for a slice whose effective limit is `limitBytes`. */
+export function sessionMemoryCeiling(
+  limitBytes: number,
+  pct: number
+): { memoryMaxBytes: number; swapMaxBytes: number } {
+  const floor = Math.min(SESSION_CEILING_FLOOR_BYTES, limitBytes);
+  const memoryMaxBytes = Math.min(
+    limitBytes,
+    Math.max(floor, Math.floor((limitBytes * pct) / 100))
+  );
+  return {
+    memoryMaxBytes,
+    swapMaxBytes: Math.min(
+      SESSION_SWAP_CAP_BYTES,
+      Math.floor(memoryMaxBytes / 4)
+    ),
+  };
+}
+
+/** `hapimatic-session-<tag>-<nonce>.scope`; a tag outside `[A-Za-z0-9_-]` is hashed. */
+export function sessionScopeUnitName(
+  sessionTag: string,
+  nonce: string
+): string {
+  const safe = /^[A-Za-z0-9_-]+$/.test(sessionTag)
+    ? sessionTag
+    : createHash("sha256").update(sessionTag).digest("hex").slice(0, 12);
+  const safeNonce = nonce.replace(/[^A-Za-z0-9]/g, "");
+  return `${SESSION_SCOPE_PREFIX}${safe}-${safeNonce}.scope`;
+}
+
+/** How long the pane waits for the user manager to answer `StartTransientUnit`. */
+export const SESSION_SCOPE_BUSCTL_TIMEOUT_S = 3;
+
+/**
+ * The bash block a pane's launch script runs before the wrapper: it moves the script's
+ * own shell into a new scope, waits up to 2 s for the move to show in `/proc/$$/cgroup`,
+ * and always ends with status 0. busctl gets a short timeout (its default is 25 s, inside
+ * the spawn's 60 s webhook budget), and when the step fails the pane's warning carries
+ * busctl's own error. Every interpolated name is validated to a shell-safe charset; the
+ * byte counts are integers.
+ */
+export function buildSessionScopeSnippet(opts: {
+  nodeSlice: string;
+  socketName: string;
+  sessionTag: string;
+  memoryMaxBytes: number;
+  swapMaxBytes: number;
+  nonce: string;
+}): string {
+  const unit = sessionScopeUnitName(opts.sessionTag, opts.nonce);
+  const slice = instanceSliceFor(opts.socketName, opts.nodeSlice);
+  if (!/^[A-Za-z0-9_.-]+$/.test(slice)) {
+    throw new Error(`session scope: unsafe slice name ${slice}`);
+  }
+  // [name, D-Bus type, value]; the count passed to busctl is derived from this list,
+  // never written by hand (a hand-written count that was off by one let a 2026-11-05
+  // research fixture run uncapped for 5.5 h on ms1).
+  const props: Array<[string, string, string]> = [
+    ["PIDs", "au", '1 "$$"'],
+    ["Slice", "s", `'${slice}'`],
+    ["OOMPolicy", "s", "continue"],
+    ["CollectMode", "s", "inactive-or-failed"],
+    ["MemoryMax", "t", String(Math.floor(opts.memoryMaxBytes))],
+    ["MemorySwapMax", "t", String(Math.floor(opts.swapMaxBytes))],
+  ];
+  const propArgs = props
+    .map(([name, type, value]) => `${name} ${type} ${value}`)
+    .join(" ");
+  const warn = (why: string): string =>
+    `echo "[hapi] per-session memory ceiling not applied (#6156): ${why}" >&2`;
+  const inScope = `command grep -qF '${unit}' /proc/$$/cgroup 2>/dev/null`;
+  return (
+    `{ if command -v busctl >/dev/null 2>&1 && [ -n "\${XDG_RUNTIME_DIR:-}" ]; then ` +
+    `if __hapi_e=$(command busctl --user --timeout=${SESSION_SCOPE_BUSCTL_TIMEOUT_S} call ` +
+    `org.freedesktop.systemd1 /org/freedesktop/systemd1 ` +
+    `org.freedesktop.systemd1.Manager StartTransientUnit 'ssa(sv)a(sa(sv))' ` +
+    `'${unit}' fail ${props.length} ${propArgs} 0 2>&1 >/dev/null); then ` +
+    `__hapi_n=0; while [ "$__hapi_n" -lt 40 ] && ! ${inScope}; do command sleep 0.05; __hapi_n=$((__hapi_n + 1)); done; ` +
+    `${inScope} || ${warn("busctl accepted the scope but this shell did not move into it")}; ` +
+    `else ${warn("busctl: ${__hapi_e:-no error text}")}; fi; ` +
+    `else ${warn("busctl or XDG_RUNTIME_DIR is missing")}; fi; }`
+  );
 }

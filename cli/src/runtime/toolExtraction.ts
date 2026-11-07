@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * Extracts the platform's tool archives (difftastic, ripgrep) and keeps the
+ * Extracts the platform's tool archives (difftastic, ripgrep, git-lfs) and keeps the
  * size manifest that proves an extraction complete (#5103). Shared by the
  * compiled binary's runtime-asset directory (`./assets.ts`) and the source
  * checkout's `bun run tools:unpack` (`cli/scripts/unpack-tools.ts`, #5125).
@@ -61,10 +61,18 @@ export function getPlatformDir(): string {
   throw new Error(`Unsupported platform: ${archName}-${platformName}`);
 }
 
+/**
+ * #6223: git-lfs unpacks into its own folder, because that folder goes on the
+ * session's PATH (`addBundledGitLfsToPath`) and `rg` and `difft` should not.
+ */
+export const GIT_LFS_DIR = "git-lfs-bin";
+
 /** The tool binaries every runtime directory must carry. */
 function requiredToolNames(): string[] {
   const isWin = platform() === "win32";
-  return isWin ? ["difft.exe", "rg.exe"] : ["difft", "rg"];
+  return isWin
+    ? ["difft.exe", "rg.exe", `${GIT_LFS_DIR}/git-lfs.exe`]
+    : ["difft", "rg", `${GIT_LFS_DIR}/git-lfs`];
 }
 
 /**
@@ -154,6 +162,7 @@ export function unpackTools(runtimeRoot: string): void {
   const archives = [
     `difftastic-${platformDir}.tar.gz`,
     `ripgrep-${platformDir}.tar.gz`,
+    `git-lfs-${platformDir}.tar.gz`,
   ];
 
   const declared: Record<string, number> = {};
@@ -189,6 +198,11 @@ export function unpackTools(runtimeRoot: string): void {
       if (stats.isFile()) {
         chmodSync(filePath, 0o755);
       }
+    }
+    // In its own folder, so the loop above does not reach it.
+    const gitLfs = join(unpackedPath, GIT_LFS_DIR, "git-lfs");
+    if (existsSync(gitLfs)) {
+      chmodSync(gitLfs, 0o755);
     }
   }
 

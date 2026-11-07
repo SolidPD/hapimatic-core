@@ -224,7 +224,9 @@ function HarnessUpdateSection({
           data-testid="harness-analysis-at-capacity"
           className="rounded-md bg-[var(--app-secondary-bg)]/40 px-3 py-2 text-[length:var(--text-body)] text-[var(--app-badge-warning-text)]"
         >
-          At session capacity — archive a session and retry.
+          {analysis.cause === "memory"
+            ? "Node low on free memory — retry when a running job finishes."
+            : "At session capacity — archive a session and retry."}
         </p>
       )}
 

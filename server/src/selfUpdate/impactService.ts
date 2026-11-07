@@ -29,7 +29,7 @@ export type AnalysisStatusEnvelope =
       analyzed_at: number;
     }
   | { status: "failed" }
-  | { status: "at_capacity" };
+  | { status: "at_capacity"; cause?: "memory" };
 
 /** Default watchdog window — an LLM changelog analysis + `gh issue` searches
  *  take a few minutes. Overridable via env for tuning without a redeploy. */
@@ -116,6 +116,9 @@ export class ImpactService implements ImpactAnalysisCoordinator {
       };
     }
     const last = this.orchestrator.lastTerminalOutcome(harnessId, from, to);
+    if (last === "insufficient_memory") {
+      return { status: "at_capacity", cause: "memory" };
+    }
     if (last) return { status: last };
     return { status: "none" };
   }

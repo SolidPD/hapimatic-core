@@ -61,8 +61,8 @@
  * per-VM `VM_GITHUB_BROKER_TOKEN`, minted as 64 hex characters) are caught server-side by
  * the entropy layer, not by
  * name — this list under-naming them does not leak their values. #5744's
- * `GATEWAY_FEEDBACK_OPERATOR_TOKEN`, #3496's `GITHUB_BROKER_PAT` and #4793's
- * `GITHUB_APP_CLIENT_SECRET` are bash-only
+ * `GATEWAY_FEEDBACK_OPERATOR_TOKEN`, #5858's `GATEWAY_FEEDBACK_INBOX_TOKENS`,
+ * #3496's `GITHUB_BROKER_PAT` and #4793's `GITHUB_APP_CLIENT_SECRET` are bash-only
  * because only `provision-gateway.sh` renders the gateway env; the server provisioner
  * never handles them. #4929's
  * `SUDO_MODEL_PASSWORD_HASH` is bash-only for a different reason: the server

@@ -50,7 +50,8 @@ export function NodeDetailDashboard({ nodeId, api }: NodeDetailDashboardProps) {
     loadMoreAlerts,
   } = useFederationAlerts(api, { nodeId });
 
-  // Standalone/spoke deployments (503) — steady state, not a fault.
+  // A server with no health aggregator (503; one built before #6217) — a
+  // designed state, not a fault. From #6217 every node serves its own health.
   if (isDisabled) {
     return (
       <div

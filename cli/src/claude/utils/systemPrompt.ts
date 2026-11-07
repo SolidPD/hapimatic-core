@@ -4,6 +4,7 @@ import { trimIdent } from "@/utils/trimIdent";
 import { shouldIncludeCoAuthoredBy } from "./claudeSettings";
 import { configuration } from "@/configuration";
 import { renderTier0, capabilityCatalogIndex } from "@hapi/protocol";
+import { buildDocsPointer } from "@/utils/hapimaticDocsPointer";
 
 /**
  * Pre-Tier-0 base system prompt, FROZEN as the byte-for-byte restore source for
@@ -105,7 +106,8 @@ export function buildSystemPrompt(cwd?: string): string {
 
   // Issue #3748 (Sub H, R4/R8): with Tier-0 injection ON (default) the folded
   // base + the live-rendered capability catalog; with HAPI_CAPABILITY_TIER0=0
-  // the frozen pre-H prompt restored byte-for-byte. renderTier0 is called live
+  // the frozen pre-H prompt restored byte-for-byte as the BASE (the #6219 docs
+  // pointer below is still appended). renderTier0 is called live
   // (not the committed snapshot). Issue #3749 (Sub I, R4): this is the CLAUDE
   // launch path, so the Tier-0 render is varied for `agentId: "claude"` (drops
   // any Codex-only entry) at `scope: "user"` — Tier-0 is never operator-scoped
@@ -115,6 +117,15 @@ export function buildSystemPrompt(cwd?: string): string {
       "\n\n" +
       renderTier0(capabilityCatalogIndex, { agentId: "claude", scope: "user" })
     : LEGACY_BASE_SYSTEM_PROMPT;
+
+  // Issue #6219: where this machine's Hapimatic documentation is, for every
+  // session, with or without Tier-0 (the kill-switch restores the base above,
+  // not the docs pointer). Orthogonal to the Tier-0 budget like the credits
+  // below; it carries its own bound (DOCS_POINTER_BUDGET_CHARS).
+  const docsPointer = buildDocsPointer();
+  if (docsPointer) {
+    prompt += "\n\n" + docsPointer;
+  }
 
   if (includeCoAuthored) {
     prompt += "\n\n" + CO_AUTHORED_CREDITS;

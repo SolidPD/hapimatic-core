@@ -297,34 +297,81 @@ export function resolveOperatorInstanceEnabled(
   return isEnvFlagTruthy(env[OPERATOR_INSTANCE_ENV]);
 }
 
+/** Hosts a plain-`http://` gateway URL may name (#5858 D10): loopback only. */
+const LOOPBACK_HOSTNAMES: ReadonlySet<string> = new Set([
+  "127.0.0.1",
+  "localhost",
+  "[::1]",
+]);
+
 /**
- * The operator node's gateway credential: `FEEDBACK_INBOX_URL` (the gateway
- * origin, trailing slashes dropped) + `FEEDBACK_INBOX_TOKEN` (the shared
- * operator bearer, ruling D12). Null when both are unset; `{ missing }` naming
- * the unset one when only one is set (issue #5798), so a typo in one env line is
- * logged instead of read as "not an operator node"; `"invalid"` when the URL is
- * not http(s). A blank value counts as unset. The one parse both the sink
- * (#2911) and the inbox (#2912) use, so the two cannot disagree about whether a
- * node is configured.
+ * Check `FEEDBACK_INBOX_URL` (already trimmed) and return the gateway origin with
+ * trailing slashes dropped, or why it is refused. The one URL rule the sink
+ * (#2911) and the inbox (#2912) share:
+ *  - https, or plain http to a loopback host only (#5858 D10): both bearers
+ *    travel to this URL, so neither may cross the network unencrypted;
+ *  - the ORIGIN only — no path, query, fragment or credentials (#5858 PM
+ *    ruling): the routes append `/api/...`, so `https://host/api` would call
+ *    `/api/api/...` and get 404s.
+ * The reason never quotes the value.
+ */
+function parseFeedbackGatewayUrl(
+  raw: string
+): { baseUrl: string } | { invalid: string } {
+  let baseUrl = raw;
+  while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
+  if (!/^https?:\/\/[^/]/i.test(baseUrl) || !URL.canParse(baseUrl)) {
+    return { invalid: "is not an http(s) URL" };
+  }
+  const url = new URL(baseUrl);
+  if (
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    baseUrl.includes("?") ||
+    baseUrl.includes("#") ||
+    url.username !== "" ||
+    url.password !== ""
+  ) {
+    return {
+      invalid:
+        "is not a bare gateway origin (it carries a path, query or credentials; set it to e.g. https://hapimatic.com)",
+    };
+  }
+  if (url.protocol === "http:" && !LOOPBACK_HOSTNAMES.has(url.hostname)) {
+    return {
+      invalid:
+        "uses plain http to a non-loopback host (use https, or http only to 127.0.0.1, localhost or [::1])",
+    };
+  }
+  return { baseUrl };
+}
+
+/**
+ * The operator node's SINK credential: `FEEDBACK_INBOX_URL` (the gateway origin,
+ * see {@link parseFeedbackGatewayUrl}) + `FEEDBACK_INBOX_TOKEN` (the shared sink
+ * bearer, ruling D12). Null when both are unset; `{ missing }` naming the unset
+ * one when only one is set (issue #5798), so a typo in one env line is logged
+ * instead of read as "not an operator node"; `{ invalid }` when the URL is
+ * refused. A blank value counts as unset. The inbox does NOT use this pair
+ * (#5858 R1): it needs `FEEDBACK_INBOX_NODE_TOKEN`, so a node that only forwards
+ * feedback cannot read it.
  */
 function readOperatorInboxEnv(
   env: Record<string, string | undefined>
 ):
   | { baseUrl: string; token: string }
   | { missing: "FEEDBACK_INBOX_URL" | "FEEDBACK_INBOX_TOKEN" }
-  | "invalid"
+  | { invalid: string }
   | null {
   const inboxUrl = env.FEEDBACK_INBOX_URL?.trim();
   const token = env.FEEDBACK_INBOX_TOKEN?.trim();
   if (!inboxUrl && !token) return null;
   if (!inboxUrl) return { missing: "FEEDBACK_INBOX_URL" };
   if (!token) return { missing: "FEEDBACK_INBOX_TOKEN" };
-  let baseUrl = inboxUrl;
-  while (baseUrl.endsWith("/")) baseUrl = baseUrl.slice(0, -1);
-  if (!/^https?:\/\/[^/]/.test(baseUrl) || !URL.canParse(baseUrl)) {
-    return "invalid";
-  }
-  return { baseUrl, token };
+  const url = parseFeedbackGatewayUrl(inboxUrl);
+  if ("invalid" in url) return url;
+  return { baseUrl: url.baseUrl, token };
 }
 
 /** The half-set log text: names the unset variable and the set one, never a value. */
@@ -342,34 +389,60 @@ function halfSetInboxMessage(
 export interface FeedbackInboxConfig {
   /** The gateway origin, e.g. `https://hapimatic.com`. */
   baseUrl: string;
-  /** The shared operator bearer. Env-only; never written to settings.json. */
+  /**
+   * This node's OWN inbox token (`FEEDBACK_INBOX_NODE_TOKEN`: the `<token>` half
+   * of its `<nodeId>:<token>` entry in the gateway's `GATEWAY_FEEDBACK_INBOX_TOKENS`,
+   * #5858 R1) — never the sink bearer.
+   * Env-only; never written to settings.json.
+   */
   token: string;
 }
 
 /**
  * The operator node's credential for the gateway's central feedback inbox
- * (issue #2912): the same `FEEDBACK_INBOX_URL` + `FEEDBACK_INBOX_TOKEN` the sink
- * forwards with. Null when unset or malformed, which keeps every inbox proxy
- * route closed (404) even where `HAPI_OPERATOR_INSTANCE` is set: the flag is a
- * visibility gate, the gateway bearer is the authorization boundary.
+ * (issue #2912): `FEEDBACK_INBOX_URL` + this node's own inbox token
+ * `FEEDBACK_INBOX_NODE_TOKEN` (#5858 R1). The sink bearer `FEEDBACK_INBOX_TOKEN`
+ * plays no part, so a node configured only to forward cannot read the inbox.
+ * Null when unset, half-set, malformed, or when the node token equals the sink
+ * token (the split would be void) — each but "unset" with one log line naming the
+ * variable, never a value. Null keeps every inbox proxy route closed (404) even
+ * where `HAPI_OPERATOR_INSTANCE` is set: the flag is a visibility gate, the
+ * gateway's per-node token is the authorization boundary.
  */
 export function resolveFeedbackInboxConfig(
   env: Record<string, string | undefined> = process.env
 ): FeedbackInboxConfig | null {
-  const inbox = readOperatorInboxEnv(env);
-  if (inbox === "invalid") {
+  const inboxUrl = env.FEEDBACK_INBOX_URL?.trim();
+  const nodeToken = env.FEEDBACK_INBOX_NODE_TOKEN?.trim();
+  if (!nodeToken) {
+    // A URL alone is a forward-only node (the sink pair); say once why the inbox is closed.
+    if (inboxUrl) {
+      console.error(
+        "[feedback-inbox] FEEDBACK_INBOX_NODE_TOKEN is not set — the inbox stays closed (FEEDBACK_INBOX_TOKEN only forwards feedback; it cannot read the inbox)"
+      );
+    }
+    return null;
+  }
+  if (!inboxUrl) {
     console.error(
-      "[feedback-inbox] FEEDBACK_INBOX_URL is not an http(s) URL — the inbox stays closed"
+      "[feedback-inbox] FEEDBACK_INBOX_URL is not set but FEEDBACK_INBOX_NODE_TOKEN is — set both or neither; the inbox stays closed"
     );
     return null;
   }
-  if (inbox !== null && "missing" in inbox) {
+  const url = parseFeedbackGatewayUrl(inboxUrl);
+  if ("invalid" in url) {
     console.error(
-      `[feedback-inbox] ${halfSetInboxMessage(inbox.missing)} — the inbox stays closed`
+      `[feedback-inbox] FEEDBACK_INBOX_URL ${url.invalid} — the inbox stays closed`
     );
     return null;
   }
-  return inbox;
+  if (nodeToken === env.FEEDBACK_INBOX_TOKEN?.trim()) {
+    console.error(
+      "[feedback-inbox] FEEDBACK_INBOX_NODE_TOKEN equals FEEDBACK_INBOX_TOKEN — the inbox needs this node's own inbox token (the token half of its GATEWAY_FEEDBACK_INBOX_TOKENS entry, without the node id), not the sink token; the inbox stays closed"
+    );
+    return null;
+  }
+  return { baseUrl: url.baseUrl, token: nodeToken };
 }
 
 /** The repo Convert-to-issue files into when `FEEDBACK_ISSUE_REPO` is unset. */
@@ -405,7 +478,8 @@ const SINK_URL_SUFFIX = "/feedback-sink";
  * env-only: the credential is never written to settings.json (#2410).
  *
  *  - Operator node: `FEEDBACK_INBOX_URL` (the gateway origin) +
- *    `FEEDBACK_INBOX_TOKEN` (the shared operator bearer, ruling D12). The node
+ *    `FEEDBACK_INBOX_TOKEN` (the shared sink bearer, ruling D12; it does not
+ *    open the inbox, #5858). The node
  *    names itself with its federation node id (else the hostname). Wins when
  *    both branches are configured, so an operator cloud VM forwards as operator.
  *    Only one of the two set is logged and is null (#5798): the node never
@@ -425,9 +499,9 @@ export function resolveFeedbackSinkConfig(
   env: Record<string, string | undefined> = process.env
 ): FeedbackSinkConfig | null {
   const inbox = readOperatorInboxEnv(env);
-  if (inbox === "invalid") {
+  if (inbox !== null && "invalid" in inbox) {
     console.error(
-      "[feedback-sink] FEEDBACK_INBOX_URL is not an http(s) URL — feedback is not forwarded"
+      `[feedback-sink] FEEDBACK_INBOX_URL ${inbox.invalid} — feedback is not forwarded`
     );
     return null;
   }
@@ -505,7 +579,7 @@ export interface SupportChannelConfig {
   hoursText: string;
   /**
    * An operator-configured "open an issue" URL. Empty = the client uses the
-   * public Core repo's `/issues/new` (`web/src/lib/publicCoreSource.ts` holds
+   * public Core repo's `/issues/new` (`shared/src/publicCoreSource.ts` holds
    * that URL — not duplicated here, because `test-public-source-gate.sh` pins
    * its copies to `scripts/lib/public-core-repo.txt`).
    */

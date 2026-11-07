@@ -164,6 +164,10 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         // #4461: one copy of the identity rule (`||` hostname fallback, casing)
         // shared with the account-health read and the 409 / SSE stamps.
         localNode: resolveLocalNodeIdentity(config),
+        // #6217: whether this node serves /api/federation/health/* and
+        // /api/federation/alerts (every node from #6217 on). An older server
+        // sends no field, and the web falls back to `enabled && role !== "node"`.
+        healthAvailable: deps.getHealthAggregator() !== null,
         nodes: registry ? registry.getNodeStates() : [],
       });
     }

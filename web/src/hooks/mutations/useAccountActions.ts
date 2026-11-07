@@ -8,6 +8,7 @@ import type {
   InVmLoginStartResponse,
   NodeActiveAccountResponse,
   SetSessionPaymentMethodRequest,
+  InVmLoginCancelResponse,
 } from "@/types/api";
 import type { ProviderId } from "@hapi/protocol";
 import { queryKeys } from "@/lib/query-keys";
@@ -83,6 +84,8 @@ function mapSwitchErrorText(err: unknown, code: string | undefined): string {
   switch (code) {
     case "at_capacity":
       return "This node is full — free a session (disconnect or delete one) and retry the switch.";
+    case "insufficient_memory":
+      return "This node is low on free memory — stop an idle session or wait for a job to finish, then retry the switch.";
     case "switch_failed_rollback_failed":
       return "Switch failed and the session is disconnected — reconnect it.";
     // Issue #4823: a key target the session cannot take (refused before any kill —
@@ -570,13 +573,16 @@ export function useAccountLogin(
  * Issue #4349: the in-VM sign-in a tenant VM uses instead of the web OAuth login. `start` creates
  * an empty per-account config dir and returns the command to run in a terminal on the VM; `check`
  * asks the server whether Claude Code's own `/login` has finished there — it resolves `null` while
- * not yet signed in, and the new account once registered (refreshing the account list). No token
- * passes through any of these calls.
+ * not yet signed in, and the new account once registered (refreshing the account list). `submit`
+ * (#6211) passes a pasted code to the binary signing in on the VM, resolving `null` while the
+ * exchange still runs. No token passes through any of these calls, and all of them reject with an
+ * `ApiError` carrying the server's clean message and its `code` (see {@link cleanLoginError}).
  */
 export function useInVmAccountLogin(api: ApiClient | null): {
   start: () => Promise<InVmLoginStartResponse>;
   check: (loginToken: string) => Promise<RedactedAccount | null>;
-  cancel: (loginToken: string) => Promise<void>;
+  submit: (loginToken: string, code: string) => Promise<RedactedAccount | null>;
+  cancel: (loginToken: string) => Promise<InVmLoginCancelResponse | null>;
 } {
   const queryClient = useQueryClient();
   return {
@@ -595,24 +601,30 @@ export function useInVmAccountLogin(api: ApiClient | null): {
         // Surface the body's human `error` (e.g. already_added), not the transport string. A rate
         // limit or server error passes through unchanged so the dialog keeps waiting.
         if (err instanceof ApiError && err.status !== 429 && err.status < 500) {
-          let message = err.message;
-          if (err.body) {
-            try {
-              const parsed = JSON.parse(err.body) as { error?: unknown };
-              if (typeof parsed.error === "string") message = parsed.error;
-            } catch {
-              // Non-JSON body — keep the transport-message fallback.
-            }
-          }
-          throw new Error(message);
+          throw cleanLoginError(err);
         }
         throw err;
       }
     },
-    cancel: async loginToken => {
-      if (!api) return;
+    submit: async (loginToken, code) => {
+      if (!api) throw new Error("API unavailable");
       try {
-        await api.cancelInVmAccountLogin(loginToken);
+        const res = await api.submitInVmAccountCode(loginToken, code);
+        if (!res.ok) return null; // signing_in (HTTP 202): keep polling
+        await queryClient.invalidateQueries({ queryKey: queryKeys.accounts });
+        return res.account;
+      } catch (err) {
+        throw cleanLoginError(err);
+      }
+    },
+    cancel: async loginToken => {
+      if (!api) return null;
+      try {
+        const res = await api.cancelInVmAccountLogin(loginToken);
+        if (res.account) {
+          await queryClient.invalidateQueries({ queryKey: queryKeys.accounts });
+        }
+        return res;
       } catch (err) {
         // Issue #6028: the server answers 200 even for an unknown token, so every
         // rejection is a real failure. Rethrow it with the body's human `error`

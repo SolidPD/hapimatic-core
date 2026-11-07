@@ -5,7 +5,10 @@ import {
   DEFAULT_COMPOSER_SUBMIT_BEHAVIOR,
   type ComposerSubmitBehavior,
 } from "@/lib/composerSubmitBehavior";
-import type { PermissionMode } from "@hapi/protocol/modes";
+import {
+  DEFAULT_SPAWN_PERMISSION_MODE,
+  type PermissionMode,
+} from "@hapi/protocol/modes";
 import {
   AUTO_RECOVER_DEFAULT_ENABLED,
   AUTO_SELECT_OPTIMAL_ACCOUNT_DEFAULT_ENABLED,
@@ -17,6 +20,9 @@ import {
 } from "@hapi/protocol/schemas";
 
 const STORAGE_KEY = getStorageKey("hapi:adminPreferences:v1");
+
+/** #6218 (D1-a): see `AdminPreferences.spawnPermissionDefaultRev`. */
+const SPAWN_PERMISSION_DEFAULT_REV = 2;
 
 export type DensityMode = "normal" | "compact" | "ultra";
 
@@ -46,9 +52,15 @@ export type AdminPreferences = {
   // shipped default `shift-to-send` (a bare Enter inserts a newline).
   composerSubmitBehavior: ComposerSubmitBehavior;
   // Default spawn permission mode (#1951 A4) — pre-selected on the Create-Session
-  // form. Defaults to "bypassPermissions" (YOLO) to preserve the prior YOLO-on
-  // default (the form's `yoloMode` previously defaulted to true).
+  // form. #6218: a no-flash cache of the NODE preference (the displayed truth is
+  // the server value via useDefaultSpawnPermissionModePreference), defaulting to
+  // the shared DEFAULT_SPAWN_PERMISSION_MODE (accept — one step below YOLO).
   defaultSpawnPermissionMode: PermissionMode;
+  // #6218 (ruling D1-a): the revision of `defaultSpawnPermissionMode`'s meaning.
+  // A blob without it predates #6218, when every device stored the old YOLO
+  // default even if the user never chose it; readStored drops that cached YOLO
+  // once (carry nothing over) and the next write stamps the revision.
+  spawnPermissionDefaultRev: typeof SPAWN_PERMISSION_DEFAULT_REV;
   // #2042 (A4): when creating a session, pre-select the most-underutilized
   // healthy account (lowest utilization `score`). Default false (OFF) — a true
   // no-op: with it off, no usage fetch occurs and default selection is unchanged.
@@ -90,8 +102,10 @@ export const DEFAULT_ADMIN_PREFERENCES: AdminPreferences = {
   autoSwitchOnRateLimit: AUTO_SWITCH_ON_RATE_LIMIT_DEFAULT_ENABLED,
   systemHealthDisplayTarget: "FED",
   composerSubmitBehavior: DEFAULT_COMPOSER_SUBMIT_BEHAVIOR,
-  // #1951 A4: "bypassPermissions" (YOLO) preserves the prior YOLO-on default.
-  defaultSpawnPermissionMode: "bypassPermissions",
+  // #6218: the shared one-step-below-YOLO default, the same constant the server
+  // preference schema defaults to, so the two can never diverge (#2486).
+  defaultSpawnPermissionMode: DEFAULT_SPAWN_PERMISSION_MODE,
+  spawnPermissionDefaultRev: SPAWN_PERMISSION_DEFAULT_REV,
   // #2042 (A4): auto-select OFF by default → preserves current selection behavior.
   // #3611: default from the shared AUTO_SELECT_OPTIMAL_ACCOUNT_DEFAULT_ENABLED (also
   // consumed by the server schema) so the web cache default and the server default
@@ -123,7 +137,20 @@ function readStored(): AdminPreferences {
       ...DEFAULT_ADMIN_PREFERENCES,
       ...parsed,
       version: 1,
+      // #6218 (D1-a): the migration below runs once; the merged blob is current.
+      spawnPermissionDefaultRev: SPAWN_PERMISSION_DEFAULT_REV,
     };
+    // #6218 (ruling D1-a, carry nothing over): a pre-#6218 blob's YOLO cannot be
+    // told apart from the old default the whole object was written with, so it
+    // is dropped once to the shared default. Any other stored mode only an
+    // explicit pick could produce, so it stays. The node's server value then
+    // replaces the cache on reconcile either way.
+    if (
+      parsed.spawnPermissionDefaultRev !== SPAWN_PERMISSION_DEFAULT_REV &&
+      merged.defaultSpawnPermissionMode === "bypassPermissions"
+    ) {
+      merged.defaultSpawnPermissionMode = DEFAULT_SPAWN_PERMISSION_MODE;
+    }
     // #3003 F4: the shallow merge above back-fills a MISSING `chatSections`, but a
     // present-but-corrupted blob (e.g. one missing the nested `reasoning` leaf)
     // replaces the default wholesale and would pass through unvalidated — a

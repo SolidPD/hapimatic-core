@@ -3,6 +3,7 @@ import { ChevronRight } from "lucide-react";
 import { reasonDisplayText } from "@hapi/protocol/githubFailureReason";
 import { FormField } from "./FormField";
 import { CONTROL_BASE, ControlChevron } from "./controls";
+import { detectedRepoLabel } from "./cloneDestination";
 import { Button } from "@/components/ui/button";
 import { BareButton } from "@/components/ui/BareButton";
 import type { GitHubAccount, GitHubRepo } from "@/hooks/queries/useGitHubRepos";
@@ -15,12 +16,6 @@ import {
 /** #4793 (ruling D-4793-3): the Repo field's one line on a broker-backed host. */
 export const CLONE_UNAVAILABLE_TEXT =
   "Cloning a repository into a new session is not available on this instance yet";
-
-/** Drop the owner/ prefix for display — "MattStarfield/foo" → "foo". */
-function repoName(nameWithOwner: string): string {
-  const i = nameWithOwner.indexOf("/");
-  return i === -1 ? nameWithOwner : nameWithOwner.slice(i + 1);
-}
 
 /**
  * Plain-language text for each server failure reason (#2327) now comes from
@@ -271,7 +266,7 @@ export function GitHubAccountRepoSelector(props: {
             className="flex h-9 items-center rounded-md border border-dashed border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-2.5 text-sm text-[var(--app-hint)]"
             title={detectedRepo}
           >
-            {repoName(detectedRepo)}
+            {detectedRepoLabel(detectedRepo, selectedAccount)}
           </div>
         </FormField>
       ) : isBroker ? (

@@ -34,6 +34,10 @@ import {
   type FetchLike,
 } from "../../services/apiKeyValidation";
 import type { AccountService } from "../../services/accountService";
+import {
+  computeApiKeyBudget,
+  resolveTimeZone,
+} from "../../services/apiKeyBudget";
 import { uuidV5 } from "../../services/providerAccountImport";
 import type { NicknameStore } from "../../accounts/nicknameStore";
 import type { MonogramStore } from "../../accounts/monogramStore";
@@ -117,8 +121,42 @@ export function toRedactedApiKey(entry: StoredApiKey): RedactedApiKey {
     // #5127: whether other federation nodes may use the key. Always set, so the
     // Settings switch reads an explicit value; only `true` in the vault shares.
     shareAcrossNodes: entry.shareAcrossNodes === true,
+    // API key budgets: the operator's budget and monthly top-up — non-secret
+    // settings, copied field-by-field. The read-time estimate is added by the
+    // routes that can meter spend (`withCredit`).
+    ...(entry.budget
+      ? {
+          budget: {
+            amountUsd: entry.budget.amountUsd,
+            setAt: entry.budget.setAt,
+          },
+        }
+      : {}),
+    ...(entry.budgetRecurrence
+      ? {
+          budgetRecurrence: {
+            amountUsd: entry.budgetRecurrence.amountUsd,
+            dayOfMonth: entry.budgetRecurrence.dayOfMonth,
+            mode: entry.budgetRecurrence.mode,
+            ...(entry.budgetRecurrence.timeZone
+              ? { timeZone: entry.budgetRecurrence.timeZone }
+              : {}),
+          },
+        }
+      : {}),
   };
 }
+
+/** How long a probe result stands before a list read re-checks the key in the
+ *  background, so a key revoked at the provider stops showing "Valid". */
+export const STALE_VALIDATION_MS = 6 * 60 * 60 * 1000;
+
+/** Dollars metered on one vault key for work started in [fromMs, toMs). */
+export type ApiKeySpendLookup = (
+  apiKeyId: string,
+  fromMs: number,
+  toMs: number
+) => number;
 
 /**
  * Issue #4823: read ONE vault entry by id, redacted. The mid-session payment-method
@@ -225,6 +263,15 @@ export interface ApiKeysRoutesOptions {
   isTenantVm?: () => boolean;
   /** #5127: the picker's cross-node key list (`GET /api-keys/available`). */
   getSharedApiKeyService?: () => SharedApiKeyService | null;
+  /** API key budgets: the spend this node metered on a key (the turn ledger).
+   *  Absent ⇒ answers carry the budget settings but no estimate. */
+  getApiKeySpend?: () => ApiKeySpendLookup | null;
+  /** Test seam: the clock for budget estimates and stale-probe checks. */
+  now?: () => number;
+  /** Re-probe a key in the background when a list read finds its last probe
+   *  older than {@link STALE_VALIDATION_MS}. Off unless the server wires it, so
+   *  a route test never reaches a provider. */
+  revalidateStaleKeys?: boolean;
 }
 
 export function createApiKeysRoutes(
@@ -269,6 +316,79 @@ export function createApiKeysRoutes(
     } else {
       console.warn(`[${options.category}]`, message);
     }
+  }
+
+  const now = opts.now ?? Date.now;
+
+  /** The redacted view plus the read-time credit estimate (API key budgets).
+   *  Fail-open: a spend read that throws leaves the estimate out and is logged;
+   *  the list still answers. */
+  function withCredit(entry: StoredApiKey): RedactedApiKey {
+    const redacted = toRedactedApiKey(entry);
+    const lookup = opts.getApiKeySpend?.();
+    if (!lookup) return redacted;
+    if (!entry.budget && !entry.budgetRecurrence && !entry.outOfCreditAt) {
+      return redacted;
+    }
+    try {
+      const { status, outOfCredit } = computeApiKeyBudget({
+        budget: entry.budget,
+        recurrence: entry.budgetRecurrence,
+        outOfCreditAt: entry.outOfCreditAt,
+        nowMs: now(),
+        spend: (fromMs, toMs) => lookup(entry.id, fromMs, toMs),
+      });
+      return {
+        ...redacted,
+        ...(status ? { budgetStatus: status } : {}),
+        ...(outOfCredit ? { outOfCredit: true } : {}),
+      };
+    } catch (error) {
+      const failure = errorClass(error);
+      logFault(
+        "warn",
+        `API key ${entry.id}: its spend could not be read (${failure})`,
+        {
+          category: "api-keys-budget",
+          context: { vaultId: entry.id, error: failure },
+        }
+      );
+      return redacted;
+    }
+  }
+
+  /** Keys being re-probed in the background (one probe per key at a time). */
+  const revalidating = new Set<string>();
+
+  /** Re-probe a key whose last result is older than {@link STALE_VALIDATION_MS}
+   *  (or that was never probed), off the request path; the next list read shows
+   *  the new status. A rejected key is left alone — a 401 does not heal. */
+  function revalidateIfStale(entry: StoredApiKey): void {
+    if (!opts.revalidateStaleKeys) return;
+    if (entry.status === "invalid" || revalidating.has(entry.id)) return;
+    const last = entry.lastValidatedAt
+      ? Date.parse(entry.lastValidatedAt)
+      : NaN;
+    if (Number.isFinite(last) && now() - last < STALE_VALIDATION_MS) return;
+    revalidating.add(entry.id);
+    // `force`: staleness is decided here, so the probe's own 60 s cache must
+    // not answer it a second time.
+    void validateApiKeyById(settingsFile, entry.id, {
+      fetchImpl: opts.fetchImpl,
+      force: true,
+    })
+      .catch(error => {
+        const failure = errorClass(error);
+        logFault(
+          "warn",
+          `API key ${entry.id}: the background re-check failed (${failure})`,
+          {
+            category: "api-keys-revalidate",
+            context: { vaultId: entry.id, error: failure },
+          }
+        );
+      })
+      .finally(() => revalidating.delete(entry.id));
   }
 
   /** Mirror a Gemini key's name and/or monogram onto its Google account's
@@ -337,7 +457,8 @@ export function createApiKeysRoutes(
     async c => {
       const settings = await readSettings(settingsFile);
       const entries = settings?.apiKeys ?? [];
-      return c.json(entries.map(toRedactedApiKey));
+      for (const entry of entries) revalidateIfStale(entry);
+      return c.json(entries.map(withCredit));
     }
   );
 
@@ -671,7 +792,8 @@ export function createApiKeysRoutes(
     }
   );
 
-  // PATCH /api-keys/:id — set a key's name and monogram in one write (#4463 R6).
+  // PATCH /api-keys/:id — set a key's name and monogram (#4463 R6), sharing (#5127),
+  // budget and monthly top-up in one write.
   app.patch(
     "/api-keys/:id",
     cataloged(
@@ -680,7 +802,7 @@ export function createApiKeysRoutes(
         domain: "accounts",
         surface: "rest",
         description:
-          "Set a stored provider key's name and monogram in one write; a Gemini key's Google account shows the same identity.",
+          "Set a stored provider key's name, monogram, sharing, budget and monthly top-up in one write; a Gemini key's Google account shows the same identity.",
         whenToUse: "When the user renames a saved key or edits its monogram.",
         invocation: {
           kind: "rest",
@@ -725,6 +847,19 @@ export function createApiKeysRoutes(
           return c.json({ error: unavailable, code: "share_unavailable" }, 400);
         }
       }
+      // API key budgets: the server stamps when the amount was true.
+      const budget = parsed.data.budget;
+      const recurrence = parsed.data.budgetRecurrence;
+      if (
+        recurrence?.timeZone !== undefined &&
+        resolveTimeZone(recurrence.timeZone) !== recurrence.timeZone
+      ) {
+        return c.json(
+          { error: "Unknown time zone", code: "invalid_time_zone" },
+          400
+        );
+      }
+      const stampedAt = new Date(now()).toISOString();
 
       const applied: {
         entry: StoredApiKey | null;
@@ -750,6 +885,17 @@ export function createApiKeysRoutes(
           }
           if (share === true) next.shareAcrossNodes = true;
           else if (share === false) delete next.shareAcrossNodes;
+          if (budget === null) delete next.budget;
+          else if (budget !== undefined) {
+            next.budget = { amountUsd: budget.amountUsd, setAt: stampedAt };
+            // A balance the operator just entered supersedes the provider's
+            // earlier "credit balance is too low".
+            delete next.outOfCreditAt;
+          }
+          if (recurrence === null) delete next.budgetRecurrence;
+          else if (recurrence !== undefined) {
+            next.budgetRecurrence = { ...recurrence };
+          }
           applied.entry = next;
           return {
             ...fresh,
@@ -779,7 +925,7 @@ export function createApiKeysRoutes(
           monogram,
         });
       }
-      return c.json(toRedactedApiKey(updated));
+      return c.json(withCredit(updated));
     }
   );
 
@@ -876,7 +1022,7 @@ export function createApiKeysRoutes(
         throw error;
       }
       if (accountKept) c.header("X-Hapi-Account-Kept", accountKept);
-      return c.json(remaining.map(toRedactedApiKey));
+      return c.json(remaining.map(withCredit));
     }
   );
 
@@ -921,7 +1067,7 @@ export function createApiKeysRoutes(
         }
         return c.json({ error: "API key not found" }, 404);
       }
-      return c.json(toRedactedApiKey(result.entry));
+      return c.json(withCredit(result.entry));
     }
   );
 

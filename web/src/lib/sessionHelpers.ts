@@ -5,6 +5,7 @@
  */
 import {
   formatModelName,
+  isEffortLevel,
   MODEL_MODE_LABELS,
   HARNESS_MANIFESTS,
   isMaxClassSubscription,
@@ -31,6 +32,12 @@ export type SessionLike = {
   /** Issue #2456: live reasoning-effort level + pinned raw model id. */
   effort?: EffortLevel;
   rawModel?: string;
+  /** Issue #6166: the effort the Claude process APPLIES (get_settings read-back)
+   *  — a level, `null` (it sends none) or absent (not measured) — the model that
+   *  read-back reported, and the effort that process was launched with. Live only. */
+  appliedEffort?: string | null;
+  appliedModel?: string;
+  appliedForEffort?: string | null;
   /** Issue #1509: resolved context window (from get_context_usage); used by isModelDowngraded. */
   contextWindowTokens?: number;
   metadata: {
@@ -75,6 +82,61 @@ export function getEffectiveEffort(
   session: SessionLike
 ): EffortLevel | undefined {
   return session.effort ?? session.metadata?.effort ?? undefined;
+}
+
+/**
+ * Issue #6166: the effort the running Claude process applies — a level, `null`
+ * (it sends no effort), or `undefined` (not measured: a pty/tmux launcher, an
+ * older binary, a dead process). Unlike {@link getEffectiveEffort} there is no
+ * metadata fallback: metadata holds the REQUEST, never an observation.
+ */
+export function getAppliedEffort(
+  session: SessionLike
+): EffortLevel | null | undefined {
+  if (session.appliedEffort === null) return null;
+  return isEffortLevel(session.appliedEffort)
+    ? session.appliedEffort
+    : undefined;
+}
+
+/**
+ * The composer chip's model-side props (issue #6166): the effective pinned raw
+ * model, the below-entitlement flag, and the effort the process applies with
+ * the model it reported and the effort it was launched with. All hidden while a
+ * model change is pending, because they describe the model being replaced (the
+ * rule `resolvedModel` follows).
+ */
+export function getComposerModelProps(
+  session: SessionLike,
+  modelChangePending: boolean
+): {
+  rawModel: string | undefined;
+  modelDowngraded: boolean;
+  appliedEffort: EffortLevel | null | undefined;
+  appliedModel: string | undefined;
+  appliedForEffort: EffortLevel | null | undefined;
+} {
+  if (modelChangePending) {
+    return {
+      rawModel: undefined,
+      modelDowngraded: false,
+      appliedEffort: undefined,
+      appliedModel: undefined,
+      appliedForEffort: undefined,
+    };
+  }
+  return {
+    rawModel: getEffectiveRawModel(session),
+    modelDowngraded: isModelDowngraded(session),
+    appliedEffort: getAppliedEffort(session),
+    appliedModel: session.appliedModel,
+    appliedForEffort:
+      session.appliedForEffort === null
+        ? null
+        : isEffortLevel(session.appliedForEffort)
+          ? session.appliedForEffort
+          : undefined,
+  };
 }
 
 /**

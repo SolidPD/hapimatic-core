@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useState, useEffect } from "react";
+import { isPinchZoomed } from "@/lib/pinchZoom";
 
 /**
  * Hook that manages iOS PWA keyboard viewport behavior.
@@ -42,6 +43,10 @@ export function useKeyboardPadding(): KeyboardState {
     // Track whether an input is focused (keyboard-triggering element)
     let inputFocused = false;
     const handleResize = () => {
+      // #6213: a pinch-zoom shrinks vv.height by a factor of scale, which looks
+      // like an open keyboard. It is not one, so leave the state as it is.
+      if (isPinchZoomed(vv)) return;
+
       const fullHeight = window.innerHeight;
       const currentHeight = Math.round(vv.height);
       const diff = fullHeight - currentHeight;

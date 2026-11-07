@@ -7,6 +7,7 @@
 import { z } from "zod";
 import {
   CLAUDE_PERMISSION_MODES,
+  DEFAULT_SPAWN_PERMISSION_MODE,
   MODEL_MODES,
   PERMISSION_MODES,
 } from "./modes";
@@ -518,6 +519,15 @@ export const MetadataSchema = z
      *  key replaced under the same id is refused when its last four characters
      *  differ (a replacement ending in the same four is not detected). Display-safe. */
     apiKeyMasked: z.string().optional(),
+    /** Issue #5819: the node id of the federation peer that placed this session
+     *  on this node with one of this node's own keys (`/federation/spawn-api-key`),
+     *  else the literal `"peer"`. Present ⇒ every relaunch re-checks that the key
+     *  is still shared with other nodes, so unticking "Make available to all
+     *  nodes" also stops relaunches of sessions another node started here (a
+     *  running one keeps the key until it relaunches). Dropped when the
+     *  session is switched onto an account or onto a key chosen on this node.
+     *  A node id, never key material. */
+    apiKeyPlacedBy: z.string().optional(),
     /** Issue #3124: per-hook native-coverage records for the message-layer hook
      *  stage (epic #3117 Sub I). Stamped by the CLI at spawn/registration from
      *  #3123's hook-projection provenance (frozen-at-spawn, mirroring
@@ -778,6 +788,21 @@ export const SessionSchema = z
      *  fed from the keepAlive tick so the in-session picker shows the exact
      *  pinned version selected via "More models". */
     rawModel: z.string().optional(),
+    /** Issue #6166: the effort the running Claude process APPLIES, read back via
+     *  the SDK get_settings control request (after env overrides and model
+     *  remaps) and fed from the keepAlive tick. A level, `null` (the process
+     *  sends no effort) or absent (not measured: pty/tmux launchers, an older
+     *  binary, a dead process). Lenient string — readers use `isEffortLevel`.
+     *  Live only: never in metadata, never a spawn input. */
+    appliedEffort: z.string().nullable().optional(),
+    /** Issue #6166: the model the get_settings read-back reported, so the chip
+     *  compares the applied effort with what the request becomes on THAT model. */
+    appliedModel: z.string().optional(),
+    /** Issue #6166: the effort the measured query was LAUNCHED with (`null` =
+     *  none). A request changed since then reaches the process only on the next
+     *  message, so the chip uses the measurement only while this equals the
+     *  current request — a pending pick is not shown as a mismatch. */
+    appliedForEffort: z.string().nullable().optional(),
     // Issue #1469: first-order context window + live usage, sourced per turn
     // from Claude Code's get_context_usage. contextWindowTokens replaces the
     // deleted web-side [1m]-suffix heuristic (the actual 200k-vs-1M fix).
@@ -1594,6 +1619,33 @@ export const AutoSelectOptimalAccountPreferencePatchSchema = z.object({
 export type AutoSelectOptimalAccountPreferencePatch = z.infer<
   typeof AutoSelectOptimalAccountPreferencePatchSchema
 >;
+
+/**
+ * Issue #6218 — the node's default spawn permission mode: the posture a new
+ * session gets when the request names none (the Create page and fan-out
+ * pre-select it; a REST / MCP / `hapi api sessions spawn` / federation-peer
+ * spawn with no `yolo` and no `permissionMode` starts in it). A Claude-vocabulary
+ * mode, mapped onto each harness by `resolveDefaultSpawnPermissionMode`.
+ *
+ * Node-local and server-authoritative (`settings.json`
+ * `defaultSpawnPermissionModePreference`), NOT part of federation preference sync:
+ * an operator keeps YOLO on an operator machine by setting it there, and a fresh
+ * install or customer VM gets the shared one-step-below-YOLO default. The shared
+ * {@link DEFAULT_SPAWN_PERMISSION_MODE} is the single default on both sides — this
+ * schema and the web localStorage cache (`useAdminPreferences.ts`).
+ */
+export const DefaultSpawnPermissionModePreferenceSchema = z.object({
+  mode: z.enum(CLAUDE_PERMISSION_MODES).default(DEFAULT_SPAWN_PERMISSION_MODE),
+});
+
+export type DefaultSpawnPermissionModePreference = z.infer<
+  typeof DefaultSpawnPermissionModePreferenceSchema
+>;
+
+/** PUT body for `/preferences/default-spawn-permission-mode` (#6218). */
+export const DefaultSpawnPermissionModePreferencePatchSchema = z.object({
+  mode: z.enum(CLAUDE_PERMISSION_MODES),
+});
 
 // ── Chat detail level + default output style (#2623, epic #2622 Sub-Issue A) ──
 // Two NEW server-persisted prefs (B #2624 globalizes, C #2625/D #2626 consume).
@@ -2467,6 +2519,13 @@ export const TurnTokenBreakdownSchema = z
     /** Issue #4824: the `authBinding.kind` the turn ran under, recorded when it
      *  opened; null on a legacy row. Optional for federation skew. */
     authBindingKind: z.string().nullable().optional(),
+    /** Issue #6170: the context the model held at the turn's end. For Claude,
+     *  the latest main-chain assistant message's input + cache tokens from the
+     *  transcript parser; for other runners (Codex, ACP), the context size the
+     *  runner reports at finalize. Null when the turn recorded none. The web's
+     *  context-trend source. Optional so an older federation peer's response
+     *  still parses. */
+    contextUsedTokens: z.number().nullable().optional(),
   })
   .passthrough();
 export type TurnTokenBreakdown = z.infer<typeof TurnTokenBreakdownSchema>;
@@ -2738,6 +2797,50 @@ export const ApiKeyLastValidationSchema = z.object({
 });
 export type ApiKeyLastValidation = z.infer<typeof ApiKeyLastValidationSchema>;
 
+/** The largest dollar amount a key budget or top-up accepts. */
+export const API_KEY_BUDGET_MAX_USD = 1_000_000;
+
+/** What the operator says a key has to spend: `amountUsd` was available at
+ *  `setAt` (ISO 8601). No provider reports a key's remaining credit, so the
+ *  server subtracts the spend Hapimatic metered on the key since then. */
+export const ApiKeyBudgetSchema = z.object({
+  amountUsd: z.number().finite().nonnegative().max(API_KEY_BUDGET_MAX_USD),
+  setAt: z.string(),
+});
+export type ApiKeyBudget = z.infer<typeof ApiKeyBudgetSchema>;
+
+/** A key's monthly top-up: `amountUsd` lands at local midnight in `timeZone` on
+ *  `dayOfMonth` (a shorter month uses its last day). `add` puts it on top of what
+ *  is left; `replace` sets the balance to it, so unused credit expires (as Max
+ *  and Ultra API credit does at each renewal). */
+export const API_KEY_TOP_UP_MODES = ["add", "replace"] as const;
+export const ApiKeyBudgetRecurrenceSchema = z.object({
+  amountUsd: z.number().finite().positive().max(API_KEY_BUDGET_MAX_USD),
+  dayOfMonth: z.number().int().min(1).max(31),
+  mode: z.enum(API_KEY_TOP_UP_MODES),
+  /** IANA zone the browser reported when the top-up was saved; absent ⇒ UTC. */
+  timeZone: z.string().max(64).optional(),
+});
+export type ApiKeyBudgetRecurrence = z.infer<
+  typeof ApiKeyBudgetRecurrenceSchema
+>;
+
+/** The server's read-time estimate of a key's credit (computed per request,
+ *  never stored). `remainingUsd` may be negative when metered spend passed the
+ *  budget. `periodStart` is the budget's `setAt` or the latest top-up after it;
+ *  `periodStartBalanceUsd` is what the key held then (the meter's 100 %). */
+export const ApiKeyBudgetStatusSchema = z.object({
+  remainingUsd: z.number(),
+  periodStartBalanceUsd: z.number(),
+  spentUsd: z.number(),
+  periodStart: z.string(),
+  /** The next top-up, when the key has one. */
+  nextTopUpAt: z.string().optional(),
+  /** True when the next top-up replaces the balance (unused credit expires). */
+  expiresAtNextTopUp: z.boolean(),
+});
+export type ApiKeyBudgetStatus = z.infer<typeof ApiKeyBudgetStatusSchema>;
+
 /** A key's user-set name budget in the #4463 flows (append add, PATCH). The
  *  schema-wide `label` cap stays 120 for keys stored before. */
 export const API_KEY_NAME_MAX_CHARS = 64;
@@ -2785,6 +2888,15 @@ export const StoredApiKeySchema = z
      *  federation, which fetch it from this node on demand. Anthropic only.
      *  Absent ⇒ not shared (every key stored before #5127). */
     shareAcrossNodes: z.boolean().optional(),
+    /** The operator's balance for the key and when it was true. Absent ⇒ no
+     *  budget (the card offers "Set budget"). */
+    budget: ApiKeyBudgetSchema.optional(),
+    /** The key's monthly top-up. Absent ⇒ none. */
+    budgetRecurrence: ApiKeyBudgetRecurrenceSchema.optional(),
+    /** When a session on this key last stopped on the provider's "credit
+     *  balance is too low" answer (ISO 8601). Superseded by any later metered
+     *  spend, budget edit or top-up. */
+    outOfCreditAt: z.string().optional(),
   })
   .passthrough();
 export type StoredApiKey = z.infer<typeof StoredApiKeySchema>;
@@ -2823,6 +2935,15 @@ export const RedactedApiKeySchema = z.object({
    *  older node omits it): absent means not shared, the same as `false`. The
    *  vault's `toRedactedApiKey` always sets it explicitly. */
   shareAcrossNodes: z.boolean().optional(),
+  /** The operator's budget and monthly top-up (non-secret settings). */
+  budget: ApiKeyBudgetSchema.optional(),
+  budgetRecurrence: ApiKeyBudgetRecurrenceSchema.optional(),
+  /** The read-time credit estimate; present only where the server could meter
+   *  the key's spend (the GET list and PATCH answers on the key's own node). */
+  budgetStatus: ApiKeyBudgetStatusSchema.optional(),
+  /** The provider said the key's credit is exhausted, and nothing since (spend,
+   *  a budget edit, a top-up) says otherwise. */
+  outOfCredit: z.boolean().optional(),
 });
 export type RedactedApiKey = z.infer<typeof RedactedApiKeySchema>;
 
@@ -2938,6 +3059,16 @@ export const PatchApiKeyRequestSchema = z.object({
   monogram: AccountMonogramSchema.optional(),
   /** #5127: turn sharing with the other federation nodes on or off. */
   shareAcrossNodes: z.boolean().optional(),
+  /** Set the dollars available now (the server stamps the time); `null` clears
+   *  the budget. */
+  budget: z
+    .object({
+      amountUsd: ApiKeyBudgetSchema.shape.amountUsd,
+    })
+    .nullable()
+    .optional(),
+  /** Set the monthly top-up; `null` removes it. */
+  budgetRecurrence: ApiKeyBudgetRecurrenceSchema.nullable().optional(),
 });
 export type PatchApiKeyRequest = z.infer<typeof PatchApiKeyRequestSchema>;
 
@@ -3382,17 +3513,137 @@ export const OnboardingStatusSchema = z.enum([
 ]);
 export type OnboardingStatus = z.infer<typeof OnboardingStatusSchema>;
 
+// #6211: the post-launch wizard's progress. A separate field, not new `lastStep`
+// ids: an unknown `lastStep` fails the parse, which reads as `completed`, so a
+// rollback or a stale client would silently end onboarding. `.catch(undefined)`
+// makes a corrupt or newer `flow` read as absent and leaves `status` standing.
+export const ONBOARDING_FLOW_STEP_IDS = [
+  "connect",
+  "tailscale",
+  "connectors",
+  "backup",
+  "tour",
+  "start",
+] as const;
+export const OnboardingFlowStepSchema = z.enum(ONBOARDING_FLOW_STEP_IDS);
+export type OnboardingFlowStep = z.infer<typeof OnboardingFlowStepSchema>;
+
+export const OnboardingOutcomeSchema = z.enum(["completed", "skipped"]);
+export type OnboardingOutcome = z.infer<typeof OnboardingOutcomeSchema>;
+
+// A closed list, because a funnel row may carry the provider kind and nothing else
+// (R18): no free text can bring an email or a label into it.
+export const OnboardingProviderKindSchema = z.enum([
+  "anthropic",
+  "openai",
+  "google",
+  "openrouter",
+  "custom",
+]);
+export type OnboardingProviderKind = z.infer<
+  typeof OnboardingProviderKindSchema
+>;
+
+export const OnboardingStepRecordSchema = z.object({
+  outcome: OnboardingOutcomeSchema,
+  at: z.number(),
+  provider: OnboardingProviderKindSchema.optional(),
+});
+export type OnboardingStepRecord = z.infer<typeof OnboardingStepRecordSchema>;
+
+export const OnboardingFlowSchema = z.object({
+  /** Bumped by each Restart, so a run's outcomes are not read as a later run's. */
+  run: z.number(),
+  step: OnboardingFlowStepSchema,
+  /** Closed without "Don't show this again": waits for the next arrival at /sessions. */
+  paused: z.boolean().optional(),
+  outcomes: z.partialRecord(
+    OnboardingFlowStepSchema,
+    OnboardingStepRecordSchema
+  ),
+});
+export type OnboardingFlow = z.infer<typeof OnboardingFlowSchema>;
+
 export const OnboardingStateSchema = z.object({
   status: OnboardingStatusSchema,
   lastStep: OnboardingStepIdSchema.optional(),
+  flow: OnboardingFlowSchema.optional().catch(undefined),
 });
 export type OnboardingState = z.infer<typeof OnboardingStateSchema>;
 
 export const OnboardingStatePatchSchema = z.object({
   status: OnboardingStatusSchema.optional(),
   lastStep: OnboardingStepIdSchema.optional(),
+  flow: z
+    .object({
+      step: OnboardingFlowStepSchema.optional(),
+      paused: z.boolean().optional(),
+      // The server stamps `at` when it merges these.
+      outcomes: z
+        .partialRecord(
+          OnboardingFlowStepSchema,
+          OnboardingStepRecordSchema.omit({ at: true })
+        )
+        .optional(),
+    })
+    .optional(),
+  // Replay from the first step: `pending`, a new run, and no `lastStep` (which a
+  // plain patch cannot clear).
+  restart: z.literal(true).optional(),
 });
 export type OnboardingStatePatch = z.infer<typeof OnboardingStatePatchSchema>;
+
+/**
+ * Merge a client patch over the effective state: the PUT's semantics, and the
+ * client's optimistic copy of them. A finished tour stays finished: a dismissal,
+ * skipping a re-run after completion, never demotes `completed`, whatever the
+ * client knew when it sent it (a client whose first read failed cannot tell). Every
+ * other transition is honoured, including an explicit re-arm to `pending` (the
+ * documented test-setup recipe).
+ *
+ * #6211: a `flow` patch merges over the stored flow, with outcomes merged by step
+ * and stamped here, and `restart` replaces it with a new run from the first step.
+ */
+export function mergeOnboardingPatch(
+  current: OnboardingState,
+  patch: OnboardingStatePatch,
+  now: number = Date.now()
+): OnboardingState {
+  if (patch.restart) {
+    return OnboardingStateSchema.parse({
+      status: "pending",
+      flow: {
+        run: (current.flow?.run ?? 0) + 1,
+        step: "connect",
+        outcomes: {},
+      },
+    });
+  }
+  const { restart: _restart, flow: flowPatch, ...fields } = patch;
+  const next: OnboardingState = {
+    ...current,
+    ...fields,
+    status: patch.status ?? current.status,
+  };
+  if (current.status === "completed" && patch.status === "dismissed") {
+    next.status = "completed";
+  }
+  if (flowPatch) {
+    const base = current.flow ?? { run: 1, step: "connect", outcomes: {} };
+    const outcomes = { ...base.outcomes };
+    for (const [step, record] of Object.entries(flowPatch.outcomes ?? {})) {
+      outcomes[step as OnboardingFlowStep] = { ...record, at: now };
+    }
+    const paused = flowPatch.paused ?? base.paused;
+    next.flow = {
+      run: base.run,
+      step: flowPatch.step ?? base.step,
+      outcomes,
+      ...(paused ? { paused: true } : {}),
+    };
+  }
+  return OnboardingStateSchema.parse(next);
+}
 
 // ── First-run backup-key prompt (node-local, #4791) ──────────────────
 //

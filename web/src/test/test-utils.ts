@@ -97,6 +97,9 @@ export function createMockApiClient(): Record<string, Mock> {
     // In-VM Claude sign-in on a tenant VM (issue #4349)
     startInVmAccountLogin: vi.fn(),
     completeInVmAccountLogin: vi.fn(),
+    submitInVmAccountCode: vi.fn(),
+    getTailscaleStatus: vi.fn(),
+    joinTailscale: vi.fn(),
     cancelInVmAccountLogin: vi.fn(),
     getGitStatus: vi.fn(),
     getGitRemoteUrl: vi.fn(),

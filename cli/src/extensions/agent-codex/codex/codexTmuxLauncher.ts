@@ -45,6 +45,9 @@ export const CODEX_TMUX_RESUME_FLAG = "--hapi-codex-resume";
 export interface CodexTmuxCommandOptions {
   /** Skip approvals/sandbox (matches the direct-spawn `--yolo` push). */
   yolo: boolean;
+  /** Issue #6218: starting permission mode (read-only / safe-yolo) →
+   *  `--hapi-permission-mode`, matching the direct-spawn push. */
+  permissionMode?: string;
   /**
    * OpenRouter gateway model id ("provider/model", #1733). Threaded as
    * `--hapi-model` so the codex child's EnhancedMode.model resolves to it;
@@ -78,6 +81,12 @@ export function buildCodexCommand(options: CodexTmuxCommandOptions): string[] {
   // Codex has no `opencode`-style config-block YOLO; the CLI flag is honored.
   if (options.yolo) {
     args.push("--yolo");
+  }
+
+  // Issue #6218: the starting permission mode (e.g. safe-yolo); the codex
+  // command consumes it as options.permissionMode.
+  if (options.permissionMode) {
+    args.push("--hapi-permission-mode", options.permissionMode);
   }
 
   // #1733: OpenRouter model id (codex-only — opencode gets its model from

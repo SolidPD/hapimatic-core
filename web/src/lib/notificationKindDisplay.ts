@@ -39,7 +39,8 @@ export const NOTIFICATION_KIND_DISPLAY = {
     label: "Session restart failed",
   },
   "spawn-failed": { icon: CircleX, label: "Session creation failed" },
-  "waiting-for-slot": { icon: Clock, label: "Waiting for a session slot" },
+  // #6156: the wait can be for a session slot or for free memory.
+  "waiting-for-slot": { icon: Clock, label: "Waiting for capacity" },
   "loops-resuming": { icon: Repeat, label: "Scheduled jobs resuming" },
   "model-reverted": { icon: Undo2, label: "Model reverted" },
 } as const satisfies Record<NotificationKind, NotificationKindDisplay>;

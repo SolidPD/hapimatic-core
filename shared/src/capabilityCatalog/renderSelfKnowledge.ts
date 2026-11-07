@@ -80,7 +80,12 @@ export const SELF_KNOWLEDGE_CEILING: Record<SelfKnowledgeScope, number> = {
   // each renders one line here (585 B for the eight). Measured render 11,449 B;
   // the 551 B margin fits about seven more such lines before the next reviewed
   // raise.
-  user: 12000,
+  // RAISED to 12,500 B by #6223 fix round 4 (PM ruling, 2026-11-05): the
+  // preamble's generated-files bullet now carries the secret clause word for
+  // word, because with HAPI_CAPABILITY_TIER0=0 it is the only rule a session
+  // sees. Measured render 11,984 B before and 12,289 B after (+305 B, about 76
+  // tokens). The 211 B margin is not room for another bullet.
+  user: 12500,
   // Greenfield: no replaced-doc anchor. Fits the current full user∪operator
   // render (~16 KB) with headroom for the catalog to fill as #3745 lands more
   // RPC entries, and catches the ~64–80 KB REST-inclusion runaway (R3). A

@@ -16,6 +16,7 @@ import {
 import { isPermissionModeAllowedForFlavor } from "@hapi/protocol";
 import { PermissionModeSchema } from "@hapi/protocol/schemas";
 import { NO_META_TEARDOWN } from "@/api/rpc/types";
+import { stampSpawnPosture } from "@/agent/runners/spawnPostureStamp";
 
 export { emitReadyIfIdle } from "./utils/emitReadyIfIdle";
 
@@ -62,7 +63,24 @@ export async function runCodex(opts: {
   const codexCliOverrides = parseCodexCliOverrides(opts.codexArgs);
   const sessionWrapperRef: { current: CodexSession | null } = { current: null };
 
-  let currentPermissionMode: PermissionMode = opts.permissionMode ?? "default";
+  // Issue #6218: a saved posture (metadata.permissionMode — stamped below at
+  // spawn and on every live change, or staged by a disconnected Session
+  // Configuration save) seeds a respawn, as runClaude does. Precedence: a
+  // spawn-time --yolo > the saved posture > the --hapi-permission-mode seed.
+  const savedParse = PermissionModeSchema.safeParse(
+    session.getMetadata()?.permissionMode
+  );
+  const savedPermissionMode: PermissionMode | undefined =
+    savedParse.success &&
+    isPermissionModeAllowedForFlavor(savedParse.data, "codex")
+      ? (savedParse.data as PermissionMode)
+      : undefined;
+  let currentPermissionMode: PermissionMode =
+    opts.permissionMode === "yolo"
+      ? "yolo"
+      : (savedPermissionMode ?? opts.permissionMode ?? "default");
+  // Record the starting posture so a respawn does not relaunch in YOLO.
+  stampSpawnPosture(session, currentPermissionMode);
 
   const lifecycle = createRunnerLifecycle({
     session,
@@ -133,6 +151,9 @@ export async function runCodex(opts: {
 
       if (config.permissionMode !== undefined) {
         currentPermissionMode = resolvePermissionMode(config.permissionMode);
+        // #6218: a live change is the session's new saved posture.
+        const applied = currentPermissionMode;
+        session.updateMetadata(prev => ({ ...prev, permissionMode: applied }));
       }
 
       syncSessionMode();

@@ -2,7 +2,7 @@
 import { join } from "node:path";
 
 import { CLI_VERSION } from "@/version";
-import { ensureRuntimeAssets } from "@/runtime/assets";
+import { addBundledGitLfsToPath, ensureRuntimeAssets } from "@/runtime/assets";
 import { isBunCompiled } from "@/projectPath";
 import { logger } from "@/ui/logger";
 import { getCliArgs } from "@/utils/cliArgs";
@@ -76,6 +76,7 @@ export async function runCli(): Promise<void> {
 
   if (command.requiresRuntimeAssets) {
     await ensureRuntimeAssets();
+    addBundledGitLfsToPath();
     logger.debug("Starting hapi CLI with args: ", process.argv);
   }
 

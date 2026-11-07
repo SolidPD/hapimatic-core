@@ -26,8 +26,11 @@ import { buildSeedPrompt } from "./seedPromptBuilder";
  *  NOT after the (detached) watchdog completes. */
 export type TriggerOutcome =
   | { status: "analyzing"; sessionId: string }
-  | { status: "at_capacity" }
+  | { status: "at_capacity"; cause?: "memory" }
   | { status: "failed"; reason: string };
+
+/** The last terminal non-success outcome of a range (#6156: a low-memory refusal is its own). */
+export type TerminalOutcome = "failed" | "at_capacity" | "insufficient_memory";
 
 export interface OrchestratorDeps {
   engine: Pick<
@@ -96,7 +99,7 @@ export class ImpactOrchestrator implements ImpactAnalysisCoordinator {
   /** sessionId → range-key, for the coordinator lookups keyed by session. */
   private readonly sessionToRange = new Map<string, string>();
   /** range-key → last terminal non-success outcome (for status reporting). */
-  private readonly lastOutcome = new Map<string, "failed" | "at_capacity">();
+  private readonly lastOutcome = new Map<string, TerminalOutcome>();
 
   constructor(deps: OrchestratorDeps) {
     this.engine = deps.engine;
@@ -126,7 +129,7 @@ export class ImpactOrchestrator implements ImpactAnalysisCoordinator {
     harnessId: string,
     from: string,
     to: string
-  ): "failed" | "at_capacity" | null {
+  ): TerminalOutcome | null {
     return this.lastOutcome.get(this.rangeKey(harnessId, from, to)) ?? null;
   }
 
@@ -187,12 +190,19 @@ export class ImpactOrchestrator implements ImpactAnalysisCoordinator {
     });
     if (spawn.type === "error") {
       // Authoritative capacity classifier (Task 6). A generic error → failed.
-      const outcome: "failed" | "at_capacity" =
-        spawn.code === "at_capacity" ? "at_capacity" : "failed";
+      // #6156: a low-memory refusal is a busy node like the count cap — retry
+      // later — but says so, since archiving a session is not the remedy.
+      const outcome: TerminalOutcome =
+        spawn.code === "at_capacity" || spawn.code === "insufficient_memory"
+          ? spawn.code
+          : "failed";
       this.lastOutcome.set(key, outcome);
-      return outcome === "at_capacity"
-        ? { status: "at_capacity" }
-        : { status: "failed", reason: spawn.message };
+      if (outcome === "failed") {
+        return { status: "failed", reason: spawn.message };
+      }
+      return outcome === "insufficient_memory"
+        ? { status: "at_capacity", cause: "memory" }
+        : { status: "at_capacity" };
     }
     const sessionId = spawn.sessionId;
 

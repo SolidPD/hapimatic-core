@@ -143,7 +143,7 @@ export const rpcCatalogEntries = [
     domain: "session-introspection",
     surface: "rpc",
     description:
-      "Read the session's live context-window usage (model, window, token count, percentage).",
+      'Read the session\'s live context-window usage (model, window, token count, percentage). With { "detail": "full" } it adds the full per-category breakdown, which is large.',
     whenToUse: "To read how much of the context window the session has used.",
     invocation: { kind: "rpc", method: "get-context-usage" },
     auth: "jwt",

@@ -55,6 +55,8 @@ export const FAN_OUT_MAX = 5;
 export type FanOutRefusalClass =
   /** (a) the daemon cap — HTTP 409 `{ code: "at_capacity" }`. */
   | "at_capacity"
+  /** (a2) #6156: the daemon's live-memory gate — HTTP 409 `{ code: "insufficient_memory" }`. */
+  | "insufficient_memory"
   /** (b) another worktree spawn holds the port-claim lock. */
   | "port_lock"
   /** (c) every worktree port is claimed. */
@@ -69,6 +71,7 @@ export type FanOutRefusalClass =
 
 export const REFUSAL_LABEL: Record<FanOutRefusalClass, string> = {
   at_capacity: "at capacity",
+  insufficient_memory: "low on free memory",
   port_lock: "port-claim lock busy",
   port_pool: "no free worktree port",
   missing_base: "base branch not found",
@@ -80,6 +83,7 @@ export const REFUSAL_LABEL: Record<FanOutRefusalClass, string> = {
 /** The refusal codes a spawn answer can carry, by class. */
 const CODED_REFUSALS: ReadonlySet<string> = new Set([
   "at_capacity",
+  "insufficient_memory",
   "account_unrefreshable",
   "account_token_expired",
 ]);
@@ -357,8 +361,9 @@ async function spawnLocalPeer(
     // The local route answers a capacity refusal as HTTP 409 with a code —
     // switch on the code, never on the message text.
     const refusal: FanOutRefusalClass =
-      err instanceof ApiError && err.code === "at_capacity"
-        ? "at_capacity"
+      err instanceof ApiError &&
+      (err.code === "at_capacity" || err.code === "insufficient_memory")
+        ? err.code
         : classifyRefusalMessage(errorMessage(err));
     return {
       ...head,

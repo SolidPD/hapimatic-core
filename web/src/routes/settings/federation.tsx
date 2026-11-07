@@ -47,7 +47,8 @@ type NodeCardModel = Pick<
 
 // Map the coarse federation reachability status (online/degraded/offline) onto
 // the per-node health status enum, used only for the identity-only fallback
-// cards when the #1632 batch health endpoint is unavailable (503 standalone).
+// cards when the #1632 batch health endpoint is unavailable (a 503 from a
+// server built before #6217).
 const REACHABILITY_TO_HEALTH: Record<
   FederationNodeStatus,
   FederationNodeHealthStatus
@@ -105,7 +106,8 @@ function toCardModel(
  * Tier-2 card grid of `FederationNodeCard`, and the Tier-1 `FederationAlertsFeed`.
  * Data: `useFederationHealthAggregate` (header), `useFederationHealthNodes` (#1632
  * batch — cards), `useFederationAlerts` (feed), with `useFederatedSessions` as the
- * identity-only fallback when the health endpoints return 503 (standalone/spoke).
+ * identity-only fallback when the health endpoints return 503 (a server built
+ * before #6217; from #6217 every node serves its own health).
  *
  * Card click navigates to the per-node detail route `/settings/federation/$nodeId`
  * (#1444 design, promoted to a nested route in #1935 — `NodeDetailView` is rendered
@@ -127,12 +129,15 @@ export default function FederationDashboard() {
     useFederationAlerts(api);
   const { localNode, remoteNodes } = useFederatedSessions(api);
 
-  // Health endpoints unavailable (503 standalone / federation disabled) → the
-  // dashboard renders identity-only cards + a non-blocking banner (R12).
+  // Health endpoints unavailable (a 503 from a server with no aggregator, built
+  // before #6217, or any other failed read) → the dashboard renders
+  // identity-only cards + a non-blocking banner (R12). From #6217 every node
+  // serves its own health, so on a current server this is reached only when a
+  // read fails (Fallback Preservation Rule).
   const metricsUnavailable = aggIsError || nodesIsError;
 
-  // #2513: on a standalone VM the federation HealthAggregator is never
-  // constructed (federationConfig is null), so GET /api/federation/health/nodes
+  // #2513: on a standalone VM whose server predates #6217 no HealthAggregator
+  // is constructed, so GET /api/federation/health/nodes
   // 503s and the dashboard falls back to identity-only cards with NO readings —
   // CPU/RAM/disk render as "—". The local /api/system-health collector is ALWAYS
   // available (JWT-only, not federation-gated), so source the LOCAL node's card

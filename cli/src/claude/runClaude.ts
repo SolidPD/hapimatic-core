@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT AND AGPL-3.0-only
+import { readFileSync } from "node:fs";
+import { parseCgroupV2Path } from "@/tmux/sessionSlice";
 import { logger } from "@/ui/logger";
 import { loop } from "@/claude/loop";
 import { AgentState, SessionModelMode, type Metadata } from "@/api/types";
@@ -7,6 +9,7 @@ import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { hashObject } from "@/utils/deterministicJson";
 import { extractSDKMetadataAsync } from "@/claude/sdk/metadataExtractor";
 import { applyModelInPlace } from "@/claude/applyModelInPlace";
+import { readBackAppliedEffort } from "@/claude/claudeRemote";
 import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { getEnvironmentInfo } from "@/ui/doctor";
 import {
@@ -38,6 +41,10 @@ import {
   resolveEntitledModelForBoundAccount,
 } from "@/claude/accountTokenInjection";
 import { resolveSpawnModelState } from "@/claude/spawnModelState";
+import {
+  resolveInitialPermissionMode,
+  spawnPermissionStamp,
+} from "@/claude/spawnPermissionSeed";
 import { bootstrapSession } from "@/agent/sessionFactory";
 import {
   SET_MODEL_META,
@@ -68,7 +75,14 @@ import {
 
 export interface StartOptions {
   model?: string;
+  /** The HARD spawn-time posture: set only by `--yolo` /
+   *  `--dangerously-skip-permissions`, and it outranks a saved posture. */
   permissionMode?: PermissionMode;
+  /** Issue #6218: the starting-mode SEED from `--hapi-permission-mode` (a
+   *  non-bypass Claude mode). A saved posture (`metadata.permissionMode`)
+   *  outranks it, so a reconnect or daemon recovery of a session the user
+   *  switched comes back in the switched mode. */
+  spawnPermissionMode?: PermissionMode;
   startingMode?: "local" | "remote";
   shouldStartDaemon?: boolean;
   claudeEnvVars?: Record<string, string>;
@@ -109,6 +123,18 @@ export interface StartOptions {
   outputStyle?: string;
 }
 
+/** `/proc/self/cgroup`'s v2 path, or a reason it is unknown (never throws). */
+function readOwnCgroup(): string {
+  try {
+    return (
+      parseCgroupV2Path(readFileSync("/proc/self/cgroup", "utf8")) ??
+      "unknown (no cgroup v2 entry)"
+    );
+  } catch {
+    return "unknown (unreadable)";
+  }
+}
+
 export async function runClaude(options: StartOptions = {}): Promise<void> {
   const workingDirectory = process.cwd();
   const startedBy = options.startedBy ?? "terminal";
@@ -118,6 +144,9 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   logger.debug(
     `[START] Options: startedBy=${startedBy}, startingMode=${options.startingMode}`
   );
+  // #6156 (S3): name this process's cgroup, so a per-session scope that failed to
+  // apply (the launch script fails open) shows in the session log.
+  logger.info(`[START] cgroup: ${readOwnCgroup()}`);
 
   // Validate daemon spawn requirements
   if (startedBy === "daemon" && options.startingMode === "local") {
@@ -177,6 +206,19 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
 
   // Variable to track current session instance (updated via onSessionReady callback)
   const currentSessionRef: { current: Session | null } = { current: null };
+  // Issue #6166: after a live (in-place) model switch, read back the effort the
+  // process now applies — a per-model settings effort or the new model's
+  // supported levels can change it. Fire-and-forget, like the query-start read.
+  const rereadAppliedEffort = (): void => {
+    const liveQuery = currentSessionRef.current?.getLiveQuery();
+    if (!liveQuery) return;
+    readBackAppliedEffort(
+      liveQuery,
+      applied => currentSessionRef.current?.onAppliedEffort(applied),
+      // A later answer for a query that has since been replaced is dropped.
+      () => currentSessionRef.current?.getLiveQuery() !== liveQuery
+    );
+  };
 
   const formatFailureReason = (message: string): string => {
     const maxLength = 200;
@@ -312,7 +354,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       : resolveProfileExcludes(options.sessionRole);
   // Issue #2626: inject the per-session output style into the SAME --settings
   // file (fail-open — generateHookSettingsFile omits the key when outputStyle
-  // is undefined, so R2 byte-identical holds). options.outputStyle arrives via
+  // is undefined, R2). options.outputStyle arrives via
   // the --hapi-output-style argv hop (commands/claude.ts → StartOptions).
   // Issue #4568 (F1): an API-key session's settings file names its
   // `apiKeyHelper` (vault id + mask, never the key); the launcher verifies the
@@ -383,11 +425,13 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   );
 
   // Round 11 (epic #3285): a saved permission posture (metadata.permissionMode
-  // — stamped by set-session-config on a live change, or staged by the
-  // disconnected Session Configuration save) seeds the initial mode of a
-  // respawn, so "save Plan while disconnected → reconnect" comes back IN plan
-  // mode from the first message. A spawn-time --yolo (options.permissionMode =
-  // bypassPermissions) still takes precedence; an invalid/foreign pin is ignored.
+  // — stamped at spawn (#6218), by set-session-config on a live change, or
+  // staged by the disconnected Session Configuration save) seeds the initial
+  // mode of a respawn, so "save Plan while disconnected → reconnect" comes back
+  // IN plan mode from the first message. Precedence (#6218): a spawn-time --yolo
+  // (options.permissionMode = bypassPermissions) > the saved posture > the
+  // --hapi-permission-mode seed (options.spawnPermissionMode); an
+  // invalid/foreign pin is ignored.
   const pinnedPermissionParse = PermissionModeSchema.safeParse(
     session.getMetadata()?.permissionMode
   );
@@ -397,7 +441,11 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       ? (pinnedPermissionParse.data as PermissionMode)
       : undefined;
   const initialPermissionMode: PermissionMode | undefined =
-    options.permissionMode ?? pinnedPermissionMode;
+    resolveInitialPermissionMode({
+      hard: options.permissionMode,
+      saved: pinnedPermissionMode,
+      seed: options.spawnPermissionMode,
+    });
   // Forward messages to the queue
   let currentPermissionMode: PermissionMode =
     initialPermissionMode ?? "default";
@@ -464,10 +512,12 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     }
   }
   // Issue #6070: the node default this session's effort follows (present ⇒ the
-  // effort was defaulted, so a model switch re-fits it). A fresh spawn carries it
-  // as --hapi-node-default-effort; a respawn carries no flag, and the marker comes
-  // from the stored metadata (`/cli/sessions` returns the existing record for a
-  // known tag). An explicit effort pick clears it (set-session-config below).
+  // effort was defaulted, so a model switch re-fits it). A defaulted spawn carries
+  // it as --hapi-node-default-effort: a fresh spawn, or (#6166) a resume that
+  // named no effort. A respawn that re-threads its recorded effort carries no
+  // flag, and the marker comes from the stored metadata (`/cli/sessions` returns
+  // the existing record for a known tag). An explicit effort pick clears it
+  // (set-session-config below).
   const spawnNodeDefaultEffortPin: EffortLevel | undefined = isEffortLevel(
     options.nodeDefaultEffort
   )
@@ -498,8 +548,9 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       ? { modelMode: spawnModelModePin }
       : {}),
     ...(spawnEffortPin ? { effort: spawnEffortPin } : {}),
-    // Issue #6070: the pre-fit node default (only on a fresh defaulted spawn; a
-    // respawn keeps the stored marker through the spread above).
+    // Issue #6070: the pre-fit node default (only on a defaulted spawn — fresh,
+    // or a resume that named no effort, #6166; a respawn that re-threads its
+    // recorded effort keeps the stored marker through the spread above).
     ...(spawnNodeDefaultEffortPin
       ? { nodeDefaultEffort: spawnNodeDefaultEffortPin }
       : {}),
@@ -509,6 +560,12 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     // server-side respawn paths (model/account switch, reconnect) re-source it
     // from metadata.outputStyle. Absence = no key = default (fail-open).
     ...(options.outputStyle ? { outputStyle: options.outputStyle } : {}),
+    // Issue #6218 (absorbs #5353 R3): stamp the posture the session STARTS in, in
+    // the same atomic CLI-side write, so every server respawn (reconnect, account
+    // switch, token-refresh restart, relaunch, config restart, branch) derives its
+    // `yolo` from it instead of relaunching in bypass. A posture already saved
+    // (a respawn, or a disconnected save) is kept by the spread above.
+    ...spawnPermissionStamp(pinnedPermissionMode, initialPermissionMode),
   }));
   let currentFallbackModel: string | undefined = undefined; // Track current fallback model
   let currentCustomSystemPrompt: string | undefined = undefined; // Track current custom system prompt
@@ -924,6 +981,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         modelBefore,
         warn: msg => logger.warn(msg),
       });
+      if (method === "sdk") rereadAppliedEffort();
 
       // Issue #3769 (R6): diagnostics — the path taken, the payload received, the
       // model before/after, and the method the fold used (an in-session "Default"
@@ -1042,6 +1100,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         modelBefore,
         warn: msg => logger.warn(msg),
       });
+      if (method === "sdk") rereadAppliedEffort();
 
       // Issue #3769 (R6): diagnostics for the set-model path.
       logger.info(

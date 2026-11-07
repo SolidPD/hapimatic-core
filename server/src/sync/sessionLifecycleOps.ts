@@ -33,8 +33,10 @@ import {
   isEffortLevel,
   refitNodeDefaultEffort,
   resolveModelEffortLevels,
+  respawnYoloFromPosture,
 } from "@hapi/protocol";
 import type {
+  ApiKeyPlacementRefusal,
   ModelEffortLevelsResolver,
   SpawnSessionOptions,
 } from "./syncEngine";
@@ -147,6 +149,10 @@ export interface SessionLifecycleOpsDeps {
    * levels are sent and the CLI re-fits from its static catalog.
    */
   getModelEffortLevelsResolver?: () => ModelEffortLevelsResolver | null;
+  /** Issue #5819: the SyncEngine's placement re-check, run before the teardown. */
+  apiKeyPlacementRefusal: (
+    session: Session
+  ) => Promise<ApiKeyPlacementRefusal | null>;
 }
 
 export class SessionLifecycleOps {
@@ -157,6 +163,7 @@ export class SessionLifecycleOps {
   private readonly spawnSession: SpawnSessionFn;
   private readonly markRespawning?: (sessionId: string) => void;
   private readonly getModelEffortLevelsResolver: () => ModelEffortLevelsResolver | null;
+  private readonly apiKeyPlacementRefusal: SessionLifecycleOpsDeps["apiKeyPlacementRefusal"];
 
   constructor(deps: SessionLifecycleOpsDeps) {
     this.sessionCache = deps.sessionCache;
@@ -167,6 +174,7 @@ export class SessionLifecycleOps {
     this.markRespawning = deps.markRespawning;
     this.getModelEffortLevelsResolver =
       deps.getModelEffortLevelsResolver ?? (() => null);
+    this.apiKeyPlacementRefusal = deps.apiKeyPlacementRefusal;
   }
 
   /**
@@ -665,6 +673,13 @@ export class SessionLifecycleOps {
     if ((session.metadata?.flavor ?? "claude") !== "claude") {
       return { type: "error", message: "Model restart is Claude-only" };
     }
+    // Issue #5819: refuse a cross-node placement whose key was unshared BEFORE
+    // the teardown below, so the running session keeps running. (Key sessions
+    // run on the SDK launcher, which never reaches this restart; defence in depth.)
+    const placementRefusal = await this.apiKeyPlacementRefusal(session);
+    if (placementRefusal) {
+      return { type: "error", message: placementRefusal.message };
+    }
     const agent = "claude" as const;
     const sessionName = session.metadata?.name;
 
@@ -700,7 +715,9 @@ export class SessionLifecycleOps {
       machineId,
       directory: cwd,
       agent,
-      yolo: true,
+      // Issue #6218 (absorbs #5353 R2): respawn in the saved posture, exactly as
+      // buildRespawnBase does (absent → the legacy bypass respawn).
+      yolo: respawnYoloFromPosture(session.metadata?.permissionMode),
       claimPort: true,
       resumeSessionId: claudeSessionId ?? undefined,
       hapiSessionId: sessionTag,
@@ -711,6 +728,8 @@ export class SessionLifecycleOps {
       // (mirrors buildRespawnBase — this list is the inline holdout).
       apiKeyId: session.metadata?.apiKeyId,
       apiKeyMasked: session.metadata?.apiKeyMasked,
+      // Issue #5819: the cross-node placement marker (re-checked at spawn).
+      apiKeyPlacedBy: session.metadata?.apiKeyPlacedBy,
       // Issue #1633: preserve Safe Mode across the restart.
       safeMode: session.metadata?.safeMode === true,
       // Issue #1660: preserve the per-session launcher across the respawn

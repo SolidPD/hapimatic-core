@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Session } from "@hapi/protocol/types";
+import { respawnYoloFromPosture } from "@hapi/protocol";
 import type { SpawnSessionOptions } from "./syncEngine";
 
 /**
@@ -44,7 +45,14 @@ export function buildRespawnBase(
     machineId: args.machineId,
     directory: args.directory,
     agent: "claude",
-    yolo: true,
+    // Issue #6218 (absorbs #5353 R1): respawn in the session's SAVED posture —
+    // YOLO only when it was saved in a bypass mode; otherwise no `--yolo`, and the
+    // CLI restores the saved mode itself (metadata pin > spawn seed). An absent
+    // posture (a session recorded before the spawn-time stamp) keeps the legacy
+    // bypass respawn. Covers every builder spreading this base: the four
+    // accountRestart paths (incl. the automatic token-refresh restart) and
+    // SessionRelaunch.
+    yolo: respawnYoloFromPosture(session.metadata?.permissionMode),
     claimPort: true,
     resumeSessionId: args.claudeSessionId ?? undefined,
     hapiSessionId: args.sessionTag,
@@ -57,6 +65,9 @@ export function buildRespawnBase(
     // An account switch overrides `accountUuid` and clears these two itself.
     apiKeyId: session.metadata?.apiKeyId,
     apiKeyMasked: session.metadata?.apiKeyMasked,
+    // Issue #5819: the cross-node placement marker rides every respawn, so the
+    // spawn choke point re-checks the key is still shared.
+    apiKeyPlacedBy: session.metadata?.apiKeyPlacedBy,
     // Issue #1633: preserve Safe Mode across the respawn.
     safeMode: session.metadata?.safeMode === true,
     // Issue #1660: preserve the per-session launcher (resolved kind frozen at

@@ -55,16 +55,21 @@
  * defense-in-depth (mirrors `safeOpenEnrich`).
  *
  * **Cost (R-perf).** The transcript is read ONLY when ≥1 non-`complete` row
- * exists on this node, so a non-PM finalize pays a single indexed SELECT
- * (`idx_pm_roster_status`) and nothing else.
+ * exists on this node that the finalizing session may complete, so a non-PM
+ * finalize pays a single indexed SELECT (`idx_pm_roster_status`) and nothing
+ * else. The read is a chunked forward scan, never a whole-file string (#6264):
+ * finalize runs on the server's only event loop, and a weeks-old PM transcript
+ * runs to hundreds of MB.
  */
-
-import { readFileSync } from "node:fs";
 
 import type { PmSpawnRosterRecord } from "@hapi/protocol";
 
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { PmRosterStore } from "../store/turns/pmRosterStore";
+import {
+  findNeedlesInFile,
+  isMissingFileError,
+} from "./transcript/transcriptReader";
 import type { FinalizeStep, FinalizeStepContext } from "./turnLifecycle";
 
 /**
@@ -96,27 +101,20 @@ export function createPmReconcileStep(
 ): FinalizeStep {
   return (ctx: FinalizeStepContext) => {
     try {
-      const rows = pmRoster.getReconcilable();
+      // A token hit is necessary but NOT sufficient (#2074): keep only the rows
+      // this session may complete, BEFORE reading (#6264) — a PM whose rows all
+      // carry their peers' ids then never reads its own long transcript.
+      const rows = pmRoster
+        .getReconcilable()
+        .filter(row => finalizingSessionMayComplete(row, ctx));
       // Common case for non-PM sessions: nothing to reconcile — skip the read.
       if (rows.length === 0) return {};
 
-      const transcript = readTranscriptText(ctx);
-      if (transcript === null) return {}; // no readable transcript — fail-open no-op
+      const emitted = findEmittedTokens(ctx, rows);
+      if (emitted === null) return {}; // no readable transcript — fail-open no-op
 
       for (const row of rows) {
-        // Echo-proof match (#2173): require the token in its wrapped emission
-        // form (PM_COMPLETION_TOKEN_PREFIX + token), NOT a bare substring — a bare
-        // token mention (a PM echoing a peer's token into its own status output)
-        // must NOT count as a genuine emission. The prefix + token is JSON-safe, so
-        // a raw substring match still needs no escaping.
-        if (
-          !transcript.includes(PM_COMPLETION_TOKEN_PREFIX + row.completionToken)
-        ) {
-          continue;
-        }
-        // A token hit is necessary but NOT sufficient (#2074).
-        if (!finalizingSessionMayComplete(row, ctx)) continue;
-
+        if (!emitted.has(row.completionToken)) continue;
         pmRoster.setStatus({
           completionToken: row.completionToken,
           status: "complete",
@@ -170,18 +168,35 @@ function finalizingSessionMayComplete(
 }
 
 /**
- * Read the just-finalized session's transcript as raw text (mirrors V1's
- * `grep -F` over the whole file — the closer's token may be emitted in any turn).
+ * The completion tokens of `rows` that the just-finalized session's transcript
+ * holds in their wrapped emission form (mirrors V1's `grep -F` over the whole
+ * file — the closer's token may be emitted in any turn).
+ *
+ * Echo-proof match (#2173): the needle is `PM_COMPLETION_TOKEN_PREFIX + token`,
+ * NOT the bare token — a bare mention (a PM echoing a peer's token into its own
+ * status output) must NOT count as a genuine emission. The prefix + token is
+ * JSON-safe, so a raw byte match needs no escaping.
+ *
  * Trusts the finalize event's `transcriptPath`, which the CLI turn reporter
  * already resolved against the correct (account-isolation-aware) config dir at
- * turn-open. Returns `null` on a missing path or read failure (fail-open).
+ * turn-open. Returns `null` on a missing path or file (fail-open). Any other
+ * read error is rethrown, so the step's catch logs it (#6264) — it still never
+ * aborts finalize.
  */
-function readTranscriptText(ctx: FinalizeStepContext): string | null {
+function findEmittedTokens(
+  ctx: FinalizeStepContext,
+  rows: PmSpawnRosterRecord[]
+): Set<string> | null {
   const main = ctx.event.transcriptPath;
   if (!main) return null;
+  const needles = rows.map(row =>
+    Buffer.from(PM_COMPLETION_TOKEN_PREFIX + row.completionToken)
+  );
   try {
-    return readFileSync(main, "utf-8");
-  } catch {
-    return null;
+    const found = findNeedlesInFile(main, needles);
+    return new Set([...found].map(i => rows[i].completionToken));
+  } catch (error) {
+    if (isMissingFileError(error)) return null;
+    throw error;
   }
 }

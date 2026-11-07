@@ -6,10 +6,11 @@ you can do here — **plus** the Hapimatic-native capabilities below. Your job i
 _describe_ these when asked, but to **infer and execute** them from a user's plain-language request,
 without the user naming the mechanism.
 
-> **Is this doc current?** `hapimatic-version` above is the Hapimatic release this node was last
-> provisioned/reconciled at. If it looks far behind the running server (`hapi api version`, or
-> `curl -s localhost:3008/api/version`), treat this doc as possibly stale and prefer live checks.
-> Stale self-knowledge is worse than none — say so rather than assert confidently.
+> **Version.** `hapimatic-version` above is the release this doc describes. The Hapimatic server
+> rewrites this doc, and the documentation below, from its own binary every time it starts. Answer
+> questions about Hapimatic from them, directly and completely. When an answer turns on live state
+> (the running version via `hapi api version`, a setting, a file, what a capability does now via
+> `GET /api/capabilities/catalog`), check it, then answer definitively from the result.
 
 ## Guaranteed MCP tool guardrails
 
@@ -36,6 +37,13 @@ Stock `claude` is a local terminal REPL. On a Hapimatic node you additionally ha
 - **Session spawning & orchestration** — spawn independent peer Claude Code sessions (see below).
 - **File uploads** — files the user attaches in the UI land on the filesystem under
   `UserFileUploads/` in the session's working directory; read them directly.
+- **Generated files** — always write a file you generate under `GeneratedFiles/` in the session's
+  working directory unless the user, a skill or the project's layout says where it goes, because the
+  user looks in the Files tab. In a Git repo, commit and push them, asking first for a public repo or a
+  file over 100 MiB. A file holding a secret (a password, token, API key, private key or other
+  credential, `.env` included) stays out of every commit unless the user explicitly asks for it to be
+  committed: keep it on disk and say you left it uncommitted, because a pushed secret stays in history
+  and has to be replaced.
 - **A persistent server + preferences** — Hapimatic runs as a long-lived service (systemd), so
   sessions and settings persist across page reloads and reconnects. User-facing preferences live in
   the web UI's settings.
@@ -69,14 +77,23 @@ Judgment when you use them:
 
 ## Where things live
 
-| Thing                          | Location                                                                                                                   |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| Hapimatic binary               | `~/.local/bin/hapimatic-private`; `hapi` = `~/.local/bin/hapi`, rp1-home `bin/hapi` shim (byte-identical, rp1-home#2332)   |
-| Instance data & settings       | `~/.hapimatic-private/` (`settings.json`, session state, DB)                                                               |
-| Claude config (incl. this doc) | `~/.claude/` — this file is `~/.claude/agent-self-knowledge.md`, loaded via a managed `@`-include in `~/.claude/CLAUDE.md` |
-| Uploaded files                 | `UserFileUploads/` under the session's working directory                                                                   |
-| Web UI / API                   | the node's Hapimatic URL → Caddy → server on `localhost:3008`                                                              |
-| Service management             | `systemctl --user status hapimatic-private hapimatic-private-daemon`                                                       |
+- **Documentation**: the `docs/` folder of the Hapimatic data directory, `~/.hapimatic-private/docs/`
+  on a cloud VM: the user guide and public docs for this version (start at `README.md`), the same
+  pages as `https://hapimatic.com/docs/`. Your session instructions name the exact folder and the
+  version it matches. For how Hapimatic works in code, read the source of this version in
+  `https://github.com/SolidPD/hapimatic-core`, at tag `v__HAPIMATIC_VERSION__`. Only published
+  releases are tagged: if that tag does not exist, this is a development build, so read the
+  default branch instead.
+- **Hapimatic binary**: `~/.local/bin/hapimatic-private`; `hapi` is `~/.local/bin/hapi`.
+- **Instance data and settings**: `~/.hapimatic-private/` (`settings.json`, session state, DB).
+  When someone needs the access token, say where it is (`cliApiToken` in the data directory's
+  `settings.json`) and do not print the value unless the user has explicitly asked to be shown it.
+- **Claude config (incl. this doc)**: `~/.claude/`; this file is `~/.claude/agent-self-knowledge.md`,
+  loaded via a managed `@`-include in `~/.claude/CLAUDE.md`.
+- **Uploaded files**: `UserFileUploads/` under the session's working directory.
+- **Generated files**: `GeneratedFiles/` under the session's working directory.
+- **Web UI and API**: the node's Hapimatic URL → Caddy → server on `localhost:3008`.
+- **Service management**: `systemctl --user status hapimatic-private hapimatic-private-daemon`.
 
 ## Third-party software (SBOM)
 
@@ -85,10 +102,10 @@ runtime. Its software bill of materials (every package, version, and license) is
 `https://hapimatic.com/docs/sbom`. Always answer dependency or license questions from it, because
 it is regenerated on every dependency change.
 
-## Update model (and why staleness matters)
+## Updates
 
-The Hapimatic binary and this self-knowledge doc are **pushed to this node from the provisioning
-host** — the node does not pull its own updates by default. New versions arrive when the node is
-re-provisioned or reconciled (`scripts/provision.sh` / `scripts/reconcile-vm.sh`). Each push
-re-stamps `hapimatic-version` above. If that stamp trails the running server version, this doc may
-describe an older Hapimatic — flag the mismatch instead of asserting confidently.
+A cloud VM checks for a newer Hapimatic release four times a day, and the app checks for a newer
+version of itself every hour. When an update is waiting, a red number appears on the settings gear;
+the user installs it from the update banner at the top of Settings, which downloads it and asks to
+confirm before restarting anything. The operator can also install a release on the VM. When the
+server restarts on the new version, it rewrites this doc and the documentation for that version.

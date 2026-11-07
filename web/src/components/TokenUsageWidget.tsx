@@ -26,6 +26,7 @@ import type { BackgroundAgentUsage } from "@hapi/protocol/schemas";
 import { useAppContext } from "@/lib/app-context";
 import { useSessionTokenStats } from "@/hooks/queries/useSessionTokenStats";
 import { BackgroundAgentsModal } from "@/components/BackgroundAgentsModal";
+import { ContextBreakdownModal } from "@/components/ContextBreakdownModal";
 
 /** Stacked bar segment descriptor. */
 type Segment = {
@@ -710,6 +711,10 @@ function findFlexRow(
  * row opens `BackgroundAgentsModal` straight into that agent's peek. Without a
  * `sessionId` it renders what it is given (`backgroundAgentUsage` /
  * `onOpenBackgroundAgent` props).
+ *
+ * Issue #6170: with a `sessionId`, the expanded header also carries a
+ * "Breakdown" button that opens `ContextBreakdownModal` (what the context holds,
+ * section by section).
  */
 export function TokenUsageSection(
   props: ComponentProps<typeof TokenUsageSectionView> & { sessionId?: string }
@@ -729,6 +734,7 @@ function TokenUsageSectionWithAgents({
   const { api } = useAppContext();
   const { data } = useSessionTokenStats(api, sessionId);
   const [peekAgentId, setPeekAgentId] = useState<string | null>(null);
+  const [breakdownOpen, setBreakdownOpen] = useState(false);
   return (
     <>
       <TokenUsageSectionView
@@ -739,6 +745,7 @@ function TokenUsageSectionWithAgents({
           rest.isServerSourced ? data?.backgroundAgentUsage : undefined
         }
         onOpenBackgroundAgent={setPeekAgentId}
+        onOpenContextBreakdown={() => setBreakdownOpen(true)}
       />
       {/* Mounted only while open, so a closed modal never runs its reads. */}
       {peekAgentId !== null && (
@@ -749,6 +756,15 @@ function TokenUsageSectionWithAgents({
             if (!open) setPeekAgentId(null);
           }}
           initialAgentId={peekAgentId}
+        />
+      )}
+      {breakdownOpen && (
+        <ContextBreakdownModal
+          sessionId={sessionId}
+          open
+          onOpenChange={open => {
+            if (!open) setBreakdownOpen(false);
+          }}
         />
       )}
     </>
@@ -773,6 +789,7 @@ function TokenUsageSectionView({
   onOpenBackgroundAgent,
   backgroundAgentsCollapsed,
   onBackgroundAgentsCollapseChange,
+  onOpenContextBreakdown,
 }: {
   stats: SessionTokenStats;
   /** Issue #4824: the server's split of `serverCost` by each turn's recorded
@@ -815,6 +832,8 @@ function TokenUsageSectionView({
    *  devices and nodes like the widget's own +/- state. Absent → uncontrolled. */
   backgroundAgentsCollapsed?: boolean;
   onBackgroundAgentsCollapseChange?: (collapsed: boolean) => void;
+  /** Issue #6170: open the context breakdown modal. Absent → no entry point. */
+  onOpenContextBreakdown?: () => void;
 }) {
   const [isExpanded, setIsExpanded] = useState(!initialCollapsed);
   const toggleExpanded = useCallback(() => {
@@ -1060,6 +1079,22 @@ function TokenUsageSectionView({
           ) : null}
           {headingApiValue}
         </Button>
+        {/* Issue #6170: a sibling of the toggle (never inside it — no nested
+            buttons), and only in the expanded state so the collapsed heading's
+            measured fit in the merged dock row is unchanged. */}
+        {onOpenContextBreakdown ? (
+          <Button
+            type="button"
+            variant="ghostStatic"
+            size="dense"
+            onClick={onOpenContextBreakdown}
+            aria-label="Open context breakdown"
+            data-testid="context-breakdown-open"
+            className="shrink-0 hover:text-[var(--app-fg)]"
+          >
+            Breakdown
+          </Button>
+        ) : null}
       </div>
 
       {/* Widget body */}

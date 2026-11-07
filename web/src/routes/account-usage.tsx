@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { pickUseFirstKeyId } from "@/lib/apiKeyBudget";
 import {
   RefreshCw,
   ChevronsDownUp,
@@ -57,6 +58,7 @@ import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { ApiKeyCard } from "@/components/AccountUsage/ApiKeyCard";
 import { OtherWaysToAddPopover } from "@/components/AccountUsage/OtherWaysToAddPopover";
 import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
+import { readPendingSignIn } from "@/components/AccountUsage/pendingSignIn";
 import {
   buildAccountNodeItems,
   type AccountNodeItem,
@@ -341,6 +343,11 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
     );
     return { anthropic, openai, gemini };
   }, [apiKeys]);
+  // API key budgets: the Anthropic key whose credit is most at risk of expiring.
+  const anthropicUseFirstId = useMemo(
+    () => pickUseFirstKeyId(keysByProvider.anthropic, Date.now()),
+    [keysByProvider]
+  );
   const uiHost = useMemo(
     () => ({
       nodeId: currentNodeId,
@@ -522,7 +529,11 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
     null
   );
   // #4466 R2: the provider whose "+ Add" pill was tapped (null = closed).
-  const [addProvider, setAddProvider] = useState<ProviderId | null>(null);
+  // #6211: a phone often reloads the PWA while the sign-in page is open, so a
+  // pending sign-in reopens its modal here, with the link and the place kept.
+  const [addProvider, setAddProvider] = useState<ProviderId | null>(() =>
+    readPendingSignIn() ? "anthropic" : null
+  );
 
   const [refreshing, setRefreshing] = useState(false);
   const doRefresh = useCallback(async () => {
@@ -1017,6 +1028,7 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
               keys: keysByProvider.anthropic.length,
             }}
             onAdd={() => setAddProvider("anthropic")}
+            addGuide="connect-model"
             footer={<OtherWaysToAddPopover provider="anthropic" />}
             usageView={usageViews.viewFor("anthropic")}
             onUsageViewChange={
@@ -1155,6 +1167,7 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
                     api={api}
                     localNode={uiHost}
                     defaultExpanded={allExpanded}
+                    useFirst={key.id === anthropicUseFirstId}
                   />
                 ))}
               </div>

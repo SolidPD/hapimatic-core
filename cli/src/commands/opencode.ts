@@ -30,12 +30,22 @@ export const opencodeCommand: CommandDefinition = {
         await import("@/agent/runners/opencode");
       const { runAgentSession } =
         await import("@/agent/runners/runAgentSession");
+      const { opencodeSpawnPosture } =
+        await import("@/agent/runners/spawnPostureStamp");
       registerOpenCodeAgent();
 
       await initializeToken();
       await maybeAutoStartServer();
       await authAndSetupMachineIfNeeded();
-      await runAgentSession({ agentType: "opencode", startedBy });
+      // #6218: the posture lives in the daemon's OPENCODE_CONFIG_CONTENT; record
+      // it so a respawn does not relaunch in YOLO.
+      await runAgentSession({
+        agentType: "opencode",
+        startedBy,
+        permissionMode: opencodeSpawnPosture(
+          process.env.OPENCODE_CONFIG_CONTENT
+        ),
+      });
     } catch (error) {
       console.error(
         chalk.red("Error:"),

@@ -322,7 +322,11 @@ export async function runBulkDelete(params: {
   }
 
   if (localIds.length > 0) {
-    const local = await engine.deleteSessions(localIds, namespace);
+    // #6210: answer once the records are gone; the tmux + worktree cleanup
+    // RPCs finish in the background instead of holding this response.
+    const local = await engine.deleteSessions(localIds, namespace, {
+      detachCleanup: true,
+    });
     for (const id of local.deleted) byId.set(id, { id, ok: true });
     for (const id of local.skipped) {
       // Every id here passed the namespace and active checks, so a skip is a
@@ -369,4 +373,46 @@ export async function runBulkDelete(params: {
         error: "Session was not processed",
       }
   );
+}
+
+/** Most per-session samples one bulk-failure log entry carries. */
+export const BULK_FAILURE_SAMPLE_LIMIT = 20;
+
+export type BulkFailureSummary = {
+  failed: number;
+  byReason: Record<string, number>;
+  samples: Array<{ id: string; code?: string; error?: string }>;
+};
+
+/**
+ * #6210: one summary of the sessions a bulk action did NOT act on, for a single
+ * `error_logs` entry per request — per-session refusals were never logged, so
+ * the reasons a bulk delete left sessions behind had no record. The reason key
+ * is the result `code`, else `error: ` plus the first 80 characters of the
+ * message. Results whose `code` is in `ignoreCodes` (an expected, harmless
+ * outcome for that action) are not counted. Returns null when nothing is left.
+ */
+export function summarizeBulkFailures(
+  results: BulkSessionResult,
+  ignoreCodes: readonly string[] = []
+): BulkFailureSummary | null {
+  const byReason: Record<string, number> = {};
+  const samples: BulkFailureSummary["samples"] = [];
+  let failed = 0;
+  for (const r of results) {
+    if (r.ok || (r.code !== undefined && ignoreCodes.includes(r.code))) {
+      continue;
+    }
+    failed += 1;
+    const reason = r.code ?? `error: ${(r.error ?? "unknown").slice(0, 80)}`;
+    byReason[reason] = (byReason[reason] ?? 0) + 1;
+    if (samples.length < BULK_FAILURE_SAMPLE_LIMIT) {
+      samples.push({
+        id: r.id,
+        ...(r.code ? { code: r.code } : {}),
+        ...(r.error ? { error: r.error } : {}),
+      });
+    }
+  }
+  return failed === 0 ? null : { failed, byReason, samples };
 }

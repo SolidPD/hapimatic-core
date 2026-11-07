@@ -25,11 +25,15 @@ function errorText(err: unknown): string | null {
  *                          to SSE events for keeping session.thinking state fresh.
  *                          This prevents the timer from stopping prematurely when
  *                          SSE events are delayed or missed.
+ * @param options.enabled - When false, the hook only reads and follows the
+ *                          cached session: it never fetches or polls (#6190,
+ *                          mirroring `useMessages`' `enabled`, #1083). Default true.
  */
 export function useSession(
   api: ApiClient | null,
   sessionId: string | null,
-  isActiveSession: boolean = false
+  isActiveSession: boolean = false,
+  options?: { enabled?: boolean }
 ): {
   session: Session | null;
   messageCount: number;
@@ -72,7 +76,7 @@ export function useSession(
       }
       return await api.getSession(sessionId);
     },
-    enabled: Boolean(api && sessionId),
+    enabled: Boolean(api && sessionId) && (options?.enabled ?? true),
     refetchInterval: isActiveSession ? 5_000 : false,
     // Reduce stale time for active sessions to ensure fresher data
     staleTime: isActiveSession ? 2_000 : undefined,

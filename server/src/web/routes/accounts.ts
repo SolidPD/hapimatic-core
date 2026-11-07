@@ -346,9 +346,13 @@ export function createAccountsRoutes(opts: {
         // record — so the store can be empty while spawning works via the env-token
         // fallback. Surface that so the create form can display the real default
         // ("Instance credential") instead of a confusing empty field.
-        const envCredentialPresent = Boolean(
-          process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY
-        );
+        // #6211 (#5354 R5): the daemon scrubs that env on a tenant VM, so a value
+        // left in the server's env is not a credential any session can use there.
+        const envCredentialPresent =
+          !opts.getLoginService?.()?.inVmSignInRequired() &&
+          Boolean(
+            process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY
+          );
         // Epic #3285 correction pass 1: surface the operator-set nickname (the
         // NicknameStore from epic #1855, already read by /accounts/usage) on each
         // redacted account, so the Account Chip can render "Work" / "Mose" instead
@@ -1131,7 +1135,7 @@ export function createAccountsRoutes(opts: {
         return c.json(
           {
             error:
-              "On this VM, sign in with Claude Code's own /login — Hapimatic never handles the sign-in.",
+              "On this VM, the account signs in through the unmodified Claude Code on the VM.",
             code: IN_VM_SIGN_IN_REQUIRED,
           },
           409
@@ -1278,7 +1282,7 @@ export function createAccountsRoutes(opts: {
         domain: "accounts",
         surface: "rest",
         description:
-          "On a tenant VM, create an empty per-account Claude config dir (or resume the caller's unfinished one) and return the command to run claude there and sign in with /login.",
+          "On a tenant VM, start or resume a Claude sign-in: create a per-account config dir, start the unmodified binary there, and return its sign-in page plus a terminal command.",
         whenToUse:
           "When a user adds a Claude account on a tenant VM (the web OAuth login answers in_vm_sign_in_required).",
         invocation: {
@@ -1293,7 +1297,7 @@ export function createAccountsRoutes(opts: {
       })
     ),
     loginLimiter,
-    c => {
+    async c => {
       const login = opts.getLoginService?.();
       if (!login) {
         return c.json({ error: "Account login service unavailable" }, 503);
@@ -1308,7 +1312,7 @@ export function createAccountsRoutes(opts: {
         );
       }
       try {
-        return c.json(login.startInVm(c.get("namespace") ?? ""));
+        return c.json(await login.startInVm(c.get("namespace") ?? ""));
       } catch (error) {
         return logAndJson(c, error, 500, {
           errorLogger,
@@ -1356,7 +1360,10 @@ export function createAccountsRoutes(opts: {
           400
         );
       }
-      const result = login.completeInVm(body?.loginToken ?? "");
+      const result = login.completeInVm(
+        body?.loginToken ?? "",
+        c.get("namespace") ?? ""
+      );
       if (result.ok) {
         void opts
           .getUsageService?.()
@@ -1370,7 +1377,9 @@ export function createAccountsRoutes(opts: {
           ? 202
           : result.code === "already_added"
             ? 409
-            : 400;
+            : result.code === "exchange_failed"
+              ? 422
+              : 400;
       return c.json(
         { ok: false, error: result.error, code: result.code },
         status
@@ -1386,7 +1395,7 @@ export function createAccountsRoutes(opts: {
         domain: "accounts",
         surface: "rest",
         description:
-          "Abandon a started in-VM sign-in; removes its config dir only while it is still empty, never a credential.",
+          "Abandon a started in-VM sign-in; ends its claude child and removes its config dir, or registers the account when the sign-in had already finished and answers with it.",
         whenToUse:
           "When the user starts the in-VM sign-in over; closing the dialog keeps the sign-in so a reopened dialog resumes it.",
         invocation: {
@@ -1408,8 +1417,20 @@ export function createAccountsRoutes(opts: {
       const body = (await c.req.json().catch(() => null)) as {
         loginToken?: unknown;
       } | null;
-      if (typeof body?.loginToken === "string")
-        login.cancelInVm(body.loginToken);
+      const finished =
+        typeof body?.loginToken === "string"
+          ? await login.cancelInVm(body.loginToken, c.get("namespace") ?? "")
+          : null;
+      if (finished?.ok) {
+        void opts
+          .getUsageService?.()
+          ?.refresh()
+          .catch(() => undefined);
+        return c.json({ ok: true, account: finished.account });
+      }
+      if (finished?.code === "already_added") {
+        return c.json({ ok: true, alreadyConnected: finished.error });
+      }
       return c.json({ ok: true });
     }
   );

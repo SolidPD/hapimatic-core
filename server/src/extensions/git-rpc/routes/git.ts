@@ -20,10 +20,24 @@ import {
   logAndJson,
   proxyTransportFailure,
 } from "../../../web/routes/routeErrorHelper";
+import {
+  checkPathContainment,
+  rejectWorkingDirRoot,
+} from "../../../web/routes/sessionPathGuards";
+import {
+  buildFileSearchArgs,
+  parseFileSearchOutput,
+  parseHiddenParam,
+} from "../fileSearchArgs";
 
 const fileSearchSchema = z.object({
   query: z.string().optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
+  // #6224: include hidden (non-ignored) files when the Files tab shows them.
+  hidden: z
+    .string()
+    .optional()
+    .transform(value => parseHiddenParam(value)),
 });
 
 const filePathSchema = z.object({
@@ -55,49 +69,10 @@ function parseBooleanParam(value: string | undefined): boolean | undefined {
   return undefined;
 }
 
-// H-5 (issue #1281 / SEC-1) shared by the read, write, git-diff, and directory
-// routes (issue #2518): reject absolute paths + enforce string-level containment
-// within the session cwd BEFORE the RPC. This is a cheap server-side pre-filter;
-// the authoritative symlink-hardened check runs CLI-side in validatePath, where
-// the file actually lives (the server cannot realpath a remote session's fs).
-async function checkPathContainment(
-  sessionPath: string,
-  relPath: string
-): Promise<{ error: string; status: 400 | 403 } | null> {
-  const { resolve, sep, isAbsolute } = await import("node:path");
-  if (isAbsolute(relPath)) {
-    return { error: "Absolute paths not allowed", status: 400 };
-  }
-  const resolvedCwd = resolve(sessionPath);
-  const resolvedPath = resolve(resolvedCwd, relPath);
-  if (
-    resolvedPath !== resolvedCwd &&
-    !resolvedPath.startsWith(resolvedCwd + sep)
-  ) {
-    return { error: "Path escapes session working directory", status: 403 };
-  }
-  return null;
-}
-
-// issue #2715 (sweep finding 2715-1): the mutating ops (create-folder / rename /
-// delete) must ALSO reject the session-cwd ROOT itself. checkPathContainment
-// PERMITS target == cwd by design (correct for read/list/write — GET /directory
-// defaults to "."), but a recursive delete of "." would wipe the whole
-// workspace. This is a pure resolve() string check (no realpath), so it is
-// valid for a remote session too. Applied ONLY on the mutating routes.
-async function rejectWorkingDirRoot(
-  sessionPath: string,
-  relPath: string
-): Promise<{ error: string; status: 403 } | null> {
-  const { resolve } = await import("node:path");
-  if (resolve(sessionPath, relPath) === resolve(sessionPath)) {
-    return {
-      error: "Cannot target the session working directory root",
-      status: 403,
-    };
-  }
-  return null;
-}
+// #6224: the path pre-filters (checkPathContainment, rejectWorkingDirRoot) live in
+// web/routes/sessionPathGuards, shared with the federation receivers. They are
+// cheap string checks; the authoritative symlink-hardened guard runs CLI-side in
+// validatePath, where the file lives.
 
 async function runRpc<T>(
   fn: () => Promise<T>
@@ -126,7 +101,10 @@ async function federationGetProxy(
   log: { errorLogger: ErrorLogger | null; nodeId: string },
   queryParams?: Record<string, string | undefined>
 ): Promise<Response> {
-  const headers: Record<string, string> = {};
+  // #6224 (#1097): the receiver re-asserts the caller's namespace.
+  const headers: Record<string, string> = {
+    "X-Hapi-Caller-Namespace": c.get("namespace"),
+  };
   if (federationApiToken) {
     headers["Authorization"] = `Bearer ${federationApiToken}`;
   }
@@ -181,6 +159,8 @@ async function federationBodyProxy(
 ): Promise<Response> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    // #6224 (#1097): the receiver re-asserts the caller's namespace.
+    "X-Hapi-Caller-Namespace": c.get("namespace"),
   };
   if (federationApiToken) {
     headers["Authorization"] = `Bearer ${federationApiToken}`;
@@ -466,10 +446,7 @@ export function createGitRoutes(
           return c.json({ error: "Invalid file path" }, 400);
         }
 
-        const guardError = await checkPathContainment(
-          sessionPath,
-          parsed.data.path
-        );
+        const guardError = checkPathContainment(sessionPath, parsed.data.path);
         if (guardError) {
           return c.json({ error: guardError.error }, guardError.status);
         }
@@ -548,10 +525,7 @@ export function createGitRoutes(
           return c.json({ error: "Invalid file path" }, 400);
         }
 
-        const guardError = await checkPathContainment(
-          sessionPath,
-          parsed.data.path
-        );
+        const guardError = checkPathContainment(sessionPath, parsed.data.path);
         if (guardError) {
           return c.json({ error: guardError.error }, guardError.status);
         }
@@ -626,10 +600,9 @@ export function createGitRoutes(
 
         const query = parsed.data.query?.trim() ?? "";
         const limit = parsed.data.limit ?? 200;
-        const args = ["--files"];
-        if (query) {
-          args.push("--iglob", `*${query}*`);
-        }
+        // #6224: glob metacharacters are escaped, and hidden files are added on
+        // request (never `.git` or Git-ignored paths).
+        const args = buildFileSearchArgs({ query, hidden: parsed.data.hidden });
 
         const result = await runRpc(() =>
           engine.runRipgrep(sessionResult.sessionId, args, sessionPath)
@@ -641,25 +614,7 @@ export function createGitRoutes(
           });
         }
 
-        const stdout = result.stdout ?? "";
-        const files = stdout
-          .split("\n")
-          .map(line => line.trim())
-          .filter(line => line.length > 0)
-          .slice(0, limit)
-          .map(fullPath => {
-            const parts = fullPath.split("/");
-            const fileName = parts[parts.length - 1] || fullPath;
-            const filePath = parts.slice(0, -1).join("/");
-            return {
-              fileName,
-              filePath,
-              fullPath,
-              fileType: "file" as const,
-            };
-          });
-
-        return c.json({ success: true, files });
+        return c.json(parseFileSearchOutput(result, limit));
       }
 
       // Federation fallback
@@ -674,7 +629,11 @@ export function createGitRoutes(
             `/api/federation/sessions/${encodeURIComponent(sessionId)}/files`,
             options?.federationApiToken,
             { errorLogger, nodeId: node.nodeId },
-            { query: c.req.query("query"), limit: c.req.query("limit") }
+            {
+              query: c.req.query("query"),
+              limit: c.req.query("limit"),
+              hidden: c.req.query("hidden"),
+            }
           );
         }
       }
@@ -726,10 +685,7 @@ export function createGitRoutes(
           return c.json({ error: "Invalid request body" }, 400);
         }
 
-        const guardError = await checkPathContainment(
-          sessionPath,
-          parsed.data.path
-        );
+        const guardError = checkPathContainment(sessionPath, parsed.data.path);
         if (guardError) {
           return c.json({ error: guardError.error }, guardError.status);
         }
@@ -810,7 +766,7 @@ export function createGitRoutes(
         }
 
         const rawPath = c.req.query("path") ?? ".";
-        const guardError = await checkPathContainment(sessionPath, rawPath);
+        const guardError = checkPathContainment(sessionPath, rawPath);
         if (guardError) {
           return c.json({ error: guardError.error }, guardError.status);
         }
@@ -887,17 +843,11 @@ export function createGitRoutes(
           return c.json({ error: "Invalid request body" }, 400);
         }
 
-        const guardError = await checkPathContainment(
-          sessionPath,
-          parsed.data.path
-        );
+        const guardError = checkPathContainment(sessionPath, parsed.data.path);
         if (guardError) {
           return c.json({ error: guardError.error }, guardError.status);
         }
-        const rootError = await rejectWorkingDirRoot(
-          sessionPath,
-          parsed.data.path
-        );
+        const rootError = rejectWorkingDirRoot(sessionPath, parsed.data.path);
         if (rootError) {
           return c.json({ error: rootError.error }, rootError.status);
         }
@@ -980,11 +930,11 @@ export function createGitRoutes(
         }
 
         for (const p of [parsed.data.path, parsed.data.newPath]) {
-          const guardError = await checkPathContainment(sessionPath, p);
+          const guardError = checkPathContainment(sessionPath, p);
           if (guardError) {
             return c.json({ error: guardError.error }, guardError.status);
           }
-          const rootError = await rejectWorkingDirRoot(sessionPath, p);
+          const rootError = rejectWorkingDirRoot(sessionPath, p);
           if (rootError) {
             return c.json({ error: rootError.error }, rootError.status);
           }
@@ -1066,17 +1016,11 @@ export function createGitRoutes(
           return c.json({ error: "Invalid request body" }, 400);
         }
 
-        const guardError = await checkPathContainment(
-          sessionPath,
-          parsed.data.path
-        );
+        const guardError = checkPathContainment(sessionPath, parsed.data.path);
         if (guardError) {
           return c.json({ error: guardError.error }, guardError.status);
         }
-        const rootError = await rejectWorkingDirRoot(
-          sessionPath,
-          parsed.data.path
-        );
+        const rootError = rejectWorkingDirRoot(sessionPath, parsed.data.path);
         if (rootError) {
           return c.json({ error: rootError.error }, rootError.status);
         }

@@ -21,6 +21,8 @@ type ProviderSectionProps = {
   counts?: { accounts: number; keys: number };
   /** #4466 R2: the header's "+ Add" pill. */
   onAdd?: () => void;
+  /** #6211: the `data-guide` the first-run wizard highlights this Add button by. */
+  addGuide?: string;
   /** #4466 R10: a right-aligned row at the foot of the body. */
   footer?: ReactNode;
   /** #4467: this section's usage view. With BOTH `usageView` and
@@ -85,6 +87,7 @@ export function ProviderSection({
   defaultExpanded = true,
   counts,
   onAdd,
+  addGuide,
   footer,
   usageView,
   onUsageViewChange,
@@ -145,6 +148,7 @@ export function ProviderSection({
               onClick={onAdd}
               aria-label={`Add to ${title}`}
               data-testid={`${testId}-add`}
+              data-guide={addGuide}
               className="h-auto gap-1 rounded-md bg-[color-mix(in_srgb,var(--app-accent)_10%,transparent)] px-2 py-1 text-[length:var(--text-body-dense)] font-semibold text-[var(--app-accent)] hover:opacity-80"
             >
               <PlusIcon className="h-3.5 w-3.5" />

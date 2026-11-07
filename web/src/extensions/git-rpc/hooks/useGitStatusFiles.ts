@@ -18,11 +18,18 @@ export function useGitStatusFiles(
   status: GitStatusFiles | null;
   error: string | null;
   isLoading: boolean;
+  /**
+   * #6222: no fetch is running or paused, so no newer `status` is on the way. It
+   * can still be old: this query does not poll. `isLoading` cannot say this: it is false during a background refetch, while
+   * paused with no network, and when disabled. A disabled query is settled too,
+   * so a caller that disables the query has to account for that.
+   */
+  isSettled: boolean;
   refetch: () => Promise<unknown>;
 } {
   const resolvedSessionId = sessionId ?? "unknown";
   const query = useQuery({
-    queryKey: queryKeys.gitStatus(resolvedSessionId),
+    queryKey: queryKeys.gitStatusFiles(resolvedSessionId),
     queryFn: async () => {
       if (!api || !sessionId) {
         throw new Error("Session unavailable");
@@ -65,6 +72,9 @@ export function useGitStatusFiles(
       return { status, error: errors.length ? errors.join(" ") : null };
     },
     enabled: Boolean(api && sessionId) && (options?.enabled ?? true),
+    // #6224: refetch on every mount, so coming back to the tab inside the 5 s
+    // staleTime never shows Changes greyed over a status that changed since.
+    refetchOnMount: "always",
   });
 
   const queryError =
@@ -78,6 +88,7 @@ export function useGitStatusFiles(
     status: query.data?.status ?? null,
     error: queryError ?? query.data?.error ?? null,
     isLoading: query.isLoading,
+    isSettled: query.fetchStatus === "idle",
     refetch: query.refetch,
   };
 }

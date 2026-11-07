@@ -38,6 +38,8 @@ export function useFeedbackInbox(
   return {
     items: query.data?.items ?? EMPTY_INBOX_ITEMS,
     total: query.data?.total ?? 0,
+    /** Rows on this page that could not be read (#5858 R3). */
+    skipped: query.data?.skipped ?? 0,
     isLoading: query.isLoading,
     isError: query.isError,
     error: query.error,

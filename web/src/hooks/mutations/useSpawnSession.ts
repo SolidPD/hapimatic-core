@@ -5,7 +5,7 @@ import type { ApiClient } from "@/api/client";
 import type { SpawnResponse } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
-import type { ModelMode } from "@hapi/protocol/modes";
+import type { ModelMode, PermissionMode } from "@hapi/protocol/modes";
 import type { EffortLevel } from "@hapi/protocol";
 
 // Exported so the shared spawn-command assembler (NewSession/spawnCommand.ts,
@@ -18,6 +18,10 @@ export type SpawnInput = {
   directory: string;
   agent?: "claude" | "codex" | "gemini" | "opencode";
   yolo?: boolean;
+  /** Issue #6218: the starting permission mode. The Create page sends it for
+   *  every non-YOLO pick, `default` included, so the server never substitutes
+   *  the node default for a deliberate choice. Rides the trailing object. */
+  permissionMode?: PermissionMode;
   /** Issue #1262: opt-in to spawn-time port claim. User-driven spawns
    *  from the create dialog default to `true` so a fresh worktree gets
    *  a port slot reserved (preserving pre-#1262 UX). */
@@ -116,17 +120,21 @@ export function useSpawnSession(api: ApiClient | null): {
 
       // #3818 / #4497: parent link + cut point, as ONE trailing object (T26),
       // forwarded by both the federated and the local branch. #5879: the
-      // account override rides the same object.
+      // account override rides the same object, and #6218 the permission mode.
       const parent =
         input.parentSessionId ||
         input.parentRelationship ||
         input.sourceBranch ||
-        input.forceAccount
+        input.forceAccount ||
+        input.permissionMode
           ? {
               parentSessionId: input.parentSessionId,
               parentRelationship: input.parentRelationship,
               sourceBranch: input.sourceBranch,
               ...(input.forceAccount ? { forceAccount: true } : {}),
+              ...(input.permissionMode
+                ? { permissionMode: input.permissionMode }
+                : {}),
             }
           : undefined;
 

@@ -46,6 +46,7 @@ import {
 import {
   runBulkDelete,
   runBulkSessionAction,
+  summarizeBulkFailures,
   type BulkSessionAction,
 } from "./bulkSessionActions";
 import type { PaymentMethodTarget } from "../../sync/accountRestart";
@@ -743,7 +744,17 @@ export function createSessionsRoutes(
         // 409 (retryable capacity conflict) so the UI ends the spinner and shows an
         // actionable "node full — free a slot" message instead of looping. Parity
         // with the account_unrefreshable (409) and cwd_missing (502) branches above.
-        if (result.code === "at_capacity") {
+        // #6156: a reconnect that falls back to a fresh spawn (no claudeSessionId)
+        // can meet the daemon's memory gate; same retryable-conflict surface.
+        if (
+          result.code === "at_capacity" ||
+          result.code === "insufficient_memory"
+        ) {
+          return c.json({ error: result.message, code: result.code }, 409);
+        }
+        // Issue #5819: a session another node placed here on this node's key,
+        // whose owner has since unshared it — a conflict, not a server fault.
+        if (result.code === "api_key_not_shared") {
           return c.json({ error: result.message, code: result.code }, 409);
         }
 
@@ -765,8 +776,8 @@ export function createSessionsRoutes(
             return c.json({ ok: true, newSessionId: result.newSessionId });
           }
           // Issue #4461 (R6): a forward-compatible branch only. Today the peer's
-          // reconnect receiver answers { ok: true } before its engine runs
-          // (federation/sessionLifecycle.ts), so this code never arrives here and
+          // reconnect receiver runs its engine after it answers, so it never
+          // sends this code synchronously (federation/sessionLifecycle.ts), and
           // a peer-owned session's refusal reaches the browser as the bridged
           // account-unrefreshable SSE event alone. Should a peer ever answer it
           // synchronously, answer 409 with the HUB's identity for that node.
@@ -785,6 +796,12 @@ export function createSessionsRoutes(
               },
               409
             );
+          }
+          // Issue #5819: the owning node refused because the key this session
+          // was placed there with is no longer shared — a conflict, not a bad
+          // gateway, so the client ends the spinner and shows the message.
+          if (result.code === "api_key_not_shared") {
+            return c.json({ error: result.message, code: result.code }, 409);
           }
           // Issue #1778: thread the terminal error code (e.g. "cwd_missing") to
           // the client so the UI can show an actionable message rather than
@@ -846,6 +863,10 @@ export function createSessionsRoutes(
         if (result.type === "success") {
           return c.json({ ok: true, newSessionId: result.newSessionId });
         }
+        // Issue #5819: the key of a cross-node placement is no longer shared.
+        if (result.code === "api_key_not_shared") {
+          return c.json({ error: result.message, code: result.code }, 409);
+        }
 
         return c.json({ error: result.message }, 500);
       }
@@ -864,6 +885,10 @@ export function createSessionsRoutes(
           );
           if (result.type === "success") {
             return c.json({ ok: true, newSessionId: result.newSessionId });
+          }
+          // Issue #5819: the owning node refused a branch on an unshared key.
+          if (result.code === "api_key_not_shared") {
+            return c.json({ error: result.message, code: result.code }, 409);
           }
           return c.json({ error: result.message }, 502);
         }
@@ -2220,6 +2245,18 @@ export function createSessionsRoutes(
         });
       }
 
+      // #6210: record why sessions were left behind (one entry per request).
+      const failures = summarizeBulkFailures(results);
+      if (failures) {
+        errorLogger?.warn(
+          `Bulk delete: ${failures.failed} of ${results.length} session(s) not deleted`,
+          {
+            category: "sessions-bulk-delete",
+            context: { byReason: failures.byReason, samples: failures.samples },
+          }
+        );
+      }
+
       // The numeric fields keep their pre-#3815 meaning for peers and scripts
       // that read them: `deleted` = sessions removed, `skipped` = every
       // requested session that was NOT removed. `remoteErrors` keeps the
@@ -2277,6 +2314,23 @@ export function createSessionsRoutes(
           category: `sessions-bulk-${action}`,
           fallbackMessage: "Bulk action produced an invalid result",
         });
+      }
+      // #6210: record why a Disconnect left sessions connected (one entry per
+      // request) — that is what keeps a bulk delete from deleting them. Stop
+      // turn is not logged (idle skips are its normal result), nor is an
+      // archive of an already-disconnected session.
+      const failures =
+        action === "archive"
+          ? summarizeBulkFailures(checked.data, ["session_inactive"])
+          : null;
+      if (failures) {
+        errorLogger?.warn(
+          `Bulk ${action}: ${failures.failed} of ${checked.data.length} session(s) not done`,
+          {
+            category: `sessions-bulk-${action}`,
+            context: { byReason: failures.byReason, samples: failures.samples },
+          }
+        );
       }
       return c.json({ ok: true, results: checked.data });
     };

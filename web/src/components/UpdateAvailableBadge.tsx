@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type ReactElement,
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -15,8 +16,12 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import type { ApiClient } from "@/api/client";
 import { BareButton } from "@/components/ui/BareButton";
 import { Spinner } from "@/components/Spinner";
+import { useToast } from "@/components/Toast";
+import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
+import { useSessions } from "@/hooks/queries/useSessions";
 import {
   useUpdateStatus,
   useStageUpdate,
@@ -26,13 +31,23 @@ import {
   type UpdateMode,
   type UpdateStatus,
 } from "@/hooks/useUpdateStatus";
+import { useVersion } from "@/hooks/useVersion";
+import { useOptionalAppContext } from "@/lib/app-context";
+import {
+  getClientVersion,
+  getVersionMismatch,
+  versionPairKey,
+} from "@/lib/app-version";
 import { errorReporter } from "@/lib/error-reporter";
 import { queryKeys } from "@/lib/query-keys";
 import { reloadWhenVisible } from "@/lib/safe-reload";
 import {
   activateSwUpdate,
+  autoActivateSwUpdateForMismatch,
+  hasMismatchAutoAttempted,
   isSwUpdatePending,
   onSwUpdateAvailable,
+  reportClientVersionMismatch,
   requestSwUpdateCheck,
 } from "@/lib/sw-update";
 
@@ -92,6 +107,19 @@ import {
  * A standalone SW-only refresh (fresh static assets, no pipeline update) renders
  * the SAME banner with truthful GENERIC copy (never the old version number) and a
  * single click that activates safely (R1/R8).
+ *
+ * ## Version mismatch (#3491)
+ *
+ * The bundle carries its own version (`__APP_VERSION__`). When it differs from
+ * the server's AND a new worker is waiting, this page is running a previous
+ * deploy's precached bundle: the phase is `mismatch` (the gear badge and the
+ * drawer banner), and the engine activates the waiting worker by itself once no
+ * session — local or federated — is responding, through the same
+ * SKIP_WAITING → controllerchange → reloadWhenVisible chain a tap uses. While a
+ * session is responding, a single toast says the reload is waiting. A per-tab,
+ * per-pair guard in sessionStorage allows one automatic attempt; after it the
+ * phase degrades to the tap-only `sw-only` row. A same-version waiting worker
+ * never auto-activates: it keeps the #1793 tap.
  */
 
 /** How long to wait for the new SW after apply before offering a manual Reload (R5). */
@@ -149,12 +177,24 @@ interface UpdateUiState {
   reloadStalled: boolean;
   /** The user acknowledged a rolled-back failure that left nothing to re-stage. */
   failureDismissed: boolean;
+  /**
+   * #3491: this bundle's version and the server's, set by the engine while they
+   * differ (both null otherwise). The engine reads `/api/version`; the badge and
+   * the banner read these, so they need no query of their own.
+   */
+  mismatchClient: string | null;
+  mismatchServer: string | null;
+  /** #3491: the client|server pair the engine auto-activated for in this page. */
+  mismatchAutoFiredFor: string | null;
 }
 
 const INITIAL_UI_STATE: UpdateUiState = {
   reloadInFlight: false,
   reloadStalled: false,
   failureDismissed: false,
+  mismatchClient: null,
+  mismatchServer: null,
+  mismatchAutoFiredFor: null,
 };
 let uiState: UpdateUiState = INITIAL_UI_STATE;
 const uiListeners = new Set<() => void>();
@@ -186,6 +226,7 @@ export function useUpdateUiState(): UpdateUiState {
 export function resetUpdateBadgeStateForTests(): void {
   firstServerVersion = null;
   uiState = INITIAL_UI_STATE;
+  deferredToastShownFor.clear();
   for (const listener of uiListeners) listener();
   for (const t of handoffTimers) clearTimeout(t);
   handoffTimers = [];
@@ -218,6 +259,7 @@ type BarPhase =
   | "reloading"
   | "failed"
   | "sw-only"
+  | "mismatch"
   | null;
 
 interface PhaseInputs {
@@ -225,6 +267,12 @@ interface PhaseInputs {
   swPending: boolean;
   reloadInFlight: boolean;
   failureDismissed: boolean;
+  /**
+   * #3491: this bundle is not the server's version and the automatic activation
+   * has not been spent for the pair. It only changes what a waiting worker shows
+   * (`mismatch` instead of `sw-only`); without one it shows nothing.
+   */
+  mismatch?: boolean;
 }
 
 /** Whether the durable job record is for the version the server offers now. */
@@ -245,10 +293,13 @@ export function derivePhase({
   swPending,
   reloadInFlight,
   failureDismissed,
+  mismatch = false,
 }: PhaseInputs): BarPhase {
   const jobPhase = data?.job?.phase;
   const available = data?.updateAvailable === true;
   const jobIsForLatest = isJobForLatest(data);
+  // #3491: a waiting worker on a mismatched bundle says so; same-version is sw-only.
+  const waitingPhase: BarPhase = mismatch ? "mismatch" : "sw-only";
   if (data?.deferred?.pending === true) return "pending";
   // #3737 defect #4: guard `applying` the same way the `failed` branch below is guarded
   // (`jobIsForLatest || !available`) so a stale/foreign-target applying job never masks a
@@ -260,7 +311,7 @@ export function derivePhase({
   // #4924: a waiting worker must still surface here — after a stalled tap the
   // page reloads onto the same old worker with `reloaded-for` already set.
   if (jobPhase === "succeeded" && jobIsForLatest)
-    return reloadInFlight ? "reloading" : swPending ? "sw-only" : null;
+    return reloadInFlight ? "reloading" : swPending ? waitingPhase : null;
   if (
     jobPhase === "failed" &&
     !failureDismissed &&
@@ -271,8 +322,32 @@ export function derivePhase({
   if (available && jobPhase === "ready" && jobIsForLatest) return "ready";
   if (available) return "available";
   if (reloadInFlight) return "reloading";
-  if (swPending) return "sw-only";
+  if (swPending) return waitingPhase;
   return null;
+}
+
+/**
+ * The client|server pair the engine published, or null when this bundle is the
+ * server's version (#3491).
+ */
+function mismatchPairOf(state: UpdateUiState): string | null {
+  return state.mismatchClient && state.mismatchServer
+    ? versionPairKey(state.mismatchClient, state.mismatchServer)
+    : null;
+}
+
+/**
+ * Whether the automatic activation is still available for this page's pair
+ * (#3491): a mismatch exists and neither this page nor an earlier page in this
+ * tab has used it. Once spent, the phase degrades to the tap-only `sw-only`.
+ */
+function isMismatchAutoArmed(state: UpdateUiState): boolean {
+  const pair = mismatchPairOf(state);
+  return (
+    pair !== null &&
+    state.mismatchAutoFiredFor !== pair &&
+    !hasMismatchAutoAttempted(pair)
+  );
 }
 
 /**
@@ -282,8 +357,14 @@ export function derivePhase({
  */
 function useUpdatePhase(data: UpdateStatus | undefined): BarPhase {
   const swPending = useSwPending();
-  const { reloadInFlight, failureDismissed } = useUpdateUiState();
-  return derivePhase({ data, swPending, reloadInFlight, failureDismissed });
+  const uiState = useUpdateUiState();
+  return derivePhase({
+    data,
+    swPending,
+    reloadInFlight: uiState.reloadInFlight,
+    failureDismissed: uiState.failureDismissed,
+    mismatch: isMismatchAutoArmed(uiState),
+  });
 }
 
 /**
@@ -301,10 +382,19 @@ export function useUpdateAlertCount(): number {
  * place that stays mounted while the app chrome is up (BrandedFrame), never in
  * the drawer, or an applied update would only finish reloading with the drawer open.
  */
-export function UpdateReloadEngine(): null {
+export function UpdateReloadEngine(): ReactElement | null {
   const { data } = useUpdateStatus();
   const swPending = useSwPending();
-  const { reloadInFlight } = useUpdateUiState();
+  const uiState = useUpdateUiState();
+  const { reloadInFlight } = uiState;
+  const api = useOptionalAppContext()?.api ?? null;
+  // #3491: this bundle's version against the server's. `/api/version` is read
+  // once per page (staleTime Infinity), so this is the server this page loaded
+  // against — which is exactly when a stale precached bundle is detectable.
+  const { data: versionInfo } = useVersion();
+  const mismatch = getVersionMismatch(getClientVersion(), versionInfo?.version);
+  const mismatchClient = mismatch?.client ?? null;
+  const mismatchServer = mismatch?.server ?? null;
   // The target the terminal effect last acted on (#5651). Keyed to the target, not
   // a boolean: the load-time early returns use it up for update T, and a later
   // update T2 in the same mount must still start its reload flow.
@@ -372,6 +462,113 @@ export function UpdateReloadEngine(): null {
     if (reloadInFlight && swPending) activateSwUpdate();
   }, [reloadInFlight, swPending]);
 
+  // #3491: publish the mismatch for the badge and the banner (they read the
+  // store, not the query), and record it once per pair. Telemetry waits for
+  // sign-in: the error reporter drops rows until App initializes it, and the
+  // per-pair latch would otherwise swallow the row for the rest of the page.
+  useEffect(() => {
+    setUiState({ mismatchClient, mismatchServer });
+  }, [mismatchClient, mismatchServer]);
+  const signedIn = api !== null;
+  useEffect(() => {
+    if (signedIn && mismatchClient && mismatchServer) {
+      reportClientVersionMismatch(mismatchClient, mismatchServer);
+    }
+  }, [signedIn, mismatchClient, mismatchServer]);
+
+  // #3491: the automatic activation needs a real mismatch (published above, so
+  // the phase already reads `mismatch`), a waiting worker, an unspent guard for
+  // the pair, and a signed-in page: the busy check reads the session lists,
+  // which need the API. Signed out (and during the auth bootstrap, before the
+  // API exists) it waits; the footer still shows both versions, and the first
+  // signed-in render arms it.
+  const pair = mismatchPairOf(uiState);
+  if (pair !== null && swPending && api && isMismatchAutoArmed(uiState)) {
+    return <MismatchAutoActivator api={api} pair={pair} />;
+  }
+  return null;
+}
+
+/** #3491: the pairs whose "reload waits for this turn" toast this page showed. */
+const deferredToastShownFor = new Set<string>();
+
+function subscribeVisibility(listener: () => void): () => void {
+  document.addEventListener("visibilitychange", listener);
+  return () => document.removeEventListener("visibilitychange", listener);
+}
+
+function isDocumentVisible(): boolean {
+  return document.visibilityState === "visible";
+}
+
+/** Reactive `document.visibilityState === "visible"` (#3491). */
+function useDocumentVisible(): boolean {
+  return useSyncExternalStore(
+    subscribeVisibility,
+    isDocumentVisible,
+    () => true
+  );
+}
+
+/**
+ * #3491: activate the waiting worker for a version mismatch the moment no
+ * session is responding. Mounted by the engine only while that activation is
+ * armed, so the session lists are read only then.
+ *
+ * SKIP_WAITING reloads EVERY tab of this origin (sw.ts clients.claim() fires
+ * controllerchange in each), so the gate is global — any local or federated
+ * session `thinking` — not the session this tab shows. It fails closed: until
+ * both lists have loaded, and after either fails, nothing fires (useSessions
+ * returns an empty list while it loads, which would otherwise read as idle).
+ * While busy, one toast explains the wait; the effect re-runs when the lists
+ * report no session thinking. `thinking` can drop between tool calls, so a
+ * reload may land there — bounded by the one-shot guard, and a session keeps
+ * running server-side and reconnects.
+ *
+ * It also waits for this tab to be visible. A worker activated from a hidden
+ * tab hands its reload to reloadWhenVisible, which runs it on resume without
+ * looking at the sessions again — and a turn may have started meanwhile. So the
+ * decision is taken (or re-taken) when the tab comes back, with the lists as
+ * they are then.
+ */
+function MismatchAutoActivator({
+  api,
+  pair,
+}: {
+  api: ApiClient;
+  pair: string;
+}): null {
+  const local = useSessions(api);
+  const federated = useFederatedSessions(api);
+  const { showToast } = useToast();
+  const known =
+    local.isSuccess &&
+    local.error === null &&
+    federated.isSuccess &&
+    federated.error === null;
+  const busy =
+    local.sessions.some(s => s.thinking) ||
+    federated.remoteSessions.some(s => s.thinking);
+  const visible = useDocumentVisible();
+
+  useEffect(() => {
+    if (!known) return;
+    if (busy) {
+      if (!deferredToastShownFor.has(pair)) {
+        deferredToastShownFor.add(pair);
+        showToast(
+          "App update ready — it reloads when no session is responding.",
+          { type: "info" }
+        );
+      }
+      return;
+    }
+    if (!visible) return;
+    if (autoActivateSwUpdateForMismatch(pair)) {
+      setUiState({ mismatchAutoFiredFor: pair });
+    }
+  }, [known, busy, visible, pair, showToast]);
+
   return null;
 }
 
@@ -386,7 +583,7 @@ export function UpdateDrawerBanner() {
   const trigger = useTriggerUpdate();
   const cancelDeferral = useCancelDeferral();
   const phase = useUpdatePhase(data);
-  const { reloadStalled } = useUpdateUiState();
+  const { reloadStalled, mismatchClient, mismatchServer } = useUpdateUiState();
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -454,6 +651,10 @@ export function UpdateDrawerBanner() {
         } — tap to retry`;
       case "sw-only":
         return "A new version of the app is ready. Tap to reload.";
+      case "mismatch":
+        // #3491: the page runs a previous deploy's bundle. The engine reloads it
+        // by itself once no session is responding; a tap does it now.
+        return `This app is out of date (v${mismatchClient}; server v${mismatchServer}). It reloads when no session is responding — tap to reload now.`;
       default:
         return "Update available";
     }
@@ -509,7 +710,7 @@ export function UpdateDrawerBanner() {
       void retry();
       return;
     }
-    if (phase === "sw-only" || phase === "reloading") {
+    if (phase === "sw-only" || phase === "mismatch" || phase === "reloading") {
       activateSwUpdate();
       return;
     }

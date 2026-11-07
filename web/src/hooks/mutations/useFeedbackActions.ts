@@ -7,6 +7,10 @@ import type {
   FeedbackInboxItem,
   FeedbackStatus,
 } from "@/types/api";
+import type { FeedbackPatchSaved } from "@hapi/protocol/feedbackSink";
+
+/** A PATCH result: the row, or `{ saved: true }` when it is stored but unreadable here (#5858). */
+type PatchResult = FeedbackInboxItem | FeedbackPatchSaved;
 
 /** Why a row action did not complete, in words the page can show. */
 export type FeedbackActionError =
@@ -50,7 +54,7 @@ export function useFeedbackActions(api: ApiClient | null) {
     return api;
   };
 
-  const acknowledge = useMutation<FeedbackInboxItem, unknown, string>({
+  const acknowledge = useMutation<PatchResult, unknown, string>({
     mutationFn: id =>
       need().patchFeedbackInboxItem(id, {
         status: "acknowledged",
@@ -65,7 +69,7 @@ export function useFeedbackActions(api: ApiClient | null) {
   // and a stale Dismiss or Reopen overrides another operator's claim. With it,
   // either race is the 409 the page shows as "another operator acted".
   const dismiss = useMutation<
-    FeedbackInboxItem,
+    PatchResult,
     unknown,
     { id: string; note: string; from: FeedbackStatus }
   >({
@@ -79,7 +83,7 @@ export function useFeedbackActions(api: ApiClient | null) {
   });
 
   const reopen = useMutation<
-    FeedbackInboxItem,
+    PatchResult,
     unknown,
     { id: string; from: FeedbackStatus }
   >({

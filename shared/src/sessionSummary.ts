@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { EffortLevel } from "./effort";
 import type { ModelMode, PermissionMode } from "./modes";
 import type {
   AgentState,
@@ -222,6 +223,15 @@ export type SessionSummary = {
   permissionMode?: PermissionMode;
   /** Resolved model identifier from SDK (e.g., "claude-opus-4-6"). Issue #1469: now fed live per-turn (bare), not from the system.init snapshot. */
   resolvedModel?: string;
+  /** Issue #6166: the REQUESTED reasoning effort — the live `effort`, else the
+   *  durable `metadata.effort` — so a list view (`hapi api sessions list`) shows it. */
+  effort?: EffortLevel;
+  /** Issue #6166: the effort the Claude process actually applies (SDK read-back):
+   *  a level, `null` (no effort), or absent (not measured). */
+  appliedEffort?: string | null;
+  /** Issue #6166: the effort that measured process was launched with (`null` =
+   *  none). Differs from `effort` while a pick is pending its relaunch. */
+  appliedForEffort?: string | null;
   /** Issue #1469: first-order effective context window (e.g. 1_000_000 for a [1m] session). */
   contextWindowTokens?: number;
   /** Issue #1469: live total tokens currently in the context window. */
@@ -373,6 +383,11 @@ export function toSessionSummary(
     modelMode: session.modelMode,
     permissionMode: session.permissionMode,
     resolvedModel: session.resolvedModel,
+    // Issue #6166: the requested and the applied effort (the #1616 lesson: an
+    // unprojected field is invisible to every list view).
+    effort: session.effort ?? session.metadata?.effort,
+    appliedEffort: session.appliedEffort,
+    appliedForEffort: session.appliedForEffort,
     contextWindowTokens: session.contextWindowTokens,
     contextUsedTokens: session.contextUsedTokens,
     contextPercentage: session.contextPercentage,

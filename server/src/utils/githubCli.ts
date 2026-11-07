@@ -2,10 +2,15 @@
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { GitHubFailureReason } from "@hapi/protocol/githubFailureReason";
 import type { GitHubConnectionStatus } from "@hapi/protocol/githubConnection";
+import type { GitHubRepo } from "@hapi/protocol/githubRepo";
 import {
+  REST_PER_PAGE,
+  REST_REPO_LIMIT,
+  collectWritableRepos,
   fetchAccountViaRest,
   fetchReposViaRest,
   resolveGitHubToken,
+  selfReposPath,
   type FetchImpl,
 } from "./githubRest";
 import {
@@ -28,8 +33,12 @@ import {
  *
  * ## Three transports, in a fixed order (#2327, #3013)
  *
- * 1. **`gh` CLI** — the original path. Tried FIRST so RP1 and every federation
- *    peer keep byte-identical behavior.
+ * 1. **`gh` CLI** — the original path, tried FIRST on RP1 and every federation
+ *    peer. For the signed-in identity it lists repositories through `gh api
+ *    /user/repos` (the endpoint the other two transports use), so organization and
+ *    collaborator repositories appear; any other account keeps `gh repo list`
+ *    (#6312). Every transport keeps only repositories the account may push to,
+ *    up to the shared {@link REST_REPO_LIMIT}.
  * 2. **GitHub REST** (`githubRest.ts`) — used only when `gh` fails and a
  *    `GH_TOKEN` is set (CI, operator hosts).
  * 3. **The gateway read broker** (`githubBrokerClient.ts`) — used only when there
@@ -80,17 +89,12 @@ export interface GitHubAccountResult {
   installedOn?: string[];
 }
 
-/** A repository accessible to a host GitHub account. */
-export interface GitHubRepoResult {
-  nameWithOwner: string;
-  name: string;
-  description: string | null;
-  isPrivate: boolean;
-  pushedAt: string | null;
-  /** hapimatic-private#4481: the branch a clone lands on (optional — absent
-   *  from transports that do not report it, e.g. an older broker). */
-  defaultBranch?: string | null;
-}
+/**
+ * A repository accessible to a host GitHub account. Defined once in `shared/` (#6326) so
+ * the server, the federation proxy and the web cannot drift; re-exported under the name
+ * the server modules already import.
+ */
+export type GitHubRepoResult = GitHubRepo;
 
 /** Which transport produced a successful result. */
 export type GitHubFetchSource = "gh" | "rest" | "broker";
@@ -109,7 +113,16 @@ export type GitHubFetchSource = "gh" | "rest" | "broker";
 export type { GitHubFailureReason };
 
 export type GitHubFetchResult<T> =
-  | { ok: true; data: T[]; source: GitHubFetchSource }
+  | {
+      ok: true;
+      data: T[];
+      source: GitHubFetchSource;
+      /**
+       * #6326, repo listings only: the listing stopped at {@link REST_REPO_LIMIT} with more
+       * repositories available. Absent on account lists.
+       */
+      truncated?: boolean;
+    }
   | { ok: false; reason: GitHubFailureReason };
 
 /** One `gh` invocation's outcome. A missing binary THROWS rather than exiting. */
@@ -152,6 +165,8 @@ interface CacheEntry<T> {
   data: T[];
   timestamp: number;
   source: GitHubFetchSource;
+  /** #6326: kept with the listing so a cache hit still reports it. */
+  truncated?: boolean;
 }
 
 const accountCache = new Map<string, CacheEntry<GitHubAccountResult>>();
@@ -196,13 +211,14 @@ function writeCache<T>(
   cache: Map<string, CacheEntry<T>>,
   key: string,
   data: T[],
-  source: GitHubFetchSource
+  source: GitHubFetchSource,
+  truncated = false
 ): void {
   if (cache.size >= GH_CACHE_MAX_SIZE && !cache.has(key)) {
     const oldestKey = cache.keys().next().value;
     if (oldestKey) cache.delete(oldestKey);
   }
-  cache.set(key, { data, timestamp: Date.now(), source });
+  cache.set(key, { data, timestamp: Date.now(), source, truncated });
 }
 
 /** Classify a THROWN `gh` invocation — a missing binary is the #2327 case. */
@@ -214,10 +230,22 @@ function classifyGhThrow(error: unknown): GitHubFailureReason {
   return "unknown";
 }
 
-/** Classify a NON-ZERO `gh` exit from its stderr. */
+/**
+ * Classify a NON-ZERO `gh` exit from its stderr.
+ *
+ * #6312: `gh api` reports GitHub's own HTTP failures ("Bad credentials (HTTP 401)",
+ * "API rate limit exceeded … (HTTP 403)"), which the original auth-wording regex
+ * did not recognise, so they read as `unknown` and then as `no_token`.
+ */
 function classifyGhExit(stderr: string): GitHubFailureReason {
   if (/auth login|not logged in|gh auth|authentication/i.test(stderr)) {
     return "gh_unauthenticated";
+  }
+  if (/HTTP 401|Bad credentials/i.test(stderr)) {
+    return "gh_unauthenticated";
+  }
+  if (/rate limit/i.test(stderr)) {
+    return "rate_limited";
   }
   return "unknown";
 }
@@ -226,12 +254,93 @@ function classifyGhExit(stderr: string): GitHubFailureReason {
  * Pick the reason to report when `gh` failed AND no token is configured.
  *
  * `gh_unauthenticated` is kept because it is strictly more actionable ("run
- * `gh auth login`") than the generic absence of a token. Every other `gh`
- * failure — notably the missing-binary cloud-VM case — reports `no_token`,
- * since installing a token is what actually repairs that host.
+ * `gh auth login`") than the generic absence of a token, and `rate_limited`
+ * because installing a token would not repair a throttled one (#6312). Every
+ * other `gh` failure — notably the missing-binary cloud-VM case — reports
+ * `no_token`, since installing a token is what actually repairs that host.
  */
 function reasonWhenNoToken(ghReason: GitHubFailureReason): GitHubFailureReason {
-  return ghReason === "gh_unauthenticated" ? "gh_unauthenticated" : "no_token";
+  if (ghReason === "gh_unauthenticated" || ghReason === "rate_limited") {
+    return ghReason;
+  }
+  return "no_token";
+}
+
+/**
+ * Ask `gh` which identity it is signed in as (`gh api user`), caching a success
+ * under {@link ACCOUNT_CACHE_KEY} with `source: "gh"`.
+ *
+ * The ONE writer of a `gh`-sourced identity (#6312): the account route
+ * ({@link fetchGitHubAccounts}) and the repo route ({@link resolveGhLogin}) share
+ * it, so a Create page that loads accounts first leaves the repo route a warm cache.
+ */
+async function runGhIdentity(
+  runGh: GhRunner
+): Promise<
+  | { ok: true; account: GitHubAccountResult }
+  | { ok: false; reason: GitHubFailureReason }
+> {
+  try {
+    const { code, stdout, stderr } = await runGh([
+      "gh",
+      "api",
+      "user",
+      "--jq",
+      "{login: .login, name: .name}",
+    ]);
+    if (code === 0) {
+      const parsed = JSON.parse(stdout) as {
+        login?: string;
+        name?: string | null;
+      };
+      if (parsed?.login) {
+        const account: GitHubAccountResult = {
+          login: parsed.login,
+          name: parsed.name ?? null,
+        };
+        writeCache(accountCache, ACCOUNT_CACHE_KEY, [account], "gh");
+        return { ok: true, account };
+      }
+      return { ok: false, reason: "unknown" };
+    }
+    console.error(`[GitHub] gh api user failed: ${stderr}`);
+    return { ok: false, reason: classifyGhExit(stderr) };
+  } catch (error) {
+    return { ok: false, reason: classifyGhThrow(error) };
+  }
+}
+
+/** True while a broker-provisioned host's last `gh` identity failure is still remembered. */
+function brokerHostGhFailureIsLive(
+  env: Record<string, string | undefined>
+): boolean {
+  return (
+    resolveGithubBrokerConfig(env) !== null &&
+    brokerHostGhFailure !== null &&
+    Date.now() - brokerHostGhFailure.timestamp < GH_CACHE_TTL_MS
+  );
+}
+
+/**
+ * The login `gh` is signed in as, or null when it cannot be resolved.
+ *
+ * Trusts the account cache ONLY when its entry came from `gh`: a `rest` entry is a
+ * `GH_TOKEN` identity that may differ from the `gh` login, and a `broker` entry lists
+ * linked accounts rather than the host identity (#6312).
+ */
+async function resolveGhLogin(
+  runGh: GhRunner,
+  env: Record<string, string | undefined>
+): Promise<string | null> {
+  const cached = readCache(accountCache, ACCOUNT_CACHE_KEY);
+  if (cached?.source === "gh" && cached.data[0]) return cached.data[0].login;
+  if (brokerHostGhFailureIsLive(env)) return null;
+  const identity = await runGhIdentity(runGh);
+  if (identity.ok) return identity.account.login;
+  if (resolveGithubBrokerConfig(env) !== null) {
+    brokerHostGhFailure = { reason: identity.reason, timestamp: Date.now() };
+  }
+  return null;
 }
 
 /**
@@ -292,42 +401,15 @@ export async function fetchGitHubAccounts(
   let ghReason: GitHubFailureReason;
   const brokerHost = resolveGithubBrokerConfig(env) !== null;
   const rememberedGhFailure =
-    brokerHost &&
-    brokerHostGhFailure !== null &&
-    Date.now() - brokerHostGhFailure.timestamp < GH_CACHE_TTL_MS
-      ? brokerHostGhFailure
-      : null;
+    brokerHost && brokerHostGhFailureIsLive(env) ? brokerHostGhFailure : null;
   if (rememberedGhFailure) {
     ghReason = rememberedGhFailure.reason;
   } else {
-    try {
-      const { code, stdout, stderr } = await runGh([
-        "gh",
-        "api",
-        "user",
-        "--jq",
-        "{login: .login, name: .name}",
-      ]);
-      if (code === 0) {
-        const parsed = JSON.parse(stdout) as {
-          login?: string;
-          name?: string | null;
-        };
-        if (parsed?.login) {
-          const accounts: GitHubAccountResult[] = [
-            { login: parsed.login, name: parsed.name ?? null },
-          ];
-          writeCache(accountCache, ACCOUNT_CACHE_KEY, accounts, "gh");
-          return { ok: true, data: accounts, source: "gh" };
-        }
-        ghReason = "unknown";
-      } else {
-        console.error(`[GitHub] gh api user failed: ${stderr}`);
-        ghReason = classifyGhExit(stderr);
-      }
-    } catch (error) {
-      ghReason = classifyGhThrow(error);
+    const identity = await runGhIdentity(runGh);
+    if (identity.ok) {
+      return { ok: true, data: [identity.account], source: "gh" };
     }
+    ghReason = identity.reason;
     if (brokerHost) {
       brokerHostGhFailure = { reason: ghReason, timestamp: Date.now() };
     }
@@ -378,11 +460,159 @@ export async function fetchGitHubAccounts(
 }
 
 /**
- * List repositories accessible to a host GitHub account.
+ * The signed-in `gh` identity's full repository set (#6312): every repository it
+ * owns, collaborates on, or reaches through organization membership, through the
+ * same `/user/repos` endpoint and mapping the REST transport uses.
  *
- * Tries `gh repo list <account>`, then the token-backed REST repo endpoints.
- * `account` MUST be pre-validated against `^[A-Za-z0-9._-]+$` by the caller (the
- * routes do this) — it is interpolated into the gh argv. NEVER returns a token.
+ * Explicit `page=N` calls rather than `gh api --paginate`: `--paginate` has no
+ * ceiling, and its output shape is not consistent across `gh` versions. A failed
+ * or unparseable page fails the WHOLE listing — pages already read are never
+ * returned as a success (#2391 completeness rule). A missing `gh` binary throws.
+ */
+async function fetchSelfReposViaGh(runGh: GhRunner): Promise<
+  | {
+      ok: true;
+      data: GitHubRepoResult[];
+      permissionsMissing: boolean;
+      truncated: boolean;
+    }
+  | { ok: false; stderr: string }
+> {
+  const data: GitHubRepoResult[] = [];
+  let permissionsMissing = false;
+  let truncated = false;
+  const maxPages = Math.ceil(REST_REPO_LIMIT / REST_PER_PAGE);
+  for (let page = 1; page <= maxPages; page++) {
+    const { code, stdout, stderr } = await runGh([
+      "gh",
+      "api",
+      selfReposPath(page),
+    ]);
+    if (code !== 0) return { ok: false, stderr };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch {
+      return { ok: false, stderr: "gh api returned unparseable output" };
+    }
+    if (!Array.isArray(parsed)) {
+      return { ok: false, stderr: "gh api returned a non-array payload" };
+    }
+    const pageResult = collectWritableRepos(parsed);
+    if (!pageResult.permissionsReported) permissionsMissing = true;
+    data.push(...pageResult.repos);
+    if (pageResult.rawCount < REST_PER_PAGE) break;
+    // The last page we may read came back full: there may be more past the ceiling.
+    if (page === maxPages) truncated = true;
+  }
+  if (data.length > REST_REPO_LIMIT) truncated = true;
+  return {
+    ok: true,
+    data: data.slice(0, REST_REPO_LIMIT),
+    permissionsMissing,
+    truncated,
+  };
+}
+
+/** `viewerPermission` values that cannot push; anything else, or no value, is kept (#6312). */
+const GH_NO_PUSH_PERMISSIONS = new Set(["READ", "TRIAGE", "NONE"]);
+
+/**
+ * `gh repo list <account>`: the repositories OWNED by `account`. Correct for an
+ * account other than the signed-in identity, and the owned-only fallback when the
+ * full listing is unavailable. A missing `gh` binary throws.
+ */
+async function listOwnedReposViaGh(
+  runGh: GhRunner,
+  account: string
+): Promise<
+  | { ok: true; data: GitHubRepoResult[]; truncated: boolean }
+  | { ok: false; stderr: string }
+> {
+  const { code, stdout, stderr } = await runGh([
+    "gh",
+    "repo",
+    "list",
+    account,
+    "--json",
+    "nameWithOwner,name,description,isPrivate,pushedAt,createdAt,isArchived,isFork,defaultBranchRef,viewerPermission",
+    "--limit",
+    String(REST_REPO_LIMIT),
+  ]);
+  if (code !== 0) return { ok: false, stderr };
+  const raw = JSON.parse(stdout) as Array<{
+    nameWithOwner: string;
+    name: string;
+    description: string | null;
+    isPrivate: boolean;
+    pushedAt: string | null;
+    createdAt?: string | null;
+    isArchived?: boolean;
+    isFork?: boolean;
+    defaultBranchRef?: { name?: string } | null;
+    viewerPermission?: string | null;
+  }>;
+  const repos: GitHubRepoResult[] = raw
+    .filter(
+      r =>
+        !r.viewerPermission || !GH_NO_PUSH_PERMISSIONS.has(r.viewerPermission)
+    )
+    .map(r => {
+      const repo: GitHubRepoResult = {
+        nameWithOwner: r.nameWithOwner,
+        name: r.name,
+        description: r.description ?? null,
+        isPrivate: Boolean(r.isPrivate),
+        pushedAt: r.pushedAt ?? null,
+        defaultBranch: r.defaultBranchRef?.name || null,
+      };
+      // #6326: same rule as the REST mapper — copy a field only when gh reported it.
+      if (typeof r.createdAt === "string") repo.createdAt = r.createdAt;
+      if (typeof r.isArchived === "boolean") repo.isArchived = r.isArchived;
+      if (typeof r.isFork === "boolean") repo.isFork = r.isFork;
+      return repo;
+    });
+  // `--limit` caps the RAW rows gh returns, so a full raw list may have stopped at the ceiling
+  // even when the push filter left fewer (#6326).
+  return { ok: true, data: repos, truncated: raw.length >= REST_REPO_LIMIT };
+}
+
+/**
+ * Warn when a successful listing hit the shared ceiling. Driven by the transport's own
+ * `truncated` flag (#6326): a row count cannot tell, because the push filter can leave a
+ * truncated listing under the limit.
+ */
+function warnIfAtCeiling(
+  errorLogger: ErrorLogger | null | undefined,
+  account: string,
+  source: GitHubFetchSource,
+  count: number,
+  truncated: boolean
+): void {
+  if (!truncated) return;
+  errorLogger?.warn("[GitHub] Repo list hit the shared ceiling", {
+    category: "github-list-repos",
+    context: { account, source, count, limit: REST_REPO_LIMIT },
+  });
+}
+
+/**
+ * List repositories accessible to a host GitHub account, keeping only those it may
+ * push to.
+ *
+ * The `gh` transport (#6312):
+ * - **the signed-in identity** — `/user/repos` through `gh api`, so organization and
+ *   collaborator repositories are included (`gh repo list <login>` lists only the
+ *   repositories the login OWNS, which is why they used to be missing);
+ * - **another account** — `gh repo list <account>`, as before;
+ * - **degraded** — when the identity cannot be resolved or the full listing fails,
+ *   `gh repo list <account>` again, with a `warn` and WITHOUT caching, so the next
+ *   request retries. RP1 has no token or broker to fall back to, and failing there
+ *   would empty the picker; the owned-only list is never worse than before.
+ *
+ * Then the token-backed REST endpoints, then the gateway broker. `account` MUST be
+ * pre-validated against `^[A-Za-z0-9._-]+$` by the caller (the routes do this) — it
+ * is interpolated into the gh argv. NEVER returns a token.
  */
 export async function fetchGitHubRepos(
   account: string,
@@ -394,42 +624,86 @@ export async function fetchGitHubRepos(
   const env = deps.env ?? process.env;
 
   const cached = readCache(repoCache, account);
-  if (cached) return { ok: true, data: cached.data, source: cached.source };
+  if (cached) {
+    return {
+      ok: true,
+      data: cached.data,
+      source: cached.source,
+      truncated: cached.truncated === true,
+    };
+  }
 
   let ghReason: GitHubFailureReason;
   try {
-    const { code, stdout, stderr } = await runGh([
-      "gh",
-      "repo",
-      "list",
-      account,
-      "--json",
-      "nameWithOwner,name,description,isPrivate,pushedAt,defaultBranchRef",
-      "--limit",
-      "200",
-    ]);
-    if (code === 0) {
-      const raw = JSON.parse(stdout) as Array<{
-        nameWithOwner: string;
-        name: string;
-        description: string | null;
-        isPrivate: boolean;
-        pushedAt: string | null;
-        defaultBranchRef?: { name?: string } | null;
-      }>;
-      const repos: GitHubRepoResult[] = raw.map(r => ({
-        nameWithOwner: r.nameWithOwner,
-        name: r.name,
-        description: r.description ?? null,
-        isPrivate: Boolean(r.isPrivate),
-        pushedAt: r.pushedAt ?? null,
-        defaultBranch: r.defaultBranchRef?.name || null,
-      }));
-      writeCache(repoCache, account, repos, "gh");
-      return { ok: true, data: repos, source: "gh" };
+    const ghLogin = await resolveGhLogin(runGh, env);
+    const isSelf =
+      ghLogin !== null && ghLogin.toLowerCase() === account.toLowerCase();
+    let degradedReason: string | null =
+      ghLogin === null ? "identity_unresolved" : null;
+
+    if (isSelf) {
+      const self = await fetchSelfReposViaGh(runGh);
+      if (self.ok) {
+        if (self.permissionsMissing) {
+          errorLogger?.warn(
+            "[GitHub] Repo listing carried no permissions; nothing was filtered",
+            { category: "github-list-repos", context: { account } }
+          );
+        }
+        warnIfAtCeiling(
+          errorLogger,
+          account,
+          "gh",
+          self.data.length,
+          self.truncated
+        );
+        writeCache(repoCache, account, self.data, "gh", self.truncated);
+        return {
+          ok: true,
+          data: self.data,
+          source: "gh",
+          truncated: self.truncated,
+        };
+      }
+      console.error(`[GitHub] gh api /user/repos failed: ${self.stderr}`);
+      degradedReason = `full_listing_failed:${classifyGhExit(self.stderr)}`;
     }
-    console.error(`[GitHub] gh repo list failed: ${stderr}`);
-    ghReason = classifyGhExit(stderr);
+
+    const owned = await listOwnedReposViaGh(runGh, account);
+    if (owned.ok) {
+      if (degradedReason !== null) {
+        // Owned repos only — organization and collaborator repos are missing. Not cached.
+        errorLogger?.warn(
+          "[GitHub] Full repo listing unavailable; returning owned repos only",
+          {
+            category: "github-list-repos",
+            context: { account, reason: degradedReason },
+          }
+        );
+        return {
+          ok: true,
+          data: owned.data,
+          source: "gh",
+          truncated: owned.truncated,
+        };
+      }
+      warnIfAtCeiling(
+        errorLogger,
+        account,
+        "gh",
+        owned.data.length,
+        owned.truncated
+      );
+      writeCache(repoCache, account, owned.data, "gh", owned.truncated);
+      return {
+        ok: true,
+        data: owned.data,
+        source: "gh",
+        truncated: owned.truncated,
+      };
+    }
+    console.error(`[GitHub] gh repo list failed: ${owned.stderr}`);
+    ghReason = classifyGhExit(owned.stderr);
   } catch (error) {
     ghReason = classifyGhThrow(error);
   }
@@ -442,8 +716,16 @@ export async function fetchGitHubRepos(
     if (resolveGithubBrokerConfig(env)) {
       const broker = await fetchReposViaBroker(account, env, fetchImpl);
       if (broker.ok) {
-        writeCache(repoCache, account, broker.data, "broker");
-        return { ok: true, data: broker.data, source: "broker" };
+        const { repos, truncated } = broker.data;
+        warnIfAtCeiling(
+          errorLogger,
+          account,
+          "broker",
+          repos.length,
+          truncated
+        );
+        writeCache(repoCache, account, repos, "broker", truncated);
+        return { ok: true, data: repos, source: "broker", truncated };
       }
       errorLogger?.warn("[GitHub] Repo resolution via broker failed", {
         category: "github-list-repos",
@@ -480,8 +762,10 @@ export async function fetchGitHubRepos(
     return { ok: false, reason: rest.reason };
   }
 
-  writeCache(repoCache, account, rest.data, "rest");
-  return { ok: true, data: rest.data, source: "rest" };
+  const { repos, truncated } = rest.data;
+  warnIfAtCeiling(errorLogger, account, "rest", repos.length, truncated);
+  writeCache(repoCache, account, repos, "rest", truncated);
+  return { ok: true, data: repos, source: "rest", truncated };
 }
 
 /** Clear both caches. Test-only seam; not used by production code paths. */

@@ -16,7 +16,8 @@
  * callbacks (mirrors AccountRestart) so test spies still apply.
  */
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
-import type { SpawnSessionOptions } from "./syncEngine";
+import type { Session } from "@hapi/protocol/types";
+import type { ApiKeyPlacementRefusal, SpawnSessionOptions } from "./syncEngine";
 import type { SessionCache } from "./sessionCache";
 import type { RpcGateway } from "./rpcGateway";
 import type { TurnLifecycle } from "./turnLifecycle";
@@ -57,6 +58,10 @@ export interface SessionRelaunchDeps {
   spawnSession: SpawnSessionFn;
   /** Lazy read — TurnLifecycle is injected into SyncEngine post-construction. */
   getTurnLifecycle: () => TurnLifecycle | null;
+  /** Issue #5819: the SyncEngine's placement re-check, run before the teardown. */
+  apiKeyPlacementRefusal: (
+    session: Session
+  ) => Promise<ApiKeyPlacementRefusal | null>;
 }
 
 export class SessionRelaunch {
@@ -66,6 +71,7 @@ export class SessionRelaunch {
   private readonly archiveSession: ArchiveSessionFn;
   private readonly spawnSession: SpawnSessionFn;
   private readonly getTurnLifecycle: () => TurnLifecycle | null;
+  private readonly apiKeyPlacementRefusal: SessionRelaunchDeps["apiKeyPlacementRefusal"];
 
   constructor(deps: SessionRelaunchDeps) {
     this.sessionCache = deps.sessionCache;
@@ -74,6 +80,7 @@ export class SessionRelaunch {
     this.archiveSession = deps.archiveSession;
     this.spawnSession = deps.spawnSession;
     this.getTurnLifecycle = deps.getTurnLifecycle;
+    this.apiKeyPlacementRefusal = deps.apiKeyPlacementRefusal;
   }
 
   /**
@@ -150,6 +157,14 @@ export class SessionRelaunch {
         message: `API-key sessions run on the SDK launcher (requested: ${overrides.launcher})`,
         code: "api_key_launcher_unsupported",
       };
+    }
+    // Issue #5819: a session another node placed here on one of this node's keys
+    // may not respawn on that key once its owner unshares it. Refuse BEFORE the
+    // teardown, so the running session keeps running: the spawn choke point
+    // would refuse too, but only after the kill, and then refuse the rollback.
+    const placementRefusal = await this.apiKeyPlacementRefusal(session);
+    if (placementRefusal) {
+      return { type: "error", ...placementRefusal };
     }
 
     // claudeSessionId recovery + stale-id guard — the null-tolerant chain

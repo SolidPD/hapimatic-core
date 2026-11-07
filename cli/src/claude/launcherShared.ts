@@ -57,6 +57,10 @@ export const SDK_SIGNAL_ENV_VARS = new Set([
  *   a later session to someone's key, so only the daemon's explicit export may
  *   carry it. The KEY itself is never in any environment: Claude Code reads it
  *   from the session's `apiKeyHelper` (`hapi api-key-helper`, F1).
+ * - `HAPI_API_KEY_PLACED_BY` (#5819) — marks a session another node placed here
+ *   on one of this node's keys; the wrapper then re-checks the key is still
+ *   shared. An inherited copy would refuse a LOCAL session's legitimate relaunch,
+ *   and a stale one could ride a respawn, so it is a binding var too.
  *
  * Unlike {@link SDK_SIGNAL_ENV_VARS}, these are stripped from the AMBIENT
  * `process.env` copy ONLY and are NOT re-stripped after the `extra` merge:
@@ -76,6 +80,7 @@ export const BINDING_ENV_VARS = new Set([
   "HAPI_ACCOUNT_UUID",
   "HAPI_API_KEY_ID",
   "HAPI_API_KEY_MASKED",
+  "HAPI_API_KEY_PLACED_BY",
 ]);
 
 /**

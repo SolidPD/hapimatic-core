@@ -20,7 +20,11 @@ import type {
 
 import { CEILING_RATE_WINDOW_MS } from "../../sync/ceilingGuardEvaluator";
 import { newUuidV7 } from "./ids";
-import { BINDING_COLUMNS, tableHasColumns } from "./schema";
+import {
+  BINDING_COLUMNS,
+  TURN_MIRROR_API_KEY_EXPR,
+  tableHasColumns,
+} from "./schema";
 import type {
   AppendEventsInput,
   FinalizeTurnInput,
@@ -29,6 +33,12 @@ import type {
   TurnRow,
   TurnStatus,
 } from "./types";
+
+/**
+ * Serialized-size budget of one #4614 turn feed page (issue #6164, F1): a page
+ * stops once its rows' JSON passes 2 MiB (always ≥ 1 row).
+ */
+export const FEED_PAGE_BYTE_BUDGET = 2 * 1024 * 1024;
 
 /**
  * The exact SQL prepared by {@link TurnStore.getWorkflowBadge}, hoisted to a
@@ -105,6 +115,56 @@ export class TurnStore {
       );
     }
     return this.bindingColumnsPresent;
+  }
+
+  /**
+   * Dollars metered on one vault key for work that started in [fromMs, toMs):
+   * its turns plus its background agents. Matches the key's own id and a
+   * federation binding ref to it (`<id>@<homeNodeId>`; the range bound keeps the
+   * index usable). Counts this node's turns and background agents, and the
+   * other nodes' turns mirrored here (#4614). 0 when the binding columns are
+   * missing or the window is empty.
+   */
+  sumApiKeyCost(apiKeyId: string, fromMs: number, toMs: number): number {
+    if (!(toMs > fromMs) || !this.hasBindingColumns()) return 0;
+    const params = {
+      id: apiKeyId,
+      lo: `${apiKeyId}@`,
+      hi: `${apiKeyId}A`,
+      from: fromMs,
+      to: toMs,
+    };
+    const keyMatch =
+      "(api_key_id = @id OR (api_key_id >= @lo AND api_key_id < @hi))";
+    const sum = (table: "turns" | "background_agent_usage"): number => {
+      const row = this.db
+        .prepare(
+          `SELECT COALESCE(SUM(cost_total), 0) AS c FROM ${table}
+            WHERE ${keyMatch} AND started_at_ms >= @from AND started_at_ms < @to`
+        )
+        .get(params) as { c: number } | null;
+      return row?.c ?? 0;
+    };
+    let total = sum("turns");
+    if (tableHasColumns(this.db, "background_agent_usage", ["api_key_id"])) {
+      total += sum("background_agent_usage");
+    }
+    // A key shared with the federation (#5127) is also spent by sessions on
+    // other nodes; their finalized turns arrive as mirror rows (#4614).
+    if (tableHasColumns(this.db, "turn_mirror", ["row_json"])) {
+      const key = TURN_MIRROR_API_KEY_EXPR;
+      const row = this.db
+        .prepare(
+          `SELECT COALESCE(SUM(json_extract(row_json, '$.cost_total')), 0) AS c
+             FROM turn_mirror
+            WHERE ${key} IS NOT NULL
+              AND (${key} = @id OR (${key} >= @lo AND ${key} < @hi))
+              AND started_at_ms >= @from AND started_at_ms < @to`
+        )
+        .get(params) as { c: number } | null;
+      total += row?.c ?? 0;
+    }
+    return total;
   }
 
   /**
@@ -369,16 +429,33 @@ export class TurnStore {
    * an already-finalized row. Returns true iff a row flipped (so the sweep can
    * count/log). Synchronous.
    */
-  markOrphaned(hapiSessionId: string, seq: number, endedAtMs: number): boolean {
+  markOrphaned(
+    hapiSessionId: string,
+    seq: number,
+    endedAtMs: number,
+    opts?: {
+      /** #6264: false leaves `duration_ms` NULL — the watermark exists but a
+       *  bounded read could not reach it — for the exact offline backfill
+       *  (`backfill-orphan-durations` selects `duration_ms IS NULL`). */
+      durationKnown?: boolean;
+    }
+  ): boolean {
     const result = this.db
       .prepare(
         `UPDATE turns
             SET status = 'orphaned',
                 ended_at_ms = @ended_at_ms,
-                duration_ms = MAX(0, @ended_at_ms - started_at_ms)
+                duration_ms = CASE WHEN @duration_known = 1
+                                   THEN MAX(0, @ended_at_ms - started_at_ms)
+                                   ELSE NULL END
           WHERE hapi_session_id = @hapi_session_id AND seq = @seq AND status = 'open'`
       )
-      .run({ hapi_session_id: hapiSessionId, seq, ended_at_ms: endedAtMs });
+      .run({
+        hapi_session_id: hapiSessionId,
+        seq,
+        ended_at_ms: endedAtMs,
+        duration_known: opts?.durationKnown === false ? 0 : 1,
+      });
     return result.changes > 0;
   }
 
@@ -563,12 +640,15 @@ export class TurnStore {
    * #1671. Each turn is one prompt→Stop cycle (the DB turn boundary, D10/S-7);
    * the web footer correlates a turn to its concluding message by timestamp
    * bracket. `cost_total` is the rate-card-computed API value (Sub E).
+   * `context_used_tokens` is the turn-end context size the web's context trend
+   * draws (#6170).
    */
   getTurnBreakdown(hapiSessionId: string): TurnTokenBreakdown[] {
     const rows = this.db
       .prepare(
         `SELECT seq, started_at_ms, ended_at_ms, status, model_id,
                 tok_in, tok_out, tok_cache_read, tok_cache_write, cost_total,
+                context_used_tokens,
                 launcher${this.hasBindingColumns() ? ", auth_binding_kind" : ""}
            FROM turns WHERE hapi_session_id = ? ORDER BY seq ASC`
       )
@@ -981,7 +1061,11 @@ export class TurnStore {
    * 'open'` replicates (R7). Each row carries the FULL origin row as `rowJson`
    * so an origin column unknown to the puller survives (R9).
    */
-  getTurnFeedPage(cursor: number, limit: number): MirrorTurnRow[] {
+  getTurnFeedPage(
+    cursor: number,
+    limit: number,
+    maxBytes: number = FEED_PAGE_BYTE_BUDGET
+  ): MirrorTurnRow[] {
     const rows = this.db
       .prepare(
         `SELECT * FROM turns
@@ -989,17 +1073,30 @@ export class TurnStore {
           ORDER BY change_seq ASC LIMIT @limit`
       )
       .all({ cursor, limit }) as Array<Record<string, unknown>>;
-    return rows.map(r => ({
-      turnId: String(r.id),
-      changeSeq: Number(r.change_seq),
-      hapiSessionId: String(r.hapi_session_id),
-      namespace: (r.namespace as string | null) ?? null,
-      status: String(r.status),
-      startedAtMs: (r.started_at_ms as number | null) ?? null,
-      endedAtMs: (r.ended_at_ms as number | null) ?? null,
-      durationMs: (r.duration_ms as number | null) ?? null,
-      rowJson: JSON.stringify(r),
-    }));
+    // Issue #6164 (F1): bound a page by serialized size as well as row count.
+    // Rows grew by `throughput_json` (≤ 2 KB each), and a page the puller times
+    // out on is retried forever. Stop once the page passes the budget, always
+    // keeping at least one row so a single large row can never stall the feed;
+    // `nextCursor` is the last returned row, so the rest arrives next pull.
+    const page: MirrorTurnRow[] = [];
+    let bytes = 0;
+    for (const r of rows) {
+      const rowJson = JSON.stringify(r);
+      bytes += Buffer.byteLength(rowJson, "utf8");
+      if (page.length > 0 && bytes > maxBytes) break;
+      page.push({
+        turnId: String(r.id),
+        changeSeq: Number(r.change_seq),
+        hapiSessionId: String(r.hapi_session_id),
+        namespace: (r.namespace as string | null) ?? null,
+        status: String(r.status),
+        startedAtMs: (r.started_at_ms as number | null) ?? null,
+        endedAtMs: (r.ended_at_ms as number | null) ?? null,
+        durationMs: (r.duration_ms as number | null) ?? null,
+        rowJson,
+      });
+    }
+    return page;
   }
 
   /** Feed page of timelog_adjustments changed since `cursor` (append-only on origin). */
@@ -1165,6 +1262,8 @@ function rowToTurnBreakdown(r: Record<string, unknown>): TurnTokenBreakdown {
     launcher: (r.launcher as string | null) ?? null,
     // Issue #4824: the binding the turn ran under — colours its footer figure.
     authBindingKind: (r.auth_binding_kind as string | null) ?? null,
+    // Issue #6170: turn-end context size — the context modal's trend source.
+    contextUsedTokens: (r.context_used_tokens as number | null) ?? null,
   };
 }
 

@@ -315,6 +315,12 @@ export interface ClientToServerEvents {
     permissionMode?: SessionPermissionMode;
     modelMode?: SessionModelMode;
     effort?: string;
+    // Issue #6166: the effort the Claude process applies (`null` = none), the
+    // model the read-back reported and the effort the measured query was
+    // launched with; absent = not measured (the server clears its copy).
+    appliedEffort?: string | null;
+    appliedModel?: string;
+    appliedForEffort?: string | null;
     // Composer-chip pin integrity: pinned raw model id; `null` = pin cleared.
     rawModel?: string | null;
     resolvedModel?: string;

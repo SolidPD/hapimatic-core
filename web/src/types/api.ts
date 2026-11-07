@@ -318,9 +318,35 @@ export type InVmLoginStartResponse = {
   accountUuid: string;
   configDir: string;
   command: string;
+  /** #6211: the sign-in page of the unmodified binary running for this sign-in. Absent when it
+   *  could not start (kill switch, binary missing, an older server): the terminal path remains. */
+  authorizeUrl?: string;
+};
+/**
+ * #6211: a cancel of a sign-in that had already finished registers it rather than abandon it, and
+ * answers with the account, or with the message when that account was already connected.
+ */
+export type InVmLoginCancelResponse = {
+  ok: boolean;
+  account?: RedactedAccount;
+  alreadyConnected?: string;
 };
 /** Issue #4349: `not_signed_in` (HTTP 202) means "keep waiting", not a failure. */
 export type InVmLoginCompleteResponse =
+  | { ok: true; account: RedactedAccount }
+  | { ok: false; error: string; code: string };
+/** #6211: this VM's tailnet state. Never the tailnet owner's identity. */
+export type TailscaleStatus = {
+  state: "joined" | "not-joined" | "unavailable";
+  ip?: string;
+  hostname?: string;
+  canJoin: boolean;
+  /** The name a join would give this device. */
+  deviceName: string;
+};
+export type TailscaleJoinResponse = { ok: true; status: TailscaleStatus };
+/** #6211: `signing_in` (HTTP 202) means the exchange is still running; keep polling. */
+export type InVmCodeSubmitResponse =
   | { ok: true; account: RedactedAccount }
   | { ok: false; error: string; code: string };
 // Codex (OpenAI) in-app login (issue #3807, epic #3345). The API-key path
@@ -439,6 +465,8 @@ export type FileSearchResponse = {
   success: boolean;
   files?: FileSearchItem[];
   error?: string;
+  /** #6224: more files matched than were returned. Absent from older nodes. */
+  truncated?: boolean;
 };
 
 export type FileReadResponse = {
@@ -486,11 +514,15 @@ export type GitFileStatus = {
     | "deleted"
     | "renamed"
     | "untracked"
-    | "conflicted";
+    | "conflicted"
+    // #6224: a status line the parser could not read; it still counts.
+    | "unknown";
   isStaged: boolean;
   linesAdded: number;
   linesRemoved: number;
   oldPath?: string;
+  /** #6224: an untracked folder git does not descend into (a nested repo). */
+  isDirectory?: boolean;
 };
 
 export type GitStatusFiles = {
@@ -942,6 +974,11 @@ export type FederationNodesResponse = {
   role: "hub" | "node" | "peer";
   enabled: boolean;
   localNode: { nodeId: string; nodeLabel: string } | null;
+  /**
+   * #6217: this node serves /api/federation/health/* and /api/federation/alerts
+   * — every node from #6217 on. Absent from an older server.
+   */
+  healthAvailable?: boolean;
 };
 
 export type FederationAllSessionsResponse = {
@@ -1052,6 +1089,20 @@ export type TelemetrySessionAggregate = {
   agentCount: number;
   errorCount: number;
 };
+
+// Throughput telemetry (issue #6164) — the server's contract, re-exported.
+export type {
+  DigestDetail,
+  DigestList,
+  DigestMeta,
+  ThroughputBreakdown,
+  ThroughputBreakdownDim,
+  ThroughputBreakdownRow,
+  ThroughputIssuesPage,
+  ThroughputLine,
+  ThroughputSummary,
+  ThroughputTestsPage,
+} from "@hapi/protocol";
 
 // MCP server status
 export type { McpServerStatus, McpStatusUpdate };

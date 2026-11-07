@@ -227,6 +227,22 @@ export const SPEND_LIMIT_ORG_TEXT =
 export const SPEND_LIMIT_WORKSPACE_TEXT =
   "you have reached your specified workspace api usage limits";
 
+/** Lower-cased phrase of the Anthropic answer when an organization's credit is
+ *  exhausted ("Your credit balance is too low to access the Anthropic API…", and
+ *  Claude Code's "Credit balance too low"). Test-pinned like the phrases above. */
+export const CREDIT_BALANCE_LOW_TEXTS = [
+  "credit balance is too low",
+  "credit balance too low",
+] as const;
+
+/** True when an API-error text is the exhausted-credit answer. Callers file it
+ *  under the `billing_error` class. */
+export function isCreditBalanceLowText(text: string | undefined): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  return CREDIT_BALANCE_LOW_TEXTS.some(phrase => lower.includes(phrase));
+}
+
 /**
  * Substrings identifying a subscription session/usage window. The source of
  * `rateLimitDetector.ts`'s `SESSION_LIMIT_SUBSTRINGS` (re-exported there).
@@ -349,4 +365,50 @@ export function classifyApiLimitSignal(signal: ApiLimitSignal): ApiLimitClass {
     if (isUsageWindowText(text)) return { kind: "usage-window" };
   }
   return { kind: "none" };
+}
+
+/**
+ * Re-check an EXHAUSTED API-error report against what it carried — the
+ * `/cli/error-reports` bridge's one reclassification step. Two rules:
+ *  - #4936 version skew: a tmux/pty session keeps the CLI binary it was spawned
+ *    with, so after a deploy an older CLI still reports a spend cap as
+ *    `rate_limit_error` / `unknown`; the SAME shared classifier on its status,
+ *    error code and the first 500 chars of the rendered text (which hold the
+ *    whole cap sentence) upgrades a match to the terminal class.
+ *  - API key budgets: Claude Code files the exhausted-credit answer as
+ *    `invalid_request_error` / `unknown`; its text says it is `billing_error`.
+ * A report already filed as `spend_limit_error` is kept. Returns the upgraded
+ * class (with a cap's variant and resume instant), or `null` to keep the report.
+ */
+export function reclassifyExhaustedApiError(report: {
+  errorType: string;
+  status?: number;
+  errorCode?: string;
+  text?: string;
+}):
+  | {
+      errorType: "spend_limit_error";
+      limitVariant: SpendLimitVariant;
+      resumesAt: number | null;
+    }
+  | { errorType: "billing_error" }
+  | null {
+  if (canonicalizeErrorType(report.errorType) === "spend_limit_error") {
+    return null;
+  }
+  const recheck = classifyApiLimitSignal({
+    status: report.status,
+    errorCode: report.errorCode,
+    text: report.text,
+  });
+  if (recheck.kind === "spend-limit") {
+    return {
+      errorType: "spend_limit_error",
+      limitVariant: recheck.variant,
+      resumesAt: recheck.resumesAt,
+    };
+  }
+  if (isCreditBalanceLowText(report.text))
+    return { errorType: "billing_error" };
+  return null;
 }

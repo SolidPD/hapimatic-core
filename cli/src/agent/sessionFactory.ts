@@ -344,6 +344,11 @@ export async function buildSessionMetadata(options: {
           ...(process.env.HAPI_API_KEY_MASKED
             ? { apiKeyMasked: process.env.HAPI_API_KEY_MASKED }
             : {}),
+          // Issue #5819: another node placed this session here on this node's
+          // key — every relaunch re-checks the key is still shared. A node id.
+          ...(process.env.HAPI_API_KEY_PLACED_BY
+            ? { apiKeyPlacedBy: process.env.HAPI_API_KEY_PLACED_BY }
+            : {}),
         }
       : {}),
     // Issue #1633: persist the Safe Mode flag so server-side respawns

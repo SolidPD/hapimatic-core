@@ -25,7 +25,7 @@
 
 import { access as fsAccess } from "node:fs/promises";
 import type { Session } from "@hapi/protocol/types";
-import { isYoloEquivalentMode } from "@hapi/protocol";
+import { inheritSpawnPosture, respawnYoloFromPosture } from "@hapi/protocol";
 import type { SpawnSessionOptions } from "./syncEngine";
 import type { SessionCache } from "./sessionCache";
 import type { RpcGateway } from "./rpcGateway";
@@ -451,12 +451,11 @@ export class SessionRespawn {
           directory: cwd,
           agent,
           // Round 11 (epic #3285): a SAVED permission posture
-          // (metadata.permissionMode — stamped by the CLI on a live mode change, or
-          // staged by the disconnected Session Configuration save) decides the
-          // respawn's --yolo. Absent → the pre-existing always-bypass reconnect.
-          yolo: session.metadata?.permissionMode
-            ? isYoloEquivalentMode(session.metadata.permissionMode)
-            : true,
+          // (metadata.permissionMode — stamped by the CLI at spawn (#6218) and on
+          // a live mode change, or staged by the disconnected Session
+          // Configuration save) decides the respawn's --yolo. Absent → the
+          // pre-existing always-bypass reconnect. One shared helper (#6218).
+          yolo: respawnYoloFromPosture(session.metadata?.permissionMode),
           claimPort: true,
           // Issue #1082 (ruling D5): codex threads its own resume id (→ the
           // daemon's tmux path → buildCodexCommand --hapi-codex-resume →
@@ -481,6 +480,8 @@ export class SessionRespawn {
           // reconnect respawns the key session on the node-default subscription.
           apiKeyId: session.metadata?.apiKeyId,
           apiKeyMasked: session.metadata?.apiKeyMasked,
+          // Issue #5819: the cross-node placement marker (re-checked at spawn).
+          apiKeyPlacedBy: session.metadata?.apiKeyPlacedBy,
           // Issue #1633: preserve Safe Mode across the respawn.
           safeMode: session.metadata?.safeMode === true,
           // Issue #1660: preserve the per-session launcher across the respawn
@@ -534,6 +535,7 @@ export class SessionRespawn {
               context: "reconnect",
               deadlineMs: ACCOUNT_SWITCH_SLOT_WAIT_DEADLINE_MS,
               elapsedMs: info.elapsedMs,
+              cause: info.cause,
             }),
             namespace: session.namespace,
           });
@@ -606,7 +608,7 @@ export class SessionRespawn {
     branchLabel?: string
   ): Promise<
     | { type: "success"; newSessionId: string }
-    | { type: "error"; message: string }
+    | { type: "error"; message: string; code?: string }
   > {
     const ctx = await this.resolveRespawnContext(sessionId, {
       logLabel: "Branch",
@@ -709,7 +711,9 @@ export class SessionRespawn {
       machineId,
       directory: cwd,
       agent,
-      yolo: true,
+      // Issue #6218 (absorbs #5353 R2): the branched child inherits the parent's
+      // SAVED posture (an absent posture keeps the legacy bypass branch).
+      ...inheritSpawnPosture(session.metadata?.permissionMode, agent),
       claimPort: true,
       resumeSessionId: claudeSessionId,
       name: branchLabel ?? undefined,
@@ -731,10 +735,14 @@ export class SessionRespawn {
       // daemon forces the SDK launcher for it); absent for a subscription parent.
       apiKeyId: session.metadata?.apiKeyId,
       apiKeyMasked: session.metadata?.apiKeyMasked,
+      // Issue #5819: a branch child of a cross-node placement is one too.
+      apiKeyPlacedBy: session.metadata?.apiKeyPlacedBy,
       // Issue #5879 (R7): a branched child keeps its parent's recorded reasoning
-      // effort. A branch carries `resumeSessionId`, so the daemon's fresh-spawn
-      // default does not apply to it, and without this it ran the binary default
-      // (reconnect already re-sources metadata.effort the same way).
+      // effort, threaded as a body effort (reconnect re-sources metadata.effort
+      // the same way). A branch carries `resumeSessionId`; since #6166 the
+      // daemon gives a resume that names no effort its node default, so a parent
+      // with no recorded level yields a child on the node default, not the
+      // binary default.
       effort: session.metadata?.effort,
     });
 
@@ -758,6 +766,7 @@ export class SessionRespawn {
       return { type: "success", newSessionId: result.sessionId };
     }
 
-    return { type: "error", message: result.message };
+    // Issue #5819: carry the spawn refusal's code (e.g. "api_key_not_shared").
+    return { type: "error", message: result.message, code: result.code };
   }
 }

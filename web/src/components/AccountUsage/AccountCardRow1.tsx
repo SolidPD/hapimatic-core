@@ -113,6 +113,16 @@ export type AccountCardRow1Props = {
   hardLock?: HardLock | null;
   /** A key card's status pill. */
   statusPill?: ReactNode;
+  /** A key card's credit column, right-aligned after the spacer (API key
+   *  budgets). */
+  trailing?: ReactNode;
+  /** Let the nickname use the row's free width instead of the 192 px cap — a
+   *  key card's name is its whole label. It fades only when the row is truly
+   *  too narrow. */
+  nicknameUncapped?: boolean;
+  /** Hide the secondary text below `sm` (a key card's masked key gives way
+   *  first on a phone). */
+  secondaryFromSm?: boolean;
   /** Move the status pill to a second row below `sm` (R11). */
   statusPillWraps?: boolean;
   /** The picker's "Current" marker, after the plan chip. */
@@ -222,6 +232,9 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
     alertNodes,
     score,
     statusPill,
+    trailing,
+    nicknameUncapped = false,
+    secondaryFromSm = false,
     statusPillWraps = false,
     currentMarker = false,
     expanded = false,
@@ -266,8 +279,11 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
   const secondaryClass = `text-[length:var(--text-body-dense)] text-[var(--app-hint)]${
     secondaryMono ? " font-mono" : ""
   }`;
-  const nicknameClass =
-    "max-w-24 text-[length:var(--text-label-strong)] font-semibold leading-none text-[var(--app-fg)] sm:max-w-48";
+  const nicknameText =
+    "text-[length:var(--text-label-strong)] font-semibold leading-none text-[var(--app-fg)]";
+  const nicknameClass = nicknameUncapped
+    ? `min-w-0 ${nicknameText}`
+    : `max-w-24 ${nicknameText} sm:max-w-48`;
 
   const pill =
     statusPill == null ? null : statusPillWraps ? (
@@ -318,7 +334,9 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
               data-testid="account-nickname"
               content={revealText}
               onClick={e => e.stopPropagation()}
-              className="flex min-w-0 shrink-0 items-center rounded-sm text-left"
+              className={`flex min-w-0 ${
+                nicknameUncapped ? "shrink" : "shrink-0"
+              } items-center rounded-sm text-left`}
             >
               <FadeTruncate className={nicknameClass}>{nickname}</FadeTruncate>
             </HoverTooltipButton>
@@ -334,7 +352,12 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
                 data-testid="account-secondary-toggle"
                 aria-expanded={expanded}
                 onClick={onToggle}
-                className="flex min-w-0 shrink items-center justify-start text-left font-normal hover:text-[var(--app-fg)]"
+                className={`${
+                  secondaryFromSm ? "hidden sm:flex" : "flex"
+                } min-w-0 ${
+                  // With an uncapped name, the secondary gives way first.
+                  nicknameUncapped ? "shrink-[20]" : "shrink"
+                } items-center justify-start text-left font-normal hover:text-[var(--app-fg)]`}
               >
                 <FadeTruncate className={secondaryClass}>
                   {secondary}
@@ -351,6 +374,7 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
         {onSelect ? null : (
           <span data-testid="account-row1-spacer" className="min-w-0 flex-1" />
         )}
+        {trailing}
         {alertNodes && alertNodes.length > 0 ? (
           <AccountAlertIcon nodes={alertNodes} />
         ) : null}

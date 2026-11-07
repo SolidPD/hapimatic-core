@@ -1,15 +1,185 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useEffect, useMemo, useRef } from "react";
-import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
-import type { MessagesResponse, SyncEvent } from "@/types/api";
+import {
+  useQueryClient,
+  type InfiniteData,
+  type QueryClient,
+} from "@tanstack/react-query";
+import type {
+  FederationAllSessionsResponse,
+  MessagesResponse,
+  SessionResponse,
+  SessionSummary,
+  SessionsResponse,
+  SyncEvent,
+} from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 import { upsertMessagesInCache } from "@/lib/messages";
 import { parseSseStream } from "@/lib/sse-stream";
 import { updateLastSeenSeq } from "@/lib/seq-tracker";
 import { errorReporter } from "@/lib/error-reporter";
+import {
+  isKeepaliveOnlyUpdate,
+  isKeepaliveShaped,
+  patchSessionActiveAt,
+  patchSessionDetailActiveAt,
+} from "@/lib/sessionHeartbeat";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
+}
+
+/** The caches a `session-updated` event can make stale. */
+function sessionCacheKeys(sessionId: string) {
+  return [
+    queryKeys.sessions,
+    queryKeys.federationAllSessions,
+    queryKeys.session(sessionId),
+  ];
+}
+
+function isSessionCacheFetching(
+  queryClient: QueryClient,
+  sessionId: string
+): boolean {
+  return sessionCacheKeys(sessionId).some(
+    queryKey => queryClient.isFetching({ queryKey, exact: true }) > 0
+  );
+}
+
+/**
+ * Invalidate the lists any session change can make stale. The federation list
+ * is included because the SSE bridge forwards session events from remote
+ * nodes, so thinking/active changes for remote sessions must refresh it too.
+ * File claims are included because a session's death auto-releases its claims
+ * (File Conflict Monitor #1971); `["file-claims"]` prefix-matches every
+ * per-repo `["file-claims", repo]` query (queryKeys.fileClaims).
+ */
+function invalidateSessionLists(queryClient: QueryClient): void {
+  void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
+  void queryClient.invalidateQueries({
+    queryKey: queryKeys.federationAllSessions,
+  });
+  void queryClient.invalidateQueries({ queryKey: ["file-claims"] });
+}
+
+/** The response to a changed session: invalidate the lists and claims, refetch the detail. */
+function refetchAfterSessionChange(
+  queryClient: QueryClient,
+  sessionId: string
+): void {
+  invalidateSessionLists(queryClient);
+  void queryClient.refetchQueries({ queryKey: queryKeys.session(sessionId) });
+}
+
+/**
+ * Issue #6208: decide what a `session-updated` event needs.
+ *
+ * - "refetch": not a keepalive, or a value differs from the cache.
+ * - "absorbed": every cached copy already shows what the keepalive carries;
+ *   only a newer `activeAt` was written (when it moved by ≥ 20 s).
+ * - "deferred": a keepalive arrived while one of the session's caches was
+ *   refetching. It is held in `pending` and re-checked against what that fetch
+ *   lands (see {@link recheckPendingKeepalives}). Invalidating here instead would
+ *   cancel and restart the in-flight fetch on every keepalive; with keepalives
+ *   arriving faster than a fetch completes, the lists never land and every tab
+ *   refetches continuously (measured in Edge on the SL7: 927 of 927 keepalives
+ *   in 30 s, 1,878 list requests, create page 9 s).
+ */
+function classifySessionUpdate(
+  queryClient: QueryClient,
+  pending: Map<string, unknown>,
+  sessionId: string,
+  data: unknown
+): "refetch" | "absorbed" | "deferred" {
+  if (!isKeepaliveShaped(data)) {
+    // The refetch this event triggers supersedes any keepalive still held.
+    pending.delete(sessionId);
+    return "refetch";
+  }
+  if (isSessionCacheFetching(queryClient, sessionId)) {
+    pending.set(sessionId, data);
+    return "deferred";
+  }
+  // Decided now, so a keepalive still held is superseded. One can outlive its
+  // fetch: a cancel with revert settles it with neither success nor error.
+  pending.delete(sessionId);
+  return applyKeepaliveIfUnchanged(queryClient, sessionId, data)
+    ? "absorbed"
+    : "refetch";
+}
+
+/**
+ * Re-check keepalives held while a fetch was in flight, once none of their
+ * session's caches is still fetching. A keepalive the landed data agrees with
+ * is absorbed; one it contradicts (the fetch started before a newer change)
+ * takes the refetch path, so a superseded response cannot stick.
+ */
+function recheckPendingKeepalives(
+  queryClient: QueryClient,
+  pending: Map<string, unknown>
+): void {
+  for (const [sessionId, data] of [...pending]) {
+    if (isSessionCacheFetching(queryClient, sessionId)) continue;
+    pending.delete(sessionId);
+    if (!applyKeepaliveIfUnchanged(queryClient, sessionId, data)) {
+      refetchAfterSessionChange(queryClient, sessionId);
+    }
+  }
+}
+
+/**
+ * Absorb a keepalive without a refetch when every cached copy of the session
+ * already shows what it carries: only a newer `activeAt` is written into the
+ * caches (and only when it moved by ≥ 20 s). Returns false, touching nothing,
+ * when anything differs.
+ */
+function applyKeepaliveIfUnchanged(
+  queryClient: QueryClient,
+  sessionId: string,
+  data: unknown
+): boolean {
+  const local = queryClient.getQueryData<SessionsResponse>(queryKeys.sessions);
+  const federation = queryClient.getQueryData<FederationAllSessionsResponse>(
+    queryKeys.federationAllSessions
+  );
+  const rows = [local, federation]
+    .map(list => list?.sessions.find(session => session.id === sessionId))
+    .filter((row): row is SessionSummary => row !== undefined);
+  if (rows.length === 0) return false;
+  const detail = queryClient.getQueryData<SessionResponse>(
+    queryKeys.session(sessionId)
+  );
+  if (!rows.every(row => isKeepaliveOnlyUpdate(data, row, detail?.session))) {
+    return false;
+  }
+
+  const activeAt = (data as { activeAt: number }).activeAt;
+  // Write only when a patch helper returns a new object: an unchanged cache
+  // is left alone so its observers are not notified at all. An `activeAt`
+  // patch is not a fetch, so it replaces `data` and nothing else. setQueryData
+  // would dispatch a fetch success: status "success", error cleared,
+  // `dataUpdatedAt` moved. That would hide a failed list fetch (the error
+  // banner, and the update auto-reload's "lists are known" check) and push back
+  // the list polls, which count from the last real fetch (msUntilPollDue).
+  const patch = <T>(queryKey: readonly unknown[], next: T) =>
+    queryClient
+      .getQueryCache()
+      .find({ queryKey, exact: true })
+      ?.setState({ data: next });
+  const nextLocal = patchSessionActiveAt(local, sessionId, activeAt);
+  if (nextLocal !== local) {
+    patch(queryKeys.sessions, nextLocal);
+  }
+  const nextFederation = patchSessionActiveAt(federation, sessionId, activeAt);
+  if (nextFederation !== federation) {
+    patch(queryKeys.federationAllSessions, nextFederation);
+  }
+  const nextDetail = patchSessionDetailActiveAt(detail, activeAt);
+  if (nextDetail !== detail) {
+    patch(queryKeys.session(sessionId), nextDetail);
+  }
+  return true;
 }
 
 type SSESubscription = {
@@ -45,6 +215,16 @@ function buildEventsUrl(
 
 /** Backoff delays in milliseconds: 1s, 2s, 4s, 8s, 16s, 30s cap */
 const BACKOFF_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
+
+/**
+ * Issue #6208 (R9): a stream that stayed up at least this long counts as a
+ * healthy connection, so a later mid-read failure reconnects from the base
+ * delay. A shorter-lived stream that fails mid-read keeps backing off, so that
+ * loop cannot reconnect (and resync) every second. This applies to the error
+ * path only: a stream that ends normally, or arrives with no body, always
+ * reconnects from the base delay.
+ */
+const STABLE_STREAM_MS = 30_000;
 
 function getBackoffDelay(attempt: number): number {
   return BACKOFF_DELAYS[Math.min(attempt, BACKOFF_DELAYS.length - 1)] ?? 30000;
@@ -124,6 +304,20 @@ export function useSSE(options: {
     abortControllerRef.current = controller;
     const { signal } = controller;
 
+    // Issue #6208: keepalives held while their session's caches were fetching,
+    // re-checked whenever a fetch lands (success or error).
+    const pendingKeepalives = new Map<string, unknown>();
+    const unsubscribeQueryCache = queryClient
+      .getQueryCache()
+      .subscribe(cacheEvent => {
+        if (pendingKeepalives.size === 0 || cacheEvent.type !== "updated") {
+          return;
+        }
+        const action = cacheEvent.action.type;
+        if (action !== "success" && action !== "error") return;
+        recheckPendingKeepalives(queryClient, pendingKeepalives);
+      });
+
     const handleSyncEvent = (event: SyncEvent) => {
       if (event.type === "message-received") {
         // Track highest seen seq for backfill on reconnect
@@ -143,24 +337,33 @@ export function useSSE(options: {
         });
       }
 
+      // Issue #6208: the server re-sends every live session about every
+      // 10–12 s. A keepalive the cache already matches is absorbed (only
+      // activeAt moves); one that arrives while a list or detail fetch is in
+      // flight is held and re-checked when that fetch lands
+      // (recheckPendingKeepalives). Either way the refetches below are
+      // skipped: they would change nothing on screen but re-render the whole
+      // chat. The rest of this handler, including the onEvent callback at the
+      // end, still runs.
+      const skipRefetchForKeepalive =
+        event.type === "session-updated" &&
+        classifySessionUpdate(
+          queryClient,
+          pendingKeepalives,
+          event.sessionId,
+          event.data
+        ) !== "refetch";
+
       if (
-        event.type === "session-added" ||
-        event.type === "session-updated" ||
-        event.type === "session-removed"
+        !skipRefetchForKeepalive &&
+        (event.type === "session-added" ||
+          event.type === "session-updated" ||
+          event.type === "session-removed")
       ) {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
-        // Also invalidate federation data — SSE bridge forwards session events
-        // from remote nodes, so thinking/active state changes for remote
-        // sessions need to refresh the federation session list too.
-        void queryClient.invalidateQueries({
-          queryKey: queryKeys.federationAllSessions,
-        });
-        // File Conflict Monitor (#1971): a session's death auto-releases its
-        // claims, so refresh the conflict table near-instantly. Prefix-matches
-        // every per-repo `["file-claims", repo]` query (queryKeys.fileClaims).
-        void queryClient.invalidateQueries({ queryKey: ["file-claims"] });
+        invalidateSessionLists(queryClient);
         if ("sessionId" in event) {
           if (event.type === "session-removed") {
+            pendingKeepalives.delete(event.sessionId);
             void queryClient.removeQueries({
               queryKey: queryKeys.session(event.sessionId),
             });
@@ -608,6 +811,10 @@ export function useSSE(options: {
       // Get the latest token before each connection attempt
       const currentToken = getTokenRef.current?.() || options.token;
       const url = buildEventsUrl(options.baseUrl, currentToken, subscription);
+      // Issue #6208 (R9): when this attempt's stream stayed up long enough to
+      // count as healthy, a later mid-read failure is a fresh outage and
+      // reconnects from the base delay, not from this attempt's backoff step.
+      let connectedAt: number | null = null;
 
       try {
         const response = await fetch(url, {
@@ -636,9 +843,11 @@ export function useSSE(options: {
           return;
         }
 
-        // Success — reset backoff and notify
+        // Connected — notify, and note when, so a later mid-read failure can
+        // tell a stable stream from a flapping one (STABLE_STREAM_MS).
         onConnectRef.current?.();
         connectedRef.current = true;
+        connectedAt = Date.now();
 
         const body = response.body;
         if (!body) {
@@ -665,7 +874,7 @@ export function useSSE(options: {
           attemptSignal.removeEventListener("abort", onAbort);
         }
 
-        // Stream ended normally — reconnect immediately (backoff reset)
+        // Stream ended normally — reconnect from the base delay (backoff reset)
         connectedRef.current = false;
         if (!attemptSignal.aborted) {
           onDisconnectRef.current?.("closed");
@@ -682,7 +891,9 @@ export function useSSE(options: {
         connectedRef.current = false;
         onErrorRef.current?.(error);
         onDisconnectRef.current?.("error");
-        scheduleReconnect(attempt);
+        const stayedUp =
+          connectedAt !== null && Date.now() - connectedAt >= STABLE_STREAM_MS;
+        scheduleReconnect(stayedUp ? 0 : attempt);
       }
     };
 
@@ -725,6 +936,8 @@ export function useSSE(options: {
 
     return () => {
       window.removeEventListener("online", onOnline);
+      unsubscribeQueryCache();
+      pendingKeepalives.clear();
       controller.abort();
       attemptControllerRef.current?.abort();
       if (reconnectTimerRef.current) {

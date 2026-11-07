@@ -12,6 +12,7 @@
  * rewrite of inline meta objects.
  */
 import { z } from "zod";
+import { ContextUsageDetailSchema } from "@hapi/protocol";
 import type { CapabilityMeta } from "./types";
 
 const abortInput = z.object({});
@@ -56,7 +57,14 @@ export const MCP_TOGGLE_META: CapabilityMeta = {
 // `mcp_reconnect` was DROPPED (expert-review ruling 1B-29): zero implementation
 // exists repo-wide, and advertising meta for vaporware would make the registry lie.
 
-const getContextUsageInput = z.object({});
+// Issue #6170: `detail: "full"` asks for Claude Code's full breakdown; absent or
+// "summary" keeps the five-field reply. `detail` selects the reply's shape only:
+// on the default path Claude Code itself still receives no `detail`. Optional,
+// so `{}` stays valid for every existing caller (the #2419 ajv gate rejects
+// keys a schema does not declare).
+const getContextUsageInput = z.object({
+  detail: z.enum(["summary", "full"]).optional(),
+});
 const setModelInput = z.object({
   // Model family/mode: "sonnet" | "opus" | "fable" | "default" (kept a bare
   // string here to avoid coupling the meta module to ModelModeSchema's enum —
@@ -64,28 +72,32 @@ const setModelInput = z.object({
   modelMode: z.string(),
 });
 
-// Slim shape of Query.getContextUsage()'s ContextUsagePayload (cli/src/claude/
-// sdk/types.ts) — documents the `usage` field the handler returns on success.
-const contextUsagePayloadSchema = z.object({
-  model: z.string(),
-  maxTokens: z.number(),
-  rawMaxTokens: z.number(),
-  totalTokens: z.number(),
-  percentage: z.number(),
-});
-
 /**
  * `get-context-usage` — the session's live context-window usage (model,
  * effective window, live token count + percentage). `readonly`: a pure read
  * that returns the payload; the handler wraps the already-built
  * `Query.getContextUsage()` (issue #1469) and returns a CLI-shaped
- * `no_active_query` when the session is idle.
+ * `no_active_query` when no Claude process is attached.
+ *
+ * Issue #6170: `{ detail: "full" }` returns Claude Code's full breakdown
+ * (`Query.getContextUsageDetail()`); the default reply is unchanged. The
+ * outputSchema documents the `usage` field: the five core fields always, the
+ * breakdown sections only for the full form (`ContextUsageDetailSchema`).
+ *
+ * Why this stays `readonly` although the full form lists file paths (the R4
+ * rule below, the #3745 block, keeps fs-disclosing tool-group reads off the
+ * generic invoke path): the reply is metadata only — token counts, names, and
+ * memory-file, agent and skill paths the handler shortens (relative to the
+ * working directory, `~/…`, `<account>/…`, `<project>`) — never file content;
+ * AC2 of #6170 requires the method to stay generically invocable; and every
+ * invoke is namespace-scoped. The default reply carries no paths; an agent gets
+ * the full reply only when it passes `{ "detail": "full" }`.
  */
 export const GET_CONTEXT_USAGE_META: CapabilityMeta = {
   description:
-    "Live context-window usage for this session: active model, effective context window, live token count and usage percentage. Returns { ok: true, usage } on success, or a { ok: false, code: 'no_active_query' } response when the session is idle.",
+    'Live context-window usage for this session: active model, effective context window, live token count and usage percentage. Returns { ok: true, usage } on success, or a { ok: false, code: \'no_active_query\' } response when no Claude process is attached. Pass { "detail": "full" } for the full per-category breakdown (memory files, MCP tools and server instructions, agents, skills, messages); that reply is large, so omit it when only the totals are needed.',
   inputSchema: z.toJSONSchema(getContextUsageInput),
-  outputSchema: z.toJSONSchema(contextUsagePayloadSchema),
+  outputSchema: z.toJSONSchema(ContextUsageDetailSchema),
   riskTier: "readonly",
   since: "2026-08-08",
 };
@@ -652,14 +664,16 @@ const recoverWorktreeInput = z.object({ originalPath: z.string() });
  * `recover-worktree` — re-materialise a soft-deleted worktree from
  * `.worktrees/.trash/` back to its ORIGINAL recorded path (issue #3839, D28:
  * restore-from-trash before resuming an orphaned transcript). `mutating`: it
- * moves a worktree, but it never deletes or overwrites anything — it refuses
- * when the destination already exists and touches only the trash entry whose
- * recorded `originalPath` equals the requested path (no caller-named holding
- * dir, no branch operation).
+ * moves a worktree back — or, for an entry whose working tree disk pressure
+ * evicted (#6158), re-adds it from its kept branch and restores its
+ * work-in-progress snapshot — but it never deletes or overwrites anything: it
+ * refuses when the destination already exists and touches only the trash entry
+ * whose recorded `originalPath` equals the requested path (no caller-named
+ * holding dir; no branch is created, renamed or deleted).
  */
 export const RECOVER_WORKTREE_META: CapabilityMeta = {
   description:
-    "Restore a soft-deleted worktree from .worktrees/.trash to its original recorded path (machine-scoped). Mutating — moves a worktree; refuses when the destination exists, never deletes, never touches a branch.",
+    "Restore a soft-deleted worktree from .worktrees/.trash to its original recorded path (machine-scoped). Mutating — moves the worktree back, or re-adds an evicted one from its kept branch with its uncommitted work restored; refuses when the destination exists, never deletes, never creates, renames or deletes a branch.",
   inputSchema: z.toJSONSchema(recoverWorktreeInput),
   riskTier: "mutating",
   since: "2026-09-23",

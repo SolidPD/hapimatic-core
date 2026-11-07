@@ -12,13 +12,43 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { HandoffPendingGate, Session } from "@hapi/protocol";
-import { renderHandoffMessage } from "@hapi/protocol";
+import { inheritSpawnPosture, renderHandoffMessage } from "@hapi/protocol";
+import { isEffortLevel } from "@hapi/protocol/effort";
 
-import type { SyncEngine } from "../sync/syncEngine";
+import type { SpawnSessionOptions, SyncEngine } from "../sync/syncEngine";
 import type { Store } from "../store";
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { ContextWatermarkService } from "./contextWatermarkService";
 import type { SuccessorHandoffDeps } from "../sync/successorHandoffStep";
+
+/**
+ * Issue #6166 (R5): the model and effort pins a context-watermark successor
+ * inherits from its predecessor. The model pin travels — `rawModel`, or
+ * `modelMode` when no raw id is pinned (the two are mutually exclusive) — so the
+ * successor runs the same model. The effort travels only when it was an
+ * explicit pick (a level with no `nodeDefaultEffort` marker): the daemon never
+ * fits a body effort to the model, so a defaulted effort is omitted and the
+ * successor gets a fresh node default fitted to that model.
+ */
+export function successorSpawnPins(
+  predecessor: Session
+): Pick<SpawnSessionOptions, "rawModel" | "modelMode" | "effort"> {
+  const metadata = predecessor.metadata;
+  const pins: Pick<SpawnSessionOptions, "rawModel" | "modelMode" | "effort"> =
+    {};
+  if (metadata?.rawModel) {
+    pins.rawModel = metadata.rawModel;
+  } else if (metadata?.modelMode && metadata.modelMode !== "default") {
+    pins.modelMode = metadata.modelMode;
+  }
+  if (
+    isEffortLevel(metadata?.effort) &&
+    !isEffortLevel(metadata?.nodeDefaultEffort)
+  ) {
+    pins.effort = metadata.effort;
+  }
+  return pins;
+}
 
 export function buildSuccessorHandoffDeps(args: {
   syncEngine: SyncEngine;
@@ -75,18 +105,27 @@ export function buildSuccessorHandoffDeps(args: {
       // Spawn as a SIMPLE session in the predecessor's own cwd (same machine,
       // same directory) — mirrors the sessionRespawn fork path, so the successor
       // sees the handoff packet on disk and shares the initiative worktree. The
-      // successor inherits the predecessor's role (pm) and account binding.
+      // successor inherits the predecessor's role (pm), account binding, model
+      // pin and an explicit effort (#6166).
       const result = await syncEngine.spawnSession({
         machineId,
         directory: cwd,
         sessionType: "simple",
+        // Issue #6218: the successor continues the predecessor's work, so it
+        // inherits the predecessor's SAVED posture rather than the node default
+        // (a bypass PM successor stays YOLO; a legacy record with no posture keeps
+        // the old implicit YOLO).
+        ...inheritSpawnPosture(predecessor.metadata?.permissionMode, "claude"),
         name: `${baseName}-successor`,
         parentSessionId: predecessor.id,
         accountUuid: predecessor.metadata?.accountUuid,
         // Issue #4568 (R6): a successor of an API-key session bills the same key.
         apiKeyId: predecessor.metadata?.apiKeyId,
         apiKeyMasked: predecessor.metadata?.apiKeyMasked,
+        // Issue #5819: a successor of a cross-node placement is one too.
+        apiKeyPlacedBy: predecessor.metadata?.apiKeyPlacedBy,
         sessionRole: predecessor.metadata?.sessionRole,
+        ...successorSpawnPins(predecessor),
         awaitWebhook: true, // "spawned" means "actually alive" — needed by confirm
       });
       if (result.type === "error") {

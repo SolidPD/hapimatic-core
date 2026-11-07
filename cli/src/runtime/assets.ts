@@ -12,11 +12,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, isAbsolute, join, sep } from "node:path";
 import type { EmbeddedAsset } from "#embedded-assets";
-import { isBunCompiled, runtimeAssetsBasePath } from "@/projectPath";
+import {
+  isBunCompiled,
+  runtimeAssetsBasePath,
+  runtimePath,
+} from "@/projectPath";
 import { runtimeAssetsKey } from "@/runtime/assetsKey";
 import {
+  GIT_LFS_DIR,
   TOOL_EXTRACT_OPTIONS,
   runtimeDirProblem,
   unpackTools,
@@ -327,4 +332,55 @@ export async function ensureRuntimeAssets(): Promise<void> {
     key: runtimeAssetsKey(),
     populate: populateFromEmbeddedAssets,
   });
+}
+
+/** How every bundled git-lfs folder's path ends, whichever build or instance it came from. */
+const BUNDLED_GIT_LFS_TAIL = `${sep}${join("tools", "unpacked", GIT_LFS_DIR)}`;
+
+/**
+ * #6223: `path` with `dir` as its one bundled git-lfs folder, at the end, so a
+ * git-lfs the machine has installed keeps winning. Any other bundled folder is
+ * dropped, because a tmux server outlives the daemon that started it and hands
+ * each new pane its own PATH, so a folder from an older build would otherwise
+ * outrank this one after a tool update.
+ */
+export function withBundledGitLfsFolder(
+  path: string | undefined,
+  dir: string,
+  separator: string = delimiter
+): string {
+  if (!path) {
+    return dir;
+  }
+  return [
+    ...path
+      .split(separator)
+      .filter(entry => !entry.endsWith(BUNDLED_GIT_LFS_TAIL)),
+    dir,
+  ].join(separator);
+}
+
+/**
+ * #6223: puts the bundled git-lfs on this process's PATH. Every agent launcher,
+ * the daemon and the terminal build their child env from process.env, so this
+ * one line reaches them all, and a customer gets git-lfs when they apply the
+ * update, with no inbound access needed.
+ *
+ * A relative HAPI_HOME is refused, not resolved: the daemon hands it to a child
+ * whose working directory is the repo, so it would resolve inside the repo and a
+ * repo could run its own git-lfs. A path holding the PATH delimiter is refused
+ * too, because PATH would split it and leave a relative entry.
+ */
+export function addBundledGitLfsToPath(
+  root: string = runtimePath(),
+  env: NodeJS.ProcessEnv = process.env
+): void {
+  const dir = join(root, "tools", "unpacked", GIT_LFS_DIR);
+  if (!isAbsolute(dir) || dir.includes(delimiter)) {
+    logger.debug(`[RUNTIME] not adding ${dir} to PATH: relative or ambiguous`);
+    return;
+  }
+  if (existsSync(dir)) {
+    env.PATH = withBundledGitLfsFolder(env.PATH, dir);
+  }
 }

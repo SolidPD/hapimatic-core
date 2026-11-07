@@ -49,7 +49,8 @@ import type {
  * Issue #2646 (OmniBox Phase-1, Path 3): the credential set the long-lived tmux
  * server must NOT freeze into its global env table (the `tmux show-environment`
  * read path). The union of {@link BINDING_ENV_VARS} (CLAUDE_CODE_OAUTH_TOKEN,
- * CLAUDE_CONFIG_DIR, HAPI_ACCOUNT_UUID, HAPI_API_KEY_ID, HAPI_API_KEY_MASKED) and
+ * CLAUDE_CONFIG_DIR, HAPI_ACCOUNT_UUID, HAPI_API_KEY_ID, HAPI_API_KEY_MASKED,
+ * HAPI_API_KEY_PLACED_BY) and
  * {@link SECRET_ENV_VARS} (CLI_API_TOKEN
  * and the other daemon-only secrets). Derived from the canonical sets, never
  * hardcoded. `GH_TOKEN` is now IN the strip via SECRET_ENV_VARS membership —
@@ -2498,7 +2499,7 @@ export class TmuxManager {
     //
     // Issue #3731 (R3): the account-binding set (BINDING_ENV_VARS —
     // CLAUDE_CODE_OAUTH_TOKEN / CLAUDE_CONFIG_DIR / HAPI_ACCOUNT_UUID /
-    // HAPI_API_KEY_ID / HAPI_API_KEY_MASKED) is scrubbed
+    // HAPI_API_KEY_ID / HAPI_API_KEY_MASKED / HAPI_API_KEY_PLACED_BY) is scrubbed
     // UNGATED. A binding var in a GLOBAL table is contamination by definition (every
     // per-session binding travels in that session's 0600 env file), and the exposure
     // lives on default-configured cloud VMs where the sandbox switch is OFF: the

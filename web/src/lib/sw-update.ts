@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { reloadWhenVisible } from "./safe-reload";
 import { errorReporter } from "./error-reporter";
+import { versionPairKey } from "./app-version";
 
 /**
  * Service-worker registration + update coordination (issue #1793).
@@ -50,6 +51,21 @@ const ACTIVATION_STALL_TIMEOUT_MS = 4000;
 let hadController = false;
 let controllerReloadFired = false;
 let registrationCleanup: (() => void) | null = null;
+
+// #3491: client/server version pairs this page already reported, so a pair
+// yields one telemetry row however often the engine re-renders.
+const reportedVersionMismatches = new Set<string>();
+
+/**
+ * #3491 one-shot guard for the AUTOMATIC activation, keyed per tab and port
+ * (sessionStorage dies with the tab, so a later genuine deploy is not
+ * suppressed). It must survive the reload because every latch above is a module
+ * `let` that the reload wipes: without it, an automatic trigger plus the
+ * stall fallback below reloads every ~4 s whenever iOS drops SKIP_WAITING.
+ */
+const MISMATCH_AUTO_KEY = `hapi:mismatch-auto-attempted::${
+  typeof window !== "undefined" ? window.location.origin : ""
+}`;
 
 /** True once a waiting SW has been detected (read by the update surfaces on mount). */
 export function isSwUpdatePending(): boolean {
@@ -265,12 +281,84 @@ export function activateSwUpdate(): void {
 }
 
 /**
+ * Record that this bundle is not the build the server runs (#3491). One
+ * `client-version-mismatch` row per client/server pair per page, recorded to
+ * `error_logs` for fleet tooling. A distinct category: `version-mismatch` is
+ * already the store's optimistic-concurrency discriminator.
+ *
+ * Durable on purpose: the automatic activation usually reloads the page within
+ * a few seconds of the detection, and `report()`'s 2 s batch debounce dies with
+ * the page (measured on a worktree instance: the auto-reloaded page's row never
+ * arrived). `reportBeforeReload()` persists to the outbox at once; the reloaded
+ * page delivers it, and a page that stays delivers it on its next API success.
+ */
+export function reportClientVersionMismatch(
+  client: string,
+  server: string
+): void {
+  const pair = versionPairKey(client, server);
+  if (reportedVersionMismatches.has(pair)) return;
+  reportedVersionMismatches.add(pair);
+  errorReporter.reportBeforeReload({
+    message: `Client bundle v${client} differs from server v${server}`,
+    category: "client-version-mismatch",
+    severity: "warn",
+    context: `client=${client} server=${server} waitingWorker=${swUpdatePending}`,
+  });
+}
+
+/**
+ * Whether this tab already auto-activated for `pair` (#3491). True when the
+ * guard cannot be read: without a working store the guard cannot survive the
+ * reload, so the automatic path stays off and the user's tap still works.
+ */
+export function hasMismatchAutoAttempted(pair: string): boolean {
+  try {
+    return sessionStorage.getItem(MISMATCH_AUTO_KEY) === pair;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The automatic half of the version-mismatch flow (#3491): activate the
+ * waiting worker once per client/server pair, without a tap. Returns true when
+ * it started the activation.
+ *
+ * It refuses (returns false) when there is no waiting worker (a same-version
+ * deploy cannot reach here, but a stale latch can), when this tab already tried
+ * for the pair, or when the guard cannot be written. The guard is written and
+ * read back BEFORE SKIP_WAITING is posted, so a reload — the normal one or the
+ * stall fallback's — lands on a page that does not try again: that page offers
+ * the tap instead (#1793 semantics). A later pair (A→B, then B→C) gets its own
+ * single attempt.
+ */
+export function autoActivateSwUpdateForMismatch(pair: string): boolean {
+  if (!waitingRegistration?.waiting) return false;
+  if (hasMismatchAutoAttempted(pair)) return false;
+  try {
+    sessionStorage.setItem(MISMATCH_AUTO_KEY, pair);
+    if (sessionStorage.getItem(MISMATCH_AUTO_KEY) !== pair) return false;
+  } catch {
+    return false;
+  }
+  activateSwUpdate();
+  return true;
+}
+
+/**
  * Test-only reset of module state (mirrors ErrorReporter.dispose()'s test
  * intent). Removes the listeners/timer registerServiceWorker() installed so
  * they cannot accumulate across tests under isolate:false. Production never
  * calls this.
  */
 export function resetSwUpdateForTests(): void {
+  reportedVersionMismatches.clear();
+  try {
+    sessionStorage.removeItem(MISMATCH_AUTO_KEY);
+  } catch {
+    // no store, nothing to clear
+  }
   swUpdatePending = false;
   waitingRegistration = null;
   activating = false;

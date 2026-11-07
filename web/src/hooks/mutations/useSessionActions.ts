@@ -27,6 +27,13 @@ import {
   markActionPending,
   clearActionPending,
 } from "@/lib/session-action-pending";
+import {
+  dropSessionDetailCaches,
+  removeSessionRows,
+  restoreSessionRowsById,
+  snapshotSessionLists,
+  type SessionListSnapshots,
+} from "@/lib/sessionListOptimistic";
 
 /**
  * Collect all descendant session IDs (children, grandchildren, etc.)
@@ -788,65 +795,10 @@ export function useSessionActions(
   // the single-session recipe (#1902 optimism + #2556 bubble cleanup); the cascade
   // wrapper is BESPOKE — it walks N descendants, marks each for the route guard,
   // chunks the 100-id bulk cap, and reconciles a partial skip.
-  // The pre-removal snapshots of both list caches — what a rollback restores.
-  type ListSnapshots = {
-    prevSessions: SessionsResponse | undefined;
-    prevFederation: FederationAllSessionsResponse | undefined;
-  };
-
-  // Cancel any in-flight list fetch and snapshot both list caches. Split from
-  // `removeRows` because the cascade derives its id set FROM the snapshot.
-  const snapshotLists = async (): Promise<ListSnapshots> => {
-    await queryClient.cancelQueries({ queryKey: queryKeys.sessions });
-    await queryClient.cancelQueries({
-      queryKey: queryKeys.federationAllSessions,
-    });
-    return {
-      prevSessions: queryClient.getQueryData<SessionsResponse>(
-        queryKeys.sessions
-      ),
-      prevFederation: queryClient.getQueryData<FederationAllSessionsResponse>(
-        queryKeys.federationAllSessions
-      ),
-    };
-  };
-
-  // Optimistic removal: mark every id delete-pending (the route guard AND the
-  // list queryFns' refetch filter, `withoutDeletePending`), then drop the rows
-  // from both list caches. The mark goes first so a refetch that lands between
-  // the two steps is already filtered.
-  const removeRows = (ids: string[], snap: ListSnapshots): void => {
-    for (const id of ids) markActionPending(id, "delete");
-    const idSet = new Set(ids);
-    if (snap.prevSessions) {
-      queryClient.setQueryData<SessionsResponse>(queryKeys.sessions, {
-        ...snap.prevSessions,
-        sessions: snap.prevSessions.sessions.filter(s => !idSet.has(s.id)),
-      });
-    }
-    if (snap.prevFederation) {
-      queryClient.setQueryData<FederationAllSessionsResponse>(
-        queryKeys.federationAllSessions,
-        {
-          ...snap.prevFederation,
-          sessions: snap.prevFederation.sessions.filter(s => !idSet.has(s.id)),
-        }
-      );
-    }
-  };
-
-  // Rollback: restore both list caches from the snapshot.
-  const restoreRows = (snap: ListSnapshots): void => {
-    if (snap.prevSessions) {
-      queryClient.setQueryData(queryKeys.sessions, snap.prevSessions);
-    }
-    if (snap.prevFederation) {
-      queryClient.setQueryData(
-        queryKeys.federationAllSessions,
-        snap.prevFederation
-      );
-    }
-  };
+  // The snapshot / remove / restore helpers live in `lib/sessionListOptimistic`
+  // (#6210), shared with the Select-mode bulk delete. Removal and rollback are
+  // functional, by-id updates of the CURRENT caches, so a delete here can no
+  // longer undo a concurrent bulk delete's removals (or the reverse).
 
   const viewSessionToastAction = () =>
     onNavigateToSession && sessionId
@@ -863,7 +815,7 @@ export function useSessionActions(
   // archive — a fresh snapshot here would capture the row-less list and a
   // rollback would then "restore" the row to nowhere.
   const runDeleteSession = async (
-    preRemoved?: ListSnapshots
+    preRemoved?: SessionListSnapshots
   ): Promise<void> => {
     if (!api || !sessionId) {
       throw new Error("Session unavailable");
@@ -873,21 +825,17 @@ export function useSessionActions(
     // network call, so the row leaves instantly and the header can navigate away.
     let snap = preRemoved;
     if (!snap) {
-      snap = await snapshotLists();
-      removeRows([sessionId], snap);
+      snap = await snapshotSessionLists(queryClient);
+      removeSessionRows(queryClient, [sessionId]);
     }
     try {
       // Raw fetch promise — NOT observer-tied, so it settles after the unmount.
       await api.deleteSession(sessionId);
       // Success: drop the per-session caches (#1902; #2556 optimistic-bubble store).
-      queryClient.removeQueries({ queryKey: queryKeys.session(sessionId) });
-      queryClient.removeQueries({ queryKey: queryKeys.messages(sessionId) });
-      queryClient.removeQueries({
-        queryKey: queryKeys.optimisticMessages(sessionId),
-      });
+      dropSessionDetailCaches(queryClient, [sessionId]);
     } catch (err) {
       // Failure: roll the row back and toast with a back-link to the session.
-      restoreRows(snap);
+      restoreSessionRowsById(queryClient, snap, [sessionId]);
       showToast("Failed to delete session", {
         type: "error",
         ...viewSessionToastAction(),
@@ -918,14 +866,14 @@ export function useSessionActions(
       throw new Error("Session unavailable");
     }
     setIsDeleting(true);
-    const snap = await snapshotLists();
-    removeRows([sessionId], snap);
+    const snap = await snapshotSessionLists(queryClient);
+    removeSessionRows(queryClient, [sessionId]);
     try {
       await api.archiveSession(sessionId);
     } catch (err) {
       // The archive failed, so the session is still live and undeletable: put
       // the row back, drop the mark, and toast with a back-link.
-      restoreRows(snap);
+      restoreSessionRowsById(queryClient, snap, [sessionId]);
       setIsDeleting(false);
       clearActionPending(sessionId, "delete");
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
@@ -947,7 +895,7 @@ export function useSessionActions(
     }
     setIsDeleting(true);
     await queryClient.cancelQueries({ queryKey: queryKeys.session(sessionId) });
-    const snap = await snapshotLists();
+    const snap = await snapshotSessionLists(queryClient);
     const { prevSessions, prevFederation } = snap;
 
     // Same descendant walk the "Delete all (N)" count uses (#2480), so the
@@ -964,7 +912,7 @@ export function useSessionActions(
 
     // Optimistic removal from BOTH list caches + the route-guard / refetch mark
     // for every removed session. Cleared for the whole set in the finally.
-    removeRows(ids, snap);
+    removeSessionRows(queryClient, ids);
 
     try {
       // Archive active descendants (raw api — survives the unmount), then chunk
@@ -990,48 +938,15 @@ export function useSessionActions(
       }
       const skippedSet = new Set(skipped);
       // Drop the per-session caches only for the ids the server actually deleted.
-      for (const id of ids) {
-        if (skippedSet.has(id)) continue;
-        queryClient.removeQueries({ queryKey: queryKeys.session(id) });
-        queryClient.removeQueries({ queryKey: queryKeys.messages(id) });
-        queryClient.removeQueries({
-          queryKey: queryKeys.optimisticMessages(id),
-        });
-      }
+      dropSessionDetailCaches(
+        queryClient,
+        ids.filter(id => !skippedSet.has(id))
+      );
       // Partial failure: the server kept some rows (still-active / unknown). The
       // call RESOLVED, so without this those rows would only reappear on the
       // finally's refetch — restore EXACTLY the skipped rows now and toast (R3).
       if (skipped.length > 0) {
-        const restoreSessions =
-          prevSessions?.sessions.filter(s => skippedSet.has(s.id)) ?? [];
-        if (restoreSessions.length > 0) {
-          queryClient.setQueryData<SessionsResponse>(
-            queryKeys.sessions,
-            cur => {
-              if (!cur) return cur;
-              const have = new Set(cur.sessions.map(s => s.id));
-              const add = restoreSessions.filter(s => !have.has(s.id));
-              return add.length === 0
-                ? cur
-                : { ...cur, sessions: [...cur.sessions, ...add] };
-            }
-          );
-        }
-        const restoreFederation =
-          prevFederation?.sessions.filter(s => skippedSet.has(s.id)) ?? [];
-        if (restoreFederation.length > 0) {
-          queryClient.setQueryData<FederationAllSessionsResponse>(
-            queryKeys.federationAllSessions,
-            cur => {
-              if (!cur) return cur;
-              const have = new Set(cur.sessions.map(s => s.id));
-              const add = restoreFederation.filter(s => !have.has(s.id));
-              return add.length === 0
-                ? cur
-                : { ...cur, sessions: [...cur.sessions, ...add] };
-            }
-          );
-        }
+        restoreSessionRowsById(queryClient, snap, skipped);
         const n = skipped.length;
         showToast(`${n} session${n === 1 ? "" : "s"} could not be deleted`, {
           type: "error",
@@ -1040,7 +955,9 @@ export function useSessionActions(
       }
     } catch (err) {
       // Full failure: roll the whole optimistic removal back + toast (R3/R4).
-      restoreRows(snap);
+      // By id (#6210): the finally's refetch drops any row an earlier chunk
+      // did delete.
+      restoreSessionRowsById(queryClient, snap, ids);
       showToast("Failed to delete sessions", {
         type: "error",
         ...viewSessionToastAction(),

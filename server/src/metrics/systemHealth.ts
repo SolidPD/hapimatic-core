@@ -8,16 +8,18 @@
  *   2. the federation-token-gated `/api/federation/node-metrics` peer endpoint
  *      that the hub's HealthAggregator polls (#1445 Task 7).
  *
- * Behavior is intentionally identical to the pre-extraction code. In particular
- * the module-level CPU-sampler state and its 10s-staleness guard are preserved
- * exactly — moving the functions does not change their semantics.
+ * The extraction itself changed no behavior. CPU sampling was reworked later
+ * (#6156), below.
  *
- * ⚠️ Shared-state caveat (#1445 §10): `calculateCpuUsage()` keeps module-level
- * previous-sample state. After this extraction it is shared by (a) the local
+ * CPU sampling (#6156): `calculateCpuUsage()` is shared by (a) the local
  * `/system-health` route, (b) the local `/federation/node-metrics` endpoint, and
- * (c) the in-process aggregator sample. The 10s-staleness guard makes interleaving
- * safe, but two calls landing <10s apart can yield a `0%` reading for the second.
- * Acceptable for MVP; a dedicated background CPU sampler is a follow-up.
+ * (c) the in-process aggregator sample. It keeps a short ring of samples and
+ * measures against the newest one that is 1 to 60 s old, so close calls share a
+ * window and widely spaced pollers still get a reading. The `cpu-sampler` loop in
+ * `server/src/index.ts` adds a sample every 5 s. With no usable window (the first
+ * seconds after a start) the reading is `null`, never a fake `0`: before #6156 a
+ * sample older than 10 s returned 0, so about half of ms1's federation samples
+ * read `cpu=0` while the node was pegged.
  */
 import * as os from "node:os";
 import * as fs from "node:fs";
@@ -28,7 +30,8 @@ import { z } from "zod";
  */
 export interface SystemHealthMetrics {
   cpu: {
-    usagePercent: number;
+    // null when no 1-60 s sample window exists yet (#6156); never a fake 0.
+    usagePercent: number | null;
     temperatureF: number | null; // Fahrenheit, null if unavailable
   };
   memory: {
@@ -68,7 +71,7 @@ export interface SystemHealthMetrics {
 export const SystemHealthMetricsSchema = z
   .object({
     cpu: z.object({
-      usagePercent: z.number(),
+      usagePercent: z.number().nullable(),
       temperatureF: z.number().nullable(),
     }),
     memory: z.object({
@@ -93,55 +96,85 @@ export const SystemHealthMetricsSchema = z
   })
   .passthrough();
 
-// Store previous CPU times for calculating usage percentage
-let previousCpuTimes: { idle: number; total: number } | null = null;
-let previousCpuTimestamp = 0;
+/** A sample is usable as the start of a window once it is this old. */
+export const CPU_SAMPLE_MIN_WINDOW_MS = 1000;
+/** Samples older than this are dropped: a window this long says little about now. */
+export const CPU_SAMPLE_MAX_WINDOW_MS = 60_000;
+/** How often the `cpu-sampler` loop (`server/src/index.ts`) records a sample. */
+export const CPU_SAMPLER_INTERVAL_MS = 5000;
+const CPU_SAMPLE_RING_LIMIT = 64;
 
-/**
- * Calculate CPU usage by comparing current times to previous sample.
- * Returns 0 on first call (need two samples to calculate delta).
- */
-export function calculateCpuUsage(): number {
-  const cpus = os.cpus();
+interface CpuSample {
+  at: number;
+  idle: number;
+  total: number;
+}
 
-  // Sum up all CPU times
-  let totalIdle = 0;
-  let totalTick = 0;
+let cpuSamples: CpuSample[] = [];
 
+function readCpuTimes(cpus: os.CpuInfo[]): { idle: number; total: number } {
+  let idle = 0;
+  let total = 0;
   for (const cpu of cpus) {
-    totalIdle += cpu.times.idle;
-    totalTick +=
+    idle += cpu.times.idle;
+    total +=
       cpu.times.user +
       cpu.times.nice +
       cpu.times.sys +
       cpu.times.idle +
       cpu.times.irq;
   }
+  return { idle, total };
+}
 
-  const currentTimes = { idle: totalIdle, total: totalTick };
-  const now = Date.now();
+function pushCpuSample(sample: CpuSample): void {
+  cpuSamples.push(sample);
+  cpuSamples = cpuSamples
+    .filter(s => sample.at - s.at <= CPU_SAMPLE_MAX_WINDOW_MS)
+    .slice(-CPU_SAMPLE_RING_LIMIT);
+}
 
-  // Need previous sample to calculate percentage
-  if (!previousCpuTimes || now - previousCpuTimestamp > 10000) {
-    // First call or stale data - store current and return 0
-    previousCpuTimes = currentTimes;
-    previousCpuTimestamp = now;
-    return 0;
+/** Record one CPU sample (the `cpu-sampler` loop's tick). */
+export function recordCpuSample(
+  now: number = Date.now(),
+  cpus: os.CpuInfo[] = os.cpus()
+): void {
+  pushCpuSample({ at: now, ...readCpuTimes(cpus) });
+}
+
+/**
+ * CPU usage in percent over the window since the newest stored sample that is
+ * 1 to 60 s old, or `null` when no such sample exists or the counters did not
+ * move (#6156). Every call also stores its own sample.
+ */
+export function calculateCpuUsage(
+  now: number = Date.now(),
+  cpus: os.CpuInfo[] = os.cpus()
+): number | null {
+  const current = { at: now, ...readCpuTimes(cpus) };
+  let base: CpuSample | null = null;
+  for (let i = cpuSamples.length - 1; i >= 0; i--) {
+    const age = now - cpuSamples[i].at;
+    if (age >= CPU_SAMPLE_MIN_WINDOW_MS && age <= CPU_SAMPLE_MAX_WINDOW_MS) {
+      base = cpuSamples[i];
+      break;
+    }
   }
+  pushCpuSample(current);
+  if (!base) return null;
 
-  // Calculate delta
-  const idleDelta = currentTimes.idle - previousCpuTimes.idle;
-  const totalDelta = currentTimes.total - previousCpuTimes.total;
-
-  // Update previous values
-  previousCpuTimes = currentTimes;
-  previousCpuTimestamp = now;
-
-  if (totalDelta === 0) return 0;
+  const idleDelta = current.idle - base.idle;
+  const totalDelta = current.total - base.total;
+  if (totalDelta <= 0) return null;
 
   // CPU usage = (total - idle) / total * 100
   const usagePercent = ((totalDelta - idleDelta) / totalDelta) * 100;
   return Math.max(0, Math.min(100, usagePercent));
+}
+
+/** Test seam: forget every stored CPU sample. */
+export function resetCpuSamplesForTest(): void {
+  cpuSamples = [];
 }
 
 /**
@@ -314,15 +347,21 @@ export async function getDiskUsage(): Promise<{
   }
 }
 
+/** A CPU percentage to one decimal; null stays null (no reading, not idle). */
+function roundCpuPercent(value: number | null): number | null {
+  return value === null ? null : Math.round(value * 10) / 10;
+}
+
 /**
  * Compose the full system-health metrics object — the same object the
  * `/api/system-health` route returns today. Single source of truth for both
  * the local route and the peer-facing `/api/federation/node-metrics` endpoint.
  */
+
 export async function gatherSystemHealth(): Promise<SystemHealthMetrics> {
   return {
     cpu: {
-      usagePercent: Math.round(calculateCpuUsage() * 10) / 10,
+      usagePercent: roundCpuPercent(calculateCpuUsage()),
       temperatureF: await getCpuTemperature(),
     },
     memory: getMemoryUsage(),

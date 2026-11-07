@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useQuery } from "@tanstack/react-query";
+import { queryOptions, useQuery } from "@tanstack/react-query";
 import type { ApiClient } from "@/api/client";
 import type { EffortLevel, FederationNodeStatus } from "@hapi/protocol";
 import type { DaemonCapSource } from "@hapi/protocol/schemas";
@@ -11,6 +11,7 @@ import {
   reconcilePendingSpawns,
 } from "@/lib/pending-spawns";
 import { withoutDeletePending } from "@/lib/session-action-pending";
+import { msUntilPollDue } from "@/lib/sessionHeartbeat";
 
 export type FederationRemoteNode = {
   nodeId: string;
@@ -43,17 +44,12 @@ export type FederationRemoteNode = {
 const EMPTY_REMOTE_SESSIONS: SessionSummary[] = [];
 const EMPTY_REMOTE_NODES: FederationRemoteNode[] = [];
 
-export function useFederatedSessions(api: ApiClient | null): {
-  remoteSessions: SessionSummary[];
-  remoteNodes: FederationRemoteNode[];
-  localNode: { nodeId: string; nodeLabel: string } | null;
-  /** #4461: the federation-nodes read has answered or failed (not pending). */
-  localNodeSettled: boolean;
-  isLoading: boolean;
-  error: string | null;
-  isEnabled: boolean;
-} {
-  const allSessionsQuery = useQuery({
+/**
+ * The all-sessions query, shared by every reader so the poll interval, the
+ * optimistic-override pass, and the spawn reconciliation cannot drift.
+ */
+function federationAllSessionsQuery(api: ApiClient | null) {
+  return queryOptions({
     queryKey: queryKeys.federationAllSessions,
     queryFn: async () => {
       if (!api) throw new Error("API unavailable");
@@ -78,15 +74,42 @@ export function useFederatedSessions(api: ApiClient | null): {
     },
     enabled: Boolean(api),
     // Background backstop poll (30s). SSE invalidates federationAllSessions
-    // on session-added/updated/removed events (see useSSE.ts) and mutations
-    // invalidate it directly, so this interval only catches drift in
-    // slowly-changing fields (nodeStatus, nodeUrl). Issue #1214.
-    refetchInterval: 30000,
+    // on real session changes (see useSSE.ts) and mutations invalidate it
+    // directly. This interval catches drift in slowly-changing fields
+    // (nodeStatus, nodeUrl; Issue #1214) and, since keepalives stopped
+    // refetching (Issue #6208), keeps remote rows' read-time fields
+    // (messageCount, workflowBadge) fresh. It counts from the last real fetch
+    // (msUntilPollDue), because keepalive `activeAt` patches restart
+    // TanStack's interval timer on every write.
+    refetchInterval: cached => msUntilPollDue(30_000, cached.state),
     // Don't fail hard if federation isn't enabled
     retry: 1,
   });
+}
 
-  // Fetch federation nodes to get localNode identity
+/**
+ * Issue #6208: keep the federation session list cached and fresh without
+ * re-rendering the caller (`notifyOnChangeProps: []`). A session view needs the
+ * cache — `SessionHeader` counts a session's remote descendants from it for
+ * "Delete all (N)", and the keepalive check compares remote sessions against
+ * it — but must not re-render on every change anywhere in the mesh.
+ */
+export function useFederationSessionsCache(api: ApiClient | null): void {
+  useQuery({ ...federationAllSessionsQuery(api), notifyOnChangeProps: [] });
+}
+
+/**
+ * Issue #6208: the local federation node identity, from the nodes query alone.
+ *
+ * Components that only need `localNode` use this instead of
+ * `useFederatedSessions`, because subscribing to the all-sessions list
+ * re-rendered them on every session change anywhere in the mesh.
+ */
+export function useFederationLocalNode(api: ApiClient | null): {
+  localNode: { nodeId: string; nodeLabel: string } | null;
+  /** #4461: the federation-nodes read has answered or failed (not pending). */
+  localNodeSettled: boolean;
+} {
   const nodesQuery = useQuery({
     queryKey: queryKeys.federationNodes,
     queryFn: async () => {
@@ -100,15 +123,40 @@ export function useFederatedSessions(api: ApiClient | null): {
   });
 
   return {
-    remoteSessions: allSessionsQuery.data?.sessions ?? EMPTY_REMOTE_SESSIONS,
-    remoteNodes: (allSessionsQuery.data?.nodes ??
-      EMPTY_REMOTE_NODES) as FederationRemoteNode[],
     localNode: nodesQuery.data?.localNode ?? null,
     // Issue #4461: true once `GET /api/federation/nodes` has answered OR failed.
     // A null `localNode` alone cannot tell a pending read from a failed one, and
     // the re-login deep link must not decide "UI host or not" while pending.
     localNodeSettled: nodesQuery.isFetched,
+  };
+}
+
+export function useFederatedSessions(api: ApiClient | null): {
+  remoteSessions: SessionSummary[];
+  remoteNodes: FederationRemoteNode[];
+  localNode: { nodeId: string; nodeLabel: string } | null;
+  /** #4461: the federation-nodes read has answered or failed (not pending). */
+  localNodeSettled: boolean;
+  isLoading: boolean;
+  /** #3491: the all-sessions read has answered and its last fetch did not fail. */
+  isSuccess: boolean;
+  error: string | null;
+  isEnabled: boolean;
+} {
+  const allSessionsQuery = useQuery(federationAllSessionsQuery(api));
+
+  // Fetch federation nodes to get localNode identity (one query definition,
+  // shared with the nodes-only hook so the two cannot drift).
+  const { localNode, localNodeSettled } = useFederationLocalNode(api);
+
+  return {
+    remoteSessions: allSessionsQuery.data?.sessions ?? EMPTY_REMOTE_SESSIONS,
+    remoteNodes: (allSessionsQuery.data?.nodes ??
+      EMPTY_REMOTE_NODES) as FederationRemoteNode[],
+    localNode,
+    localNodeSettled,
     isLoading: allSessionsQuery.isLoading,
+    isSuccess: allSessionsQuery.isSuccess,
     error:
       allSessionsQuery.error instanceof Error
         ? allSessionsQuery.error.message

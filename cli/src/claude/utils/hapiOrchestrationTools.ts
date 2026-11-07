@@ -25,10 +25,17 @@
  * directly (`createCapabilityTools().postDirect`), which checks the caller.
  */
 import { z } from "zod";
+import { type EffortLevel } from "@hapi/protocol/effort";
 import {
   ExistingBranchSchema,
   type ExistingBranch,
 } from "@hapi/protocol/gitBranches";
+import {
+  PERMISSION_MODES,
+  isYoloEquivalentMode,
+  type PermissionMode,
+} from "@hapi/protocol/modes";
+import { EffortLevelSchema } from "@hapi/protocol/schemas";
 
 /** The request a typed tool hands to `call()` — the `hapi_call` input. */
 export type TypedCallRequest = {
@@ -77,11 +84,12 @@ export type SpawnSessionArgs = {
   existingBranch?: ExistingBranch;
   name?: string;
   yolo?: boolean;
+  permissionMode?: PermissionMode;
   accountUuid?: string;
   forceAccount?: boolean;
   model?: string;
   modelMode?: string;
-  effort?: string;
+  effort?: EffortLevel;
 };
 
 export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
@@ -90,10 +98,16 @@ export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
     "Spawn a peer agent session on a machine and link it to THIS session as " +
     "its parent. sessionType: 'worktree' creates a git worktree for it. Wraps " +
     "machine-daemon.machine-spawn (POST /api/machines/:id/spawn, mutating). " +
-    "Find machine ids with hapi_call {GET, /api/machines}. The peer bypasses " +
-    "permission prompts unless you pass yolo: false; unless THIS session runs " +
-    "in a bypass permission mode you MUST pass yolo: false, or the call is " +
-    "refused (agent_escalation_refused). A 409 account_exhausted means the " +
+    "Find machine ids with hapi_call {GET, /api/machines}. With neither yolo " +
+    "nor permissionMode the peer starts in the node's default spawn " +
+    "permission mode, one step below YOLO unless the operator chose otherwise " +
+    "(Claude acceptEdits, Codex safe-yolo). Pass permissionMode for a specific " +
+    "mode, or yolo: true for a peer that bypasses permission prompts. Unless " +
+    "THIS session runs in a bypass permission mode, the peer is capped at THIS " +
+    "session's tier (default, plan and read-only are tier 0; acceptEdits and " +
+    "safe-yolo tier 1; YOLO tier 2): an explicit posture in a higher tier is " +
+    "refused (agent_escalation_refused), and an omitted one is lowered to THIS " +
+    "session's tier (to default at tier 0). A 409 account_exhausted means the " +
     "pinned accountUuid is at a usage cap: pin the named alternative, or pass " +
     "forceAccount: true to bind it anyway.",
   inputSchema: z.object({
@@ -120,7 +134,13 @@ export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
       .boolean()
       .optional()
       .describe(
-        "Peer bypasses permission prompts; OMITTED MEANS TRUE. Pass false for a prompting peer."
+        "true = the peer bypasses permission prompts. Omitted = the node's default spawn permission mode (not YOLO unless the operator set it)."
+      ),
+    permissionMode: z
+      .enum(PERMISSION_MODES)
+      .optional()
+      .describe(
+        "The peer's starting permission mode: default, acceptEdits, plan or bypassPermissions for Claude; default, read-only, safe-yolo or yolo for Codex. Overrides the node default; must agree with yolo when both are sent."
       ),
     accountUuid: z.string().optional(),
     // Issue #6028: the route accepts it and the 409 tells the caller to send
@@ -139,7 +159,12 @@ export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
         "Codex/opencode gateway model only; ignored for Claude (use modelMode)."
       ),
     modelMode: z.string().optional(),
-    effort: z.string().optional(),
+    // Issue #6166: the effort catalog, so a typo is a field-named invalid_input
+    // here instead of a value the route would refuse. The route accepts an
+    // effort on a non-Claude spawn and ignores it, so the description says so.
+    effort: EffortLevelSchema.optional().describe(
+      "Claude sessions only. Reasoning effort: low, medium, high, xhigh or max. Omit it to use the target node's default (xhigh unless the node sets HAPI_DEFAULT_EFFORT or settings.json defaultEffort)."
+    ),
   }) as z.ZodType<SpawnSessionArgs>,
   segments: ["machineId"],
   build: ({ machineId, ...rest }, selfSessionId) => ({
@@ -149,6 +174,12 @@ export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
     // default): #4450 R4 lets a spawner remove its peer's idle worktree by it.
     body: {
       ...defined(rest),
+      // Issue #6218: a named mode travels with the yolo it implies, so a server
+      // older than #6218 (which drops permissionMode and reads a missing yolo
+      // as YOLO) starts the peer in default, never YOLO.
+      ...(rest.permissionMode !== undefined && rest.yolo === undefined
+        ? { yolo: isYoloEquivalentMode(rest.permissionMode) }
+        : {}),
       parentSessionId: selfSessionId,
       parentRelationship: "spawn",
     },

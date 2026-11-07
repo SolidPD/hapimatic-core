@@ -11,7 +11,14 @@ import {
   summarizeBulkSessionResult,
   type BulkToastAction,
 } from "@/lib/bulkSessionToast";
-import { useBulkSessionAction } from "@/hooks/mutations/useBulkSessionAction";
+import {
+  runBulkDeleteInBackground,
+  useBulkSessionAction,
+} from "@/hooks/mutations/useBulkSessionAction";
+import {
+  removeSessionRows,
+  snapshotSessionLists,
+} from "@/lib/sessionListOptimistic";
 import { useSendToSelected } from "@/hooks/mutations/useSendToSelected";
 import { BulkActionConfirm, type BulkConfirmCopy } from "./BulkActionConfirm";
 import { SendToSelectedDialog } from "./SendToSelectedDialog";
@@ -38,6 +45,9 @@ import { SendToSelectedDialog } from "./SendToSelectedDialog";
  *   connected, so we stay in Select Mode.
  * - **Delete** is "disconnect and delete": the connected selection is disconnected
  *   first and ONLY the sessions that are disconnected afterwards are deleted.
+ *   Since #6210 the rows leave the list on confirm and Select Mode exits at
+ *   once; the work runs in the background (`runBulkDeleteInBackground`) and
+ *   puts back only the sessions it could not delete, with one toast naming why.
  * - **Send** (#3818) delivers one prompt to every selected session: sent now to
  *   an idle one, queued to a mid-turn one, skipped for a disconnected one
  *   (`useSendToSelected`). Ids are stable, so we stay in Select Mode.
@@ -45,7 +55,8 @@ import { SendToSelectedDialog } from "./SendToSelectedDialog";
  * Stop turn, Disconnect, Delete and Send confirm through `BulkActionConfirm` —
  * one step for one session, two for more (#3815 R3); Send opens its own dialog
  * (`SendToSelectedDialog`) around it, carrying the prompt field. Every action reports through ONE
- * per-session summary toast (`summarizeBulkSessionResult`).
+ * per-session summary toast (`summarizeBulkSessionResult`), except Delete, whose
+ * background run ends with `summarizeBulkDelete` (#6210).
  */
 type SelectModeChipRowProps = {
   /**
@@ -220,35 +231,27 @@ export function SelectModeChipRow({
     }
   };
 
+  // #6210: the rows leave the list on confirm and Select mode exits at once;
+  // the disconnect + delete run in the background (they outlive this row,
+  // which unmounts on exit) and put back only the sessions that could not be
+  // deleted, with one toast that names why. A session whose disconnect fails
+  // is still running and is NEVER sent to delete (#3815-17).
   const handleDelete = async () => {
     if (!api || selected.length === 0) return;
-    setIsPending(true);
-    try {
-      // Disconnect first; a session whose disconnect failed or was refused is
-      // still running and is NEVER sent to delete (#3815-17).
-      let refused: BulkSessionResult = [];
-      const deletable = disconnectedSelected.map(s => s.id);
-      if (connectedSelected.length > 0) {
-        const archived = await runBulkAction(
-          "archive",
-          connectedSelected.map(s => s.id)
-        );
-        // `session_inactive` = it was already disconnected (the list had not
-        // caught up), so it is as deletable as a fresh disconnect.
-        const nowDisconnected = (r: BulkSessionResult[number]) =>
-          r.ok || r.code === "session_inactive";
-        deletable.push(...archived.filter(nowDisconnected).map(r => r.id));
-        refused = archived.filter(r => !nowDisconnected(r));
-      }
-      const deleted =
-        deletable.length > 0 ? await runBulkAction("delete", deletable) : [];
-      onRefresh();
-      report("delete", [...deleted, ...refused]);
-    } finally {
-      setIsPending(false);
-      // records are gone — the selection is stale (Task 5 rationale extends to Delete).
-      onExit();
-    }
+    const snapshot = await snapshotSessionLists(queryClient);
+    removeSessionRows(
+      queryClient,
+      selected.map(s => s.id)
+    );
+    onExit();
+    void runBulkDeleteInBackground({
+      api,
+      queryClient,
+      showToast,
+      connectedIds: connectedSelected.map(s => s.id),
+      disconnectedIds: disconnectedSelected.map(s => s.id),
+      snapshot,
+    });
   };
 
   const handleSend = async (text: string) => {
@@ -345,7 +348,7 @@ export function SelectModeChipRow({
         },
         second: {
           title: "Confirm the delete",
-          description: `This permanently deletes ${n} sessions with their message history and queued prompts. A session that cannot be disconnected is left in place.`,
+          description: `This permanently deletes ${n} sessions with their message history and queued prompts. They leave the list at once; any session that cannot be disconnected or deleted comes back, with a message saying why.`,
           confirmLabel: `Delete ${n} sessions`,
         },
         confirmingLabel: "Deleting...",

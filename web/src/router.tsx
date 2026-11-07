@@ -56,7 +56,11 @@ import { useSessionNodeRecovery } from "@/hooks/useSessionNodeRecovery";
 import { useSessions } from "@/hooks/queries/useSessions";
 import { SpawningSessionView } from "@/components/SpawningSessionView";
 import { useSpawnHandoverActive } from "@/lib/spawn-draft";
-import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
+import {
+  useFederatedSessions,
+  useFederationLocalNode,
+  useFederationSessionsCache,
+} from "@/hooks/queries/useFederatedSessions";
 import { useSlashCommands } from "@/hooks/queries/useSlashCommands";
 import { useSendMessage } from "@/hooks/mutations/useSendMessage";
 import {
@@ -64,6 +68,7 @@ import {
   dedupeById,
 } from "@/hooks/mutations/useSessionActions";
 import { useNeedsReview } from "@/hooks/useNeedsReview";
+import { useComposeFocusMarkRead } from "@/hooks/useComposeFocusMarkRead";
 import { useAdminPreferences } from "@/hooks/useAdminPreferences";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
@@ -139,6 +144,12 @@ import AdminPreferencesPage from "@/routes/settings/preferences";
 import AdminAboutPage from "@/routes/settings/about";
 import NotificationsPage from "@/routes/settings/notifications";
 import ConnectorsPage from "@/routes/settings/connectors";
+import NetworkPage from "@/routes/settings/network";
+import {
+  ConnectModelNudge,
+  SessionsEmptyState,
+  sessionsAreEmpty,
+} from "@/components/onboarding/ConnectModelNudge";
 import ExtensionsAdminPage from "@/routes/settings/extensions";
 import ConfigurationAdminPage from "@/routes/settings/configuration";
 import AdminVmsPage from "@/routes/settings/vms";
@@ -680,6 +691,7 @@ function SessionsPage() {
             }`}
             title="New Session"
             aria-label="Create new session"
+            data-guide="create-session"
           >
             <PlusIcon className="h-5 w-5" />
           </button>
@@ -766,45 +778,62 @@ function SessionsPage() {
                 onNavigate={v => setPaneView("A", v)}
               />
             ) : (
-              <SessionList
-                sessions={sessions}
-                localNodeId={localNode?.nodeId ?? LOCAL_NODE_ID}
-                onSelect={sessionId =>
-                  isSplit
-                    ? setPaneView("A", { type: "session", sessionId })
-                    : navigate({
-                        to: "/sessions/$sessionId",
-                        params: { sessionId },
-                      })
-                }
-                onNewSession={() =>
-                  isSplit
-                    ? setPaneView("A", { type: "new-session" })
-                    : navigate({ to: "/sessions/new" })
-                }
-                onRefresh={handleRefresh}
-                isLoading={isLoading}
-                api={api}
-                liftedGroups={groups}
-                liftedProjectExpandState={projectExpandState}
-                liftedSetProjectExpanded={setProjectExpanded}
-                liftedExpandedSessions={expandedSessions}
-                liftedToggleSessionExpanded={toggleSessionExpanded}
-                liftedManualActive={manualActive}
-                liftedSetManualActive={setManualActive}
-                selectMode={selectMode}
-                selectedIds={selectedIds}
-                onToggleSelect={toggleSelect}
-                schedules={filteredSchedules}
-                heartbeatConfig={visibleHeartbeatConfig}
-                visibleSessionIds={visibleSessionIds}
-                heartbeatStatus={heartbeatStatus}
-                filterView={filterView}
-                onEditSchedule={handleEditSchedule}
-                onEditHeartbeat={handleEditHeartbeat}
-                onCreateSchedule={handleCreateSchedule}
-                initialScheduleId={searchScheduleId}
-              />
+              <>
+                <ConnectModelNudge api={api} />
+                {sessionsAreEmpty({
+                  isLoading,
+                  error,
+                  count: sessions.length,
+                }) && (
+                  <SessionsEmptyState
+                    api={api}
+                    onNewSession={() =>
+                      isSplit
+                        ? setPaneView("A", { type: "new-session" })
+                        : navigate({ to: "/sessions/new" })
+                    }
+                  />
+                )}
+                <SessionList
+                  sessions={sessions}
+                  localNodeId={localNode?.nodeId ?? LOCAL_NODE_ID}
+                  onSelect={sessionId =>
+                    isSplit
+                      ? setPaneView("A", { type: "session", sessionId })
+                      : navigate({
+                          to: "/sessions/$sessionId",
+                          params: { sessionId },
+                        })
+                  }
+                  onNewSession={() =>
+                    isSplit
+                      ? setPaneView("A", { type: "new-session" })
+                      : navigate({ to: "/sessions/new" })
+                  }
+                  onRefresh={handleRefresh}
+                  isLoading={isLoading}
+                  api={api}
+                  liftedGroups={groups}
+                  liftedProjectExpandState={projectExpandState}
+                  liftedSetProjectExpanded={setProjectExpanded}
+                  liftedExpandedSessions={expandedSessions}
+                  liftedToggleSessionExpanded={toggleSessionExpanded}
+                  liftedManualActive={manualActive}
+                  liftedSetManualActive={setManualActive}
+                  selectMode={selectMode}
+                  selectedIds={selectedIds}
+                  onToggleSelect={toggleSelect}
+                  schedules={filteredSchedules}
+                  heartbeatConfig={visibleHeartbeatConfig}
+                  visibleSessionIds={visibleSessionIds}
+                  heartbeatStatus={heartbeatStatus}
+                  filterView={filterView}
+                  onEditSchedule={handleEditSchedule}
+                  onEditHeartbeat={handleEditHeartbeat}
+                  onCreateSchedule={handleCreateSchedule}
+                  initialScheduleId={searchScheduleId}
+                />
+              </>
             )}
             {/* Per-pane toolbar (bottom): pinned above the footer when the pref
                 is "bottom" (#3276). The pane container is already flex flex-col
@@ -978,7 +1007,11 @@ function SessionPage() {
     refetch: refetchSession,
     retry: retrySession,
   } = useSession(api, sessionId, true); // isActiveSession=true enables polling fallback for timer
-  const { localNode } = useFederatedSessions(api);
+  // #6208: nodes query only — the all-sessions list re-rendered the open chat
+  // on every session change in the mesh. The list stays cached (no re-render)
+  // for SessionHeader's remote-descendant count and the keepalive check.
+  const { localNode } = useFederationLocalNode(api);
+  useFederationSessionsCache(api);
   const {
     messages,
     warning: messagesWarning,
@@ -1012,19 +1045,14 @@ function SessionPage() {
       )
     : false;
 
-  // Callback for compose field focus — clears "needs review" indicator (#279).
-  // Passed through SessionChat → HappyComposer → ComposerPrimitive.Input onFocus.
-  // On desktop, autoFocus fires this on navigation (acceptable: user navigated intentionally).
-  // On mobile/touch, autoFocus is disabled so user must tap compose field to clear.
-  const onComposeFocus = useCallback(() => {
-    if (session) {
-      markAsSeen(session.id, session.updatedAt);
-      // Clear any manual override — composing means user is actively reading
-      if (session.needsReviewOverride) {
-        void setNeedsReviewOverride(null);
-      }
-    }
-  }, [session, markAsSeen, setNeedsReviewOverride]);
+  // Compose field focus or press marks an orange session read (#279, #4536).
+  // On desktop, autoFocus fires this on navigation; on touch, the user taps.
+  const onComposeFocus = useComposeFocusMarkRead({
+    session,
+    checkNeedsReview,
+    markAsSeen,
+    setNeedsReviewOverride,
+  });
 
   // Compute isWaitingForUserQuestion from agentState (matches SessionHeader pattern)
   const isWaitingForUserQuestion = session
@@ -1441,9 +1469,35 @@ const sessionRoute = createRoute({
   component: SessionRouteComponent,
 });
 
+/**
+ * #6224: where the Files tab's Browse view is. `dir` is the base64 relative
+ * folder (absent at the session folder) and `q` the search text. Both keys are
+ * OPTIONAL via the explicit return type, so a plain navigation to the Files tab
+ * still type-checks (the optional-key pattern of `DrawerSearch` above).
+ */
+type SessionFilesSearch = {
+  dir?: string;
+  q?: string;
+};
+
+function readFilesLocation(
+  search: Record<string, unknown>
+): SessionFilesSearch {
+  const out: SessionFilesSearch = {};
+  if (typeof search.dir === "string" && search.dir) out.dir = search.dir;
+  // The default search parser JSON-parses values, so a hand-typed `q=12`
+  // arrives as a number.
+  if (typeof search.q === "string" || typeof search.q === "number") {
+    const q = String(search.q);
+    if (q) out.q = q;
+  }
+  return out;
+}
+
 const sessionFilesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId/files",
+  validateSearch: readFilesLocation,
   component: FilesPage,
 });
 
@@ -1465,7 +1519,9 @@ const sessionClaudePtyRoute = createRoute({
   component: ClaudePtyPage,
 });
 
-type SessionFileSearch = {
+// #6224: `dir` and `q` carry the Files tab's folder and search through the
+// viewer, so Back returns to them.
+type SessionFileSearch = SessionFilesSearch & {
   path: string;
   staged?: boolean;
 };
@@ -1482,7 +1538,10 @@ const sessionFileRoute = createRoute({
           ? false
           : undefined;
 
-    return staged === undefined ? { path } : { path, staged };
+    const location = readFilesLocation(search);
+    return staged === undefined
+      ? { path, ...location }
+      : { path, staged, ...location };
   },
   component: FilePage,
 });
@@ -1704,6 +1763,14 @@ const settingsConnectorsRoute = createRoute({
   component: ConnectorsPage,
 });
 
+// Network (#6211 R23): join this VM to a tailnet from inside the instance.
+// Registered here AND as a USER row (settings/index.tsx).
+const settingsNetworkRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/network",
+  component: NetworkPage,
+});
+
 const settingsAboutRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/about",
@@ -1803,6 +1870,7 @@ export const routeTree = rootRoute.addChildren([
   settingsPreferencesRoute,
   settingsNotificationsRoute,
   settingsConnectorsRoute,
+  settingsNetworkRoute,
   settingsAboutRoute,
   settingsExtensionsRoute,
   settingsConfigurationRoute,

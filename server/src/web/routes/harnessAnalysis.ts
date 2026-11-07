@@ -128,8 +128,12 @@ export function createHarnessAnalysisRoutes(opts: {
           // (the orchestrator's guard), never a second spawn.
           return c.json({ status: "analyzing", session_id: outcome.sessionId });
         case "at_capacity":
-          // R6 — a clear UI state, never a spinner.
-          return c.json({ status: "at_capacity" });
+          // R6 — a clear UI state, never a spinner. #6156: names a low-memory cause.
+          return c.json(
+            outcome.cause
+              ? { status: "at_capacity", cause: outcome.cause }
+              : { status: "at_capacity" }
+          );
         case "failed":
           // R7 — surface "failed" (the UI shows retry), never an infinite spinner.
           return c.json({ status: "failed" });

@@ -165,6 +165,7 @@ function switchAccountCodeToStatus(code: string | undefined): number {
     case "account_exhausted":
     case "no_change":
     case "at_capacity":
+    case "insufficient_memory": // #6156
     case "switch_failed_rolled_back":
     case "switch_failed_rollback_failed":
     case "stage_failed":
@@ -186,15 +187,21 @@ export type RelaunchServiceResult =
 /** Map a SessionRelaunch error code to an HTTP status (issue #2149). */
 function relaunchCodeToStatus(code: string | undefined): number {
   switch (code) {
+    // Issue #5819: `api_key_not_found` — the bound key is gone from this
+    // node's vault.
     case "not_found":
+    case "api_key_not_found":
       return 404;
     // Issue #4568 (SF-3): the same 400 the spawn route returns for a key session.
     case "api_key_launcher_unsupported":
       return 400;
+    // Issue #5819: `api_key_not_shared` — a cross-node placement whose key was
+    // unshared, refused before the teardown (the session keeps running).
     case "not_active":
     case "not_claude":
     case "missing_metadata":
     case "relaunch_failed_rolled_back":
+    case "api_key_not_shared":
       return 409;
     case "relaunch_and_rollback_failed":
       return 502;

@@ -24,6 +24,7 @@ import { Button } from "@/components/ui/button";
 import { AttachmentManagementModal } from "@/components/AssistantChat/AttachmentManagementModal";
 import { PromptTextTools } from "@/components/AssistantChat/PromptTextTools";
 import { usePlatform } from "@/hooks/usePlatform";
+import { isPinchZoomed } from "@/lib/pinchZoom";
 import { useNotesPopOut } from "@/components/NotesPopOut";
 import {
   useSessionNotesAutosave,
@@ -267,7 +268,10 @@ export function SessionNotes(props: {
     };
 
     const adjustForKeyboard = () => {
-      const keyboardHeight = window.innerHeight - vv.height - vv.offsetTop;
+      // #6213: a pinch-zoom is not a keyboard; restore the original layout.
+      const keyboardHeight = isPinchZoomed(vv)
+        ? 0
+        : window.innerHeight - vv.height - vv.offsetTop;
       if (keyboardHeight > 100) {
         flexParent.style.height = `${vv.height}px`;
         flexParent.style.overflowY = "auto";

@@ -59,7 +59,11 @@ export async function cloneRepoForSpawn(
   logger.debug(
     `[DAEMON RUN] cloneRepo '${cloneRepo}': cloning into '${directory}'`
   );
+  // `env: process.env` is required, not redundant: Bun.spawn with no `env`
+  // passes the process's ORIGINAL environment, so it would ignore startDaemon's
+  // delete of the server-only secrets (DAEMON_DELETE_AT_START_ENV_VARS, #5304).
   const cloneProc = Bun.spawn(["gh", "repo", "clone", cloneRepo, directory], {
+    env: process.env,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -157,6 +161,10 @@ export interface VaultKeyEntry {
   provider: string;
   label?: string;
   key: string;
+  /** Issue #5127: whether other federation nodes may use the key. The CLI reads
+   *  `settings.json` raw, so the field is present on every entry that has it;
+   *  absent means not shared (#5819 reads it for a cross-node placement). */
+  shareAcrossNodes?: boolean;
 }
 
 /**
@@ -183,7 +191,8 @@ export const API_KEY_AGENT_UNSUPPORTED_MESSAGE =
 export type ApiKeyBindingErrorCode =
   | "api_key_agent_unsupported"
   | "api_key_not_found"
-  | "api_key_changed";
+  | "api_key_changed"
+  | "api_key_not_shared";
 
 /**
  * Issue #4568 (R3/R4): resolve an API-key spawn against the node vault. PURE.
@@ -195,6 +204,11 @@ export type ApiKeyBindingErrorCode =
  * same four characters is NOT detected and bills as the original key. Returns
  * the mask to record (`HAPI_API_KEY_MASKED`) and the display label. Every
  * message names the key by label / mask — never key material.
+ *
+ * Issue #5819: with `requireShared` (a session another node placed here), the
+ * entry must also still be shared with other nodes. Checked after existence and
+ * before the mask, so an unshared AND replaced key reports the share refusal
+ * (both refuse). Absent / false is byte-identical to the pre-#5819 behaviour.
  */
 export function resolveApiKeyBinding(input: {
   agent: string;
@@ -202,6 +216,8 @@ export function resolveApiKeyBinding(input: {
   /** The mask recorded at the first spawn; absent on a fresh spawn. */
   expectedMasked?: string;
   apiKeys: VaultKeyEntry[] | undefined;
+  /** Issue #5819: refuse an entry that is no longer shared with other nodes. */
+  requireShared?: boolean;
 }):
   | { ok: true; masked: string; label: string }
   | { ok: false; code: ApiKeyBindingErrorCode; message: string } {
@@ -223,6 +239,13 @@ export function resolveApiKeyBinding(input: {
   }
   const masked = maskApiKey(entry.key);
   const label = entry.label?.trim() || masked;
+  if (input.requireShared && entry.shareAcrossNodes !== true) {
+    return {
+      ok: false,
+      code: "api_key_not_shared",
+      message: `The Anthropic API key "${label}" is no longer shared with other nodes — this session was started from another node, so it cannot restart on that key. Switch it to an account, or start a new session on this node with the key.`,
+    };
+  }
   if (input.expectedMasked && input.expectedMasked !== masked) {
     return {
       ok: false,
@@ -240,6 +263,10 @@ export function resolveApiKeyBinding(input: {
  * `verifyApiKeyForSession`, which discards the value and keeps only the binding. Applies {@link resolveApiKeyBinding}'s checks (Claude only, an
  * `anthropic` entry, the recorded mask unchanged), so it fails CLOSED on a
  * missing id or a changed mask; messages name the key by label / mask only.
+ * `requireShared` is opt-in: the wrapper sets it for a cross-node placement
+ * (#5819; the daemon passes the same flag to `resolveApiKeyBinding`), and
+ * `hapi api-key-helper` never does, so a running session keeps its key until
+ * it relaunches (#5819 ruling D3 = A).
  * Kept here, beside the resolver, so the helper's import graph stays light: it
  * runs as a fresh process on every key fetch.
  */
@@ -247,6 +274,8 @@ export function readVaultApiKey(input: {
   apiKeyId: string;
   expectedMasked?: string;
   apiKeys: VaultKeyEntry[] | undefined;
+  /** Issue #5819: see {@link resolveApiKeyBinding}. */
+  requireShared?: boolean;
 }):
   | { ok: true; key: string }
   | { ok: false; code: ApiKeyBindingErrorCode; message: string } {
@@ -255,6 +284,7 @@ export function readVaultApiKey(input: {
     apiKeyId: input.apiKeyId,
     expectedMasked: input.expectedMasked,
     apiKeys: input.apiKeys,
+    requireShared: input.requireShared,
   });
   if (!resolution.ok) return resolution;
   const entry = (input.apiKeys ?? []).find(k => k.id === input.apiKeyId);

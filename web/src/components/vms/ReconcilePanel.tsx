@@ -263,11 +263,22 @@ function SurfaceRow(props: {
           data-testid={`reconcile-rotate-${vmName}`}
         >
           handoff-secret has no automated repair — it never transports key
-          material. To re-key: from the gateway host run{" "}
-          <code>hapimatic-gateway rotate-secret {vmName}</code>, set{" "}
-          <code>HAPI_GOOGLE_HANDOFF_SECRET</code> in the VM&apos;s handoff
-          drop-in, run <code>systemctl --user daemon-reload</code> on the VM,
-          then re-detect.
+          material. To re-key, run on the gateway host{" "}
+          <code>
+            ( cd ~/gateway &amp;&amp; set -a &amp;&amp; .
+            ~/.config/hapimatic-gateway/env &amp;&amp; set +a &amp;&amp;
+            ~/.bun/bin/bun run src/index.ts rotate-secret {vmName} )
+          </code>{" "}
+          (it prints the secret, so use a private terminal). Set{" "}
+          <code>HAPI_GOOGLE_HANDOFF_SECRET</code> in the VM&apos;s server
+          drop-in only (<code>hapimatic-private.service.d/20-handoff.conf</code>
+          ), run{" "}
+          <code>
+            systemctl --user daemon-reload &amp;&amp; systemctl --user
+            try-restart hapimatic-private.service
+          </code>{" "}
+          on the VM, then re-detect. A rotation script that never prints the
+          secret is tracked in #6337.
         </p>
       )}
     </li>

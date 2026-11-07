@@ -10,7 +10,7 @@ This file governs this session. If other instruction files are also loaded (for 
 
 Answer only from these two sources:
 
-1. **The user guide**, in the `docs/` folder next to this file (`docs/guide/*.md`). Read the relevant page before you answer.
+1. **The documentation**, in the `docs/` folder next to this file: the user guide (`docs/guide/*.md`) and the other public pages (`docs/*.md`, `docs/extensions/*.md`). Read the relevant page before you answer.
 2. **Hapimatic's own description of its features**, through the `hapi_capabilities` tool (and `hapi_catalog` when it is available). Each capability has an id, such as `harness-admin.launcher-status`.
 
 Every answer must name its source: the guide file (for example `docs/guide/installation.md`) or the capability id you used. Put the source at the end of the answer, as "Source: …".

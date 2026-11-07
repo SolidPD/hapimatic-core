@@ -105,7 +105,7 @@ export function HelpMenu(props: HelpMenuProps) {
       <HelpAction
         icon={Compass}
         title="Replay the tour"
-        description="The five-card tour of where your sessions live and how to start one."
+        description="A quick look at where your sessions live and how to start one."
         onClick={props.onReplayTour}
         testId="help-replay-tour"
       />

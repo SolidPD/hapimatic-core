@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { ApiClient } from "@/api/client";
 import { queryKeys } from "@/lib/query-keys";
 import type { GitHubConnectionStatus } from "@hapi/protocol/githubConnection";
+import type { GitHubRepo } from "@hapi/protocol/githubRepo";
 
 /**
  * Issue #1953 (A6): query hooks for the GitHub-account → repo selector.
@@ -38,15 +39,11 @@ export interface GitHubAccount {
   installedOn?: string[];
 }
 
-export interface GitHubRepo {
-  nameWithOwner: string;
-  name: string;
-  description: string | null;
-  isPrivate: boolean;
-  pushedAt: string | null;
-  /** hapimatic-private#4481: the branch a clone lands on, when known. */
-  defaultBranch?: string | null;
-}
+/**
+ * #6326: one definition in `shared/` for the server, the federation proxy, this hook and the API
+ * client; re-exported here so every existing `@/hooks/queries/useGitHubRepos` import still works.
+ */
+export type { GitHubRepo };
 
 // #3508: module-level stable empty fallbacks — keep the pending-query array
 // identities constant across renders (the #3462 render-loop fuel). Pattern:
@@ -137,6 +134,11 @@ export function useGitHubRepos(
   unavailable: boolean;
   /** Machine-readable cause when `unavailable`, else null. */
   reason: string | null;
+  /**
+   * #6326: the server stopped at its repository cap with more available, so the loaded list is
+   * not the whole set. False when the list is complete, failed, or the host predates the flag.
+   */
+  truncated: boolean;
 } {
   const query = useQuery({
     queryKey: queryKeys.githubRepos(account, nodeId),
@@ -146,6 +148,7 @@ export function useGitHubRepos(
           repos: [] as GitHubRepo[],
           unavailable: false,
           reason: null as string | null,
+          truncated: false,
         };
       }
       const result = await api.getGitHubRepos(account, nodeId);
@@ -154,12 +157,14 @@ export function useGitHubRepos(
           repos: [] as GitHubRepo[],
           unavailable: true,
           reason: result.reason ?? "unknown",
+          truncated: false,
         };
       }
       return {
         repos: result.repos,
         unavailable: false,
         reason: null as string | null,
+        truncated: result.truncated === true,
       };
     },
     enabled: (options?.enabled ?? true) && Boolean(api && account),
@@ -174,5 +179,6 @@ export function useGitHubRepos(
     error: query.error instanceof Error ? query.error.message : null,
     unavailable: query.data?.unavailable ?? false,
     reason: query.data?.reason ?? null,
+    truncated: query.data?.truncated ?? false,
   };
 }

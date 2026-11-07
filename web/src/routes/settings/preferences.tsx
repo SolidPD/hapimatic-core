@@ -26,6 +26,7 @@ import {
 } from "@/hooks/useAdminPreferences";
 import { useAutoRecoverPreference } from "@/hooks/useAutoRecoverPreference";
 import { useAutoSelectOptimalAccountPreference } from "@/hooks/useAutoSelectOptimalAccountPreference";
+import { useDefaultSpawnPermissionModePreference } from "@/hooks/useDefaultSpawnPermissionModePreference";
 import { useAutoSwitchOnRateLimitPreference } from "@/hooks/useAutoSwitchOnRateLimitPreference";
 import { useChatSectionPrefs } from "@/hooks/useChatSectionPrefs";
 import { useDefaultOutputStyle } from "@/hooks/useDefaultOutputStyle";
@@ -63,7 +64,6 @@ import { tokens } from "@/design/tokens";
 import { ThemePicker } from "@/components/settings/ThemePicker";
 import { BackupKeySection } from "@/components/settings/sections/BackupKeySection";
 import { SessionHandoffSection } from "@/components/settings/sections/SessionHandoffSection";
-import { GettingStartedSection } from "@/components/settings/sections/GettingStartedSection";
 import { OnboardingSection } from "@/components/settings/sections/OnboardingSection";
 import { VoiceInputSection } from "@/components/settings/sections/VoiceInputSection";
 import { useScrollToLocationHash } from "@/hooks/useScrollToLocationHash";
@@ -451,9 +451,14 @@ export default function AdminPreferencesPage() {
     setAutoExpandRepoGroups,
     setSessionListControlBarPosition,
     setComposerSubmitBehavior,
-    setDefaultSpawnPermissionMode,
     setTerminalComposeEnterAfterSend,
   } = useAdminPreferences();
+  // #6218 (D2-a): the node's default spawn permission mode is server-authoritative
+  // — every spawn that names no posture starts in it, API and MCP spawns included.
+  const {
+    mode: defaultSpawnPermissionMode,
+    setMode: setDefaultSpawnPermissionMode,
+  } = useDefaultSpawnPermissionModePreference(api);
   const {
     enabled: autoRecoverEnabled,
     setEnabled: setAutoRecover,
@@ -605,14 +610,14 @@ export default function AdminPreferencesPage() {
           description="Terminal tab compose line on touch devices. Off: Send puts the text at the prompt so you can edit it, then press Enter. On: Send runs it immediately."
         />
 
-        {/* Default Spawn Permission Mode (#1951 A4) */}
+        {/* Default Spawn Permission Mode (#1951 A4; node-wide since #6218) */}
         <RadioGroup<PermissionMode>
           label="Default Spawn Permission Mode"
           options={CLAUDE_PERMISSION_MODES}
           labelFor={m => getPermissionModeLabel(m)}
-          value={prefs.defaultSpawnPermissionMode}
+          value={defaultSpawnPermissionMode}
           onChange={setDefaultSpawnPermissionMode}
-          description="The permission posture pre-selected on the Create-Session form. 'YOLO' bypasses approval prompts and sandboxing. Per-session and per-agent overridable — codex/gemini fall back to an equivalent mode."
+          description="This node's default for every new session that does not name a mode, including sessions started from the API, and the mode pre-selected on the Create-Session form. A session an agent starts with Hapimatic's spawn_session tool is capped at the agent's own tier (default and plan, then accept, then YOLO); the cap does not cover `hapi api sessions spawn` run from a shell. Accept (the default) auto-approves edits and asks before running commands. 'YOLO' bypasses approval prompts and sandboxing. Each harness gets its equivalent: accept is safe-YOLO for Codex and default for Gemini and OpenCode."
         />
 
         {/* Chat & Verbosity (#2623 — epic #2622 Sub-Issue A): two NEW
@@ -1049,19 +1054,9 @@ export default function AdminPreferencesPage() {
             the builtin.voice-input extension is disabled. */}
         <VoiceInputSection api={api} />
 
-        {/* Getting started (#3865) — re-entry to the IN-APP first-run tour
-            (node-local state, every instance). Distinct from the gateway
-            Onboarding section below. Self-contained: owns its own
-            <section id="getting-started">, deep-linked from the drawer's
-            "Getting started" sub-row. */}
-        <GettingStartedSection />
-
-        {/* Onboarding (#2711) — "Restart onboarding" re-entry to the gateway
-            /setup wizard. Self-contained + ssoEnabled-gated: it owns its own
-            <section id="onboarding"> and renders nothing on a non-gateway
-            instance (an ungated control would link to hapimatic.com/setup, a
-            gateway that never provisioned self-hosted / .ts.net / localhost
-            instances). Deep-linkable here via #onboarding. */}
+        {/* Onboarding (#6211 R16): the one "Restart onboarding" control, on every
+            install type. Self-contained: it owns its own <section id="onboarding">,
+            deep-linked from the Settings menu's sub-row. */}
         <OnboardingSection />
       </div>
     </SettingsPage>

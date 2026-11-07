@@ -8,11 +8,15 @@ import { useSession } from "@/hooks/queries/useSession";
 import { useSessionNodeRecovery } from "@/hooks/useSessionNodeRecovery";
 import { useMessages } from "@/hooks/queries/useMessages";
 import { useParentMessages } from "@/hooks/queries/useParentMessages";
-import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
+import {
+  useFederationLocalNode,
+  useFederationSessionsCache,
+} from "@/hooks/queries/useFederatedSessions";
 import { useSlashCommands } from "@/hooks/queries/useSlashCommands";
 import { useSendMessage } from "@/hooks/mutations/useSendMessage";
 import { useSessionActions } from "@/hooks/mutations/useSessionActions";
 import { useNeedsReview } from "@/hooks/useNeedsReview";
+import { useComposeFocusMarkRead } from "@/hooks/useComposeFocusMarkRead";
 import { getSessionTitle } from "@/lib/sessionHelpers";
 import { Button } from "@/components/ui/button";
 
@@ -40,7 +44,10 @@ export function SplitPaneSessionView(props: {
     refetch: refetchSession,
     retry: retrySession,
   } = useSession(api, sessionId, true);
-  const { localNode } = useFederatedSessions(api);
+  const { localNode } = useFederationLocalNode(api);
+  // #6208: keep the federation list cached (no re-render) for SessionHeader's
+  // remote-descendant count and the keepalive check.
+  useFederationSessionsCache(api);
   const {
     messages,
     warning: messagesWarning,
@@ -70,14 +77,13 @@ export function SplitPaneSessionView(props: {
       )
     : false;
 
-  const onComposeFocus = useCallback(() => {
-    if (session) {
-      markAsSeen(session.id, session.updatedAt);
-      if (session.needsReviewOverride) {
-        void setNeedsReviewOverride(null);
-      }
-    }
-  }, [session, markAsSeen, setNeedsReviewOverride]);
+  // Compose field focus or press marks an orange session read (#279, #4536).
+  const onComposeFocus = useComposeFocusMarkRead({
+    session,
+    checkNeedsReview,
+    markAsSeen,
+    setNeedsReviewOverride,
+  });
 
   const agentType = session?.metadata?.flavor ?? "claude";
   const { getSuggestions: getSlashSuggestions } = useSlashCommands(
@@ -130,7 +136,7 @@ export function SplitPaneSessionView(props: {
   return (
     <div className="flex flex-col flex-1 min-h-0">
       {/* Pane-level back button — returns to session list in this pane */}
-      <div className="flex items-center px-2 py-1 bg-[var(--app-bg)] border-b border-[var(--app-border)]">
+      <div className="flex shrink-0 items-center px-2 py-1 bg-[var(--app-bg)] border-b border-[var(--app-border)]">
         <Button
           type="button"
           variant="ghost"
@@ -158,36 +164,47 @@ export function SplitPaneSessionView(props: {
           {getSessionTitle(session)}
         </span>
       </div>
-      <SessionChat
-        api={api}
-        session={session}
-        // #3638 (X5): in a split pane, full-screen hides ONLY pane-local chrome
-        // (ViewPicker/SessionHeader/info strip); the shared app bar is never
-        // hidden, so SessionChat must NOT set the lifted app-bar context here.
-        inSplitPane
-        messages={messages}
-        parentMessages={parentMessages}
-        isLoadingParentMessages={parentMessagesLoading}
-        messagesWarning={messagesWarning}
-        hasMoreMessages={messagesHasMore}
-        isLoadingMessages={messagesLoading}
-        isLoadingMoreMessages={messagesLoadingMore}
-        isSending={isSending}
-        onBack={onBack}
-        onRefresh={refreshSelectedSession}
-        onLoadMore={loadMoreMessages}
-        onSend={sendMessage}
-        onRetryMessage={retryMessage}
-        autocompleteSuggestions={getSlashSuggestions}
-        onComposeFocus={onComposeFocus}
-        needsReview={needsReview}
-        onToggleReadStatus={onToggleReadStatus}
-        serverMessageCount={messageCount}
-        nodeId={session.nodeId ?? localNode?.nodeId}
-        nodeLabel={session.nodeLabel ?? localNode?.nodeLabel}
-        nodeUrl={session.nodeUrl}
-        nodeStatus={session.nodeStatus}
-      />
+      {/* #6209: SessionChat's root is `h-full`. As the flex item below the
+          bar, its default `min-height: auto` is the smaller of its content
+          height and 100% of this column, so once its content no longer fit
+          below the bar it could not shrink to make room (a fresh, short
+          session hides the bug). The pane then overflowed by up to the bar's
+          height and hid the bottom of the dock, e.g. the collapsed Prompt /
+          Notes / Context line. This box takes exactly the height left after
+          the bar and may be smaller than its content. */}
+      <div className="flex min-h-0 flex-1 flex-col">
+        <SessionChat
+          api={api}
+          session={session}
+          // #3638 (X5): in a split pane, full-screen hides ONLY pane-local
+          // chrome (ViewPicker/SessionHeader/info strip); the shared app bar is
+          // never hidden, so SessionChat must NOT set the lifted app-bar
+          // context here.
+          inSplitPane
+          messages={messages}
+          parentMessages={parentMessages}
+          isLoadingParentMessages={parentMessagesLoading}
+          messagesWarning={messagesWarning}
+          hasMoreMessages={messagesHasMore}
+          isLoadingMessages={messagesLoading}
+          isLoadingMoreMessages={messagesLoadingMore}
+          isSending={isSending}
+          onBack={onBack}
+          onRefresh={refreshSelectedSession}
+          onLoadMore={loadMoreMessages}
+          onSend={sendMessage}
+          onRetryMessage={retryMessage}
+          autocompleteSuggestions={getSlashSuggestions}
+          onComposeFocus={onComposeFocus}
+          needsReview={needsReview}
+          onToggleReadStatus={onToggleReadStatus}
+          serverMessageCount={messageCount}
+          nodeId={session.nodeId ?? localNode?.nodeId}
+          nodeLabel={session.nodeLabel ?? localNode?.nodeLabel}
+          nodeUrl={session.nodeUrl}
+          nodeStatus={session.nodeStatus}
+        />
+      </div>
     </div>
   );
 }

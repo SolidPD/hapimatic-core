@@ -42,6 +42,18 @@ import { getDefaultClaudeCodePath } from "@/claude/sdk/utils";
 import { MAX_RETRY_BUDGET } from "@/claude/claudeTmuxRemoteLauncher";
 import { buildTmuxEnvFileCommand } from "@/claude/launcherShared";
 import { buildPaneEnvFilter } from "@/tmux/TmuxManager";
+import {
+  buildSessionScopeSnippet,
+  probeSliceProvisionedCached,
+  resolveSessionMemoryCeilingPct,
+  resolveSessionSliceConfig,
+  sessionMemoryCeiling,
+  type SliceProbe,
+} from "@/tmux/sessionSlice";
+import {
+  resolveSessionSliceLimit,
+  type SessionSliceLimit,
+} from "./sessionCapacity";
 import { getActiveEgressBrokerPort } from "@/sandbox/egressBroker";
 import { buildCodexCommand } from "@/extensions/agent-codex/codex/codexTmuxLauncher";
 import {
@@ -67,8 +79,12 @@ export interface TmuxSpawnOptions {
    */
   agent?: "claude" | "codex" | "gemini" | "opencode";
 
-  /** Enable YOLO mode */
+  /** Enable YOLO mode. Omitted = NOT YOLO (#6218). */
   yolo?: boolean;
+
+  /** Issue #6218: the starting permission mode (a non-default, non-YOLO mode of
+   *  a harness with runtime modes), threaded as --hapi-permission-mode. */
+  permissionMode?: string;
 
   /** Issue #1633: launch the claude child with --safe-mode (scaffolding disabled) */
   safeMode?: boolean;
@@ -423,6 +439,10 @@ export function buildSandboxEnv(
   const capabilityTier0 = env.HAPI_CAPABILITY_TIER0;
   if (capabilityTier0 !== undefined)
     out.HAPI_CAPABILITY_TIER0 = capabilityTier0;
+  // #6219: the docs pointer's off switch rides the same forward, for the same
+  // reason (the worker builds its system prompt in its own process).
+  const docsPointer = env.HAPI_DOCS_POINTER;
+  if (docsPointer !== undefined) out.HAPI_DOCS_POINTER = docsPointer;
   if (configuration.omniboxSandboxEnabled && brokerPort) {
     const proxyUrl = `http://127.0.0.1:${brokerPort}`;
     out.HTTP_PROXY = proxyUrl;
@@ -854,13 +874,81 @@ export async function resolveReusableWindow(
   return null;
 }
 
+/**
+ * #6156: why the per-session scope was skipped while it is on, logged once each until
+ * a scope is next applied (so the same skip returning days later is logged again).
+ */
+const scopeSkipWarned = new Set<string>();
+function skipSessionScope(reason: string): null {
+  if (!scopeSkipWarned.has(reason)) {
+    scopeSkipWarned.add(reason);
+    logger.warn(
+      `[TMUX SPAWN] Per-session memory ceiling skipped: ${reason}. New sessions start without their own memory cap (#6156)`
+    );
+  }
+  return null;
+}
+
+/**
+ * Issue #6156 (S3): the shell block that moves a new session into its own scope with a
+ * memory ceiling (`buildSessionScopeSnippet`), or `null` — leaving the launch command
+ * byte-identical — when session containment is off or unprovisioned, the ceiling is
+ * turned off (`HAPI_SESSION_MEMORY_CEILING_PCT=off`), or this instance's slice does not
+ * exist yet (its tmux server is not contained, so its limit is unknown). With both
+ * switches on, a skip is logged once per reason.
+ */
+export async function buildSessionScopePrefix(
+  sessionTag: string,
+  deps: {
+    env?: NodeJS.ProcessEnv;
+    probe?: (slice: string) => Promise<SliceProbe>;
+    limit?: () => SessionSliceLimit;
+    nonce?: () => string;
+  } = {}
+): Promise<string | null> {
+  const env = deps.env ?? process.env;
+  const config = resolveSessionSliceConfig(env);
+  if (!config.enabled) return null;
+  const pct = resolveSessionMemoryCeilingPct(env);
+  if (pct === null) return null;
+  const probe = await (deps.probe ?? probeSliceProvisionedCached)(config.slice);
+  if (!probe.ok) {
+    return skipSessionScope(
+      `${config.slice} is not provisioned (${probe.reason ?? "no reason given"})`
+    );
+  }
+  const limit = (deps.limit ?? (() => resolveSessionSliceLimit({ env })))();
+  if (!limit.present) {
+    return skipSessionScope("this instance's slice does not exist yet");
+  }
+  if (limit.limitBytes === null) {
+    return skipSessionScope("this instance's slice has no memory limit");
+  }
+  scopeSkipWarned.clear();
+  const { memoryMaxBytes, swapMaxBytes } = sessionMemoryCeiling(
+    limit.limitBytes,
+    pct
+  );
+  return buildSessionScopeSnippet({
+    nodeSlice: config.slice,
+    socketName: env.HAPI_TMUX_SESSION_NAME || configuration.tmuxSessionName,
+    sessionTag,
+    memoryMaxBytes,
+    swapMaxBytes,
+    nonce: (deps.nonce ?? (() => generateShortId().slice(0, 8)))(),
+  });
+}
+
 export async function spawnSessionInTmux(
   options: TmuxSpawnOptions
 ): Promise<TmuxSpawnResult> {
   const {
     directory,
     agent = "claude",
-    yolo = true,
+    // Issue #6218: an omitted yolo is NOT YOLO (the only caller,
+    // sessionSpawner, always passes the resolved value).
+    yolo = false,
+    permissionMode,
     safeMode = false,
     modelMode,
     effort,
@@ -1052,11 +1140,13 @@ export async function spawnSessionInTmux(
     const claudeArgs = isCodex
       ? buildCodexCommand({
           yolo,
+          permissionMode,
           model,
           codexResumeSessionId: resumeSessionId,
         })
       : buildClaudeCommand({
           yolo,
+          permissionMode,
           safeMode,
           modelMode,
           effort,
@@ -1185,6 +1275,13 @@ export async function spawnSessionInTmux(
         codexHome: envVars.CODEX_HOME,
         harnessBinPrefix: resolveHarnessBinPrefix(agent, os.homedir()),
       });
+    }
+    // Issue #6156 (S3): run the session in its own memory-capped scope. Wraps the
+    // jail (never the reverse); fails open, and off/uncontained leaves the command
+    // byte-identical (buildSessionScopePrefix returns null).
+    const scopePrefix = await buildSessionScopePrefix(hapiSessionId);
+    if (scopePrefix !== null) {
+      spawnCommand = `${scopePrefix} && ${spawnCommand}`;
     }
     const envFilePath = join(
       os.tmpdir(),
@@ -3141,6 +3238,8 @@ export async function cleanupGhostWindows(): Promise<number> {
 
 export interface BuildCommandOptions {
   yolo: boolean;
+  /** Issue #6218: starting permission mode → --hapi-permission-mode. */
+  permissionMode?: string;
   safeMode?: boolean;
   modelMode?: string;
   effort?: string;
@@ -3168,6 +3267,13 @@ export function buildClaudeCommand(options: BuildCommandOptions): string[] {
   // YOLO mode (skip permissions)
   if (options.yolo) {
     args.push("--yolo");
+  }
+
+  // Issue #6218: the starting permission mode (e.g. acceptEdits). A
+  // Hapimatic-internal flag commands/claude.ts consumes; persisted in claudeArgs
+  // so a daemon recovery relaunches with it (a saved posture still wins).
+  if (options.permissionMode) {
+    args.push("--hapi-permission-mode", options.permissionMode);
   }
 
   // Issue #1633: Safe Mode — the claude child launches with --safe-mode and

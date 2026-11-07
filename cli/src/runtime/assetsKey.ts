@@ -3,12 +3,12 @@
  * The key of the compiled binary's runtime-asset directory,
  * `<HAPI_HOME>/runtime/<key>` (issue #4594, D-4594-2 A).
  *
- * The key is a digest of the embedded assets the binary carries (the difftastic
- * and ripgrep archives plus their LICENSE files), computed by
+ * The key is a digest of the embedded assets the binary carries (the difftastic,
+ * ripgrep and git-lfs archives plus their LICENSE files), computed by
  * cli/scripts/build-executable.ts and inlined with `bun build --define`. A release
  * that does not change the embedded tools therefore reuses the existing directory
- * (they have not changed since 2025-12-16, and one directory is ~173 MB), and a
- * release that does change them extracts a fresh one.
+ * (they rarely change, and one directory is ~150 MB on arm64 Linux), and a release
+ * that does change them extracts a fresh one.
  */
 import { createHash } from "node:crypto";
 import { CLI_VERSION } from "../version";
@@ -22,8 +22,10 @@ declare const HAPI_RUNTIME_ASSETS_KEY: string | undefined;
  *
  * v2 (#5103): strict extraction plus `.runtime-manifest.json` (the declared tool
  * sizes). A v1 directory has no manifest, so a v2 build never reuses one.
+ *
+ * v3 (#6223): git-lfs, unpacked under `git-lfs-bin/`.
  */
-export const RUNTIME_ASSETS_LAYOUT = "hapi-runtime-assets-v2";
+export const RUNTIME_ASSETS_LAYOUT = "hapi-runtime-assets-v3";
 
 /** A build-time key: the first 12 hex digits of the digest. */
 export const RUNTIME_ASSETS_KEY_PATTERN = /^[0-9a-f]{12}$/;
@@ -36,11 +38,14 @@ export const RUNTIME_ASSETS_KEY_PATTERN = /^[0-9a-f]{12}$/;
 export function runtimeAssetPaths(platformDir: string): string[] {
   return [
     "tools/archives/difftastic-LICENSE",
+    "tools/archives/git-lfs-LICENSE",
     "tools/archives/ripgrep-LICENSE",
     "tools/licenses/difftastic-LICENSE",
+    "tools/licenses/git-lfs-LICENSE",
     "tools/licenses/ripgrep-LICENSE",
     `tools/archives/difftastic-${platformDir}.tar.gz`,
     `tools/archives/ripgrep-${platformDir}.tar.gz`,
+    `tools/archives/git-lfs-${platformDir}.tar.gz`,
   ];
 }
 

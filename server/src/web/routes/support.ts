@@ -12,8 +12,9 @@
  * THE SUPPORT SESSION (R1, R4) is a normal simple session of the user's own
  * harness and account, in `<dataDir>/support` — the materialized persona +
  * offline docs (`support/supportWorkspace.ts`). It is spawned with `yolo: false`
- * written EXPLICITLY (an omitted `yolo` spawns in YOLO mode — the daemon tests
- * `options.yolo !== false`) and with `safeMode` unset (safe mode disables
+ * written EXPLICITLY (an omitted `yolo` would take the node's default spawn
+ * permission mode, which an operator may set to YOLO — #6218) and with
+ * `safeMode` unset (safe mode disables
  * CLAUDE.md and would strip the persona). It spawns on the machine whose daemon
  * runs on THIS server host (`metadata.host === os.hostname()`), because the
  * workspace exists only here and a federated hub lists remote machines too.
@@ -293,7 +294,8 @@ export function createSupportRoutes(
         machineId: machine.id,
         directory: workspace,
         agent: parsed.data.agent ?? "claude",
-        // Explicit: an omitted yolo spawns in YOLO mode (R4).
+        // Explicit (R4): an omitted yolo takes the node's default spawn
+        // permission mode, which may be YOLO (#6218).
         yolo: false,
         sessionType: "simple",
         name: SUPPORT_SESSION_NAME,
@@ -302,7 +304,8 @@ export function createSupportRoutes(
         const status =
           result.code === "account_unrefreshable" ||
           result.code === "account_token_expired" ||
-          result.code === "at_capacity"
+          result.code === "at_capacity" ||
+          result.code === "insufficient_memory"
             ? 409
             : 502;
         return c.json({ error: result.message, code: result.code }, status);

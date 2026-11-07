@@ -42,6 +42,14 @@ export function useAppGoBack(): () => void {
   const navigate = useNavigate();
   const router = useRouter();
   const pathname = useLocation({ select: location => location.pathname });
+  // #6224: the file viewer carries the Files tab's folder (`dir`) and search
+  // (`q`), so Back returns to the same place in Browse.
+  const fileDir = useLocation({
+    select: location => searchString(location.search, "dir"),
+  });
+  const fileQuery = useLocation({
+    select: location => searchString(location.search, "q"),
+  });
 
   return useCallback(() => {
     // #3638: interceptors get first refusal — an interceptor that exits a modal
@@ -60,7 +68,17 @@ export function useAppGoBack(): () => void {
     // For single file view, go back to files list
     if (pathname.match(/^\/sessions\/[^/]+\/file$/)) {
       const filesPath = pathname.replace(/\/file$/, "/files");
-      navigate({ to: filesPath });
+      if (fileDir || fileQuery) {
+        navigate({
+          to: filesPath,
+          search: {
+            ...(fileDir ? { dir: fileDir } : {}),
+            ...(fileQuery ? { q: fileQuery } : {}),
+          },
+        });
+      } else {
+        navigate({ to: filesPath });
+      }
       return;
     }
 
@@ -73,5 +91,12 @@ export function useAppGoBack(): () => void {
 
     // Fallback to history.back() for other cases
     router.history.back();
-  }, [navigate, pathname, router]);
+  }, [navigate, pathname, router, fileDir, fileQuery]);
+}
+
+/** A string search param, or undefined when absent or not a string. */
+function searchString(search: unknown, key: string): string | undefined {
+  if (!search || typeof search !== "object") return undefined;
+  const value = (search as Record<string, unknown>)[key];
+  return typeof value === "string" && value ? value : undefined;
 }

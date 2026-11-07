@@ -4,13 +4,20 @@
  * universal feedback inbox (issue #2912, epic #2909 Sub C).
  *
  * The browser only ever talks to its own instance; these routes forward to the
- * gateway's operator-bearer inbox (`gateway/src/routes/feedbackInbox.ts`)
+ * gateway's inbox API (`gateway/src/routes/feedbackInbox.ts`)
  * through `feedback/inboxClient.ts`. Every route takes #2910's `operatorOnly`
  * gate as a route argument, opened only when BOTH `HAPI_OPERATOR_INSTANCE` is
- * set AND the gateway credential (`FEEDBACK_INBOX_URL` + `FEEDBACK_INBOX_TOKEN`)
- * is configured — closed is a plain 404, and since #5571 a closed gate also
- * drops the route from the capability catalog. A customer VM is closed by
- * construction: it never holds the operator credential.
+ * set AND this node's inbox credential (`FEEDBACK_INBOX_URL` +
+ * `FEEDBACK_INBOX_NODE_TOKEN`, the token half of its own `GATEWAY_FEEDBACK_INBOX_TOKENS` entry —
+ * never the sink bearer, #5858 R1) is configured — closed is a plain 404, and
+ * since #5571 a closed gate also drops the route from the capability catalog. A
+ * customer VM is closed by construction: it never holds an inbox token.
+ *
+ * **Agent reads (#5858 R2).** The list and item reads return tenant-written text
+ * and submitter/owner emails, so they are catalogued `riskTier: "mutating"` and
+ * listed in `never-readonly.test.ts`: `hapi_call` refuses them
+ * (`tier_not_invocable`). `counts` carries only integers and origin labels and
+ * stays `readonly`.
  *
  * The acting operator is computed here, never taken from the browser: the
  * node label plus the JWT namespace (`<nodeLabel>/<namespace>`), sent to the
@@ -33,6 +40,7 @@ import {
   neutralizeUntrustedText,
   renderUntrustedFeedbackText,
   type FeedbackInboxItem,
+  type FeedbackPatchSaved,
 } from "@hapi/protocol/feedbackSink";
 import { defineCapability } from "@hapi/protocol";
 import { Hono, type Context } from "hono";
@@ -89,6 +97,9 @@ function failure(c: Context<WebAppEnv>, result: FeedbackInboxResult<unknown>) {
       return c.json({ error: "invalid" }, 400);
     case "unavailable":
       return c.json({ error: "inbox_unavailable" }, 502);
+    case "schema_mismatch":
+      // #5858 R3: the gateway answered, but newer than this node can read.
+      return c.json({ error: "inbox_schema_mismatch" }, 502);
   }
 }
 
@@ -131,7 +142,10 @@ export function createFeedbackInboxProxyRoutes(
           path: "/api/feedback/inbox",
         },
         auth: "jwt",
-        riskTier: "readonly",
+        // Tenant feedback text + submitter/owner emails → never readonly, so the
+        // generic agent invoker (`hapi_call`) refuses it (#5858 R2); the browser
+        // and the #2914 helper call the route directly and are unaffected.
+        riskTier: "mutating",
         availability: { scope: "user" },
       })
     ),
@@ -191,7 +205,10 @@ export function createFeedbackInboxProxyRoutes(
           path: "/api/feedback/inbox/:id",
         },
         auth: "jwt",
-        riskTier: "readonly",
+        // Tenant feedback text + submitter/owner emails → never readonly, so the
+        // generic agent invoker (`hapi_call`) refuses it (#5858 R2); the browser
+        // and the #2914 helper call the route directly and are unaffected.
+        riskTier: "mutating",
         availability: { scope: "user" },
       })
     ),
@@ -241,7 +258,13 @@ export function createFeedbackInboxProxyRoutes(
         body.data,
         actorOf(c)
       );
-      return result.ok ? c.json(result.data) : failure(c, result);
+      if (!result.ok) return failure(c, result);
+      // #5858 R3: the gateway stored it but this node cannot read the row it
+      // returned — the browser is told it is saved, never that it failed.
+      if (result.data === null) {
+        return c.json({ saved: true } satisfies FeedbackPatchSaved);
+      }
+      return c.json(result.data);
     }
   );
 
@@ -312,6 +335,12 @@ async function convert(c: Context<WebAppEnv>, deps: ConvertDeps) {
       actor
     );
     if (!claim.ok) return failure(c, claim);
+    // #5858 R3: the claim is stored (acknowledged by this actor) but its row is
+    // unreadable here, so nothing is filed; Convert again after this node is
+    // updated resumes through the acknowledged-by-me branch below.
+    if (claim.data === null) {
+      return c.json({ error: "inbox_schema_mismatch" }, 502);
+    }
     row = claim.data;
   } else if (row.status !== "acknowledged" || row.actedBy !== actor) {
     return c.json({ error: "conflict", current: row }, 409);
@@ -328,6 +357,7 @@ async function convert(c: Context<WebAppEnv>, deps: ConvertDeps) {
   }
 
   // 4) Stamp. A failure here leaves the issue filed; Convert again re-stamps it.
+  //    A stored stamp whose row this node cannot read (`data: null`) is stamped.
   const stamp = await inbox.patch(
     id,
     {

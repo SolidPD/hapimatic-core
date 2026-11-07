@@ -63,17 +63,15 @@ export const claudeManifest: HarnessManifest = {
     reasoningEffort: { values: [...EFFORT_LEVELS] },
   },
   // verified: CLAUDE_PERMISSION_MODES (modes.ts). All four switch in-session via
-  // the composer permission switcher; at the spawn wire only the yolo-equivalent
-  // survives as the `yolo` boolean (#1951 isYoloEquivalentMode → bypassPermissions),
-  // so bypassPermissions + the default (yolo:false baseline) are "both" while
-  // acceptEdits/plan collapse to that baseline at spawn and are distinct only
-  // in-session.
+  // the composer permission switcher, and all four are spawn-settable: the spawn
+  // wire carries `permissionMode`, which seeds the CLI's starting mode through
+  // `--hapi-permission-mode` (#6218), and bypassPermissions rides the `yolo` flag.
   permissionModes: {
     modes: [
       { id: "default", applicability: "both" },
-      { id: "acceptEdits", applicability: "in-session" },
+      { id: "acceptEdits", applicability: "both" },
       { id: "bypassPermissions", applicability: "both" },
-      { id: "plan", applicability: "in-session" },
+      { id: "plan", applicability: "both" },
     ],
   },
   // verified: claude SDK emits per-turn usage; server/src/parity/tokenParity.ts

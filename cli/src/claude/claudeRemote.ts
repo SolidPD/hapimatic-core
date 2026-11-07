@@ -29,6 +29,30 @@ import {
   generateApiKeyHelperSettingsFile,
 } from "./utils/generateHookSettings";
 import { readBoundApiKeyBinding } from "./accountTokenInjection";
+import type { EffortLevel } from "@hapi/protocol/effort";
+
+/**
+ * Issue #6166: read back the effort (and model) the Claude process applies, via
+ * get_settings, and report it. Never awaited — the answer can queue behind a
+ * permission prompt, so nothing may wait on it. An unknown effort, an answer
+ * that arrives once `isStale()` is true, and any error report nothing, so the
+ * applied effort stays absent (unknown).
+ */
+export function readBackAppliedEffort(
+  query: Pick<Query, "getAppliedSettings">,
+  report: (applied: { effort: EffortLevel | null; model?: string }) => void,
+  isStale: () => boolean = () => false
+): void {
+  void query
+    .getAppliedSettings()
+    .then(applied => {
+      if (applied.effort === undefined || isStale()) return;
+      report({ effort: applied.effort, model: applied.model });
+    })
+    .catch(() => {
+      // An older binary, an exited child, or a transient error: unknown.
+    });
+}
 
 export async function claudeRemote(opts: {
   // Fixed parameters
@@ -65,6 +89,18 @@ export async function claudeRemote(opts: {
     contextUsedTokens: number;
     contextPercentage: number;
   }) => void;
+  // Issue #6166: the effort (and model) the Claude process actually applies,
+  // read back once per query start via get_settings; `null` = it sends none.
+  // Never fires after claudeRemote returns (`queryEnded` drops a late answer).
+  onAppliedEffort?: (applied: {
+    effort: EffortLevel | null;
+    model?: string;
+  }) => void;
+  // Issue #6166: the SDK query (one Claude process) started, with this effort on
+  // its argv, and later ended — so a measurement is tied to the launch it
+  // describes and dropped when that process is gone.
+  onQueryStart?: (launch: { effort?: string }) => void;
+  onQueryEnd?: () => void;
   onMessage: (message: SDKMessage) => void;
   onCompletionEvent?: (message: string) => void;
   onSessionReset?: () => void;
@@ -351,6 +387,7 @@ export async function claudeRemote(opts: {
   // out-of-band control requests such as mcp-toggle. Invoked once per
   // claudeRemote() call; ownership ends when this function returns.
   opts.onQueryCreated?.(response);
+  opts.onQueryStart?.({ effort: initial.mode.effort });
 
   // Bounce detection: track consecutive empty results to detect degenerate sessions
   // (e.g., heavily-compacted sessions that return instant empty results without hitting the API)
@@ -371,6 +408,12 @@ export async function claudeRemote(opts: {
   // message, where the query is provably active) to push the first-order model
   // name + context window. Reset on each result (turn boundary).
   let contextUsageNeedsRefresh = true;
+
+  // Issue #6166: read the applied effort once per query start — on the FIRST
+  // system/init of this call (init is re-emitted at turn starts). `queryEnded`
+  // drops an answer that arrives after this call has returned.
+  let appliedEffortRequested = false;
+  let queryEnded = false;
 
   const scheduleNextMessage = () => {
     if (nextMessageFetchInFlight || inputEnded) {
@@ -480,6 +523,18 @@ export async function claudeRemote(opts: {
       if (message.type === "system" && message.subtype === "init") {
         // Start thinking when session initializes
         updateThinking(true);
+
+        // Issue #6166: read back the effort the process applies (after any env
+        // override or model remap). Fire-and-forget and before the session-file
+        // wait below, so neither the stream nor the init handling waits on it.
+        if (!appliedEffortRequested && opts.onAppliedEffort) {
+          appliedEffortRequested = true;
+          readBackAppliedEffort(
+            response,
+            opts.onAppliedEffort,
+            () => queryEnded
+          );
+        }
 
         const systemInit = message as SDKSystemMessage;
 
@@ -675,6 +730,8 @@ export async function claudeRemote(opts: {
         `(streamMessages=${streamMessageSeq}, results=${resultSeq}, nextFetches=${nextMessageFetchSeq}, inputEnded=${inputEnded})`
     );
     updateThinking(false);
+    queryEnded = true;
+    opts.onQueryEnd?.();
     // #1734: restore process.env for every key opts.claudeEnvVars overwrote, so
     // a binding var (e.g. CLAUDE_CODE_OAUTH_TOKEN) does not persist into a later
     // same-process spawn (research code-review #3).

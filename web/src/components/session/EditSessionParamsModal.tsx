@@ -94,7 +94,7 @@ import { useAccountUsage } from "@/hooks/queries/useAccountUsage";
 import { useAccountsUsageView } from "@/hooks/useAccountsUsageView";
 import { useAccountActions } from "@/hooks/mutations/useAccountActions";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
-import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
+import { useFederationLocalNode } from "@/hooks/queries/useFederatedSessions";
 import { apiKeyDisplayName } from "@/lib/apiKeyStatus";
 
 /**
@@ -461,7 +461,7 @@ function EditSessionParamsForm({
   // kind is refused: the respawn would use the node's default launcher; NOT
   // `current.launcher`, which defaults it to "sdk"). Remote: keys are node-local.
   // Local mode: a live session the terminal controls (a stopped session stages).
-  const { localNode } = useFederatedSessions(api);
+  const { localNode } = useFederationLocalNode(api);
   const effectiveNodeId = nodeId ?? session.nodeId;
   const isRemoteSession =
     effectiveNodeId != null &&
@@ -603,6 +603,10 @@ function EditSessionParamsForm({
       directory: projectDir ?? "",
       agent,
       yolo: isYoloEquivalentMode(shown.permissionMode),
+      // #6218: a non-YOLO mode is part of the launch params too.
+      permissionMode: isYoloEquivalentMode(shown.permissionMode)
+        ? undefined
+        : shown.permissionMode,
       // E9: the copied command still carries the session's launcher + safe-mode
       // flags — read from the session, since they are no longer editable here.
       safeMode: current.safeMode || undefined,

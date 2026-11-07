@@ -14,6 +14,9 @@ import { ImpactAnalysisStore } from "./impactAnalysisStore";
 import { AuditStore } from "./auditStore";
 import { UpdateStatusStore } from "./updateStatusStore";
 import { SessionStore } from "./sessionStore";
+import { updateSessionMetadata } from "./sessions";
+import { safeJsonParse } from "./json";
+import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { ErrorLogStore } from "./errorLogStore";
 import { NotificationStore } from "./notificationStore";
 import { FeedbackStore } from "./feedbackStore";
@@ -36,6 +39,11 @@ import { applyTurnsMigrations } from "./turns/schema";
 import { seedRateCards } from "./turns/rateCards";
 import { TurnStore } from "./turns/turnStore";
 import { TurnMirrorStore } from "./turns/turnMirrorStore";
+import { applyThroughputMigrations } from "./throughput/schema";
+import { ThroughputFactsStore } from "./throughput/factsStore";
+import { ThroughputRollupStore } from "./throughput/rollupStore";
+import { ThroughputGithubStore } from "./throughput/githubStore";
+import { ThroughputDigestStore } from "./throughput/digestStore";
 import { PmRosterStore } from "./turns/pmRosterStore";
 import { BackgroundAgentUsageStore } from "./turns/backgroundAgentUsage";
 import { TurnAnalyticsCounts } from "./turns/analyticsCounts";
@@ -208,6 +216,11 @@ export class Store {
   readonly usageAlertState: UsageAlertStore;
   readonly turns: TurnStore;
   readonly turnMirror: TurnMirrorStore;
+  // Issue #6164 (epic #6163 A1): throughput facts, rollups, GitHub facts, digests.
+  readonly throughputFacts: ThroughputFactsStore;
+  readonly throughputRollups: ThroughputRollupStore;
+  readonly throughputGithub: ThroughputGithubStore;
+  readonly throughputDigests: ThroughputDigestStore;
   readonly pmRoster: PmRosterStore;
   /** Issue #4385: background agents' full usage, recorded at completion. */
   readonly backgroundAgentUsage: BackgroundAgentUsageStore;
@@ -307,6 +320,10 @@ export class Store {
     this.usageAlertState = new UsageAlertStore(this.db);
     this.turns = new TurnStore(this.db);
     this.turnMirror = new TurnMirrorStore(this.db);
+    this.throughputFacts = new ThroughputFactsStore(this.db);
+    this.throughputRollups = new ThroughputRollupStore(this.db);
+    this.throughputGithub = new ThroughputGithubStore(this.db);
+    this.throughputDigests = new ThroughputDigestStore(this.db);
     this.pmRoster = new PmRosterStore(this.db);
     this.backgroundAgentUsage = new BackgroundAgentUsageStore(this.db);
     this.turnAnalytics = new TurnAnalyticsCounts(this.db);
@@ -1261,6 +1278,9 @@ export class Store {
     this.migrateAddColumn("sessions", "is_sidebar", "INTEGER DEFAULT 0");
     this.migrateAddColumn("sessions", "parent_hapi_session_id", "TEXT");
     applyTurnsMigrations(this.db);
+    // Issue #6164 (A1): node-local throughput tables + two turn_mirror indexes.
+    // After applyTurnsMigrations (turn_mirror must exist). Fail-open; SCHEMA_VERSION stays 1.
+    applyThroughputMigrations(this.db);
     // Epic #1662, Sub G (#1669): shadow-mode parity ledger (`parity_runs`).
     // Idempotent + fail-open; SCHEMA_VERSION stays 1 (D7).
     applyParityMigrations(this.db);
@@ -1842,6 +1862,170 @@ export class Store {
         "[Store] Migration failed: timelog orphan cleanup #1508 (v2):",
         error
       );
+    }
+  }
+
+  /**
+   * Issue #5819 (D5 = B): one-time backfill of the cross-node placement marker
+   * on sessions another node placed here BEFORE the fix. No key material is
+   * read or written.
+   *
+   * A session belongs to a placed lineage when its metadata names an
+   * `originatingNodeId` that is set and is not this node's own id (the hub
+   * proxy records it on every remote spawn, plain or key:
+   * `web/routes/federation/webClient.ts` → `peerSpawn.ts` → the daemon's
+   * `HAPI_ORIGINATING_NODE_ID`), when it already carries a marker, or when it
+   * is a branch child (`parent_relationship = 'branch'`) of a lineage session,
+   * whatever that parent binds now. Pre-fix branch builders never copied
+   * `originatingNodeId`, and the spawn check reads a child's own record before
+   * its parent, so the lineage is followed here. Every lineage session that
+   * binds a BARE vault key id (`isQualifiedApiKeyRef` false, as at the spawn
+   * check) and has no marker is stamped with the lineage's placing node.
+   *
+   * Not recoverable, because nothing links them back to the placement: a
+   * watermark successor made before the fix (it stores neither a parent link
+   * nor an origin), and a branch child whose parent was deleted (deleting a
+   * session clears its children's parent link) or whose queued parent link was
+   * lost to a restart. Known, accepted edge (Q1): a cross-node session, or a
+   * branch child of one, that this node's operator later switched onto one of
+   * this node's keys is stamped too; after an unshare its relaunch is refused,
+   * and switching it again drops the marker.
+   *
+   * Atomic: a row it cannot write rolls back the whole pass and writes no
+   * migration marker, so the next boot retries; until then the rows are not
+   * re-checked. Call it once at boot, after this node's own federation id is
+   * known and before the SyncEngine loads its session cache. Returns the number
+   * of sessions stamped (0 once it has run).
+   */
+  backfillApiKeyPlacement(ownNodeId: string | null): number {
+    const migrationMarker = "api-key-placement-5819-v1";
+    try {
+      const marker = this.db
+        .prepare("SELECT key FROM _migration_markers WHERE key = ?")
+        .get(migrationMarker) as { key: string } | undefined;
+      if (marker) return 0;
+
+      const rows = this.db
+        .prepare(
+          "SELECT id, namespace, metadata, metadata_version, " +
+            "parent_session_id, parent_relationship FROM sessions"
+        )
+        .all() as Array<{
+        id: string;
+        namespace: string;
+        metadata: string | null;
+        metadata_version: number;
+        parent_session_id: string | null;
+        parent_relationship: string | null;
+      }>;
+      const insertMarker = this.db.prepare(
+        "INSERT INTO _migration_markers " +
+          "(key, applied_at, rows_affected, strategy, metadata) " +
+          "VALUES (?, ?, ?, ?, ?)"
+      );
+
+      const parsedRows = new Map<
+        string,
+        { row: (typeof rows)[number]; md: Record<string, unknown> }
+      >();
+      for (const row of rows) {
+        const parsed = safeJsonParse(row.metadata);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          parsedRows.set(row.id, {
+            row,
+            md: parsed as Record<string, unknown>,
+          });
+        }
+      }
+      // Binds a bare key and carries no marker: the only rows it writes.
+      const needsStamp = (md: Record<string, unknown>): boolean =>
+        typeof md.apiKeyId === "string" &&
+        md.apiKeyId.length > 0 &&
+        !isQualifiedApiKeyRef(md.apiKeyId) &&
+        !md.apiKeyPlacedBy;
+
+      // Session id → the placing node, for every session in a placed lineage.
+      const lineage = new Map<string, string>();
+      let fromOrigin = 0;
+      let fromBranchParent = 0;
+      const stamp = (id: string, placedBy: string): void => {
+        const { row, md } = parsedRows.get(id)!;
+        const write = updateSessionMetadata(
+          this.db,
+          row.id,
+          { ...md, apiKeyPlacedBy: placedBy },
+          row.metadata_version,
+          row.namespace,
+          { touchUpdatedAt: false }
+        );
+        if (write.result !== "success") {
+          throw new Error(
+            `session ${row.id}: metadata write returned ${write.result}`
+          );
+        }
+      };
+
+      const txn = this.db.transaction(() => {
+        for (const [id, { md }] of parsedRows) {
+          if (typeof md.apiKeyPlacedBy === "string" && md.apiKeyPlacedBy) {
+            lineage.set(id, md.apiKeyPlacedBy);
+            continue;
+          }
+          const origin = md.originatingNodeId;
+          if (
+            typeof origin !== "string" ||
+            origin.length === 0 ||
+            origin === ownNodeId
+          ) {
+            continue;
+          }
+          lineage.set(id, origin);
+          if (needsStamp(md)) {
+            stamp(id, origin);
+            fromOrigin++;
+          }
+        }
+        // Repeat so a grandchild follows its child, in any row order. Each
+        // pass adds at least one session to the lineage or stops, so it ends
+        // within parsedRows.size passes.
+        for (let changed = true; changed; ) {
+          changed = false;
+          for (const [id, { row, md }] of parsedRows) {
+            if (lineage.has(id)) continue;
+            if (row.parent_relationship !== "branch") continue;
+            const placedBy = row.parent_session_id
+              ? lineage.get(row.parent_session_id)
+              : undefined;
+            if (!placedBy) continue;
+            lineage.set(id, placedBy);
+            changed = true;
+            if (needsStamp(md)) {
+              stamp(id, placedBy);
+              fromBranchParent++;
+            }
+          }
+        }
+        insertMarker.run(
+          migrationMarker,
+          Date.now(),
+          fromOrigin + fromBranchParent,
+          "stamp-apiKeyPlacedBy-on-placed-lineage",
+          JSON.stringify({ ownNodeId, fromOrigin, fromBranchParent })
+        );
+      });
+      txn();
+
+      const stamped = fromOrigin + fromBranchParent;
+      console.log(
+        `[Store] Issue #5819 API-key placement backfill: stamped ${stamped} session(s) another node placed on this node's keys (${fromOrigin} by origin, ${fromBranchParent} branched from them)`
+      );
+      return stamped;
+    } catch (error) {
+      console.error(
+        "[Store] Migration failed: API-key placement backfill #5819 (no marker written; retried at the next boot):",
+        error
+      );
+      return 0;
     }
   }
 

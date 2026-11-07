@@ -178,6 +178,57 @@ export function checkCallerNamespace(
   return null;
 }
 
+/**
+ * #6224 Task 9: the version-tolerant namespace check for the session FILE-OP
+ * receivers that existed before #6224 (file read/write, directory list/create,
+ * search, rename, delete, and the git reads).
+ *
+ * Every node built with #6224 forwards `X-Hapi-Caller-Namespace` on these
+ * routes, and a forwarded namespace that does not match the session is refused
+ * with 404, the same as `checkCallerNamespace`. A request WITHOUT the header can
+ * only come from a node built before #6224, so it is allowed exactly as before
+ * and logged once per route per hour. Mesh nodes update at different times
+ * (there is no lockstep deploy), so failing closed here would break every older
+ * sender for as long as the rollout takes.
+ *
+ * The receiver cannot work the namespace out for itself: the federation token is
+ * one shared mesh secret, and the user's JWT is signed by the sending node.
+ * The routes #6224's later PRs add will use the strict `checkCallerNamespace`
+ * instead, because only a node that sends the header knows them.
+ */
+const NAMESPACE_ABSENT_WARN_INTERVAL_MS = 60 * 60 * 1000;
+const namespaceAbsentWarnedAt = new Map<string, number>();
+
+export function checkCallerNamespaceIfPresent(
+  c: Context<WebAppEnv>,
+  session: { namespace: string },
+  deps: Pick<FederationDeps, "errorLogger">,
+  route: string
+): Response | null {
+  const callerNamespace = c.req.header("x-hapi-caller-namespace");
+  if (callerNamespace === undefined) {
+    const now = Date.now();
+    const last = namespaceAbsentWarnedAt.get(route);
+    if (last === undefined || now - last >= NAMESPACE_ABSENT_WARN_INTERVAL_MS) {
+      namespaceAbsentWarnedAt.set(route, now);
+      deps.errorLogger?.warn(
+        `Federation ${route} request carried no caller namespace (a sender built before #6224); allowed`,
+        { category: "federation-namespace-absent", context: { route } }
+      );
+    }
+    return null;
+  }
+  if (session.namespace !== callerNamespace) {
+    return c.json({ error: "Session not found" }, 404);
+  }
+  return null;
+}
+
+/** Test-only: forget which routes already logged a missing namespace. */
+export function resetNamespaceAbsentWarningsForTests(): void {
+  namespaceAbsentWarnedAt.clear();
+}
+
 export async function notifyOriginatingHub(params: {
   originatingNodeId?: string;
   nodeId: string;

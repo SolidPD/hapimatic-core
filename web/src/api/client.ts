@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /* eslint-disable max-lines -- Grandfathered god-file (Epic 0, #2077); decomposition verdict tracked in claudedocs/architecture-hotspot-review.md. */
 import type { GitHubConnectionStatus } from "@hapi/protocol/githubConnection";
+import type { GitHubRepo } from "@hapi/protocol/githubRepo";
 import type {
   ExistingBranch,
   GitBranchListing,
@@ -21,6 +22,7 @@ import type {
   AutoSwitchOnRateLimitPreference,
   ChatSectionsPreference,
   DefaultOutputStylePreference,
+  DefaultSpawnPermissionModePreference,
   FederationSettingPatch,
   FederationSettingsView,
   OpenRouterFavorites,
@@ -46,11 +48,13 @@ import {
   FeedbackCountsSchema,
   FeedbackInboxItemSchema,
   FeedbackInboxListSchema,
+  FeedbackPatchSavedSchema,
   type FeedbackCounts,
   type FeedbackInboxFilters,
   type FeedbackInboxItem,
   type FeedbackInboxList,
   type FeedbackPatch,
+  type FeedbackPatchSaved,
 } from "@hapi/protocol/feedbackSink";
 import type { FeedbackConvertResponse } from "@/types/api";
 import type { QueuedMessage, SessionView } from "@hapi/protocol/types";
@@ -83,7 +87,12 @@ import type {
   BookmarkUpsertRequest,
   BookmarkUpsertResponse,
 } from "@hapi/protocol";
-import { normalizeUsageRow, serializeNotes } from "@hapi/protocol";
+import {
+  normalizeUsageRow,
+  parseGetContextUsageResult,
+  serializeNotes,
+  type ParsedContextUsageDetail,
+} from "@hapi/protocol";
 import type {
   CapabilityCatalogResponse,
   CapabilityAuditResponse,
@@ -97,6 +106,10 @@ import type {
   AccountHealthResponse,
   SessionMetadataTurnsResponse,
   AccountLoginStartResponse,
+  InVmCodeSubmitResponse,
+  TailscaleJoinResponse,
+  TailscaleStatus,
+  InVmLoginCancelResponse,
   InVmLoginCompleteResponse,
   InVmLoginStartResponse,
   AccountLoginCompleteResponse,
@@ -172,6 +185,12 @@ import type {
   TelemetrySummary,
   TelemetryTimeseries,
   TelemetryTokenEstimate,
+  DigestDetail,
+  DigestList,
+  ThroughputBreakdown,
+  ThroughputBreakdownDim,
+  ThroughputSummary,
+  ThroughputTestsPage,
   UpdateScheduledTaskRequest,
   NotificationListResponse,
   NotificationUnreadCountResponse,
@@ -254,11 +273,12 @@ type RequestReportOptions = {
 /**
  * Issue #2362: the four `/api/federation/health/*` + `/api/federation/alerts`
  * routes return 503 from exactly ONE guard — `if (!agg)` in
- * `server/src/web/routes/federation/health.ts` — and the HealthAggregator is
- * constructed only inside `if (federationConfig) { if (role !== "node") … }`
- * (`server/src/index.ts`). So 503 on these routes means "standalone or spoke",
- * both designed configurations; there is no fault path that produces it.
- * Suppressing the report therefore loses no genuine diagnostic signal.
+ * `server/src/web/routes/federation/health.ts`. From #6217 every node builds a
+ * HealthAggregator (a local-only one on a standalone node or a spoke,
+ * `server/src/index.ts`), so a 503 now comes only from a server built before
+ * #6217, where a standalone or spoke deployment had no aggregator by design.
+ * There is no fault path that produces it, so suppressing the report loses no
+ * genuine diagnostic signal.
  *
  * 404 is deliberately NOT listed: on `/federation/health/:nodeId` it means the
  * caller asked about a node that is not registered, which is a real caller
@@ -334,6 +354,14 @@ export class ApiError extends Error {
 }
 
 /**
+ * Issue #6170: the context breakdown read, as `getSessionContextBreakdown`
+ * returns it. `code` is the server's or the CLI's machine code (see the method).
+ */
+export type SessionContextBreakdownResult =
+  | { kind: "ok"; detail: ParsedContextUsageDetail }
+  | { kind: "error"; code: string; message: string };
+
+/**
  * Context-watermark admin status (#2587). GET /api/watermark's server-authoritative
  * shape: the enable flag, the effective watermark percent + eligible roles (the R1
  * status block), and every per-session {@link WatermarkState}. `WatermarkState` is
@@ -390,6 +418,9 @@ export type SpawnParentOptions = {
   /** Issue #5879: spawn on `accountUuid` even when it is at its usage cap (the
    *  server otherwise answers 409 `account_exhausted`). Absent → not forced. */
   forceAccount?: boolean;
+  /** Issue #6218: the session's starting permission mode. Absent → the target
+   *  node's default spawn permission mode (or the explicit `yolo`). */
+  permissionMode?: PermissionMode;
 };
 
 /**
@@ -955,7 +986,8 @@ export class ApiClient {
   async searchSessionFiles(
     sessionId: string,
     query: string,
-    limit?: number
+    limit?: number,
+    options?: { hidden?: boolean }
   ): Promise<FileSearchResponse> {
     const params = new URLSearchParams();
     if (query) {
@@ -963,6 +995,10 @@ export class ApiClient {
     }
     if (limit !== undefined) {
       params.set("limit", `${limit}`);
+    }
+    // #6224: include hidden (non-ignored) files; an older node ignores it.
+    if (options?.hidden) {
+      params.set("hidden", "true");
     }
     const qs = params.toString();
     return await this.request<FileSearchResponse>(
@@ -1771,11 +1807,49 @@ export class ApiClient {
     );
   }
 
-  async cancelInVmAccountLogin(loginToken: string): Promise<void> {
-    await this.request<{ ok: boolean }>("/api/accounts/native-login/cancel", {
-      method: "POST",
-      body: JSON.stringify({ loginToken }),
-    });
+  // #6211: the auth key goes in the POST body only. The refusals are designed
+  // answers, so none is reported, and the join can take the server's full minute.
+  async getTailscaleStatus(): Promise<TailscaleStatus> {
+    return await this.request<TailscaleStatus>("/api/network/tailscale");
+  }
+
+  async joinTailscale(authKey: string): Promise<TailscaleJoinResponse> {
+    return await this.request<TailscaleJoinResponse>(
+      "/api/network/tailscale/join",
+      { method: "POST", body: JSON.stringify({ authKey }) },
+      0,
+      undefined,
+      70_000,
+      { expectedStatuses: [400, 409, 502] }
+    );
+  }
+
+  // #6211: a pasted code goes in the POST body only (the request logger prints
+  // URLs). A 400, 409 or 422 is a designed answer, so those are not reported.
+  async submitInVmAccountCode(
+    loginToken: string,
+    code: string
+  ): Promise<InVmCodeSubmitResponse> {
+    return await this.request<InVmCodeSubmitResponse>(
+      "/api/accounts/native-login/code",
+      { method: "POST", body: JSON.stringify({ loginToken, code }) },
+      0,
+      undefined,
+      ApiClient.LOGIN_COMPLETE_TIMEOUT_MS,
+      { expectedStatuses: [400, 409, 422] }
+    );
+  }
+
+  async cancelInVmAccountLogin(
+    loginToken: string
+  ): Promise<InVmLoginCancelResponse> {
+    return await this.request<InVmLoginCancelResponse>(
+      "/api/accounts/native-login/cancel",
+      {
+        method: "POST",
+        body: JSON.stringify({ loginToken }),
+      }
+    );
   }
 
   // Codex (OpenAI) in-app login (issue #3807, epic #3345). `start` runs the
@@ -1977,6 +2051,7 @@ export class ApiClient {
           parentRelationship: parent?.parentRelationship,
           sourceBranch: parent?.sourceBranch,
           forceAccount: parent?.forceAccount,
+          permissionMode: parent?.permissionMode,
         }),
       },
       0,
@@ -2070,6 +2145,7 @@ export class ApiClient {
           sourceBranch: parent?.sourceBranch,
           apiKeyId: parent?.apiKeyId,
           forceAccount: parent?.forceAccount,
+          permissionMode: parent?.permissionMode,
         }),
       },
       0,
@@ -2602,18 +2678,15 @@ export class ApiClient {
   ): Promise<{
     success: boolean;
     account: string | null;
-    repos: Array<{
-      nameWithOwner: string;
-      name: string;
-      description: string | null;
-      isPrivate: boolean;
-      pushedAt: string | null;
-    }>;
+    /** The shared repository type (#6326); fields a host does not report are absent. */
+    repos: GitHubRepo[];
     error?: string;
     /** #2327: machine-readable failure cause when `success` is false. */
     reason?: string;
     /** #2327: which transport served a successful result ("gh" | "rest"). */
     source?: string;
+    /** #6326: the list stopped at the server's cap with more repositories available. */
+    truncated?: boolean;
   }> {
     let url = `/api/github/repos?account=${encodeURIComponent(account)}`;
     if (nodeId) {
@@ -2626,13 +2699,15 @@ export class ApiClient {
    * Get system health metrics from the host machine
    */
   async getSystemHealth(): Promise<{
-    cpu: { usagePercent: number; temperatureF: number | null };
+    // null = no 1-60 s CPU sample window yet (#6156); swap/disk null = the
+    // collector failed (#1519). All three mirror server/src/metrics/systemHealth.ts.
+    cpu: { usagePercent: number | null; temperatureF: number | null };
     memory: { total: number; used: number; usagePercent: number };
-    swap: { total: number; used: number; usagePercent: number };
+    swap: { total: number; used: number; usagePercent: number | null };
     disk: {
       total: number;
       used: number;
-      usagePercent: number;
+      usagePercent: number | null;
       mountPoint: string;
     };
     hostname: string;
@@ -2645,9 +2720,10 @@ export class ApiClient {
   /**
    * Get the federation-wide aggregate health (worst-case severity across all
    * nodes/dimensions). Issue #1445; consumed by useSystemHealthDisplayTarget
-   * (#1040) and the Federation Health Dashboard (#1037). On standalone/spoke
-   * deployments with no HealthAggregator this endpoint returns 503 — callers
-   * MUST tolerate the rejection (the icon falls back to local health).
+   * (#1040) and the Federation Health Dashboard (#1037). A server built before
+   * #6217 runs no HealthAggregator on a standalone or spoke deployment, so this
+   * endpoint returns 503 there — callers MUST tolerate the rejection (the icon
+   * falls back to local health).
    *
    * Issue #2362: that 503 is also suppressed at the error-report boundary (see
    * FEDERATION_HEALTH_REPORT_OPTS) — it is a designed response, not a fault.
@@ -2667,8 +2743,9 @@ export class ApiClient {
    * Get a single federation node's health detail (metrics + time-series).
    * Issue #1445.
    *
-   * Issue #2362: a 503 here (health disabled) is suppressed at the error-report
-   * boundary. A 404 (unknown node) is NOT — that is a genuine caller error.
+   * Issue #2362: a 503 here (a server built before #6217 with no health
+   * aggregator) is suppressed at the error-report boundary. A 404 (unknown
+   * node) is NOT — that is a genuine caller error.
    */
   async getFederationNodeHealth(
     nodeId: string
@@ -2686,8 +2763,9 @@ export class ApiClient {
   /**
    * Batch per-node health for the Federation Health Dashboard's Tier-2 cards
    * (issue #1632; consumed by #1037). One request → one entry per node, offline
-   * nodes preserved (NO aggregation collapse). Returns 503 on standalone/spoke
-   * deployments with no HealthAggregator — callers MUST tolerate the rejection.
+   * nodes preserved (NO aggregation collapse). Returns 503 from a server built
+   * before #6217 on a standalone or spoke deployment (no HealthAggregator) —
+   * callers MUST tolerate the rejection.
    *
    * Issue #2362: that 503 is also suppressed at the error-report boundary (see
    * FEDERATION_HEALTH_REPORT_OPTS) — it is a designed response, not a fault.
@@ -2706,8 +2784,8 @@ export class ApiClient {
   /**
    * Get the federation alerts feed (issue #1445; consumed by #1037's Tier-1
    * incidents feed). Newest-first; cursor-based pagination via the returned
-   * `nextCursor`. Returns 503 on standalone/spoke deployments — callers MUST
-   * tolerate the rejection.
+   * `nextCursor`. Returns 503 from a server built before #6217 on a standalone
+   * or spoke deployment — callers MUST tolerate the rejection.
    *
    * Issue #2362: that 503 is also suppressed at the error-report boundary (see
    * FEDERATION_HEALTH_REPORT_OPTS) — it is a designed response, not a fault.
@@ -3599,12 +3677,14 @@ export class ApiClient {
   /**
    * Move a row through the lifecycle. The acting operator is recorded by the
    * server; nothing here names one. A 409 means another operator moved the row
-   * first (its `body` carries the row as it is now).
+   * first (its `body` carries the row as it is now). `{ saved: true }` (#5858 R3)
+   * means the gateway stored the change but this instance cannot read the
+   * returned row (the gateway is newer) — still a success.
    */
   async patchFeedbackInboxItem(
     id: string,
     body: FeedbackPatch
-  ): Promise<FeedbackInboxItem> {
+  ): Promise<FeedbackInboxItem | FeedbackPatchSaved> {
     const raw = await this.request<unknown>(
       `/api/feedback/inbox/${encodeURIComponent(id)}`,
       { method: "PATCH", body: JSON.stringify(body) },
@@ -3613,7 +3693,7 @@ export class ApiClient {
       ApiClient.DEFAULT_TIMEOUT_MS,
       { expectedStatuses: FEEDBACK_INBOX_WRITE_EXPECTED }
     );
-    return FeedbackInboxItemSchema.parse(raw);
+    return FeedbackInboxItemSchema.or(FeedbackPatchSavedSchema).parse(raw);
   }
 
   /** File the row as a GitHub issue (server-chosen repo) and mark it actioned. */
@@ -3641,6 +3721,66 @@ export class ApiClient {
     return await this.request<SessionTokenStatsResponse>(
       `/api/sessions/${encodeURIComponent(sessionId)}/token-stats`
     );
+  }
+
+  /**
+   * Issue #6170: Claude Code's full context breakdown for a session, through
+   * the readonly `get-context-usage` capability with `{ detail: "full" }`.
+   * Every designed failure comes back as `{ kind: "error", code }` rather than a
+   * throw: 403 `tier_not_invocable` (the session's launcher does not register
+   * the method), 400 `invalid_input` (the session runs a CLI from before
+   * #6170), 404 `session_not_found`, 409 `transport_failed`, the CLI's own
+   * `no_active_query` / `context_usage_error`, and `unexpected_reply` for a
+   * shape this client cannot read. Network failures still throw.
+   */
+  async getSessionContextBreakdown(
+    sessionId: string
+  ): Promise<SessionContextBreakdownResult> {
+    let envelope: unknown;
+    try {
+      envelope = await this.request<unknown>(
+        `/api/sessions/${encodeURIComponent(sessionId)}/capabilities/get-context-usage`,
+        { method: "POST", body: JSON.stringify({ detail: "full" }) },
+        0,
+        undefined,
+        undefined,
+        { expectedStatuses: [400, 403, 404, 409] }
+      );
+    } catch (err) {
+      if (err instanceof ApiError && err.body) {
+        try {
+          const parsed = JSON.parse(err.body) as {
+            code?: unknown;
+            error?: unknown;
+          };
+          return {
+            kind: "error",
+            code: typeof parsed.code === "string" ? parsed.code : "unknown",
+            message:
+              typeof parsed.error === "string" ? parsed.error : err.message,
+          };
+        } catch {
+          // Not a structured envelope — fall through to the rethrow.
+        }
+      }
+      throw err;
+    }
+    const data =
+      typeof envelope === "object" && envelope !== null
+        ? (envelope as { data?: unknown }).data
+        : undefined;
+    const result = parseGetContextUsageResult(data);
+    if (!result) {
+      return {
+        kind: "error",
+        code: "unexpected_reply",
+        message: "The session sent a context reply this page cannot read.",
+      };
+    }
+    if (!result.ok) {
+      return { kind: "error", code: result.code, message: result.error };
+    }
+    return { kind: "ok", detail: result.usage };
   }
 
   /**
@@ -3727,6 +3867,20 @@ export class ApiClient {
   ): Promise<AutoSelectOptimalAccountPreference> {
     return await this.request<AutoSelectOptimalAccountPreference>(
       "/api/preferences/auto-select-optimal-account",
+      { method: "PUT", body: JSON.stringify(pref) }
+    );
+  }
+  // Issue #6218: the node's default spawn permission mode (server-authoritative).
+  async getDefaultSpawnPermissionModePreference(): Promise<DefaultSpawnPermissionModePreference> {
+    return await this.request<DefaultSpawnPermissionModePreference>(
+      "/api/preferences/default-spawn-permission-mode"
+    );
+  }
+  async setDefaultSpawnPermissionModePreference(
+    pref: DefaultSpawnPermissionModePreference
+  ): Promise<DefaultSpawnPermissionModePreference> {
+    return await this.request<DefaultSpawnPermissionModePreference>(
+      "/api/preferences/default-spawn-permission-mode",
       { method: "PUT", body: JSON.stringify(pref) }
     );
   }
@@ -4510,6 +4664,65 @@ export class ApiClient {
     const qs = params.toString();
     return await this.request(
       `/api/telemetry/session-aggregates${qs ? `?${qs}` : ""}`
+    );
+  }
+
+  // ── Throughput telemetry (issue #6164) ──────────────────────────
+
+  /** The aggregate throughput summary for a window (the server snaps it to UTC days). */
+  async getThroughputSummary(range: {
+    from: number;
+    to: number;
+  }): Promise<ThroughputSummary> {
+    const params = new URLSearchParams({
+      from: String(range.from),
+      to: String(range.to),
+    });
+    return await this.request<ThroughputSummary>(
+      `/api/telemetry/throughput/summary?${params.toString()}`
+    );
+  }
+
+  /** Cost per account, session or issue (paged by `cursor`). */
+  async getThroughputBreakdown(
+    dim: ThroughputBreakdownDim,
+    range: { from: number; to: number },
+    cursor?: string
+  ): Promise<ThroughputBreakdown> {
+    const params = new URLSearchParams({
+      dim,
+      from: String(range.from),
+      to: String(range.to),
+    });
+    if (cursor) params.set("cursor", cursor);
+    return await this.request<ThroughputBreakdown>(
+      `/api/telemetry/throughput/breakdown?${params.toString()}`
+    );
+  }
+
+  /** Failing test units from CI and agents' runs (first page). */
+  async getThroughputTests(range: {
+    from: number;
+    to: number;
+  }): Promise<ThroughputTestsPage> {
+    const params = new URLSearchParams({
+      from: String(range.from),
+      to: String(range.to),
+    });
+    return await this.request<ThroughputTestsPage>(
+      `/api/telemetry/throughput/tests?${params.toString()}`
+    );
+  }
+
+  /** The stored weekly digests, newest first. */
+  async getThroughputDigests(): Promise<DigestList> {
+    return await this.request<DigestList>("/api/telemetry/throughput/digests");
+  }
+
+  /** One stored weekly digest. */
+  async getThroughputDigest(id: string): Promise<DigestDetail> {
+    return await this.request<DigestDetail>(
+      `/api/telemetry/throughput/digests/${encodeURIComponent(id)}`
     );
   }
 }

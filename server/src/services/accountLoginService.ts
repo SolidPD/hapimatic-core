@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -27,6 +27,16 @@ import {
   type FreshOauthToken,
   type IsolatedCredentialsSyncOptions,
 } from "./isolatedCredentialsSync";
+import {
+  NOT_AN_AUTHORIZATION_CODE_MSG,
+  startClaudeNativeSignIn,
+  validatePastedCode,
+  type ClaudeNativeSignIn,
+  type FailedNativeSignIn,
+  type NetworkErrorCode,
+  type StartClaudeNativeSignIn,
+} from "./claudeNativeSignIn";
+import { findClaudePath } from "../utils/mcpPoller";
 
 /**
  * Server-side orchestrator for web-initiated OAuth login (issue #1263).
@@ -59,19 +69,6 @@ interface PendingLogin {
   expiresAt: number;
 }
 
-/**
- * Shown when the pasted value cannot be an Anthropic authorization code
- * (#3452). A digits-only value is the shape of the 6-digit sign-in code
- * claude.com emails during login, which belongs on the claude.com page — the
- * authorization code Anthropic shows AFTER approval is a long opaque string
- * (conventionally `<code>#<state>`).
- */
-export const NOT_AN_AUTHORIZATION_CODE_MSG =
-  "That is not an Anthropic authorization code. It looks like the 6-digit " +
-  "sign-in code claude.com emailed you — enter that on the claude.com sign-in " +
-  "page, approve access, then paste the long authorization code Anthropic shows " +
-  "afterwards (copy the whole thing, including the part after #).";
-
 /** RR4: 5-minute single-use window for a login attempt. */
 const LOGIN_TTL_MS = 5 * 60 * 1000;
 
@@ -85,6 +82,25 @@ export const IN_VM_SIGN_IN_REQUIRED = "in_vm_sign_in_required";
 /** #4349: how long a started in-VM sign-in stays registrable (the user runs `/login` meanwhile). */
 const IN_VM_LOGIN_TTL_MS = 30 * 60 * 1000;
 
+/** #6211: how long a repeat `completeInVm` of a finished sign-in answers the same. */
+const IN_VM_REPEAT_COMPLETE_WINDOW_MS = 60 * 1000;
+
+/**
+ * #6211: live paste sign-in children across this server. Past it a start gets no link, and the
+ * client shows the terminal path. Each child can live 15 minutes in the server's own cgroup, outside
+ * the sessions' memory slice, and the per-namespace rate limits do not bound the total.
+ */
+const IN_VM_MAX_LIVE_SIGN_INS = 8;
+
+/**
+ * #6211: `HAPI_TENANT_PASTE_SIGNIN=0` (or false/no/off) turns the paste sign-in off; the client then
+ * shows the terminal sign-in. Read per start from the server's env, which `~/.config/hapimatic/env` sets at unit start, so a change needs a server restart.
+ */
+function pasteSignInEnabled(env: NodeJS.ProcessEnv): boolean {
+  const flag = (env.HAPI_TENANT_PASTE_SIGNIN ?? "").toLowerCase();
+  return !(flag === "0" || flag === "false" || flag === "no" || flag === "off");
+}
+
 /** #4349: an in-VM sign-in waiting for the binary to write its identity into the new dir. */
 interface PendingInVmLogin {
   accountUuid: string;
@@ -93,6 +109,10 @@ interface PendingInVmLogin {
   owner: string;
   /** Unix epoch ms. */
   expiresAt: number;
+  /** #6211: the running `claude auth login` behind the paste sign-in, when one could start. */
+  signIn?: ClaudeNativeSignIn;
+  /** #6211: a child on its way up, which a concurrent start joins rather than doubling. */
+  signInStarting?: Promise<void>;
 }
 
 export type InVmLoginStartResult = {
@@ -101,6 +121,11 @@ export type InVmLoginStartResult = {
   configDir: string;
   /** The exact command to run in a terminal on this VM; the user then types `/login`. */
   command: string;
+  /**
+   * #6211: the sign-in page of the unmodified binary running for this sign-in. Absent when it could
+   * not start (kill switch, binary missing, no URL parsed), and the client shows the terminal path.
+   */
+  authorizeUrl?: string;
 };
 
 export type InVmLoginCompleteResult =
@@ -111,7 +136,21 @@ export type InVmLoginCompleteResult =
         | "not_signed_in"
         | "expired_state"
         | "already_added"
+        | "exchange_failed"
         | "invalid_request";
+      error: string;
+    };
+
+export type InVmCodeSubmitResult =
+  | { ok: true; account: RedactedAccount }
+  | {
+      ok: false;
+      code:
+        | "invalid_code"
+        | "signing_in"
+        | "exchange_failed"
+        | "expired_state"
+        | "already_added";
       error: string;
     };
 
@@ -135,6 +174,14 @@ export class AccountLoginService {
   private readonly pending = new Map<string, PendingLogin>();
   /** #4349: in-VM sign-ins waiting for the binary's identity (never a token). */
   private readonly pendingInVm = new Map<string, PendingInVmLogin>();
+  /** #6211: finished sign-ins, so a poll racing the submit reads the same answer. */
+  private readonly finishedInVm = new Map<
+    string,
+    { result: InVmLoginCompleteResult; owner: string; at: number }
+  >();
+  private readonly startNativeSignIn: StartClaudeNativeSignIn;
+  private readonly findClaude: () => string | null;
+  private readonly env: NodeJS.ProcessEnv;
   private readonly tenantVm: () => boolean;
   private readonly accountConfigsDir: string;
   private readonly fetchImpl?: FetchLike;
@@ -171,8 +218,17 @@ export class AccountLoginService {
        * base the cli spawn path resolves `CLAUDE_CONFIG_DIR=<base>/<uuid>` from.
        */
       accountConfigsDir?: string;
+      /** #6211: starts the sign-in child (test seam). */
+      startNativeSignIn?: StartClaudeNativeSignIn;
+      /** #6211: resolves the `claude` binary (test seam). */
+      findClaude?: () => string | null;
+      /** #6211: the env the kill switch is read from (test seam). */
+      env?: NodeJS.ProcessEnv;
     } = {}
   ) {
+    this.startNativeSignIn = opts.startNativeSignIn ?? startClaudeNativeSignIn;
+    this.findClaude = opts.findClaude ?? findClaudePath;
+    this.env = opts.env ?? process.env;
     this.tenantVm = opts.tenantVm ?? isTenantVm;
     this.accountConfigsDir =
       opts.accountConfigsDir ??
@@ -423,8 +479,13 @@ export class AccountLoginService {
    * The user has to leave the dialog to reach a terminal, so an unexpired sign-in `owner` already
    * started is resumed (same token, dir and command, expiry renewed) rather than replaced: a
    * reopened dialog then polls the dir `/login` wrote into. Only {@link cancelInVm} ends one early.
+   *
+   * #6211: it also starts the unmodified `claude auth login --claudeai` in that dir and adds its
+   * sign-in page, so the user can sign in without a terminal. The terminal command stays in the
+   * answer, because both routes sign in to the same dir and either one registers it. A resume keeps
+   * the child and its link; only a child that has ended is replaced.
    */
-  startInVm(owner = ""): InVmLoginStartResult {
+  async startInVm(owner = ""): Promise<InVmLoginStartResult> {
     if (!this.tenantVm()) {
       throw new Error("in-VM sign-in runs only on a tenant VM (#4349)");
     }
@@ -436,12 +497,8 @@ export class AccountLoginService {
     if (resumable) {
       const [loginToken, entry] = resumable;
       entry.expiresAt = this.now() + IN_VM_LOGIN_TTL_MS;
-      return {
-        loginToken,
-        accountUuid: entry.accountUuid,
-        configDir: entry.configDir,
-        command: inVmSignInCommand(entry.configDir),
-      };
+      await this.ensureSignInChild(loginToken, entry);
+      return inVmStartResult(loginToken, entry);
     }
     const accountUuid = randomUUID();
     const configDir = join(this.accountConfigsDir, accountUuid);
@@ -449,18 +506,166 @@ export class AccountLoginService {
     // Not recursive: a fresh uuid must never name an existing dir.
     mkdirSync(configDir, { mode: 0o700 });
     const loginToken = randomUUID();
-    this.pendingInVm.set(loginToken, {
+    const entry: PendingInVmLogin = {
       accountUuid,
       configDir,
       owner,
       expiresAt: this.now() + IN_VM_LOGIN_TTL_MS,
-    });
-    return {
-      loginToken,
-      accountUuid,
-      configDir,
-      command: inVmSignInCommand(configDir),
     };
+    this.pendingInVm.set(loginToken, entry);
+    await this.ensureSignInChild(loginToken, entry);
+    return inVmStartResult(loginToken, entry);
+  }
+
+  /**
+   * #6211: pass a pasted code to this sign-in's child. Only the unmodified binary exchanges it:
+   * the code is written to the child's stdin and goes nowhere else. Registration stays with
+   * {@link completeInVm}, which reads only the identity the binary wrote.
+   */
+  async submitInVmCode(
+    loginToken: string,
+    code: string,
+    owner = ""
+  ): Promise<InVmCodeSubmitResult> {
+    this.sweepExpired();
+    const entry = this.pendingInVm.get(loginToken);
+    if (!entry || entry.owner !== owner) {
+      return {
+        ok: false,
+        code: "expired_state",
+        error: "This sign-in expired or is unknown. Start over.",
+      };
+    }
+    if (entry.signInStarting) await entry.signInStarting;
+    const signIn = entry.signIn;
+    // A child that ended first never saw this code, so "not accepted" would be untrue.
+    if (!signIn || signIn.endedUnsubmitted) {
+      return {
+        ok: false,
+        code: "expired_state",
+        error: "This sign-in has no link running. Open a new sign-in link.",
+      };
+    }
+    const check = validatePastedCode(code, signIn.state);
+    if (!check.ok) {
+      return { ok: false, code: "invalid_code", error: check.error };
+    }
+    const outcome = await signIn.submit(check.code);
+    if (outcome === "signing_in") {
+      return { ok: false, code: "signing_in", error: "Still signing in." };
+    }
+    // #6275 S12: a poll that registered the account, or a cancel, settled this sign-in while the
+    // code was exchanged. Stopping the child is then not a refusal, so answer what that settled.
+    if (this.pendingInVm.get(loginToken) !== entry) {
+      const finished = this.finishedInVm.get(loginToken);
+      if (finished?.owner === owner) {
+        const settled = finished.result;
+        if (settled.ok) return settled;
+        if (settled.code === "already_added") {
+          return { ok: false, code: "already_added", error: settled.error };
+        }
+      }
+      return {
+        ok: false,
+        code: "expired_state",
+        error: "This sign-in was stopped. Open a new sign-in link.",
+      };
+    }
+    if (outcome === "exchange_failed") {
+      const failed = signIn.failedExchange;
+      return {
+        ok: false,
+        code: "exchange_failed",
+        error: failed
+          ? inVmExchangeFailureMessage(failed)
+          : IN_VM_EXCHANGE_UNREAD_MSG,
+      };
+    }
+    const done = this.completeInVm(loginToken, owner);
+    if (done.ok) return done;
+    if (done.code === "already_added" || done.code === "expired_state") {
+      return { ok: false, code: done.code, error: done.error };
+    }
+    // Exit 0 with no usable identity: nothing to register, and the flow is spent.
+    // #6275 S20: the terminal guidance a poll gets here does not fit the paste dialog.
+    if (done.code === "not_signed_in") {
+      console.warn(
+        "[accounts] paste sign-in exited 0 but left no usable account to add"
+      );
+      return {
+        ok: false,
+        code: "exchange_failed",
+        error: IN_VM_NO_ACCOUNT_AFTER_SIGN_IN_MSG,
+      };
+    }
+    return { ok: false, code: "exchange_failed", error: done.error };
+  }
+
+  /**
+   * #6211: make sure a live child backs this sign-in. A failure leaves `signIn` unset, which reads
+   * as "no link" and sends the client to the terminal path (never an error of its own).
+   */
+  private ensureSignInChild(
+    loginToken: string,
+    entry: PendingInVmLogin
+  ): Promise<void> {
+    if (entry.signInStarting) return entry.signInStarting;
+    if (entry.signIn?.alive) return Promise.resolve();
+    // A finished child's dir is about to register; a new child there could only get in the way.
+    if (entry.signIn && readDirIdentity(entry.configDir)) {
+      return Promise.resolve();
+    }
+    entry.signIn = undefined;
+    if (!pasteSignInEnabled(this.env)) return Promise.resolve();
+    let live = 0;
+    for (const other of this.pendingInVm.values()) {
+      if (other.signIn?.alive || other.signInStarting) live += 1;
+    }
+    if (live >= IN_VM_MAX_LIVE_SIGN_INS) {
+      console.warn("[accounts] paste sign-in unavailable: too_many_live");
+      return Promise.resolve();
+    }
+    const claudePath = this.findClaude();
+    if (!claudePath) {
+      console.warn("[accounts] paste sign-in unavailable: binary_missing");
+      return Promise.resolve();
+    }
+    entry.signInStarting = this.startNativeSignIn({
+      claudePath,
+      configDir: entry.configDir,
+    })
+      .then(res => {
+        if (!res.ok) {
+          console.warn(`[accounts] paste sign-in unavailable: ${res.reason}`);
+          return;
+        }
+        entry.signIn = res.signIn;
+        // Cancelled or registered while it was starting: it must not outlive the sign-in.
+        if (this.pendingInVm.get(loginToken) !== entry) res.signIn.kill();
+      })
+      .catch(() => {
+        console.warn("[accounts] paste sign-in unavailable: start_threw");
+      })
+      .finally(() => {
+        entry.signInStarting = undefined;
+      });
+    return entry.signInStarting;
+  }
+
+  /**
+   * #6211: end a sign-in's child, then deal with its dir. The removal waits for the child, because
+   * a child still exiting could write into the dir again. With no child this runs synchronously.
+   */
+  private async retireInVm(
+    entry: PendingInVmLogin,
+    dir: "keep" | "remove"
+  ): Promise<void> {
+    if (entry.signInStarting) await entry.signInStarting;
+    if (entry.signIn?.alive) {
+      entry.signIn.kill();
+      await entry.signIn.exited;
+    }
+    if (dir === "remove") removeInVmDir(entry.configDir);
   }
 
   /**
@@ -468,9 +673,10 @@ export class AccountLoginService {
    * identity into its dir. Reads ONLY `<dir>/.claude.json` `oauthAccount` (email, uuids, names) —
    * never `.credentials.json` — and stores a token-less `native` record whose key is the dir's
    * uuid. `not_signed_in` until the identity appears; the pending entry survives that answer so
-   * the client can check again.
+   * the client can check again. This is the only registration, whichever route signed in. A repeat
+   * call shortly after it answers the same, because the client's poll can race a code submit.
    */
-  completeInVm(loginToken: string): InVmLoginCompleteResult {
+  completeInVm(loginToken: string, owner = ""): InVmLoginCompleteResult {
     this.sweepExpired();
     if (!loginToken) {
       return {
@@ -480,7 +686,9 @@ export class AccountLoginService {
       };
     }
     const entry = this.pendingInVm.get(loginToken);
-    if (!entry) {
+    if (!entry || entry.owner !== owner) {
+      const finished = this.finishedInVm.get(loginToken);
+      if (finished?.owner === owner) return finished.result;
       return {
         ok: false,
         code: "expired_state",
@@ -489,6 +697,14 @@ export class AccountLoginService {
     }
     const identity = readDirIdentity(entry.configDir);
     if (!identity) {
+      const failed = entry.signIn?.failedExchange;
+      if (failed) {
+        return {
+          ok: false,
+          code: "exchange_failed",
+          error: inVmExchangeFailureMessage(failed),
+        };
+      }
       return {
         ok: false,
         code: "not_signed_in",
@@ -496,6 +712,15 @@ export class AccountLoginService {
           "No sign-in found yet. Run the command in a terminal on this VM, type /login and finish Claude's prompts.",
       };
     }
+    return this.registerInVm(loginToken, entry, identity);
+  }
+
+  /** The registration itself, once the binary has written an identity into the sign-in's dir. */
+  private registerInVm(
+    loginToken: string,
+    entry: PendingInVmLogin,
+    identity: NonNullable<ReturnType<typeof readDirIdentity>>
+  ): InVmLoginCompleteResult {
     const duplicate = this.accountService
       .list()
       .map(a => this.accountService.getRawAny(a.accountUuid))
@@ -507,11 +732,23 @@ export class AccountLoginService {
       );
     if (duplicate) {
       this.pendingInVm.delete(loginToken);
-      return {
+      // #6211 R20: the new dir holds a live credential nothing references, so it goes rather than
+      // lingering. The check keeps the existing account's dir safe in every case.
+      const sameDir =
+        isNativeAnthropicAccount(duplicate) &&
+        duplicate.configDir === entry.configDir;
+      void this.retireInVm(entry, sameDir ? "keep" : "remove");
+      const result: InVmLoginCompleteResult = {
         ok: false,
         code: "already_added",
-        error: `${identity.emailAddress} is already signed in on this VM.`,
+        error: `${identity.emailAddress} is already connected.`,
       };
+      this.finishedInVm.set(loginToken, {
+        result,
+        owner: entry.owner,
+        at: this.now(),
+      });
+      return result;
     }
     const now = this.now();
     const parsed = NativeAnthropicStoredAccountSchema.safeParse({
@@ -537,14 +774,50 @@ export class AccountLoginService {
     }
     this.accountService.add(parsed.data);
     this.pendingInVm.delete(loginToken);
-    return { ok: true, account: toRedactedAccount(parsed.data) };
+    void this.retireInVm(entry, "keep");
+    const result: InVmLoginCompleteResult = {
+      ok: true,
+      account: toRedactedAccount(parsed.data),
+    };
+    this.finishedInVm.set(loginToken, { result, owner: entry.owner, at: now });
+    return result;
   }
 
-  /** #4349: abandon a started in-VM sign-in; removes its dir only while it is still empty. */
-  cancelInVm(loginToken: string): void {
+  /**
+   * #4349: abandon a started in-VM sign-in, resolving once that is done. #6211: it leaves no live
+   * credential where nothing can see or revoke it. The child stops first, because it can finish
+   * writing up to the moment it exits. A sign-in that did finish then registers, which puts it on
+   * Provider Accounts, and the caller gets that answer back rather than null. Anything else goes
+   * with its dir, including a credential with no identity to register it under: that dir was made
+   * for this sign-in, so nothing else refers to it.
+   */
+  async cancelInVm(
+    loginToken: string,
+    owner = ""
+  ): Promise<InVmLoginCompleteResult | null> {
     const entry = this.pendingInVm.get(loginToken);
+    if (!entry || entry.owner !== owner) {
+      // A poll may have registered it just before this cancel, and its answer lost on the way.
+      const finished = this.finishedInVm.get(loginToken);
+      return finished?.owner === owner ? finished.result : null;
+    }
     this.pendingInVm.delete(loginToken);
-    if (entry) removeDirIfEmpty(entry.configDir);
+    await this.retireInVm(entry, "keep");
+    const identity = readDirIdentity(entry.configDir);
+    let result: InVmLoginCompleteResult | null = null;
+    if (identity) {
+      try {
+        result = this.registerInVm(loginToken, entry, identity);
+      } catch (err) {
+        // The account store could not be written. The sign-in goes back on the list, so a second
+        // cancel, a poll or the sweep can still register its credential.
+        this.pendingInVm.set(loginToken, entry);
+        throw err;
+      }
+    }
+    if (result?.ok || result?.code === "already_added") return result;
+    removeInVmDir(entry.configDir);
+    return null;
   }
 
   private sweepExpired(): void {
@@ -553,20 +826,100 @@ export class AccountLoginService {
       if (t > v.expiresAt) this.pending.delete(k);
     }
     for (const [k, v] of this.pendingInVm) {
-      if (t > v.expiresAt) {
+      if (t <= v.expiresAt) continue;
+      // #6211 R20: a terminal sign-in finished while no dialog was polling. It holds a live
+      // credential, so it registers rather than sitting where nothing can see or revoke it.
+      const identity = readDirIdentity(v.configDir);
+      if (identity) this.registerInVm(k, v, identity);
+      if (this.pendingInVm.get(k) === v) {
         this.pendingInVm.delete(k);
-        removeDirIfEmpty(v.configDir);
+        // Nothing can register it after this, so a credential left here would only be stranded.
+        void this.retireInVm(v, "remove");
+      }
+    }
+    for (const [k, v] of this.finishedInVm) {
+      if (t > v.at + IN_VM_REPEAT_COMPLETE_WINDOW_MS) {
+        this.finishedInVm.delete(k);
       }
     }
   }
 }
 
-/** #4349: remove an in-VM sign-in dir only while it is empty — never a dir `/login` wrote into. */
-function removeDirIfEmpty(configDir: string): void {
+function inVmStartResult(
+  loginToken: string,
+  entry: PendingInVmLogin
+): InVmLoginStartResult {
+  return {
+    loginToken,
+    accountUuid: entry.accountUuid,
+    configDir: entry.configDir,
+    command: inVmSignInCommand(entry.configDir),
+    ...(entry.signIn ? { authorizeUrl: entry.signIn.authorizeUrl } : {}),
+  };
+}
+
+/** #6275 S12: a network error code from the child, in words. */
+const NETWORK_REASONS: Record<NetworkErrorCode, string> = {
+  ENOTFOUND: "its address lookup failed",
+  EAI_AGAIN: "its address lookup failed",
+  ECONNREFUSED: "the connection was refused",
+  ECONNRESET: "the connection was dropped",
+  ECONNABORTED: "the connection was dropped",
+  EPIPE: "the connection was dropped",
+  hangup: "the connection was dropped",
+  ETIMEDOUT: "the request timed out",
+  timeout: "the request timed out",
+  ENETUNREACH: "the network is unreachable",
+  EHOSTUNREACH: "the network is unreachable",
+  ENETDOWN: "the network is unreachable",
+  EPROTO: "the secure connection failed",
+  tls: "the secure connection could not be verified",
+};
+
+/** #6275 S20: claude exited 0 but left no usable account behind for the paste sign-in. */
+export const IN_VM_NO_ACCOUNT_AFTER_SIGN_IN_MSG =
+  "Claude finished signing in, but left no account here to add. Open a new sign-in link and try again.";
+/** A failed exchange whose cause could not be read (not expected; the submit just ended it). */
+const IN_VM_EXCHANGE_UNREAD_MSG =
+  "The sign-in did not finish. Open a new sign-in link.";
+
+/**
+ * #6275 S12, S20: what a failed paste exchange tells the user, by its cause, so a failed sign-in
+ * says whether the network, a refusal in front of Anthropic, Anthropic's server or the code was
+ * the problem. The server's log line for the child (`[accounts] paste sign-in ended: …`) carries
+ * the exit code and signal.
+ */
+export function inVmExchangeFailureMessage({
+  failure,
+  end,
+}: FailedNativeSignIn): string {
+  switch (failure.cause) {
+    case "code_refused":
+      return "Anthropic did not accept that code. Open a new sign-in link and paste the code it shows.";
+    case "denied":
+      return `Anthropic's sign-in service refused the request (HTTP ${failure.status}), which is usually not about the code: something between this VM and Anthropic, such as a firewall or proxy, may be blocking it. Check this VM's network, then open a new sign-in link.`;
+    case "network":
+      return `This VM could not reach Anthropic to finish signing in: ${NETWORK_REASONS[failure.errorCode]}. Check its internet connection, then open a new sign-in link.`;
+    case "server":
+      return failure.status >= 400
+        ? `Anthropic's sign-in service answered with an error (HTTP ${failure.status}). Wait a minute, then open a new sign-in link.`
+        : `Anthropic's sign-in service gave an answer this sign-in could not use (HTTP ${failure.status}). Wait a minute, then open a new sign-in link.`;
+    case "stopped":
+      return "The sign-in stopped before it finished. Open a new sign-in link.";
+    case "unknown": {
+      const how = end.signal
+        ? `was ended by ${end.signal}`
+        : `exited with code ${end.code ?? "unknown"}`;
+      return `The sign-in did not finish: claude ${how}. Open a new sign-in link.`;
+    }
+  }
+}
+
+function removeInVmDir(configDir: string): void {
   try {
-    rmdirSync(configDir); // fails (and keeps the dir) unless it is empty
+    rmSync(configDir, { recursive: true, force: true });
   } catch {
-    // Not empty, or already gone: never delete a credential.
+    // Already gone, or not removable: nothing further to do with it.
   }
 }
 

@@ -421,6 +421,19 @@ export function createSessionLifecycleRoutes(
         }
       }
 
+      // Issue #5819: a session another node placed here on one of this node's
+      // keys may not reconnect on that key once its owner unshares it. Answer
+      // synchronously (the #1778 shape above) so the asking node sees the
+      // refusal instead of { ok: true } and a spinner; the healthy respawn below
+      // stays fire-and-forget (Fallback Preservation Rule).
+      const placementRefusal = await engine.apiKeyPlacementRefusal(session);
+      if (placementRefusal) {
+        return c.json(
+          { error: placementRefusal.message, code: placementRefusal.code },
+          placementRefusal.code === "api_key_not_shared" ? 409 : 404
+        );
+      }
+
       // Kick off reconnect in the background — don't await.
       void engine.reconnectSession(sessionId).then(result => {
         if (result.type === "error") {
@@ -497,6 +510,10 @@ export function createSessionLifecycleRoutes(
       if (result.type === "success") {
         return c.json({ ok: true, newSessionId: result.newSessionId });
       }
+      // Issue #5819: the key of a cross-node placement is no longer shared.
+      if (result.code === "api_key_not_shared") {
+        return c.json({ error: result.message, code: result.code }, 409);
+      }
 
       return c.json({ error: result.message }, 500);
     }
@@ -553,7 +570,11 @@ export function createSessionLifecycleRoutes(
 
       try {
         // Peer-incoming RPC: bypasses SessionService by design — see server/CLAUDE.md § "SessionService Audience Boundary"
-        await engine.deleteSession(sessionId);
+        // #6210: answer once the record is gone; tmux + worktree cleanup finish
+        // in the background. A hub bulk delete sends one of these per session
+        // with a 10 s timeout, and 55 awaited worktree cleanups held 53 of the
+        // answers for 40 s, so the hub reported deletes the peer then completed.
+        await engine.deleteSession(sessionId, { detachCleanup: true });
         return c.json({ ok: true });
       } catch (err) {
         return logAndJson(c, err, 500, {

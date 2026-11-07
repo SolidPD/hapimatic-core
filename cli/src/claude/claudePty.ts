@@ -4,6 +4,10 @@ import { logger } from "@/ui/logger";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { getProjectPath } from "./utils/path";
 import { appendMcpConfigArg } from "./utils/mcpConfig";
+import {
+  applyPreTrustShim,
+  preTrustConfigPath,
+} from "./utils/projectMcpConfig";
 import { buildSystemPrompt } from "./utils/systemPrompt";
 import { withBunRuntimeEnv } from "@/utils/bunRuntime";
 import { getDefaultClaudeCodePath } from "./sdk/utils";
@@ -57,6 +61,25 @@ export async function claudePty(
   }
 
   const args: string[] = [];
+
+  // #6211: the same pre-trust the tmux launcher applies, because this launcher's
+  // screen is hidden as well: a bound config with no first-run flags would otherwise
+  // sit at the theme picker, then the trust prompt. #6275 S10: for an unbound
+  // session a failure here (no ~/.claude.json, a cwd the path check refuses, a
+  // corrupt config, a lock timeout) starts the session without it, as this launcher
+  // did before #6211. #6275 S18: a session bound to an account's config dir still
+  // fails visibly, because without the shim it would start at those hidden prompts.
+  const boundConfigPath = preTrustConfigPath(opts.claudeEnvVars);
+  try {
+    await applyPreTrustShim(opts.path, boundConfigPath, {
+      createIfMissing: boundConfigPath !== undefined,
+    });
+  } catch (error) {
+    if (boundConfigPath !== undefined) throw error;
+    logger.warn(
+      `[ClaudePty] pre-trust not applied, starting without it: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 
   const hasContinueFlag = opts.claudeArgs?.includes("--continue");
   const hasResumeFlag = opts.claudeArgs?.includes("--resume");

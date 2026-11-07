@@ -75,6 +75,7 @@ import {
   type EgressBrokerHandle,
 } from "@/sandbox/egressBroker";
 import { resolveEgressAllowlist } from "@/sandbox/egressPolicy";
+import { DAEMON_DELETE_AT_START_ENV_VARS } from "@/sandbox/secretEnvVars";
 import { runSystemdInvariantsCheck } from "./systemdInvariants";
 import { createOwnStateWriter } from "./daemonStateOwnership";
 import {} from "./orphanCheckDecision";
@@ -106,6 +107,7 @@ import {
   createWorktreeCollector,
   runningInsideWorktreeInstanceDaemon,
 } from "./worktreeCollector";
+import { startSlicePressureWatchdog } from "./slicePressureWatchdog";
 import {
   machineRotatorRoleLine,
   resolveMachineRotatorRole,
@@ -178,25 +180,15 @@ export interface DaemonRuntimeHandles {
 export async function startDaemon(
   testSeams: StartDaemonTestSeams = {}
 ): Promise<void> {
-  // Defense #1: Sanitize inherited env vars from parent shell.
-  // When daemon is started from within a Hapimatic session, it inherits
-  // HAPI_SESSION_ID and HAPI_TMUX_WINDOW which would leak to all spawned
-  // child processes, causing session collision. See issue #283.
-  delete process.env.HAPI_SESSION_ID;
-  delete process.env.HAPI_TMUX_WINDOW;
-  // #5764: only the server reads the federation token
-  // (server/src/config/federationConfig.ts); the daemon never does, and every
-  // child it spawns copies its environment (sessionSpawner.ts). Remove it before
-  // recovery, tmux or any spawn can see it. This changes neither the launch
-  // snapshot in /proc/<pid>/environ nor what a same-user process can read from
-  // settings.json; it stops the token being handed to sessions.
-  delete process.env.FEDERATION_API_TOKEN;
-  // #5781: the same for the feedback-inbox operator bearer and a cloud VM's
-  // feedback-relay bearer. Only the server reads either; a daemon unit that sets
-  // one (a VM provisioned before #5926 still has 21-feedback.conf here) would hand
-  // it to the direct-spawn wrapper and the routes that skip the strip (#4125, #4057).
-  delete process.env.FEEDBACK_INBOX_TOKEN;
-  delete process.env.FEEDBACK_RELAY_TOKEN;
+  // Defense #1: a session-started daemon must not pass panes HAPI_SESSION_ID/
+  // HAPI_TMUX_WINDOW (collision, #283) or CLAUDECODE=1 (watchdog victim #6156).
+  for (const k of ["HAPI_SESSION_ID", "HAPI_TMUX_WINDOW", "CLAUDECODE"])
+    delete process.env[k];
+  // Server-only secrets (#5764 federation, #5781/#5858 feedback, #5304 Google
+  // hand-off key): only the server reads them, so remove them before recovery,
+  // tmux or any spawn can see them. A Bun.spawn child sees the delete only when
+  // it passes `env` (see the set's definition, which gives each member's reason).
+  for (const k of DAEMON_DELETE_AT_START_ENV_VARS) delete process.env[k];
 
   // We don't have cleanup function at the time of server construction
   // Control flow is:
@@ -1373,6 +1365,7 @@ export async function startDaemon(
     // inert unless HAPI_WORKTREE_COLLECTOR=1 on this daemon's unit). ctx.daemonJobNode
     // + ctx.daemonJobRegistry are already assigned above, so the ordering is safe.
     const { collectorLoop } = createWorktreeCollector(ctx, testSeams);
+    const sliceWatchdog = startSlicePressureWatchdog(ctx, testSeams); // #6156: lease holder acts
     // Setup signal handlers
     const cleanupAndShutdown = async (
       source: "hapi-app" | "hapi-cli" | "os-signal" | "exception",
@@ -1390,6 +1383,7 @@ export async function startDaemon(
       collectorLoop.stop();
       logger.debug("[DAEMON RUN] Worktree collector loop stopped");
 
+      sliceWatchdog.stop(); // #6156: also gives up the node lease
       // Issue #1449: stop the credentials watcher — tears down the fs watch +
       // any pending debounce timer (R9) so the daemon shuts down cleanly.
       if (credentialsWatcher) {

@@ -149,14 +149,21 @@ export const AGENT_FORBIDDEN_ENV_VARS: ReadonlySet<string> = new Set([
   // other route that leaves it in a wrapper's env. It is not a boundary against a
   // same-user process reading settings.json.
   "FEDERATION_API_TOKEN",
-  // #5781: an operator node's bearer for the gateway's central feedback sink (#2911)
-  // and its inbox reads (#2912). Only the server reads it (resolveFeedbackSinkConfig /
+  // #5781: an operator node's bearer for the gateway's central feedback sink (#2911).
+  // Since #5858 it no longer opens the inbox: resolveFeedbackInboxConfig reads it only
+  // to refuse an equal node token. Only the server reads it (resolveFeedbackSinkConfig /
   // resolveFeedbackInboxConfig, server/src/config/serverSettings.ts); the daemon never
   // does, and deletes it from its own env at start (daemon/run.ts). Not in
   // SECRET_ENV_VARS: since #5847 every surface that consumes that set also applies this
   // one, ungated, so a second membership would add no strip (the #5764 precedent). It is
   // not a boundary against a same-user process reading the operator's env file.
   "FEEDBACK_INBOX_TOKEN",
+  // #5858 R1: an operator node's OWN token for the gateway's feedback inbox (#2912),
+  // split from the sink bearer above so a node that only forwards cannot read the
+  // inbox. Only the server reads it (resolveFeedbackInboxConfig); the daemon deletes it
+  // from its own env at start (daemon/run.ts). Kept out of SECRET_ENV_VARS for the same
+  // #5847 reason as FEEDBACK_INBOX_TOKEN.
+  "FEEDBACK_INBOX_NODE_TOKEN",
   // #5781 (D7): a cloud VM's per-VM bearer for the gateway feedback relay (#2667), which
   // also redeems backup restore grants (#2509). Only the server reads it
   // (serverSettings.ts, buildWebApp.ts). VMs provisioned before #5926 also carry its
@@ -168,6 +175,58 @@ export const AGENT_FORBIDDEN_ENV_VARS: ReadonlySet<string> = new Set([
   // reads it from the server unit's drop-in FILE, never from an environment, so the
   // strip cannot break a restore.
   "FEEDBACK_RELAY_TOKEN",
+  // #6156: not a secret, but the slice-pressure watchdog's victim marker. Claude Code
+  // sets CLAUDECODE=1 only for the processes it runs, so a process carrying it (and a
+  // HAPI_SESSION_ID) is an agent-run tool the watchdog may kill. A daemon or tmux
+  // server started from inside a session would hand it to every pane, making each
+  // session's wrapper and claude a valid victim. The daemon deletes it from its own
+  // env at start (daemon/run.ts); this strips it from a tmux server an older or
+  // session-started daemon created. claude itself never needs it inherited (it
+  // marks a nested session).
+  "CLAUDECODE",
+  // #5304: a cloud VM's per-VM key for verifying the gateway's Google sign-in hand-off
+  // token. Only the server reads it (googleHandoffSecret, serverSettings.ts); the daemon
+  // deletes it from its own env at start (daemon/run.ts). VMs provisioned before #5304
+  // also carry it in the daemon unit's 20-handoff.conf until the reconcile
+  // handoff-placement repair removes that line. Keep it after that repair too: a tmux
+  // server started by an older daemon (KillMode=process) can still hold an old value.
+  // Not in SECRET_ENV_VARS, for the #5847 reason given at FEEDBACK_INBOX_TOKEN. It is
+  // not a boundary against a same-user process reading the drop-in or /proc environ.
+  "HAPI_GOOGLE_HANDOFF_SECRET",
+]);
+
+/**
+ * Server-only secrets the daemon deletes from its own `process.env` at start
+ * (`startDaemon`, daemon/run.ts), before recovery, tmux or any spawn runs. Only the
+ * server reads each one, and every child the daemon spawns copies its environment
+ * (sessionSpawner.ts), so a daemon unit that sets one would hand it to the
+ * direct-spawn wrapper and to the routes that skip the agent strip (#4125, #4057).
+ * Deleting it changes neither the launch snapshot in /proc/<pid>/environ nor what a
+ * same-user process can read from a drop-in or settings.json; it stops the value
+ * being handed to children. That holds for Node's spawn and for any call that
+ * passes `env: process.env`, but NOT for `Bun.spawn`/`Bun.spawnSync` without an
+ * `env` option, which passes the ORIGINAL launch environment; so every such call
+ * in cli/src passes `env` (pinned by a source scan in secretEnvVars.test.ts).
+ *
+ * - `FEDERATION_API_TOKEN` (#5764): server/src/config/federationConfig.ts.
+ * - `FEEDBACK_INBOX_TOKEN` (#5781) and `FEEDBACK_INBOX_NODE_TOKEN` (#5858 R1): the
+ *   feedback sink and inbox bearers (serverSettings.ts).
+ * - `FEEDBACK_RELAY_TOKEN` (#5781 D7): VMs provisioned before #5926 still carry
+ *   21-feedback.conf on the daemon unit.
+ * - `HAPI_GOOGLE_HANDOFF_SECRET` (#5304): VMs provisioned before #5304 carry it in
+ *   the daemon unit's 20-handoff.conf.
+ *
+ * A strict subset of {@link AGENT_FORBIDDEN_ENV_VARS} (pinned by a test): the
+ * onboarding vars are consumed before they are deleted, the daemon reads its own
+ * `GH_TOKEN`, and `CLAUDECODE` (#6156, not a secret) is deleted by startDaemon's
+ * own Defense #1 loop, so none of them belongs here.
+ */
+export const DAEMON_DELETE_AT_START_ENV_VARS: ReadonlySet<string> = new Set([
+  "FEDERATION_API_TOKEN",
+  "FEEDBACK_INBOX_TOKEN",
+  "FEEDBACK_INBOX_NODE_TOKEN",
+  "FEEDBACK_RELAY_TOKEN",
+  "HAPI_GOOGLE_HANDOFF_SECRET",
 ]);
 
 /**

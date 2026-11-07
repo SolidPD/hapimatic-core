@@ -49,6 +49,8 @@ export function useGitHubSection(args: {
   accountsSource: string | null;
   repos: GitHubRepo[];
   reposLoading: boolean;
+  /** #6326: the server stopped at its repository cap with more available. */
+  reposTruncated: boolean;
   issues: RepoIssueItem[];
   /** Forge-origin repo resolved from the directory, or null. */
   detectedRepo: string | null;
@@ -81,6 +83,7 @@ export function useGitHubSection(args: {
     accountsSource: accountsQuery.source,
     repos: reposQuery.repos,
     reposLoading: reposQuery.isLoading,
+    reposTruncated: reposQuery.truncated,
     issues: issuesQuery.issues,
     detectedRepo: issuesQuery.repo,
     issuesLoading: issuesQuery.isLoading,

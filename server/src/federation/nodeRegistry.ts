@@ -26,6 +26,7 @@ import type {
 } from "@hapi/protocol";
 import type { SyncEvent } from "@hapi/protocol/types";
 import type { GitBranchListing } from "@hapi/protocol/gitBranches";
+import type { GitHubRepo } from "@hapi/protocol/githubRepo";
 import {
   ANTHROPIC_LOGIN_CAPABILITY,
   FederationApiKeyRefusalSchema,
@@ -86,6 +87,12 @@ import type {
 import { readPeerJsonObject } from "./proxyFetchSignal";
 
 const FETCH_TIMEOUT_MS = 10_000;
+/**
+ * #6210: how long the record of an evicted (deleted) remote session is kept.
+ * A poll that started before the eviction can only land within its own fetch
+ * timeouts (10 s each, run in parallel), so 60 s outlives every such poll.
+ */
+export const EVICTION_TOMBSTONE_TTL_MS = 60_000;
 /** #5127: fetch error codes (Bun and Node) that mean the peer is unreachable. */
 const UNREACHABLE_CODES = new Set([
   "ConnectionRefused",
@@ -445,6 +452,18 @@ export class NodeRegistry {
 
   private nodeStates = new Map<string, FederationNodeState>();
   private sessionCache = new Map<string, CachedRemoteSessions>();
+  /**
+   * #6210: remote sessions evicted from the cache (after a confirmed delete,
+   * or by a relaunch), each stamped with the eviction sequence. `pollNode`
+   * drops any id evicted after the poll started, so a poll in flight across a
+   * delete cannot put the row back; after a relaunch the next poll re-adds it.
+   * `at` is `performance.now()` (monotonic) for the TTL prune.
+   */
+  private evictionSeq = 0;
+  private evictedSessions = new Map<
+    string,
+    { nodeId: string | null; seq: number; at: number }
+  >();
   private readonly loop: SupervisedLoop;
 
   /** SSE event bridge: one persistent connection per remote node. */
@@ -840,6 +859,14 @@ export class NodeRegistry {
           if (line.startsWith("data: ") && this.eventBridgeSseManager) {
             try {
               const event = JSON.parse(line.slice(6)) as SyncEvent;
+              // #6210: the peer deleted this session. Evict it from THIS node's
+              // cached list before the event is rebroadcast, so a browser
+              // refetch triggered by it no longer sees the row. Done whether
+              // or not the event is forwarded, and scoped to the channel's node
+              // so one peer cannot evict another node's session.
+              if (event.type === "session-removed" && "sessionId" in event) {
+                this.evictSessionFromCache(event.sessionId, nodeConfig.id);
+              }
               if (this.shouldForwardEvent(event)) {
                 // Issue #4461 (R7): name the node whose store refused. The hub's
                 // own id and label for this peer win over anything the peer
@@ -1138,15 +1165,55 @@ export class NodeRegistry {
     return false;
   }
 
-  /** Remove a session from the local cache (e.g. after confirmed deletion). */
-  evictSessionFromCache(sessionId: string): void {
-    for (const cached of this.sessionCache.values()) {
+  /**
+   * Remove a session from the local cache (after a confirmed deletion, or a
+   * relaunch that wants fresh state).
+   *
+   * #6210: also records a tombstone (even when the id is not cached), so a poll
+   * that started before this eviction cannot re-insert the session; a poll
+   * that starts after it is trusted. With `nodeId`, only that node's cached
+   * list is touched; without it, the tombstone matches every node.
+   */
+  evictSessionFromCache(sessionId: string, nodeId?: string): void {
+    const now = performance.now();
+    for (const [id, tomb] of this.evictedSessions) {
+      if (now - tomb.at > EVICTION_TOMBSTONE_TTL_MS) {
+        this.evictedSessions.delete(id);
+      }
+    }
+    this.evictedSessions.set(sessionId, {
+      nodeId: nodeId ?? null,
+      seq: ++this.evictionSeq,
+      at: now,
+    });
+    const entries =
+      nodeId === undefined
+        ? this.sessionCache.values()
+        : [this.sessionCache.get(nodeId)].filter(
+            (c): c is CachedRemoteSessions => c !== undefined
+          );
+    for (const cached of entries) {
       const idx = cached.sessions.findIndex(s => s.id === sessionId);
       if (idx !== -1) {
         cached.sessions.splice(idx, 1);
         return;
       }
     }
+  }
+
+  /**
+   * #6210: true when `sessionId` was evicted from `nodeId` after a poll that
+   * read `startSeq` began — that poll's snapshot may predate the delete.
+   */
+  private evictedSince(
+    sessionId: string,
+    nodeId: string,
+    startSeq: number
+  ): boolean {
+    const tomb = this.evictedSessions.get(sessionId);
+    if (!tomb || tomb.seq <= startSeq) return false;
+    if (performance.now() - tomb.at > EVICTION_TOMBSTONE_TTL_MS) return false;
+    return tomb.nodeId === null || tomb.nodeId === nodeId;
   }
 
   /** Mark a cached session as inactive (e.g. after confirmed archive). */
@@ -1338,10 +1405,11 @@ export class NodeRegistry {
    * Update a cached session's live-control fields after a successful federation
    * proxy mutation (#3083). Guards on `if (session)` — NOT `if (session?.metadata)`
    * — because `permissionMode` / `modelMode` are TOP-LEVEL `SessionSummary` fields
-   * (`shared/src/sessionSummary.ts:117`, `:115`) while `metadata` is nullable, so a
+   * (`shared/src/sessionSummary.ts`) while `metadata` is nullable, so a
    * metadata-guarded copy would silently no-op for a cached summary with
-   * `metadata: null`. `effort` / `rawModel` are not summary fields — they refresh at
-   * the next poll. In place, never evict (ruling A-D4; docs/internal/architecture/federation.md).
+   * `metadata: null`. It does not write `effort` (a summary field since #6166): the
+   * cached summary's effort refreshes at the next poll. `rawModel` is not a summary
+   * field. In place, never evict (ruling A-D4; docs/internal/architecture/federation.md).
    */
   updateCachedSessionConfig(
     sessionId: string,
@@ -1780,7 +1848,7 @@ export class NodeRegistry {
     branchLabel?: string
   ): Promise<
     | { type: "success"; newSessionId: string }
-    | { type: "error"; message: string }
+    | { type: "error"; message: string; code?: string }
   > {
     const state = this.nodeStates.get(nodeId);
     if (!state || state.status === "offline") {
@@ -1806,6 +1874,9 @@ export class NodeRegistry {
           message:
             (body as Record<string, string>).error ??
             `Node returned ${res.status}`,
+          // #5819: surface the peer's code (e.g. "api_key_not_shared"), as
+          // reconnectOnNode does since #1778.
+          code: (body as Record<string, string>).code,
         };
       }
       const result = (await res.json()) as {
@@ -2049,13 +2120,10 @@ export class NodeRegistry {
   ): Promise<
     | {
         type: "success";
-        repos: Array<{
-          nameWithOwner: string;
-          name: string;
-          description: string | null;
-          isPrivate: boolean;
-          pushedAt: string | null;
-        }>;
+        /** The shared type (#6326); the peer's JSON is cast, so an older peer omits newer fields. */
+        repos: GitHubRepo[];
+        /** #6326: absent from a peer that predates it. */
+        truncated?: boolean;
       }
     | { type: "error"; message: string }
   > {
@@ -3228,6 +3296,9 @@ export class NodeRegistry {
   ): Promise<void> {
     const state = this.nodeStates.get(nodeConfig.id);
     if (!state) return;
+    // #6210: read before any fetch — a session evicted after this point may
+    // still be in the snapshot this poll is about to receive.
+    const startSeq = this.evictionSeq;
 
     try {
       // Fetch node info, sessions, and (R4) the claim snapshot concurrently.
@@ -3241,13 +3312,17 @@ export class NodeRegistry {
       ]);
 
       // Mark sessions with federation origin
+      // #6210: drop sessions deleted while this poll was in flight, before the
+      // cache write and the new-id diff below (no spurious `session-added`).
       const sessions: SessionSummary[] = (
         sessionsResponse.sessions as SessionSummary[]
-      ).map(s => ({
-        ...s,
-        nodeId: nodeConfig.id,
-        nodeLabel: nodeConfig.label,
-      }));
+      )
+        .filter(s => !this.evictedSince(s.id, nodeConfig.id, startSeq))
+        .map(s => ({
+          ...s,
+          nodeId: nodeConfig.id,
+          nodeLabel: nodeConfig.label,
+        }));
 
       // Update state — success
       state.info = info;
@@ -3460,7 +3535,7 @@ export class NodeRegistry {
         };
       }
       // Immediately remove from cache so client queries reflect the deletion
-      this.evictSessionFromCache(sessionId);
+      this.evictSessionFromCache(sessionId, nodeId);
       if (options?.deferPoll) {
         return { ok: true };
       }

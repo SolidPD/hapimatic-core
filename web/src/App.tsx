@@ -19,6 +19,7 @@ import { usePwaRecovery } from "@/hooks/usePwaRecovery";
 import { useSyncingState } from "@/hooks/useSyncingState";
 import { usePushNotifications } from "@/hooks/usePushNotifications";
 import { useClearNotificationsOnOpen } from "@/hooks/useClearNotificationsOnOpen";
+import { useBrowserZoomPolicy } from "@/hooks/useTouchGestureZoomGuard";
 import {
   readGlobalOptOut,
   syncPreferencesToCache,
@@ -238,63 +239,10 @@ export function App() {
   // the delivered notifications, on load and on every return to visible.
   useClearNotificationsOnOpen();
 
-  useEffect(() => {
-    const preventDefault = (event: Event) => {
-      event.preventDefault();
-    };
-
-    const onWheel = (event: WheelEvent) => {
-      if (event.ctrlKey) {
-        event.preventDefault();
-      }
-    };
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      const modifier = event.ctrlKey || event.metaKey;
-      if (!modifier) return;
-      if (
-        event.key === "+" ||
-        event.key === "-" ||
-        event.key === "=" ||
-        event.key === "0"
-      ) {
-        event.preventDefault();
-      }
-    };
-
-    document.addEventListener("gesturestart", preventDefault as EventListener, {
-      passive: false,
-    });
-    document.addEventListener(
-      "gesturechange",
-      preventDefault as EventListener,
-      { passive: false }
-    );
-    document.addEventListener("gestureend", preventDefault as EventListener, {
-      passive: false,
-    });
-
-    window.addEventListener("wheel", onWheel, { passive: false });
-    window.addEventListener("keydown", onKeyDown);
-
-    return () => {
-      document.removeEventListener(
-        "gesturestart",
-        preventDefault as EventListener
-      );
-      document.removeEventListener(
-        "gesturechange",
-        preventDefault as EventListener
-      );
-      document.removeEventListener(
-        "gestureend",
-        preventDefault as EventListener
-      );
-
-      window.removeEventListener("wheel", onWheel);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, []);
+  // #6213: browser zoom and pinch-zoom (Ctrl/Cmd + = - 0, Ctrl+wheel, trackpad
+  // pinch) are never cancelled; Safari pinch gestures are cancelled on
+  // touch-primary devices only.
+  useBrowserZoomPolicy();
 
   useEffect(() => {
     const tg = getTelegramWebApp();
@@ -649,7 +597,7 @@ export function App() {
           <SettingsDrawer />
           {/* #3865: the in-app first-run tour — one app-level host (auto-present
               over /sessions while the node-local state is pending; Settings
-              re-entry via the hapi:onboarding-open window event). */}
+              re-entry via the hapi:onboarding-restart window event). */}
           <OnboardingHost />
           {/* #4791: the first-run "save your backup key" step — one app-level
               host, presented over /sessions after launch; it waits for the tour

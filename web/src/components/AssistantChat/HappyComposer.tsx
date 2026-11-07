@@ -127,6 +127,12 @@ export function HappyComposer(props: {
   // model/effort picker (SessionChat → HappyComposer → ComposerButtons).
   effort?: EffortLevel;
   rawModel?: string;
+  /** Issue #6166: the effort the Claude process applies (`null` = none; absent =
+   *  not measured), the model the read-back reported and the effort that
+   *  process was launched with — for the config chip. */
+  appliedEffort?: EffortLevel | null;
+  appliedModel?: string;
+  appliedForEffort?: EffortLevel | null;
   /** #1509 (iter AC): running a below-entitlement model → composer model text red. */
   modelDowngraded?: boolean;
   onEffortChange?: (level: EffortLevel) => void;
@@ -1143,6 +1149,9 @@ export function HappyComposer(props: {
       rawModel={rawModel}
       nativeModel={nativeModel}
       effort={effort}
+      appliedEffort={props.appliedEffort}
+      appliedModel={props.appliedModel}
+      appliedForEffort={props.appliedForEffort}
       modelDowngraded={modelDowngraded}
       accountEmail={props.accountEmail}
       apiKeyName={props.apiKeyName}
@@ -1363,6 +1372,7 @@ export function HappyComposer(props: {
                     onKeyDown={handleKeyDown}
                     onPaste={handlePaste}
                     onFocus={onComposeFocus}
+                    onPointerDown={onComposeFocus}
                     // Issue #2848: re-arm IME suppression when the field loses
                     // focus so the next focus is suppressed again. Skipped during
                     // the summon's own programmatic blur (summoningRef). Kiosk-gated

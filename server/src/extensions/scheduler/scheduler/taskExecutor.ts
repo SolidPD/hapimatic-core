@@ -57,7 +57,15 @@ export type SkipReason =
   | "overlap"
   | "thermal"
   | "session-busy"
-  | "cap-pressure";
+  | "cap-pressure"
+  | "memory";
+
+/**
+ * errorMessage prefix of a run the daemon refused because the node was low on
+ * free memory (#6156). The run is deferred like a cap-pressure skip, so a
+ * one-shot is re-armed rather than dropped.
+ */
+export const MEMORY_SKIP_PREFIX = "Deferred — node low on free memory";
 
 /**
  * errorMessage prefix of a cap-pressure skip row. Consecutive cap-pressure
@@ -414,6 +422,9 @@ export class TaskExecutor {
         });
 
         if (spawnResult.type === "error") {
+          if (spawnResult.code === "insufficient_memory") {
+            return this.deferForMemory(task, execution, spawnResult.message);
+          }
           throw new Error(`Spawn failed: ${spawnResult.message}`);
         }
 
@@ -777,6 +788,43 @@ export class TaskExecutor {
       execution: { ...execution, status: "skipped", errorMessage },
       error: "Cap pressure — deferred",
       skipReason: "cap-pressure",
+    };
+  }
+
+  /**
+   * The daemon refused the spawn for low memory (#6156): record the run as
+   * skipped, so SchedulerService re-arms a one-shot (#4033) instead of the
+   * failure path leaving it enabled with no next run.
+   */
+  private deferForMemory(
+    task: ScheduledTask,
+    execution: TaskExecution,
+    reason: string
+  ): ExecutionResult {
+    const errorMessage = `${MEMORY_SKIP_PREFIX}: ${reason}`;
+    // Like the other skips, one row per tick; but only the episode's first is a
+    // warning, so a long low-memory spell cannot crowd other scheduler warnings out
+    // of the category's rate limit.
+    const previous = this.store
+      .getExecutionHistory(task.id, 2)
+      .find(row => row.id !== execution.id);
+    const continuing =
+      previous?.status === "skipped" &&
+      previous.errorMessage?.startsWith(MEMORY_SKIP_PREFIX) === true;
+    this.store.updateExecution(execution.id, {
+      status: "skipped",
+      completedAt: Date.now(),
+      errorMessage,
+    });
+    const log = `Deferred task "${task.name}" — ${errorMessage}`;
+    const meta = { category: "scheduler", namespace: task.namespace };
+    if (continuing) this.errorLogger?.info(log, meta);
+    else this.errorLogger?.warn(log, meta);
+    return {
+      success: false,
+      execution: { ...execution, status: "skipped", errorMessage },
+      error: "Low memory — deferred",
+      skipReason: "memory",
     };
   }
 

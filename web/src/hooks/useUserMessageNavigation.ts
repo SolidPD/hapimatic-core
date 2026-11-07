@@ -99,7 +99,14 @@ export function attachUserTakeoverListeners(
   onTakeover: () => void
 ): void {
   const passive = { passive: true, signal };
-  viewport.addEventListener("wheel", onTakeover, passive);
+  // #6213: a Ctrl+wheel zoom (incl. trackpad pinch) is not a user scroll.
+  viewport.addEventListener(
+    "wheel",
+    (event: WheelEvent) => {
+      if (!event.ctrlKey) onTakeover();
+    },
+    passive
+  );
   viewport.addEventListener("touchmove", onTakeover, passive);
   viewport.addEventListener("pointerdown", onTakeover, passive);
   const doc = viewport.ownerDocument;

@@ -48,9 +48,11 @@ import {
   formatReloginMessage,
   isEnvTokenAccount,
   isMaxClassSubscription,
+  isQualifiedApiKeyRef,
   generateSessionId,
   type JobRegistry,
 } from "@hapi/protocol";
+import { resolveSpawnPosture } from "@hapi/protocol/modes";
 import type {
   AuthBinding,
   BackgroundAgentEntry,
@@ -58,6 +60,7 @@ import type {
   CeilingBreachAction,
   CeilingGuardConfig,
   CeilingGuardConfigPatch,
+  RedactedApiKey,
 } from "@hapi/protocol/schemas";
 import type { PushService } from "../push/pushService";
 import { buildSessionPushPayload } from "../push/sessionPushPayload";
@@ -136,7 +139,10 @@ import type { SpawnSuccess } from "./spawnSuccess";
 import { notifySessionEnded as notifyTranscriptSessionEnded } from "../services/transcriptIndexer";
 import { resolveTranscriptPaths } from "./transcript/transcriptPath";
 import {
+  type AgentLaunchClass,
+  type BoundedReadOptions,
   classifyAgentLaunch,
+  classifyAgentLaunches,
   readAgentMeta,
 } from "./transcript/transcriptParser";
 import {
@@ -194,12 +200,37 @@ export type {
   RpcWriteFileResponse,
 } from "./rpcGateway";
 
+/**
+ * Issue #5819: the launch a placement re-check is asked about — the binding it
+ * would spawn with, and the session record(s) it re-binds from.
+ */
+export interface ApiKeyPlacementInput {
+  apiKeyId?: string;
+  apiKeyPlacedBy?: string;
+  /** The tag a same-session respawn re-uses (reconnect, relaunch, restart). */
+  hapiSessionId?: string;
+  /** The session a branch child or a watermark successor inherits from. */
+  parentSessionId?: string;
+  parentRelationship?: "branch" | "spawn";
+}
+
+/** Issue #5819: why a launch of a cross-node placement may not run on its key. */
+export interface ApiKeyPlacementRefusal {
+  code: "api_key_not_shared" | "api_key_not_found";
+  message: string;
+}
+
 /** Options for spawning a new session via the daemon. */
 export interface SpawnSessionOptions {
   machineId: string;
   directory: string;
   agent?: "claude" | "codex" | "gemini" | "opencode";
   yolo?: boolean;
+  /** Issue #6218: the starting permission mode. When neither this nor `yolo` is
+   *  set, `spawnSession` resolves both from the node's default spawn permission
+   *  mode preference (never YOLO unless that preference is YOLO). Forwarded
+   *  field-by-field daemon-ward (#1262), where it seeds `--hapi-permission-mode`. */
+  permissionMode?: PermissionMode;
   /** Issue #1262: opt-in to spawn-time port claim from the 3010-3019 pool.
    *  Default-false. When omitted/false the worktree is created with
    *  `claimed_port: null` and the port is claimed later (typically at
@@ -242,6 +273,11 @@ export interface SpawnSessionOptions {
    *  a vault entry whose key changed under the same id. Absent on a fresh spawn —
    *  the daemon then records the vault entry's current mask. */
   apiKeyMasked?: string;
+  /** Issue #5819: set when another node placed this session on this node with
+   *  one of this node's keys (`session.metadata.apiKeyPlacedBy`). Every respawn
+   *  except a payment-method switch carries it, and `spawnSession` then refuses
+   *  the launch once the key is no longer shared. A node id, never key material. */
+  apiKeyPlacedBy?: string;
   scheduleId?: string;
   /** Absolute path to vanilla Claude CLI on this node (issue #933) */
   claudePath?: string;
@@ -328,20 +364,26 @@ export interface SpawnSessionOptions {
    *  undefined/false ⇒ the daemon runs NO optimal-pick (#3023 unchanged, R3). */
   autoSelectOptimalAccount?: boolean;
   /** Issue #6028: the effort levels the pinned model supports, from this node's
-   *  model catalog. Server-stamped by `spawnSession` on a fresh claude spawn —
-   *  never a client body field. The daemon clamps its own default (env / settings
-   *  / xhigh) to it. Absent ⇒ the daemon uses its static fallback lookup (or no
-   *  clamp). Forwarded field-by-field on the spawn RPC (the #1262 trap). */
+   *  model catalog. Server-stamped by `spawnSession` on a claude spawn that names
+   *  no effort (a fresh spawn, or since #6166 a resume) — never a client body
+   *  field. The daemon clamps its own default (env / settings / xhigh) to it.
+   *  Absent ⇒ the daemon uses its static fallback lookup (or no clamp). Forwarded
+   *  field-by-field on the spawn RPC (the #1262 trap). */
   modelEffortLevels?: EffortLevel[];
 }
 
 /** Issue #6028: maps a spawn's model pin to the effort levels that model supports. */
 /** Issue #6070: async so the spawn path can wait on an in-flight catalog fetch
- *  (`ClaudeModelCatalogService.modelsForSpawn`); a plain array still works. */
-export type ModelEffortLevelsResolver = (pin: {
-  rawModel?: string;
-  modelMode?: string;
-}) => EffortLevel[] | undefined | Promise<EffortLevel[] | undefined>;
+ *  (`ClaudeModelCatalogService.modelsForSpawn`); a plain array still works.
+ *  Issue #6166: `wait: false` asks for the cached catalog with no wait at all
+ *  (`peekModels`) — a resume; absent or `true` may wait in the boot window. */
+export type ModelEffortLevelsResolver = (
+  pin: {
+    rawModel?: string;
+    modelMode?: string;
+  },
+  opts?: { wait: boolean }
+) => EffortLevel[] | undefined | Promise<EffortLevel[] | undefined>;
 
 /**
  * Minimal structural seam for target-account validation (issue #1456,
@@ -549,6 +591,16 @@ export class SyncEngine {
   private readAutoSelectOptimalAccount: (() => Promise<boolean>) | null = null;
 
   /**
+   * Issue #6218 — the node's default spawn permission mode reader, injected via
+   * `setDefaultSpawnPermissionModeReader` from `index.ts` (the #3611 pattern).
+   * `spawnSession` uses it to resolve a request that names no posture. Null or a
+   * throwing reader ⇒ the shared non-YOLO default applies.
+   */
+  private readDefaultSpawnPermissionMode:
+    | (() => Promise<PermissionMode>)
+    | null = null;
+
+  /**
    * Issue #6028 — resolves the effort levels a spawn's pinned model supports,
    * from the node's model catalog. Injected from `buildWebApp.ts` (which owns the
    * catalog) via `setModelEffortLevelsResolver`. Null / a throw / `undefined` ⇒
@@ -647,6 +699,12 @@ export class SyncEngine {
         // dead or uncertain session still archives (existing behavior — Fallback
         // Preservation Rule). This complements Task 2's reconnect re-attach gate:
         // together they close BOTH kill paths the false-inactive flag can trigger.
+        //
+        // #6264: snapshot `activeAt` BEFORE the first await. The probe can take up
+        // to the 30 s RPC timeout (a daemon reconnecting after a server stall), and
+        // a respawn under the same session id may come up meanwhile.
+        const armedActiveAt =
+          this.sessionCache.getSession(sessionId)?.activeAt ?? null;
         void (async () => {
           try {
             const session = this.sessionCache.getSession(sessionId);
@@ -679,11 +737,57 @@ export class SyncEngine {
               { category: "sync", sessionId }
             );
           }
+          // #6264: re-check at fire time. Re-read the session (the `session` const
+          // above can be a stale object — refreshSession replaces map entries). At
+          // fire time it was inactive by construction, so `active` now, a newer
+          // `activeAt`, or a connected CLI all mean it came back — skip the kill.
+          // The re-check augments the archive and never replaces it (Fallback
+          // Preservation Rule): if it throws, the archive goes ahead as before.
+          let reactivated = false;
+          let connected = false;
+          try {
+            const fresh = this.sessionCache.getSession(sessionId);
+            reactivated =
+              fresh !== undefined &&
+              (fresh.active === true ||
+                (armedActiveAt !== null && fresh.activeAt > armedActiveAt));
+            connected = this.rpcGateway.hasConnectedCli(sessionId);
+          } catch (error) {
+            this.errorLogger?.warn(
+              `Force-kill watchdog: re-check for ${sessionId} threw (${error instanceof Error ? error.message : String(error)}) — proceeding with archive (issue #6264)`,
+              { category: "sync", sessionId }
+            );
+          }
+          if (reactivated || connected) {
+            this.errorLogger?.warn(
+              `Force-kill watchdog: session ${sessionId} came back while the liveness probe ran — skipping archive (issue #6264)`,
+              {
+                category: "sync",
+                sessionId,
+                context: { reactivated, connected },
+              }
+            );
+            return;
+          }
           // #1603: watchdog force-kill is a TERMINAL archive (no respawn
           // follows) — reap the launcher's hapimatic-remote window so window B's
           // claude does not orphan when the session is never deleted.
-          void this.archiveSession(sessionId, { reapRemoteWindow: true });
+          void this.archiveSession(sessionId, { reapRemoteWindow: true }).catch(
+            err =>
+              this.errorLogger?.warn(
+                `Force-kill watchdog: archiveSession failed for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+                { category: "sync", sessionId }
+              )
+          );
         })();
+      },
+      // #6264: the 5 s inactivity tick was itself blocked (a server stall), so
+      // the stall time was taken out of the force-kill clocks.
+      onStallReset: (gapMs, inactiveSessions) => {
+        this.errorLogger?.warn(
+          `Inactivity watchdog: ${gapMs} ms since the previous tick — the server was blocked; took the stall out of ${inactiveSessions} force-kill clock(s) (issue #6264)`,
+          { category: "sync", context: { gapMs, inactiveSessions } }
+        );
       },
     });
     this.machineCache = new MachineCache(store, this.eventPublisher);
@@ -831,17 +935,8 @@ export class SyncEngine {
       // file the /api/api-keys routes mount with (buildWebApp.ts). The singleton
       // throws when read before createConfiguration(); that reads as "no such
       // key" (fail closed — the switch is refused, nothing is killed), logged.
-      getApiKeyById: async id => {
-        try {
-          return await readRedactedApiKeyById(configuration.settingsFile, id);
-        } catch (error) {
-          errorLogger?.error(
-            `API-key lookup for a session switch failed: ${error instanceof Error ? error.message : String(error)}`,
-            { category: "sync" }
-          );
-          return null;
-        }
-      },
+      // #5819: the same reader serves the placement re-check (readApiKeyById).
+      getApiKeyById: id => this.readApiKeyById(id),
       // #4914: waiting-for-slot / account-unrefreshable / session-restart-failed.
       notifyUser: input => this.notifyUser(input),
     });
@@ -886,6 +981,7 @@ export class SyncEngine {
       markRespawning: sid => this.respawnMarks.mark(sid),
       // Issue #6070: read late — buildWebApp injects the resolver after this.
       getModelEffortLevelsResolver: () => this.resolveModelEffortLevels,
+      apiKeyPlacementRefusal: session => this.apiKeyPlacementRefusal(session),
     });
     // Issue #2149: session-relaunch delegate (launcher / safeMode teardown +
     // respawn). archiveSession + spawnSession stay facade callbacks (test spies on
@@ -898,6 +994,7 @@ export class SyncEngine {
       archiveSession: (sid, opts) => this.archiveSession(sid, opts),
       spawnSession: opts => this.spawnSession(opts),
       getTurnLifecycle: () => this.turnLifecycle,
+      apiKeyPlacementRefusal: session => this.apiKeyPlacementRefusal(session),
     });
     this.reloadAll();
     this.inactivityTimer = setInterval(() => {
@@ -1310,6 +1407,10 @@ export class SyncEngine {
     permissionMode?: PermissionMode;
     modelMode?: ModelMode;
     effort?: string;
+    // Issue #6166: applied effort read back from Claude (`null` = none).
+    appliedEffort?: string | null;
+    appliedModel?: string;
+    appliedForEffort?: string | null;
     // Composer-chip pin integrity: pinned raw model id; `null` = pin cleared.
     rawModel?: string | null;
     resolvedModel?: string;
@@ -1401,6 +1502,12 @@ export class SyncEngine {
             apiKeyId: latestTurn.apiKeyId,
           }
         : NO_TURN_BINDING;
+      const launchClasses = this.classifyBatchLaunches(
+        sessionId,
+        agents,
+        paths.subagentsDir,
+        mainPath
+      );
       for (const agent of agents) {
         // #4385 fix round 1: isolate each agent — one that throws (a rate card,
         // a DB write) must not drop the rest of the batch.
@@ -1411,7 +1518,8 @@ export class SyncEngine {
             agent,
             paths.subagentsDir,
             mainPath,
-            binding
+            binding,
+            launchClasses
           );
         } catch (error) {
           this.errorLogger?.warn("background agent usage record failed", {
@@ -1435,13 +1543,70 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * #6264: classify, with ONE bounded read of the main transcript, every agent in
+   * the batch whose meta lacks `requestShape` — each used to cost a whole-file
+   * parse, all inside one callback on the event loop. Fail-open: `null` makes
+   * `recordOneBackgroundAgent` classify per agent (each read is bounded too).
+   */
+  private classifyBatchLaunches(
+    sessionId: string,
+    agents: readonly BackgroundAgentEntry[],
+    subagentsDir: string,
+    mainPath: string | null
+  ): ReadonlyMap<string, AgentLaunchClass> | null {
+    if (mainPath === null) return null;
+    try {
+      const ids: string[] = [];
+      for (const agent of agents) {
+        if (!isValidAgentId(agent.id)) continue;
+        const meta = readAgentMeta(subagentsDir, agent.id);
+        const toolUseId = agent.toolUseId ?? meta?.toolUseId ?? null;
+        if (meta?.requestShape === undefined && toolUseId !== null) {
+          ids.push(toolUseId);
+        }
+      }
+      if (ids.length === 0) return null;
+      return classifyAgentLaunches(
+        mainPath,
+        ids,
+        this.launchClassifyOptions(sessionId)
+      );
+    } catch (error) {
+      // The per-agent fallback still classifies each launch (with logging).
+      this.errorLogger?.warn(
+        `background agent launch: batch classification failed: ${error instanceof Error ? error.message : String(error)}`,
+        { category: "turns-lifecycle", sessionId }
+      );
+      return null;
+    }
+  }
+
+  /** #6264: report a cap hit or a failed read, so a launch classified
+   *  "unknown" for that reason is not read as "launch not found". */
+  private launchClassifyOptions(sessionId: string): BoundedReadOptions {
+    return {
+      onCapHit: hit =>
+        this.errorLogger?.warn(
+          "background agent launch: transcript scan cap reached",
+          { category: "turns-lifecycle", sessionId, context: { ...hit } }
+        ),
+      onReadError: error =>
+        this.errorLogger?.warn(
+          `background agent launch: transcript read failed: ${error instanceof Error ? error.message : String(error)}`,
+          { category: "turns-lifecycle", sessionId }
+        ),
+    };
+  }
+
   private recordOneBackgroundAgent(
     hapiSessionId: string,
     namespace: string | null,
     agent: BackgroundAgentEntry,
     subagentsDir: string,
     mainPath: string | null,
-    binding: TurnBillingBinding
+    binding: TurnBillingBinding,
+    launchClasses: ReadonlyMap<string, AgentLaunchClass> | null = null
   ): void {
     // #4657: the id is CLI-supplied and becomes a file name below — check it
     // with the same bounded rule the seed path and the peek route use.
@@ -1457,10 +1622,28 @@ export class SyncEngine {
     const toolUseId = agent.toolUseId ?? meta?.toolUseId ?? null;
     let background = meta?.requestShape === "background";
     if (!background && meta?.requestShape === undefined) {
-      background =
-        toolUseId !== null &&
-        mainPath !== null &&
-        classifyAgentLaunch(mainPath, toolUseId) === "background";
+      if (toolUseId !== null && mainPath !== null) {
+        const launch =
+          launchClasses?.get(toolUseId) ??
+          classifyAgentLaunch(
+            mainPath,
+            toolUseId,
+            this.launchClassifyOptions(hapiSessionId)
+          );
+        background = launch === "background";
+        if (launch === "unknown") {
+          // #6264: the launch was not found (beyond the bounded scan, or an
+          // unreadable transcript), so this agent's usage goes unrecorded.
+          this.errorLogger?.warn(
+            "background agent launch not found in the transcript — usage not recorded",
+            {
+              category: "turns-lifecycle",
+              sessionId: hapiSessionId,
+              context: { agentId: agent.id, toolUseId },
+            }
+          );
+        }
+      }
     }
     if (!background) {
       console.debug(
@@ -3075,8 +3258,12 @@ export class SyncEngine {
    * file-claim release, MCP batch-state teardown (issue #2080: delegated to
    * SessionDeletion).
    */
-  async deleteSession(sessionId: string): Promise<void> {
-    await this.sessionDeletion.deleteSession(sessionId);
+  async deleteSession(
+    sessionId: string,
+    // #6210: `detachCleanup` answers once the record is gone (sessionDeletion.ts).
+    opts?: { detachCleanup?: boolean }
+  ): Promise<void> {
+    await this.sessionDeletion.deleteSession(sessionId, opts);
     // Issue #1883 (in-path leak fix) — prune the model-downgrade + auto-abort
     // dedupe sets. `downgradeNotified` leaked one entry per downgraded session
     // for the process lifetime; #2080 moved deletion into sessionDeletion.ts
@@ -3093,11 +3280,14 @@ export class SyncEngine {
    */
   async deleteSessions(
     sessionIds: string[],
-    namespace: string
+    namespace: string,
+    // #6210: `detachCleanup` answers once the records are gone.
+    opts?: { detachCleanup?: boolean }
   ): Promise<{ deleted: string[]; skipped: string[] }> {
     const result = await this.sessionDeletion.deleteSessions(
       sessionIds,
-      namespace
+      namespace,
+      opts
     );
     // Issue #1883 (in-path leak fix) — prune dedupe state for ACTUALLY-deleted
     // sessions ONLY. `skipped` sessions are still live and MUST keep their
@@ -3263,6 +3453,103 @@ export class SyncEngine {
     return this.sessionRelaunch.relaunchSession(sessionId, overrides);
   }
 
+  /**
+   * Issue #4823 / #5819: one vault entry, redacted (never the key). Serves the
+   * payment-method switch and the placement re-check. The configuration
+   * singleton throws when read before createConfiguration(); a read that throws
+   * is logged, and an unreadable settings file reads as "no such key" without
+   * an error. Either way both callers refuse (fail closed).
+   */
+  private async readApiKeyById(id: string): Promise<RedactedApiKey | null> {
+    try {
+      return await readRedactedApiKeyById(configuration.settingsFile, id);
+    } catch (error) {
+      this.errorLogger?.error(
+        `API-key lookup failed: ${error instanceof Error ? error.message : String(error)}`,
+        { category: "sync" }
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Issue #5819: the placement re-check every launch on a key runs. A session
+   * another node placed here with one of this node's keys carries
+   * `apiKeyPlacedBy`; once the key's owner unticks "Make available to all
+   * nodes", no launch of it may run on that key. The marker is read fail-safe:
+   * from the input, else from the record the launch re-binds (the same tag,
+   * else the parent of a branch or a successor), so a respawn builder that
+   * forgot to thread the field is still checked. That fallback can only add a
+   * refusal. A managed peer (`parentRelationship: "spawn"`) is a new session
+   * whose key its spawner chose, so it does not inherit its parent's marker.
+   * A qualified ref needs no check: its home re-checks sharing on every call.
+   * Returns the effective marker and the refusal, if any.
+   */
+  async checkApiKeyPlacement(input: ApiKeyPlacementInput): Promise<{
+    placedBy?: string;
+    refusal: ApiKeyPlacementRefusal | null;
+  }> {
+    if (!input.apiKeyId || isQualifiedApiKeyRef(input.apiKeyId)) {
+      return { refusal: null };
+    }
+    const placedBy =
+      input.apiKeyPlacedBy ?? this.recordedApiKeyPlacement(input);
+    if (!placedBy) return { refusal: null };
+    const entry = await this.readApiKeyById(input.apiKeyId);
+    if (!entry || entry.provider !== "anthropic") {
+      return {
+        placedBy,
+        refusal: {
+          code: "api_key_not_found",
+          message:
+            "The Anthropic API key this session is bound to is no longer in this node's key vault — start a new session with a stored key",
+        },
+      };
+    }
+    if (entry.shareAcrossNodes !== true) {
+      const label = entry.label?.trim();
+      const name = label ? `"${label}"` : entry.maskedKey;
+      return {
+        placedBy,
+        refusal: {
+          code: "api_key_not_shared",
+          message: `The API key ${name} is no longer shared with other nodes. This session was started from another node, so it cannot restart on that key — switch it to an account, or start a new session on this node with the key.`,
+        },
+      };
+    }
+    return { placedBy, refusal: null };
+  }
+
+  /**
+   * Issue #5819: the session-shaped form of {@link checkApiKeyPlacement}, for a
+   * caller about to tear a session down before it respawns it (relaunch, config
+   * restart) or answering a peer's reconnect synchronously.
+   */
+  async apiKeyPlacementRefusal(
+    session: Session
+  ): Promise<ApiKeyPlacementRefusal | null> {
+    const md = session.metadata;
+    const { refusal } = await this.checkApiKeyPlacement({
+      apiKeyId: md?.apiKeyId,
+      apiKeyPlacedBy: md?.apiKeyPlacedBy,
+    });
+    return refusal;
+  }
+
+  private recordedApiKeyPlacement(
+    input: ApiKeyPlacementInput
+  ): string | undefined {
+    const own = input.hapiSessionId
+      ? this.sessionCache.getSessionByTag(input.hapiSessionId)
+      : undefined;
+    if (own) return own.metadata?.apiKeyPlacedBy;
+    if (!input.parentSessionId || input.parentRelationship === "spawn") {
+      return undefined;
+    }
+    return this.sessionCache.getSession(input.parentSessionId)?.metadata
+      ?.apiKeyPlacedBy;
+  }
+
   async spawnSession(opts: SpawnSessionOptions): Promise<
     // Issue #5614: SpawnSuccess carries the daemon's sessionTypeDowngrade.
     SpawnSuccess | { type: "error"; message: string; code?: string }
@@ -3292,6 +3579,18 @@ export class SyncEngine {
           "An API-key session binds no subscription account — the spawn named both a key and an account",
         code: "api_key_with_account",
       };
+    }
+    // Issue #5819: a session another node placed here on one of this node's keys
+    // may not launch on that key once its owner unshares it. Refused before the
+    // daemon, so nothing is created. The effective marker (from the options, else
+    // the record) rides the daemon payload so the daemon and the wrapper re-check
+    // too, even when a respawn builder dropped the field.
+    const placement = await this.checkApiKeyPlacement(opts);
+    if (placement.refusal) {
+      return { type: "error", ...placement.refusal };
+    }
+    if (placement.placedBy) {
+      opts.apiKeyPlacedBy = placement.placedBy;
     }
     if (opts.accountUuid && this.accountService) {
       const acct = this.accountService.getRaw(opts.accountUuid);
@@ -3371,31 +3670,57 @@ export class SyncEngine {
       }
     }
 
+    // Issue #6218: a spawn that names no posture (no `yolo`, no `permissionMode`
+    // — a transcript resume, a federation-peer spawn from a hub that sent none, a
+    // future caller) starts in this node's default spawn permission mode, stamped
+    // explicitly here at the universal choke point so the daemon never has to
+    // guess. A request that sets either field passes through untouched: every
+    // respawn derives its own `yolo`, and the REST route resolves its posture
+    // before its agent-escalation floor. A missing or throwing reader falls back
+    // to the shared default, which is never YOLO.
+    if (opts.yolo === undefined && opts.permissionMode === undefined) {
+      const posture = resolveSpawnPosture({
+        flavor: opts.agent ?? "claude",
+        fallbackMode: await this.getNodeDefaultSpawnPermissionMode(),
+      });
+      if (posture.ok) {
+        opts.yolo = posture.yolo;
+        opts.permissionMode = posture.permissionMode;
+      }
+    }
+
     // Issue #6028: stamp the pinned model's supported effort levels so the daemon
     // can fit its spawn default (env / settings / xhigh, resolved daemon-side) to
-    // the model. Only a fresh claude spawn resolves a default; a resume re-threads
-    // its recorded effort. Fail-open: no resolver, a throw, or an unknown model
-    // stamps nothing; the daemon then looks the pin up in its static catalog
-    // (exact id, or a dated pin's undated id since #6070).
+    // the model. A claude spawn that names no effort resolves a default: a fresh
+    // spawn, or since #6166 a resume (a resume that re-threads its recorded level
+    // carries a body effort and is skipped). Fail-open: no resolver, a throw, or
+    // an unknown model stamps nothing; the daemon then looks the pin up in its
+    // static catalog (exact id, or a dated pin's undated id since #6070).
     // Issue #6070: only when there is a default to fit to a pinned model — an
     // explicit body effort is never clamped (nodeSpawnDefaults.ts) and the Default
     // model resolves to no levels — so the resolver's boot-window wait
     // (modelsForSpawn) is never spent on a spawn that cannot use the answer.
+    // Issue #6166: a resume never waits on the catalog. Account-switch,
+    // token-refresh, model-switch and relaunch respawns kill the old process
+    // first and spawn under the rpcGateway deadline, so a boot-window wait would
+    // lengthen the outage; a resume reads the cache (or the fallback) instead.
     const pinsModel =
       Boolean(opts.rawModel) ||
       (Boolean(opts.modelMode) && opts.modelMode !== "default");
     if (
       this.resolveModelEffortLevels &&
       (opts.agent ?? "claude") === "claude" &&
-      !opts.resumeSessionId &&
       !opts.effort &&
       pinsModel
     ) {
       try {
-        const levels = await this.resolveModelEffortLevels({
-          rawModel: opts.rawModel,
-          modelMode: opts.modelMode,
-        });
+        const levels = await this.resolveModelEffortLevels(
+          {
+            rawModel: opts.rawModel,
+            modelMode: opts.modelMode,
+          },
+          { wait: !opts.resumeSessionId }
+        );
         if (levels) opts.modelEffortLevels = levels;
       } catch {
         // Fail-open — the daemon falls back to its static-catalog lookup.
@@ -3684,6 +4009,34 @@ export class SyncEngine {
   }
 
   /**
+   * Issue #6218 — inject the node's default spawn permission mode reader (wired
+   * from `index.ts` over the node's `settingsFile`). Unset ⇒ a spawn that names
+   * no posture gets the shared one-step-below-YOLO default.
+   */
+  setDefaultSpawnPermissionModeReader(
+    reader: () => Promise<PermissionMode>
+  ): void {
+    this.readDefaultSpawnPermissionMode = reader;
+  }
+
+  /**
+   * Issue #6218 — this node's default spawn permission mode, or `undefined` when
+   * no reader is wired or it throws (callers then apply the shared non-YOLO
+   * default through `resolveSpawnPosture`). The ONE read both `spawnSession`'s
+   * stamp and the REST spawn route use, so the route's agent-escalation floor
+   * judges exactly the posture the spawn will run with.
+   */
+  async getNodeDefaultSpawnPermissionMode(): Promise<
+    PermissionMode | undefined
+  > {
+    try {
+      return (await this.readDefaultSpawnPermissionMode?.()) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Issue #6028 — inject the model-effort resolver (wired from `buildWebApp.ts`,
    * which owns the model catalog). Unset ⇒ `spawnSession` stamps no
    * `modelEffortLevels` and the daemon uses its static-catalog lookup.
@@ -3789,7 +4142,7 @@ export class SyncEngine {
     branchLabel?: string
   ): Promise<
     | { type: "success"; newSessionId: string }
-    | { type: "error"; message: string }
+    | { type: "error"; message: string; code?: string }
   > {
     return this.sessionRespawn.branchSession(sessionId, branchLabel);
   }

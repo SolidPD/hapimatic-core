@@ -12,6 +12,13 @@ import type {
   BackgroundAgentsSnapshot,
   ClaudeAccountInfo,
 } from "@hapi/protocol/schemas";
+import {
+  FALLBACK_CLAUDE_MODELS,
+  clampEffortToModel,
+  isEffortLevel,
+  resolveModelEffortLevels,
+  type EffortLevel,
+} from "@hapi/protocol";
 import { BackgroundAgentTracker } from "@/claude/utils/backgroundAgentTracker";
 import { getProjectPath } from "@/claude/utils/path";
 import { join } from "node:path";
@@ -103,6 +110,19 @@ export class AgentSessionBase<Mode> {
   // this, no keepAlive tick carried it, so one store write dropped it for good.
   protected rawModel?: string;
   protected resolvedModel?: string;
+  // Issue #6166: the effort the Claude process APPLIES, read back via the SDK
+  // get_settings request (after env overrides and model remaps): a level,
+  // `null` (it sends none) or undefined (not measured). `appliedModel` is the
+  // model that read-back reported, and `appliedForEffort` the effort the
+  // measured query was LAUNCHED with (`null` = none), so a reader can tell a
+  // pending effort change (the next message relaunches the query) from a
+  // mismatch. Live only — reported on the keepAlive and never written to
+  // metadata, which feeds respawns and outlives the process.
+  protected appliedEffort?: EffortLevel | null;
+  protected appliedModel?: string;
+  protected appliedForEffort?: EffortLevel | null;
+  // Issue #6166: one mismatch warning per distinct launch/applied/model triple.
+  private readonly warnedEffortMismatches = new Set<string>();
   // Issue #1469: first-order context window + live usage, pushed per turn from
   // get_context_usage (see onContextUsage). Propagated via keepAlive runtime.
   protected contextWindowTokens?: number;
@@ -395,6 +415,13 @@ export class AgentSessionBase<Mode> {
     permissionMode?: SessionPermissionMode;
     modelMode?: SessionModelMode;
     effort?: string;
+    // Issue #6166: the applied effort read back from Claude (`null` = none), the
+    // model it reported and the effort the measured query was launched with.
+    // Present only while measured; the server always-assigns them (like
+    // blockedOnTuiPrompt), so a tick without them clears its copy.
+    appliedEffort?: EffortLevel | null;
+    appliedModel?: string;
+    appliedForEffort?: EffortLevel | null;
     // Composer-chip pin integrity: always present — `null` when no raw model is
     // pinned (a family-mode pick clears the pin), so the server drops a stale
     // id instead of keeping it (same always-assign contract as
@@ -430,6 +457,13 @@ export class AgentSessionBase<Mode> {
       permissionMode: this.permissionMode,
       modelMode: this.modelMode,
       effort: this.effort,
+      ...(this.appliedEffort !== undefined
+        ? {
+            appliedEffort: this.appliedEffort,
+            appliedModel: this.appliedModel,
+            appliedForEffort: this.appliedForEffort,
+          }
+        : {}),
       rawModel: this.rawModel ?? null,
       resolvedModel: this.resolvedModel,
       contextWindowTokens: this.contextWindowTokens,
@@ -468,6 +502,86 @@ export class AgentSessionBase<Mode> {
 
   setRawModel(rawModel: string | undefined): void {
     this.rawModel = rawModel;
+  }
+
+  // Issue #6166: an SDK query (one Claude process) is starting with this effort
+  // on its argv. An earlier measurement described the previous process, so it
+  // is dropped; this query's read-back reports against this launch effort.
+  onQueryStart = (launch: { effort?: string }) => {
+    const hadMeasurement = this.appliedEffort !== undefined;
+    this.appliedEffort = undefined;
+    this.appliedModel = undefined;
+    this.appliedForEffort = isEffortLevel(launch.effort) ? launch.effort : null;
+    if (hadMeasurement) {
+      this.client.keepAlive(
+        this.thinking,
+        this.mode,
+        this.getKeepAliveRuntime()
+      );
+    }
+  };
+
+  // Issue #6166: the SDK query ended, so its Claude process is gone and the
+  // measurement no longer describes a running process.
+  onQueryEnd = () => {
+    const hadMeasurement = this.appliedEffort !== undefined;
+    this.appliedEffort = undefined;
+    this.appliedModel = undefined;
+    this.appliedForEffort = undefined;
+    if (hadMeasurement) {
+      this.client.keepAlive(
+        this.thinking,
+        this.mode,
+        this.getKeepAliveRuntime()
+      );
+    }
+  };
+
+  // Issue #6166: the effort the Claude process applies, read back via get_settings
+  // (once per query start, and after a live model switch). Pushed on the
+  // keepAlive so the web chip and the session summary show what the process
+  // runs. Only a running query is measured: a read-back that arrives before its
+  // query start or after its end describes no live process, so it is dropped.
+  onAppliedEffort = (applied: {
+    effort: EffortLevel | null;
+    model?: string;
+  }) => {
+    if (this.appliedForEffort === undefined) return;
+    if (
+      applied.effort === this.appliedEffort &&
+      applied.model === this.appliedModel
+    ) {
+      return;
+    }
+    this.appliedEffort = applied.effort;
+    this.appliedModel = applied.model;
+    this.client.keepAlive(this.thinking, this.mode, this.getKeepAliveRuntime());
+    this.warnOnEffortMismatch();
+  };
+
+  // Issue #6166 (R7): compare like with like — what the LAUNCH effort becomes on
+  // the applied model (a model without a level remaps it, e.g. xhigh → high on
+  // Opus 4.6) against what Claude applies. The launch effort, not the current
+  // request: a pick made since then reaches the process only on the next
+  // message, so it is pending, not a mismatch. No launch effort, no warning.
+  private warnOnEffortMismatch(): void {
+    const launched = this.appliedForEffort;
+    if (!isEffortLevel(launched) || this.appliedEffort === undefined) return;
+    const expected = clampEffortToModel(
+      launched,
+      resolveModelEffortLevels(FALLBACK_CLAUDE_MODELS, "fallback", {
+        rawModel: this.appliedModel,
+      })
+    );
+    if (this.appliedEffort === expected) return;
+    const key = `${launched}|${this.appliedEffort}|${this.appliedModel ?? ""}`;
+    if (this.warnedEffortMismatches.has(key)) return;
+    this.warnedEffortMismatches.add(key);
+    logger.warn(
+      `[effort] Claude runs ${this.appliedEffort ?? "no effort"} on ${
+        this.appliedModel ?? "an unreported model"
+      } but it was launched with --effort ${launched}: a CLAUDE_CODE_EFFORT_LEVEL value (process env or a settings.json env block) or the model's supported levels`
+    );
   }
 
   // Issue #1469: replaces onModelResolved. Receives the first-order per-turn

@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { LOCAL_NODE_ID } from "@hapi/protocol";
 import type { EffortLevel } from "@hapi/protocol";
-import { resolveSpawnPermissionMode } from "@hapi/protocol/modes";
+import { resolveDefaultSpawnPermissionMode } from "@hapi/protocol/modes";
 import type { ApiClient } from "@/api/client";
 import type { Machine } from "@/types/api";
 import {
@@ -39,7 +39,7 @@ import {
   useFederatedSessions,
   type FederationRemoteNode,
 } from "@/hooks/queries/useFederatedSessions";
-import { useAdminPreferences } from "@/hooks/useAdminPreferences";
+import { useDefaultSpawnPermissionModePreference } from "@/hooks/useDefaultSpawnPermissionModePreference";
 import { getCurrentBranchV2, parseStatusSummaryV2 } from "@/lib/gitParsers";
 import {
   FAN_OUT_MAX,
@@ -217,7 +217,9 @@ export function FanOutDialog(props: {
   const { accounts, isLoading: accountsLoading } = useAccounts(api, isOpen);
   const { activeAccount } = useNodeActiveAccount(api, LOCAL_NODE_ID, isOpen);
   const { globalDefaultLauncher } = useLauncherSelection();
-  const { prefs } = useAdminPreferences();
+  // #6218 (D2-a): the node's default spawn permission mode (read while open).
+  const { mode: defaultSpawnPermissionMode } =
+    useDefaultSpawnPermissionModePreference(isOpen ? api : null);
   const capacity = useSpawnCapacity(api, isOpen ? { kind: "local" } : null);
   const capSource = useDaemonCapacity(api, { enabled: isOpen }).data?.capSource;
   const { remoteNodes } = useFederatedSessions(api);
@@ -309,8 +311,8 @@ export function FanOutDialog(props: {
           directoryIsGitRepo: parentBranch != null ? true : undefined,
           sessionTypeUserSelected: true,
           cloneRepo: null,
-          permissionMode: resolveSpawnPermissionMode(
-            prefs.defaultSpawnPermissionMode,
+          permissionMode: resolveDefaultSpawnPermissionMode(
+            defaultSpawnPermissionMode,
             p.agent
           ),
           safeMode: false,
@@ -339,7 +341,7 @@ export function FanOutDialog(props: {
       peers,
       isPending,
       parentBranch,
-      prefs.defaultSpawnPermissionMode,
+      defaultSpawnPermissionMode,
       globalDefaultLauncher,
       accounts.length,
       machines,
@@ -461,6 +463,8 @@ export function FanOutDialog(props: {
         directory: p.nodeId ? p.directory : parentDirectory,
         agent: eff.agent,
         yolo: eff.yolo,
+        // #6218: each peer starts in its resolved mode, not in `default`.
+        permissionMode: eff.permissionMode,
         safeMode: eff.safeMode,
         launcher: eff.launcher ?? globalDefaultLauncher,
         globalDefaultLauncher,

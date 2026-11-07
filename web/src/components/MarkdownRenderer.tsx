@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { memo } from "react";
 import type { MarkdownTextPrimitiveProps } from "@assistant-ui/react-markdown";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
 import { TextMessagePartProvider } from "@assistant-ui/react";
@@ -34,6 +35,9 @@ function MarkdownContent(props: MarkdownRendererProps) {
   );
 }
 
-export function MarkdownRenderer(props: MarkdownRendererProps) {
+// Issue #6208: skip the re-parse when a parent re-renders with the same props.
+export const MarkdownRenderer = memo(function MarkdownRenderer(
+  props: MarkdownRendererProps
+) {
   return <MarkdownContent {...props} />;
-}
+});

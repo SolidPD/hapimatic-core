@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { SpawnInput } from "@/hooks/mutations/useSpawnSession";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
-import type { ModelMode } from "@hapi/protocol/modes";
+import {
+  isYoloEquivalentMode,
+  type ModelMode,
+  type PermissionMode,
+} from "@hapi/protocol/modes";
 import { DEFAULT_OUTPUT_STYLE_DEFAULT } from "@hapi/protocol/schemas";
 import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import type { EffortLevel } from "@hapi/protocol";
@@ -36,6 +40,13 @@ export type SpawnSelections = {
   directory: string;
   agent: AgentType;
   yolo: boolean;
+  /**
+   * Issue #6218: the selected permission mode. {@link buildSpawnInput} sends it
+   * for every non-YOLO pick (`default` included), so the posture is explicit and
+   * the server never substitutes the node default for a deliberate choice.
+   * Optional so a caller with no mode (an older path) keeps its `yolo`-only wire.
+   */
+  permissionMode?: PermissionMode;
   safeMode: boolean;
   /** Per-session launcher selection. */
   launcher: ClaudeRemoteLauncherKind;
@@ -154,6 +165,11 @@ export function buildSpawnInput(sel: SpawnSelections): SpawnInput {
     directory,
     agent: sel.agent,
     yolo: sel.yolo,
+    // #6218: a YOLO pick rides `yolo` alone; any other mode is sent explicitly.
+    permissionMode:
+      sel.permissionMode && !isYoloEquivalentMode(sel.permissionMode)
+        ? sel.permissionMode
+        : undefined,
     safeMode: sel.safeMode || undefined,
     // #4568: an API-key session runs on the SDK launcher — sent EXPLICITLY (not
     // omitted when SDK is the global default) so the request names the launcher
@@ -327,6 +343,9 @@ export function assembleSpawnCommand(
     );
   }
   if (input.yolo) lines.push("--yolo");
+  // #6218: a non-YOLO starting mode, next to where --yolo would be.
+  if (input.permissionMode)
+    lines.push(`--permission-mode ${input.permissionMode}`);
   if (input.safeMode) lines.push("--safe-mode");
   // #2149: MCP set — one `--mcp` line per enabled server (copy-params only). The
   // create-flow preview passes no set, so these render only for the Edit modal.

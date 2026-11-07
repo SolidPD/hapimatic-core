@@ -19,9 +19,13 @@ declare module "@novnc/novnc" {
     wsProtocols?: string[];
   }
   export default class RFB extends EventTarget {
+    /** `urlOrChannel` is a ws(s) URL, or a WebSocket the caller already opened
+     * (noVNC 1.7.0 also accepts an RTCDataChannel; core/rfb.js:109-114, 550-570,
+     * core/websock.js:258-295). DesktopView passes its own socket so it can read
+     * the server's close code (#6214). */
     constructor(
       target: HTMLElement,
-      urlOrChannel: string,
+      urlOrChannel: string | WebSocket,
       options?: RFBOptions
     );
     viewOnly: boolean;

@@ -38,6 +38,10 @@ type SessionAlivePayload = {
   modelMode?: ModelMode;
   // Issue #2456: live reasoning-effort level riding the keepAlive tick.
   effort?: string;
+  // Issue #6166: applied effort read back from Claude (`null` = none).
+  appliedEffort?: string | null;
+  appliedModel?: string;
+  appliedForEffort?: string | null;
   resolvedModel?: string;
   contextWindowTokens?: number;
   contextUsedTokens?: number;
@@ -232,11 +236,38 @@ export function registerCliHandlers(
     // previously left MCP server processes orphaned. (Issue #849)
     if (sessionId && deps.onArchiveSession) {
       const archiveCallback = deps.onArchiveSession;
+      // #6264: replace, never orphan, a pending timer. An overwritten handle can
+      // no longer be cancelled by a reconnect and would archive a live session.
+      clearTimeout(disconnectGraceTimers.get(sessionId));
+      const cliNamespace = socket.nsp;
       const timer = setTimeout(() => {
         disconnectGraceTimers.delete(sessionId);
+        // #6264: a stale socket's disconnect (e.g. one that outlived a server
+        // stall) must not archive a session another socket now serves. By the
+        // "disconnect" event socket.io has already removed THIS socket from its
+        // rooms, so any live member is a different connection.
+        if (hasLiveCliSocket(cliNamespace, sessionId)) {
+          deps.errorLogger?.warn(
+            `Disconnect grace expired for ${sessionId} but a live CLI socket is connected — skipping archive (issue #6264)`,
+            { category: "socket", sessionId }
+          );
+          return;
+        }
         archiveCallback(sessionId);
       }, DISCONNECT_GRACE_MS);
       disconnectGraceTimers.set(sessionId, timer);
     }
   });
+}
+
+/** True when room `session:<id>` holds a socket the namespace still knows. */
+function hasLiveCliSocket(
+  cliNamespace: SocketWithData["nsp"],
+  sessionId: string
+): boolean {
+  const room = cliNamespace.adapter.rooms.get(`session:${sessionId}`);
+  for (const id of room ?? []) {
+    if (cliNamespace.sockets.get(id)) return true;
+  }
+  return false;
 }

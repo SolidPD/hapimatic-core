@@ -18,6 +18,7 @@ import type { ApiClient } from "@/api/client";
 import type { CreateScheduledTaskRequest, Machine } from "@/types/api";
 import { usePlatform } from "@/hooks/usePlatform";
 import { useCreateSessionSections } from "@/hooks/useCreateSessionSections";
+import { ConnectModelCreateLine } from "@/components/onboarding/ConnectModelNudge";
 import { useSpawnSession } from "@/hooks/mutations/useSpawnSession";
 import { usePollFederationRefresh } from "@/hooks/mutations/usePollFederation";
 import { useScheduleMutations } from "@/extensions/scheduler/hooks/useScheduleMutations";
@@ -59,6 +60,7 @@ import {
   deriveFormState,
 } from "./formState";
 import { useAdminPreferences } from "@/hooks/useAdminPreferences";
+import { useDefaultSpawnPermissionModePreference } from "@/hooks/useDefaultSpawnPermissionModePreference";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { useAvailableApiKeys } from "@/hooks/queries/useAvailableApiKeys";
 import {
@@ -66,6 +68,7 @@ import {
   sharedKeysUnavailableHint,
 } from "@/lib/apiKeyStatus";
 import {
+  resolveDefaultSpawnPermissionMode,
   resolveSpawnPermissionMode,
   getSpawnPermissionModeOptionsForFlavor,
 } from "@hapi/protocol/modes";
@@ -76,6 +79,11 @@ import { AgentSelector } from "./AgentSelector";
 import { CapabilityChips } from "./CapabilityChips";
 import { ProviderModelFields } from "./ProviderModelFields";
 import { AccountSelector } from "./AccountSelector";
+import {
+  defaultCloneDir,
+  ownerQualifiedCloneDir,
+  sameRepo,
+} from "./cloneDestination";
 import { BranchNameField, toBranchName } from "./BranchNameField";
 import { BranchReadOnly, BranchSelector } from "./BranchSelector";
 import { useBranchSelection } from "./useBranchSelection";
@@ -331,23 +339,6 @@ export const NewSession = forwardRef<
     return undefined;
   }, [selectedRemoteNode, localMachineId, props.machines]);
 
-  // Issue #1733: does the selected target advertise gateway:openrouter? Mirrors
-  // availableAgents' target resolution (remote node vs local machine caps).
-  const supportsOpenRouter = useMemo((): boolean => {
-    if (selectedRemoteNode) {
-      return (
-        selectedRemoteNode.capabilities?.includes("gateway:openrouter") ?? false
-      );
-    }
-    if (localMachineId) {
-      const machine = props.machines.find(m => m.id === localMachineId);
-      return (
-        machine?.metadata?.capabilities?.includes("gateway:openrouter") ?? false
-      );
-    }
-    return false;
-  }, [selectedRemoteNode, localMachineId, props.machines]);
-
   // Multi-account (#1455): account list + node default for the create-session
   // selector. Gated on !isRemoteTarget — remote spawns use the node default.
   const {
@@ -431,6 +422,16 @@ export const NewSession = forwardRef<
   // setters, so a guard closed over the `cloneRepo` state would still see the
   // pre-loop value when `repo` is restored before `gitType`.
   const cloneRepoRef = useRef<string | null>(null);
+  // #6312: the destination the current clone PICK set. A pick whose default
+  // `~/projects/<name>` already holds a DIFFERENT repository (two owners can share a
+  // name) is redirected once to `~/projects/<owner>-<name>`; any other directory
+  // change (a typed path, an account switch, a cleared pick) clears this ref, so a
+  // directory the user chose is never redirected.
+  const pickedCloneRef = useRef<{
+    nameWithOwner: string;
+    dest: string;
+    redirected: boolean;
+  } | null>(null);
   // #3558: the session mode, updated synchronously by applySessionMode (the only
   // writer) for the same reason — the clone lock is Standard-only, and a
   // restore can set `sessionMode` in the same loop as `repo` / `gitType`.
@@ -467,8 +468,8 @@ export const NewSession = forwardRef<
   // routing; the Codex session uses its own ChatGPT auth).
   const [selectedModel, setSelectedModel] = useState<string>("");
   // #1951 A4: the spawn-time permission mode replaces the binary YOLO toggle.
-  // Initialized from the user's saved default (resolved to a valid mode for the
-  // current agent flavor); collapsed to the wire `yolo` boolean in formState.
+  // Initialized from the node's default (#6218, resolved to the current agent
+  // flavor's equivalent); formState sends it with the wire `yolo` boolean.
   const { prefs: adminPrefs } = useAdminPreferences();
   // #2042 (A4): the usage envelope carries each account's `score` (from #2039),
   // used to auto-select the most-underutilized account on create. Polled only
@@ -490,26 +491,37 @@ export const NewSession = forwardRef<
     !isRemoteTarget &&
       (adminPrefs.autoSelectOptimalAccount || usageForLockCheck)
   );
+  // #6218 (D2-a): the node's default spawn permission mode, server-authoritative
+  // (the cached value until the read lands, then the server's).
+  const { mode: defaultSpawnPermissionMode } =
+    useDefaultSpawnPermissionModePreference(props.api);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() =>
-    resolveSpawnPermissionMode(adminPrefs.defaultSpawnPermissionMode, agent)
+    resolveDefaultSpawnPermissionMode(defaultSpawnPermissionMode, agent)
   );
-  // Keep the selected mode valid for the chosen agent. On an agent change,
-  // re-resolve only when the current mode is not in the new flavor's option set
-  // (preserves an explicit in-flavor selection; maps a yolo-equivalent default
-  // across flavors via resolveSpawnPermissionMode — R4).
+  // #6218: true once the mode was picked by the user or restored from a
+  // bookmark. Precedence: user edit > bookmark > the node default.
+  const permissionModeExplicitRef = useRef(false);
+  // An untouched, un-bookmarked mode follows the node default for the chosen
+  // harness whenever the default or the harness changes, so a stale cached
+  // default is replaced once the server value lands. An explicit pick is kept
+  // while it is valid for the harness and otherwise mapped from itself (an
+  // explicit YOLO stays the new harness's YOLO — R4), never from the default.
   useEffect(() => {
     setPermissionMode(prev => {
+      if (!permissionModeExplicitRef.current) {
+        return resolveDefaultSpawnPermissionMode(
+          defaultSpawnPermissionMode,
+          agent
+        );
+      }
       const valid = getSpawnPermissionModeOptionsForFlavor(agent).map(
         o => o.mode
       );
       return valid.includes(prev)
         ? prev
-        : resolveSpawnPermissionMode(
-            adminPrefs.defaultSpawnPermissionMode,
-            agent
-          );
+        : resolveSpawnPermissionMode(prev, agent);
     });
-  }, [agent, adminPrefs.defaultSpawnPermissionMode]);
+  }, [agent, defaultSpawnPermissionMode]);
   // #2456: the create-page Model+Effort row uses the live full catalog (rawModel
   // / effort, "" = Default; Claude-only). modelMode stays "default" — the #2434
   // family pin is subsumed by the catalog; formState omits unset pins so an
@@ -535,10 +547,32 @@ export const NewSession = forwardRef<
   const [selectedOpencodeModel, setSelectedOpencodeModel] = useState("");
   // Issue #3349: the node's redacted API-key vault feeds the opencode native
   // provider selector (provider names/labels only — never the secret). Fetched
-  // only for that consumer (D13).
+  // only for that consumer (D13). #6211: and for Codex, for the check below.
   const { data: vaultKeys } = useApiKeys(props.api, {
-    enabled: agent === "opencode",
+    enabled: agent === "opencode" || agent === "codex",
   });
+  // Issue #1733: does the selected target advertise gateway:openrouter? Mirrors
+  // availableAgents' target resolution (remote node vs local machine caps).
+  // #6211: a local daemon reads that once when it starts, but a spawn reads the key
+  // live, so a key added since then works before the capability says so.
+  const supportsOpenRouter = useMemo((): boolean => {
+    if (selectedRemoteNode) {
+      return (
+        selectedRemoteNode.capabilities?.includes("gateway:openrouter") ?? false
+      );
+    }
+    if (localMachineId) {
+      const caps = props.machines.find(m => m.id === localMachineId)?.metadata
+        ?.capabilities;
+      if (!caps) return false;
+      return (
+        caps.includes("gateway:openrouter") ||
+        ((caps.includes("agent:codex") || caps.includes("agent:opencode")) &&
+          (vaultKeys ?? []).some(k => k.provider === "openrouter"))
+      );
+    }
+    return false;
+  }, [selectedRemoteNode, localMachineId, props.machines, vaultKeys]);
   // Issue #5127: the Claude credential picker's "API keys" — this node's own
   // keys and the keys other nodes share, for the selected target (a remote
   // target lists only shared keys). Each carries the `bindingRef` the spawn
@@ -659,6 +693,7 @@ export const NewSession = forwardRef<
     accountsSource: githubAccountsSource,
     repos: githubRepos,
     reposLoading: githubReposLoading,
+    reposTruncated: githubReposTruncated,
     issues: repoIssues,
     detectedRepo,
     issuesLoading,
@@ -679,9 +714,25 @@ export const NewSession = forwardRef<
   // hides behind the read-only detected repo, and Worktree would stay locked.
   // (A RESTORED repo is also cleared by the defaults engine's precedence
   // effect; both go through the idempotent applyCloneRepo.)
+  // #6312: unless the folder holds a DIFFERENT repository than the one just picked —
+  // then the clone keeps going to an owner-qualified folder instead (once).
   useEffect(() => {
-    if (detectedRepo != null && cloneRepoRef.current) applyCloneRepo(null);
-  }, [detectedRepo, applyCloneRepo]);
+    if (detectedRepo == null || !cloneRepoRef.current) return;
+    const pick = pickedCloneRef.current;
+    if (
+      pick &&
+      !pick.redirected &&
+      cloneRepoRef.current === pick.nameWithOwner &&
+      directory === pick.dest &&
+      !sameRepo(detectedRepo, pick.nameWithOwner)
+    ) {
+      pick.redirected = true;
+      pick.dest = ownerQualifiedCloneDir(pick.nameWithOwner);
+      setDirectory(pick.dest);
+      return;
+    }
+    applyCloneRepo(null);
+  }, [detectedRepo, directory, applyCloneRepo]);
   // #4793 (D-4793-3): a broker-backed cloud VM cannot clone, so the Repo field is one line
   // and any clone repo — a restored saved default included — is dropped. Keyed on cloneRepo
   // too, so a restore that lands after the account list still never reaches the spawn.
@@ -1011,6 +1062,8 @@ export const NewSession = forwardRef<
       directory,
       agent: formState.effective.agent,
       yolo: formState.effective.yolo,
+      // #6218: the picked mode itself; buildSpawnInput sends it unless YOLO.
+      permissionMode: formState.effective.permissionMode,
       safeMode: formState.effective.safeMode,
       // effective.launcher is undefined for non-Claude → fall back to the global
       // default so buildSpawnInput omits `launcher` (its `!== globalDefault` rule).
@@ -1183,7 +1236,11 @@ export const NewSession = forwardRef<
           restoredGitTypeRef.current = null;
           branchSel.selectBranch(v, { restore: true });
         },
-        permissionMode: setPermissionMode,
+        permissionMode: v => {
+          // #6218: a bookmarked mode outranks the node default.
+          permissionModeExplicitRef.current = true;
+          setPermissionMode(v);
+        },
         safeMode: setSafeMode,
         // #3558: a restored Scheduled mode drops the clone lock, so a Git Type
         // the same restore coerced to Basic is handed back (order-independent).
@@ -1259,6 +1316,7 @@ export const NewSession = forwardRef<
       githubAccountUserEditedRef.current = true;
       setGithubAccount(login);
       restoredGitTypeRef.current = null;
+      pickedCloneRef.current = null;
       applyCloneRepo(null); // reset the repo selection when the account changes
     },
     [markTouched, applyCloneRepo]
@@ -1269,6 +1327,7 @@ export const NewSession = forwardRef<
       markTouched("repo");
       restoredGitTypeRef.current = null;
       if (!repo) {
+        pickedCloneRef.current = null;
         applyCloneRepo(null);
         return;
       }
@@ -1276,9 +1335,16 @@ export const NewSession = forwardRef<
       // so the live preview and the spawn payload match the daemon.
       applyCloneRepo(repo.nameWithOwner);
       // The web derives the clone-destination directory (the daemon stays dumb and
-      // clones into the provided directory). MVP base: ~/projects/<repoName>.
+      // clones into the provided directory). Base: ~/projects/<repoName>; #6312
+      // redirects to ~/projects/<owner>-<name> if that folder holds another repo.
+      const dest = defaultCloneDir(repo);
+      pickedCloneRef.current = {
+        nameWithOwner: repo.nameWithOwner,
+        dest,
+        redirected: false,
+      };
       hasUserEditedDirectory.current = true;
-      setDirectory(`~/projects/${repo.name}`);
+      setDirectory(dest);
       setLinkedIssue(null);
     },
     [markTouched, applyCloneRepo]
@@ -1288,6 +1354,7 @@ export const NewSession = forwardRef<
     (value: string) => {
       markTouched("directory");
       hasUserEditedDirectory.current = true;
+      pickedCloneRef.current = null; // #6312: a typed directory is never redirected
       setDirectory(value);
       // Clear linked issue when directory changes (repo may differ)
       setLinkedIssue(null);
@@ -1810,6 +1877,11 @@ export const NewSession = forwardRef<
                     setOutputStyle(value);
                   }}
                 />
+                <ConnectModelCreateLine
+                  api={props.api}
+                  remoteTarget={isRemoteTarget}
+                  availableAgents={availableAgents}
+                />
                 {/* Account — Claude-only (R8). A remote target uses its node
                 default; #5127 (D9) shows the selector there only for the API
                 keys other nodes share (formState.fields.account.visible). */}
@@ -2064,6 +2136,7 @@ export const NewSession = forwardRef<
                     isDisabled={formState.fields.permissionMode.disabled}
                     onChange={v => {
                       markTouched("permissionMode");
+                      permissionModeExplicitRef.current = true;
                       setPermissionMode(v);
                     }}
                   />
@@ -2235,6 +2308,7 @@ export const NewSession = forwardRef<
           repos={githubRepos}
           selectedRepo={cloneRepo}
           isLoading={githubReposLoading}
+          truncated={githubReposTruncated}
           onSelect={repo => {
             handleCloneRepoChange(repo);
             setGithubRepoModalOpen(false);

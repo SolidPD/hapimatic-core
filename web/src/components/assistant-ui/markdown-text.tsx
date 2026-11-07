@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { ComponentPropsWithoutRef } from "react";
+import { memo, type ComponentPropsWithoutRef } from "react";
 import {
   MarkdownTextPrimitive,
   unstable_memoizeMarkdownComponents as memoizeMarkdownComponents,
@@ -322,7 +322,11 @@ export const defaultComponents = memoizeMarkdownComponents({
   img: Image,
 } as const);
 
-export function MarkdownText() {
+// Issue #6208: react-markdown rebuilds its processor and re-parses on every
+// render, so a parent re-render must not reach this unless its props changed.
+// The text itself comes from the assistant-ui part store, which re-renders
+// this component directly as a message streams.
+export const MarkdownText = memo(function MarkdownText() {
   return (
     <MarkdownTextPrimitive
       // #3591 (R4): the DERIVED plugin list — plain MARKDOWN_PLUGINS plus
@@ -338,4 +342,4 @@ export function MarkdownText() {
       className={cn("aui-md min-w-0 max-w-full break-words text-[1em]")}
     />
   );
-}
+});

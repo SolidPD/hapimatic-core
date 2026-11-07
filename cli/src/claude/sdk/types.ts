@@ -5,6 +5,7 @@
  */
 
 import type { Readable } from "node:stream";
+import type { EffortLevel } from "@hapi/protocol/effort";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
 
 /**
@@ -140,6 +141,32 @@ export interface McpToggleRequest extends ControlRequest {
 
 export interface GetContextUsageRequest extends ControlRequest {
   subtype: "get_context_usage";
+  /**
+   * Issue #6170: Claude Code's own detail level. Omitted means Claude Code's
+   * default, which is "full" (it counts each category with the token-count
+   * API); "summary" answers from the last response's usage and local estimates.
+   */
+  detail?: "summary" | "full";
+}
+
+/**
+ * Issue #6166: read Claude Code's applied settings. The answer
+ * (`control_response.response.response`) carries `{ effective, sources, applied }`;
+ * `effective` and `sources` hold the merged settings, `env` blocks included,
+ * which can carry secrets — so `Query.getAppliedSettings` keeps only `applied`.
+ */
+export interface GetSettingsRequest extends ControlRequest {
+  subtype: "get_settings";
+}
+
+/** Issue #6166: the slice of the get_settings `applied` object Hapimatic reads. */
+export interface AppliedSettings {
+  /** The effort the process applies after env overrides and model remaps: a
+   *  level, `null` (it sends no effort), or `undefined` (absent or not a level
+   *  — unknown). */
+  effort: EffortLevel | null | undefined;
+  /** The model the process applies (a raw id), when it reports one. */
+  model: string | undefined;
 }
 
 /**
@@ -172,8 +199,10 @@ export interface SetPermissionModeRequest extends ControlRequest {
 /**
  * Slim first-order subset of Claude Code's get_context_usage control_response
  * payload that Hapimatic's display needs. The full upstream payload also
- * carries categories/gridRows/memoryFiles/agents/messageBreakdown (large) —
- * the cli boundary extracts only these fields before propagating. Issue #1469.
+ * carries categories/gridRows/memoryFiles/agents/messageBreakdown (large).
+ * `Query.getContextUsage()` (the per-turn path and the default capability call)
+ * extracts only these fields; `Query.getContextUsageDetail()` keeps the rest
+ * (#6170, {@link ContextUsageDetailPayload}). Issue #1469.
  */
 export interface ContextUsagePayload {
   /** Active model id; may carry a tier suffix like "[1m]" (stripped by caller). */
@@ -187,6 +216,16 @@ export interface ContextUsagePayload {
   /** Live usage percentage (0-100). */
   percentage: number;
 }
+
+/**
+ * Issue #6170: Claude Code's full get_context_usage reply, passed through
+ * unchanged, with the five {@link ContextUsagePayload} fields normalized on top.
+ * The shared `ContextUsageDetailSchema` (@hapi/protocol) documents the known
+ * sections; the CLI does not reshape them, so fields a newer Claude Code adds
+ * (for example `mcpInstructions` in 2.1.316) reach the caller as they are.
+ */
+export type ContextUsageDetailPayload = ContextUsagePayload &
+  Record<string, unknown>;
 
 export interface CanUseToolRequest extends ControlRequest {
   subtype: "can_use_tool";
@@ -313,14 +352,16 @@ export class AbortError extends Error {
 
 /**
  * Error thrown by Query.request() when Claude returns a control_response
- * with subtype "error", or when the subprocess exits before responding.
- * Carries an optional structured `code` so consumers (e.g. the mcp-toggle
- * launcher handler) can map to a stable error code without parsing the
- * message text.
+ * with subtype "error", when the subprocess exits before responding, or when
+ * a request made with a timeout gets no reply in time. Carries an optional
+ * structured `code` so consumers (e.g. the mcp-toggle launcher handler) can
+ * map to a stable error code without parsing the message text.
  *
  * Currently produced codes:
  * - "claude_exited" — synthesized by Query.cleanupControllers when a
  *   pending control_request is rejected because the subprocess exited.
+ * - "timeout" — Query.request() with `opts.timeoutMs` when no reply arrived
+ *   in time (getContextUsageDetail, #6170).
  *
  * The `code` field is optional and additive: legacy upstream errors that
  * don't carry a code surface as SdkRequestError with code === undefined,

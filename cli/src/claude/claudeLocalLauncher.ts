@@ -20,6 +20,7 @@ import {
 import { createSessionRateLimitDetector } from "./services/sessionRateLimitDetector";
 import { getLocalLaunchExitReason } from "@/agent/localLaunchPolicy";
 import {
+  appendEffortArg,
   resolveAccountTokenForSession,
   resolveAccountConfigDirForSession,
   readBoundApiKeyId,
@@ -271,7 +272,15 @@ export async function claudeLocalLauncher(
             withAccountToken(session.claudeEnvVars, accountToken),
             accountConfigDir
           ),
-          claudeArgs: session.claudeArgs,
+          // Issue #6166: a session taken over in a terminal keeps its effort —
+          // before, only the pty/tmux launchers appended it, so a local launch
+          // ran the binary default (medium on Opus 5.5). A user's own --effort
+          // passthrough wins. A new array: consumeOneTimeFlags below still
+          // edits session.claudeArgs itself.
+          claudeArgs: appendEffortArg(
+            session.claudeArgs ?? [],
+            session.getEffort()
+          ),
           mcpServers: session.mcpServers,
           allowedTools: session.allowedTools,
           hookSettingsPath: session.hookSettingsPath,

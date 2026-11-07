@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -300,6 +301,8 @@ export function HappyThread(props: {
     };
 
     const handleWheel = (event: WheelEvent) => {
+      // #6213: Ctrl+wheel and trackpad pinch are browser zoom or pinch-zoom, not a scroll.
+      if (event.ctrlKey) return;
       if (event.deltaY < 0) markUserScrollUp();
     };
 
@@ -840,7 +843,11 @@ export function HappyThread(props: {
     observer.observe(content);
     // A user who scrolls during the settle window wins — wheel/touchmove are not
     // synthesised by our programmatic scroll, so the abort never self-triggers.
-    viewport.addEventListener("wheel", stop, {
+    // #6213: a Ctrl+wheel zoom is not a scroll, so it does not abort the settle.
+    const stopOnWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey) stop();
+    };
+    viewport.addEventListener("wheel", stopOnWheel, {
       passive: true,
       signal: abort.signal,
     });
@@ -889,20 +896,37 @@ export function HappyThread(props: {
     prevLoadingMoreRef.current = props.isLoadingMoreMessages;
   }, [props.isLoadingMoreMessages, props.rawMessagesCount]);
 
+  // Issue #6208: every message reads this context, so a new value object on
+  // each render re-rendered (and re-parsed the markdown of) the whole thread
+  // whenever the session record was refetched. Keep its identity unless an
+  // input actually changed.
+  const chatContextValue = useMemo(
+    () => ({
+      api: props.api,
+      sessionId: props.sessionId,
+      metadata: props.metadata,
+      disabled: props.disabled,
+      onRefresh: props.onRefresh,
+      onRetryMessage: props.onRetryMessage,
+      chatSections,
+      bookmarks: props.bookmarks,
+      prefillComposer: props.prefillComposer,
+    }),
+    [
+      props.api,
+      props.sessionId,
+      props.metadata,
+      props.disabled,
+      props.onRefresh,
+      props.onRetryMessage,
+      chatSections,
+      props.bookmarks,
+      props.prefillComposer,
+    ]
+  );
+
   return (
-    <HappyChatProvider
-      value={{
-        api: props.api,
-        sessionId: props.sessionId,
-        metadata: props.metadata,
-        disabled: props.disabled,
-        onRefresh: props.onRefresh,
-        onRetryMessage: props.onRetryMessage,
-        chatSections,
-        bookmarks: props.bookmarks,
-        prefillComposer: props.prefillComposer,
-      }}
-    >
+    <HappyChatProvider value={chatContextValue}>
       <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col relative">
         <ThreadPrimitive.Viewport
           asChild

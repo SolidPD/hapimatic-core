@@ -332,6 +332,19 @@ export function physicalPathFunctionLines(): string[] {
  *   read is passed over: the script's own physical path, below it, fails the
  *   same way (past 40 links too, where the walk stops), and the caller refuses
  *   that first.
+ * - `through_hooks <path>` (#5976) is true when `<path>`, read as text (empty
+ *   and `.` parts dropped, a `..` taking the part before it back, from the
+ *   start of the path), reaches `$CONFIG_ROOT/hooks` with any part after it (a
+ *   `..` after that point is read through the link, as the kernel reads it). A
+ *   relative `<path>` is read from the shell's folder (`pwd -P`), as `[ -f ]`
+ *   reads it (#5976 fix round 1), and is taken as through `hooks/` when that
+ *   folder cannot be read (deleted under the run; fix round 2, fail-closed).
+ *   The hook registration walk asks it when the
+ *   root's own `hooks/` link is refused, so a registration through that link
+ *   is refused with it whatever its text spelling. It reads no file, so a
+ *   `..` after ANOTHER link (`lnk/../x`, `lnk -> hooks/sub`) is read as text
+ *   and is not caught. `$CONFIG_ROOT` is the root's physical path, so a `..`
+ *   right after it is read as the kernel reads it.
  * - `root_content_refusal <physical path> [d]` (#6063) sets `_rckind` for a
  *   path that a copy outside the section folders reads through a link: `l` when
  *   `d` is given and `holds_config_root` holds it (the root or a folder above
@@ -580,6 +593,29 @@ export function credentialLinkFunctionLines(): string[] {
     '    if link_into_root "$_rfph" d; then _rfkind=r; return 0; fi',
     '    _rfanc="$_rfanc$_rfph$_cnl"',
     "  done",
+    "}",
+    "# #5976: whether a registered hook script's path goes through the config",
+    "# root's own hooks/, read as text: empty and . parts are dropped and a .. takes",
+    "# the part before it back, and it is true at the first point the path reaches",
+    "# <root>/hooks with any part after it (a .. there is read through the link, as",
+    "# the kernel reads it). So hooks/./x, hooks/sub/../x, xdir/../hooks/x and",
+    "# ../.claude/hooks/x from the root do, and ../hooks/x (a folder beside the",
+    "# root) does not. A relative path is read from this shell's folder, as -f",
+    "# reads it (fix round 1: .claude/hooks/x run from HOME); a folder pwd -P",
+    "# cannot read (deleted) refuses (fix round 2). It reads no file itself;",
+    "# the walk asks it only when the hooks/ link is refused.",
+    "through_hooks() { # $1 = a path; true when, read as text, it reaches $CONFIG_ROOT/hooks and goes on below it",
+    '  _thw="$CONFIG_ROOT/"; _tht=""',
+    '  while [ -n "$_thw" ]; do _ths="${_thw%%/*}"; _thw="${_thw#*/}"; case "$_ths" in ""|.) ;; ..) _tht="${_tht%/*}" ;; *) _tht="$_tht/$_ths" ;; esac; done',
+    '  _thh="$_tht/hooks"; _tht=""',
+    '  case "$1" in /*) _thw="$1/" ;; *) _thp="$(pwd -P)" || return 0; _thw="$_thp/$1/" ;; esac',
+    '  while [ -n "$_thw" ]; do',
+    '    _ths="${_thw%%/*}"; _thw="${_thw#*/}"',
+    '    case "$_ths" in ""|.) continue ;; ..) _tht="${_tht%/*}"; continue ;; esac',
+    '    _tht="$_tht/$_ths"',
+    '    if [ "$_tht" = "$_thh" ] && [ -n "$_thw" ]; then return 0; fi',
+    "  done",
+    "  return 1",
     "}",
     "# #6063: the loop and into-root tests for a path a copy outside the section",
     "# folders reads through a link (CLAUDE.md, a settings script, the tenant",

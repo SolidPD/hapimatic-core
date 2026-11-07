@@ -73,6 +73,8 @@ import {
 } from "@/modules/common/remote/RemoteLauncherBase";
 import { NO_META_TEARDOWN } from "@/api/rpc/types";
 import { CLI_VERSION } from "@/version";
+import { configuration } from "@/configuration";
+import { homedir } from "node:os";
 
 interface PermissionsField {
   date: number;
@@ -254,9 +256,18 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     // (capabilityPolicy 1B-14). `mcp-status` reads the existing live source
     // (`pollMcpStatus` → `claude mcp list`), NOT a new Query bridge (ruling
     // 1B-28 — no `mcp_status` subtype exists in `sdk/types.ts`).
+    // Issue #6170: `{ detail: "full" }` returns the full breakdown; `pathRoots`
+    // shortens its file paths before they leave the CLI.
     session.client.rpcHandlerManager.registerHandler(
       "get-context-usage",
-      createGetContextUsageHandler({ getQuery: () => this.currentQuery }),
+      createGetContextUsageHandler({
+        getQuery: () => this.currentQuery,
+        pathRoots: {
+          cwd: session.path,
+          home: homedir(),
+          accountConfigsDir: configuration.accountConfigsDir,
+        },
+      }),
       GET_CONTEXT_USAGE_META
     );
     session.client.rpcHandlerManager.registerHandler(
@@ -612,6 +623,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
       let pending: {
         message: string;
         mode: EnhancedMode;
+        isolate: boolean;
+        hash: string;
       } | null = null;
 
       // Spawn-time --yolo sets session.permissionMode to "bypassPermissions",
@@ -734,6 +747,12 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
               if (pending) {
                 let p = pending;
                 pending = null;
+                // Issue #6166 (ports tiann/hapi 9727f7e4a): seed the mode gate
+                // from the parked message. This query was launched with its mode
+                // (--effort among it); without the seed modeHash stays null, so
+                // the NEXT mode change (a second effort pick) passes the hash
+                // check and is fed into this process, which never applies it.
+                modeHash = p.hash;
                 // Apply spawn-time bypass on first message
                 const effectivePerm =
                   spawnBypass && !spawnModeApplied
@@ -791,6 +810,11 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             },
             onThinkingChange: session.onThinkingChange,
             onContextUsage: session.onContextUsage,
+            // Issue #6166: the applied effort read back from Claude, tied to
+            // the query (process) it describes.
+            onAppliedEffort: session.onAppliedEffort,
+            onQueryStart: session.onQueryStart,
+            onQueryEnd: session.onQueryEnd,
             onMissingAttachments: (missingPaths: string[]) => {
               // Issue #1442: surface the silent multi-image data loss to the
               // sender via the proven #1078 tool-error toast path. Use the SAME

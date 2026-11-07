@@ -22,9 +22,14 @@
  * must not block or crash `finalizeTurn`.
  *
  * **Correctness model (D10):** full re-read + uuid dedup is the correctness
- * mechanism; a per-file offset would be an optimization only (not implemented —
- * finalize runs off the session hot path). Reads `readFileSync` because B's
- * `parseStep` seam is synchronous (`FinalizeStep = (ctx) => Partial<...>`).
+ * mechanism for transcripts up to `TRANSCRIPT_FULL_READ_MAX_BYTES`. Reads are
+ * synchronous because B's `parseStep` seam is synchronous
+ * (`FinalizeStep = (ctx) => Partial<...>`), and finalize runs ON the server's
+ * single event loop — a whole-file read of a 520 MB transcript froze ms1 for
+ * 18 minutes (#6264). Above the threshold, `parseTurn`, `lastMessageTsMs` and
+ * `classifyAgentLaunch` read backward from EOF within fixed byte caps (the
+ * primitives live in `./transcriptReader`); the result equals a full read
+ * whenever what they need lies inside the cap, and is fail-open otherwise.
  */
 
 import { createHash } from "node:crypto";
@@ -33,7 +38,42 @@ import { join } from "node:path";
 
 import { resolveTranscriptPaths } from "./transcriptPath";
 import type { ResolveTranscriptPathsInput } from "./transcriptPath";
+import {
+  TRANSCRIPT_CLASSIFY_SCAN_MAX_BYTES,
+  admitScannedLine,
+  isMissingFileError,
+  readEntriesFrom,
+  readTranscript,
+  resolveBounds,
+  scanLinesBackward,
+  useBoundedRead,
+} from "./transcriptReader";
+import type {
+  BoundedReadOptions,
+  ResolvedBounds,
+  TranscriptCapHit,
+  TranscriptEntry,
+} from "./transcriptReader";
 import type { FinalizeStepContext, FinalizeStepResult } from "../turnLifecycle";
+
+// `SKIP_TYPES` and `TranscriptEntry` are re-exported (with the sub-agent
+// helpers below) for the throughput facts collector (#6164). Its streaming fold
+// (`TranscriptFold`) re-implements this parser's segmentation and per-
+// `message.id` dedup, so a change to either here must be made there too; its
+// parity test against `parseAllTurns` catches a divergence.
+export {
+  SKIP_TYPES,
+  TRANSCRIPT_CLASSIFY_SCAN_MAX_BYTES,
+  TRANSCRIPT_FULL_READ_MAX_BYTES,
+  TRANSCRIPT_TAIL_PARSE_MAX_BYTES,
+  TRANSCRIPT_TAIL_SCAN_MAX_BYTES,
+  readTranscript,
+} from "./transcriptReader";
+export type {
+  BoundedReadOptions,
+  TranscriptCapHit,
+  TranscriptEntry,
+} from "./transcriptReader";
 
 // ───────────────────────────── public types ─────────────────────────────
 
@@ -95,7 +135,8 @@ export interface TurnParseResult {
 }
 
 /** Finalize context the parser needs (a subset of B's finalize event + spawn data). */
-export interface ParseTurnContext extends Partial<ResolveTranscriptPathsInput> {
+export interface ParseTurnContext
+  extends Partial<ResolveTranscriptPathsInput>, BoundedReadOptions {
   ccSessionId?: string;
   /** Spawn-resolved context window; usually unknown at finalize → remaining NULL. */
   contextWindow?: number | null;
@@ -105,135 +146,90 @@ export interface ParseTurnContext extends Partial<ResolveTranscriptPathsInput> {
 
 /** Parser-evolution marker → A's `schema_version` column. Bump on format changes.
  *  2 = #4385: background `Agent` launches are excluded from the finalize rollup
- *  (they are accounted once at completion in `background_agent_usage`). Under
- *  K-4578-1 each parser behaviour change bumps this by one; a later lander
+ *  (they are accounted once at completion in `background_agent_usage`).
+ *  3 = #6264: above `TRANSCRIPT_FULL_READ_MAX_BYTES` the finalize parse reads only
+ *  the last turn, and `skipped` counts that window rather than the whole file.
+ *  Under K-4578-1 each parser behaviour change bumps this by one; a later lander
  *  rebases to max + 1. */
-export const TRANSCRIPT_PARSER_SCHEMA_VERSION = 2;
+export const TRANSCRIPT_PARSER_SCHEMA_VERSION = 3;
 
-// ───────────────────────────── entry shape ─────────────────────────────
+// ───────────────────────── bounded reads (#6264) ─────────────────────────
 
-/**
- * Minimal transcript-entry shape (the "minimal schema" — every field optional,
- * everything else tolerated). We validate only `type` is a string and the line
- * is an object; all field access below is defensive. A heavyweight per-line Zod
- * parse over a full re-read buys no correctness here (every field is
- * optional/passthrough) and costs latency, so the schema is this typed view +
- * the skip-set + the object guard.
- */
-interface TranscriptEntry {
-  type: string;
-  uuid?: string;
-  parentUuid?: string | null;
-  isSidechain?: boolean | null;
-  isMeta?: boolean | null;
-  isCompactSummary?: boolean | null;
-  isVisibleInTranscriptOnly?: boolean | null;
-  isApiErrorMessage?: boolean | null;
-  subtype?: string | null;
-  timestamp?: string | number | null;
-  compactMetadata?: Record<string, unknown> | null;
-  /** Claude Code's structured tool result on a tool_result-carrying user entry.
-   *  #4385: `status: "async_launched"` marks a background `Agent` launch. */
-  toolUseResult?: unknown;
-  message?: {
-    /** Anthropic API message id (`msg_…`) — the #2229 usage-dedup key. */
-    id?: string;
-    role?: string;
-    model?: string;
-    usage?: Record<string, unknown>;
-    content?: unknown;
-  } | null;
-}
+/** After the first in-bound timestamp, how far further back the watermark looks. */
+const WATERMARK_LOOKBEHIND_LINES = 2000;
+const WATERMARK_LOOKBEHIND_BYTES = 4 * 1024 * 1024;
+
+const USER_NEEDLE = Buffer.from('"user"');
+const TOOL_USE_ID_NEEDLE = Buffer.from('"tool_use_id"');
+const TIMESTAMP_NEEDLE = Buffer.from('"timestamp"');
 
 /**
- * Internal Claude Code event types + Hapimatic bridge entries to skip (verified
- * present in real transcripts). Never parsed as turns/prompts; never counted.
+ * The entries from the LAST main-chain prompt to EOF, read backward within the
+ * scan cap (#6264). Phase 1 JSON-parses only candidate prompt lines — those
+ * containing `"user"` and not `"tool_use_id"` — and stops at the newest one that
+ * is a main-chain prompt (without dedup). Phase 2 parses `[boundary, EOF)` forward
+ * when it fits the parse budget. A prompt the prefilter skips only moves the
+ * boundary earlier; `segmentTurns` over the window still finds the true last
+ * prompt, so the last segment equals a full read's. A skipped prompt can be a
+ * user entry mixing a `tool_result` with text, which `isMainChainPrompt` accepts.
+ * So when the whole file was scanned, no clean prompt was found, and such lines
+ * were skipped, the boundary falls back to the start of the file. That is never
+ * a silent empty turn: the parse budget then gives an exact parse or a logged
+ * cap hit. Returns `null` (after `onCapHit`) when the scan cap or the parse
+ * budget is reached first.
  */
-const SKIP_TYPES = new Set([
-  // Claude Code internal state/tracking events.
-  "file-history-snapshot",
-  "change",
-  "queue-operation",
-  // Hapimatic bridge entries written into the same JSONL stream.
-  "attachment",
-  "bridge-session",
-  "last-prompt",
-  "mode",
-  "permission-mode",
-]);
-
-// ───────────────────────────── reader (Task 2) ─────────────────────────────
-
-/**
- * Full-read the transcript, JSON-parse each non-empty line, skip
- * internal/unknown/malformed entries, normalize `session_id`→`sessionId`, and
- * dedup by `uuid` (R7). Synchronous (B's seam is sync). Returns `[]` when the
- * file is missing — the caller treats that as a fail-open NULL result.
- */
-export function readTranscript(path: string): {
-  entries: TranscriptEntry[];
-  skipped: number;
-  /** #4385: true when the file exists but could not be read (EACCES, EISDIR,
-   *  …). A missing file (ENOENT) is not a read error. */
-  readError?: boolean;
-} {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | null)?.code;
-    return { entries: [], skipped: 0, readError: code !== "ENOENT" };
-  }
-
-  const lines = raw.split("\n");
-  const entries: TranscriptEntry[] = [];
-  const seenUuids = new Set<string>();
-  let skipped = 0;
-
-  for (const line of lines) {
-    if (line.trim() === "") continue;
-    let obj: unknown;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      skipped += 1;
-      continue;
-    }
-    if (typeof obj !== "object" || obj === null) {
-      skipped += 1;
-      continue;
-    }
-    const rec = obj as Record<string, unknown>;
-
-    // Dual-schema session_id normalization (legacy camelCase vs current snake).
-    if ("session_id" in rec && !("sessionId" in rec)) {
-      rec.sessionId = rec.session_id;
-    }
-
-    const type = rec.type;
-    if (typeof type !== "string") {
-      skipped += 1;
-      continue;
-    }
-    if (SKIP_TYPES.has(type)) {
-      skipped += 1;
-      continue;
-    }
-
-    // Dedup by uuid (when present). Entries without a uuid (rare) are kept.
-    const uuid = typeof rec.uuid === "string" ? rec.uuid : undefined;
-    if (uuid !== undefined) {
-      if (seenUuids.has(uuid)) {
-        skipped += 1;
-        continue;
+function readLastTurnWindow(
+  path: string,
+  bounds: ResolvedBounds,
+  onCapHit?: (hit: TranscriptCapHit) => void
+): { entries: TranscriptEntry[]; skipped: number } | null {
+  let boundary = -1;
+  let skippedCandidate = false;
+  const scan = scanLinesBackward(
+    path,
+    (line, lineStart) => {
+      if (line.indexOf(TOOL_USE_ID_NEEDLE) !== -1) {
+        skippedCandidate = true;
+        return "continue";
       }
-      seenUuids.add(uuid);
+      const entry = admitScannedLine(line);
+      if (entry === null || !isMainChainPrompt(entry)) return "continue";
+      boundary = lineStart;
+      return "stop";
+    },
+    {
+      maxBytes: bounds.tailScanMaxBytes,
+      chunkBytes: bounds.chunkBytes,
+      needles: [USER_NEEDLE],
     }
-
-    entries.push(rec as unknown as TranscriptEntry);
+  );
+  if (boundary === -1 && !scan.hitCap && skippedCandidate) {
+    // The whole file was scanned, and the only possible prompts were skipped
+    // lines (see above): read from the start, under the parse budget.
+    boundary = 0;
   }
-
-  return { entries, skipped };
+  if (boundary === -1) {
+    // No main-chain prompt anywhere in the scanned range. If the whole file was
+    // scanned there is genuinely no prompt (an empty result, not a cap hit).
+    if (!scan.hitCap) return { entries: [], skipped: 0 };
+    onCapHit?.({
+      path,
+      sizeBytes: scan.sizeBytes,
+      bytesScanned: scan.bytesScanned,
+      reason: "scan-cap",
+    });
+    return null;
+  }
+  if (scan.sizeBytes - boundary > bounds.tailParseMaxBytes) {
+    onCapHit?.({
+      path,
+      sizeBytes: scan.sizeBytes,
+      bytesScanned: scan.bytesScanned,
+      reason: "parse-budget",
+    });
+    return null;
+  }
+  return readEntriesFrom(path, boundary);
 }
 
 /**
@@ -252,16 +248,33 @@ export function readTranscript(path: string): {
  * Fail-open (mirrors `parseAllTurns` R12): returns `null` on ANY failure (missing
  * file, unresolvable path, no parseable timestamp) — the caller falls back to the
  * `started_at_ms` floor.
+ *
+ * Bounded (#6264): above `TRANSCRIPT_FULL_READ_MAX_BYTES` it scans backward from
+ * EOF, takes the largest timestamp at or below `upperBoundMs`, and after the
+ * first in-bound timestamp looks a bounded distance further back to absorb small
+ * out-of-order writes. Its reach is the 16 MiB parse budget, not the 64 MiB scan
+ * cap, because nearly every line carries a timestamp and each one parsed counts.
+ * Known trade-off: an OLDER orphaned turn whose bound lies beyond that reach
+ * returns `null` and reports `onCapHit`, so the sweep can leave its duration
+ * unresolved for the exact backfill instead of flooring it. `exact: true` keeps
+ * the whole-file read; the offline orphan backfill uses it. A failed read of an
+ * existing file also returns `null`, and reports `onReadError`.
  */
-export function lastMessageTsMs(ctx: {
-  transcriptPath?: string | null;
-  ccSessionId?: string | null;
-  workingDirectory?: string | null;
-  configDir?: string;
-  upperBoundMs?: number;
-}): number | null {
+export function lastMessageTsMs(
+  ctx: {
+    transcriptPath?: string | null;
+    ccSessionId?: string | null;
+    workingDirectory?: string | null;
+    configDir?: string;
+    upperBoundMs?: number;
+    /** Always read the whole file (offline backfill — #6264 R10). */
+    exact?: boolean;
+  } & BoundedReadOptions
+): number | null {
+  // Set once the path resolves: an error before that is an unresolvable path
+  // (a normal fail-open case), one after it is a failed read worth reporting.
+  let mainPath: string | null = null;
   try {
-    let mainPath: string;
     if (ctx.transcriptPath) {
       // The stored transcript_path IS the main JSONL — read it directly.
       mainPath = ctx.transcriptPath;
@@ -272,17 +285,74 @@ export function lastMessageTsMs(ctx: {
         configDir: ctx.configDir,
       }).main;
     }
-    const { entries } = readTranscript(mainPath);
+    const inBound = (ts: number): boolean =>
+      ts > 0 &&
+      (typeof ctx.upperBoundMs !== "number" || ts <= ctx.upperBoundMs);
+
+    const bounds = resolveBounds(ctx);
+    if (
+      ctx.exact === true ||
+      !useBoundedRead(mainPath, bounds.fullReadMaxBytes)
+    ) {
+      const { entries } = readTranscript(mainPath);
+      let max: number | null = null;
+      for (const e of entries) {
+        const ts = tsMsOf(e, 0); // fallback 0 marks an unparseable/absent timestamp
+        if (!inBound(ts)) continue;
+        if (max === null || ts > max) max = ts;
+      }
+      return max;
+    }
+
     let max: number | null = null;
-    for (const e of entries) {
-      const ts = tsMsOf(e, 0); // fallback 0 marks an unparseable/absent timestamp
-      if (ts <= 0) continue;
-      if (typeof ctx.upperBoundMs === "number" && ts > ctx.upperBoundMs)
-        continue;
-      if (max === null || ts > max) max = ts;
+    let firstHitAt = -1;
+    let linesSinceHit = 0;
+    let parsedBytes = 0;
+    let overBudget = false;
+    const scan = scanLinesBackward(
+      mainPath,
+      (line, lineStart) => {
+        if (firstHitAt !== -1) {
+          linesSinceHit += 1;
+          if (
+            linesSinceHit > WATERMARK_LOOKBEHIND_LINES ||
+            firstHitAt - lineStart > WATERMARK_LOOKBEHIND_BYTES
+          ) {
+            return "stop";
+          }
+        }
+        parsedBytes += line.length;
+        if (parsedBytes > bounds.tailParseMaxBytes) {
+          overBudget = true;
+          return "stop";
+        }
+        const entry = admitScannedLine(line);
+        if (entry === null) return "continue";
+        const ts = tsMsOf(entry, 0);
+        if (!inBound(ts)) return "continue";
+        if (max === null || ts > max) max = ts;
+        if (firstHitAt === -1) firstHitAt = lineStart;
+        return "continue";
+      },
+      {
+        maxBytes: bounds.tailScanMaxBytes,
+        chunkBytes: bounds.chunkBytes,
+        needles: [TIMESTAMP_NEEDLE],
+      }
+    );
+    if (max === null && (scan.hitCap || overBudget)) {
+      ctx.onCapHit?.({
+        path: mainPath,
+        sizeBytes: scan.sizeBytes,
+        bytesScanned: scan.bytesScanned,
+        reason: overBudget ? "parse-budget" : "scan-cap",
+      });
     }
     return max;
-  } catch {
+  } catch (error) {
+    if (mainPath !== null && !isMissingFileError(error)) {
+      ctx.onReadError?.(error);
+    }
     return null;
   }
 }
@@ -306,7 +376,7 @@ function contentIsSolelyToolResult(content: unknown): boolean {
  * `tool_result` (a tool-result carrier is not a prompt). Treats null/false/absent
  * equivalently for the meta flags (real transcripts emit `isMeta:null`).
  */
-function isMainChainPrompt(e: TranscriptEntry): boolean {
+export function isMainChainPrompt(e: TranscriptEntry): boolean {
   return (
     e.type === "user" &&
     !e.isSidechain &&
@@ -324,7 +394,7 @@ function isMainChainPrompt(e: TranscriptEntry): boolean {
  * (legacy sub-agent layout), which roll up into the turn (R8). The finalizing
  * turn is the LAST segment. Returns `[]` when no main-chain prompt exists.
  */
-function segmentTurns(entries: TranscriptEntry[]): TranscriptEntry[][] {
+export function segmentTurns(entries: TranscriptEntry[]): TranscriptEntry[][] {
   const promptIdxs: number[] = [];
   for (let i = 0; i < entries.length; i += 1) {
     if (isMainChainPrompt(entries[i])) promptIdxs.push(i);
@@ -346,7 +416,7 @@ function num(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
 
-interface TokenSums {
+export interface TokenSums {
   tokIn: number;
   tokOut: number;
   tokCacheRead: number;
@@ -359,7 +429,7 @@ interface TokenSums {
   sawUsage: boolean;
 }
 
-function emptyTokenSums(): TokenSums {
+export function emptyTokenSums(): TokenSums {
   return {
     tokIn: 0,
     tokOut: 0,
@@ -388,7 +458,7 @@ function emptyTokenSums(): TokenSums {
  * instead; if a future Claude Code writes progressively-accumulating per-block
  * usage, align this site to max at the same time.
  */
-function addUsage(
+export function addUsage(
   sums: TokenSums,
   usage: Record<string, unknown> | undefined,
   apiMessageId?: string,
@@ -421,7 +491,7 @@ function isAssistant(e: TranscriptEntry): boolean {
 }
 
 /** Context occupancy of an assistant `usage` block (R2): in + cacheCreate + cacheRead. */
-function occupancy(usage: Record<string, unknown> | undefined): number {
+export function occupancy(usage: Record<string, unknown> | undefined): number {
   if (!usage) return 0;
   return (
     num(usage.input_tokens) +
@@ -463,12 +533,23 @@ export function sumAgentTranscriptUsage(path: string): {
  * false when the file is missing; `readable` is false when it exists but the
  * read failed. Either way the writer leaves any stored row in place and logs it,
  * because the agent is already excluded from the rollup.
+ *
+ * #6164: `w1` / `w5` split `cacheWrite` by cache TTL. (The throughput facts
+ * collector sums agent files with its own `summarizeAgentCalls`; only tests
+ * read these two today.) `w1` is the nested
+ * `cache_creation.ephemeral_1h_input_tokens`; `w5` is the rest of
+ * `cacheWrite`, so a write with no nested split counts as a 5-minute write
+ * (the rate `computeTurnCost` already uses for every write).
  */
 export function summarizeAgentTranscript(path: string): {
   in: number;
   out: number;
   cacheRead: number;
   cacheWrite: number;
+  /** #6164: 1-hour cache writes (`cache_creation.ephemeral_1h_input_tokens`). */
+  w1: number;
+  /** #6164: `cacheWrite − w1` — 5-minute writes plus writes with no TTL split. */
+  w5: number;
   modelId: string | null;
   firstAssistantTsMs: number | null;
   exists: boolean;
@@ -499,6 +580,8 @@ export function summarizeAgentTranscript(path: string): {
     out: sums.tokOut,
     cacheRead: sums.tokCacheRead,
     cacheWrite: sums.tokCacheWrite,
+    w1: sums.ephemeral1h,
+    w5: Math.max(0, sums.tokCacheWrite - sums.ephemeral1h),
     modelId,
     firstAssistantTsMs,
     exists,
@@ -547,9 +630,105 @@ export function readAgentMeta(
  */
 export function classifyAgentLaunch(
   mainTranscriptPath: string,
+  toolUseId: string,
+  opts?: BoundedReadOptions
+): AgentLaunchClass {
+  return (
+    classifyAgentLaunches(mainTranscriptPath, [toolUseId], opts).get(
+      toolUseId
+    ) ?? "unknown"
+  );
+}
+
+export type AgentLaunchClass = "background" | "foreground" | "unknown";
+
+/**
+ * Classify several `Agent` launches with ONE read of the main transcript
+ * (#6264 — a batch of ending agents used to cost one whole-file parse each).
+ * Above `TRANSCRIPT_FULL_READ_MAX_BYTES` it scans backward and parses only the
+ * lines that contain one of the ids; JSON never escapes a tool-use id, so a byte
+ * match is exact. It stops once every launch line is found (nothing before a
+ * launch can mention its id), so the result equals a full read whenever the
+ * launch lies inside the scan cap. An id not found is `"unknown"`; any read
+ * error is `"unknown"` for every id, never a throw, and reports `onReadError`.
+ */
+export function classifyAgentLaunches(
+  mainTranscriptPath: string,
+  toolUseIds: readonly string[],
+  opts?: BoundedReadOptions
+): Map<string, AgentLaunchClass> {
+  const result = new Map<string, AgentLaunchClass>();
+  const ids = [...new Set(toolUseIds)];
+  for (const id of ids) result.set(id, "unknown");
+  if (ids.length === 0) return result;
+  try {
+    const bounds = resolveBounds(opts, TRANSCRIPT_CLASSIFY_SCAN_MAX_BYTES);
+    let entries: TranscriptEntry[];
+    if (!useBoundedRead(mainTranscriptPath, bounds.fullReadMaxBytes)) {
+      const read = readTranscript(mainTranscriptPath);
+      if (read.readError === true) {
+        opts?.onReadError?.(
+          new Error(`transcript unreadable: ${mainTranscriptPath}`)
+        );
+      }
+      entries = read.entries;
+    } else {
+      const pending = new Set(ids);
+      const newestFirst: TranscriptEntry[] = [];
+      const scan = scanLinesBackward(
+        mainTranscriptPath,
+        line => {
+          const entry = admitScannedLine(line);
+          if (entry === null) return "continue";
+          newestFirst.push(entry);
+          if (isAssistant(entry)) {
+            for (const block of contentBlocks(entry)) {
+              if (block.type === "tool_use" && typeof block.id === "string") {
+                pending.delete(block.id);
+              }
+            }
+          }
+          return pending.size === 0 ? "stop" : "continue";
+        },
+        {
+          maxBytes: bounds.tailScanMaxBytes,
+          chunkBytes: bounds.chunkBytes,
+          needles: ids.map(id => Buffer.from(id)),
+        }
+      );
+      if (scan.hitCap && pending.size > 0) {
+        opts?.onCapHit?.({
+          path: mainTranscriptPath,
+          sizeBytes: scan.sizeBytes,
+          bytesScanned: scan.bytesScanned,
+          reason: "scan-cap",
+        });
+      }
+      // Back to file order, then first-occurrence dedup as a full read would.
+      const seen = new Set<string>();
+      entries = [];
+      for (let i = newestFirst.length - 1; i >= 0; i -= 1) {
+        const e = newestFirst[i];
+        if (typeof e.uuid === "string") {
+          if (seen.has(e.uuid)) continue;
+          seen.add(e.uuid);
+        }
+        entries.push(e);
+      }
+    }
+    for (const id of ids) result.set(id, classifyLaunchIn(entries, id));
+  } catch (error) {
+    // Fail-open: an unreadable transcript classifies nothing. Report the cause
+    // so "unknown" from a failed read is not mistaken for "launch not found".
+    if (!isMissingFileError(error)) opts?.onReadError?.(error);
+  }
+  return result;
+}
+
+function classifyLaunchIn(
+  entries: readonly TranscriptEntry[],
   toolUseId: string
-): "background" | "foreground" | "unknown" {
-  const { entries } = readTranscript(mainTranscriptPath);
+): AgentLaunchClass {
   let found = false;
   for (const e of entries) {
     if (isAssistant(e)) {
@@ -580,7 +759,7 @@ function modelProviderOf(modelId: string | null): string | null {
 
 // ───────────────────────── event extraction (Task 5/6) ─────────────────────────
 
-function tsMsOf(e: TranscriptEntry, fallback: number): number {
+export function tsMsOf(e: TranscriptEntry, fallback: number): number {
   const t = e.timestamp;
   if (typeof t === "number" && Number.isFinite(t)) return t;
   if (typeof t === "string") {
@@ -590,7 +769,9 @@ function tsMsOf(e: TranscriptEntry, fallback: number): number {
   return fallback;
 }
 
-function contentBlocks(e: TranscriptEntry): Array<Record<string, unknown>> {
+export function contentBlocks(
+  e: TranscriptEntry
+): Array<Record<string, unknown>> {
   const c = e.message?.content;
   if (!Array.isArray(c)) return [];
   return c.filter(b => typeof b === "object" && b !== null) as Array<
@@ -704,7 +885,9 @@ interface SubAgentMeta {
  * read as background (CC 2.1.271 launched background agents with no flag; the
  * `async_launched` result arm and the meta arm catch those).
  */
-function isBackgroundLaunchInput(input: Record<string, unknown>): boolean {
+export function isBackgroundLaunchInput(
+  input: Record<string, unknown>
+): boolean {
   return input.run_in_background === true;
 }
 
@@ -712,13 +895,79 @@ function isBackgroundLaunchInput(input: Record<string, unknown>): boolean {
  * #4385 (T8): true when a tool_result-carrying user entry reports an
  * asynchronous launch (`toolUseResult.status === "async_launched"`).
  */
-function isAsyncLaunchedResult(e: TranscriptEntry): boolean {
+export function isAsyncLaunchedResult(e: TranscriptEntry): boolean {
   const tur = e.toolUseResult;
   return (
     typeof tur === "object" &&
     tur !== null &&
     (tur as Record<string, unknown>).status === "async_launched"
   );
+}
+
+/** One external sub-agent file launched by a segment's `Task`/`Agent` call. */
+export interface MatchedSubAgent {
+  /** The `<id>` of `agent-<id>.meta.json`. */
+  agentId: string;
+  toolUseId: string;
+  /** The meta's `agentType`, or null. */
+  agentType: string | null;
+  /** Any background arm fired (launch input, launch result, or meta). */
+  background: boolean;
+  /** Path of `agent-<id>.jsonl`, next to its meta file. */
+  file: string;
+}
+
+/**
+ * Match `subagentsDir`'s `agent-<id>.meta.json` files to the launches seen in a
+ * segment (#6164: extracted from `rollupExternalSubAgents`, which consumes it
+ * unchanged, so the throughput facts collector matches sub-agents exactly as
+ * the finalize rollup does). In directory order; a meta that cannot be parsed
+ * or names no `toolUseId` is skipped; a missing or unreadable directory
+ * matches nothing (R12).
+ */
+export function matchExternalSubAgents(
+  taskToolUseIds: Set<string>,
+  backgroundToolUseIds: Set<string>,
+  subagentsDir: string
+): MatchedSubAgent[] {
+  if (taskToolUseIds.size === 0 && backgroundToolUseIds.size === 0) return [];
+  if (!existsSync(subagentsDir)) return [];
+
+  let metaFiles: string[];
+  try {
+    metaFiles = readdirSync(subagentsDir).filter(f => f.endsWith(".meta.json"));
+  } catch {
+    return []; // unreadable dir degrades to no rollup (R12)
+  }
+
+  const matched: MatchedSubAgent[] = [];
+  for (const metaFile of metaFiles) {
+    let meta: SubAgentMeta;
+    try {
+      meta = JSON.parse(
+        readFileSync(join(subagentsDir, metaFile), "utf-8")
+      ) as SubAgentMeta;
+    } catch {
+      continue;
+    }
+    const toolUseId = meta.toolUseId;
+    if (!toolUseId) continue;
+    const launchedHere =
+      taskToolUseIds.has(toolUseId) || backgroundToolUseIds.has(toolUseId);
+    if (!launchedHere) continue;
+
+    matched.push({
+      agentId: metaFile.slice("agent-".length, -".meta.json".length),
+      toolUseId,
+      agentType: meta.agentType ?? null,
+      background:
+        backgroundToolUseIds.has(toolUseId) ||
+        meta.requestShape === "background",
+      // agent-<id>.jsonl sits next to agent-<id>.meta.json.
+      file: join(subagentsDir, metaFile.replace(/\.meta\.json$/, ".jsonl")),
+    });
+  }
+  return matched;
 }
 
 /**
@@ -745,55 +994,29 @@ function rollupExternalSubAgents(
   events: TurnParseEvent[],
   fallbackTsMs: number
 ): void {
-  if (taskToolUseIds.size === 0 && backgroundToolUseIds.size === 0) return;
-  if (!existsSync(subagentsDir)) return;
-
-  let metaFiles: string[];
-  try {
-    metaFiles = readdirSync(subagentsDir).filter(f => f.endsWith(".meta.json"));
-  } catch {
-    return; // unreadable dir degrades to no rollup (R12)
-  }
-
-  for (const metaFile of metaFiles) {
-    let meta: SubAgentMeta;
-    try {
-      meta = JSON.parse(
-        readFileSync(join(subagentsDir, metaFile), "utf-8")
-      ) as SubAgentMeta;
-    } catch {
-      continue;
-    }
-    const toolUseId = meta.toolUseId;
-    if (!toolUseId) continue;
-    const launchedHere =
-      taskToolUseIds.has(toolUseId) || backgroundToolUseIds.has(toolUseId);
-    if (!launchedHere) continue;
-
-    if (
-      backgroundToolUseIds.has(toolUseId) ||
-      meta.requestShape === "background"
-    ) {
+  for (const agent of matchExternalSubAgents(
+    taskToolUseIds,
+    backgroundToolUseIds,
+    subagentsDir
+  )) {
+    const { toolUseId } = agent;
+    if (agent.background) {
       // `agentId` (from the meta filename) lets the finalize seed step write
       // this agent's row from its file as it is now (#4385 fix round 1).
       events.push({
         tsMs: fallbackTsMs,
         kind: "subagent",
-        name: meta.agentType ?? null,
+        name: agent.agentType,
         payload: {
           toolUseId,
           background: true,
-          agentId: metaFile.slice("agent-".length, -".meta.json".length),
+          agentId: agent.agentId,
         },
       });
       continue;
     }
 
-    // agent-<id>.jsonl sits next to agent-<id>.meta.json.
-    const agentFile = metaFile.replace(/\.meta\.json$/, ".jsonl");
-    const { entries: subEntries } = readTranscript(
-      join(subagentsDir, agentFile)
-    );
+    const { entries: subEntries } = readTranscript(agent.file);
 
     const subSums = emptyTokenSums();
     // #2229 (R2): per-file seen-set — sub-agent transcripts duplicate usage per
@@ -820,7 +1043,7 @@ function rollupExternalSubAgents(
     events.push({
       tsMs: fallbackTsMs,
       kind: "subagent",
-      name: meta.agentType ?? null,
+      name: agent.agentType,
       payload: {
         toolUseId,
         tokens: {
@@ -878,7 +1101,28 @@ export function parseTurn(ctx: ParseTurnContext): TurnParseResult {
     resolvedMain = paths.main;
     const fallbackTsMs = ctx.fallbackTsMs ?? 0;
 
-    const { entries, skipped } = readTranscript(paths.main);
+    // #6264: a large transcript is read from its last main-chain prompt to EOF
+    // only. `skipped` then counts that window, not the whole file.
+    const bounds = resolveBounds(ctx);
+    let read: { entries: TranscriptEntry[]; skipped: number };
+    if (useBoundedRead(paths.main, bounds.fullReadMaxBytes)) {
+      let capHit: TranscriptCapHit | null = null;
+      const tail = readLastTurnWindow(paths.main, bounds, hit => {
+        capHit = hit;
+        ctx.onCapHit?.(hit);
+      });
+      if (tail === null) {
+        const hit = capHit as TranscriptCapHit | null;
+        return {
+          ...nullResult(resolvedMain),
+          parseError: `transcript tail ${hit?.reason ?? "scan-cap"} reached (${hit?.sizeBytes ?? "?"} bytes)`,
+        };
+      }
+      read = tail;
+    } else {
+      read = readTranscript(paths.main);
+    }
+    const { entries, skipped } = read;
     const segments = segmentTurns(entries);
     if (segments.length === 0) {
       // No detectable main-chain prompt — nothing to attribute. Fail-open NULLs.

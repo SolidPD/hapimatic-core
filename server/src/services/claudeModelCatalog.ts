@@ -23,10 +23,12 @@ import { homedir } from "node:os";
 import {
   EFFORT_LEVELS,
   FALLBACK_CLAUDE_MODELS,
+  resolveModelEffortLevels,
   type ClaudeModelInfo,
   type ClaudeModelsResponse,
   type EffortLevel,
 } from "@hapi/protocol";
+import type { ModelEffortLevelsResolver } from "../sync/syncEngine";
 import type { AccountService } from "./accountService";
 import {
   isTenantVm,
@@ -103,6 +105,23 @@ export class ClaudeModelCatalogService {
       }
       return { models: FALLBACK_CLAUDE_MODELS, source: "fallback" };
     }
+  }
+
+  /**
+   * The spawn path's model-effort resolver (issue #6028), wired into
+   * `SyncEngine.setModelEffortLevelsResolver` by `buildWebApp.ts`. Issue #6166:
+   * a resume asks with `wait: false` and reads {@link peekModels}, so it never
+   * waits; any other call reads {@link modelsForSpawn}, which waits only in the
+   * boot window (#6070).
+   */
+  effortLevelsResolver(): ModelEffortLevelsResolver {
+    return async (pin, resolveOpts) => {
+      const { models, source } =
+        resolveOpts?.wait === false
+          ? this.peekModels()
+          : await this.modelsForSpawn();
+      return resolveModelEffortLevels(models, source, pin);
+    };
   }
 
   /**

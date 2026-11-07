@@ -80,6 +80,10 @@ function reconnectErrorMessage(err: unknown): string {
   if (err instanceof ApiError && err.code === "at_capacity") {
     return "This node is full — free a session (disconnect or delete one) and retry the reconnect.";
   }
+  // #6156: a reconnect that falls back to a fresh spawn can meet the memory gate.
+  if (err instanceof ApiError && err.code === "insufficient_memory") {
+    return "This node is low on free memory — stop an idle session or wait for a job to finish, then retry the reconnect.";
+  }
   // Issue #1835 (R2): a reconnect refused by the pre-spawn account-health gate
   // carries code "account_unrefreshable" → 409 (`sessions.ts`). The server ALSO
   // emits a session-scoped `account-unrefreshable` SSE event just before the 409

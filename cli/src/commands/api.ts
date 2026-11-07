@@ -8,11 +8,19 @@ import {
   type BulkSessionResult,
 } from "@hapi/protocol/bulkSessionResult";
 import {
+  EffortLevelSchema,
   ModelModeSchema,
+  PermissionModeSchema,
   SessionRoleSchema,
   SESSION_ROLES,
 } from "@hapi/protocol/schemas";
-import { MODEL_MODES } from "@hapi/protocol/modes";
+import { EFFORT_LEVELS, type EffortLevel } from "@hapi/protocol/effort";
+import {
+  MODEL_MODES,
+  PERMISSION_MODES,
+  isPermissionMode,
+  isYoloEquivalentMode,
+} from "@hapi/protocol/modes";
 import { configuration } from "@/configuration";
 import { readSettings } from "@/persistence";
 import { writeStdout } from "@/utils/stdout";
@@ -56,10 +64,22 @@ export type ResolvedSpawnArgs = {
    *  strictly here (clear CLI error on a typo); absent → the session follows
    *  the normal default-mode resolution, byte-identical to pre-#2434. */
   modelMode?: string;
+  /** Issue #6166: Claude reasoning-effort pin (low/medium/high/xhigh/max).
+   *  Validated strictly here; absent → the target node's default (xhigh unless
+   *  the node sets HAPI_DEFAULT_EFFORT or settings.json defaultEffort), and the
+   *  request body is byte-identical to before. */
+  effort?: EffortLevel;
   /** Issue #2479: link the spawned session to a parent (managed peer). Defaults
    *  to the caller's HAPI_SESSION_ID when the flag is omitted, so a spawn from
    *  inside a session auto-links to it. May be a tag; the server resolves it. */
   parentSessionId?: string;
+  /** Issue #6218: `--yolo` asks for a peer that bypasses permission prompts.
+   *  Absent → the node's default spawn permission mode (not YOLO unless the
+   *  operator set it). */
+  yolo?: true;
+  /** Issue #6218: `--permission-mode <mode>` — the peer's starting permission
+   *  mode, validated strictly here; the server checks it against the harness. */
+  permissionMode?: string;
 };
 export type SpawnArgsError = { error: string };
 
@@ -112,7 +132,7 @@ export async function resolveSpawnArgs(
   if (!dir) {
     return {
       error:
-        "Usage: hapi api sessions spawn --dir <path> [--machine <id>] [--name <display-name>] [--session-role <role>] [--model-mode <mode>] [--parent-session-id <id>]",
+        "Usage: hapi api sessions spawn --dir <path> [--machine <id>] [--name <display-name>] [--session-role <role>] [--model-mode <mode>] [--effort <level>] [--yolo | --permission-mode <mode>] [--parent-session-id <id>]",
     };
   }
 
@@ -146,6 +166,36 @@ export async function resolveSpawnArgs(
     };
   }
 
+  // Issue #6166: validate --effort strictly at the CLI, like --model-mode. It
+  // applies to Claude sessions only — the server ignores an effort on another
+  // agent's spawn.
+  const effortRaw = parseFlag(args, "--effort");
+  let effort: EffortLevel | undefined;
+  if (effortRaw !== undefined) {
+    const parsed = EffortLevelSchema.safeParse(effortRaw);
+    if (!parsed.success) {
+      return {
+        error: `Invalid --effort '${effortRaw}'. Valid levels: ${EFFORT_LEVELS.join(", ")} (Claude sessions only).`,
+      };
+    }
+    effort = parsed.data;
+  }
+
+  // Issue #6218: the spawn's permission posture. An omitted posture gets the
+  // node's default spawn permission mode server-side, so a PM lane that needs a
+  // bypass peer must pass --yolo. The server is the authoritative check (the
+  // mode against the harness, and --yolo against the mode).
+  const yolo = args.includes("--yolo");
+  const permissionModeRaw = parseFlag(args, "--permission-mode");
+  if (
+    permissionModeRaw !== undefined &&
+    !PermissionModeSchema.safeParse(permissionModeRaw).success
+  ) {
+    return {
+      error: `Invalid --permission-mode '${permissionModeRaw}'. Valid modes: ${PERMISSION_MODES.join(", ")}.`,
+    };
+  }
+
   // An explicit --machine wins and avoids consulting settings.json (R2).
   let machineId = parseFlag(args, "--machine");
   if (!machineId) {
@@ -174,7 +224,72 @@ export async function resolveSpawnArgs(
     ...(name ? { name } : {}),
     ...(sessionRoleRaw ? { sessionRole: sessionRoleRaw } : {}),
     ...(modelModeRaw ? { modelMode: modelModeRaw } : {}),
+    ...(effort ? { effort } : {}),
+    ...(yolo ? { yolo: true as const } : {}),
+    ...(permissionModeRaw ? { permissionMode: permissionModeRaw } : {}),
     ...(parentSessionId ? { parentSessionId } : {}),
+  };
+}
+
+/**
+ * The `POST /api/machines/:id/spawn` body for `hapi api sessions spawn`, built
+ * from the parsed flags. Pure, so a test catches a flag the body drops (the
+ * #1262 trap; issue #6166). Each optional field is spread-guarded: an omitted
+ * flag keeps the body byte-identical to a request without it.
+ */
+export function buildSpawnBody(
+  resolved: ResolvedSpawnArgs
+): Record<string, unknown> {
+  const {
+    dir,
+    name,
+    sessionRole,
+    modelMode,
+    effort,
+    yolo,
+    permissionMode,
+    parentSessionId,
+  } = resolved;
+  return {
+    directory: dir,
+    earlyReturn: true,
+    ...(name ? { name } : {}),
+    ...(sessionRole ? { sessionRole } : {}),
+    // Issue #2434: forward the Claude model-mode pin so the session starts on
+    // the intended model atomically — no post-spawn `POST /sessions/:id/model`
+    // correction.
+    ...(modelMode ? { modelMode } : {}),
+    // Issue #6166: forward an explicit effort pick; without one the target
+    // node's default applies.
+    ...(effort ? { effort } : {}),
+    // Issue #6218: the permission posture. Omitted → the node's default spawn
+    // permission mode, applied server-side.
+    ...spawnPostureBody(yolo, permissionMode),
+    // Issue #2479: forward the parent link so the spawned session groups under
+    // its spawner as a managed peer. May be a tag — the server resolves it.
+    ...(parentSessionId ? { parentSessionId } : {}),
+  };
+}
+
+/**
+ * Issue #6218: the spawn request's posture fields. A named mode travels with
+ * the `yolo` it implies, so a server older than #6218 (which drops the unknown
+ * `permissionMode` and reads a missing `yolo` as YOLO) starts the peer in
+ * `default`, never YOLO. With neither flag the posture stays omitted and the
+ * server applies the node's default spawn permission mode.
+ */
+export function spawnPostureBody(
+  yolo: boolean | undefined,
+  permissionMode: string | undefined
+): { yolo?: boolean; permissionMode?: string } {
+  if (yolo) {
+    return { yolo: true, ...(permissionMode ? { permissionMode } : {}) };
+  }
+  if (!permissionMode) return {};
+  return {
+    yolo:
+      isPermissionMode(permissionMode) && isYoloEquivalentMode(permissionMode),
+    permissionMode,
   };
 }
 
@@ -459,8 +574,7 @@ async function handleSessions(args: string[]): Promise<void> {
       console.error(resolved.error);
       process.exit(1);
     }
-    const { dir, machineId, name, sessionRole, modelMode, parentSessionId } =
-      resolved;
+    const { machineId } = resolved;
 
     const jwt = await authenticateCli();
     // Issue #1565: request the early-return spawn path (Option B). A new server
@@ -481,20 +595,7 @@ async function handleSessions(args: string[]): Promise<void> {
     try {
       resp = await axios.post(
         `${configuration.serverUrl}/api/machines/${encodeURIComponent(machineId)}/spawn`,
-        {
-          directory: dir,
-          earlyReturn: true,
-          ...(name ? { name } : {}),
-          ...(sessionRole ? { sessionRole } : {}),
-          // Issue #2434: forward the Claude model-mode pin so the session
-          // starts on the intended model atomically — no post-spawn
-          // `POST /sessions/:id/model` correction. The spread-guard keeps an
-          // omitted flag byte-identical to the pre-#2434 request body.
-          ...(modelMode ? { modelMode } : {}),
-          // Issue #2479: forward the parent link so the spawned session groups
-          // under its spawner as a managed peer. May be a tag — server resolves.
-          ...(parentSessionId ? { parentSessionId } : {}),
-        },
+        buildSpawnBody(resolved),
         { headers: authHeaders(jwt), timeout: SPAWN_CLIENT_TIMEOUT_MS }
       );
     } catch (error) {
@@ -858,6 +959,9 @@ ${chalk.bold("Usage:")}
                           --machine <id>               Override local machine (optional)
                           --name <display-name>        Set session display name (optional)
                           --session-role <role>        Role-scoped @-include profile: pm|worker|researcher|closer|interactive (optional)
+                          --effort <level>             Claude reasoning effort: low|medium|high|xhigh|max (optional; default: the node's)
+                          --yolo                       Peer bypasses permission prompts (omitted: the node's default spawn permission mode)
+                          --permission-mode <mode>     Starting permission mode, e.g. acceptEdits|plan|default (optional)
   hapi api sessions send <id> "<message>"              Send a message to a session
   hapi api sessions messages <id>                      Get message history
   hapi api sessions capabilities <id>                  List a session's live RPC capabilities (name + meta)

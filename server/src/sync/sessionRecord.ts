@@ -72,6 +72,12 @@ export function buildSessionRecord(input: {
     // until the first token of the next response.
     effort: existing?.effort ?? metadata?.effort,
     rawModel: existing?.rawModel ?? metadata?.rawModel,
+    // Issue #6166: the applied effort is an observation of the live process —
+    // carried as-is (a `??` would turn `null`, "Claude sends no effort", into
+    // absent) and never seeded from metadata, which holds the REQUEST.
+    appliedEffort: existing?.appliedEffort,
+    appliedModel: existing?.appliedModel,
+    appliedForEffort: existing?.appliedForEffort,
     notes: stored.notes ?? undefined,
     // #3286: hydrate the persisted view (undefined when no row value → the
     // client falls back to DEFAULT_SESSION_VIEW).

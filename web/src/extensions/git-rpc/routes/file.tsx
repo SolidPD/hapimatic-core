@@ -10,6 +10,17 @@ import { useAppGoBack } from "@/hooks/useAppGoBack";
 import { queryKeys } from "@/lib/query-keys";
 import { langAlias, useShikiHighlighter } from "@/lib/shiki";
 import { decodeBase64, encodeBase64 } from "@/lib/utils";
+import { isNoRepoGitError } from "@/lib/files-view";
+import { friendlyRpcError } from "@/extensions/git-rpc/browse/browseModel";
+import {
+  isBinaryContent,
+  isUtf8Text,
+} from "@/extensions/git-rpc/browse/preview/binaryContent";
+import {
+  FilePreview,
+  base64ToBytes,
+  previewKindFor,
+} from "@/extensions/git-rpc/browse/preview/FilePreview";
 
 // issue #2964: CodeMirror editor is lazy-loaded so it stays out of the initial
 // bundle and only ships when the user enters edit mode (Suspense falls back to
@@ -33,7 +44,9 @@ function triggerDownload(fileName: string, base64Content: string): void {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(url);
+  // #6224: revoking at once can cancel the download in Safari and the iOS PWA,
+  // which read the blob after click() returns.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function EditIcon(props: { className?: string }) {
@@ -171,16 +184,6 @@ function resolveLanguage(path: string): string | undefined {
   return langAlias[ext] ?? ext;
 }
 
-function isBinaryContent(content: string): boolean {
-  if (!content) return false;
-  if (content.includes("\0")) return true;
-  const nonPrintable = content.split("").filter(char => {
-    const code = char.charCodeAt(0);
-    return code < 32 && code !== 9 && code !== 10 && code !== 13;
-  }).length;
-  return nonPrintable / content.length > 0.1;
-}
-
 function extractCommandError(
   result: GitCommandResponse | undefined
 ): string | null {
@@ -226,9 +229,15 @@ export default function FilePage() {
   const diffContent = diffQuery.data?.success
     ? (diffQuery.data.stdout ?? "")
     : "";
-  const diffError = extractCommandError(diffQuery.data);
+  const rawDiffError =
+    extractCommandError(diffQuery.data) ??
+    (diffQuery.error instanceof Error ? diffQuery.error.message : null);
+  // #6224: in a folder that is not a Git repo there is simply no diff; git's
+  // usage text must not show. A broken-repo error is not this and still shows.
+  const diffNotARepo = isNoRepoGitError(rawDiffError);
+  const diffError = diffNotARepo ? null : rawDiffError;
   const diffSuccess = diffQuery.data?.success === true;
-  const diffFailed = diffQuery.data?.success === false;
+  const diffFailed = diffQuery.data?.success === false || diffQuery.isError;
 
   const fileContentResult = fileQuery.data;
   // issue #2518: the server withholds content for oversized files (tooLarge) —
@@ -249,13 +258,34 @@ export default function FilePage() {
   const binaryFile = fileContentResult?.success
     ? !decodedContentResult.ok || isBinaryContent(decodedContent)
     : false;
+  // #6224: an image or PDF previews inline, from the bytes already fetched.
+  const contentBytes = useMemo(
+    () => (downloadableContent ? base64ToBytes(downloadableContent) : null),
+    [downloadableContent]
+  );
+  // #6224 review: text that is not valid UTF-8 is shown but cannot be edited,
+  // because saving it would rewrite the bytes the lenient decode replaced.
+  const utf8Text = useMemo(
+    () => (contentBytes ? isUtf8Text(contentBytes) : true),
+    [contentBytes]
+  );
+  const notUtf8Text =
+    fileContentResult?.success === true &&
+    !tooLarge &&
+    !binaryFile &&
+    !utf8Text;
   // issue #2518: editing requires a text file whose read returned a hash (for a
   // conflict-safe save round-trip).
   const editable =
     fileContentResult?.success === true &&
     !tooLarge &&
     !binaryFile &&
+    utf8Text &&
     typeof fileHash === "string";
+  const preview = useMemo(
+    () => (tooLarge ? null : previewKindFor(fileName, contentBytes)),
+    [fileName, contentBytes, tooLarge]
+  );
 
   const language = useMemo(() => resolveLanguage(filePath), [filePath]);
   const highlighted = useShikiHighlighter(decodedContent, language);
@@ -301,6 +331,11 @@ export default function FilePage() {
 
   useEffect(() => {
     if (editing) return;
+    // An image's diff is only "Binary files differ"; open on the picture.
+    if (preview) {
+      setDisplayMode("file");
+      return;
+    }
     if (diffSuccess && !diffContent) {
       setDisplayMode("file");
       return;
@@ -308,13 +343,17 @@ export default function FilePage() {
     if (diffFailed) {
       setDisplayMode("file");
     }
-  }, [diffSuccess, diffFailed, diffContent, editing]);
+  }, [diffSuccess, diffFailed, diffContent, editing, preview]);
 
   const loading = diffQuery.isLoading || fileQuery.isLoading;
+  // #6224: a thrown error (a 403 from the path guard, a 502 from an unreachable
+  // node) used to leave fileQuery.data empty and render "File is empty.".
   const fileError =
     fileContentResult && !fileContentResult.success && !tooLarge
-      ? (fileContentResult.error ?? "Failed to read file")
-      : null;
+      ? friendlyRpcError(fileContentResult.error ?? "Failed to read file")
+      : fileQuery.error instanceof Error
+        ? friendlyRpcError(fileQuery.error.message)
+        : null;
   const missingPath = !filePath;
   const diffErrorMessage = diffError ? `Diff unavailable: ${diffError}` : null;
 
@@ -350,6 +389,8 @@ export default function FilePage() {
           <button
             type="button"
             onClick={goBack}
+            title="Back to files"
+            aria-label="Back to files"
             className="flex h-8 w-8 items-center justify-center rounded-full text-[var(--app-hint)] transition-colors hover:bg-[var(--app-secondary-bg)] hover:text-[var(--app-fg)]"
           >
             <BackIcon />
@@ -419,6 +460,15 @@ export default function FilePage() {
           {diffErrorMessage && !editing ? (
             <div className="mb-3 rounded-md bg-amber-500/10 p-2 text-xs text-[var(--app-hint)]">
               {diffErrorMessage}
+            </div>
+          ) : null}
+          {notUtf8Text && !preview && !editing ? (
+            <div
+              role="note"
+              className="mb-3 rounded-md bg-[var(--app-subtle-bg)] p-2 text-xs text-[var(--app-hint)]"
+            >
+              This file isn&apos;t UTF-8 text, so it can&apos;t be edited here
+              without changing its bytes.
             </div>
           ) : null}
           {missingPath ? (
@@ -505,6 +555,18 @@ export default function FilePage() {
                 </button>
               </div>
             </div>
+          ) : preview && contentBytes && displayMode === "file" ? (
+            <FilePreview
+              fileName={fileName}
+              bytes={contentBytes}
+              kind={preview.kind}
+              mime={preview.mime}
+              onDownload={
+                downloadableContent
+                  ? () => triggerDownload(fileName, downloadableContent)
+                  : undefined
+              }
+            />
           ) : binaryFile ? (
             <div className="rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] p-4 text-sm text-[var(--app-hint)]">
               <p className="mb-2">

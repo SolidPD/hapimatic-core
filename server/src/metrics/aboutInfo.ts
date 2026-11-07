@@ -129,7 +129,7 @@ async function gatherHarnesses(): Promise<HarnessInfo[]> {
  * tailnet owner's email — R4). `null` when tailscale is absent / not running
  * / output unparseable (R7 / OR-4).
  */
-async function gatherTailscale(): Promise<TailscaleInfo> {
+export async function gatherTailscale(): Promise<TailscaleInfo> {
   try {
     const proc = Bun.spawn(["tailscale", "status", "--json"], {
       stdout: "pipe",

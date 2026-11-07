@@ -11,7 +11,10 @@ import {
 import * as PopoverPrimitive from "@radix-ui/react-popover";
 import { NodeBadge } from "@/components/NodeBadge";
 import { useAppContext } from "@/lib/app-context";
-import { useFederationNodesInfo } from "@/hooks/queries/useFederationHealthAvailable";
+import {
+  federationHealthAvailable,
+  useFederationNodesInfo,
+} from "@/hooks/queries/useFederationHealthAvailable";
 import { IPAD_WINDOW_CONTROLS_INSET_X } from "@/hooks/useIPadMultitasking";
 import {
   computeChipPlacement,
@@ -112,8 +115,9 @@ export function TitleBarNodeChip({
     const timer = window.setInterval(() => void refetch(), NODES_RETRY_MS);
     return () => window.clearInterval(timer);
   }, [isError, hasNode, refetch]);
-  // A node without a health aggregator answers 503 to the health poll (R6).
-  const resourceHealth = Boolean(data?.enabled && data.role !== "node");
+  // A node without a health aggregator (a server older than #6217 on a
+  // standalone or spoke) answers 503 to the health poll (R6).
+  const resourceHealth = federationHealthAvailable(data);
 
   const measurerRef = useRef<HTMLDivElement>(null);
   const [placement, setPlacement] = useState<Placed | null>(null);
