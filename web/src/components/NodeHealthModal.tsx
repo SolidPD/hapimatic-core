@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useNavigate } from "@tanstack/react-router";
 import { ExternalLink } from "lucide-react";
-import { displayNodeLabel } from "@hapi/protocol";
+import { displayNodeLabel, normalizeNodeWebUrl } from "@hapi/protocol";
 import { useAppContext } from "@/lib/app-context";
 import { useNodeHealth } from "@/hooks/queries/useNodeHealth";
+import { useFederationNodesInfo } from "@/hooks/queries/useFederationHealthAvailable";
+import { NODE_STATUS_TEXT_CLASS, resolveNodeHref } from "@/lib/nodeSwitcher";
 import { NodeDetailDashboard } from "@/components/NodeDetailDashboard";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 
 export type NodeHealthStatus = "online" | "degraded" | "offline";
-
-const HEALTH_TEXT_CLASS: Record<NodeHealthStatus, string> = {
-  online: "text-[var(--app-badge-success-text)]",
-  degraded: "text-[var(--app-badge-warning-text)]",
-  offline: "text-[var(--app-badge-error-text)]",
-};
 
 /**
  * NodeHealthModal — the Settings → Federation per-node health page
@@ -27,6 +23,13 @@ const HEALTH_TEXT_CLASS: Record<NodeHealthStatus, string> = {
  * "Node not found", 503 → the dashboard's health-disabled placeholder). The
  * footer keeps the two links the badge used to carry / the page offers: the
  * node's native UI (when it has a URL) and the full Settings page.
+ *
+ * "Open node UI" (#6123) resolves the address the way the title-bar node
+ * switcher does — the node's advertised `webUrl`, else its stored federation
+ * url — from the deduped nodes read, and falls back to the `nodeUrl` prop only
+ * when that read does not list the node. Every href passes
+ * `normalizeNodeWebUrl`. The `nodeUrl` prop keeps its other meanings (label
+ * casing here and in NodeBadge; FanOut's "served elsewhere" test).
  */
 export function NodeHealthModal({
   nodeId,
@@ -50,6 +53,11 @@ export function NodeHealthModal({
   const { api } = useAppContext();
   const navigate = useNavigate();
   const { node, isNotFound } = useNodeHealth(api, nodeId);
+  const { data: nodesInfo } = useFederationNodesInfo(api);
+  const nodeState = nodesInfo?.nodes.find(s => s.config.id === nodeId);
+  const openNodeHref = nodeState
+    ? resolveNodeHref(nodeState)
+    : normalizeNodeWebUrl(nodeUrl);
 
   // System-wide casing rule (epic #3285 round 11): local machines UPPER CASE,
   // cloud VMs lower case — the same helper the Node Badge applies, so the badge
@@ -88,7 +96,7 @@ export function NodeHealthModal({
           </DialogTitle>
           <span
             data-testid="node-health-modal-status"
-            className={`shrink-0 text-[length:var(--text-caption)] font-medium ${HEALTH_TEXT_CLASS[health]}`}
+            className={`shrink-0 text-[length:var(--text-caption)] font-medium ${NODE_STATUS_TEXT_CLASS[health]}`}
           >
             {health}
           </span>
@@ -110,14 +118,14 @@ export function NodeHealthModal({
 
         {/* Footer — the deep links. */}
         <div className="flex items-center justify-end gap-2 border-t border-[var(--app-border)] px-4 py-3">
-          {nodeUrl && (
+          {openNodeHref && (
             <Button
               asChild
               variant="outline"
               className="h-auto rounded-md px-2.5 py-1.5 text-xs font-normal"
             >
               <a
-                href={nodeUrl}
+                href={openNodeHref}
                 target="_blank"
                 rel="noopener noreferrer"
                 data-testid="node-health-modal-open-node-ui"

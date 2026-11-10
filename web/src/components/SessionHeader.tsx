@@ -80,6 +80,11 @@ import { Spinner } from "@/components/Spinner";
 import type { RecoveryStatus } from "@/types/api";
 import { Button } from "@/components/ui/button";
 import { SupportSessionBar } from "@/components/SupportSessionBar";
+import { useSessionOpenPinCount } from "@/hooks/queries/useSession";
+import {
+  openPinsArchiveNote,
+  withOpenPinsNote,
+} from "@/lib/pins/archiveWarning";
 
 export function SessionHeader(props: {
   session: Session;
@@ -143,6 +148,8 @@ export function SessionHeader(props: {
 
   // Repo URL from metadata (no lazy API call needed)
   const repoUrl = session.metadata?.repoIdentity?.url ?? null;
+  // #6454: the open pins a Disconnect confirm warns about (unknown until read).
+  const { openPinCount } = useSessionOpenPinCount(session.id);
 
   // Get branch name — check isDetached before falling back to worktree metadata
   const isDetached = branchInfo?.isDetached ?? false;
@@ -843,7 +850,10 @@ export function SessionHeader(props: {
         isOpen={disconnectOpen}
         onClose={() => setDisconnectOpen(false)}
         title="Disconnect Session"
-        description={`Are you sure you want to disconnect "${title}"? The session will become inactive.`}
+        description={withOpenPinsNote(
+          `Are you sure you want to disconnect "${title}"? The session will become inactive.`,
+          openPinsArchiveNote(openPinCount)
+        )}
         confirmLabel="Disconnect"
         confirmingLabel="Disconnecting..."
         onConfirm={archiveSession}

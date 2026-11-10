@@ -178,6 +178,23 @@ export class ApiClient {
   }
 
   /**
+   * Issue #6171: per-server MCP RAM (the daemon's sampler) or context cost (a
+   * session's turn-end reply) for the New Session picker. Names and numbers
+   * only: never argv, environ or a URL.
+   */
+  async updateMcpCosts(
+    update: import("@hapi/protocol/schemas").McpCostsUpdate
+  ): Promise<void> {
+    await axios.post(`${configuration.serverUrl}/cli/mcp-costs`, update, {
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 10_000,
+    });
+  }
+
+  /**
    * Issue #1449: relay a redacted account-capture notice to the server, which
    * broadcasts an account-captured SSE so the web UI updates the account
    * dropdown live. Mirrors updateMcpStatus (daemon-side POST to a /cli route).

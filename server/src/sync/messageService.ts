@@ -47,6 +47,11 @@ export type SendMessageResult =
         createdAt: number;
         localId: string | null;
       };
+      /**
+       * #6453: a `record` send whose `localId` was already stored: the old row
+       * came back and the record step did not run (see `persistWithRecord`).
+       */
+      replayed?: true;
     }
   | {
       delivered: false;
@@ -60,6 +65,21 @@ export type SendMessageResult =
       // could re-render, though it consumes the pre-resolved `outcome`).
       params?: Record<string, string | number>;
     };
+
+/**
+ * Thrown by {@link MessageService.sendMessage} when the caller's `record` step
+ * declines (#6452): nothing was persisted or delivered. Only a caller that passes
+ * `record` can see it, so the `delivered === false` narrowings above never do.
+ */
+export class RecordVetoError extends Error {
+  constructor(message = "The record step declined; nothing was sent") {
+    super(message);
+    this.name = "RecordVetoError";
+  }
+}
+
+/** The `sendMessage` payload's optional in-transaction record step (#6452). */
+export type MessageRecordStep = () => boolean;
 
 /**
  * Dependencies the #3124 message-hook stage needs from the engine. Injected
@@ -168,6 +188,11 @@ export class MessageService {
       // content.meta.origin and forwarded to the message-hook stage so the
       // token gate can verify provenance + self-send.
       origin?: MessageOrigin;
+      // #6452: run this in the SAME transaction as the message insert, after the
+      // hook stage: the message and what `record` writes commit together or not
+      // at all, and nothing is emitted until the commit. Returning false (or
+      // throwing) persists nothing; false throws `RecordVetoError`.
+      record?: MessageRecordStep;
     }
   ): Promise<SendMessageResult> {
     const sentFrom = payload.sentFrom ?? "webapp";
@@ -294,11 +319,23 @@ export class MessageService {
       },
     };
 
-    const msg = this.store.messages.addMessage(
-      sessionId,
-      content,
-      payload.localId ?? undefined
-    );
+    const record = payload.record;
+    const persisted = record
+      ? this.persistWithRecord(
+          sessionId,
+          content,
+          payload.localId ?? undefined,
+          record
+        )
+      : {
+          msg: this.store.messages.addMessage(
+            sessionId,
+            content,
+            payload.localId ?? undefined
+          ),
+          replayed: false,
+        };
+    const msg = persisted.msg;
 
     this.emitNewMessage(sessionId, msg);
 
@@ -314,6 +351,7 @@ export class MessageService {
         createdAt: msg.createdAt,
         localId: msg.localId,
       },
+      ...(persisted.replayed ? { replayed: true as const } : {}),
     };
   }
 
@@ -406,6 +444,62 @@ export class MessageService {
     };
     const msg = this.store.messages.addMessage(sessionId, content);
     this.emitNewMessage(sessionId, msg);
+  }
+
+  /**
+   * #6448: persist a chat notice that a `hapi_pin` block was not saved, because
+   * the fence path has no tool result to carry the reason. The agent `event`
+   * record with `data.type: "message"` the web already renders as a line of
+   * text — never a `role: "user"` record, so it never wakes or re-prompts the
+   * session. `localId` stays UNSET (#3579-5); millisecond `at` keeps two
+   * notices byte-distinct for the web dedupe (#3579-1).
+   */
+  persistPinFenceNotice(sessionId: string, message: string): void {
+    const content = {
+      role: "agent",
+      content: {
+        id: randomUUID(),
+        type: "event",
+        data: { type: "message", message, at: new Date().toISOString() },
+      },
+    };
+    const msg = this.store.messages.addMessage(sessionId, content);
+    this.emitNewMessage(sessionId, msg);
+  }
+
+  /**
+   * #6452: the caller's record step and the message insert in ONE `BEGIN
+   * IMMEDIATE` transaction (`addMessage`'s own `.immediate()` nests as a
+   * savepoint), so a pins message and its recorded answers are never split: a
+   * crash or a busy store leaves neither, and a retry with the same `localId`
+   * finds nothing half-done. The record step runs first, so a veto writes nothing.
+   *
+   * #6453 (IR-3): when a message with this `localId` is already stored, the
+   * record step already ran with it, so it does not run again: the retry's own
+   * record step describes a message that will never be stored (the insert
+   * de-duplicates to the old row), and running it would mark state the agent
+   * never hears about. The caller sees `replayed: true`.
+   */
+  private persistWithRecord(
+    sessionId: string,
+    content: unknown,
+    localId: string | undefined,
+    record: MessageRecordStep
+  ): {
+    msg: ReturnType<Store["messages"]["addMessage"]>;
+    replayed: boolean;
+  } {
+    const txn = this.store.getRawDb().transaction(() => {
+      const replayed =
+        localId !== undefined &&
+        this.store.messages.hasLocalId(sessionId, localId);
+      if (!replayed && !record()) throw new RecordVetoError();
+      return {
+        msg: this.store.messages.addMessage(sessionId, content, localId),
+        replayed,
+      };
+    });
+    return txn.immediate();
   }
 
   /**

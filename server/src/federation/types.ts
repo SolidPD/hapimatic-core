@@ -15,6 +15,8 @@ export type NodeRegistryOptions = {
   peerStore?: PeerStore;
   /** Override the default eviction threshold (default: 10 consecutive failures). */
   evictionThreshold?: number;
+  /** Issue #6447: the Pins gate. Defaults to `resolvePinsEnabled()`; tests override it. */
+  pinsEnabled?: boolean;
   /** Runtime job registry to register the poll loop into (#1963). */
   jobRegistry?: JobRegistry | null;
   /**

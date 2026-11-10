@@ -119,7 +119,10 @@ const StageModelTupleRecord = z.record(z.string(), z.array(z.number()));
  *           that holds its session's first real model call, whose `f` is the
  *           session's starting context
  * - `idle`  gaps over {@link IDLE_GAP_MS}: count `n`, per-class totals
- *           `c: { cls: [n, w1, w5] }`, and the top 3 by rewrite size
+ *           `c: { cls: [n, w1, w5, warmN, warmCr] }` (warmN / warmCr since
+ *           #6169: gaps whose opening call read >= 90% of its prefix from the
+ *           cache, and their cache-read tokens; absent on older rows → 0), and
+ *           the top 3 by rewrite size
  *           `top: [[atMs, gapMs, cls, w1, w5, model], …]`
  * - `tests` agent test runs, failing runs, ≤ 10 scrubbed failing-unit ids
  * - `bg`    background agents launched in the turn: count, per-model
@@ -417,6 +420,29 @@ export const QuotaModelSchema = z
   .passthrough();
 export type QuotaModel = z.infer<typeof QuotaModelSchema>;
 
+/**
+ * Issue #6169: prompt-cache keep-alives on THIS node (the ledger is node-local),
+ * set against the kept-warm reopenings of this node's own turns, so both sides
+ * count the same sessions. Every figure is an estimate.
+ */
+export const ThroughputKeepaliveSummarySchema = z
+  .object({
+    scope: z.literal("node"),
+    byOutcome: z
+      .object({ sent: z.number(), refused: z.number(), failed: z.number() })
+      .passthrough(),
+    /** The `sent` keep-alives priced: cache read, input and output. */
+    costUsd: z.number(),
+    keptWarmN: z.number(),
+    avoidedUsd: z.number(),
+    /** `avoidedUsd - costUsd`. */
+    netUsd: z.number(),
+  })
+  .passthrough();
+export type ThroughputKeepaliveSummary = z.infer<
+  typeof ThroughputKeepaliveSummarySchema
+>;
+
 /** The readonly aggregate summary (no account, session, issue or test identities). */
 export const ThroughputSummarySchema = z
   .object({
@@ -459,9 +485,15 @@ export const ThroughputSummarySchema = z
           w1: z.number(),
           w5: z.number(),
           usd: z.number(),
+          /** #6169: reopenings that read >= 90% of their prefix from the cache. */
+          warmN: z.number().optional(),
+          /** #6169: the rewrite cost those reopenings avoided (estimate). */
+          avoidedUsd: z.number().optional(),
         })
         .passthrough()
     ),
+    /** #6169: this node's prompt-cache keep-alives against what they saved. */
+    keepalive: ThroughputKeepaliveSummarySchema.optional(),
     coverage: ThroughputCoverageSchema,
     github: ThroughputGithubSummarySchema,
     quota: QuotaModelSchema,
@@ -647,6 +679,134 @@ export const DigestListSchema = z
   .object({ digests: z.array(DigestMetaSchema) })
   .passthrough();
 export type DigestList = z.infer<typeof DigestListSchema>;
+
+// ───────────────────────── release health (D3 #6173) ─────────────────────────
+
+/** Source classes the release-health metric counts separately (#6173 R2). */
+export const RELEASE_HEALTH_SOURCE_CLASSES = [
+  "server",
+  "cli",
+  "client",
+] as const;
+export type ReleaseHealthSourceClass =
+  (typeof RELEASE_HEALTH_SOURCE_CLASSES)[number];
+
+/**
+ * Error-log categories that never count against a release (#6173 R2): failures
+ * a session reports from outside the app (`api-error`, `tool-error`,
+ * `prompt-blocked`) and an operational watchdog.
+ */
+export const RELEASE_HEALTH_EXCLUDED_CATEGORIES = [
+  "api-error",
+  "tool-error",
+  "prompt-blocked",
+  "slice-pressure-watchdog",
+] as const;
+
+/** A version the route accepts: a release or a local test build (`-AA`). */
+export const RELEASE_HEALTH_VERSION_PATTERN = /^\d+\.\d+\.\d+(-[A-Z]{1,2})?$/;
+
+/**
+ * Matt's M5 ruling (2026-11-07) and the uptime floor. An error-minute rise in a
+ * source class needs a rate above `riseFactor` times the baseline's AND at
+ * least `minExcessErrorMinutes` more error-minutes over the candidate's uptime;
+ * unclean restarts or flood events per day above the baseline's are a rise with
+ * no factor or excess. Either side under `minUptimeHours` is
+ * `insufficient-data`.
+ */
+export const RELEASE_HEALTH_THRESHOLDS = {
+  minUptimeHours: 24,
+  riseFactor: 1.5,
+  minExcessErrorMinutes: 10,
+} as const;
+export type ReleaseHealthThresholds = {
+  minUptimeHours: number;
+  riseFactor: number;
+  minExcessErrorMinutes: number;
+};
+
+/**
+ * Default and maximum look-back (whole days). The maximum is `error_logs`'s
+ * retention (`ERROR_LOG_RETENTION_DAYS`, 30), not the segments' 35 days: past
+ * it a version's uptime would count while its error rows were already deleted,
+ * which would understate an old baseline's rate. A server test pins the two.
+ */
+export const RELEASE_HEALTH_DEFAULT_SINCE_DAYS = 30;
+export const RELEASE_HEALTH_MAX_SINCE_DAYS = 30;
+
+export const RELEASE_HEALTH_VERDICTS = [
+  "rise",
+  "no-rise",
+  "insufficient-data",
+] as const;
+export type ReleaseHealthVerdict = (typeof RELEASE_HEALTH_VERDICTS)[number];
+
+const ReleaseHealthByClassSchema = z
+  .object({ server: z.number(), cli: z.number(), client: z.number() })
+  .passthrough();
+
+/** One app version's health on this node over the window. */
+export const ReleaseHealthVersionSchema = z
+  .object({
+    version: z.string(),
+    /** This server process is running the version now. */
+    live: z.boolean(),
+    segments: z.number(),
+    /** Start of its earliest recorded segment (epoch ms). */
+    firstStartedMs: z.number(),
+    lastSeenMs: z.number(),
+    uptimeHours: z.number(),
+    /** Segments of this version left open and followed by the same version. */
+    uncleanRestarts: z.number(),
+    uncleanRestartsPerDay: z.number(),
+    /** Rate-limit summary rows among its counted `error`/`fatal` rows. */
+    floodEvents: z.number(),
+    floodEventsPerDay: z.number(),
+    /** Distinct minutes holding at least one counted row, per source class. */
+    errorMinutes: ReleaseHealthByClassSchema,
+    errorMinutesPerHour: ReleaseHealthByClassSchema,
+  })
+  .passthrough();
+export type ReleaseHealthVersion = z.infer<typeof ReleaseHealthVersionSchema>;
+
+/** The candidate-vs-baseline verdict (#6173 R3). */
+export const ReleaseHealthComparisonSchema = z
+  .object({
+    candidate: z.string(),
+    baseline: z.string(),
+    verdict: z.enum(RELEASE_HEALTH_VERDICTS),
+    /** Which side is under the uptime floor, when the verdict is insufficient-data. */
+    insufficient: z.enum(["candidate", "baseline", "both"]).nullable(),
+    reasons: z.array(z.string()),
+  })
+  .passthrough();
+export type ReleaseHealthComparison = z.infer<
+  typeof ReleaseHealthComparisonSchema
+>;
+
+/** `GET /api/telemetry/throughput/release-health` (#6173 R2, R3). */
+export const ThroughputReleaseHealthResponseSchema = z
+  .object({
+    generatedAtMs: z.number(),
+    sinceMs: z.number(),
+    /** The version this server is running. */
+    nodeVersion: z.string(),
+    versions: z.array(ReleaseHealthVersionSchema),
+    /** Counted error-minutes that fall in no recorded segment. */
+    unattributedErrorMinutes: z.number(),
+    thresholds: z
+      .object({
+        minUptimeHours: z.number(),
+        riseFactor: z.number(),
+        minExcessErrorMinutes: z.number(),
+      })
+      .passthrough(),
+    comparison: ReleaseHealthComparisonSchema.nullable(),
+  })
+  .passthrough();
+export type ThroughputReleaseHealthResponse = z.infer<
+  typeof ThroughputReleaseHealthResponseSchema
+>;
 
 // ───────────────────────────── pure helpers ─────────────────────────────
 

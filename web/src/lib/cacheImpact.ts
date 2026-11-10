@@ -23,6 +23,8 @@ export type EditableField =
   | "effort"
   | "permissionMode"
   | "mcp"
+  /** Issue #6171: a set session's MCP set — read at start, so a relaunch. */
+  | "mcpSet"
   | "launcher"
   | "safeMode"
   | "outputStyle"
@@ -42,6 +44,7 @@ const CACHE_BUSTING: Record<EditableField, boolean> = {
   modelMode: true,
   rawModel: true,
   mcp: true,
+  mcpSet: true,
   outputStyle: true,
   permissionMode: true,
   launcher: true,
@@ -59,6 +62,7 @@ const CACHE_BUSTING: Record<EditableField, boolean> = {
  * context cache on the first post-relaunch turn.
  */
 const FORCES_RELAUNCH: ReadonlySet<EditableField> = new Set<EditableField>([
+  "mcpSet",
   "launcher",
   "safeMode",
   "outputStyle",

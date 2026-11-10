@@ -19,6 +19,7 @@ import { usePdfThumbnail } from "@/hooks/usePdfThumbnail";
 import { getFileCategory } from "@/lib/file-types";
 import { messagePreview } from "@/chat/messagePreview";
 import { CompactChevron } from "@/components/AssistantChat/messages/CompactChevron";
+import { PinAnswersMessage } from "@/components/AssistantChat/messages/PinAnswersMessage";
 import { BookmarkGutter } from "@/components/AssistantChat/messages/BookmarkGutter";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -399,11 +400,13 @@ export function HappyUserMessage() {
               <div className="flex items-end gap-2">
                 <div className="flex-1 min-w-0">
                   {marker ? <UserMarkerChip marker={marker} /> : null}
-                  <LazyRainbowText
-                    text={displayText}
-                    remarkPlugins={USER_MARKDOWN_PLUGINS}
-                    className="[&>p+p]:mt-3"
-                  />
+                  <PinAnswersMessage text={displayText}>
+                    <LazyRainbowText
+                      text={displayText}
+                      remarkPlugins={USER_MARKDOWN_PLUGINS}
+                      className="[&>p+p]:mt-3"
+                    />
+                  </PinAnswersMessage>
                 </div>
                 {status ? (
                   <div className="shrink-0 self-end pb-0.5">

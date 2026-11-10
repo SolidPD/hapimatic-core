@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useEffect, useRef, useCallback } from "react";
+import { recordScrollWrite } from "@/lib/scrollCauseRecorder";
 
 /**
  * Check if an element is a text input where iOS selection handles need to work.
@@ -93,10 +94,22 @@ export function usePreventRubberBand(
         // Nudge away from top boundary
         if (scrollTop === 0) {
           scrollEl.scrollTop = 1;
+          recordScrollWrite(
+            "rubber-band-nudge",
+            scrollEl,
+            scrollTop,
+            scrollEl.scrollTop
+          );
         }
         // Nudge away from bottom boundary
         else if (scrollTop >= scrollHeight - clientHeight) {
           scrollEl.scrollTop = scrollHeight - clientHeight - 1;
+          recordScrollWrite(
+            "rubber-band-nudge",
+            scrollEl,
+            scrollTop,
+            scrollEl.scrollTop
+          );
         }
       }
     };

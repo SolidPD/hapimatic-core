@@ -14,6 +14,7 @@ import { extensions as builtinCliExtensions } from "@/extensions.generated";
 import { resolveCommand } from "./registry";
 import { apiKeyHelperCommand } from "./apiKeyHelper";
 import { securityCommand } from "./security";
+import { hookForwarderCommand } from "./hookForwarder";
 
 /**
  * Commands that dispatch BEFORE any CLI extension loads, so an extension's loader output
@@ -21,11 +22,14 @@ import { securityCommand } from "./security";
  * - `api-key-helper` (#4568 IR1): Claude Code uses its whole stdout as the API key.
  * - `security` (#4886 N2): the audit's `--json` report must parse, and an extension the
  *   audit may report as blocked must not have run inside the audit (or replaced the verb).
- * Both are built-in commands and need no extension.
+ * - `hook-forwarder` (#6455): Claude Code reads a Stop hook's stdout as its decision and
+ *   adds a `UserPromptSubmit` or `SessionStart` hook's stdout to the agent's context.
+ * All are built-in commands and need no extension.
  */
 const PRE_EXTENSION_COMMANDS = new Set([
   apiKeyHelperCommand.name,
   securityCommand.name,
+  hookForwarderCommand.name,
 ]);
 
 export async function runCli(): Promise<void> {
@@ -57,8 +61,8 @@ export async function runCli(): Promise<void> {
   // for extensions declaring a `cli` entry point and concatenate them AFTER the
   // build-time builtins (R6). Default OFF → fsCliEntries is [] and this call is
   // byte-identical to before. ⚠️ This runs on every `hapi` invocation except
-  // -v/--version and PRE_EXTENSION_COMMANDS, which return earlier (incl. the
-  // short-lived per-hook-event `hook-forwarder` subprocess), so the scan cost is
+  // -v/--version and PRE_EXTENSION_COMMANDS (which include the short-lived
+  // per-hook-event `hook-forwarder` subprocess, #6455), so the scan cost is
   // paid per process — acceptable because it is opt-in and only fires when the
   // operator has enabled filesystem extensions.
   const fsExtensionsEnabled = ["true", "1", "yes"].includes(

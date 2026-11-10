@@ -16,6 +16,7 @@ import {
 import { SyntaxHighlighter } from "@/components/assistant-ui/shiki-highlighter";
 import { CopyButton } from "@/components/ui/CopyButton";
 import { QUICK_REPLIES_COMPONENTS_BY_LANGUAGE } from "@/components/AssistantChat/messages/QuickReplies";
+import { pinComponentsByLanguage } from "@/components/AssistantChat/messages/PinChatShims";
 import {
   STAGE_REPORT_COMPONENTS_BY_LANGUAGE,
   STAGE_REPORT_TABLE_CLASS,
@@ -35,6 +36,9 @@ export const MARKDOWN_PLUGINS = [remarkGfm, remarkGemoji];
 export const MARKDOWN_COMPONENTS_BY_LANGUAGE = {
   ...QUICK_REPLIES_COMPONENTS_BY_LANGUAGE,
   ...STAGE_REPORT_COMPONENTS_BY_LANGUAGE,
+  // #6450: a `hapi_pin` fence renders its pin's live card; with Pins off it
+  // stays an ordinary code block, header and Copy included.
+  ...pinComponentsByLanguage(CodeHeader),
 } as const;
 
 /**

@@ -57,3 +57,17 @@ export function applyThreadFade(el: HTMLElement, fade: ThreadFade): void {
   el.style.setProperty(THREAD_FADE_TOP_VAR, `${fade.top}px`);
   el.style.setProperty(THREAD_FADE_BOTTOM_VAR, `${fade.bottom}px`);
 }
+
+/**
+ * #6449: the View Picker's Pins row scrolls sideways and reuses the same math
+ * (it is axis-agnostic: pass `scrollLeft` / `scrollWidth` / `clientWidth` as
+ * `scrollTop` / `scrollHeight` / `clientHeight`). `top` becomes the left edge
+ * and `bottom` the right edge of the `.tab-row-fade` mask in `index.css`.
+ */
+export const TAB_ROW_FADE_LEFT_VAR = "--tab-row-fade-left";
+export const TAB_ROW_FADE_RIGHT_VAR = "--tab-row-fade-right";
+
+export function applyTabRowFade(el: HTMLElement, fade: ThreadFade): void {
+  el.style.setProperty(TAB_ROW_FADE_LEFT_VAR, `${fade.top}px`);
+  el.style.setProperty(TAB_ROW_FADE_RIGHT_VAR, `${fade.bottom}px`);
+}

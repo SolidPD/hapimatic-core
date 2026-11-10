@@ -65,7 +65,19 @@ export interface Availability {
   minVersion?: string;
   /** Node-local mount fact. Stays INSIDE `availability` (where #3744 R3 and #3746 R6 read it); #3749 owns the mount-aware evaluator branch (OR-4). */
   mountedWhen?: string;
+  /**
+   * The per-instance gate (the #5571 class) a non-REST entry sits behind (#6448).
+   * A gated entry is Tier-1 only: never in Tier-0 or a self-knowledge doc, which
+   * render from the static index without knowing any instance's gate, and in the
+   * served catalog only where that gate is open. REST routes do not use it: a
+   * closed gate's routes are already dropped by `CLOSED_GATE_TAG`.
+   */
+  gate?: CatalogGate;
 }
+
+/** The instance gates an `availability.gate` may name (#6448). */
+export const CATALOG_GATES = ["pins"] as const;
+export type CatalogGate = (typeof CATALOG_GATES)[number];
 
 /**
  * A single capability catalog entry. Field list is R1's exact set. `probe`,

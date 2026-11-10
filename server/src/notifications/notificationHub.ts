@@ -5,9 +5,8 @@ import type {
   NotificationHubOptions,
 } from "./notificationTypes";
 import type { ErrorLogger } from "../logging/errorLogger";
+import { isQuestionToolName } from "@hapi/protocol";
 import { extractMessageEventType } from "./eventParsing";
-
-const QUESTION_TOOL_NAMES = new Set(["AskUserQuestion", "ask_user_question"]);
 
 export class NotificationHub {
   private readonly channels: NotificationChannel[];
@@ -165,7 +164,7 @@ export class NotificationHub {
     for (const [requestId, request] of Object.entries(requests)) {
       if (request && typeof request === "object" && "tool" in request) {
         const toolName = (request as { tool?: string }).tool;
-        if (toolName && QUESTION_TOOL_NAMES.has(toolName)) {
+        if (toolName && isQuestionToolName(toolName)) {
           questionRequestIds.add(requestId);
         } else {
           permissionRequestIds.add(requestId);
@@ -235,10 +234,12 @@ export class NotificationHub {
     }
 
     // Extract question summary from the request if available
+    // #6455: the CLI stores a request's input as `arguments` (agentState schema);
+    // this read named `args`, so every question notification lost its text.
     const request = requests[newQuestionId] as
-      | { args?: { questions?: Array<{ question?: string }> } }
+      | { arguments?: { questions?: Array<{ question?: string }> } }
       | undefined;
-    const questionSummary = request?.args?.questions?.[0]?.question || "";
+    const questionSummary = request?.arguments?.questions?.[0]?.question || "";
 
     const existingTimer = this.questionDebounce.get(session.id);
     if (existingTimer) {

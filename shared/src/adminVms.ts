@@ -536,6 +536,16 @@ export const HEALTH_CHECKS = [
   "gateway-mapping",
   "hostkey-pin",
   "backup",
+  // #6246: the whole-home set. The newest object of any set keeps `backup`
+  // green, so this row reads the home object alone.
+  "backup-home",
+  // #6246 BD1: the git set (repositories with a network remote are in no
+  // other set), and the newest full each chained set's dailies restore from.
+  "backup-git",
+  "backup-full",
+  // #6246 N1: a run that could not confirm a chain's base kept the chain and
+  // said so in <vm>/base-check/<date>.json.
+  "backup-base",
   "backup-markers",
   "vm-parity",
   "account-mappings",

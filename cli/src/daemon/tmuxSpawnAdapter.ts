@@ -119,6 +119,9 @@ export interface TmuxSpawnOptions {
    *  every launcher delivers) and a model/account-switch respawn preserves it. */
   outputStyle?: string;
 
+  /** Issue #6171: the encoded `--hapi-mcp-set` JSON (`encodeMcpSetLaunchArg`). */
+  mcpSetArg?: string;
+
   /** OAuth token for authentication */
   token?: string;
 
@@ -956,6 +959,7 @@ export async function spawnSessionInTmux(
     rawModel,
     sessionRole,
     outputStyle,
+    mcpSetArg,
     token,
     model,
     codexHome,
@@ -1154,6 +1158,7 @@ export async function spawnSessionInTmux(
           rawModel,
           sessionRole,
           outputStyle,
+          mcpSetArg,
           projectDir,
           directory,
           resumeSessionId,
@@ -3248,6 +3253,8 @@ export interface BuildCommandOptions {
   rawModel?: string;
   sessionRole?: string;
   outputStyle?: string;
+  /** Issue #6171: see TmuxSpawnOptions.mcpSetArg. */
+  mcpSetArg?: string;
   projectDir: string;
   directory: string;
   resumeSessionId?: string;
@@ -3333,6 +3340,12 @@ export function buildClaudeCommand(options: BuildCommandOptions): string[] {
     // Issue #2626 security: escaped — this arg is `.join(" ")`-ed into a shell
     // string and run via bash, so an unescaped value would inject shell commands.
     args.push("--hapi-output-style", escapeShellArg(options.outputStyle));
+  }
+
+  // Issue #6171: the MCP set. Escaped — names hold spaces, colons and quotes, and
+  // this arg is `.join(" ")`-ed into a shell string run by bash.
+  if (options.mcpSetArg) {
+    args.push("--hapi-mcp-set", escapeShellArg(options.mcpSetArg));
   }
 
   // Resume existing session

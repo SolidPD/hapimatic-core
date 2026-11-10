@@ -31,10 +31,19 @@ import {
   type OrchestrationToolSpec,
   type TypedCallRequest,
 } from "./hapiOrchestrationTools";
+import { createPinTools, PIN_TOOL_SPECS } from "./hapiPinTools";
 
 // Constants for image fetching
 const IMAGE_FETCH_TIMEOUT_MS = 10000; // 10 seconds
 const IMAGE_MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+/**
+ * Budget for each gate probe run before `mcp.connect` (#6448): the operator
+ * catalog probe and the Pins gate read. `/api/version` answers in a few
+ * milliseconds locally, so this only covers a stalled server, which would
+ * otherwise stall session start.
+ */
+const GATE_PROBE_TIMEOUT_MS = 2000;
 
 /**
  * Check if a URL points to a private/internal IP address
@@ -187,11 +196,23 @@ async function fetchImageAsBase64(url: string): Promise<
 //
 
 /** Minimal `fetch` signature — lets tests inject a fake without a global mock
- *  (the CLI no-mocking / dependency-injection convention, cli/CLAUDE.md). */
-type FetchLike = (
+ *  (the CLI no-mocking / dependency-injection convention, cli/CLAUDE.md).
+ *  `signal` and `headers` are optional so a fake may omit them; a real
+ *  `fetch` and `Response` satisfy both (#6448's pin tools use them). */
+export type FetchLike = (
   url: string,
-  init?: { method?: string; headers?: Record<string, string>; body?: string }
-) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
+  init?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+  }
+) => Promise<{
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+  headers?: { get(name: string): string | null };
+}>;
 
 /** The MCP tool result shape shared by both capability tools. */
 type CapabilityToolResult = {
@@ -300,7 +321,7 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
   let cachedJwt: string | null = null;
   let jwtExpiresAtMs = 0;
 
-  async function authenticate(): Promise<string> {
+  async function authenticate(signal?: AbortSignal): Promise<string> {
     const token = deps.getCliApiToken();
     if (!token) {
       throw new Error(
@@ -311,6 +332,7 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ accessToken: token }),
+      ...(signal ? { signal } : {}),
     });
     if (!resp.ok) {
       throw new Error(`Auth exchange failed: HTTP ${resp.status}`);
@@ -324,9 +346,9 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
     return cachedJwt;
   }
 
-  async function getJwt(): Promise<string> {
+  async function getJwt(signal?: AbortSignal): Promise<string> {
     if (cachedJwt && Date.now() < jwtExpiresAtMs) return cachedJwt;
-    return authenticate();
+    return authenticate(signal);
   }
 
   /**
@@ -339,9 +361,14 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
    */
   async function authedFetch(
     path: string,
-    init?: { method?: string; body?: string; headers?: Record<string, string> }
+    init?: {
+      method?: string;
+      body?: string;
+      headers?: Record<string, string>;
+      signal?: AbortSignal;
+    }
   ) {
-    const jwt = await getJwt();
+    const jwt = await getJwt(init?.signal);
     // Drop any caller key that differs only in case from `Authorization`: fetch
     // merges header names case-insensitively, so a lower-case duplicate would be
     // joined into the bearer value instead of replaced (PR #5615 review).
@@ -355,11 +382,16 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
       ...extra,
       Authorization: `Bearer ${jwt}`,
     };
-    const request = { method: init?.method, body: init?.body, headers };
+    const request = {
+      method: init?.method,
+      body: init?.body,
+      headers,
+      ...(init?.signal ? { signal: init.signal } : {}),
+    };
     let resp = await doFetch(`${base}${path}`, request);
     if (resp.status === 401) {
       cachedJwt = null;
-      headers.Authorization = `Bearer ${await authenticate()}`;
+      headers.Authorization = `Bearer ${await authenticate(init?.signal)}`;
       resp = await doFetch(`${base}${path}`, request);
     }
     return resp;
@@ -554,8 +586,11 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
         surface: "mcp",
         sessionId: deps.selfSessionId,
       });
+      // #6448: one budget for the auth exchange and the catalog read, because
+      // this runs before `mcp.connect` and a stalled server stalled session start.
       const resp = await authedFetch(
-        `/api/capabilities/catalog?${params.toString()}`
+        `/api/capabilities/catalog?${params.toString()}`,
+        { signal: AbortSignal.timeout(GATE_PROBE_TIMEOUT_MS) }
       );
       if (!resp.ok) return false;
       const body = (await resp.json()) as { mcp?: unknown };
@@ -565,7 +600,35 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
           e => !!e && typeof e === "object" && (e as { id?: unknown }).id === id
         )
       );
-    } catch {
+    } catch (err) {
+      // #6448: with a budget, a slow server now drops the operator tool for the
+      // whole session, so say why.
+      logger.debug(`[hapiMCP] Operator catalog probe for ${id} failed:`, err);
+      return false;
+    }
+  }
+
+  /**
+   * Whether this session's server has the Pins gate open (#6448): its
+   * unauthenticated `/api/version` answers `pinsEnabled: true` only then. The
+   * session process cannot read the server's environment, and this is the read
+   * Sub-Issue A's contract names. Fails closed: any error, non-2xx status, odd
+   * body or timeout answers `false`. A failed request or a non-2xx status writes
+   * one debug line; a body without `pinsEnabled: true` is a closed gate.
+   */
+  async function pinsGateOpen(): Promise<boolean> {
+    try {
+      const resp = await doFetch(`${base}/api/version`, {
+        signal: AbortSignal.timeout(GATE_PROBE_TIMEOUT_MS),
+      });
+      if (!resp.ok) {
+        logger.debug(`[hapiMCP] Pins gate probe: HTTP ${resp.status}`);
+        return false;
+      }
+      const body = (await resp.json()) as { pinsEnabled?: unknown };
+      return body?.pinsEnabled === true;
+    } catch (err) {
+      logger.debug("[hapiMCP] Pins gate probe failed:", err);
       return false;
     }
   }
@@ -647,6 +710,7 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
     typedCall,
     postDirect,
     listsMcpEntry,
+    pinsGateOpen,
   };
 }
 
@@ -699,10 +763,28 @@ export const HAPY_MCP_TOOL_NAMES = [
  */
 export const HAPY_MCP_OPERATOR_TOOL_NAMES = ["remove_worktree"] as const;
 
+/**
+ * The pin tools (issue #6448), registered only while the session's server
+ * reports the Pins gate open. Kept out of {@link HAPY_MCP_TOOL_NAMES}, the
+ * always-on surface the stdio bridge declares; at runtime the bridge proxies
+ * whatever is registered, these included. Their catalog entries carry
+ * `gate: "pins"`, so Tier-0 and the self-knowledge docs never list them.
+ */
+export const HAPY_MCP_PIN_TOOL_NAMES = [
+  "pin_post",
+  "pin_update",
+  "pin_withdraw",
+  "pin_get",
+  "pin_resolve",
+  // #6453: where a pin's files go.
+  "pin_folder",
+] as const;
+
 /** One of the tool names `startHappyServer` registers (issue #3744, R2). */
 export type HapyMcpToolName =
   | (typeof HAPY_MCP_TOOL_NAMES)[number]
-  | (typeof HAPY_MCP_OPERATOR_TOOL_NAMES)[number];
+  | (typeof HAPY_MCP_OPERATOR_TOOL_NAMES)[number]
+  | (typeof HAPY_MCP_PIN_TOOL_NAMES)[number];
 
 /**
  * The registered tools a launcher may put in `allowedTools` (#4450 D2 = A):
@@ -975,12 +1057,13 @@ export async function startHappyServer(
   // `createCapabilityTools` above for the auth + single-enforcement contract.
   //
 
-  const capabilityTools = createCapabilityTools({
+  const capabilityDeps: CapabilityToolDeps = {
     selfSessionId: client.sessionId,
     serverUrl: configuration.serverUrl,
     getCliApiToken: () => configuration.cliApiToken,
     ...options.capabilityDeps,
-  });
+  };
+  const capabilityTools = createCapabilityTools(capabilityDeps);
 
   const hapiCapabilitiesInputSchema: z.ZodTypeAny = z.object({
     sessionId: z
@@ -1179,16 +1262,25 @@ export async function startHappyServer(
   }
 
   //
-  // Operator tools (issue #4450). Registered BEFORE `mcp.connect` (no reliance on
-  // `tools/list_changed`), and only when the launcher asks for them AND this
+  // Gated tools, registered BEFORE `mcp.connect` (no reliance on
+  // `tools/list_changed`), so they are in the first `tools/list`. Both probes
+  // start together and neither rejects; each has GATE_PROBE_TIMEOUT_MS, so a
+  // stalled server delays session start by at most that.
+  //
+  const [operatorListed, pinsEnabled] = await Promise.all([
+    options.operatorTools === true
+      ? capabilityTools.listsMcpEntry("mcp.remove-worktree")
+      : Promise.resolve(false),
+    capabilityTools.pinsGateOpen(),
+  ]);
+
+  //
+  // Operator tools (issue #4450): only when the launcher asks for them AND this
   // session's catalog lists the entry — the server lists an operator entry only
   // for a caller that derives operator scope, so a user host or a customer VM
   // never sees the tool. The route re-checks the scope on every call.
   //
-  if (
-    options.operatorTools === true &&
-    (await capabilityTools.listsMcpEntry("mcp.remove-worktree"))
-  ) {
+  if (operatorListed) {
     registerHapyTool(
       "remove_worktree",
       {
@@ -1202,6 +1294,54 @@ export async function startHappyServer(
           removeWorktreeTool,
           capabilityTools.postDirect
         )
+    );
+  }
+
+  //
+  // Pin tools (issue #6448): only while the server reports the Pins gate open.
+  // The gate is read once, here: a change reaches a session at its next start. A
+  // running session keeps its tools, and after the gate closes their calls get
+  // `pins_unavailable`. Each registration stays a literal call because
+  // `mcpTools.test.ts` scans this file's source for them.
+  //
+  if (pinsEnabled) {
+    const pinTools = createPinTools(capabilityDeps);
+    const pinConfig = (
+      spec: (typeof PIN_TOOL_SPECS)[keyof typeof PIN_TOOL_SPECS]
+    ) => ({
+      description: spec.description,
+      title: spec.title,
+      inputSchema: spec.inputSchema as z.ZodTypeAny,
+    });
+    registerHapyTool(
+      "pin_post",
+      pinConfig(PIN_TOOL_SPECS.pin_post),
+      (args: unknown) => pinTools.post(args)
+    );
+    registerHapyTool(
+      "pin_update",
+      pinConfig(PIN_TOOL_SPECS.pin_update),
+      (args: unknown) => pinTools.update(args)
+    );
+    registerHapyTool(
+      "pin_withdraw",
+      pinConfig(PIN_TOOL_SPECS.pin_withdraw),
+      (args: unknown) => pinTools.withdraw(args)
+    );
+    registerHapyTool(
+      "pin_get",
+      pinConfig(PIN_TOOL_SPECS.pin_get),
+      (args: unknown) => pinTools.get(args)
+    );
+    registerHapyTool(
+      "pin_resolve",
+      pinConfig(PIN_TOOL_SPECS.pin_resolve),
+      (args: unknown) => pinTools.resolve(args)
+    );
+    registerHapyTool(
+      "pin_folder",
+      pinConfig(PIN_TOOL_SPECS.pin_folder),
+      (args: unknown) => pinTools.folder(args)
     );
   }
 
@@ -1239,6 +1379,9 @@ export async function startHappyServer(
     // The ACTUAL registered set (#3744 R2) — driven by the same `registerHapyTool`
     // calls above, so it can never diverge from what the MCP server exposes.
     toolNames: [...registeredToolNames],
+    // #6448: whether the server reported the Pins gate open at start, so tests
+    // and #6458 can read the decision.
+    pinsEnabled,
     stop: () => {
       logger.debug("[hapiMCP] Stopping server");
       mcp.close();

@@ -2,6 +2,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { McpStatusUpdateSchema, MetadataSchema } from "@hapi/protocol/schemas";
+import { registerCliMcpCostsRoute } from "./cliMcpCosts";
 import {
   sessionNameSchema,
   defineCapability,
@@ -887,6 +888,9 @@ export function createCliRoutes(
       return c.json({ ok: true });
     }
   );
+
+  // Issue #6171: MCP cost reports for the New Session picker.
+  registerCliMcpCostsRoute(app, store);
 
   if (store) {
     const errorReportsLimiter = createRateLimiter({

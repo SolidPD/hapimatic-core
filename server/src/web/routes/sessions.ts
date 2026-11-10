@@ -5,6 +5,7 @@ import {
   getPermissionModesForFlavor,
   isModelModeAllowedForFlavor,
   isPermissionModeAllowedForFlavor,
+  mcpLiveToggleRefusal,
   toSessionSummary,
   type SessionSummary,
 } from "@hapi/protocol";
@@ -26,7 +27,12 @@ import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
-import { refuseAgentArchive } from "./agentEscalation";
+import { floorAgentMcpEnable, refuseAgentArchive } from "./agentEscalation";
+import {
+  archiveResponseBody,
+  peerArchiveOpenPinCount,
+  readPeerArchiveBody,
+} from "./pinRouteHelpers";
 import {
   logAndJson,
   proxyTransportFailure,
@@ -74,6 +80,7 @@ import {
 } from "../../accounts/accountHeadroom";
 import type { SpawnWarning } from "@hapi/protocol";
 import type { ErrorLogger } from "../../logging/errorLogger";
+import { resolvePinsEnabled } from "../../config/pinsConfig";
 import { scanSlashCommandsFromFilesystem } from "../../utils/slashCommands";
 import {
   recordSessionsLatency,
@@ -173,6 +180,8 @@ function computeSessions(
   const allSessions = engine.getSessionsByNamespace(namespace);
   const messageCounts = engine.getMessageCountsByNamespace(namespace);
   const branchCounts = engine.getChildBranchCounts(namespace);
+  // #6447: absent, not zero, while the Pins gate is closed.
+  const pinCounts = resolvePinsEnabled() ? engine.getOpenPinCounts() : null;
 
   const real = allSessions
     .sort((a, b) => {
@@ -196,7 +205,8 @@ function computeSessions(
         branchCounts.get(s.id),
         // #1804 (A2): resolve the linked-issue workflow badge server-side so the
         // Row-1 state badge rides the summary (no per-card client query).
-        engine.getSessionWorkflowBadge(s.id)
+        engine.getSessionWorkflowBadge(s.id),
+        pinCounts ? (pinCounts.get(s.id) ?? 0) : undefined
       )
     );
 
@@ -400,7 +410,10 @@ export function createSessionsRoutes(
                 const body = (await resp.json()) as {
                   session?: Record<string, unknown>;
                   messageCount?: number;
+                  openPinCount?: number;
                 };
+                // #6447 (R15): a closed hub does not serve a peer's count.
+                if (!resolvePinsEnabled()) delete body.openPinCount;
                 // Enrich with the owning node's identity so the web client's
                 // instance view shows the correct nodeLabel. Without this, the
                 // remote node's /federation/sessions/:id returns a raw Session
@@ -471,6 +484,7 @@ export function createSessionsRoutes(
                 promptDraft: remote.metadata?.promptDraft ?? undefined,
               },
               messageCount: remote.messageCount ?? 0,
+              openPinCount: remote.openPinCount,
             });
           }
         }
@@ -480,7 +494,13 @@ export function createSessionsRoutes(
       const messageCount = engine.getMessageCountForSession(
         sessionResult.sessionId
       );
-      return c.json({ session: sessionResult.session, messageCount });
+      return c.json({
+        session: sessionResult.session,
+        messageCount,
+        ...(resolvePinsEnabled()
+          ? { openPinCount: engine.getOpenPinCount(sessionResult.sessionId) }
+          : {}),
+      });
     }
   );
 
@@ -616,7 +636,14 @@ export function createSessionsRoutes(
           reapRemoteWindow: true,
           preserveForReconnect: true,
         });
-        return c.json({ ok: true });
+        // #6454: the open pins the session asked, answerable after the archive.
+        return c.json(
+          archiveResponseBody(
+            engine.pins,
+            sessionResult.sessionId,
+            resolvePinsEnabled()
+          )
+        );
       }
 
       // Federation fallback: proxy archive to the remote node
@@ -652,7 +679,16 @@ export function createSessionsRoutes(
             // client queries see the session as inactive without waiting
             // for the next poll cycle.
             registry.markSessionInactive(sessionId);
-            return c.json({ ok: true });
+            // #6454: relay the peer's open-pin count, unless this hub's Pins
+            // gate is closed (the list projection drops it then too).
+            const openPinCount = resolvePinsEnabled()
+              ? peerArchiveOpenPinCount(await readPeerArchiveBody(resp))
+              : undefined;
+            return c.json(
+              openPinCount !== undefined
+                ? { ok: true, openPinCount }
+                : { ok: true }
+            );
           }
           // #5433: a cut body is a logged 502 (readProxyBodyOr502).
           const read = await readProxyBodyOr502(c, resp, {
@@ -1017,7 +1053,10 @@ export function createSessionsRoutes(
       if (result.code === "session_not_found") {
         return c.json(result, 404);
       }
-      if (result.code === "invalid_request") {
+      if (
+        result.code === "invalid_request" ||
+        result.code === "hapi_protected"
+      ) {
         return c.json(result, 400);
       }
       return c.json(result, 409);
@@ -1557,6 +1596,21 @@ export function createSessionsRoutes(
         );
       }
 
+      // Issue #6171: refused before anything is queued or staged. A remote
+      // session is checked by its own node's receiver.
+      const refusal = localSession
+        ? mcpLiveToggleRefusal(
+            localSession.metadata?.mcpSet,
+            parsed.data.desired
+          )
+        : null;
+      if (refusal) {
+        return c.json(
+          { ok: false, error: refusal.message, code: refusal.code },
+          refusal.code === "hapi_protected" ? 400 : 409
+        );
+      }
+
       const service = options?.getSessionService?.();
       if (!service) {
         return c.json(
@@ -1579,9 +1633,15 @@ export function createSessionsRoutes(
           404
         );
       }
+      // #6171 delta review DS-2: a peer's refusal (409
+      // mcp_set_requires_relaunch, 400 hapi_protected) keeps its code.
       return c.json(
-        { ok: false, error: result.message, code: "transport_failed" },
-        result.status as 400 | 500 | 502 | 503
+        {
+          ok: false,
+          error: result.message,
+          code: result.code ?? "transport_failed",
+        },
+        result.status as 400 | 409 | 500 | 502 | 503
       );
     }
   );
@@ -2048,9 +2108,9 @@ export function createSessionsRoutes(
         domain: "session-lifecycle",
         surface: "rest",
         description:
-          "Relaunch an active session with new spawn-frozen params (launcher, safe mode) via teardown and resume respawn.",
+          "Relaunch an active session with new spawn-frozen params (launcher, safe mode, MCP set) via teardown and resume respawn, or save a new MCP set on a stopped session.",
         whenToUse:
-          "When the user changes a session's launcher or safe-mode setting.",
+          "When the user changes a session's launcher, safe-mode setting or MCP servers.",
         invocation: {
           kind: "rest",
           method: "POST",
@@ -2086,6 +2146,11 @@ export function createSessionsRoutes(
         );
       }
 
+      // Issue #6171: a set's `enableForProject` writes the project's config, so a
+      // non-bypass agent caller may not send it (narrowing stays allowed).
+      const mcpFloor = floorAgentMcpEnable(c, engine, parsed.data.mcpSet);
+      if (mcpFloor) return mcpFloor;
+
       const service = options?.getSessionService?.();
       if (!service) {
         return c.json(
@@ -2105,7 +2170,12 @@ export function createSessionsRoutes(
         );
       }
       return c.json(
-        { error: result.message, code: result.code },
+        {
+          error: result.message,
+          code: result.code,
+          // Issue #6171: the servers a project-disabled refusal names.
+          ...(result.servers ? { servers: result.servers } : {}),
+        },
         result.status as 400 | 404 | 409 | 500 | 502 | 503
       );
     }
@@ -2567,7 +2637,7 @@ export function createSessionsRoutes(
         domain: "session-lifecycle",
         surface: "rest",
         description:
-          "Persist a session's selected view (chat, terminal, desktop, or files) so it syncs across devices.",
+          "Persist a session's selected view (chat, pins, terminal, desktop, or files) so it syncs across devices.",
         whenToUse: "When the user switches a session's view pane.",
         invocation: {
           kind: "rest",

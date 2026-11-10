@@ -192,3 +192,58 @@ function parsePrices(raw: string): RateCardPrices | null {
     return null;
   }
 }
+
+/**
+ * Issue #6169: what a kept-warm reopening saved, as an estimate: rewriting its
+ * `warmCr` cache-read tokens at the 1-hour write rate, less reading them.
+ */
+export function avoidedRewriteUsd(
+  pricer: ThroughputPricer,
+  model: string | null,
+  atMs: number,
+  warmCr: number
+): number {
+  if (warmCr <= 0) return 0;
+  const zero = { in: 0, out: 0, cr: 0, w1: 0, w5: 0, wu: 0 };
+  return (
+    pricer.price(model, atMs, { ...zero, w1: warmCr }).total -
+    pricer.price(model, atMs, { ...zero, cr: warmCr }).total
+  );
+}
+
+/**
+ * Issue #6169: a keep-alive ledger's attempts by outcome, and what the `sent`
+ * ones are estimated to have cost (each priced as its cache read, input and
+ * output at `atMs`). Shared by the summary route and the report CLI.
+ */
+export function keepaliveLedgerCost(
+  pricer: ThroughputPricer,
+  rows: ReadonlyArray<{
+    outcome: "sent" | "refused" | "failed";
+    model: string | null;
+    n: number;
+    crTokens: number;
+    inTokens: number;
+    outTokens: number;
+  }>,
+  atMs: number
+): {
+  byOutcome: { sent: number; refused: number; failed: number };
+  costUsd: number;
+} {
+  const byOutcome = { sent: 0, refused: 0, failed: 0 };
+  let costUsd = 0;
+  for (const r of rows) {
+    byOutcome[r.outcome] += r.n;
+    if (r.outcome !== "sent") continue;
+    costUsd += pricer.price(r.model, atMs, {
+      in: r.inTokens,
+      out: r.outTokens,
+      cr: r.crTokens,
+      w1: 0,
+      w5: 0,
+      wu: 0,
+    }).total;
+  }
+  return { byOutcome, costUsd };
+}

@@ -45,6 +45,7 @@ import {
   FederationSettingsBlockSchema,
   migrateChatDetailLevelToSections,
   OpenRouterFavoritesSchema,
+  PINS_VIEW_DEFAULT,
   SearchFilterPreferencesSchema,
   SHARE_API_KEYS_BY_DEFAULT_DEFAULT,
   TERMINAL_KEYBOARD_EXPANDED_DEFAULT,
@@ -1021,12 +1022,10 @@ export function createPreferencesRoutes(
   );
 
   // ── Federation-global settings 🌐 view + per-key patch (#2624, B) ───────
-  // The browser's JWT surface [expert-review 2026-08-05: 2624-1]: the fed-token
-  // receiver in routes/federation/settingsSync.ts is unreachable by the JWT.
-
-  // The per-key A-default fallbacks buildView needs (R5), hoisted so the GET and
-  // PUT cannot drift (#4548). A federation-native key (terminalKeyboardExpanded,
-  // shareApiKeysByDefault, accountsUsageView) falls back to its shared default.
+  // The browser's JWT surface (2624-1); peers use federation/settingsSync.ts.
+  // buildView's per-key A-default fallbacks (R5), hoisted so the GET and PUT
+  // cannot drift (#4548). A federation-native key (terminalKeyboardExpanded,
+  // shareApiKeysByDefault, accountsUsageView, pinsView) has a shared default.
   async function federationView(block: FederationSettingsBlock) {
     return buildView(block, {
       chatSections: await readChatSections(settingsFile),
@@ -1035,6 +1034,7 @@ export function createPreferencesRoutes(
       terminalKeyboardExpanded: TERMINAL_KEYBOARD_EXPANDED_DEFAULT,
       shareApiKeysByDefault: SHARE_API_KEYS_BY_DEFAULT_DEFAULT,
       accountsUsageView: ACCOUNTS_USAGE_VIEW_DEFAULT,
+      pinsView: PINS_VIEW_DEFAULT,
     });
   }
 

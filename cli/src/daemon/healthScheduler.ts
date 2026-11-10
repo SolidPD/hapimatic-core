@@ -35,6 +35,11 @@ import {
   reapOrphanMcpProcesses,
   type OrphanMcpDebounce,
 } from "./orphanMcpReaper";
+import {
+  MCP_COST_SAMPLE_EVERY_TICKS,
+  mcpServerCommands,
+  sampleMcpCosts,
+} from "./mcpCostSampler";
 import { sweepStaleSockets } from "./staleSocketSweep";
 import { sweepStaleEnvFiles } from "./staleEnvFileSweep";
 import { isTmuxPersistenceEnabled } from "./recoveryIntegration";
@@ -81,6 +86,11 @@ export function createHealthScheduler(
   );
   let mcpPollCounter = 0;
   let mcpPollInProgress = false;
+  // Issue #6171: the RAM sampler's inputs, held across maintenance ticks: the
+  // server list from the last global poll, a tick count and an in-flight guard.
+  let lastGlobalMcpServers: Array<{ name: string; url: string }> = [];
+  let mcpCostTick = 0;
+  let mcpCostSampleInProgress = false;
   // Issue #1069: default raised from 5 (5 min) to 30 (30 min) to reduce
   // stdio MCP server respawn churn. Combined with the two-phase polling
   // change below, this drops serena spawn rate from ~1500/day to ~50/day.
@@ -422,6 +432,31 @@ export function createHealthScheduler(
         });
       }
 
+      // Issue #6171: per-server MCP memory for the New Session picker, every
+      // MCP_COST_SAMPLE_EVERY_TICKS ticks. Fire-and-forget with an in-flight
+      // guard; its memory reads are async. Best-effort: a failure only leaves
+      // the picker's numbers older.
+      mcpCostTick += 1;
+      if (
+        mcpCostTick % MCP_COST_SAMPLE_EVERY_TICKS === 0 &&
+        !mcpCostSampleInProgress
+      ) {
+        mcpCostSampleInProgress = true;
+        void (async () => {
+          try {
+            const ram = await sampleMcpCosts({
+              ownHome: configuration.happyHomeDir,
+              servers: mcpServerCommands(lastGlobalMcpServers),
+            });
+            if (ram.length > 0) await api.updateMcpCosts({ ram });
+          } catch (error) {
+            logger.debug("[DAEMON RUN] MCP cost sample failed:", error);
+          } finally {
+            mcpCostSampleInProgress = false;
+          }
+        })();
+      }
+
       // Stale tmux socket cleanup (issue #849; rewritten for #4204 PR-1).
       // The sweep now lives in ./staleSocketSweep and probes each hapimatic-*
       // socket with a bounded async net.connect, unlinking ONLY on ECONNREFUSED
@@ -642,6 +677,8 @@ export function createHealthScheduler(
               try {
                 const status = await pollMcpStatus();
                 if (status) {
+                  // Issue #6171: the RAM sampler names processes from this list.
+                  lastGlobalMcpServers = status.servers;
                   await api.updateMcpStatus(status);
                 }
                 recordMcpPollSuccess(MCP_POLL_FAILURE_GLOBAL_KEY);

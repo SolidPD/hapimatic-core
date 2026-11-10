@@ -10,6 +10,11 @@ import type { Server } from "socket.io";
 import type { RpcRegistry } from "../socket/rpcRegistry";
 import type { CapabilityMeta } from "../socket/handlers/cli/rpcHandlers";
 import type { ApplySessionConfig } from "@hapi/protocol/schemas";
+import {
+  CACHE_KEEPALIVE_RPC_METHOD,
+  type CacheKeepaliveResponse,
+} from "@hapi/protocol";
+import { cacheKeepaliveRpc } from "./cacheKeepaliveRpc";
 import type { SpawnSessionOptions } from "./syncEngine";
 import type { ErrorLogger } from "../logging/errorLogger";
 // Issue #3632: value import (not `import type`) — this predicate is CALLED at
@@ -260,6 +265,17 @@ export class RpcGateway {
     await this.sessionRpc(sessionId, "killSession", {});
   }
 
+  /** Issue #6169: prompt-cache keep-alive (`cacheKeepaliveRpc.ts`); never throws. */
+  async cacheKeepalive(
+    sessionId: string,
+    request: { deadlineAt: number }
+  ): Promise<CacheKeepaliveResponse> {
+    return await cacheKeepaliveRpc(
+      params => this.sessionRpc(sessionId, CACHE_KEEPALIVE_RPC_METHOD, params),
+      request
+    );
+  }
+
   async spawnSession(opts: SpawnSessionOptions): Promise<
     | SpawnSuccess
     // Issue #1772: carry the daemon's error `code` (e.g. "at_capacity") back to
@@ -342,6 +358,11 @@ export class RpcGateway {
           // (#1262 trap — an un-listed field is silently dropped, so the daemon
           // would never set GEMINI_MODEL / bake the codex config.toml model).
           nativeModelSelection: opts.nativeModelSelection,
+          // Issue #6171: forward the MCP set and the server-stamped known names
+          // (#1262 trap — an un-listed field is silently dropped, so the session
+          // starts every server). Guarded by syncEngine.spawnMcpSet.test.ts.
+          mcpSet: opts.mcpSet,
+          mcpKnown: opts.mcpKnown,
           // Issue #3632: stamp the OWNING SERVER's message-hook stage flag into
           // the spawn RPC. Read FRESH here via messageHooksEnabled() — NOT from
           // `opts` — because the daemon runs as a separate systemd unit whose env
@@ -1146,6 +1167,11 @@ export class RpcGateway {
    */
   getCapabilityMeta(sessionId: string, method: string): CapabilityMeta | null {
     return this.rpcRegistry.getMeta(this.sessionMethodKey(sessionId, method));
+  }
+
+  /** #6169: `method` is registered WITH meta (a teardown leaves it name-only). */
+  hasSessionMethod(sessionId: string, method: string): boolean {
+    return this.getCapabilityMeta(sessionId, method) !== null;
   }
 
   /**

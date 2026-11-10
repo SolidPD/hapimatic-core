@@ -57,6 +57,7 @@ export const SESSION_INFO_KEYS = [
   "Output Style",
   "Session Role",
   "MCP Servers (configured)",
+  "MCP Set",
   "Thinking Time",
   "Context",
   "Messages",
@@ -67,6 +68,17 @@ export const SESSION_INFO_KEYS = [
 ] as const;
 
 export type SessionInfoKey = (typeof SESSION_INFO_KEYS)[number];
+
+/** Issue #6171: the "MCP Set" value. */
+function mcpSetValue(
+  set: { mode?: string; servers?: string[] } | undefined
+): string {
+  if (set?.mode !== "only") return "every server";
+  const servers = [...(set.servers ?? [])].sort();
+  return servers.length > 0
+    ? oneLine(`${servers.join(", ")} (+ hapi)`)
+    : "hapi only";
+}
 
 /** Printed when a value is unknown (U+2014 EM DASH). */
 export const UNKNOWN = "—";
@@ -115,6 +127,8 @@ export type SessionInfoSource = {
     permissionMode?: string;
     outputStyle?: string;
     nativeModel?: string;
+    /** Issue #6171: the MCP set the session started with. */
+    mcpSet?: { mode?: string; servers?: string[] };
   } | null;
 };
 
@@ -343,6 +357,9 @@ export function deriveSessionInfoRecord(
         ? oneLine([...ctx.mcpEnabled].sort().join(", "))
         : "none"
       : UNKNOWN,
+    // #6171: a chosen set names its servers (hapi is always on as well); no set
+    // means every configured server.
+    "MCP Set": full ? mcpSetValue(md?.mcpSet) : UNKNOWN,
     "Thinking Time": formatHms(thinkingMs),
     Context: contextValue(src),
     // The exact count behind the surface's message badge (the badge itself

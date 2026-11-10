@@ -26,13 +26,16 @@ export type PorterExportProfile = (typeof PORTER_EXPORT_PROFILES)[number];
 export const PorterExportProfileSchema = z.enum(PORTER_EXPORT_PROFILES);
 
 /**
- * The licensed premium marketplace's names. Provisional until #3989 publishes
- * the marketplace identity: the L2 tier is `hapimatic-premium` (product map
- * decision 17; the K19 parity fixture
- * `infrastructure/cloud-vm/fixtures/l2_plugins.example.json`).
+ * The licensed premium marketplace's names. `hapimatic-pro` is the Hapimatic
+ * Pro marketplace (#3989, decision D1 = 3): the private repository
+ * `solidpd/hapimatic-pro`, which pilots add straight from GitHub, so only this
+ * name (not a hapimatic.com source) identifies it. `hapimatic-premium` is the
+ * tier's earlier name (product map decision 17), kept so a copy installed
+ * under it is still recognised.
  */
 export const PREMIUM_MARKETPLACE_NAMES: readonly string[] = [
   "hapimatic-premium",
+  "hapimatic-pro",
 ];
 
 /**

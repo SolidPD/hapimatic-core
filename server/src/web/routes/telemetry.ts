@@ -1,107 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
-import type {
-  TelemetryFileInfo,
-  TelemetryStore,
-  TelemetrySummary,
-  TelemetryTimeseriesBucket,
-} from "../../store/telemetryStore";
+import type { TelemetryStore } from "../../store/telemetryStore";
 import type { TurnAnalyticsCounts } from "../../store/turns/analyticsCounts";
-import { TURNS_SOURCED_FILE_TYPES } from "../../store/turns/analyticsCounts";
+import {
+  extendTelemetryRequestTimeout,
+  InlineTelemetryExecutor,
+  logTelemetryEvent,
+  TELEMETRY_AGGREGATE_LOG_CATEGORY,
+  TelemetryExecutorError,
+  TelemetryRequestAbortedError,
+  type TelemetryExecutor,
+} from "../../telemetry/executor";
 import type { WebAppEnv } from "../middleware/auth";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { configuration } from "../../configuration";
 import { constantTimeEquals } from "../../utils/crypto";
 import { parseAccessToken } from "../../utils/accessToken";
 import { logAndJson } from "./routeErrorHelper";
-
-/**
- * fileTypes whose counts come from `turn_events` (issue #1889 Sub K2). Every
- * other fileType (`hook`, plus any unknown value) stays sourced from the legacy
- * `telemetry.db`. The set drives the per-fileType source routing in the merge
- * helpers below.
- */
-const TURNS_FILE_TYPES = new Set(TURNS_SOURCED_FILE_TYPES);
-
-/**
- * App-level merge for `summary` (issue #1889 D-C(a) — cross-DB merge, no ATTACH).
- * Source routing by fileType: skill/agent/mcp from `turn_events`, hook (and any
- * unknown type) from legacy `telemetry.db`. With no fileType filter the result
- * is turns{skill,agent,mcp} ∪ legacy{hook}, re-sorted by count DESC to preserve
- * the legacy ordering contract. Falls back to pure-legacy when the turns reader
- * is unavailable (fallback preservation — never replace the slow path).
- */
-function mergedSummary(
-  legacy: TelemetryStore,
-  turns: TurnAnalyticsCounts | null,
-  filters: { fileType?: string; startTime?: number; endTime?: number }
-): TelemetrySummary {
-  if (!turns) return legacy.getSummary(filters);
-
-  const f = filters.fileType;
-  if (f === undefined) {
-    const t = turns.getSummary(filters);
-    const h = legacy.getSummary({ ...filters, fileType: "hook" });
-    return {
-      byFile: [...t.byFile, ...h.byFile].sort((a, b) => b.count - a.count),
-      byType: [...t.byType, ...h.byType].sort((a, b) => b.count - a.count),
-    };
-  }
-  if (TURNS_FILE_TYPES.has(f)) return turns.getSummary(filters);
-  return legacy.getSummary(filters);
-}
-
-/**
- * App-level merge for `files` (issue #1889). Same per-fileType routing as
- * {@link mergedSummary}; unfiltered = turns files ∪ legacy hook files, by count.
- */
-function mergedFiles(
-  legacy: TelemetryStore,
-  turns: TurnAnalyticsCounts | null,
-  fileType: string | undefined
-): TelemetryFileInfo[] {
-  if (!turns) return legacy.getFiles(fileType);
-  if (fileType === undefined) {
-    return [...turns.getFiles(undefined), ...legacy.getFiles("hook")].sort(
-      (a, b) => b.count - a.count
-    );
-  }
-  if (TURNS_FILE_TYPES.has(fileType)) return turns.getFiles(fileType);
-  return legacy.getFiles(fileType);
-}
-
-/**
- * App-level merge for `timeseries` (issue #1889). The endpoint has no fileType
- * filter (only filePath), so we always take skill/agent/mcp buckets from turns
- * and the hook-only buckets from legacy (the new `fileType: "hook"` slice keeps
- * skill/agent from being double-counted), then sum on the shared bucket key.
- */
-function mergedTimeseries(
-  legacy: TelemetryStore,
-  turns: TurnAnalyticsCounts | null,
-  params: {
-    filePath?: string;
-    interval: "hour" | "day" | "week";
-    startTime?: number;
-    endTime?: number;
-  }
-): TelemetryTimeseriesBucket[] {
-  if (!turns) return legacy.getTimeseries(params);
-
-  const byBucket = new Map<string, number>();
-  for (const b of turns.getTimeseries(params)) {
-    byBucket.set(b.bucket, (byBucket.get(b.bucket) ?? 0) + b.count);
-  }
-  for (const b of legacy.getTimeseries({ ...params, fileType: "hook" })) {
-    byBucket.set(b.bucket, (byBucket.get(b.bucket) ?? 0) + b.count);
-  }
-  return [...byBucket.entries()]
-    .map(([bucket, count]) => ({ bucket, count }))
-    .sort((a, b) => (a.bucket < b.bucket ? -1 : a.bucket > b.bucket ? 1 : 0));
-}
 
 const eventSchema = z.object({
   filePath: z.string().min(1),
@@ -227,11 +145,81 @@ export function createTelemetryRoutes(
      * pure-legacy behavior.
      */
     getTurnAnalytics?: () => TurnAnalyticsCounts | null;
+    /**
+     * Where the reads run (issue #6516). The server passes the worker
+     * executor; when absent, the routes run in-thread through an
+     * `InlineTelemetryExecutor` over the two accessors above (today's
+     * behaviour, which every `:memory:` route test relies on).
+     */
+    executor?: TelemetryExecutor | null;
   }
 ): Hono<WebAppEnv> {
   const errorLogger = options?.errorLogger ?? null;
   const getTurnAnalytics = options?.getTurnAnalytics ?? null;
+  const executor: TelemetryExecutor =
+    options?.executor ??
+    new InlineTelemetryExecutor({
+      getTelemetryStore,
+      getTurnAnalytics,
+      errorLogger,
+    });
   const app = new Hono<WebAppEnv>();
+
+  /**
+   * Run an executor-backed read. Extends this request's Bun timeout first
+   * (Premise P3), then maps an executor rejection to `503 {error, code}` with
+   * `Retry-After`. Anything else propagates exactly as before #6516.
+   */
+  async function viaExecutor(
+    c: Context<WebAppEnv>,
+    fn: () => Promise<Response>
+  ): Promise<Response> {
+    extendTelemetryRequestTimeout(c.env, c.req.raw);
+    try {
+      return await fn();
+    } catch (err) {
+      const mapped = executorErrorResponse(c, err);
+      if (mapped) return mapped;
+      throw err;
+    }
+  }
+
+  function executorErrorResponse(
+    c: Context<WebAppEnv>,
+    err: unknown
+  ): Response | null {
+    if (err instanceof TelemetryExecutorError) {
+      return c.json({ error: err.message, code: err.code }, 503, {
+        "Retry-After": "5",
+      });
+    }
+    if (err instanceof TelemetryRequestAbortedError) {
+      // The client has gone; the body is for completeness only.
+      return c.json({ error: err.message, code: "telemetry_aborted" }, 503);
+    }
+    return null;
+  }
+
+  /**
+   * Recompute today's `daily_aggregates` before a read of them. A failed
+   * refresh still serves the stored aggregates, as before #6516, but is now
+   * logged (rate-limited per category) instead of swallowed by a bare catch.
+   */
+  async function refreshToday(store: TelemetryStore): Promise<void> {
+    const today = new Date().toISOString().slice(0, 10);
+    try {
+      await executor.refreshDay(today, store);
+    } catch (err) {
+      logTelemetryEvent(
+        { errorLogger },
+        "warn",
+        TELEMETRY_AGGREGATE_LOG_CATEGORY,
+        `today refresh of ${today} failed; serving the stored aggregates: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
 
   function requireStore(c: {
     json: (data: unknown, status?: number) => Response;
@@ -266,7 +254,7 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
@@ -277,13 +265,18 @@ export function createTelemetryRoutes(
       const startTime = startTimeStr ? parseInt(startTimeStr, 10) : undefined;
       const endTime = endTimeStr ? parseInt(endTimeStr, 10) : undefined;
 
-      const summary = mergedSummary(store, getTurnAnalytics?.() ?? null, {
-        fileType,
-        startTime: startTime && !isNaN(startTime) ? startTime : undefined,
-        endTime: endTime && !isNaN(endTime) ? endTime : undefined,
+      return viaExecutor(c, async () => {
+        const summary = await executor.run(
+          "summary",
+          {
+            fileType,
+            startTime: startTime && !isNaN(startTime) ? startTime : undefined,
+            endTime: endTime && !isNaN(endTime) ? endTime : undefined,
+          },
+          c.req.raw.signal
+        );
+        return c.json(summary);
       });
-
-      return c.json(summary);
     }
   );
 
@@ -311,7 +304,7 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
@@ -330,14 +323,19 @@ export function createTelemetryRoutes(
       const startTime = startTimeStr ? parseInt(startTimeStr, 10) : undefined;
       const endTime = endTimeStr ? parseInt(endTimeStr, 10) : undefined;
 
-      const buckets = mergedTimeseries(store, getTurnAnalytics?.() ?? null, {
-        filePath,
-        interval: interval as "hour" | "day" | "week",
-        startTime: startTime && !isNaN(startTime) ? startTime : undefined,
-        endTime: endTime && !isNaN(endTime) ? endTime : undefined,
+      return viaExecutor(c, async () => {
+        const buckets = await executor.run(
+          "timeseries",
+          {
+            filePath,
+            interval: interval as "hour" | "day" | "week",
+            startTime: startTime && !isNaN(startTime) ? startTime : undefined,
+            endTime: endTime && !isNaN(endTime) ? endTime : undefined,
+          },
+          c.req.raw.signal
+        );
+        return c.json({ buckets });
       });
-
-      return c.json({ buckets });
     }
   );
 
@@ -365,14 +363,19 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
       const fileType = c.req.query("fileType") || undefined;
-      const files = mergedFiles(store, getTurnAnalytics?.() ?? null, fileType);
-
-      return c.json({ files });
+      return viaExecutor(c, async () => {
+        const files = await executor.run(
+          "files",
+          { fileType },
+          c.req.raw.signal
+        );
+        return c.json({ files });
+      });
     }
   );
 
@@ -400,7 +403,7 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
@@ -408,15 +411,15 @@ export function createTelemetryRoutes(
       const startDate = c.req.query("startDate") || undefined;
       const endDate = c.req.query("endDate") || undefined;
 
-      // Trigger aggregation for today before querying
-      try {
-        store.aggregateDay();
-      } catch {
-        // Non-critical — stale data is acceptable
-      }
-
-      const stats = store.getDurationStats({ fileType, startDate, endDate });
-      return c.json({ stats });
+      return viaExecutor(c, async () => {
+        await refreshToday(store);
+        const stats = await executor.run(
+          "duration-stats",
+          { fileType, startDate, endDate },
+          c.req.raw.signal
+        );
+        return c.json({ stats });
+      });
     }
   );
 
@@ -444,7 +447,7 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
@@ -452,14 +455,15 @@ export function createTelemetryRoutes(
       const startDate = c.req.query("startDate") || undefined;
       const endDate = c.req.query("endDate") || undefined;
 
-      try {
-        store.aggregateDay();
-      } catch {
-        // Non-critical
-      }
-
-      const rates = store.getOutcomeRates({ fileType, startDate, endDate });
-      return c.json({ rates });
+      return viaExecutor(c, async () => {
+        await refreshToday(store);
+        const rates = await executor.run(
+          "outcome-rates",
+          { fileType, startDate, endDate },
+          c.req.raw.signal
+        );
+        return c.json({ rates });
+      });
     }
   );
 
@@ -487,7 +491,7 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
@@ -496,14 +500,15 @@ export function createTelemetryRoutes(
       const windowDays = windowStr ? parseInt(windowStr, 10) : undefined;
       const threshold = thresholdStr ? parseFloat(thresholdStr) : undefined;
 
-      try {
-        store.aggregateDay();
-      } catch {
-        // Non-critical
-      }
-
-      const anomalies = store.getAnomalies({ windowDays, threshold });
-      return c.json({ anomalies });
+      return viaExecutor(c, async () => {
+        await refreshToday(store);
+        const anomalies = await executor.run(
+          "anomalies",
+          { windowDays, threshold },
+          c.req.raw.signal
+        );
+        return c.json({ anomalies });
+      });
     }
   );
 
@@ -531,7 +536,7 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
@@ -550,13 +555,19 @@ export function createTelemetryRoutes(
         );
       }
 
-      const comparison = store.getComparison(
-        parseInt(p1s, 10),
-        parseInt(p1e, 10),
-        parseInt(p2s, 10),
-        parseInt(p2e, 10)
-      );
-      return c.json({ comparison });
+      return viaExecutor(c, async () => {
+        const comparison = await executor.run(
+          "comparison",
+          {
+            period1Start: parseInt(p1s, 10),
+            period1End: parseInt(p1e, 10),
+            period2Start: parseInt(p2s, 10),
+            period2End: parseInt(p2e, 10),
+          },
+          c.req.raw.signal
+        );
+        return c.json({ comparison });
+      });
     }
   );
 
@@ -595,7 +606,7 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
@@ -606,15 +617,19 @@ export function createTelemetryRoutes(
       const endTime = endTimeStr ? parseInt(endTimeStr, 10) : undefined;
       const repo = c.req.query("repo") || undefined;
 
-      const turns = getTurnAnalytics?.() ?? null;
-      const estimates =
-        turns?.getSkillTokenEstimates({
-          fileType,
-          startTime: startTime && !isNaN(startTime) ? startTime : undefined,
-          endTime: endTime && !isNaN(endTime) ? endTime : undefined,
-          repo,
-        }) ?? [];
-      return c.json({ estimates });
+      return viaExecutor(c, async () => {
+        const estimates = await executor.run(
+          "token-estimates",
+          {
+            fileType,
+            startTime: startTime && !isNaN(startTime) ? startTime : undefined,
+            endTime: endTime && !isNaN(endTime) ? endTime : undefined,
+            repo,
+          },
+          c.req.raw.signal
+        );
+        return c.json({ estimates });
+      });
     }
   );
 
@@ -642,7 +657,7 @@ export function createTelemetryRoutes(
         telemetry: "off",
       })
     ),
-    c => {
+    async c => {
       const store = requireStore(c);
       if (store instanceof Response) return store;
 
@@ -654,12 +669,18 @@ export function createTelemetryRoutes(
       const endTime = endTimeStr ? parseInt(endTimeStr, 10) : undefined;
       const limit = limitStr ? parseInt(limitStr, 10) : undefined;
 
-      const sessions = store.getSessionAggregates({
-        startTime: startTime && !isNaN(startTime) ? startTime : undefined,
-        endTime: endTime && !isNaN(endTime) ? endTime : undefined,
-        limit: limit && !isNaN(limit) ? limit : undefined,
+      return viaExecutor(c, async () => {
+        const sessions = await executor.run(
+          "session-aggregates",
+          {
+            startTime: startTime && !isNaN(startTime) ? startTime : undefined,
+            endTime: endTime && !isNaN(endTime) ? endTime : undefined,
+            limit: limit && !isNaN(limit) ? limit : undefined,
+          },
+          c.req.raw.signal
+        );
+        return c.json({ sessions });
       });
-      return c.json({ sessions });
     }
   );
 
@@ -694,14 +715,25 @@ export function createTelemetryRoutes(
       const body = await c.req.json().catch(() => null);
       const date = (body as { date?: string } | null)?.date;
 
+      extendTelemetryRequestTimeout(c.env, c.req.raw);
       try {
+        // Compute through the executor (off-thread in worker mode), write the
+        // day atomically on the main connection. Degraded mode answers 503
+        // telemetry_unavailable here: this route records no aggregate debt.
         if (date) {
-          store.aggregateDay(date);
+          const rows = await executor.run(
+            "computeDay",
+            { date },
+            c.req.raw.signal
+          );
+          store.replaceDayAggregates(date, rows);
           return c.json({ aggregated: date });
         }
-        const count = store.aggregateMissing();
+        const count = await executor.aggregateMissing(store, c.req.raw.signal);
         return c.json({ aggregatedDays: count });
       } catch (err) {
+        const mapped = executorErrorResponse(c, err);
+        if (mapped) return mapped;
         return logAndJson(c, err, 500, {
           errorLogger,
           category: "telemetry-aggregate",

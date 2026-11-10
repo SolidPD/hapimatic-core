@@ -33,6 +33,7 @@ import { listCommands } from "./registry";
 import { API_RESOURCE_ACTIONS } from "./api";
 import {
   HAPY_MCP_OPERATOR_TOOL_NAMES,
+  HAPY_MCP_PIN_TOOL_NAMES,
   HAPY_MCP_TOOL_NAMES,
 } from "@/claude/utils/startHappyServer";
 import { HAPI_STDIO_BRIDGE_TOOL_NAMES } from "@/extensions/agent-codex/codex/happyMcpStdioBridge";
@@ -94,10 +95,15 @@ export function buildLocalSurface(): {
 } {
   const mcp: ObservedMcpHarness[] = [
     // The Claude harness can also be handed the operator tools (#4450): an
-    // operator host registers them, so they are observed here too.
+    // operator host registers them, so they are observed here too. The pin
+    // tools (#6448) are registered wherever the Pins gate is open.
     {
       harness: "claude",
-      tools: [...HAPY_MCP_TOOL_NAMES, ...HAPY_MCP_OPERATOR_TOOL_NAMES],
+      tools: [
+        ...HAPY_MCP_TOOL_NAMES,
+        ...HAPY_MCP_OPERATOR_TOOL_NAMES,
+        ...HAPY_MCP_PIN_TOOL_NAMES,
+      ],
     },
     { harness: "codex-bridge", tools: [...HAPI_STDIO_BRIDGE_TOOL_NAMES] },
   ];

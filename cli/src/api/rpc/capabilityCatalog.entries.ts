@@ -72,6 +72,18 @@ export const rpcCatalogEntries = [
     riskTier: "destructive",
     availability: { scope: "user" },
   }),
+  defineCapability({
+    id: "session-lifecycle.cache-keepalive",
+    domain: "session-lifecycle",
+    surface: "rpc",
+    description:
+      "Renew an idle session's prompt cache through a Claude Code side question the agent never sees. Used by the server's keep-alive scheduler.",
+    whenToUse: "To keep a waiting session's prompt cache warm.",
+    invocation: { kind: "rpc", method: "cache-keepalive" },
+    auth: "jwt",
+    riskTier: "mutating",
+    availability: { scope: "operator" },
+  }),
 
   // ── MCP control ────────────────────────────────────────────────────────────
   defineCapability({

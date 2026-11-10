@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import axios from "axios";
 import chalk from "chalk";
-import { PmSpawnReconciliationStatusSchema } from "@hapi/protocol";
+import { PmSpawnReconciliationStatusSchema, type McpSet } from "@hapi/protocol";
+import { parseMcpSetFlags } from "./apiSpawnMcpFlags";
 import {
   BULK_SESSION_MAX_IDS,
   BulkSessionResultSchema,
@@ -80,6 +81,10 @@ export type ResolvedSpawnArgs = {
   /** Issue #6218: `--permission-mode <mode>` — the peer's starting permission
    *  mode, validated strictly here; the server checks it against the harness. */
   permissionMode?: string;
+  /** Issue #6171: the MCP servers the session starts with (see
+   *  {@link parseMcpSetFlags}). Absent → the project's default, else every
+   *  server, and the request body is byte-identical to before. */
+  mcpSet?: McpSet;
 };
 export type SpawnArgsError = { error: string };
 
@@ -132,7 +137,7 @@ export async function resolveSpawnArgs(
   if (!dir) {
     return {
       error:
-        "Usage: hapi api sessions spawn --dir <path> [--machine <id>] [--name <display-name>] [--session-role <role>] [--model-mode <mode>] [--effort <level>] [--yolo | --permission-mode <mode>] [--parent-session-id <id>]",
+        "Usage: hapi api sessions spawn --dir <path> [--machine <id>] [--name <display-name>] [--session-role <role>] [--model-mode <mode>] [--effort <level>] [--yolo | --permission-mode <mode>] [--mcp <name>]... [--mcp-none | --mcp-all] [--mcp-enable-for-project] [--parent-session-id <id>]",
     };
   }
 
@@ -196,6 +201,10 @@ export async function resolveSpawnArgs(
     };
   }
 
+  // Issue #6171: the MCP set, validated before the machine lookup.
+  const mcp = parseMcpSetFlags(args);
+  if ("error" in mcp) return mcp;
+
   // An explicit --machine wins and avoids consulting settings.json (R2).
   let machineId = parseFlag(args, "--machine");
   if (!machineId) {
@@ -228,6 +237,7 @@ export async function resolveSpawnArgs(
     ...(yolo ? { yolo: true as const } : {}),
     ...(permissionModeRaw ? { permissionMode: permissionModeRaw } : {}),
     ...(parentSessionId ? { parentSessionId } : {}),
+    ...(mcp.mcpSet ? { mcpSet: mcp.mcpSet } : {}),
   };
 }
 
@@ -249,6 +259,7 @@ export function buildSpawnBody(
     yolo,
     permissionMode,
     parentSessionId,
+    mcpSet,
   } = resolved;
   return {
     directory: dir,
@@ -268,6 +279,9 @@ export function buildSpawnBody(
     // Issue #2479: forward the parent link so the spawned session groups under
     // its spawner as a managed peer. May be a tag — the server resolves it.
     ...(parentSessionId ? { parentSessionId } : {}),
+    // Issue #6171: the MCP set; without one the target's project default
+    // applies, else every server.
+    ...(mcpSet ? { mcpSet } : {}),
   };
 }
 
@@ -962,6 +976,10 @@ ${chalk.bold("Usage:")}
                           --effort <level>             Claude reasoning effort: low|medium|high|xhigh|max (optional; default: the node's)
                           --yolo                       Peer bypasses permission prompts (omitted: the node's default spawn permission mode)
                           --permission-mode <mode>     Starting permission mode, e.g. acceptEdits|plan|default (optional)
+                          --mcp <name>                 Start with only these MCP servers (repeatable; Claude only; hapi stays on)
+                          --mcp-none                   Start with no MCP servers but hapi
+                          --mcp-all                    Start with every MCP server, ignoring the project's default
+                          --mcp-enable-for-project     Turn a named server that is off for the project on for the whole project
   hapi api sessions send <id> "<message>"              Send a message to a session
   hapi api sessions messages <id>                      Get message history
   hapi api sessions capabilities <id>                  List a session's live RPC capabilities (name + meta)

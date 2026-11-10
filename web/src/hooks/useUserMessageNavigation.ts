@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useCallback, useEffect, useRef, useState } from "react";
 import { computeAnchorRestoreDelta } from "@/lib/scroll-anchor";
+import { recordScrollWrite } from "@/lib/scrollCauseRecorder";
+import { claimThreadScroll } from "@/lib/threadScrollClaim";
 
 export interface UserMessageNavigationOptions {
   loadMore: () => Promise<unknown>;
@@ -167,6 +169,10 @@ export function startPostSnapCorrection({
   let done = false;
   let debounceId: ReturnType<typeof setTimeout> | null = null;
   let expectedScrollTop = viewport.scrollTop;
+  // #6122: this correction owns the thread's scroll position for its window, so the
+  // thread's reading anchor stays passive instead of writing against it (released in
+  // teardown, which always runs — the window is hard-capped).
+  const releaseClaim = claimThreadScroll(viewport);
 
   const userMoved = (): boolean =>
     Math.abs(viewport.scrollTop - expectedScrollTop) > SETTLE_STABLE_EPSILON_PX;
@@ -190,9 +196,16 @@ export function startPostSnapCorrection({
       targetOffset: offsetAfterSnap,
     });
     if (Math.abs(delta) <= SETTLE_STABLE_EPSILON_PX) return;
+    const before = viewport.scrollTop;
     viewport.scrollTop = viewport.scrollTop + delta;
     // Read back: the browser clamps to the scroll range.
     expectedScrollTop = viewport.scrollTop;
+    recordScrollWrite(
+      "user-nav-correction",
+      viewport,
+      before,
+      expectedScrollTop
+    );
   };
 
   const observer = createResizeObserver(() => {
@@ -214,6 +227,7 @@ export function startPostSnapCorrection({
     if (debounceId !== null) clearTimeout(debounceId);
     debounceId = null;
     clearTimeout(capId);
+    releaseClaim();
   }
 
   observer.observe(content);
@@ -352,7 +366,14 @@ export function useUserMessageNavigation(
         if (stable || Date.now() >= deadline) {
           // Snap onto the settled element (instant — the smooth entry motion
           // already played) and re-arm the highlight on the corrected target.
+          const snapBefore = viewport?.scrollTop ?? 0;
           element.scrollIntoView({ behavior: "auto", block: SCROLL_BLOCK });
+          recordScrollWrite(
+            "user-nav-snap",
+            viewport,
+            snapBefore,
+            viewport?.scrollTop ?? 0
+          );
           highlightMessage(element);
           if (!viewport) {
             cleanup();
@@ -406,10 +427,19 @@ export function useUserMessageNavigation(
         typeof window !== "undefined" &&
         typeof window.matchMedia === "function" &&
         window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const navViewport = viewportRef.current;
+      const navBefore = navViewport?.scrollTop ?? 0;
       element.scrollIntoView({
         behavior: prefersReducedMotion ? "auto" : "smooth",
         block: SCROLL_BLOCK,
       });
+      recordScrollWrite(
+        "user-nav-snap",
+        navViewport,
+        navBefore,
+        navViewport?.scrollTop ?? 0,
+        prefersReducedMotion ? "instant" : "smooth"
+      );
       setTimeout(() => {
         highlightMessage(element);
         if (targetId) setCursorId(targetId);

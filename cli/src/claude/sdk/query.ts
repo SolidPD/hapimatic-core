@@ -19,6 +19,8 @@ import {
   type ContextUsageDetailPayload,
   type ContextUsagePayload,
   type GetContextUsageRequest,
+  type SideQuestionAnswer,
+  type SideQuestionRequest,
   type SDKControlResponse,
   type CanCallToolCallback,
   type CanUseToolControlRequest,
@@ -41,6 +43,12 @@ import { isEffortLevel } from "@hapi/protocol/effort";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
 import { logger } from "@/ui/logger";
 import { appendMcpConfigArg } from "../utils/mcpConfig";
+import {
+  groupMcpServers,
+  type McpServerStatus,
+  type McpServerUsage,
+} from "@hapi/protocol";
+import { readMcpStatusReply } from "./mcpStatusReply";
 
 /**
  * Parse a stderr line from Claude Code for API error/retry patterns.
@@ -138,6 +146,12 @@ export function parseStderrApiError(line: string): SDKMessage | null {
 }
 
 /**
+ * Issue #6169: how long a cancelled side question's progress lines are still
+ * dropped. Claude Code keeps a side-question fork retrying for up to 660 s.
+ */
+const SIDE_QUESTION_CANCEL_GRACE_MS = 11 * 60_000;
+
+/**
  * Conventional UNIX signal numbers we map to exit codes when Node delivers a
  * `null` exit code with a named signal. Used by classifyChildExit. Matches
  * the legacy inline table that lived in the close handler before #1239 PR C.
@@ -224,6 +238,9 @@ export function classifyChildExit(
  */
 export const CONTEXT_USAGE_DETAIL_TIMEOUT_MS = 25_000;
 
+/** Issue #6171: a live `mcp_status` read is short; the poll fallback is slower. */
+export const MCP_STATUS_TIMEOUT_MS = 10_000;
+
 /**
  * Read the get_context_usage payload, which sits at
  * control_response.response.response (the same double-nest the can_use_tool
@@ -249,6 +266,43 @@ function readContextUsageReply(
   };
 }
 
+/**
+ * Issue #6171: the reply's MCP tool and instruction rows, keeping only rows of
+ * the shape `groupMcpServers` reads (a malformed row is dropped, never thrown).
+ */
+function readMcpUsage(data: Record<string, unknown>): {
+  mcpTools: Array<{
+    name: string;
+    serverName: string;
+    tokens: number;
+    isLoaded?: boolean;
+  }>;
+  mcpInstructions: Array<{ serverName: string; tokens: number }>;
+} {
+  const rows = (value: unknown): Array<Record<string, unknown>> =>
+    Array.isArray(value)
+      ? value.filter(
+          (row): row is Record<string, unknown> =>
+            !!row &&
+            typeof row === "object" &&
+            typeof (row as { serverName?: unknown }).serverName === "string" &&
+            typeof (row as { tokens?: unknown }).tokens === "number"
+        )
+      : [];
+  return {
+    mcpTools: rows(data.mcpTools).map(row => ({
+      name: typeof row.name === "string" ? row.name : "",
+      serverName: row.serverName as string,
+      tokens: row.tokens as number,
+      ...(typeof row.isLoaded === "boolean" ? { isLoaded: row.isLoaded } : {}),
+    })),
+    mcpInstructions: rows(data.mcpInstructions).map(row => ({
+      serverName: row.serverName as string,
+      tokens: row.tokens as number,
+    })),
+  };
+}
+
 /** The five fields every caller relies on, with #1469's fallbacks. */
 function normalizeContextUsage(
   data: Record<string, unknown> & { model: string; maxTokens: number }
@@ -271,6 +325,11 @@ function normalizeContextUsage(
 export class Query implements AsyncIterableIterator<SDKMessage> {
   private pendingControlResponses = new Map<string, ControlResponseHandler>();
   private cancelControllers = new Map<string, AbortController>();
+  /**
+   * Issue #6169: side questions in flight, or cancelled within the last 11
+   * minutes, whose progress lines are dropped.
+   */
+  private sideQuestionRequestIds = new Set<string>();
   private sdkMessages: AsyncIterableIterator<SDKMessage>;
   private inputStream = new Stream<SDKMessage>();
   private canCallTool?: CanCallToolCallback;
@@ -359,6 +418,10 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
                 message as unknown as ControlCancelRequest
               );
               continue;
+            } else if (this.isSideQuestionProgress(message)) {
+              // Issue #6169: a keep-alive's progress line is control-plane noise;
+              // keep it out of the conversation stream entirely.
+              continue;
             }
 
             this.inputStream.enqueue(message);
@@ -390,6 +453,26 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
       this.cleanupControllers();
       rl.close();
     }
+  }
+
+  /**
+   * Issue #6169: a `system/control_request_progress` line belonging to a side
+   * question this Query sent. Every other progress line passes through.
+   */
+  private isSideQuestionProgress(message: unknown): boolean {
+    if (this.sideQuestionRequestIds.size === 0) return false;
+    if (!message || typeof message !== "object") return false;
+    const m = message as {
+      type?: unknown;
+      subtype?: unknown;
+      request_id?: unknown;
+    };
+    return (
+      m.type === "system" &&
+      m.subtype === "control_request_progress" &&
+      typeof m.request_id === "string" &&
+      this.sideQuestionRequestIds.has(m.request_id)
+    );
   }
 
   /**
@@ -440,6 +523,25 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
   }
 
   /**
+   * Issue #6171: this Claude process's own MCP server state, via the `mcp_status`
+   * control_request (measured on Claude Code 2.1.312; see `readMcpStatusReply`).
+   * A server the session's MCP set denies is absent, so this is the session's
+   * truth where `claude mcp list` shows the project's. An older binary answers
+   * the unknown subtype with an error control_response, which rejects here.
+   */
+  async getMcpServerStatus(): Promise<McpServerStatus[]> {
+    if (!this.childStdin) {
+      throw new Error("getMcpServerStatus requires --input-format stream-json");
+    }
+    const res = await this.request(
+      { subtype: "mcp_status" } as ControlRequest,
+      this.childStdin,
+      { timeoutMs: MCP_STATUS_TIMEOUT_MS }
+    );
+    return readMcpStatusReply(res);
+  }
+
+  /**
    * Fetch Claude Code's authoritative context-usage snapshot via the
    * get_context_usage SDK control_request. Unlike mcpToggle (which discards
    * the response), this RETURNS the slim first-order payload — the effective
@@ -449,13 +551,29 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
    * attached"). Sends no `detail`, exactly as before #6170. Issue #1469.
    */
   async getContextUsage(): Promise<ContextUsagePayload> {
+    return (await this.getTurnContextUsage()).usage;
+  }
+
+  /**
+   * Issue #6171: the same request as {@link getContextUsage}, whose reply also
+   * lists each MCP tool and server instruction (F21), so one call gives both the
+   * header figures (unchanged) and each server's context cost. No new request.
+   */
+  async getTurnContextUsage(): Promise<{
+    usage: ContextUsagePayload;
+    mcpServers: McpServerUsage[];
+  }> {
     if (!this.childStdin) {
       throw new Error("getContextUsage requires --input-format stream-json");
     }
 
     const request: GetContextUsageRequest = { subtype: "get_context_usage" };
     const res = await this.request(request, this.childStdin);
-    return normalizeContextUsage(readContextUsageReply(res));
+    const data = readContextUsageReply(res);
+    return {
+      usage: normalizeContextUsage(data),
+      mcpServers: groupMcpServers(readMcpUsage(data)),
+    };
   }
 
   /**
@@ -525,6 +643,88 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
   }
 
   /**
+   * Issue #6169: ask Claude Code a side question — the prompt-cache keep-alive.
+   * Claude Code runs it as a one-shot fork on the main conversation's cache
+   * prefix (no tools, no transcript line, no hooks), so the fork's request reads
+   * the cache and renews its lifetime; the main agent never sees it. Bounded by
+   * `timeoutMs` because `request()` has no closed-state guard: an untimed request
+   * written after the child's stdin ended would never settle. The answer text is
+   * returned but never logged. `sentAt` is when the request line was written —
+   * the cache touch the caller records.
+   */
+  async askSideQuestion(
+    question: string,
+    opts: { timeoutMs: number }
+  ): Promise<SideQuestionAnswer> {
+    if (!this.childStdin) {
+      throw new Error("askSideQuestion requires --input-format stream-json");
+    }
+
+    let sentAt = 0;
+    let requestId: string | null = null;
+    let timedOut = false;
+    const request: SideQuestionRequest = { subtype: "side_question", question };
+    try {
+      const res = await this.request(request, this.childStdin, {
+        timeoutMs: opts.timeoutMs,
+        onSent: id => {
+          sentAt = Date.now();
+          requestId = id;
+          this.sideQuestionRequestIds.add(id);
+        },
+      });
+      // Nested at control_response.response.response, like get_context_usage.
+      const payload = (res as { response?: unknown }).response;
+      const answer =
+        payload && typeof payload === "object"
+          ? (payload as { response?: unknown; synthetic?: unknown })
+          : {};
+      return {
+        response: typeof answer.response === "string" ? answer.response : null,
+        synthetic: answer.synthetic === true,
+        sentAt,
+      };
+    } catch (err) {
+      if (
+        requestId !== null &&
+        err instanceof SdkRequestError &&
+        err.code === "timeout"
+      ) {
+        timedOut = true;
+        this.cancelSideQuestion(requestId);
+      }
+      throw err;
+    } finally {
+      if (requestId !== null && !timedOut) {
+        this.sideQuestionRequestIds.delete(requestId);
+      }
+    }
+  }
+
+  /**
+   * A timed-out side question keeps running in Claude Code (it retries on its
+   * own for minutes), so cancel it, and keep dropping its progress lines for the
+   * longest it could still emit them.
+   */
+  private cancelSideQuestion(requestId: string): void {
+    try {
+      this.childStdin?.write(
+        JSON.stringify({
+          type: "control_cancel_request",
+          request_id: requestId,
+        }) + "\n"
+      );
+    } catch (err) {
+      logger.debug(`[cache-keepalive] cancel write failed: ${String(err)}`);
+    }
+    const forget = setTimeout(
+      () => this.sideQuestionRequestIds.delete(requestId),
+      SIDE_QUESTION_CANCEL_GRACE_MS
+    );
+    forget.unref?.();
+  }
+
+  /**
    * Set the model for subsequent conversation turns on the running Claude
    * process via the set_model SDK control_request (issue #2256). Delivers the
    * subtype through the existing stream-JSON stdin pipe, mirroring mcpToggle
@@ -585,7 +785,11 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
   private request(
     request: ControlRequest,
     childStdin: Writable,
-    opts?: { timeoutMs?: number }
+    opts?: {
+      timeoutMs?: number;
+      /** Issue #6169: called once the request line is written, with its id. */
+      onSent?: (requestId: string) => void;
+    }
   ): Promise<SDKControlResponse["response"]> {
     const requestId = Math.random().toString(36).substring(2, 15);
     const sdkRequest: SDKControlRequest = {
@@ -625,6 +829,7 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
       });
 
       childStdin.write(JSON.stringify(sdkRequest) + "\n");
+      opts?.onSent?.(requestId);
     });
   }
 

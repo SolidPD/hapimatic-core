@@ -268,25 +268,27 @@ export function StatusBar(props: {
     verb: "Enable" | "Disable";
     names: string[];
   } | null>(null);
-  const [localModeBanner, setLocalModeBanner] = useState<string | null>(null);
+  // A refused batch's reason: terminal mode, or (#6171) a session started with
+  // a chosen MCP set, whose servers change only by relaunching it.
+  const [batchBanner, setBatchBanner] = useState<string | null>(null);
   const batch = useMcpBatch(sessionId);
 
-  // Auto-dismiss the local-mode banner after a timeout
+  // Auto-dismiss the refusal banner after a timeout
   useEffect(() => {
-    if (!localModeBanner) return;
+    if (!batchBanner) return;
     const id = setTimeout(
-      () => setLocalModeBanner(null),
+      () => setBatchBanner(null),
       LOCAL_MODE_BANNER_TIMEOUT_MS
     );
     return () => clearTimeout(id);
-  }, [localModeBanner]);
+  }, [batchBanner]);
 
   // Reset modal state when it closes
   useEffect(() => {
     if (!showMcpDetail) {
       setSelectMode(false);
       setSelectedServers(new Set());
-      setLocalModeBanner(null);
+      setBatchBanner(null);
     }
   }, [showMcpDetail]);
 
@@ -326,9 +328,11 @@ export function StatusBar(props: {
       // useMcpBatch's snapshot, no need to keep selection visible.
       setSelectMode(false);
       setSelectedServers(new Set());
-      if (!result.ok && result.code === "local_mode_not_supported") {
-        setLocalModeBanner(
-          `This session is in terminal mode — batch ${verb.toLowerCase()} aborted. Toggle MCP servers from the terminal.`
+      if (!result.ok) {
+        setBatchBanner(
+          result.code === "local_mode_not_supported"
+            ? `This session is in terminal mode — batch ${verb.toLowerCase()} aborted. Toggle MCP servers from the terminal.`
+            : result.error
         );
       }
     },
@@ -481,16 +485,16 @@ export function StatusBar(props: {
                       ✕
                     </Button>
                   </div>
-                  {/* Local-mode banner */}
-                  {localModeBanner ? (
+                  {/* Refused-batch banner */}
+                  {batchBanner ? (
                     <div className="flex items-start gap-2 px-4 py-2 bg-amber-500/10 border-b border-amber-500/30 text-xs text-amber-300">
                       <span className="shrink-0 mt-0.5">⚠</span>
-                      <span className="flex-1">{localModeBanner}</span>
+                      <span className="flex-1">{batchBanner}</span>
                       <Button
                         type="button"
                         variant="ghostStatic"
                         size="bare"
-                        onClick={() => setLocalModeBanner(null)}
+                        onClick={() => setBatchBanner(null)}
                         className="shrink-0 text-amber-400 hover:text-amber-200"
                         aria-label="Dismiss"
                       >

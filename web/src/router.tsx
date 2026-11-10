@@ -25,6 +25,7 @@ import {
   useLocation,
   useNavigate,
   useParams,
+  useSearch,
 } from "@tanstack/react-router";
 import { App } from "@/App";
 import { reconcileSessionViewOpenRedirects } from "@/lib/session-view";
@@ -100,8 +101,6 @@ import {
   useHeartbeatStatus,
 } from "@/extensions/heartbeat/useHeartbeat";
 import type { ScheduledTask } from "@/types/api";
-import ErrorLogsPage from "@/extensions/error-log-viewer/routes/error-logs";
-import ExtensionMarketplacePage from "@/extensions/extension-marketplace/routes/extensions";
 import {
   SearchFilterBar,
   getSearchFilterEngagement,
@@ -122,49 +121,53 @@ import {
 } from "@/lib/sessionListManualOrder";
 import { useSplitViewContext } from "@/lib/split-view-context";
 import { SplitPaneContentView } from "@/components/SplitPaneContentView";
-import FilesPage from "@/extensions/git-rpc/routes/files";
-import FilePage from "@/extensions/git-rpc/routes/file";
-import TerminalPage from "@/routes/sessions/terminal";
-import ClaudePtyPage from "@/routes/sessions/claude-pty";
-import DesktopPage from "@/routes/sessions/desktop";
-import AccountUsagePage from "@/routes/account-usage";
 import { parseReloginSearch, type ReloginSearch } from "@/lib/reloginLink";
-// Admin pages promoted from in-drawer `?section=` overlays to their own routes (#1935).
-import FederationDashboard from "@/routes/settings/federation";
-import { NodeDetailView } from "@/components/federation/NodeDetailView";
-import AdminSystemJobsPage from "@/routes/settings/system-jobs";
 import type { SystemJobKind } from "@/lib/systemJobsSearchFilterSort";
-import AdminFileConflictsPage from "@/routes/settings/file-conflicts";
-import TimeLogPage from "@/extensions/time-log/routes/time-log";
-import SessionMetadataPage from "@/routes/settings/session-metadata";
-import TranscriptsPage from "@/routes/settings/transcripts";
-import AdminFeedbackPage from "@/routes/settings/feedback";
-import AdminHelpPage from "@/routes/settings/help";
-import AdminPreferencesPage from "@/routes/settings/preferences";
-import AdminAboutPage from "@/routes/settings/about";
-import NotificationsPage from "@/routes/settings/notifications";
-import ConnectorsPage from "@/routes/settings/connectors";
-import NetworkPage from "@/routes/settings/network";
 import {
   ConnectModelNudge,
   SessionsEmptyState,
   sessionsAreEmpty,
 } from "@/components/onboarding/ConnectModelNudge";
-import ExtensionsAdminPage from "@/routes/settings/extensions";
-import ConfigurationAdminPage from "@/routes/settings/configuration";
-import AdminVmsPage from "@/routes/settings/vms";
-import HarnessScorecardPage from "@/routes/settings/harness-scorecard";
-import AdminHarnessUpdatesPage from "@/routes/settings/harness-updates";
-// #3752: capability panel lives under components/Settings (per the directive),
-// not routes/settings — a deliberate placement deviation.
-import CapabilitiesPanel from "@/components/Settings/CapabilitiesPanel";
 import { makeLegacyAdminRedirects } from "@/routes/legacyAdminRedirects";
 import { makeDesignRoutes } from "@/routes/design/designRoute";
+import {
+  AccountUsagePage,
+  AdminAboutPage,
+  AdminFeedbackPage,
+  AdminFileConflictsPage,
+  AdminHarnessUpdatesPage,
+  AdminHelpPage,
+  AdminPreferencesPage,
+  AdminSystemJobsPage,
+  AdminVmsPage,
+  AnalyticsRoutePage,
+  CapabilitiesPanel,
+  ClaudePtyPage,
+  ConfigurationAdminPage,
+  ConnectorsPage,
+  DesktopPage,
+  ErrorLogsPage,
+  ExtensionMarketplacePage,
+  ExtensionsAdminPage,
+  FederationDashboard,
+  FilePage,
+  FilesPage,
+  HarnessScorecardPage,
+  NetworkPage,
+  NodeDetailViewPage,
+  NotificationsPage,
+  SessionMetadataPage,
+  TerminalPage,
+  TimeLogPage,
+  TranscriptsPage,
+} from "@/routes/lazyPages";
 import { Button } from "@/components/ui/button";
 
-const LazyAnalyticsPage = lazy(
-  () => import("@/extensions/analytics/routes/analytics")
-);
+// #6449: the Pins view is code-split (it ships dark behind the pins gate). In
+// the main bundle it pushed that bundle 42 KB past the then-4 MiB PWA precache
+// limit; split out, it was still 7 KB over. #6123 raised the limit to 5 MiB;
+// #3098 code-split the main bundle and restored 4 MiB (vite.config.ts).
+const LazyPinsPage = lazy(() => import("@/routes/sessions/pins"));
 
 // Get status emoji for document title / favicon based on session state.
 // Priority matches getStatusDotClass() in RecoveryStatusBadge.tsx:
@@ -996,7 +999,22 @@ function SessionsPage() {
 function SessionPage() {
   const { api } = useAppContext();
   const goBack = useAppGoBack();
+  const navigate = useNavigate();
   const { sessionId } = useParams({ from: "/sessions/$sessionId" });
+  // #6453 (R12): `?at=` opens the chat at a pin's spot or a bookmark; the jump
+  // clears it once it ends, with replace, so Back does not repeat it. `?pin=`
+  // opens the Pins tab at that pin. Both only while the Pins gate is open (R13).
+  const { at: jumpTo, pin: revealPin } = useSearch({
+    from: "/sessions/$sessionId",
+  });
+  const onJumpDone = useCallback(() => {
+    void navigate({
+      to: "/sessions/$sessionId",
+      params: { sessionId },
+      search: {},
+      replace: true,
+    });
+  }, [navigate, sessionId]);
   const {
     session,
     messageCount,
@@ -1176,6 +1194,9 @@ function SessionPage() {
       nodeLabel={session.nodeLabel ?? localNode?.nodeLabel}
       nodeUrl={session.nodeUrl}
       nodeStatus={session.nodeStatus}
+      jumpTo={jumpTo}
+      onJumpDone={onJumpDone}
+      revealPin={revealPin}
     />
   );
 }
@@ -1453,14 +1474,50 @@ function SessionRouteComponent() {
   return <SessionPage />;
 }
 
+/**
+ * #6453 (KD10): `at` is the chat spot to open at (`pin:<key>`, the "In chat"
+ * target, or a bookmark id) and `pin` the pin to open the Pins tab at. Both are
+ * OPTIONAL via the explicit return type (the `readFilesLocation` pattern).
+ */
+type SessionChatSearch = {
+  at?: string;
+  pin?: string;
+};
+
+/**
+ * A search value as text. The default search parser JSON-parses values, so a
+ * hand-typed `?pin=12` arrives as a number and `?pin=true` as a boolean.
+ */
+function searchText(value: unknown): string | undefined {
+  if (typeof value === "string") return value || undefined;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return undefined;
+}
+
+export function readSessionChatSearch(
+  search: Record<string, unknown>
+): SessionChatSearch {
+  // #6453 (IR-4): both keys are ALWAYS present, as `undefined` when unreadable.
+  // This result is merged over the raw search (`{...raw, ...validated}`), so an
+  // omitted key would let a raw array or object through to `useSearch` (the
+  // #5417 trap, `parseReloginSearch`).
+  return { at: searchText(search.at), pin: searchText(search.pin) };
+}
+
 const sessionRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId",
+  validateSearch: readSessionChatSearch,
   // Issue #3516: guard against re-entering a mid-delete session from a stale link.
   // Keyed on isActionPending(id, "delete") ONLY (K12) — a #3515 `spawning`
   // placeholder is also absent from the cache but is NOT delete-pending, so it is
   // untouched. The mark is cleared by the delete mutation's onSettled (+ 90s TTL),
   // after which the not-found UI handles a genuinely-stale link.
+  // #6453 (R13): `?pin=` and `?at=` are weighed by SessionChat's open-redirect,
+  // which knows whether the Pins gate is open; with it closed the persisted view
+  // wins, as before G.
   beforeLoad: ({ params }) => {
     if (isActionPending(params.sessionId, "delete")) {
       throw redirect({ to: "/sessions", replace: true });
@@ -1511,6 +1568,41 @@ const sessionDesktopRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/sessions/$sessionId/desktop",
   component: DesktopPage,
+});
+
+// #6449: the Pins view (epic #6446). The page gates itself: a closed pins gate
+// replaces this route with Chat (R18).
+function PinsRoutePage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex h-full items-center justify-center">
+          <LoadingState label="Loading pins…" className="text-sm" />
+        </div>
+      }
+    >
+      <LazyPinsPage />
+    </Suspense>
+  );
+}
+
+/** #6453: the pin to reveal; optional, like the chat route's search. */
+type SessionPinsSearch = {
+  pin?: string;
+};
+
+export function readSessionPinsSearch(
+  search: Record<string, unknown>
+): SessionPinsSearch {
+  // Always present, as `undefined` when unreadable (see readSessionChatSearch).
+  return { pin: searchText(search.pin) };
+}
+
+const sessionPinsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/sessions/$sessionId/pins",
+  validateSearch: readSessionPinsSearch,
+  component: PinsRoutePage,
 });
 
 const sessionClaudePtyRoute = createRoute({
@@ -1596,20 +1688,6 @@ const extensionsRoute = createRoute({
   component: ExtensionMarketplacePage,
 });
 
-function AnalyticsRoutePage() {
-  return (
-    <Suspense
-      fallback={
-        <div className="flex h-full items-center justify-center text-[var(--app-muted)]">
-          Loading analytics...
-        </div>
-      }
-    >
-      <LazyAnalyticsPage />
-    </Suspense>
-  );
-}
-
 // #2745 feedback round: Analytics + Account Usage are Settings-menu pages, so
 // they live under /settings/* like every other settings page (#2765's rule).
 // Legacy top-level paths redirect in legacyAdminRedirects.tsx.
@@ -1643,7 +1721,7 @@ const settingsFederationRoute = createRoute({
 // Reads the `$nodeId` path param (was a `?nodeId=` search param pre-#1935).
 function AdminFederationNodeRoutePage() {
   const { nodeId } = useParams({ from: "/settings/federation/$nodeId" });
-  return <NodeDetailView nodeId={nodeId} />;
+  return <NodeDetailViewPage nodeId={nodeId} />;
 }
 
 const settingsFederationNodeRoute = createRoute({
@@ -1850,6 +1928,7 @@ export const routeTree = rootRoute.addChildren([
   sessionRoute,
   sessionTerminalRoute,
   sessionDesktopRoute,
+  sessionPinsRoute,
   sessionClaudePtyRoute,
   sessionFilesRoute,
   sessionFileRoute,

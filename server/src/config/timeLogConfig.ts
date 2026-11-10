@@ -41,7 +41,7 @@ function getServerDefaultTimezone(): string {
   }
 }
 
-function isValidTimezone(tz: string): boolean {
+export function isValidTimezone(tz: string): boolean {
   // The cheapest cross-runtime IANA validation: ask Intl to construct a formatter.
   // Invalid identifiers throw RangeError. Valid ones (including unusual zones like
   // "Etc/GMT-12") are accepted.
@@ -131,6 +131,21 @@ export async function loadTimeLogConfig(
     timezone: resolveLocalTimeLogTimezone(settings, serverDefault),
     isFederation: false,
   };
+}
+
+/**
+ * The zone the operator chose, or `null` when they chose none: the federation
+ * value, else a valid node-local `timeLogPreferences.timezone`. Never the host
+ * zone, so a caller can put the operator's own browser zone ahead of it (#6450).
+ */
+export async function loadTimeLogPreferenceTimezone(
+  dataDir: string
+): Promise<string | null> {
+  const settings = await readSettings(getSettingsFile(dataDir));
+  return (
+    resolveFederationTimeLogTimezone(settings) ??
+    (resolveLocalTimeLogTimezone(settings, "") || null)
+  );
 }
 
 /**

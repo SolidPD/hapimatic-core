@@ -9,9 +9,10 @@
  * DE-DUPLICATING (shared `buildRespawnBase` + the `spawnSession` facade), NOT by
  * hand-rolling teardown at the route layer (KD-1).
  *
- * KD-2 / R2: model / permission-mode / MCP / effort / rawModel are NOT relaunch
- * fields — they apply live via their own routes. This path is ONLY for launcher /
- * safeMode (R3), which are frozen at spawn (`session.metadata.launcherKind /
+ * KD-2 / R2: model / permission-mode / effort / rawModel are NOT relaunch
+ * fields — they apply live via their own routes. This path is for launcher /
+ * safeMode (R3) and, since #6171, the session's MCP set (its deny list is read
+ * at start, so a change needs a restart), all frozen at spawn (`session.metadata.launcherKind /
  * safeMode`). `archiveSession` + `spawnSession` are injected as SyncEngine facade
  * callbacks (mirrors AccountRestart) so test spies still apply.
  */
@@ -23,6 +24,9 @@ import type { RpcGateway } from "./rpcGateway";
 import type { TurnLifecycle } from "./turnLifecycle";
 import type { ErrorLogger } from "../logging/errorLogger";
 import { buildRespawnBase } from "./respawnBase";
+import type { McpSet } from "@hapi/protocol";
+import type { McpCatalogService } from "../services/mcpCatalogService";
+import { resolveSpawnMcpSet } from "../services/mcpSetResolver";
 import { gracefulTurnInterruptBeforeKill } from "./gracefulTurnInterrupt";
 
 type SpawnSessionResult =
@@ -42,11 +46,16 @@ type ArchiveSessionFn = (
 export type RelaunchOverrides = {
   launcher?: ClaudeRemoteLauncherKind;
   safeMode?: boolean;
+  /** Issue #6171: the session's new MCP set. */
+  mcpSet?: McpSet;
+  /** Issue #6171: save `mcpSet` on the session with no respawn — for when an
+   *  account switch is about to restart it anyway (one restart, not two). */
+  persistOnly?: boolean;
 };
 
 export type RelaunchResult =
   | { type: "success" }
-  | { type: "error"; message: string; code?: string };
+  | { type: "error"; message: string; code?: string; servers?: string[] };
 
 export interface SessionRelaunchDeps {
   sessionCache: SessionCache;
@@ -62,6 +71,8 @@ export interface SessionRelaunchDeps {
   apiKeyPlacementRefusal: (
     session: Session
   ) => Promise<ApiKeyPlacementRefusal | null>;
+  /** Issue #6171: the MCP catalog, for the project-disabled refusal. */
+  getMcpCatalog?: () => McpCatalogService | null;
 }
 
 export class SessionRelaunch {
@@ -72,6 +83,7 @@ export class SessionRelaunch {
   private readonly spawnSession: SpawnSessionFn;
   private readonly getTurnLifecycle: () => TurnLifecycle | null;
   private readonly apiKeyPlacementRefusal: SessionRelaunchDeps["apiKeyPlacementRefusal"];
+  private readonly getMcpCatalog: () => McpCatalogService | null;
 
   constructor(deps: SessionRelaunchDeps) {
     this.sessionCache = deps.sessionCache;
@@ -81,6 +93,7 @@ export class SessionRelaunch {
     this.spawnSession = deps.spawnSession;
     this.getTurnLifecycle = deps.getTurnLifecycle;
     this.apiKeyPlacementRefusal = deps.apiKeyPlacementRefusal;
+    this.getMcpCatalog = deps.getMcpCatalog ?? (() => null);
   }
 
   /**
@@ -118,6 +131,55 @@ export class SessionRelaunch {
     if (!session) {
       return { type: "error", message: "Session not found", code: "not_found" };
     }
+
+    // Issue #6171: the MCP set. Checked first so a refusal tears nothing down; a
+    // stopped session (or `persistOnly`) just records it, and the next start —
+    // reconnect, or the account switch the modal stages with it — applies it.
+    const spawnOverride =
+      overrides.launcher !== undefined || overrides.safeMode !== undefined;
+    if (overrides.persistOnly && (!overrides.mcpSet || spawnOverride)) {
+      return {
+        type: "error",
+        message:
+          "persistOnly saves an MCP set alone, with no launcher or safe-mode change",
+        code: "invalid_request",
+      };
+    }
+    let mcpSet: McpSet | undefined;
+    if (overrides.mcpSet !== undefined) {
+      const resolution = resolveSpawnMcpSet({
+        requested: overrides.mcpSet,
+        directory: session.metadata?.path ?? "",
+        flavor: session.metadata?.flavor ?? "claude",
+        safeMode: (overrides.safeMode ?? session.metadata?.safeMode) === true,
+        catalog: session.metadata?.path ? this.getMcpCatalog() : null,
+      });
+      if (!resolution.ok) {
+        return {
+          type: "error",
+          message: resolution.message,
+          code: resolution.code,
+          ...(resolution.servers ? { servers: resolution.servers } : {}),
+        };
+      }
+      mcpSet = resolution.mcpSet;
+      if (overrides.persistOnly || (!session.active && !spawnOverride)) {
+        // `enableForProject` is kept: the wrapper applies it at the next start
+        // and stamps the set without it, so it is used once.
+        const saved = await this.sessionCache.updateSessionMetadataFields(
+          sessionId,
+          current => ({ ...current, mcpSet })
+        );
+        return saved
+          ? { type: "success" }
+          : {
+              type: "error",
+              message: "Could not save the MCP set on the session",
+              code: "metadata_write_failed",
+            };
+      }
+    }
+
     if (!session.active) {
       return {
         type: "error",
@@ -204,6 +266,8 @@ export class SessionRelaunch {
       ...respawnBase,
       launcher: overrides.launcher ?? respawnBase.launcher,
       safeMode: overrides.safeMode ?? respawnBase.safeMode,
+      // Issue #6171: the new set (the rollback below keeps the old one).
+      ...(mcpSet ? { mcpSet } : {}),
     });
     if (spawnResult.type === "success") {
       return { type: "success" };

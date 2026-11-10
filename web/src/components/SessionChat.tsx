@@ -77,58 +77,18 @@ import {
 import { Spinner } from "@/components/Spinner";
 import { ViewPicker } from "@/components/session/ViewPicker";
 import {
-  computeEffectiveSessionView,
   hasConsumedOpenRedirect,
-  isSessionViewAvailable,
   markOpenRedirectConsumed,
+  pendingOpenRedirect,
   sessionViewToPath,
 } from "@/lib/session-view";
-
-// #3638: gutter expand/compress glyphs — the exact paths from the binding mockup
-// (claudedocs/design-mockups/r16/thread-fade-fullscreen.html, panels A/D). Defined
-// inline here (BrandedFrame's RefreshIcon/ChevronLeftIcon precedent) rather than in
-// icons.tsx, to keep the change within this feature's file scope.
-function ThreadMaximizeIcon(props: { className?: string }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={props.className}
-      aria-hidden="true"
-    >
-      <polyline points="15 3 21 3 21 9" />
-      <polyline points="9 21 3 21 3 15" />
-      <line x1="21" y1="3" x2="14" y2="10" />
-      <line x1="3" y1="21" x2="10" y2="14" />
-    </svg>
-  );
-}
-
-function ThreadMinimizeIcon(props: { className?: string }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={props.className}
-      aria-hidden="true"
-    >
-      <polyline points="4 14 10 14 10 20" />
-      <polyline points="20 10 14 10 14 4" />
-      <line x1="14" y1="10" x2="21" y2="3" />
-      <line x1="3" y1="21" x2="10" y2="14" />
-    </svg>
-  );
-}
+import { useSessionViewOptions } from "@/hooks/useSessionViewOptions";
+import { PinsSubmitStrip } from "@/components/AssistantChat/PinsSubmitStrip";
+import { ChatJumpMount } from "@/components/ChatJumpMount";
+import {
+  ThreadMaximizeIcon,
+  ThreadMinimizeIcon,
+} from "@/components/SessionChat.icons";
 
 export function SessionChat(props: {
   api: ApiClient;
@@ -161,6 +121,15 @@ export function SessionChat(props: {
    * and must NOT lift the app-bar-hide flag (the app bar is shared by both panes).
    */
   inSplitPane?: boolean;
+  /**
+   * #6453 (R11, R12): the routed page's `?at=` — `pin:<key>` or a bookmark id.
+   * A split pane never passes it, so a pane never jumps.
+   */
+  jumpTo?: string;
+  /** Called when the jump ends, so the route clears `at`. */
+  onJumpDone?: () => void;
+  /** #6453 (R12, R13): the routed page's `?pin=`, revealed in the Pins tab. */
+  revealPin?: string;
 }) {
   const { haptic } = usePlatform();
   const navigate = useNavigate();
@@ -328,6 +297,10 @@ export function SessionChat(props: {
   // state, the X2 local dock-collapse override, the X1 Back interceptor +
   // blocker, and X4 per-device persistence + restore. The app-bar hide is lifted
   // via useThreadFullscreen and set by the hook in single view only.
+  const viewOptions = useSessionViewOptions(props.session.id); // #6449
+  // #6453 (R13): a `?pin=` or `?at=` link works only while the Pins gate is open.
+  const jumpAllowed = viewOptions.settled && viewOptions.pinsEnabled === true;
+  const link = props.revealPin ? "pin" : props.jumpTo ? "at" : null;
   const {
     isFullscreen,
     toggleFullscreen,
@@ -338,6 +311,8 @@ export function SessionChat(props: {
   } = useThreadFullscreenMode({
     session: props.session,
     inSplitPane: props.inSplitPane,
+    viewOptions,
+    link,
   });
   // #4004: iPad windowed mode overlays window controls on the full-screen gutter.
   const isIPadMultitasking = useIPadMultitasking();
@@ -644,19 +619,27 @@ export function SessionChat(props: {
   // R7) or when the server value arrives (cross-device). Back-loop-safe: the
   // consumed flag is set here and cleared only when navigation leaves the session
   // (router reconcile), so Back — which strips the last segment to the chat route
-  // (useAppGoBack) — never re-loops, yet a genuine reopen re-arms.
+  // (useAppGoBack) — never re-loops, yet a genuine reopen re-arms. #6449: a
+  // persisted Pins view waits (unconsumed) until the version + detail answer.
+  // #6453 (R13): so does a Pins link, which works only with Pins on.
+  const { revealPin } = props;
   useEffect(() => {
     const sid = props.session.id;
     if (hasConsumedOpenRedirect(sid)) return;
-    const effectiveView = computeEffectiveSessionView(props.session, sid);
-    if (
-      effectiveView !== "chat" &&
-      isSessionViewAvailable(effectiveView, props.session)
-    ) {
-      markOpenRedirectConsumed(sid);
-      navigate({ to: sessionViewToPath(effectiveView, sid) });
+    const decision = pendingOpenRedirect(props.session, sid, viewOptions, link);
+    if (decision.kind === "pending" || decision.kind === "none") return;
+    markOpenRedirectConsumed(sid);
+    if (decision.kind === "reveal") {
+      navigate({
+        to: "/sessions/$sessionId/pins",
+        params: { sessionId: sid },
+        search: { pin: revealPin },
+        replace: true,
+      });
+    } else if (decision.kind === "redirect") {
+      navigate({ to: sessionViewToPath(decision.view, sid) });
     }
-  }, [props.session, navigate]);
+  }, [props.session, navigate, viewOptions, link, revealPin]);
 
   // Handler for moving notes content to composer (#1075: text + attachments).
   // Appends the text and absorbs the notes attachments into the composer's box.
@@ -895,6 +878,21 @@ export function SessionChat(props: {
 
   return (
     <div className="flex h-full flex-col" {...swipeBackHandlers}>
+      {props.jumpTo && props.onJumpDone && jumpAllowed ? (
+        <ChatJumpMount
+          api={props.api}
+          sessionId={props.session.id}
+          at={props.jumpTo}
+          viewportRef={viewportRefForNav}
+          messages={props.messages}
+          bookmarks={bookmarks.bookmarks}
+          bookmarksLoading={bookmarks.isLoading}
+          loadMore={props.onLoadMore}
+          hasMore={props.hasMoreMessages}
+          isLoadingMore={props.isLoadingMoreMessages}
+          onDone={props.onJumpDone}
+        />
+      ) : null}
       {/* #3638: full-screen page mode hides the tab strip (pane-local chrome, so
           hidden in split view too). */}
       {!isFullscreen && (
@@ -1307,6 +1305,7 @@ export function SessionChat(props: {
                 </Button>
               </div>
             ) : null}
+            <PinsSubmitStrip api={props.api} session={props.session} />
             <HappyComposer
               disabled={props.isSending}
               permissionMode={props.session.permissionMode}

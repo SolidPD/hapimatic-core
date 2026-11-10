@@ -38,6 +38,8 @@ type SessionAlivePayload = {
   appliedEffort?: string | null;
   appliedModel?: string;
   appliedForEffort?: string | null;
+  // Issue #6169: CLI-reported prompt-cache state (validated in sessionCache).
+  promptCache?: unknown;
   // Composer-chip pin integrity: pinned raw model id; `null` = pin cleared.
   rawModel?: string | null;
   resolvedModel?: string;

@@ -12,7 +12,11 @@
  * rewrite of inline meta objects.
  */
 import { z } from "zod";
-import { ContextUsageDetailSchema } from "@hapi/protocol";
+import {
+  CacheKeepaliveRequestSchema,
+  CacheKeepaliveResponseSchema,
+  ContextUsageDetailSchema,
+} from "@hapi/protocol";
 import type { CapabilityMeta } from "./types";
 
 const abortInput = z.object({});
@@ -133,6 +137,22 @@ export const SET_MODEL_META: CapabilityMeta = {
   inputSchema: z.toJSONSchema(setModelInput),
   riskTier: "mutating",
   since: "2026-08-08",
+};
+
+/**
+ * `cache-keepalive` (issue #6169) — renew the session's prompt cache while it
+ * waits, via Claude Code's `side_question` fork (no tools, no transcript line, no
+ * hooks; the main agent never sees it). `mutating`: it spends quota on a model
+ * request, so the readonly-only invoke gate must keep it off the generic
+ * `hapi_invoke` path; only the server's keep-alive scheduler calls it.
+ */
+export const CACHE_KEEPALIVE_META: CapabilityMeta = {
+  description:
+    "Renew the session's prompt cache while it is idle, through a Claude Code side question the main agent never sees (no tools, no transcript). Called by the server's keep-alive scheduler; it refuses when a turn is in flight, the cache is not 1-hour, or the warm window has closed. Mutating — spends quota, so the readonly invoke gate blocks it.",
+  inputSchema: z.toJSONSchema(CacheKeepaliveRequestSchema),
+  outputSchema: z.toJSONSchema(CacheKeepaliveResponseSchema),
+  riskTier: "mutating",
+  since: "2026-11-07",
 };
 
 // ── Issue #3745 (epic #3740, Sub-Issue E) — full cli-side surface ─────────────

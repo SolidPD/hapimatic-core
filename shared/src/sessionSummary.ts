@@ -16,6 +16,7 @@ import type {
   WorktreeMetadata,
 } from "./schemas";
 import type { ClaudeRemoteLauncherKind } from "./launcherResolver";
+import type { McpSet } from "./mcpSet";
 
 /**
  * Recovery status for sessions that persist across restarts
@@ -129,6 +130,10 @@ export type SessionSummaryMetadata = {
    *  modal can mark the session's current key (#4823's current-key marker)
    *  without the detail-path record. Absent for every non-key session. */
   apiKeyId?: string;
+  /** Issue #6171: the session's MCP set, projected so a LIST-opened Session
+   *  Configuration modal knows a set session changes servers by relaunch (and
+   *  starts from the set's membership). Absent for a session without one. */
+  mcpSet?: McpSet;
   /** Issue #2150: set ONLY on a hub-side federation spawn placeholder row in
    *  `/federation/all-sessions` — the caller-generated correlation id the row is
    *  keyed by, so a poller (CLI or web) can match the row to its own spawn. */
@@ -264,6 +269,12 @@ export type SessionSummary = {
    * list / SSE / federation flow (no new field on `LinkedIssue`, no migration).
    */
   workflowBadge?: SessionWorkflowBadge | null;
+  /**
+   * Issue #6447: pins with status `open`, for the Pins tab badge. Absent means the
+   * owning node cannot serve pins (its gate is closed, or it is an older peer), so
+   * treat `undefined` as unknown, not zero.
+   */
+  openPinCount?: number;
   /** Manual read/unread override for cross-device sync */
   needsReviewOverride?: "read" | "unread" | null;
   /** Per-session auto-recover override: null=follow global, true=force on, false=force off */
@@ -296,7 +307,8 @@ export function toSessionSummary(
   session: Session,
   messageCount?: number,
   childBranchCount?: number,
-  workflowBadge?: SessionWorkflowBadge | null
+  workflowBadge?: SessionWorkflowBadge | null,
+  openPinCount?: number
 ): SessionSummary {
   const requests = session.agentState?.requests ?? {};
   const pendingRequestsCount = Object.keys(requests).length;
@@ -351,6 +363,8 @@ export function toSessionSummary(
         // #4568: the API-key binding's vault id (mirrors authBinding) — the
         // current-key marker on a list-opened modal reads it.
         apiKeyId: session.metadata.apiKeyId,
+        // #6171: the MCP set (mirrors apiKeyId) — a list-opened modal reads it.
+        mcpSet: session.metadata.mcpSet,
       }
     : null;
 
@@ -405,5 +419,7 @@ export function toSessionSummary(
     branchCreatedAt: session.branchCreatedAt ?? null,
     childBranchCount: childBranchCount ?? 0,
     workflowBadge: workflowBadge ?? null,
+    // Spread only when defined, so a closed Pins gate produces no key at all.
+    ...(openPinCount !== undefined ? { openPinCount } : {}),
   };
 }

@@ -485,6 +485,10 @@ export class ApiMachineClient {
           cloneRepo,
           sessionRole,
           outputStyle,
+          // Issue #6171: destructure the MCP set + known names from the wire
+          // payload (#1262 trap — un-listed here, the session starts every server).
+          mcpSet,
+          mcpKnown,
           // Issue #3348: destructure the bundled non-claude native model
           // selection from the wire payload (#1262 trap — un-listed here, the
           // daemon never sets GEMINI_MODEL / bakes the codex config.toml model).
@@ -583,6 +587,11 @@ export class ApiMachineClient {
           // --hapi-output-style, so the style never reaches the --settings file
           // and R1 fails silently). Guarded by apiMachine.spawnOutputStyle.test.ts.
           outputStyle,
+          // Issue #6171: forward the MCP set + known names to the daemon
+          // spawnSession (#1262 trap — omit them and the daemon never appends
+          // --hapi-mcp-set). Guarded by apiMachine.spawnMcpSet.test.ts.
+          mcpSet,
+          mcpKnown,
           // Issue #3348: forward the bundled non-claude native model selection to
           // the daemon spawnSession (#1262 trap — omit it and the daemon never
           // sets GEMINI_MODEL / bakes the codex config.toml model + effort).

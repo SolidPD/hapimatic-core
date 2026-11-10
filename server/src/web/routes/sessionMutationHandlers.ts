@@ -70,6 +70,8 @@ export type ProxyResult =
       code?: string;
       // Issue #5879: a peer's validated `account_exhausted` detail (rebind proxy).
       exhaustion?: AccountExhaustion;
+      // Issue #6171: the servers a peer's `mcp_server_project_disabled` names.
+      servers?: string[];
     };
 
 /**
@@ -550,7 +552,7 @@ export const VIEW_MUTATION = defineFieldMutation({
     domain: "session-lifecycle",
     surface: "rest",
     description:
-      "Persist a session's selected view (chat, terminal, desktop, files) on the node that owns it. Peer-incoming PUT field receiver for a remote-owned session.",
+      "Persist a session's selected view (chat, pins, terminal, desktop, files) on the node that owns it. Peer-incoming PUT field receiver for a remote-owned session.",
     whenToUse:
       "When updating the selected view of a session whose process lives on a remote federation node.",
     invocation: {
@@ -570,7 +572,7 @@ export const VIEW_MUTATION = defineFieldMutation({
   applyCache: (registry, id, value) =>
     registry.updateCachedSessionView(id, value),
   clientInvalidBodyMessage:
-    'Invalid body: view must be "chat", "terminal", "desktop", "files", or null',
+    'Invalid body: view must be "chat", "pins", "terminal", "desktop", "files", or null',
   federationErrorCategory: "federation-update-view",
   federationErrorFallback: "Failed to update session view",
 });

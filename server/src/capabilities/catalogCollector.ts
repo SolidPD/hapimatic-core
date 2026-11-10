@@ -48,11 +48,12 @@
 import type { Hono } from "hono";
 import { CAPABILITY_TAG, CLOSED_GATE_TAG } from "./cataloged";
 import { capabilityCatalogIndex } from "@hapi/protocol";
-import type { CatalogEntry, Surface } from "@hapi/protocol";
+import type { CatalogEntry, CatalogGate, Surface } from "@hapi/protocol";
 import type { WebAppEnv } from "../web/middleware/auth";
 import type { RpcRegistry } from "../socket/rpcRegistry";
 import type { CapabilityMeta } from "../socket/handlers/cli/rpcHandlers";
 import type { ErrorLogger } from "../logging/errorLogger";
+import { resolvePinsEnabled } from "../config/pinsConfig";
 
 /**
  * Hono stores the original handler on a COMPOSED one under this well-known key
@@ -111,6 +112,14 @@ export interface CatalogProviderOptions {
    * reverse drift.
    */
   extensionEntries?: readonly CatalogEntry[];
+  /**
+   * The instance gates that are open here (#6448). An entry whose
+   * `availability.gate` is not in this list is left out of every bucket, the way
+   * a closed gate's REST route is (#5571), so `hapi_catalog` and
+   * `GET /api/capabilities/catalog` never name a tool this instance did not
+   * register. Absent means every gate is closed.
+   */
+  openGates?: readonly CatalogGate[];
 }
 
 /** The static (non-`rpc`) half of the catalog, collected once at boot. */
@@ -156,6 +165,24 @@ function readHandlerMark(handler: unknown, key: symbol): unknown {
     : undefined;
 }
 
+/** #6449: the Pins tab's `ui` entry, which a closed pins gate does not advertise. */
+export const PINS_UI_ENTRY_ID = "ui.session-pins";
+
+/**
+ * #6449: drop the Pins tab's `ui` entry while the pins gate is closed, matching
+ * the exact id. A closed gate leaves nothing advertising a tab that does not
+ * exist yet (A's rule, `web/middleware/pinsGate.ts`); the REST pin routes are
+ * omitted through their closed-gate mark above.
+ */
+export function withoutClosedPinsUi<T extends { id: string }>(
+  entries: T[],
+  pinsEnabled: boolean = resolvePinsEnabled()
+): T[] {
+  return pinsEnabled
+    ? entries
+    : entries.filter(entry => entry.id !== PINS_UI_ENTRY_ID);
+}
+
 /**
  * Collect the STATIC catalog ONCE from the fully-mounted app. Fail-soft: any
  * error logs and yields the empty static shape (never throws).
@@ -163,7 +190,8 @@ function readHandlerMark(handler: unknown, key: symbol): unknown {
 function collectStaticCatalog(
   app: Hono<WebAppEnv>,
   extensionEntries: readonly CatalogEntry[] = [],
-  errorLogger?: ErrorLogger | null
+  errorLogger?: ErrorLogger | null,
+  openGates: readonly CatalogGate[] = []
 ): StaticCatalog {
   try {
     // Group by "METHOD PATH". A cataloged route registers >= 2 `app.routes`
@@ -231,12 +259,22 @@ function collectStaticCatalog(
       );
     };
 
+    // #6448: drop a closed gate's entries AFTER the extension merge, because an
+    // extension manifest's entries pass `catalogEntrySchema` too and could carry
+    // a gate. An ungated entry always passes, so with no gated entries every
+    // bucket is the byte-identical shape.
+    const ungatedOrOpen = (entries: CatalogEntry[]): CatalogEntry[] =>
+      entries.filter(entry => {
+        const gate = entry.availability?.gate;
+        return gate === undefined || openGates.includes(gate);
+      });
+
     return {
-      rest: withExt(rest, "rest"),
+      rest: ungatedOrOpen(withExt(rest, "rest")),
       uncatalogedRest,
-      mcp: withExt(bySurface("mcp"), "mcp"),
-      cli: withExt(bySurface("cli"), "cli"),
-      ui: withExt(bySurface("ui"), "ui"),
+      mcp: ungatedOrOpen(withExt(bySurface("mcp"), "mcp")),
+      cli: ungatedOrOpen(withExt(bySurface("cli"), "cli")),
+      ui: ungatedOrOpen(withExt(withoutClosedPinsUi(bySurface("ui")), "ui")),
     };
   } catch (err) {
     errorLogger?.error(
@@ -325,7 +363,8 @@ export function buildCatalogProvider(
   const staticPart = collectStaticCatalog(
     app,
     options?.extensionEntries,
-    options?.errorLogger
+    options?.errorLogger,
+    options?.openGates
   );
   return () => {
     try {

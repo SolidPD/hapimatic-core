@@ -343,9 +343,13 @@ export type ReapOrphanMcpResult = {
 };
 
 /** Where /proc lives and how to read one of its files (both injectable). */
-type ProcFs = { root: string; readFile: (path: string) => string };
+export type ProcFs = { root: string; readFile: (path: string) => string };
 
-function readProcFile(fs: ProcFs, pid: number, name: string): string | null {
+export function readProcFile(
+  fs: ProcFs,
+  pid: number,
+  name: string
+): string | null {
   try {
     return fs.readFile(join(fs.root, String(pid), name));
   } catch {
@@ -354,14 +358,18 @@ function readProcFile(fs: ProcFs, pid: number, name: string): string | null {
   }
 }
 
-function readArgv(fs: ProcFs, pid: number): string[] | null {
+export function readArgv(fs: ProcFs, pid: number): string[] | null {
   const raw = readProcFile(fs, pid, "cmdline");
   if (!raw) return null;
   const argv = normalizeArgv(raw.split("\0"));
   return argv.length > 0 ? argv : null;
 }
 
-function readEnvValue(fs: ProcFs, pid: number, key: string): string | null {
+export function readEnvValue(
+  fs: ProcFs,
+  pid: number,
+  key: string
+): string | null {
   const raw = readProcFile(fs, pid, "environ");
   if (!raw) return null;
   const prefix = `${key}=`;
@@ -369,7 +377,7 @@ function readEnvValue(fs: ProcFs, pid: number, key: string): string | null {
   return entry === undefined ? null : entry.slice(prefix.length);
 }
 
-function readStat(fs: ProcFs, pid: number): ProcStat | null {
+export function readStat(fs: ProcFs, pid: number): ProcStat | null {
   const raw = readProcFile(fs, pid, "stat");
   return raw === null ? null : parseProcStat(raw);
 }

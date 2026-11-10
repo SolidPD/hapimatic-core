@@ -13,6 +13,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/Toast";
 import { queryKeys } from "@/lib/query-keys";
+import {
+  openPinsArchiveNote,
+  sumOpenPins,
+  withOpenPinsNote,
+} from "@/lib/pins/archiveWarning";
 
 type GlobalConnectPopoverProps = {
   sessions: SessionSummary[];
@@ -160,7 +165,12 @@ export function GlobalConnectPopover({
         isOpen={confirmAction === "disconnect"}
         onClose={() => setConfirmAction(null)}
         title="Disconnect All Sessions"
-        description={`Disconnect all ${connectableSessions.length} active session${connectableSessions.length === 1 ? "" : "s"}?`}
+        description={withOpenPinsNote(
+          `Disconnect all ${connectableSessions.length} active session${connectableSessions.length === 1 ? "" : "s"}?`,
+          openPinsArchiveNote(sumOpenPins(connectableSessions), {
+            several: connectableSessions.length > 1,
+          })
+        )}
         confirmLabel="Disconnect All"
         confirmingLabel="Disconnecting..."
         onConfirm={handleDisconnectAll}

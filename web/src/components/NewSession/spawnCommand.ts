@@ -8,7 +8,7 @@ import {
 } from "@hapi/protocol/modes";
 import { DEFAULT_OUTPUT_STYLE_DEFAULT } from "@hapi/protocol/schemas";
 import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
-import type { EffortLevel } from "@hapi/protocol";
+import type { EffortLevel, McpSet } from "@hapi/protocol";
 import type { ExistingBranch } from "@hapi/protocol/gitBranches";
 import type { AgentType, SessionType } from "./types";
 
@@ -127,6 +127,12 @@ export type SpawnSelections = {
    * the live preview AND the real spawn read it from ONE source (#1949 R4).
    */
   cloneRepo: string | null;
+  /**
+   * Issue #6171: the MCP set, ALREADY gated (`fields.mcpServers.visible`) and
+   * only present once the user touched the picker. Absent ⇒ no field: the
+   * target applies the project's default, else every server.
+   */
+  mcpSet?: McpSet;
 };
 
 /**
@@ -237,6 +243,8 @@ export function buildSpawnInput(sel: SpawnSelections): SpawnInput {
       sel.outputStyle !== DEFAULT_OUTPUT_STYLE_DEFAULT
         ? sel.outputStyle
         : undefined,
+    // #6171: Claude-only (the server refuses a set for another agent).
+    mcpSet: sel.agent === "claude" ? sel.mcpSet : undefined,
   };
 }
 
@@ -347,10 +355,24 @@ export function assembleSpawnCommand(
   if (input.permissionMode)
     lines.push(`--permission-mode ${input.permissionMode}`);
   if (input.safeMode) lines.push("--safe-mode");
-  // #2149: MCP set — one `--mcp` line per enabled server (copy-params only). The
-  // create-flow preview passes no set, so these render only for the Edit modal.
-  for (const server of mcpServers ?? []) {
-    lines.push(`--mcp ${shellQuote(server)}`);
+  // #6171: the spawn's MCP set (`hapi api sessions spawn` flags) — one `--mcp`
+  // line per server, `--mcp-none` for an empty set, `--mcp-all` for every one.
+  // #2149: without one, the Edit modal's copy passes the session's enabled
+  // servers as `mcpServers` (the create preview passes none).
+  if (input.mcpSet?.mode === "all") {
+    lines.push("--mcp-all");
+  } else if (input.mcpSet?.mode === "only") {
+    if (input.mcpSet.servers.length === 0) lines.push("--mcp-none");
+    for (const server of input.mcpSet.servers) {
+      lines.push(`--mcp ${shellQuote(server)}`);
+    }
+    if (input.mcpSet.enableForProject?.length) {
+      lines.push("--mcp-enable-for-project");
+    }
+  } else {
+    for (const server of mcpServers ?? []) {
+      lines.push(`--mcp ${shellQuote(server)}`);
+    }
   }
   if (input.name) lines.push(`--name ${shellQuote(input.name)}`);
 

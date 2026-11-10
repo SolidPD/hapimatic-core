@@ -115,6 +115,10 @@ const SURFACE_LABEL: Record<string, string> = {
 function isRenderCandidate(entry: CatalogEntry): boolean {
   if (entry.trusted === false) return false;
   if (entry.surface === "ui" || entry.surface === "rest") return false;
+  // #6448: a gated entry is never rendered. The doc is a committed artifact the
+  // boot writer copies to the machine-global ~/.claude/agent-self-knowledge.md,
+  // which every instance on a host shares, gate open or not.
+  if (entry.availability?.gate !== undefined) return false;
   return true;
 }
 

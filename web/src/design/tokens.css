@@ -304,10 +304,43 @@
   --palette-view-terminal: #60a5fa; /* blue */
   --palette-view-desktop: #a78bfa; /* purple */
   --palette-view-files: #fbbf24; /* amber */
+  --palette-view-pins: #fb7185; /* rose (#6449) — the --accent-rose-400 value */
   --view-accent-chat: var(--palette-view-chat);
   --view-accent-terminal: var(--palette-view-terminal);
   --view-accent-desktop: var(--palette-view-desktop);
   --view-accent-files: var(--palette-view-files);
+  --view-accent-pins: var(--palette-view-pins);
+
+  /* ── Pins Ledger (#6449 · epic #6446, mockup v6 :37-40) ───────────────────
+     The Pins view's section outlines, section header bar, star, and per-kind
+     icon colors. Action Items is the one literal: it shares
+     --app-badge-error-text's value but not its meaning (a section that needs
+     you, not an error). Every other value references an existing primitive. */
+  --pins-section-action: #fca5a5;
+  --pins-section-completed: var(--app-hint);
+  --pins-section-header-bg: var(--app-banner-bg);
+  --pins-star: var(--accent-amber-300);
+  --pins-kind-decision: var(--accent-rose-400);
+  --pins-kind-variants: var(--accent-indigo-400);
+  --pins-kind-review: var(--accent-sky-400);
+  --pins-kind-steps: var(--accent-amber-300);
+  --pins-kind-dashboard: var(--accent-teal-400);
+  --pins-kind-detected: var(--status-cat-attention);
+  /* The timeline of automatic picks and its toggle while on (#6451). */
+  --pins-timeline: var(--accent-blue-400);
+  /* Project Managers (#6454, mockup v6 :37-40): the section is gold, the
+     --session-rel-spawn family every Project-Manager-managed group uses, and
+     lanes A to H take fixed accents; any later letter is gold. */
+  --pins-section-pm: var(--session-rel-spawn);
+  --pins-lane-a: var(--accent-mint);
+  --pins-lane-b: var(--accent-blue-400);
+  --pins-lane-c: var(--accent-violet-400);
+  --pins-lane-d: var(--accent-orange-400);
+  --pins-lane-e: var(--accent-pink-400);
+  --pins-lane-f: var(--accent-teal-400);
+  --pins-lane-g: var(--accent-amber-300);
+  --pins-lane-h: var(--accent-indigo-400);
+  --pins-lane-other: var(--session-rel-spawn);
 
   /* ── Named cyan accent (#3030 · OOS-2 convergence vocabulary) ─────────────
      ONE name for the audited #22d3ee decorative cyan that 5 sites inline today:

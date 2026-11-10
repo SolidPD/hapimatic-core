@@ -111,7 +111,16 @@ export type AuthResponse = {
 };
 
 export type SessionsResponse = { sessions: SessionSummary[] };
-export type SessionResponse = { session: Session; messageCount?: number };
+export type SessionResponse = {
+  session: Session;
+  messageCount?: number;
+  /**
+   * #6447/#6449: the session's open-pin count, present only while the pins
+   * gate is open on the owning node (and on the hub serving this client).
+   * `0` is a known count; absent means no Pins tab.
+   */
+  openPinCount?: number;
+};
 export type MessagesResponse = {
   messages: DecryptedMessage[];
   page: {
@@ -1113,6 +1122,17 @@ export type {
   McpToggleRequest,
   McpToggleResponse,
 } from "@hapi/protocol/types";
+// Issue #6171: the New Session picker's catalog.
+export type {
+  McpCatalogEntry,
+  McpCatalogResponse,
+} from "@hapi/protocol/schemas";
+export type McpCatalogRouteResponse =
+  | {
+      success: true;
+      catalog: import("@hapi/protocol/schemas").McpCatalogResponse;
+    }
+  | { success: false; error: string; code?: string };
 export type McpStatusResponse = {
   servers: McpServerStatus[];
   checkedAt: string | null;

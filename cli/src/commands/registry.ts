@@ -18,6 +18,7 @@ import { mcpCommand } from "./mcp";
 import { federationCommand } from "./federation";
 import { notifyCommand } from "./notify";
 import { securityCommand } from "./security";
+import { selftestCommand } from "./selftest";
 import { serverCommand } from "./server";
 import { voiceEngineCommand } from "./voiceEngine";
 import type { CommandContext, CommandDefinition } from "./types";
@@ -49,6 +50,7 @@ function ensureRegistry(): {
       opencodeCommand,
       launcherCommand,
       securityCommand,
+      selftestCommand,
       mcpCommand,
       extCommand,
       serverCommand,

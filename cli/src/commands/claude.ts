@@ -2,6 +2,7 @@
 import chalk from "chalk";
 import { execFileSync } from "node:child_process";
 import { z } from "zod";
+import { parseMcpSetLaunchArg } from "@hapi/protocol";
 import { SessionRoleSchema } from "@hapi/protocol/schemas";
 import type { StartOptions } from "@/claude/runClaude";
 import { parseSpawnPermissionSeed } from "@/claude/spawnPermissionSeed";
@@ -135,6 +136,18 @@ export const claudeCommand: CommandDefinition = {
         // (Task 1 spike, fail-open). Consumes the next token via `++i` like
         // --hapi-effort so the catch-all does not slurp it.
         options.outputStyle = args[++i];
+      } else if (arg === "--hapi-mcp-set") {
+        // Issue #6171: Hapimatic-internal — the MCP set and the known names,
+        // which runClaude turns into `deniedMcpServers`. Consumed via `++i` so the
+        // catch-all does not forward it to Claude. An unreadable value is dropped
+        // and logged: the session then starts every server (today's behavior).
+        const raw = args[++i];
+        const payload = parseMcpSetLaunchArg(raw);
+        if (payload) {
+          options.mcpSet = payload;
+        } else {
+          logger.warn("[CLAUDE] ignoring an unreadable --hapi-mcp-set value");
+        }
       } else if (arg === "--started-by") {
         options.startedBy = args[++i] as "daemon" | "terminal";
       } else {

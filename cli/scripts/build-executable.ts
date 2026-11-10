@@ -1,5 +1,13 @@
 import { dirname, isAbsolute, join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   computeRuntimeAssetsKey,
@@ -268,6 +276,11 @@ async function buildTarget(
     `--target=${target}`,
     `--outfile=${outfile}`,
     join(projectRoot, "src", "bootstrap.ts"),
+    // Issue #6516: the telemetry query worker. A compiled binary only carries
+    // a worker listed as an entrypoint (Premise P2). Both entrypoints live
+    // under src/, so the bundle root stays src/ and bootstrap keeps its path;
+    // the server loads the worker as ./workers/telemetryQueryWorker.ts.
+    join(projectRoot, "src", "workers", "telemetryQueryWorker.ts"),
   ];
 
   console.log(`[build:exe] ${cmd.join(" ")}`);
@@ -283,6 +296,47 @@ async function buildTarget(
   const exitCode = await proc.exited;
   if (exitCode !== 0) {
     throw new Error(`Build failed for target ${target} (exit ${exitCode})`);
+  }
+
+  if (isHostTarget(platform, arch)) {
+    await selftestTelemetryWorker(outfile, target);
+  } else {
+    console.log(
+      `[build:exe] ${target}: telemetry-worker selftest skipped (this host cannot run the binary; degraded mode covers it at runtime)`
+    );
+  }
+}
+
+function isHostTarget(platform: string, arch: string): boolean {
+  return platform === process.platform && arch === process.arch;
+}
+
+/**
+ * Issue #6516 (R7, V6): run the built binary's own telemetry-worker self-test
+ * and fail the build when it fails, so a binary whose bundled worker cannot
+ * start never ships. HAPI_HOME is a scratch dir: the CLI scans extensions
+ * under its home before any command runs.
+ */
+async function selftestTelemetryWorker(
+  outfile: string,
+  target: string
+): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), "hapi-build-selftest-"));
+  try {
+    const proc = Bun.spawn({
+      cmd: [outfile, "selftest", "telemetry-worker"],
+      env: { ...process.env, HAPI_HOME: home },
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const code = await proc.exited;
+    if (code !== 0) {
+      throw new Error(
+        `${target}: telemetry-worker selftest failed (exit ${code}); the binary's bundled query worker does not start`
+      );
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 }
 

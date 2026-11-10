@@ -110,6 +110,11 @@ export function isTier0Eligible(entry: CatalogEntry): boolean {
   // never Tier-0 — the always-injected ~650-token primer cannot hold the ~412
   // user-scope REST routes the epic rules into the catalog.
   if (entry.surface === "rest") return false;
+  // #6448: a gated entry is never Tier-0. Tier-0 renders from the static index at
+  // every system-prompt build, including the daemon's spawn path before the
+  // session exists, so it cannot know whether an instance's gate is open. The stdio bridge's
+  // declared tool list derives from this predicate and stays the ungated set.
+  if (entry.availability?.gate !== undefined) return false;
   if (entry.riskTier !== "readonly" && entry.riskTier !== "mutating") {
     return false;
   }

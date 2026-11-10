@@ -40,6 +40,21 @@ function extractRole(content: unknown): string | null {
   return null;
 }
 
+/** #6453: whether the session already stores a message with this `localId`. */
+export function hasMessageWithLocalId(
+  db: Database,
+  sessionId: string,
+  localId: string
+): boolean {
+  return Boolean(
+    db
+      .prepare(
+        "SELECT 1 FROM messages WHERE session_id = ? AND local_id = ? LIMIT 1"
+      )
+      .get(sessionId, localId)
+  );
+}
+
 export function addMessage(
   db: Database,
   sessionId: string,

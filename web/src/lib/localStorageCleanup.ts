@@ -16,6 +16,8 @@ import {
   syncPreferencesToCache,
 } from "@/lib/notificationPreferences";
 import { pruneSessionOrder } from "@/lib/sessionListManualOrder";
+import { pruneStaging } from "@/lib/pins/staging";
+import { prunePinsView } from "@/lib/pins/viewState";
 
 const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const MAX_ENTRIES = 500;
@@ -83,6 +85,12 @@ export function pruneOrphanedSessions(validIds: Set<string>): void {
   // Issue #466: prune the manual reorder store's per-group root-session order
   // (root ids are a subset of session ids; drop entries for deleted sessions).
   pruneSessionOrder(validIds);
+
+  // Issue #6450: staged pin answers, one key per session.
+  pruneStaging(validIds);
+
+  // Issue #6451: each session's Pins view (filters, sort, grouping).
+  prunePinsView(validIds);
 
   // Issue #87: muted sessions stored as string[] — drop ids for deleted
   // sessions and, when the set changed, re-sync the SW preferences cache so the

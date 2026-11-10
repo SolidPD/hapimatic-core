@@ -9,6 +9,10 @@
  * explicitly. This module holds only the arithmetic, DOM-free (it takes measured
  * numbers, not elements), so it is unit-testable under jsdom, which performs no
  * layout. The DOM-touching capture/restore lives in `HappyThread.tsx`.
+ *
+ * Issue #6122 adds the continuous reading anchor: `pickReadingAnchorIndex` chooses the block
+ * to hold while the user is scrolled up, and `computeContentOffsetDelta` measures how far
+ * content above it moved it.
  */
 
 export interface AnchorRestoreInput {
@@ -69,4 +73,56 @@ export function computeAnchorRestoreDelta({
     offset = targetOffset * (anchorHeightNow / anchorHeightCaptured);
   }
   return anchorTopNow - viewportTopNow - offset;
+}
+
+/**
+ * Index of the reading anchor among the thread's anchor candidates (issue #6122): the first
+ * candidate whose top is at or below the viewport's top edge, else the last one above it,
+ * else -1 when there are none.
+ *
+ * Candidates are in document order. In the thread's single flex column their tops never
+ * decrease (a nested block sits at or below its message's top), so a binary search finds the
+ * answer with about log2(count) reads; `topAt` is called lazily, so a caller can pass live
+ * `getBoundingClientRect().top` reads without measuring every candidate.
+ *
+ * Preferring a candidate fully below the top edge means growth inside a block that straddles
+ * the edge (above the reading line) still counts as growth above the anchor and is
+ * compensated, the same preference the browser's own scroll anchoring has.
+ */
+export function pickReadingAnchorIndex(
+  count: number,
+  topAt: (index: number) => number,
+  viewportTop: number
+): number {
+  if (count <= 0) return -1;
+  let lo = 0;
+  let hi = count - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (topAt(mid) >= viewportTop - 0.5) {
+      found = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return found === -1 ? count - 1 : found;
+}
+
+/**
+ * How far content above an anchor moved it (issue #6122), from two content-relative offsets:
+ * the anchor's top minus the content column's top, now and when it was last observed.
+ *
+ * Content-relative is the point. The user's own scrolling moves the anchor and the content
+ * column together, so it never shows up here. The viewport-relative form cannot tell a user
+ * scroll from a prepend, which is how the old load-older compensation undid scrolls made
+ * while a page was loading. A positive result means content above grew; scrolling down by it
+ * keeps the anchor where it was on screen.
+ */
+export function computeContentOffsetDelta(
+  offsetNow: number,
+  offsetAtBaseline: number
+): number {
+  return offsetNow - offsetAtBaseline;
 }

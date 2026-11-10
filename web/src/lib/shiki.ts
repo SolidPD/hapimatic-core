@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { createHighlighterCore } from "shiki/core";
-import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
-import type { HighlighterCore } from "shiki/core";
+import type { HighlighterCore, LanguageInput, ThemeInput } from "shiki/core";
 import { useState, useEffect, useMemo, type ReactNode } from "react";
 import { toJsxRuntime } from "hast-util-to-jsx-runtime";
 import { jsx, jsxs, Fragment } from "react/jsx-runtime";
 
+// #3098: shiki loads when the first code block highlights, not when this module
+// loads. That covers the engine (a static import before, so it sat in the main
+// bundle) and the two themes and 29 grammars (a module-level `import()` array,
+// so their ~1.5 MB of chunks were fetched and evaluated at every app start).
+// (toJsxRuntime stays static: react-markdown already puts it in the main
+// bundle.)
+
 // Only 2 themes
-const THEMES = [
+const loadThemes = (): ThemeInput[] => [
   import("@shikijs/themes/github-light"),
   import("@shikijs/themes/github-dark"),
 ];
 
-// 30 common languages for LLM code output
-const LANGS = [
+// 29 common languages for LLM code output
+const loadLangs = (): LanguageInput[] => [
   // Shell
   import("@shikijs/langs/shellscript"),
   import("@shikijs/langs/powershell"),
@@ -92,12 +97,35 @@ export const langAlias: Record<string, string> = {
 // Singleton highlighter instance
 let highlighterPromise: Promise<HighlighterCore> | null = null;
 
-function getHighlighter(): Promise<HighlighterCore> {
+async function createHighlighter(): Promise<HighlighterCore> {
+  // Start the themes and grammars together with the engine (one wait, not two).
+  const themes = loadThemes();
+  const langs = loadLangs();
+  // If the engine fails to load, these are never handed to shiki: settle them
+  // here so a failure among them is not reported as an unhandled rejection.
+  void Promise.allSettled([...themes, ...langs]);
+  const [{ createHighlighterCore }, { createJavaScriptRegexEngine }] =
+    await Promise.all([
+      import("shiki/core"),
+      import("shiki/engine/javascript"),
+    ]);
+  return createHighlighterCore({
+    themes,
+    langs,
+    engine: createJavaScriptRegexEngine({ forgiving: true }),
+  });
+}
+
+export function getHighlighter(): Promise<HighlighterCore> {
   if (!highlighterPromise) {
-    highlighterPromise = createHighlighterCore({
-      themes: THEMES,
-      langs: LANGS,
-      engine: createJavaScriptRegexEngine({ forgiving: true }),
+    const pending = createHighlighter();
+    highlighterPromise = pending;
+    // A chunk that fails to load (say, offline before the service worker has
+    // cached it) must not disable highlighting for the whole session: forget the
+    // failed attempt so a later code block tries again. A stale deploy is not
+    // fixed by a retry; main.tsx's vite:preloadError handler reloads the app.
+    pending.catch(() => {
+      if (highlighterPromise === pending) highlighterPromise = null;
     });
   }
   return highlighterPromise;
@@ -128,7 +156,14 @@ export function useShikiHighlighter(
     let cancelled = false;
 
     async function highlight() {
-      const highlighter = await getHighlighter();
+      let highlighter: HighlighterCore;
+      try {
+        highlighter = await getHighlighter();
+      } catch {
+        // The code stays plain text; getHighlighter() retries on the next block.
+        if (!cancelled) setHighlighted(null);
+        return;
+      }
       if (cancelled) return;
 
       const loadedLangs = highlighter.getLoadedLanguages();

@@ -56,7 +56,24 @@ import {
   type FeedbackPatch,
   type FeedbackPatchSaved,
 } from "@hapi/protocol/feedbackSink";
-import type { FeedbackConvertResponse } from "@/types/api";
+// #6449: types only. The pin schemas validate in the code-split Pins chunk
+// (hooks/queries/usePins.ts), so they stay out of the main bundle, whose size
+// `maximumFileSizeToCacheInBytes` in vite.config.ts caps for the PWA precache.
+import type {
+  PinDashboardsResponse,
+  PinDeadlineRequest,
+  PinGetResponse,
+  PinListResponse,
+  PinMutationResponse,
+  PinSaveResponse,
+  PinSubmissionRequest,
+  PinSubmissionResponse,
+} from "@hapi/protocol";
+import type {
+  FeedbackConvertResponse,
+  McpCatalogRouteResponse,
+} from "@/types/api";
+import type { McpSet } from "@hapi/protocol";
 import type { QueuedMessage, SessionView } from "@hapi/protocol/types";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type {
@@ -290,6 +307,32 @@ const FEDERATION_HEALTH_REPORT_OPTS: RequestReportOptions = {
 };
 
 /**
+ * Issue #6516 IR-2: the nine Analytics reads under `/api/telemetry/*` answer
+ * `503` with `telemetry_unavailable`, `telemetry_busy` or `telemetry_timeout`
+ * by design (the query worker is unusable, its queue is full, or a job ran past
+ * its bound), and the Analytics page names the cause. Reporting each one would
+ * spend the 10/60 s report budget: in degraded mode the five scans plus one
+ * retry each send about 10 a minute, which drops every other report from the
+ * tab and uses up the server's identical limit. A 500 is still reported.
+ */
+const TELEMETRY_REPORT_OPTS: RequestReportOptions = {
+  expectedStatuses: [503],
+};
+
+/**
+ * Issue #6516 A-2: how long an Analytics read may take before the client gives
+ * up. The server answers every telemetry request within its executor's bounds
+ * (`server/src/telemetry/executor.ts`): a job waits at most 600 s in the queue
+ * (then `telemetry_busy`) and runs at most 300 s (then `telemetry_timeout`).
+ * The duration-stats, outcome-rates and anomalies routes run two jobs (today's
+ * refresh, then the read), so the longest answer comes within 2 × 900 s, and
+ * the server no longer resets such a request (A-1). The 30 s default threw a
+ * cold `summary` away: it took 63.9 s on a prod-sized copy, and the slowest
+ * cold request 69.7 s. One more minute lets the server's own 503 arrive first.
+ */
+export const TELEMETRY_TIMEOUT_MS = 2 * (600_000 + 300_000) + 60_000;
+
+/**
  * The POST init for a notification read / dismiss (#4916). With a `nodeId` the
  * body routes the call straight to the node that holds the row; without one the
  * request has no body, exactly as before.
@@ -421,6 +464,9 @@ export type SpawnParentOptions = {
   /** Issue #6218: the session's starting permission mode. Absent → the target
    *  node's default spawn permission mode (or the explicit `yolo`). */
   permissionMode?: PermissionMode;
+  /** Issue #6171: the MCP servers the session starts with. Absent → the
+   *  target project's default, else every server (the body has no field). */
+  mcpSet?: McpSet;
 };
 
 /**
@@ -2052,6 +2098,7 @@ export class ApiClient {
           sourceBranch: parent?.sourceBranch,
           forceAccount: parent?.forceAccount,
           permissionMode: parent?.permissionMode,
+          mcpSet: parent?.mcpSet,
         }),
       },
       0,
@@ -2146,6 +2193,7 @@ export class ApiClient {
           apiKeyId: parent?.apiKeyId,
           forceAccount: parent?.forceAccount,
           permissionMode: parent?.permissionMode,
+          mcpSet: parent?.mcpSet,
         }),
       },
       0,
@@ -2271,6 +2319,169 @@ export class ApiClient {
       method: "PUT",
       body: JSON.stringify({ view }),
     });
+  }
+
+  /**
+   * #6449: a session's pins. The caller passes the limit (`usePins` asks for
+   * the maximum, 500, because the server sorts open and live pins first, then
+   * by creation time, oldest first, so its default of 200 would drop the
+   * most recently created closed pins) and validates
+   * the response. A closed pins gate answers a plain 404 by design, so it is
+   * an expected status (never reported). `signal` lets TanStack abort a
+   * superseded list download rather than leave it running to the timeout.
+   */
+  async listSessionPins(
+    sessionId: string,
+    opts: { limit: number; signal?: AbortSignal }
+  ): Promise<PinListResponse> {
+    return await this.request<PinListResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pins?limit=${opts.limit}`,
+      opts.signal ? { signal: opts.signal } : undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [404] }
+    );
+  }
+
+  /**
+   * #6449: one pin, for a `pin-changed` event (A's guidance: fetch the changed
+   * pin, not the list). A 404 is expected: a missing pin answers JSON
+   * `{"error":"Pin not found"}`, a closed gate plain text.
+   */
+  async getSessionPin(sessionId: string, key: string): Promise<PinGetResponse> {
+    // 501: a peer with no pin routes. #6450's chat cards read pins one by one,
+    // so a session on an older node would otherwise report one error per card.
+    return await this.request<PinGetResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pins/${encodeURIComponent(key)}`,
+      undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [404, 501] }
+    );
+  }
+
+  /** #6449: star or unstar a pin (publishes `pin-changed`, so devices follow). */
+  async setSessionPinStarred(
+    sessionId: string,
+    key: string,
+    starred: boolean
+  ): Promise<PinMutationResponse> {
+    return await this.request<PinMutationResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pins/${encodeURIComponent(key)}/star`,
+      { method: "PUT", body: JSON.stringify({ starred }) }
+    );
+  }
+
+  /**
+   * #6455: dismiss a pin for the operator (publishes `pin-changed`). The server
+   * refuses an open prompt pin with 409 `pin_reserved_key`: the prompt itself is
+   * still waiting, so the caller treats that as an expected outcome.
+   */
+  async dismissSessionPin(
+    sessionId: string,
+    key: string
+  ): Promise<PinMutationResponse> {
+    return await this.request<PinMutationResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pins/${encodeURIComponent(key)}/dismiss`,
+      { method: "POST" },
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [409] }
+    );
+  }
+
+  /**
+   * #6452: move, stop, or restart a pin's automatic pick. Its refusals carry
+   * the server's `code` and message in the `ApiError` body: 400 a time under a
+   * minute or over a year away, 403 an agent caller, 409 a closed pin or one
+   * with no pick, 501 a node built before #6452.
+   */
+  async setSessionPinDeadline(
+    sessionId: string,
+    key: string,
+    body: PinDeadlineRequest
+  ): Promise<PinMutationResponse> {
+    return await this.request<PinMutationResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pins/${encodeURIComponent(key)}/deadline`,
+      { method: "PUT", body: JSON.stringify(body) },
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      // Refusals the dialog explains, never API faults to report.
+      { expectedStatuses: [400, 409, 501] }
+    );
+  }
+
+  /**
+   * #6450: send the operator's staged answers to a session as one user message
+   * and record them on its pins. The caller validates the response. Its refusals
+   * are expected outcomes the Submit dialog explains (400 nothing to send, 409
+   * session not running, 413 too large, 501 an older node), never API faults; the
+   * `ApiError` carries their `code` and body.
+   */
+  async submitPinAnswers(
+    sessionId: string,
+    request: PinSubmissionRequest
+  ): Promise<PinSubmissionResponse> {
+    return await this.request<PinSubmissionResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pin-answers`,
+      { method: "POST", body: JSON.stringify(request) },
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [400, 409, 413, 501] }
+    );
+  }
+
+  /**
+   * #6454: every Project Manager dashboard in the caller's namespace, across
+   * nodes, with the facts of the sessions their lanes name. Raw JSON: it is
+   * parsed in the Pins chunk (hooks/queries/usePinDashboards.ts). A 404 (a
+   * closed gate, or an older node) is expected: the section is hidden.
+   */
+  async getPinDashboards(opts?: {
+    signal?: AbortSignal;
+  }): Promise<PinDashboardsResponse> {
+    return await this.request<PinDashboardsResponse>(
+      "/api/pins/dashboards",
+      opts?.signal ? { signal: opts.signal } : undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [404] }
+    );
+  }
+
+  /**
+   * #6453: copy a pin's files into `GeneratedFiles/pins/<folder>/` in the
+   * session's folder and record the save. The caller validates the response.
+   * Its refusals are expected outcomes the Save button explains (409 nothing to
+   * save or an unsafe folder, 413 over the caps, 501 an older node); the
+   * `ApiError` carries their `code` and body.
+   */
+  async savePinFiles(sessionId: string, key: string): Promise<PinSaveResponse> {
+    return await this.request<PinSaveResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pins/${encodeURIComponent(key)}/save`,
+      { method: "POST" },
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [409, 413, 501] }
+    );
+  }
+
+  /** #6449: mark a pin's current revision seen (publishes no event). */
+  async markSessionPinSeen(
+    sessionId: string,
+    key: string
+  ): Promise<PinMutationResponse> {
+    return await this.request<PinMutationResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pins/${encodeURIComponent(key)}/seen`,
+      { method: "PUT" }
+    );
   }
 
   /**
@@ -2595,6 +2806,39 @@ export class ApiClient {
       url += `&nodeId=${encodeURIComponent(nodeId)}`;
     }
     return await this.request(url);
+  }
+
+  /**
+   * Issue #6171: the MCP servers known for a project on the local node, or on
+   * `nodeId` (proxied to the peer), with each server's project state and cost
+   * and the project's default set. `success:false` = unavailable (an older peer,
+   * a lookup failure); the form then hides the picker.
+   */
+  async getMcpCatalog(
+    directory: string,
+    nodeId?: string | null
+  ): Promise<McpCatalogRouteResponse> {
+    const params = new URLSearchParams();
+    if (directory) params.set("directory", directory);
+    if (nodeId) params.set("nodeId", nodeId);
+    const query = params.toString();
+    return await this.request(`/api/mcp-catalog${query ? `?${query}` : ""}`);
+  }
+
+  /** Issue #6171: store (or, with `null`, clear) a project's default MCP set. */
+  async setMcpProjectDefault(
+    directory: string,
+    set: McpSet | null,
+    nodeId?: string | null
+  ): Promise<void> {
+    await this.request("/api/mcp-project-default", {
+      method: "PUT",
+      body: JSON.stringify({
+        directory,
+        set,
+        ...(nodeId ? { nodeId } : {}),
+      }),
+    });
   }
 
   /**
@@ -4544,126 +4788,188 @@ export class ApiClient {
 
   // ── Telemetry ────────────────────────────────────────────────────────
 
-  async getTelemetrySummary(filters?: {
-    fileType?: string;
-    startTime?: number;
-    endTime?: number;
-  }): Promise<TelemetrySummary> {
+  /**
+   * One Analytics read (#6516): it waits {@link TELEMETRY_TIMEOUT_MS}, and its
+   * designed 503s are not reported ({@link TELEMETRY_REPORT_OPTS}). `signal` is
+   * the query's own: TanStack Query aborts it when the query is dropped (a new
+   * range or filter, or the page closes), and the server then drops the queued
+   * job. Without it an abandoned read would stay queued for up to
+   * {@link TELEMETRY_TIMEOUT_MS} and could fill the executor's queue.
+   */
+  private async telemetryRequest<T>(
+    path: string,
+    signal?: AbortSignal
+  ): Promise<T> {
+    return await this.request<T>(
+      path,
+      signal ? { signal } : undefined,
+      0,
+      undefined,
+      TELEMETRY_TIMEOUT_MS,
+      TELEMETRY_REPORT_OPTS
+    );
+  }
+
+  async getTelemetrySummary(
+    filters?: {
+      fileType?: string;
+      startTime?: number;
+      endTime?: number;
+    },
+    signal?: AbortSignal
+  ): Promise<TelemetrySummary> {
     const params = new URLSearchParams();
     if (filters?.fileType) params.set("fileType", filters.fileType);
     if (filters?.startTime) params.set("startTime", String(filters.startTime));
     if (filters?.endTime) params.set("endTime", String(filters.endTime));
     const qs = params.toString();
-    return await this.request<TelemetrySummary>(
-      `/api/telemetry/summary${qs ? `?${qs}` : ""}`
+    return await this.telemetryRequest<TelemetrySummary>(
+      `/api/telemetry/summary${qs ? `?${qs}` : ""}`,
+      signal
     );
   }
 
-  async getTelemetryTimeseries(params: {
-    filePath?: string;
-    interval: string;
-    startTime?: number;
-    endTime?: number;
-  }): Promise<TelemetryTimeseries> {
+  async getTelemetryTimeseries(
+    params: {
+      filePath?: string;
+      interval: string;
+      startTime?: number;
+      endTime?: number;
+    },
+    signal?: AbortSignal
+  ): Promise<TelemetryTimeseries> {
     const qs = new URLSearchParams();
     qs.set("interval", params.interval);
     if (params.filePath) qs.set("filePath", params.filePath);
     if (params.startTime) qs.set("startTime", String(params.startTime));
     if (params.endTime) qs.set("endTime", String(params.endTime));
-    return await this.request<TelemetryTimeseries>(
-      `/api/telemetry/timeseries?${qs.toString()}`
+    return await this.telemetryRequest<TelemetryTimeseries>(
+      `/api/telemetry/timeseries?${qs.toString()}`,
+      signal
     );
   }
 
-  async getTelemetryFiles(filters?: {
-    fileType?: string;
-  }): Promise<TelemetryFilesResponse> {
+  async getTelemetryFiles(
+    filters?: {
+      fileType?: string;
+    },
+    signal?: AbortSignal
+  ): Promise<TelemetryFilesResponse> {
     const qs = filters?.fileType ? `?fileType=${filters.fileType}` : "";
-    return await this.request<TelemetryFilesResponse>(
-      `/api/telemetry/files${qs}`
+    return await this.telemetryRequest<TelemetryFilesResponse>(
+      `/api/telemetry/files${qs}`,
+      signal
     );
   }
 
-  async getTelemetryDurationStats(filters?: {
-    fileType?: string;
-    startDate?: string;
-    endDate?: string;
-  }): Promise<{ stats: TelemetryDurationStats[] }> {
+  async getTelemetryDurationStats(
+    filters?: {
+      fileType?: string;
+      startDate?: string;
+      endDate?: string;
+    },
+    signal?: AbortSignal
+  ): Promise<{ stats: TelemetryDurationStats[] }> {
     const params = new URLSearchParams();
     if (filters?.fileType) params.set("fileType", filters.fileType);
     if (filters?.startDate) params.set("startDate", filters.startDate);
     if (filters?.endDate) params.set("endDate", filters.endDate);
     const qs = params.toString();
-    return await this.request(
-      `/api/telemetry/duration-stats${qs ? `?${qs}` : ""}`
+    return await this.telemetryRequest(
+      `/api/telemetry/duration-stats${qs ? `?${qs}` : ""}`,
+      signal
     );
   }
 
-  async getTelemetryOutcomeRates(filters?: {
-    fileType?: string;
-    startDate?: string;
-    endDate?: string;
-  }): Promise<{ rates: TelemetryOutcomeRate[] }> {
+  async getTelemetryOutcomeRates(
+    filters?: {
+      fileType?: string;
+      startDate?: string;
+      endDate?: string;
+    },
+    signal?: AbortSignal
+  ): Promise<{ rates: TelemetryOutcomeRate[] }> {
     const params = new URLSearchParams();
     if (filters?.fileType) params.set("fileType", filters.fileType);
     if (filters?.startDate) params.set("startDate", filters.startDate);
     if (filters?.endDate) params.set("endDate", filters.endDate);
     const qs = params.toString();
-    return await this.request(
-      `/api/telemetry/outcome-rates${qs ? `?${qs}` : ""}`
+    return await this.telemetryRequest(
+      `/api/telemetry/outcome-rates${qs ? `?${qs}` : ""}`,
+      signal
     );
   }
 
-  async getTelemetryAnomalies(options?: {
-    window?: number;
-    threshold?: number;
-  }): Promise<{ anomalies: TelemetryAnomaly[] }> {
+  async getTelemetryAnomalies(
+    options?: {
+      window?: number;
+      threshold?: number;
+    },
+    signal?: AbortSignal
+  ): Promise<{ anomalies: TelemetryAnomaly[] }> {
     const params = new URLSearchParams();
     if (options?.window) params.set("window", String(options.window));
     if (options?.threshold) params.set("threshold", String(options.threshold));
     const qs = params.toString();
-    return await this.request(`/api/telemetry/anomalies${qs ? `?${qs}` : ""}`);
+    return await this.telemetryRequest(
+      `/api/telemetry/anomalies${qs ? `?${qs}` : ""}`,
+      signal
+    );
   }
 
-  async getTelemetryComparison(periods: {
-    period1Start: number;
-    period1End: number;
-    period2Start: number;
-    period2End: number;
-  }): Promise<{ comparison: TelemetryPeriodComparison[] }> {
+  async getTelemetryComparison(
+    periods: {
+      period1Start: number;
+      period1End: number;
+      period2Start: number;
+      period2End: number;
+    },
+    signal?: AbortSignal
+  ): Promise<{ comparison: TelemetryPeriodComparison[] }> {
     const params = new URLSearchParams();
     params.set("period1Start", String(periods.period1Start));
     params.set("period1End", String(periods.period1End));
     params.set("period2Start", String(periods.period2Start));
     params.set("period2End", String(periods.period2End));
-    return await this.request(`/api/telemetry/comparison?${params.toString()}`);
+    return await this.telemetryRequest(
+      `/api/telemetry/comparison?${params.toString()}`,
+      signal
+    );
   }
 
-  async getTelemetryTokenEstimates(filters?: {
-    fileType?: string;
-    startTime?: number;
-  }): Promise<{ estimates: TelemetryTokenEstimate[] }> {
+  async getTelemetryTokenEstimates(
+    filters?: {
+      fileType?: string;
+      startTime?: number;
+    },
+    signal?: AbortSignal
+  ): Promise<{ estimates: TelemetryTokenEstimate[] }> {
     const params = new URLSearchParams();
     if (filters?.fileType) params.set("fileType", filters.fileType);
     if (filters?.startTime) params.set("startTime", String(filters.startTime));
     const qs = params.toString();
-    return await this.request(
-      `/api/telemetry/token-estimates${qs ? `?${qs}` : ""}`
+    return await this.telemetryRequest(
+      `/api/telemetry/token-estimates${qs ? `?${qs}` : ""}`,
+      signal
     );
   }
 
-  async getTelemetrySessionAggregates(filters?: {
-    startTime?: number;
-    endTime?: number;
-    limit?: number;
-  }): Promise<{ sessions: TelemetrySessionAggregate[] }> {
+  async getTelemetrySessionAggregates(
+    filters?: {
+      startTime?: number;
+      endTime?: number;
+      limit?: number;
+    },
+    signal?: AbortSignal
+  ): Promise<{ sessions: TelemetrySessionAggregate[] }> {
     const params = new URLSearchParams();
     if (filters?.startTime) params.set("startTime", String(filters.startTime));
     if (filters?.endTime) params.set("endTime", String(filters.endTime));
     if (filters?.limit) params.set("limit", String(filters.limit));
     const qs = params.toString();
-    return await this.request(
-      `/api/telemetry/session-aggregates${qs ? `?${qs}` : ""}`
+    return await this.telemetryRequest(
+      `/api/telemetry/session-aggregates${qs ? `?${qs}` : ""}`,
+      signal
     );
   }
 

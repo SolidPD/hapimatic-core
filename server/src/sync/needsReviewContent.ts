@@ -26,14 +26,17 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Claude SDK `output` assistant record → `true` iff it carries a non-empty
- * visible text block.
+ * A Claude SDK `output` assistant record's content blocks, or `null` when the
+ * record is not a user-facing answer. Shared by the needs-review classifier and
+ * the `hapi_pin` extractor (#6448), so the two apply one set of exclusions.
  */
-function isNewClaudeAssistantText(content: Record<string, unknown>): boolean {
-  if (content.type !== "output") return false;
+function claudeAssistantBlocks(
+  content: Record<string, unknown>
+): unknown[] | null {
+  if (content.type !== "output") return null;
 
   const data = isObject(content.data) ? content.data : null;
-  if (!data) return false;
+  if (!data) return null;
 
   // A meta / compact-summary / subagent-narration record carries assistant text
   // but is NOT the user-facing answer — excluding it here keeps the #2162
@@ -46,16 +49,24 @@ function isNewClaudeAssistantText(content: Record<string, unknown>): boolean {
     data.isCompactSummary === true ||
     data.isSidechain === true
   ) {
-    return false;
+    return null;
   }
 
-  if (data.type !== "assistant") return false;
+  if (data.type !== "assistant") return null;
 
   const message = isObject(data.message) ? data.message : null;
-  if (!message) return false;
+  if (!message) return null;
 
-  const blocks = message.content;
-  if (!Array.isArray(blocks)) return false;
+  return Array.isArray(message.content) ? message.content : null;
+}
+
+/**
+ * Claude SDK `output` assistant record → `true` iff it carries a non-empty
+ * visible text block.
+ */
+function isNewClaudeAssistantText(content: Record<string, unknown>): boolean {
+  const blocks = claudeAssistantBlocks(content);
+  if (!blocks) return false;
 
   // Require at least one non-empty text block. An assistant message with only
   // `tool_use` blocks is an intra-turn tool boundary, not a new answer (R1).
@@ -80,20 +91,44 @@ function isNewClaudeAssistantText(content: Record<string, unknown>): boolean {
  * envelope, so there is no third branch.
  */
 function isNewCodexAssistantText(content: Record<string, unknown>): boolean {
-  if (content.type !== "codex") return false;
+  const message = codexAssistantMessage(content);
+  return message !== null && message.trim() !== "";
+}
+
+/** A Codex/ACP assistant record's message text, or `null` when it is not one. */
+function codexAssistantMessage(
+  content: Record<string, unknown>
+): string | null {
+  if (content.type !== "codex") return null;
 
   const data = isObject(content.data) ? content.data : null;
-  if (!data) return false;
+  if (!data) return null;
 
   // Subagent narration is not the user-facing answer (same principle as the
   // Claude-path `isSidechain` exclusion). Harmless when the field is absent.
-  if (data.isSidechain === true) return false;
+  if (data.isSidechain === true) return null;
 
-  return (
-    data.type === "message" &&
-    typeof data.message === "string" &&
-    data.message.trim() !== ""
-  );
+  return data.type === "message" && typeof data.message === "string"
+    ? data.message
+    : null;
+}
+
+/** The inner content of an agent/assistant record, or `null` for anything else. */
+function assistantRecordContent(
+  content: unknown
+): Record<string, unknown> | null {
+  const record = unwrapRoleWrappedRecordEnvelope(content);
+  if (!record) return null;
+
+  // Only assistant/agent records represent a model answer. A user text send has
+  // role "user"; `unwrapRoleWrappedRecordEnvelope` returns whatever role the
+  // envelope carries.
+  if (record.role !== "agent" && record.role !== "assistant") return null;
+
+  if (!isObject(record.content) || typeof record.content.type !== "string") {
+    return null;
+  }
+  return record.content;
 }
 
 /**
@@ -102,20 +137,52 @@ function isNewCodexAssistantText(content: Record<string, unknown>): boolean {
  *   role-wrapped `{ role, content, meta }` envelope.
  */
 export function isNewUserFacingAssistantContent(content: unknown): boolean {
-  const record = unwrapRoleWrappedRecordEnvelope(content);
-  if (!record) return false;
+  const inner = assistantRecordContent(content);
+  if (!inner) return false;
+  return isNewClaudeAssistantText(inner) || isNewCodexAssistantText(inner);
+}
 
-  // Only assistant/agent records represent a model answer. A user text send has
-  // role "user"; `unwrapRoleWrappedRecordEnvelope` returns whatever role the
-  // envelope carries.
-  if (record.role !== "agent" && record.role !== "assistant") return false;
+/** One user-facing assistant text unit, as stored. */
+export type AssistantText = {
+  text: string;
+  /**
+   * True for a Claude text block, which is always a whole block. False for a
+   * `codex`-envelope message, which this record alone cannot place: Codex
+   * stores whole messages there, but an ACP agent stores each
+   * `agent_message_chunk` as its own record in the same envelope. The fence
+   * reader tells them apart by the session's flavor.
+   */
+  complete: boolean;
+};
 
-  if (!isObject(record.content) || typeof record.content.type !== "string") {
-    return false;
+/**
+ * #6448: every non-empty user-facing assistant text in a stored record, for the
+ * `hapi_pin` fence reader. The same exclusions as
+ * {@link isNewUserFacingAssistantContent}: user records, meta, compact-summary
+ * and sidechain records yield nothing. The compact-summary exclusion matters: a
+ * summary that repeats a fence would otherwise revise an open pin, or reopen a
+ * withdrawn one. Total: never throws.
+ */
+export function extractUserFacingAssistantTexts(
+  content: unknown
+): AssistantText[] {
+  const inner = assistantRecordContent(content);
+  if (!inner) return [];
+
+  const blocks = claudeAssistantBlocks(inner);
+  if (blocks) {
+    const texts: AssistantText[] = [];
+    for (const block of blocks) {
+      if (!isObject(block) || block.type !== "text") continue;
+      if (typeof block.text === "string" && block.text.trim() !== "") {
+        texts.push({ text: block.text, complete: true });
+      }
+    }
+    return texts;
   }
 
-  return (
-    isNewClaudeAssistantText(record.content) ||
-    isNewCodexAssistantText(record.content)
-  );
+  const message = codexAssistantMessage(inner);
+  return message !== null && message.trim() !== ""
+    ? [{ text: message, complete: false }]
+    : [];
 }

@@ -1,11 +1,52 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { request } from "node:http";
 
+import { writeStdout } from "@/utils/stdout";
+
 function logError(message: string, error?: unknown): void {
   const detail =
     error instanceof Error ? error.message : error ? String(error) : "";
   const suffix = detail ? `: ${detail}` : "";
   process.stderr.write(`[hook-forwarder] ${message}${suffix}\n`);
+}
+
+/** The forwarder's own bound on one hook request (#6455). */
+export const FORWARD_TIMEOUT_MS = 15_000;
+
+/**
+ * The hook server's answer Claude Code should read, or null (#6455). Only a Stop
+ * hook's JSON decision is relayed: Claude Code adds the plain stdout of a
+ * `UserPromptSubmit` or `SessionStart` hook to the agent's context, so anything
+ * else printed here would leak into the conversation. An older hook server
+ * answers `text/plain ok`, which is never relayed, so a version skew either way
+ * blocks nothing.
+ */
+export function relayableDecision(
+  forwarded: Buffer,
+  status: number | undefined,
+  contentType: string | undefined,
+  response: Buffer
+): string | null {
+  if (status !== 200) return null;
+  if (!contentType?.toLowerCase().startsWith("application/json")) return null;
+  try {
+    const input = JSON.parse(forwarded.toString("utf-8")) as {
+      hook_event_name?: unknown;
+    } | null;
+    if (input?.hook_event_name !== "Stop") return null;
+    const text = response.toString("utf-8");
+    const parsed = JSON.parse(text) as { decision?: unknown } | null;
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      (parsed.decision !== "block" && parsed.decision !== "approve")
+    ) {
+      return null;
+    }
+    return text;
+  } catch {
+    return null;
+  }
 }
 
 function parsePort(value: string | undefined): number | null {
@@ -69,7 +110,10 @@ function parseArgs(args: string[]): {
   return { port, token };
 }
 
-export async function runSessionHookForwarder(args: string[]): Promise<void> {
+export async function runSessionHookForwarder(
+  args: string[],
+  options: { timeoutMs?: number } = {}
+): Promise<void> {
   const { port, token } = parseArgs(args);
   if (!port) {
     logError("Invalid or missing port argument");
@@ -97,6 +141,7 @@ export async function runSessionHookForwarder(args: string[]): Promise<void> {
     const body = Buffer.concat(chunks);
 
     let hadError = false;
+    let decision: string | null = null;
     await new Promise<void>(resolve => {
       const req = request(
         {
@@ -115,16 +160,32 @@ export async function runSessionHookForwarder(args: string[]): Promise<void> {
             hadError = true;
             logError(`Hook server responded with status ${res.statusCode}`);
           }
+          const parts: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => parts.push(chunk));
           res.on("error", error => {
             hadError = true;
             logError("Error reading hook server response", error);
             resolve();
           });
-          res.on("end", () => resolve());
-          res.resume();
+          // A response cut off mid-body ends in "close" without "end".
+          res.on("close", () => resolve());
+          res.on("end", () => {
+            decision = relayableDecision(
+              body,
+              res.statusCode,
+              res.headers["content-type"],
+              Buffer.concat(parts)
+            );
+            resolve();
+          });
         }
       );
 
+      // #6455: the hook server answers within its own bounds; this only stops a
+      // hung server from holding Claude's hook. A failing Stop hook never blocks.
+      req.setTimeout(options.timeoutMs ?? FORWARD_TIMEOUT_MS, () => {
+        req.destroy(new Error("hook server did not answer in time"));
+      });
       req.on("error", error => {
         hadError = true;
         logError("Failed to send hook request", error);
@@ -132,6 +193,11 @@ export async function runSessionHookForwarder(args: string[]): Promise<void> {
       });
       req.end(body);
     });
+    if (decision !== null) {
+      // Synchronous and complete, so the process cannot exit before Claude Code
+      // has the whole decision (#3450).
+      writeStdout(decision);
+    }
     if (hadError) {
       process.exitCode = 1;
     }

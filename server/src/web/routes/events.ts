@@ -7,6 +7,7 @@ import { defineCapability } from "@hapi/protocol";
 import type { SSEManager } from "../../sse/sseManager";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
+import { resolvePinsEnabled } from "../../config/pinsConfig";
 import type { WebAppEnv } from "../middleware/auth";
 import { cataloged } from "../../capabilities/cataloged";
 import {
@@ -155,6 +156,16 @@ export function createEventsRoutes(
   return app;
 }
 
+/** Substring first, because only the rare match pays for the parse. */
+function isPinChangedFrame(data: string): boolean {
+  if (!data.includes('"pin-changed"')) return false;
+  try {
+    return (JSON.parse(data) as { type?: unknown }).type === "pin-changed";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Bridge SSE events from a remote node to the web client.
  * Opens an HTTP SSE connection to the remote node's federation endpoint
@@ -215,8 +226,12 @@ function streamRemoteSSE(
 
         for (const line of lines) {
           if (line.startsWith("data: ")) {
+            const data = line.slice(6);
+            // #6447 (R15): a closed hub does not relay a peer's pin event. This
+            // stream copies frames, so the bridge's filter never sees them.
+            if (!resolvePinsEnabled() && isPinChangedFrame(data)) continue;
             // Re-emit the data line as an SSE event
-            await stream.writeSSE({ data: line.slice(6) });
+            await stream.writeSSE({ data });
           } else if (line.startsWith(": heartbeat")) {
             // Forward heartbeat comments
             await stream.write(": heartbeat\n\n");

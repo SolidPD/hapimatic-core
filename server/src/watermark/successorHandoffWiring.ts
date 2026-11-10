@@ -16,6 +16,7 @@ import { inheritSpawnPosture, renderHandoffMessage } from "@hapi/protocol";
 import { isEffortLevel } from "@hapi/protocol/effort";
 
 import type { SpawnSessionOptions, SyncEngine } from "../sync/syncEngine";
+import { inheritedSessionPins } from "../sync/respawnBase";
 import type { Store } from "../store";
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { ContextWatermarkService } from "./contextWatermarkService";
@@ -126,6 +127,9 @@ export function buildSuccessorHandoffDeps(args: {
         apiKeyPlacedBy: predecessor.metadata?.apiKeyPlacedBy,
         sessionRole: predecessor.metadata?.sessionRole,
         ...successorSpawnPins(predecessor),
+        // Issue #6171: the output style and the MCP set travel too (the style
+        // was dropped here before #6171).
+        ...inheritedSessionPins(predecessor),
         awaitWebhook: true, // "spawned" means "actually alive" — needed by confirm
       });
       if (result.type === "error") {

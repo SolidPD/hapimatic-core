@@ -6,12 +6,15 @@ import type { FederationConfig } from "@hapi/protocol";
  *
  * The mirror is a background replication backstop, not a latency-critical path,
  * so the default cadence (60s) is deliberately slower than the 15s session poll.
- * The per-node opt-out has TWO sources (env wins, mirroring federationConfig's
- * own env-override precedence): the `FEDERATION_TURN_MIRROR_DISABLED` env var and
- * the `settings.federation.turnMirrorDisabled` flag (carried on FederationConfig).
- * `enabled:false` does NOT skip constructing the loop — index.ts still builds the
- * SupervisedLoop so it registers as "stopped" and the opt-out stays visible in
- * the System Jobs portal (the KD-9 pattern).
+ * The per-node opt-out has TWO sources and either one disables the loop: the
+ * `FEDERATION_TURN_MIRROR_DISABLED` env var and the
+ * `settings.federation.turnMirrorDisabled` flag (carried on FederationConfig by
+ * loadFederationConfig, #6483). They are OR'd, so unlike the FEDERATION_*
+ * overrides loadFederationConfig applies, the env cannot re-enable a loop the
+ * settings disable. `enabled:false` does NOT skip constructing the loop —
+ * turnMirrorPullService (started by federation/turnMirrorWiring.ts) still builds
+ * the SupervisedLoop so it registers as "stopped" and the opt-out stays visible
+ * in the System Jobs portal (the KD-9 pattern).
  */
 export interface TurnMirrorConfig {
   /** When false, the pull loop registers as "stopped" and stores no mirror rows. */
@@ -32,7 +35,8 @@ function isTruthyEnv(v: string | undefined): boolean {
 
 /**
  * Compute the mirror config from the already-loaded FederationConfig + env.
- * Sync (federationConfig is loaded once at boot); loaded fresh wherever called.
+ * Sync (federationConfig is loaded at boot and never reloaded); loaded fresh
+ * wherever called.
  */
 export function loadTurnMirrorConfig(
   federationConfig: FederationConfig | null

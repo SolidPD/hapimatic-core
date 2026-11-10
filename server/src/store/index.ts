@@ -44,6 +44,7 @@ import { ThroughputFactsStore } from "./throughput/factsStore";
 import { ThroughputRollupStore } from "./throughput/rollupStore";
 import { ThroughputGithubStore } from "./throughput/githubStore";
 import { ThroughputDigestStore } from "./throughput/digestStore";
+import { ThroughputKeepaliveStore } from "./throughput/keepaliveStore";
 import { PmRosterStore } from "./turns/pmRosterStore";
 import { BackgroundAgentUsageStore } from "./turns/backgroundAgentUsage";
 import { TurnAnalyticsCounts } from "./turns/analyticsCounts";
@@ -59,6 +60,9 @@ import {
 import { applyParityMigrations, ParityRunsStore } from "./parityRuns";
 import { ExtensionPrefsStore } from "./extensionPrefsStore";
 import { BookmarkStore } from "./bookmarkStore";
+import { McpProjectDefaultsStore } from "./mcpProjectDefaultsStore";
+import { McpServerStatsStore } from "./mcpServerStatsStore";
+import { PinStore } from "./pinStore";
 import { getConfiguration } from "../configuration";
 
 export type {
@@ -102,6 +106,9 @@ export { TimeLogStore } from "./timeLogStore";
 export { PeerStore } from "./peerStore";
 export { ExtensionPrefsStore } from "./extensionPrefsStore";
 export { BookmarkStore } from "./bookmarkStore";
+export { McpProjectDefaultsStore } from "./mcpProjectDefaultsStore";
+export { McpServerStatsStore } from "./mcpServerStatsStore";
+export { PinStore } from "./pinStore";
 export { LeaseStore } from "./leaseStore";
 export { ApiKeyShareAuditStore } from "./apiKeyShareAuditStore";
 export type {
@@ -221,6 +228,8 @@ export class Store {
   readonly throughputRollups: ThroughputRollupStore;
   readonly throughputGithub: ThroughputGithubStore;
   readonly throughputDigests: ThroughputDigestStore;
+  /** Issue #6169: the node-local prompt-cache keep-alive ledger. */
+  readonly throughputKeepalive: ThroughputKeepaliveStore;
   readonly pmRoster: PmRosterStore;
   /** Issue #4385: background agents' full usage, recorded at completion. */
   readonly backgroundAgentUsage: BackgroundAgentUsageStore;
@@ -235,6 +244,9 @@ export class Store {
   readonly timelogAdjustments: TimelogAdjustmentsStore;
   readonly extensionPrefs: ExtensionPrefsStore;
   readonly bookmarks: BookmarkStore;
+  readonly mcpProjectDefaults: McpProjectDefaultsStore;
+  readonly mcpServerStats: McpServerStatsStore;
+  readonly pins: PinStore;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
@@ -324,6 +336,7 @@ export class Store {
     this.throughputRollups = new ThroughputRollupStore(this.db);
     this.throughputGithub = new ThroughputGithubStore(this.db);
     this.throughputDigests = new ThroughputDigestStore(this.db);
+    this.throughputKeepalive = new ThroughputKeepaliveStore(this.db);
     this.pmRoster = new PmRosterStore(this.db);
     this.backgroundAgentUsage = new BackgroundAgentUsageStore(this.db);
     this.turnAnalytics = new TurnAnalyticsCounts(this.db);
@@ -331,6 +344,9 @@ export class Store {
     this.timelogAdjustments = new TimelogAdjustmentsStore(this.db);
     this.extensionPrefs = new ExtensionPrefsStore(this.db);
     this.bookmarks = new BookmarkStore(this.db);
+    this.mcpProjectDefaults = new McpProjectDefaultsStore(this.db);
+    this.mcpServerStats = new McpServerStatsStore(this.db);
+    this.pins = new PinStore(this.db);
   }
 
   /**
@@ -561,6 +577,32 @@ export class Store {
     } catch (error) {
       console.error(
         `[Store] Migration failed: CREATE TABLE audit_logs:`,
+        error
+      );
+    }
+
+    // Issue #6171: a project's default MCP set, and what this node knows about each
+    // MCP server. Additive via runMigrations() and NOT in REQUIRED_TABLES /
+    // SCHEMA_VERSION (adding them there would crash existing DBs). A failure leaves
+    // the picker without defaults or costs; spawns are unaffected.
+    try {
+      this.db.run(
+        "CREATE TABLE IF NOT EXISTS mcp_project_defaults (" +
+          "project_root TEXT PRIMARY KEY, " +
+          "set_json TEXT NOT NULL, " +
+          "updated_at INTEGER NOT NULL)"
+      );
+      this.db.run(
+        "CREATE TABLE IF NOT EXISTS mcp_server_stats (" +
+          "key TEXT PRIMARY KEY, " +
+          "name TEXT NOT NULL, " +
+          "last_seen_at INTEGER NOT NULL, " +
+          "ram_json TEXT, " +
+          "context_json TEXT)"
+      );
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: CREATE TABLE mcp_project_defaults/mcp_server_stats:`,
         error
       );
     }
@@ -1088,6 +1130,87 @@ export class Store {
     } catch (error) {
       console.error(
         `[Store] Migration failed: CREATE TABLE session_bookmarks:`,
+        error
+      );
+    }
+
+    // Issue #6447 (epic #6446): pin records. The foreign key is deliberate, unlike
+    // session_bookmarks: a pin is always written on the node that owns its session
+    // (the routes proxy there), so its row lives beside the session row, and the
+    // cascade removes it through every delete path. No CHECK on status, because
+    // later sub-issues extend it (house rule K1). NOT in REQUIRED_TABLES and
+    // SCHEMA_VERSION stays 1: a reverted binary simply stops touching it.
+    try {
+      this.db.run(
+        "CREATE TABLE IF NOT EXISTS session_pins (" +
+          "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, " +
+          "key TEXT NOT NULL, " +
+          "status TEXT NOT NULL DEFAULT 'open', " +
+          "revision INTEGER NOT NULL DEFAULT 1, " +
+          "starred INTEGER NOT NULL DEFAULT 0, " +
+          "seen_at INTEGER, " +
+          "seen_revision INTEGER, " +
+          "posted_seq INTEGER, " +
+          // Before the JSON columns, because reaching a column past them walks each
+          // row's overflow pages, and eviction and the list sort on these.
+          "created_at INTEGER NOT NULL, " +
+          "updated_at INTEGER NOT NULL, " +
+          "anchor_json TEXT, " +
+          "content_json TEXT NOT NULL, " +
+          "answers_json TEXT NOT NULL DEFAULT '[]', " +
+          "PRIMARY KEY (session_id, key))"
+      );
+      this.db.run(
+        "CREATE INDEX IF NOT EXISTS idx_session_pins_open " +
+          "ON session_pins(session_id) WHERE status = 'open'"
+      );
+      // The Project Manager dashboards list (#6454): live rows, newest first.
+      this.db.run(
+        "CREATE INDEX IF NOT EXISTS idx_session_pins_live " +
+          "ON session_pins(updated_at) WHERE status = 'live'"
+      );
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: CREATE TABLE session_pins:`,
+        error
+      );
+    }
+    // Issue #6453: "Save to session folder". Added, not created, so a fresh and a
+    // migrated table have the same columns; nullable, so a reverted binary ignores
+    // them. They sit after the JSON columns, which is fine: nothing sorts on them.
+    this.migrateAddColumn("session_pins", "saved_to", "TEXT");
+    this.migrateAddColumn("session_pins", "saved_revision", "INTEGER");
+    this.migrateAddColumn("session_pins", "saved_at", "INTEGER");
+    this.migrateAddColumn("session_pins", "save_reported_at", "INTEGER");
+
+    // Issue #6452 (epic #6446): automatic picks. The deadline is server-owned
+    // state beside the pin, never content: an operator's move must not bump the
+    // revision. Nullable and unread by older code, so SCHEMA_VERSION stays 1 and a
+    // reverted binary simply ignores them. `deadline_revision` is the revision the
+    // deadline was last reconciled against, so a pin a build without #6452 edited
+    // is re-armed rather than fired.
+    for (const [column, type] of [
+      ["deadline_at", "INTEGER"],
+      ["deadline_by", "TEXT"],
+      ["deadline_revision", "INTEGER"],
+      ["deadline_id", "TEXT"],
+      ["deadline_changed_at", "INTEGER"],
+      ["deadline_reported_at", "INTEGER"],
+    ] as const) {
+      this.migrateAddColumn("session_pins", column, type);
+    }
+    try {
+      // The loop's due scan and its next-wake MIN both read this. Every query
+      // must write `status = 'open'` as a literal: with `status = ?` the planner
+      // cannot prove the partial index applies and scans the table.
+      this.db.run(
+        "CREATE INDEX IF NOT EXISTS idx_session_pins_deadline " +
+          "ON session_pins(deadline_at, session_id, key) " +
+          "WHERE status = 'open' AND deadline_at IS NOT NULL"
+      );
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: CREATE INDEX idx_session_pins_deadline:`,
         error
       );
     }

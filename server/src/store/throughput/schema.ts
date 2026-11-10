@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Database } from "bun:sqlite";
+import { addColumnIfMissing } from "../turns/schema";
 
 /**
  * Throughput telemetry tables (issue #6164, epic #6163 Sub-Issue A1).
@@ -117,6 +118,8 @@ const ROLLUP_DDL = `
     usd      REAL NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_tp_idle_day ON throughput_rollup_idle(day, origin);
+  -- #6169 adds warm_n / warm_cr / avoided_usd to throughput_rollup_idle with
+  -- ADD COLUMN (IDLE_WARM_COLUMNS below), on a fresh DB and an upgraded one alike.
 
   CREATE TABLE IF NOT EXISTS throughput_rollup_session (
     ns         TEXT,
@@ -339,6 +342,64 @@ const MIRROR_INDEX_DDL = `
     ON turn_mirror(origin_node_id, started_at_ms);
 `;
 
+/**
+ * Issue #6169: the prompt-cache keep-alive ledger, one additive row per
+ * (namespace, node, UTC day, outcome, code, model). Node-local and NOT a rollup: no
+ * transcript records a keep-alive (Claude Code writes no transcript line for a
+ * side question), so a bucket rebuild could not recompute it. It stays out of
+ * `ROLLUP_TABLES` (whose rebuild deletes every listed table) and its writes never
+ * bump `rollup.generation`. `code` is the CLI's refusal or failure code (`''`
+ * for a sent keep-alive); `model` is `''` when the session reported none.
+ */
+const KEEPALIVE_DDL = `
+  CREATE TABLE IF NOT EXISTS throughput_keepalive_daily (
+    ns          TEXT NOT NULL,
+    origin      TEXT NOT NULL,
+    day         TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    code        TEXT NOT NULL DEFAULT '',
+    model       TEXT NOT NULL DEFAULT '',
+    n           INTEGER NOT NULL,
+    cr_tokens   INTEGER NOT NULL,
+    in_tokens   INTEGER NOT NULL,
+    out_tokens  INTEGER NOT NULL,
+    PRIMARY KEY (ns, origin, day, outcome, code, model)
+  );
+  CREATE INDEX IF NOT EXISTS idx_tp_keepalive_day ON throughput_keepalive_daily(day);
+`;
+
+/**
+ * Issue #6173 (D3): one row per run of an app version on this node — opened at
+ * throughput boot, touched every 5 minutes, closed (`clean_stop = 1`) on a
+ * graceful stop. A segment left open and followed by the same version is an
+ * unclean restart. Node-local, never replicated, outside `ROLLUP_TABLES`;
+ * pruned by `ReleaseHealthStore.pruneBefore` (35 days, the facts window).
+ */
+const RELEASE_HEALTH_DDL = `
+  CREATE TABLE IF NOT EXISTS throughput_version_segments (
+    version       TEXT NOT NULL,
+    started_ms    INTEGER NOT NULL,
+    last_seen_ms  INTEGER NOT NULL,
+    clean_stop    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (version, started_ms)
+  );
+  CREATE INDEX IF NOT EXISTS idx_tp_version_segments_last_seen
+    ON throughput_version_segments(last_seen_ms);
+`;
+
+/**
+ * Issue #6169: kept-warm reopenings per idle class. A constant-default ADD
+ * COLUMN does not rewrite the table. Each is guarded on its own, so one failure
+ * leaves the others; `replaceBucket` and `idleByClass` check for them
+ * (`hasWarmColumns`) and fall back to the pre-#6169 shape when one is missing
+ * (the upgraded-DB test covers it).
+ */
+const IDLE_WARM_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ["warm_n", "INTEGER NOT NULL DEFAULT 0"],
+  ["warm_cr", "INTEGER NOT NULL DEFAULT 0"],
+  ["avoided_usd", "REAL NOT NULL DEFAULT 0"],
+];
+
 /** Every rollup table rebuilt per (origin, day) bucket. */
 export const ROLLUP_TABLES = [
   "throughput_rollup_cost",
@@ -357,6 +418,8 @@ const MIGRATION_BLOCKS: ReadonlyArray<readonly [string, string]> = [
   ["github", GITHUB_DDL],
   ["quota/digests", QUOTA_DIGEST_DDL],
   ["turn_mirror indexes", MIRROR_INDEX_DDL],
+  ["keep-alive ledger", KEEPALIVE_DDL],
+  ["release-health segments", RELEASE_HEALTH_DDL],
 ];
 
 export function applyThroughputMigrations(db: Database): void {
@@ -366,6 +429,14 @@ export function applyThroughputMigrations(db: Database): void {
     } catch (error) {
       console.error(`[Store] Migration failed: throughput ${name}:`, error);
     }
+  }
+  for (const [column, type] of IDLE_WARM_COLUMNS) {
+    addColumnIfMissing(
+      db,
+      "throughput_rollup_idle",
+      column,
+      `ALTER TABLE throughput_rollup_idle ADD COLUMN ${column} ${type}`
+    );
   }
 }
 

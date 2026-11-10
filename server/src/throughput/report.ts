@@ -9,6 +9,7 @@ import {
   histogramCount,
   mergeHistograms,
   percentileFromHistogram,
+  utcDayOf,
   type ThroughputTokens,
 } from "@hapi/protocol";
 import {
@@ -16,10 +17,14 @@ import {
   toFactsTurnRow,
   type FactsTurnRow,
 } from "../store/throughput/factsStore";
+import { ThroughputKeepaliveStore } from "../store/throughput/keepaliveStore";
 import { ThroughputRollupStore } from "../store/throughput/rollupStore";
+import { tableExists } from "../store/turns/schema";
 import {
   emptyPricedLine,
   addPricedLine,
+  avoidedRewriteUsd,
+  keepaliveLedgerCost,
   ThroughputPricer,
   type PricedLine,
 } from "./pricing";
@@ -84,6 +89,21 @@ export interface ThroughputReport {
     /** Each session's first real main-chain call (its starting context). */
     start: { n: number; p50: number | null };
   };
+  /**
+   * #6169: this node's prompt-cache keep-alives (the ledger's whole UTC days
+   * covering the window, every namespace) against the kept-warm reopenings of
+   * its local rows; null when the database has no keep-alive ledger or no row
+   * in those days.
+   */
+  keepalive: {
+    sent: number;
+    refused: number;
+    failed: number;
+    costUsd: number;
+    keptWarmN: number;
+    avoidedUsd: number;
+    netUsd: number;
+  } | null;
 }
 
 interface Accumulator {
@@ -96,6 +116,37 @@ interface Accumulator {
   ctxStart: Record<string, number>;
   withFacts: number;
   unpriced: number;
+  keptWarmN: number;
+  avoidedUsd: number;
+}
+
+/** #6169: the keep-alive ledger's figures for the days covering the window. */
+function keepaliveOf(
+  db: Database,
+  pricer: ThroughputPricer,
+  fromMs: number,
+  toMs: number,
+  acc: Accumulator
+): ThroughputReport["keepalive"] {
+  if (!tableExists(db, "throughput_keepalive_daily")) return null;
+  // The window is [fromMs, toMs): a `toMs` on a UTC midnight must not take
+  // in the day it opens, as summary.ts's daysOf() also excludes.
+  const rows = new ThroughputKeepaliveStore(db).sum(
+    utcDayOf(fromMs),
+    utcDayOf(toMs - 1),
+    null
+  );
+  if (rows.length === 0) return null;
+  // Priced inside the window too: a card that starts at a midnight `toMs`
+  // covers none of these rows.
+  const { byOutcome, costUsd } = keepaliveLedgerCost(pricer, rows, toMs - 1);
+  return {
+    ...byOutcome,
+    costUsd,
+    keptWarmN: acc.keptWarmN,
+    avoidedUsd: acc.avoidedUsd,
+    netUsd: acc.avoidedUsd - costUsd,
+  };
 }
 
 /** Compute every local row's missing facts in memory (`--facts=compute`). */
@@ -164,6 +215,8 @@ export async function computeReport(
   const rows: Array<Record<string, unknown>> = [];
   const origins: string[] = [];
   let computedFacts = 0;
+  /** The first `localRows` of `rows` are this node's own (the ledger's scope). */
+  let localRows = 0;
   if (opts.origin === null || opts.origin === "local") {
     const local = rollups.localTurnsInRange(opts.fromMs, opts.toMs);
     if (opts.facts === "compute") {
@@ -174,6 +227,7 @@ export async function computeReport(
       );
     }
     rows.push(...local);
+    localRows = local.length;
     origins.push("local");
   }
   if (opts.origin !== "local") {
@@ -203,9 +257,22 @@ export async function computeReport(
     ctxStart: {},
     withFacts: 0,
     unpriced: 0,
+    keptWarmN: 0,
+    avoidedUsd: 0,
   };
-  for (const row of rows) {
+  for (const [index, row] of rows.entries()) {
     const r = resolveRow(row, pricer);
+    if (index < localRows && r.facts?.idle?.c) {
+      for (const v of Object.values(r.facts.idle.c)) {
+        acc.keptWarmN += v[3] ?? 0;
+        acc.avoidedUsd += avoidedRewriteUsd(
+          pricer,
+          r.model,
+          r.startedAtMs,
+          v[4] ?? 0
+        );
+      }
+    }
     if (r.facts) {
       acc.withFacts += 1;
       // The rollup's rules: main-chain bins may be coarse; the start sample is
@@ -294,6 +361,12 @@ export async function computeReport(
         p50: percentileFromHistogram(acc.ctxStart, 50),
       },
     },
+    // The ledger is this node's own: only a report that includes local rows
+    // can set it against their kept-warm reopenings.
+    keepalive:
+      opts.origin === null || opts.origin === "local"
+        ? keepaliveOf(opts.db, pricer, opts.fromMs, opts.toMs, acc)
+        : null,
   };
 }
 
@@ -444,6 +517,8 @@ export interface BaselineRow {
 }
 
 const money = (v: number) => `$${Math.round(v).toLocaleString("en-US")}`;
+/** #6169: keep-alive figures are cents, so two decimals and the sign before the "$". */
+const cents = (v: number) => `${v < 0 ? "-" : ""}$${Math.abs(v).toFixed(2)}`;
 const pct = (v: number, places = 1) => `${(v * 100).toFixed(places)}%`;
 const k = (v: number | null) => (v === null ? "—" : `${Math.round(v / 1000)}K`);
 
@@ -654,6 +729,11 @@ export function renderReport(
     `| Context per call, all calls (median) | ${k(r.context.allCalls.p50)} (n ${r.context.allCalls.n}) |`,
     `| Context per call, main chain (median) | ${k(r.context.mainChain.p50)} (n ${r.context.mainChain.n}) |`,
     `| Starting context (median) | ${k(r.context.start.p50)} (n ${r.context.start.n}) |`,
+    ...(r.keepalive
+      ? [
+          `| Keep-alive (this node, whole UTC days, estimates) | ${r.keepalive.sent} sent (${r.keepalive.refused} refused, ${r.keepalive.failed} failed), ${cents(r.keepalive.costUsd)}; kept warm ${r.keepalive.keptWarmN}, avoided ${cents(r.keepalive.avoidedUsd)}; net ${cents(r.keepalive.netUsd)} |`,
+        ]
+      : []),
     "",
   ];
   if (gh) {

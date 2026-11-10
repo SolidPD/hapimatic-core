@@ -84,6 +84,10 @@ import {
 } from "./SortableListEntry";
 import { IssueStateBadge } from "@/components/IssueStateBadge";
 import { resolveStateBadge } from "@hapi/protocol/workflowPhases";
+import {
+  openPinsArchiveNote,
+  withOpenPinsNote,
+} from "@/lib/pins/archiveWarning";
 
 export function SessionItem(props: {
   session: SessionSummary;
@@ -1026,7 +1030,10 @@ export function SessionItem(props: {
         isOpen={disconnectOpen}
         onClose={() => setDisconnectOpen(false)}
         title="Disconnect Session"
-        description={`Are you sure you want to disconnect "${sessionName}"? The session will become inactive.`}
+        description={withOpenPinsNote(
+          `Are you sure you want to disconnect "${sessionName}"? The session will become inactive.`,
+          openPinsArchiveNote(s.openPinCount)
+        )}
         confirmLabel="Disconnect"
         confirmingLabel="Disconnecting..."
         onConfirm={archiveSession}

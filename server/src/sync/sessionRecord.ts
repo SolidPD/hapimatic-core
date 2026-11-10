@@ -78,6 +78,8 @@ export function buildSessionRecord(input: {
     appliedEffort: existing?.appliedEffort,
     appliedModel: existing?.appliedModel,
     appliedForEffort: existing?.appliedForEffort,
+    // Issue #6169: live keep-alive cache state, carried across a record rebuild.
+    promptCache: existing?.promptCache,
     notes: stored.notes ?? undefined,
     // #3286: hydrate the persisted view (undefined when no row value → the
     // client falls back to DEFAULT_SESSION_VIEW).

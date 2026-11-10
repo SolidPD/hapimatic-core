@@ -50,6 +50,7 @@ import type {
   BackgroundAgentsSnapshot,
   ProviderUsageSnapshotWindow,
 } from "@hapi/protocol/schemas";
+import type { PromptCacheState } from "@hapi/protocol";
 import { applyVersionedAck } from "./versionedUpdate";
 
 /**
@@ -915,6 +916,8 @@ export class ApiSessionClient extends EventEmitter {
       // Issue #4383: background-agents snapshot (K11 — always present, null when
       // none). Rides the same runtime object spread into session-alive.
       backgroundAgents?: BackgroundAgentsSnapshot | null;
+      // Issue #6169: prompt-cache keep-alive state (always present, null when none).
+      promptCache?: PromptCacheState | null;
     }
   ): void {
     // Reliable keepalive - do NOT use .volatile as dropped keepalives cause

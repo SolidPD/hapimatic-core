@@ -41,6 +41,7 @@ import type {
   SpawnSessionOptions,
 } from "./syncEngine";
 import type { SessionCache } from "./sessionCache";
+import { inheritedSessionPins } from "./respawnBase";
 import type { RpcGateway } from "./rpcGateway";
 import type { ErrorLogger } from "../logging/errorLogger";
 
@@ -740,10 +741,10 @@ export class SessionLifecycleOps {
       // (mirrors safeMode/launcherKind) — else a respawn silently reverts to
       // the FULL stack (OR-4). Undefined for legacy/interactive sessions.
       sessionRole: session.metadata?.sessionRole,
-      // Issue #2626: preserve the per-session output style across the respawn
-      // (mirrors sessionRole) — else a respawn reverts to the machine default.
-      // Undefined for legacy/default-style sessions → omitted.
-      outputStyle: session.metadata?.outputStyle,
+      // Issue #2626 / #6171: preserve the output style and the MCP set across
+      // the respawn (one helper with buildRespawnBase, so neither can drop one).
+      // Undefined for sessions that never had them → omitted.
+      ...inheritedSessionPins(session),
       // Issue #2434: preserve the model pin across the respawn (mirrors
       // safeMode/launcherKind/sessionRole). The primary spawn overrides this
       // field with the requested mode (see the spread below), and the rollback

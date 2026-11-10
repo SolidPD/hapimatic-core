@@ -49,6 +49,14 @@ export function HappyChatProvider(props: {
   );
 }
 
+/**
+ * #6450: the chat context, or null outside a chat thread, for a renderer that
+ * must degrade (a `hapi_pin` fence stays a code block) instead of throwing.
+ */
+export function useOptionalHappyChatContext(): HappyChatContextValue | null {
+  return useContext(HappyChatContext);
+}
+
 export function useHappyChatContext(): HappyChatContextValue {
   const ctx = useContext(HappyChatContext);
   if (!ctx) {

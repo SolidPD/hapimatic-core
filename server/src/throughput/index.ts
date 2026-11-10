@@ -17,7 +17,9 @@ import {
 } from "../notifications/notifier";
 import { getKnownSecretLiterals } from "../services/knownSecretLiterals";
 import type { Store } from "../store";
+import { ReleaseHealthStore } from "../store/throughput/releaseHealthStore";
 import { parseAccessToken } from "../utils/accessToken";
+import { VERSION } from "../version.generated";
 import { loadThroughputConfig, type ThroughputConfig } from "./config";
 import { ThroughputDigest, createDigestLoop } from "./digest";
 import { ThroughputFactsCollector, createFactsLoop } from "./factsCollector";
@@ -28,6 +30,12 @@ import {
 } from "./github/collector";
 import { compileLanePattern, type IssueVocabulary } from "./github/issueFacts";
 import { ThroughputQuota, createQuotaLoop } from "./quota";
+import {
+  ReleaseHealthService,
+  createVersionLoop,
+  setReleaseHealthRuntime,
+  type LiveSegment,
+} from "./releaseHealth";
 import { ThroughputRollup, createRollupLoop } from "./rollup";
 import { setThroughputRuntime } from "./runtime";
 import { ThroughputSummaryService } from "./summary";
@@ -41,11 +49,17 @@ import { ThroughputSummaryService } from "./summary";
  * reverse, before the store closes. Every loop is constructed and registered
  * even when disabled, so System Jobs shows it as stopped. Fail-soft: a failure
  * here is logged and never blocks boot.
+ *
+ * Issue #6173 (D3): when telemetry is on (every node, not only the fleet-jobs
+ * one), `start()` also opens this run's version segment before any loop starts,
+ * and `stop()` closes it, which is what marks a graceful stop.
  */
 
 let loops: SupervisedLoop[] = [];
 let facts: ThroughputFactsCollector | null = null;
 let current: ThroughputConfig | null = null;
+let releaseSegments: ReleaseHealthStore | null = null;
+let liveSegment: LiveSegment | null = null;
 
 /** The active configuration (null before start). */
 export function getThroughputConfig(): ThroughputConfig | null {
@@ -63,6 +77,9 @@ export function start(opts: {
   getNodeRegistry: () => NodeRegistry | null;
   errorLogger: ErrorLogger;
 }): void {
+  // A second start() without a stop() would leak the first run's loops and
+  // leave its version segment open, which reads as an unclean restart.
+  if (loops.length > 0 || liveSegment) stop();
   try {
     const cfg = loadThroughputConfig({
       settings: opts.settings,
@@ -113,6 +130,7 @@ export function start(opts: {
       rollups: store.throughputRollups,
       github: store.throughputGithub,
       digests: store.throughputDigests,
+      keepalive: store.throughputKeepalive,
       localOrigin: () => node,
       mirror: () => {
         const fed = opts.federationConfig;
@@ -147,6 +165,28 @@ export function start(opts: {
       timezone: cfg.digest.timezone,
     });
 
+    // #6173: open the segment now, before the loops start (the loop's first
+    // touch is 5 minutes out), so even a short-lived version has one. Its own
+    // try/catch: a failed open must not reach the outer catch, which stops
+    // every loop.
+    releaseSegments = new ReleaseHealthStore(store.getRawDb());
+    if (on) {
+      try {
+        const opened = releaseSegments.openSegment(VERSION, Date.now());
+        liveSegment = opened
+          ? { version: opened.version, startedMs: opened.startedMs }
+          : null;
+      } catch (error) {
+        console.warn("[throughput] release-health segment open failed:", error);
+        liveSegment = null;
+      }
+    }
+    const releaseHealth = new ReleaseHealthService({
+      store: releaseSegments,
+      nodeVersion: VERSION,
+      live: () => liveSegment,
+    });
+
     loops = [
       createFactsLoop({
         collector: facts,
@@ -163,18 +203,32 @@ export function start(opts: {
       }),
       createQuotaLoop({ quota, node, enabled: fleet, registry }),
       createDigestLoop({ digest, node, enabled: fleet, registry }),
+      createVersionLoop({
+        store: releaseSegments,
+        segment: () => liveSegment,
+        node,
+        enabled: on && liveSegment !== null,
+        registry,
+      }),
     ];
     for (const loop of loops) loop.start();
-    if (on) setThroughputRuntime({ service, ownerNamespace });
+    if (on) {
+      setThroughputRuntime({ service, ownerNamespace });
+      setReleaseHealthRuntime(releaseHealth);
+    }
   } catch (error) {
     console.error("[throughput] start failed (telemetry off):", error);
     stop();
   }
 }
 
-/** Stop every loop (reverse order) and clear the route handles. */
+/**
+ * Stop every loop (reverse order), close this run's version segment (a clean
+ * stop) and clear the route handles.
+ */
 export function stop(): void {
   setThroughputRuntime(null);
+  setReleaseHealthRuntime(null);
   for (const loop of [...loops].reverse()) {
     try {
       loop.stop();
@@ -183,6 +237,17 @@ export function stop(): void {
     }
   }
   loops = [];
+  const segment = liveSegment;
+  const segments = releaseSegments;
+  liveSegment = null;
+  releaseSegments = null;
+  if (segment && segments) {
+    try {
+      segments.closeSegment(segment.version, segment.startedMs, Date.now());
+    } catch (error) {
+      console.warn("[throughput] release-health segment close failed:", error);
+    }
+  }
   const collector = facts;
   facts = null;
   void collector?.close().catch(() => undefined);

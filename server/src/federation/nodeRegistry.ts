@@ -26,6 +26,8 @@ import type {
 } from "@hapi/protocol";
 import type { SyncEvent } from "@hapi/protocol/types";
 import type { GitBranchListing } from "@hapi/protocol/gitBranches";
+import type { McpCatalogResponse } from "@hapi/protocol/schemas";
+import type { McpSet } from "@hapi/protocol";
 import type { GitHubRepo } from "@hapi/protocol/githubRepo";
 import {
   ANTHROPIC_LOGIN_CAPABILITY,
@@ -52,6 +54,7 @@ import type {
 } from "@hapi/protocol/schemas";
 import { isEffortLevel, type EffortLevel } from "@hapi/protocol/effort";
 import type { SSEManager } from "../sse/sseManager";
+import { resolvePinsEnabled } from "../config/pinsConfig";
 import type { PeerStore } from "../store/peerStore";
 import type { CachedRemoteSessions, NodeRegistryOptions } from "./types";
 import { createHomeUrlGuard } from "./secretTransport";
@@ -443,6 +446,8 @@ export function parseSpawnRefusal(
  */
 export class NodeRegistry {
   private readonly config: NodeRegistryOptions["config"];
+  /** #6447: a closed hub neither relays a peer's pin events nor serves its counts. */
+  private readonly pinsEnabled: boolean;
   private readonly apiToken: string | null;
   private readonly getLocalSessionCount: () => number;
   private readonly peerStore: PeerStore | null;
@@ -535,6 +540,7 @@ export class NodeRegistry {
   constructor(options: NodeRegistryOptions) {
     this.homeUrlGuard = options.homeUrlGuard ?? createHomeUrlGuard();
     this.config = options.config;
+    this.pinsEnabled = options.pinsEnabled ?? resolvePinsEnabled();
     this.apiToken = options.apiToken;
     this.getLocalSessionCount = options.getLocalSessionCount;
     this.peerStore = options.peerStore ?? null;
@@ -1261,6 +1267,20 @@ export class NodeRegistry {
     }
   }
 
+  /** Issue #6447: update a cached session's open pin count after a successful proxied pin write. */
+  updateCachedSessionOpenPinCount(
+    sessionId: string,
+    openPinCount: number
+  ): void {
+    for (const cached of this.sessionCache.values()) {
+      const session = cached.sessions.find(s => s.id === sessionId);
+      if (session) {
+        session.openPinCount = openPinCount;
+        return;
+      }
+    }
+  }
+
   /** Update a cached session's needsReviewOverride after a successful federation proxy mutation. */
   updateCachedSessionNeedsReviewOverride(
     sessionId: string,
@@ -1499,6 +1519,16 @@ export class NodeRegistry {
   }
 
   private updateCacheFromBridgedEvent(nodeId: string, event: SyncEvent): void {
+    // #6447: an agent posting on a peer never passes through the hub, so no proxied
+    // updateCachedSession* call runs for the most common writer. A closed hub
+    // dropped this event in shouldForwardEvent, so it never reaches here.
+    if (event.type === "pin-changed") {
+      const pinned = this.sessionCache
+        .get(nodeId)
+        ?.sessions.find(s => s.id === event.sessionId);
+      if (pinned) pinned.openPinCount = event.openPinCount;
+      return;
+    }
     if (event.type !== "session-updated" || !("sessionId" in event)) return;
     const data = (event as { data?: Record<string, unknown> }).data;
     if (!data) return;
@@ -2082,6 +2112,31 @@ export class NodeRegistry {
    * A stale peer without the endpoint surfaces as `type: "error"` and the web
    * falls back to today's Git Type + Branch Name controls.
    */
+  /** Issue #6171: a peer's MCP catalog for a directory on its own disk. */
+  async getMcpCatalogOnNode(
+    nodeId: string,
+    directory: string
+  ): Promise<
+    | { type: "success"; catalog: McpCatalogResponse }
+    | { type: "error"; message: string }
+  > {
+    return this.proxyToNode(nodeId, "/api/federation/mcp-catalog", {
+      directory,
+    });
+  }
+
+  /** Issue #6171: store or clear (`set: null`) a project's default on its node. */
+  async setMcpProjectDefaultOnNode(
+    nodeId: string,
+    body: { directory: string; set: McpSet | null }
+  ): Promise<{ type: "success" } | { type: "error"; message: string }> {
+    return this.proxyToNode(
+      nodeId,
+      "/api/federation/mcp-project-default",
+      body
+    );
+  }
+
   async listGitBranchesOnNode(
     nodeId: string,
     directory: string
@@ -2874,6 +2929,27 @@ export class NodeRegistry {
     );
   }
 
+  // ── Pin dashboards (issue #6454) ────────────────────────────────────────
+
+  /**
+   * A peer's Project Manager dashboards in the caller's namespace, for the hub's
+   * `GET /api/pins/dashboards` fan-out. `readPeerRoute` rather than
+   * `proxyToNodeAsCaller`, because only it reads the error body: an older peer's
+   * 401 `Invalid token` (and a closed gate's 404) is `unsupported`, while a wrong
+   * federation token is `unreachable`. The caller validates an `ok` body.
+   */
+  async listPinDashboardsOnNode(
+    nodeId: string,
+    namespace: string
+  ): Promise<PeerReadOutcome> {
+    return this.readPeerRoute(
+      nodeId,
+      "/api/federation/pins/dashboards",
+      "Pin dashboards",
+      { namespace, timeoutMs: NOTIFICATION_PROXY_TIMEOUT_MS }
+    );
+  }
+
   // ── Notifications (issue #4913) ─────────────────────────────────────────
   // Hub → peer proxies for the /api/notifications fan-out. Each forwards the
   // caller's namespace (the receivers fail closed without it, #1097) and uses a
@@ -2962,12 +3038,14 @@ export class NodeRegistry {
    *   - a throw → `timeout` (`TimeoutError`) or `network`, with its error text;
    *   - a 2xx that is not JSON → `malformed`;
    *   - any other 2xx → `ok` with the parsed body, for the caller to validate.
-   * `label` names the read in the malformed message.
+   * `label` names the read in the malformed message. `namespace` forwards the
+   * caller as `X-Hapi-Caller-Namespace`, for a receiver that scopes to it (#6454).
    */
   private async readPeerRoute(
     nodeId: string,
     endpoint: string,
-    label: string
+    label: string,
+    options: { namespace?: string; timeoutMs?: number } = {}
   ): Promise<PeerReadOutcome> {
     const state = this.nodeStates.get(nodeId);
     if (!state || state.status === "offline") {
@@ -2976,7 +3054,15 @@ export class NodeRegistry {
     const url = `${state.config.url}${endpoint}`;
     let res: Response;
     try {
-      res = await this.fetchWithAuth(url, "POST", {});
+      res = await this.fetchWithAuth(
+        url,
+        "POST",
+        {},
+        options.timeoutMs ?? FETCH_TIMEOUT_MS,
+        options.namespace
+          ? { "X-Hapi-Caller-Namespace": options.namespace }
+          : undefined
+      );
     } catch (err) {
       const timedOut = err instanceof Error && err.name === "TimeoutError";
       return {
@@ -3237,6 +3323,7 @@ export class NodeRegistry {
    * Delegates to the exported `shouldForwardBridgeEvent()` pure function.
    */
   private shouldForwardEvent(event: SyncEvent): boolean {
+    if (event.type === "pin-changed" && !this.pinsEnabled) return false;
     return shouldForwardBridgeEvent(
       event,
       this.interestingSessions,
@@ -3320,6 +3407,11 @@ export class NodeRegistry {
         .filter(s => !this.evictedSince(s.id, nodeConfig.id, startSeq))
         .map(s => ({
           ...s,
+          // #6447 (R15): with this hub's gate closed, the only path that still
+          // brings a peer's count in (the bridged event is dropped and no proxied
+          // pin write can reach a 404 route), so the list and the cached detail
+          // fallback both inherit a closed gate.
+          ...(this.pinsEnabled ? {} : { openPinCount: undefined }),
           nodeId: nodeConfig.id,
           nodeLabel: nodeConfig.label,
         }));

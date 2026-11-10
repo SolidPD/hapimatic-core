@@ -238,10 +238,15 @@ export function formatRelativeTime(value: number): string | null {
  * rewrite of `formatRelativeTime`) because the verbose "…ago" form still has live
  * consumers (`SessionItem.tsx`), so the two forms must coexist.
  */
-export function formatRelativeTimeCompact(value: number): string | null {
+export function formatRelativeTimeCompact(
+  value: number,
+  // #6449: the Pins Ledger passes its per-minute clock so ages are testable
+  // and every row shares one "now".
+  now: number = Date.now()
+): string | null {
   const ms = value < 1_000_000_000_000 ? value * 1000 : value;
   if (!Number.isFinite(ms)) return null;
-  const delta = Date.now() - ms;
+  const delta = now - ms;
   if (delta < 60_000) return "now";
   const minutes = Math.floor(delta / 60_000);
   if (minutes < 60) return `${minutes}m`;

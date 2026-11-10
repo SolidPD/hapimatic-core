@@ -60,11 +60,10 @@ export type BackupIdentityPaths = {
 
 /**
  * Resolve the production paths from a settings file. The pending identity and
- * recipient live under `~/.config/hapimatic/` — deliberately NOT under HAPI_HOME
- * / next to settings.json — because `~/.config/hapimatic/` is not one of the
- * backup sets (`backup.sh:108` backs up `.hapimatic-private .claude projects`),
- * so a pending identity there is never captured by a nightly backup before the
- * user acknowledges it.
+ * recipient live under `~/.config/hapimatic/`. That folder is in the `home`
+ * backup set (#6246), but the pending identity itself is left out of every
+ * backup (`backup-exclude.list`, Matt's ruling Q1): every backup is encrypted to
+ * that same key, so a copy inside one cannot help a restore.
  */
 export function defaultBackupIdentityPaths(
   settingsFile: string

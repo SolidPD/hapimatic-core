@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -7,7 +8,11 @@ import {
   useRef,
   useState,
 } from "react";
-import { ThreadPrimitive, useThreadViewport } from "@assistant-ui/react";
+import {
+  ThreadPrimitive,
+  useAssistantState,
+  useThreadViewport,
+} from "@assistant-ui/react";
 import { applyThreadFade, computeThreadFade } from "@/lib/threadFade";
 import type { ApiClient } from "@/api/client";
 import type { SessionMetadataSummary } from "@/types/api";
@@ -20,6 +25,8 @@ import { HappyUserMessage } from "@/components/AssistantChat/messages/UserMessag
 import { HappySystemMessage } from "@/components/AssistantChat/messages/SystemMessage";
 import { Button } from "@/components/ui/button";
 import { ScrollPositionRail } from "@/components/ui/ScrollPositionRail";
+import { ScrollRecorderPanel } from "@/components/AssistantChat/ScrollRecorderPanel";
+import { ThreadMessageById } from "@/components/AssistantChat/ThreadMessageById";
 import { Spinner } from "@/components/Spinner";
 import { useToast } from "@/components/Toast";
 import {
@@ -28,6 +35,17 @@ import {
   clearScrollPosition,
 } from "@/lib/scroll-position-cache";
 import { computeAnchorRestoreDelta } from "@/lib/scroll-anchor";
+import {
+  recordEvent,
+  recordScrollWrite,
+  registerThreadViewport,
+} from "@/lib/scrollCauseRecorder";
+import {
+  claimThreadScroll,
+  isThreadScrollClaimed,
+} from "@/lib/threadScrollClaim";
+import { anchorLabel, useReadingAnchor } from "@/hooks/useReadingAnchor";
+import { useFollowOffRequests } from "@/hooks/useFollowOffRequests";
 
 // Exported for use in SessionChat
 export interface ScrollState {
@@ -73,6 +91,91 @@ const THREAD_MESSAGE_COMPONENTS = {
   SystemMessage: HappySystemMessage,
 } as const;
 
+const MESSAGE_ID_SEPARATOR = "\u0000";
+
+// The band above the viewport in which the top sentinel starts a load-older.
+const TOP_SENTINEL_MARGIN_PX = 200;
+// Jump-to-top holds the viewport until its smooth scroll ends: `scrollend`, user
+// input, or this cap, whichever comes first (the cap is the backstop where
+// `scrollend` never fires), so no compensation cuts it short (#6122).
+const JUMP_TO_TOP_CLAIM_MAX_MS = 1500;
+
+// The joined ids per messages array. The thread store notifies on every change (composer
+// edits included); while the array is the same one, this keeps the selector O(1).
+const joinedIdsByMessages = new WeakMap<object, string>();
+function joinMessageIds(messages: readonly { id: string }[]): string {
+  let joined = joinedIdsByMessages.get(messages);
+  if (joined === undefined) {
+    joined = messages.map(message => message.id).join(MESSAGE_ID_SEPARATOR);
+    joinedIdsByMessages.set(messages, joined);
+  }
+  return joined;
+}
+
+/**
+ * #6122: the thread's message list, keyed by message id.
+ *
+ * assistant-ui's own `ThreadPrimitive.Messages` keys rows by position. Loading older history
+ * then does not insert rows above the reader: React keeps every row at its position and
+ * refills it with a different, older message, and appends the leftovers at the bottom. That
+ * defeats any element anchor (the reader lands at the top of the new batch), and reused rows
+ * briefly show the previous message's text, highlighting and open state, which changes their
+ * height after the load. Keyed by id, a load-older is a real insert above the existing rows.
+ * Each row also resolves its message by id (`ThreadMessageById`): a positional row that
+ * moves reads its old index for one render, so it would still show another message and
+ * remount when the role differs. With both, existing rows keep their DOM nodes and state.
+ *
+ * Memoized like the list it replaces, so a HappyThread render does not revisit every row; the
+ * selector returns one joined string, so it re-renders only when the ids change.
+ */
+const ThreadMessagesById = memo(function ThreadMessagesById() {
+  const joinedIds = useAssistantState(({ thread }) =>
+    joinMessageIds(thread.messages)
+  );
+  const count = useAssistantState(({ thread }) => thread.messages.length);
+  const keys = useMemo(() => {
+    const ids = count === 0 ? [] : joinedIds.split(MESSAGE_ID_SEPARATOR);
+    // Defensive: assistant-ui's message repository rejects a repeated id, so the runtime
+    // should never deliver one. If one does reach this list, a shared key would make React
+    // drop a row, so only the repeats get a suffix and every other row keeps its identity.
+    const seen = new Map<string, number>();
+    let repeats = 0;
+    const unique = ids.map(id => {
+      const n = seen.get(id) ?? 0;
+      seen.set(id, n + 1);
+      if (n === 0) return id;
+      repeats += 1;
+      return `${id}${MESSAGE_ID_SEPARATOR}${n}`;
+    });
+    if (repeats > 0) {
+      recordEvent("dup-message-id", `count=${ids.length} repeats=${repeats}`);
+    }
+    return unique;
+  }, [joinedIds, count]);
+  if (keys.length === 0) return null;
+  return (
+    <>
+      {keys.map((key, index) =>
+        // A repeated id cannot be resolved by id (assistant-ui keys its messages by id),
+        // so only the repeats keep the positional row.
+        key.includes(MESSAGE_ID_SEPARATOR) ? (
+          <ThreadPrimitive.MessageByIndex
+            key={key}
+            index={index}
+            components={THREAD_MESSAGE_COMPONENTS}
+          />
+        ) : (
+          <ThreadMessageById
+            key={key}
+            id={key}
+            components={THREAD_MESSAGE_COMPONENTS}
+          />
+        )
+      )}
+    </>
+  );
+});
+
 export function HappyThread(props: {
   api: ApiClient;
   sessionId: string;
@@ -110,28 +213,50 @@ export function HappyThread(props: {
   const contentRef = useRef<HTMLDivElement | null>(null);
   const topSentinelRef = useRef<HTMLDivElement | null>(null);
   const loadLockRef = useRef(false);
-  const pendingScrollRef = useRef<{
-    // #3768 (Option C, expert-review D14): element-anchored load-older restore.
-    // anchorEl is the top-visible block at load-start; anchorTop is its
-    // viewport-relative offset. Compensation shifts the viewport so anchorEl
-    // returns to anchorTop — driven ONLY by content inserted ABOVE it, so a
-    // streaming token / #3177 tail placeholder growing the column during the load
-    // moves nothing and is ignored (dissolves the scrollHeight-delta blind spot,
-    // finding 3768-5).
-    anchorEl: HTMLElement;
-    anchorTop: number;
-    // rawMessagesCount at capture, so the settle-effect can release immediately
-    // on a zero-new-row page (the ResizeObserver would never fire).
-    count: number;
-  } | null>(null);
-  // #3768: hard-cap timer id — armed when a load-older page arrives (count grew)
-  // and cleared by the ResizeObserver on compensation. A page that grows the
-  // count but renders NO rows (all normalized away, or ResizeObserver absent)
-  // would otherwise leave the anchor stuck and wedge bottom-follow + the load
-  // lock (finding 3768-3); the timer is the fallback release.
+  // A load-older page in flight. #6122: it no longer carries an anchor of its own —
+  // the reading anchor below compensates the prepend whenever the rows land, with no
+  // time limit — so it only tracks the load lock's lifecycle. `count` is
+  // rawMessagesCount at load start, so the settle-effect can release at once on a
+  // zero-new-row page (no rows mount, so no resize would ever report one).
+  const pendingLoadOlderRef = useRef<{ count: number } | null>(null);
+  // #3768: hard-cap timer id — armed when a load-older page arrives (count grew).
+  // A page that grows the count but renders NO rows (all normalized away, or
+  // ResizeObserver absent) would otherwise hold the load lock for good (finding
+  // 3768-3); the timer is the lock's fallback release. #6122: since the reading
+  // anchor compensates whenever rows land, the cap no longer costs a compensation.
   const loadHardCapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
+  // The debounced load-lock release after rows mount; cleared by any other release or
+  // load start, so a stale timer cannot drop the lock of a later load.
+  const lockReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
+  // The latest handleLoadMore, for callers that must not re-subscribe when it
+  // changes: the top-sentinel observer and the post-load chain check.
+  const handleLoadMoreRef = useRef<(trigger?: string) => void>(() => {});
+  // Ends jump-to-top's hold on the viewport (#6122); null when none is held.
+  const endJumpToTopRef = useRef<(() => void) | null>(null);
+  // #6122: true while the #3158 text-size restore owns the viewport.
+  const textScaleSettlingRef = useRef(false);
+  const rawMessagesCountRef = useRef(props.rawMessagesCount);
+  rawMessagesCountRef.current = props.rawMessagesCount;
+  // #6122: what the stable handleLoadMore reads. Kept in a ref so a new onLoadMore
+  // identity (useMessages returns a fresh one every render) cannot re-create the
+  // top-sentinel IntersectionObserver, whose initial callback started loads nobody
+  // asked for.
+  const loadInputsRef = useRef({
+    onLoadMore: props.onLoadMore,
+    hasMore: props.hasMoreMessages,
+    isLoading: props.isLoadingMessages,
+    isLoadingMore: props.isLoadingMoreMessages,
+  });
+  loadInputsRef.current = {
+    onLoadMore: props.onLoadMore,
+    hasMore: props.hasMoreMessages,
+    isLoading: props.isLoadingMessages,
+    isLoadingMore: props.isLoadingMoreMessages,
+  };
   const prevLoadingMoreRef = useRef(false);
   const loadStartedRef = useRef(false);
   const isLoadingMoreRef = useRef(props.isLoadingMoreMessages);
@@ -182,6 +307,8 @@ export function HappyThread(props: {
   const [newMessageCount, setNewMessageCount] = useState(0);
   const prevRenderedCountRef = useRef(props.renderedMessagesCount);
   const autoScrollEnabledRef = useRef(autoScrollEnabled);
+  // #6122: the scrollHeight the view was last pinned at while following.
+  const followedHeightRef = useRef(Number.POSITIVE_INFINITY);
   const newMessageCountRef = useRef(newMessageCount);
   const hasBootstrappedRef = useRef(false);
   const { showToast } = useToast();
@@ -193,6 +320,156 @@ export function HappyThread(props: {
   useEffect(() => {
     newMessageCountRef.current = newMessageCount;
   }, [newMessageCount]);
+
+  // #6122: set follow mode from an event handler. The ref changes at once, not when React
+  // next commits, so a content resize in between already sees the user's choice: a stale
+  // "following" snapped a reader who had just scrolled up back to the bottom, and kept the
+  // reading anchor from being picked.
+  const setFollowing = useCallback((next: boolean) => {
+    autoScrollEnabledRef.current = next;
+    // #6122: leaving follow forgets the last pin. Follow can return without one (the
+    // near-bottom band, the at-bottom safety net); a stale pin reads as pending growth.
+    if (!next) followedHeightRef.current = Number.POSITIVE_INFINITY;
+    setAutoScrollEnabled(next);
+  }, []);
+
+  // #6122: the reading anchor that keeps a scrolled-up reader's text in place
+  // (hooks/useReadingAnchor.ts). Paused while the #833 restore, the #3158 text-size
+  // restore, or a thread-scroll claim (a navigator's post-snap correction,
+  // jump-to-top's smooth scroll) owns the viewport.
+  const readingAnchor = useReadingAnchor({
+    viewportRef,
+    contentRef,
+    followingRef: autoScrollEnabledRef,
+    programmaticScrollRef: isScrollingToBottomRef,
+    directionBaselineRef: lastScrollTopForDirRef,
+    isPaused: () =>
+      isRestoringRef.current ||
+      textScaleSettlingRef.current ||
+      isThreadScrollClaimed(viewportRef.current),
+  });
+  const {
+    compensate: compensateReadingAnchor,
+    pick: pickReadingAnchor,
+    sync: syncReadingAnchor,
+    clear: clearReadingAnchor,
+    invalidateCandidates,
+    readingAnchorRef,
+  } = readingAnchor;
+
+  // #6122: whether the top sentinel is inside the band its observer watches (the
+  // viewport plus TOP_SENTINEL_MARGIN_PX above it). False before layout.
+  const isTopSentinelInRange = useCallback((): boolean => {
+    const sentinel = topSentinelRef.current;
+    const viewport = viewportRef.current;
+    if (!sentinel || !viewport) return false;
+    const v = viewport.getBoundingClientRect();
+    if (v.height <= 0) return false;
+    const s = sentinel.getBoundingClientRect();
+    return s.bottom >= v.top - TOP_SENTINEL_MARGIN_PX && s.top <= v.bottom;
+  }, []);
+
+  // #6122: the ONE release of a load-older page: drops the pending record and its hard-cap
+  // timer and frees the load lock. `debounceLock` (rows just mounted, the follow writer
+  // finishing the page, or the hard cap) holds the lock 100 ms more, so the top sentinel,
+  // still in view right after the shift, does not start the next page at once; it then
+  // starts it if the sentinel is still in range. Clearing the record without freeing the
+  // lock would block load-older for good, because the settle effect arms the hard cap only
+  // while a record is pending (#3768-3).
+  const releaseLoadOlder = useCallback(
+    (reason: string, debounceLock = false) => {
+      const hadPending = pendingLoadOlderRef.current !== null;
+      pendingLoadOlderRef.current = null;
+      if (loadHardCapTimerRef.current !== null) {
+        clearTimeout(loadHardCapTimerRef.current);
+        loadHardCapTimerRef.current = null;
+      }
+      if (lockReleaseTimerRef.current !== null) {
+        clearTimeout(lockReleaseTimerRef.current);
+        lockReleaseTimerRef.current = null;
+      }
+      if (debounceLock) {
+        lockReleaseTimerRef.current = setTimeout(() => {
+          lockReleaseTimerRef.current = null;
+          loadLockRef.current = false;
+          // The sentinel observer re-subscribed when the page finished, while the lock
+          // was still held, so its initial callback did nothing. A sentinel still in
+          // range (a short page) starts the next one now: infinite scroll at the top.
+          if (isTopSentinelInRange()) handleLoadMoreRef.current("io-chain");
+        }, 100);
+      } else {
+        loadLockRef.current = false;
+      }
+      if (hadPending) {
+        recordEvent(
+          "load-older-release",
+          `reason=${reason}`,
+          viewportRef.current
+        );
+      }
+    },
+    [isTopSentinelInRange]
+  );
+
+  // #6122: a load-older page has mounted its rows when the reading anchor was pushed down
+  // (content was inserted above it) after the message count grew past the load's start.
+  const noteLoadOlderRows = useCallback(
+    (compensated: number) => {
+      const pending = pendingLoadOlderRef.current;
+      if (
+        !pending ||
+        compensated <= 0 ||
+        rawMessagesCountRef.current <= pending.count
+      ) {
+        return;
+      }
+      recordEvent(
+        "load-older-rows",
+        `moved=${Math.round(compensated)}`,
+        viewportRef.current
+      );
+      releaseLoadOlder("rows", true);
+    },
+    [releaseLoadOlder]
+  );
+
+  // #2858 follow mode's one writer: pin the viewport to the bottom under the single-frame
+  // guard. A load-older page whose rows have mounted (the count grew) is then done.
+  // `detail` tells the recorder which caller pinned (the scroll handler's catch-up).
+  const followToBottom = useCallback(
+    (viewport: HTMLElement, detail?: string) => {
+      clearReadingAnchor();
+      const pending = pendingLoadOlderRef.current;
+      if (pending && rawMessagesCountRef.current > pending.count) {
+        releaseLoadOlder("follow", true);
+      }
+      isScrollingToBottomRef.current = true;
+      const before = viewport.scrollTop;
+      viewport.scrollTop = viewport.scrollHeight;
+      recordScrollWrite(
+        "follow-to-bottom",
+        viewport,
+        before,
+        viewport.scrollTop,
+        detail
+      );
+      followedHeightRef.current = viewport.scrollHeight;
+      requestAnimationFrame(() => {
+        isScrollingToBottomRef.current = false;
+      });
+    },
+    [clearReadingAnchor, releaseLoadOlder]
+  );
+
+  // #6122: the rows changed, so the cached candidate list may hold removed elements or miss
+  // new ones.
+  useEffect(() => {
+    invalidateCandidates();
+  }, [
+    invalidateCandidates,
+    props.renderedMessagesCount,
+    props.rawMessagesCount,
+  ]);
 
   // Safety net: sync autoScrollEnabled with assistant-ui's isAtBottom.
   // Catches edge cases where assistant-ui keeps viewport at bottom
@@ -208,10 +485,14 @@ export function HappyThread(props: {
     if (isRestoringRef.current) return; // Don't fight scroll restore (#833)
     if (userScrollDirectionRef.current === "up") return; // #1298 Concern 4 gate
     if (auiIsAtBottom && !autoScrollEnabled) {
-      setAutoScrollEnabled(true);
+      recordEvent("aui-at-bottom-sync", undefined, viewportRef.current);
+      // #6122: through setFollowing, so a scroll event before the next commit cannot
+      // run a reading-anchor compensation while the thread already follows.
+      setFollowing(true);
+      clearReadingAnchor();
       setNewMessageCount(0);
     }
-  }, [auiIsAtBottom, autoScrollEnabled]);
+  }, [auiIsAtBottom, autoScrollEnabled, clearReadingAnchor, setFollowing]);
 
   // Track scroll position to toggle autoScroll (stable listener using refs)
   // Uses two-tier threshold: "exact bottom" (< 5px) forces re-enable, "near bottom" (< 120px) enables if not already
@@ -224,29 +505,9 @@ export function HappyThread(props: {
 
     const SCROLL_DIRECTION_HYSTERESIS_PX = 2;
 
-    const handleScroll = () => {
-      // Skip during programmatic scroll-to-bottom to avoid fighting
-      // assistant-ui's animation or instant scroll
-      if (isScrollingToBottomRef.current) return;
-
-      const currentTop = viewport.scrollTop;
-      // Track user-initiated scroll direction for #1298 Concern 4 safety-net gating.
-      // 2px hysteresis avoids spurious flips on float-rounded scroll events.
-      if (
-        currentTop <
-        lastScrollTopForDirRef.current - SCROLL_DIRECTION_HYSTERESIS_PX
-      ) {
-        userScrollDirectionRef.current = "up";
-      } else if (
-        currentTop >
-        lastScrollTopForDirRef.current + SCROLL_DIRECTION_HYSTERESIS_PX
-      ) {
-        userScrollDirectionRef.current = "down";
-      }
-      lastScrollTopForDirRef.current = currentTop;
-
+    const applyFollowThresholds = () => {
       const distanceFromBottom =
-        viewport.scrollHeight - currentTop - viewport.clientHeight;
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
 
       if (distanceFromBottom < EXACT_BOTTOM_THRESHOLD_PX) {
         // User is at exact bottom - force enable auto-scroll (user clearly wants
@@ -258,8 +519,11 @@ export function HappyThread(props: {
         // follow request, so it can't clear the gate or re-arm follow.
         if (userScrollDirectionRef.current !== "up") {
           userScrollDirectionRef.current = null;
-          if (!autoScrollEnabledRef.current) setAutoScrollEnabled(true);
+          if (!autoScrollEnabledRef.current) setFollowing(true);
           if (newMessageCountRef.current > 0) setNewMessageCount(0);
+        }
+        if (autoScrollEnabledRef.current) {
+          followedHeightRef.current = viewport.scrollHeight;
         }
       } else if (distanceFromBottom < NEAR_BOTTOM_THRESHOLD_PX) {
         // User is near bottom - enable if not already. Same #2414 gate: without
@@ -267,18 +531,83 @@ export function HappyThread(props: {
         // scroll event of a single ~100px wheel-up notch (< 120px), would undo
         // the wheel-up disable that the user-intent listener just set.
         if (userScrollDirectionRef.current !== "up") {
-          if (!autoScrollEnabledRef.current) setAutoScrollEnabled(true);
+          if (!autoScrollEnabledRef.current) setFollowing(true);
           if (newMessageCountRef.current > 0) setNewMessageCount(0);
         }
       } else {
         // User scrolled away from bottom - disable auto-scroll
-        if (autoScrollEnabledRef.current) setAutoScrollEnabled(false);
+        if (autoScrollEnabledRef.current) setFollowing(false);
       }
+    };
+
+    const handleScroll = () => {
+      // A guarded write (follow, jump-to-bottom, the initial landing, the text-size
+      // restore, a compensation) is not user intent, so it skips the direction and
+      // threshold logic below; the #833 restore and jump-to-top are not guarded. #6122:
+      // it still moves the direction baseline and the reading anchor. The baseline
+      // used to stay at the pre-write position, so the next user scroll was
+      // measured from a stale top.
+      const guarded = isScrollingToBottomRef.current;
+      // #6122: following, and the content grew since the view was last pinned. This
+      // frame's scroll event can come before the content observer's follow writer: the
+      // browser clamping the pinned position during a commit is one such event (43px
+      // measured after a jump to the bottom). Follow first, as the observer would, or
+      // the thresholds below read the grown distance as leaving follow. The event does
+      // not say who moved, so only a move of under 120px up qualifies, and none while a
+      // thread-scroll claim is held. A move of 120px or more (an instant PageUp, a
+      // find-in-page or reduced-motion navigator jump) reaches the thresholds and leaves
+      // follow. Known limits, for positive intent detection: a small keyboard step in a
+      // frame with large growth is pinned back; a clamp of 120px or more loses follow.
+      const pinnedTop = followedHeightRef.current - viewport.clientHeight;
+      const catchUp =
+        !guarded &&
+        autoScrollEnabledRef.current &&
+        !isRestoringRef.current &&
+        !isThreadScrollClaimed(viewport) &&
+        viewport.scrollHeight > followedHeightRef.current &&
+        Math.abs(lastScrollTopForDirRef.current - pinnedTop) < 2 &&
+        lastScrollTopForDirRef.current - viewport.scrollTop <
+          NEAR_BOTTOM_THRESHOLD_PX;
+      if (catchUp) followToBottom(viewport, "catch-up");
+      const currentTop = viewport.scrollTop;
+      // Track user-initiated scroll direction for #1298 Concern 4 safety-net gating.
+      // 2px hysteresis avoids spurious flips on float-rounded scroll events.
+      if (!guarded && !catchUp) {
+        if (
+          currentTop <
+          lastScrollTopForDirRef.current - SCROLL_DIRECTION_HYSTERESIS_PX
+        ) {
+          userScrollDirectionRef.current = "up";
+        } else if (
+          currentTop >
+          lastScrollTopForDirRef.current + SCROLL_DIRECTION_HYSTERESIS_PX
+        ) {
+          userScrollDirectionRef.current = "down";
+        }
+      }
+      // #6122 reading anchor, step (a): a commit can change the layout before this
+      // frame's resize callback runs, so compensate here first; the thresholds
+      // then read the real geometry.
+      noteLoadOlderRows(compensateReadingAnchor("scroll"));
+      lastScrollTopForDirRef.current = viewport.scrollTop;
+      if (!guarded) applyFollowThresholds();
+      // Step (b): re-pick at the position the reader is now at, with follow mode
+      // already settled by the thresholds.
+      if (autoScrollEnabledRef.current) clearReadingAnchor();
+      else pickReadingAnchor("scroll");
     };
 
     viewport.addEventListener("scroll", handleScroll, { passive: true });
     return () => viewport.removeEventListener("scroll", handleScroll);
-  }, []); // Stable: no dependencies, reads from refs
+    // Stable: every dependency is a stable callback; the handler reads refs.
+  }, [
+    clearReadingAnchor,
+    compensateReadingAnchor,
+    followToBottom,
+    noteLoadOlderRows,
+    pickReadingAnchor,
+    setFollowing,
+  ]);
 
   // User-intent scroll listeners (#2414): native wheel-up / upward touch-drag
   // are the reliable user-vs-programmatic discriminator the distance heuristic
@@ -297,7 +626,7 @@ export function HappyThread(props: {
     // autoScrollEnabledRef first avoids a redundant state write when already off.
     const markUserScrollUp = () => {
       userScrollDirectionRef.current = "up";
-      if (autoScrollEnabledRef.current) setAutoScrollEnabled(false);
+      if (autoScrollEnabledRef.current) setFollowing(false);
     };
 
     const handleWheel = (event: WheelEvent) => {
@@ -333,7 +662,8 @@ export function HappyThread(props: {
       viewport.removeEventListener("touchstart", handleTouchStart);
       viewport.removeEventListener("touchmove", handleTouchMove);
     };
-  }, []); // Stable: attaches once, reads/writes refs + setAutoScrollEnabled
+  }, [setFollowing]); // Stable: attaches once, reads/writes refs + setFollowing
+  useFollowOffRequests(viewportRef, userScrollDirectionRef, setFollowing);
 
   // #2858 single-ownership follow-mode: with assistant-ui's autoScroll now off
   // (the Viewport renders all four arming sites false), WE own stick-to-bottom
@@ -350,62 +680,37 @@ export function HappyThread(props: {
     const observer = new ResizeObserver(() => {
       const viewport = viewportRef.current;
       if (!viewport) return;
-      // #3768 (Option C, expert-review D14): element-anchored load-older
-      // compensation. The prepended rows mount one commit AFTER the count bump
-      // (assistant-ui's passive setAdapter re-render); this observer fires then,
-      // when the column has grown. This check runs BEFORE the autoScroll/#833
-      // guards because a load-older happens while the user is scrolled UP
-      // (autoScroll off), so gating it on autoScroll would make it dead code.
-      // Return in BOTH the compensated and still-pending sub-cases so bottom-follow
-      // never runs while a load-older anchor is pending.
-      const pending = pendingScrollRef.current;
-      if (pending) {
-        // How far the captured top-visible block MOVED. Only content inserted
-        // ABOVE it moves it, so a tail/streaming growth yields moved === 0 and is
-        // ignored (the anchor is retained for the real prepend). A prepend moves
-        // it down → compensate by exactly that delta.
-        const moved = computeAnchorRestoreDelta({
-          anchorTopNow: pending.anchorEl.getBoundingClientRect().top,
-          viewportTopNow: viewport.getBoundingClientRect().top,
-          targetOffset: pending.anchorTop,
-        });
-        if (moved !== 0) {
-          isScrollingToBottomRef.current = true;
-          viewport.scrollTop += moved;
-          requestAnimationFrame(() => {
-            isScrollingToBottomRef.current = false;
-          });
-          pendingScrollRef.current = null;
-          if (loadHardCapTimerRef.current !== null) {
-            clearTimeout(loadHardCapTimerRef.current);
-            loadHardCapTimerRef.current = null;
-          }
-          // Debounce the load-lock release so the top-sentinel IntersectionObserver
-          // doesn't immediately re-fire while it is still in view after the shift.
-          setTimeout(() => {
-            loadLockRef.current = false;
-          }, 100);
-        }
+      // 1. Following: pin to the bottom. There is no reading anchor, and a
+      //    load-older page whose rows have mounted (the count grew) is done.
+      if (autoScrollEnabledRef.current && !isRestoringRef.current) {
+        followToBottom(viewport);
         return;
       }
-      if (!autoScrollEnabledRef.current) return; // user off-bottom; don't follow
-      if (isRestoringRef.current) return; // don't fight #833 restore
-      isScrollingToBottomRef.current = true;
-      viewport.scrollTop = viewport.scrollHeight;
-      requestAnimationFrame(() => {
-        isScrollingToBottomRef.current = false;
-      });
+      // 2-3. Scrolled up (#6122): the reading anchor scrolls by any change above
+      //    the reader. Prepended load-older rows (#3768), a reasoning block
+      //    opening and an image loading are all the same case; growth below the
+      //    reader (streaming, the #3177 tail placeholder) moves nothing. Paused
+      //    while the #833 restore, the #3158 text-size restore, or a thread-scroll
+      //    claim (a navigator's correction, jump-to-top) owns the viewport.
+      // 4. A load-older page has mounted its rows when that pushed the anchor
+      //    down after the count grew; release its lock.
+      noteLoadOlderRows(syncReadingAnchor("resize"));
     });
     observer.observe(content);
     return () => {
       observer.disconnect();
-      // #3768: cancel any in-flight load-older hard-cap timer on unmount.
+      // #3768: cancel any in-flight load-older timers on unmount.
       if (loadHardCapTimerRef.current !== null) {
         clearTimeout(loadHardCapTimerRef.current);
         loadHardCapTimerRef.current = null;
       }
+      if (lockReleaseTimerRef.current !== null) {
+        clearTimeout(lockReleaseTimerRef.current);
+        lockReleaseTimerRef.current = null;
+      }
     };
-  }, []); // Stable: observes once, reads refs only
+    // Stable: observes once; every dependency is a stable callback.
+  }, [followToBottom, noteLoadOlderRows, syncReadingAnchor]);
 
   // Track new messages when autoScroll is disabled
   const wasLoadingMoreRef = useRef(props.isLoadingMoreMessages);
@@ -456,14 +761,33 @@ export function HappyThread(props: {
   const scrollToBottom = useCallback(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    // #6122: a jump wins over everything pending. A load-older page landing after
+    // it no longer pulls the view back to where the load started, and follow is on
+    // at once (not at the next commit), so content that grows below right after
+    // the jump is followed: one press reaches the bottom.
+    releaseLoadOlder("jump-to-bottom");
+    // A jump-to-top hold still running blocks the follow catch-up, stranding the reader
+    // in a page that lands now. End it first (its re-pick is cleared next).
+    endJumpToTopRef.current?.();
+    clearReadingAnchor();
     isScrollingToBottomRef.current = true;
     // Clear user-scroll-up gate: clicking Jump-to-Bottom is an explicit intent
     // to follow streaming again (#1298 Concern 4).
     userScrollDirectionRef.current = null;
     // #2858: own the scroll (auiScrollToBottom is no longer bound). Mirrors the
     // scrollToTop viewport.scrollTo pattern below.
+    const before = viewport.scrollTop;
     viewport.scrollTo({ top: viewport.scrollHeight, behavior: "instant" });
-    setAutoScrollEnabled(true);
+    // #6122: the read-back distance shows whether the jump actually landed.
+    recordScrollWrite(
+      "jump-to-bottom",
+      viewport,
+      before,
+      viewport.scrollTop,
+      `landed-dist=${Math.round(viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight)}`
+    );
+    followedHeightRef.current = viewport.scrollHeight;
+    setFollowing(true);
     setNewMessageCount(0);
     // Clear the guard after a SINGLE frame (#2858): the instant scroll completes
     // synchronously but its scroll event fires asynchronously. Never a timer or a
@@ -473,16 +797,50 @@ export function HappyThread(props: {
     requestAnimationFrame(() => {
       isScrollingToBottomRef.current = false;
     });
-  }, []);
+  }, [clearReadingAnchor, releaseLoadOlder, setFollowing]);
 
-  // Scroll to top handler
+  // Scroll to top handler. #6122: releases a pending load-older page, and holds the
+  // viewport (a thread-scroll claim) until the smooth scroll ends, because any
+  // scrollTop write during it, a reading-anchor compensation included, aborts it
+  // partway. The anchor re-picks when the hold ends.
   const scrollToTop = useCallback(() => {
+    releaseLoadOlder("jump-to-top");
     const viewport = viewportRef.current;
     if (viewport) {
+      endJumpToTopRef.current?.();
+      const release = claimThreadScroll(viewport);
+      const abort = new AbortController();
+      let cap: ReturnType<typeof setTimeout> | null = null;
+      const end = () => {
+        if (endJumpToTopRef.current !== end) return;
+        endJumpToTopRef.current = null;
+        if (cap !== null) clearTimeout(cap);
+        abort.abort();
+        release();
+        pickReadingAnchor("jump-to-top-end");
+      };
+      endJumpToTopRef.current = end;
+      cap = setTimeout(end, JUMP_TO_TOP_CLAIM_MAX_MS);
+      const listen = { passive: true, signal: abort.signal };
+      viewport.addEventListener("scrollend", end, listen);
+      viewport.addEventListener("wheel", end, listen);
+      viewport.addEventListener("touchstart", end, listen);
+      const before = viewport.scrollTop;
       viewport.scrollTo({ top: 0, behavior: "smooth" });
+      // Smooth scrolling is asynchronous: the read-back is the start, the target is 0.
+      recordScrollWrite(
+        "jump-to-top",
+        viewport,
+        before,
+        viewport.scrollTop,
+        "target=0 smooth"
+      );
     }
-    setAutoScrollEnabled(false);
-  }, []);
+    setFollowing(false);
+  }, [pickReadingAnchor, releaseLoadOlder, setFollowing]);
+
+  // #6122: a jump-to-top hold never outlives the thread.
+  useEffect(() => () => endJumpToTopRef.current?.(), []);
 
   // #3158: capture the top-visible content element + its viewport-relative
   // offset. SessionChat's text-size handlers call this synchronously BEFORE the
@@ -575,6 +933,28 @@ export function HappyThread(props: {
     };
   }, [props.sessionId]);
 
+  // #6122 scroll-cause recorder: a no-op unless switched on (Settings → Preferences →
+  // Diagnostics, or ?scrollrec=1). useLayoutEffect for the same composed-ref reason as
+  // the effects around it. It reads this thread's state through refs only.
+  useLayoutEffect(() => {
+    return registerThreadViewport(viewportRef.current, contentRef.current, {
+      label: props.sessionId,
+      getState: () => ({
+        following: autoScrollEnabledRef.current,
+        direction: userScrollDirectionRef.current,
+        loadOlderPending: pendingLoadOlderRef.current !== null,
+      }),
+    });
+  }, [props.sessionId]);
+
+  useEffect(() => {
+    recordEvent(
+      autoScrollEnabled ? "follow-on" : "follow-off",
+      undefined,
+      viewportRef.current
+    );
+  }, [autoScrollEnabled]);
+
   // Must be useLayoutEffect (not useEffect) because ThreadPrimitive.Viewport's
   // composed refs clear viewportRef.current before useEffect cleanup runs.
   useLayoutEffect(() => {
@@ -597,7 +977,15 @@ export function HappyThread(props: {
     if (cached !== null && cached > 0) {
       const viewport = viewportRef.current;
       if (viewport) {
+        const before = viewport.scrollTop;
         viewport.scrollTop = cached;
+        recordScrollWrite(
+          "restore-833",
+          viewport,
+          before,
+          viewport.scrollTop,
+          `cached=${Math.round(cached)}`
+        );
         didRestoreRef.current = true;
         clearScrollPosition(props.sessionId);
         requestAnimationFrame(() => {
@@ -612,7 +1000,15 @@ export function HappyThread(props: {
       const viewport = viewportRef.current;
       if (viewport) {
         isScrollingToBottomRef.current = true;
+        const before = viewport.scrollTop;
         viewport.scrollTop = viewport.scrollHeight;
+        recordScrollWrite(
+          "initial-bottom",
+          viewport,
+          before,
+          viewport.scrollTop
+        );
+        followedHeightRef.current = viewport.scrollHeight;
         requestAnimationFrame(() => {
           isScrollingToBottomRef.current = false;
         });
@@ -632,76 +1028,82 @@ export function HappyThread(props: {
     hasBootstrappedRef.current = false;
   }, [props.sessionId]);
 
-  const handleLoadMore = useCallback(() => {
-    if (
-      props.isLoadingMessages ||
-      !props.hasMoreMessages ||
-      props.isLoadingMoreMessages ||
-      loadLockRef.current
-    ) {
-      return;
-    }
-    const viewport = viewportRef.current;
-    if (!viewport) {
-      return;
-    }
-    // #3768 (Option C): anchor to the top-visible block (data-bookmark-anchor,
-    // #3146), fallback the content column. Compensation later restores THIS
-    // element's viewport-relative offset, so only content inserted above it
-    // counts — tail/streaming growth during the load is ignored.
-    const viewportTop = viewport.getBoundingClientRect().top;
-    const contentEl = contentRef.current;
-    const anchorEls = contentEl
-      ? Array.from(
-          contentEl.querySelectorAll<HTMLElement>("[data-bookmark-anchor]")
-        )
-      : [];
-    const anchorEl =
-      anchorEls.find(
-        el => el.getBoundingClientRect().bottom > viewportTop + 1
-      ) ??
-      contentEl ??
-      viewport;
-    pendingScrollRef.current = {
-      anchorEl,
-      anchorTop: anchorEl.getBoundingClientRect().top - viewportTop,
-      count: props.rawMessagesCount, // #3768: baseline to detect a no-op page
-    };
-    loadLockRef.current = true;
-    loadStartedRef.current = false;
-    let loadPromise: Promise<unknown>;
-    try {
-      loadPromise = props.onLoadMore();
-    } catch (error) {
-      pendingScrollRef.current = null;
-      loadLockRef.current = false;
-      throw error;
-    }
-    void loadPromise
-      .catch(error => {
-        pendingScrollRef.current = null;
-        loadLockRef.current = false;
-        console.error("Failed to load older messages:", error);
-        showToast("Failed to load older messages", { type: "error" });
-      })
-      .finally(() => {
-        if (
-          !loadStartedRef.current &&
-          !isLoadingMoreRef.current &&
-          pendingScrollRef.current
-        ) {
-          pendingScrollRef.current = null;
-          loadLockRef.current = false;
-        }
-      });
-  }, [
-    props.hasMoreMessages,
-    props.isLoadingMoreMessages,
-    props.isLoadingMessages,
-    props.onLoadMore,
-    props.rawMessagesCount,
-  ]);
+  // #6122: stable (reads its inputs from refs), so the top-sentinel observer below
+  // is not re-created on every render. Its initial callback, which fires on every
+  // re-subscription, used to start loads nobody asked for.
+  const showToastRef = useRef(showToast);
+  showToastRef.current = showToast;
+  const handleLoadMore = useCallback(
+    (trigger: string = "button") => {
+      const inputs = loadInputsRef.current;
+      if (
+        inputs.isLoading ||
+        !inputs.hasMore ||
+        inputs.isLoadingMore ||
+        loadLockRef.current
+      ) {
+        return;
+      }
+      const viewport = viewportRef.current;
+      if (!viewport) {
+        return;
+      }
+      // #6122: the load no longer captures an anchor of its own. The reading anchor
+      // holds the block being read and compensates the prepend whenever its rows
+      // mount; this pass makes sure it is current. `count` lets the settle-effect
+      // spot a page that adds no messages (#3768).
+      syncReadingAnchor("load-start");
+      if (lockReleaseTimerRef.current !== null) {
+        clearTimeout(lockReleaseTimerRef.current);
+        lockReleaseTimerRef.current = null;
+      }
+      const count = rawMessagesCountRef.current;
+      pendingLoadOlderRef.current = { count };
+      const anchor = readingAnchorRef.current;
+      recordEvent(
+        "load-older-start",
+        `trigger=${trigger} count=${count} anchor=${anchor ? anchorLabel(anchor.el) : "none"}`,
+        viewport
+      );
+      loadLockRef.current = true;
+      loadStartedRef.current = false;
+      let loadPromise: Promise<unknown>;
+      try {
+        loadPromise = inputs.onLoadMore();
+      } catch (error) {
+        releaseLoadOlder("error");
+        throw error;
+      }
+      void loadPromise
+        .catch(error => {
+          recordEvent("load-older-error", undefined, viewportRef.current);
+          releaseLoadOlder("error");
+          console.error("Failed to load older messages:", error);
+          showToastRef.current("Failed to load older messages", {
+            type: "error",
+          });
+        })
+        .finally(() => {
+          // Settled without ever reporting a load in progress (nothing to fetch).
+          if (
+            !loadStartedRef.current &&
+            !isLoadingMoreRef.current &&
+            pendingLoadOlderRef.current
+          ) {
+            releaseLoadOlder("settled-idle");
+          }
+        });
+    },
+    [readingAnchorRef, releaseLoadOlder, syncReadingAnchor]
+  );
+  handleLoadMoreRef.current = handleLoadMore;
 
+  // The top sentinel starts a load-older when it scrolls into view. #6122: keyed on
+  // the three load states only, and unsubscribed while a page loads (no load could
+  // start then). It subscribes again when the load finishes, so a sentinel still in
+  // view chains the next page (infinite scroll), but not on every render or
+  // streamed message. "io-initial" tags the callback a new subscription fires at
+  // once, so the recorder can tell it from a real scroll into view.
   useEffect(() => {
     const sentinel = topSentinelRef.current;
     const viewport = viewportRef.current;
@@ -709,7 +1111,8 @@ export function HappyThread(props: {
       !sentinel ||
       !viewport ||
       !props.hasMoreMessages ||
-      props.isLoadingMessages
+      props.isLoadingMessages ||
+      props.isLoadingMoreMessages
     ) {
       return;
     }
@@ -717,23 +1120,30 @@ export function HappyThread(props: {
       return;
     }
 
+    let initial = true;
     const observer = new IntersectionObserver(
       entries => {
+        const trigger = initial ? "io-initial" : "io";
+        initial = false;
         for (const entry of entries) {
           if (entry.isIntersecting) {
-            handleLoadMore();
+            handleLoadMoreRef.current(trigger);
           }
         }
       },
       {
         root: viewport,
-        rootMargin: "200px 0px 0px 0px",
+        rootMargin: `${TOP_SENTINEL_MARGIN_PX}px 0px 0px 0px`,
       }
     );
 
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [handleLoadMore, props.hasMoreMessages, props.isLoadingMessages]);
+  }, [
+    props.hasMoreMessages,
+    props.isLoadingMessages,
+    props.isLoadingMoreMessages,
+  ]);
 
   // #3768: the load-older scroll compensation formerly lived here in a
   // useLayoutEffect keyed on props.rawMessagesCount. It fired at the count bump
@@ -741,7 +1151,8 @@ export function HappyThread(props: {
   // was still the old height → delta ≈ 0 and the pending anchor was discarded
   // prematurely, leaving the viewport at the absolute top of the fresh batch. The
   // compensation now lives in the contentRef ResizeObserver above, which fires
-  // when the rows actually mount and scrollHeight has grown (R1/R2).
+  // when the rows actually mount and scrollHeight has grown (R1/R2). #6122: the
+  // load no longer has an anchor of its own; the reading anchor compensates it.
 
   // #3158: text-size anchoring restore. When props.textScale changes and the
   // user is NOT following the bottom, restore the top-visible element captured
@@ -779,6 +1190,13 @@ export function HappyThread(props: {
     const viewport = viewportRef.current;
     const content = contentRef.current;
     if (!viewport) return;
+    // #6122: while this restore owns the viewport the reading anchor only measures,
+    // so the two never write on the same resize; it re-baselines when this ends.
+    textScaleSettlingRef.current = true;
+    const endSettling = () => {
+      textScaleSettlingRef.current = false;
+      pickReadingAnchor("text-scale-end");
+    };
 
     // Move the viewport so the captured anchor returns to its recorded
     // viewport-relative offset. Absolute `scrollTop` assignment (not `scrollBy`)
@@ -795,7 +1213,15 @@ export function HappyThread(props: {
       });
       if (Math.abs(delta) < 1) return; // already anchored (sub-pixel)
       isScrollingToBottomRef.current = true;
+      const before = viewport.scrollTop;
       viewport.scrollTop = viewport.scrollTop + delta;
+      recordScrollWrite(
+        "text-scale-restore",
+        viewport,
+        before,
+        viewport.scrollTop,
+        `delta=${Math.round(delta)}`
+      );
       requestAnimationFrame(() => {
         isScrollingToBottomRef.current = false;
       });
@@ -810,7 +1236,10 @@ export function HappyThread(props: {
     //    anchor can reflow after the font change) or a hard cap elapses — never a
     //    repeating poll, so it cannot flicker. Aborts (without correcting) the
     //    instant the user scrolls.
-    if (typeof ResizeObserver === "undefined" || !content) return;
+    if (typeof ResizeObserver === "undefined" || !content) {
+      endSettling();
+      return;
+    }
 
     const SETTLE_QUIET_MS = 80; // no resize for this long ⇒ layout settled
     const SETTLE_MAX_WAIT_MS = 500; // hard cap even if resizes keep dribbling in
@@ -833,6 +1262,7 @@ export function HappyThread(props: {
       abort.abort();
       observer.disconnect();
       if (applyFinal) restore();
+      endSettling();
     };
     function finish() {
       teardown(true);
@@ -857,7 +1287,7 @@ export function HappyThread(props: {
     });
 
     return () => teardown(false);
-  }, [props.textScale]);
+  }, [pickReadingAnchor, props.textScale]);
 
   useEffect(() => {
     isLoadingMoreRef.current = props.isLoadingMoreMessages;
@@ -867,34 +1297,45 @@ export function HappyThread(props: {
     if (
       prevLoadingMoreRef.current &&
       !props.isLoadingMoreMessages &&
-      pendingScrollRef.current
+      pendingLoadOlderRef.current
     ) {
       // #3768: a load-older finished. The prepended rows mount in a LATER commit
       // (assistant-ui's passive setAdapter), so the contentRef ResizeObserver has
       // not compensated yet at this isLoadingMoreMessages true→false transition.
-      // Do NOT null the anchor here — that discarded it one commit early (the
-      // jump-to-top bug this issue fixes).
-      if (props.rawMessagesCount <= pendingScrollRef.current.count) {
+      // Keep the pending record until the rows report it, or the hard cap below
+      // fires. It holds no anchor (#6122), but releasing it here would free the
+      // load lock before the rows mount.
+      recordEvent(
+        "load-older-arrived",
+        `count=${props.rawMessagesCount} base=${pendingLoadOlderRef.current.count}`,
+        viewportRef.current
+      );
+      if (props.rawMessagesCount <= pendingLoadOlderRef.current.count) {
         // Zero NEW raw messages: an empty/duplicate page. No rows will mount, so
-        // the ResizeObserver would never fire → release the anchor now.
-        pendingScrollRef.current = null;
-        loadLockRef.current = false;
+        // nothing will report them → release the load now.
+        recordEvent("load-older-zero-row", undefined, viewportRef.current);
+        releaseLoadOlder("zero-row");
       } else if (loadHardCapTimerRef.current === null) {
-        // Real page (count grew): leave the anchor for the ResizeObserver, but
+        // Real page (count grew): the rows release the load when they mount, but
         // arm a ~1s hard cap so a page that grows the count yet renders NO rows
-        // (all normalized away, or ResizeObserver absent) cannot leave the anchor
-        // stuck and wedge bottom-follow + the load lock (finding 3768-3).
+        // (all normalized away, or ResizeObserver absent) cannot hold the load
+        // lock for good (finding 3768-3). #6122: the cap costs no compensation;
+        // the reading anchor still corrects rows that mount after it.
         loadHardCapTimerRef.current = setTimeout(() => {
           loadHardCapTimerRef.current = null;
-          if (pendingScrollRef.current) {
-            pendingScrollRef.current = null;
-            loadLockRef.current = false;
+          if (pendingLoadOlderRef.current) {
+            recordEvent("load-older-hardcap", undefined, viewportRef.current);
+            // Debounced like a rows release, so it also chains the next page. A page
+            // that lands while the anchor is paused (jump-to-top's smooth scroll, a
+            // navigator's correction) reports no rows, and without the chain loading
+            // would stop at the top with more history left (#6122).
+            releaseLoadOlder("hardcap", true);
           }
         }, 1000);
       }
     }
     prevLoadingMoreRef.current = props.isLoadingMoreMessages;
-  }, [props.isLoadingMoreMessages, props.rawMessagesCount]);
+  }, [props.isLoadingMoreMessages, props.rawMessagesCount, releaseLoadOlder]);
 
   // Issue #6208: every message reads this context, so a new value object on
   // each render re-rendered (and re-parsed the markdown of) the whole thread
@@ -934,8 +1375,9 @@ export function HappyThread(props: {
           // inert. All FOUR arming sites of its scrollingToBottomBehaviorRef are
           // off, and auiScrollToBottom is never called, so assistant-ui can never
           // scroll the viewport. HappyThread is the SOLE issuer of programmatic
-          // scrolls (jump-to-bottom, follow-mode via our ResizeObserver, #833
-          // restore, load-older anchor, initial position). This kills the
+          // scrolls (follow-mode via our ResizeObserver, the reading-anchor
+          // compensation, jump-to-bottom, jump-to-top, the #833 restore, the
+          // #3158 text-size restore, initial position). This kills the
           // snap-vs-drag fight STRUCTURALLY: a scrollbar drag emits a scroll event
           // byte-identical to scrollTo(), so intent inference was unwinnable
           // (3rd recurrence, #710 → #1298 → #2414). Verified against 0.11.53:
@@ -1003,7 +1445,7 @@ export function HappyThread(props: {
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={handleLoadMore}
+                          onClick={() => handleLoadMore("button")}
                           disabled={
                             props.isLoadingMoreMessages ||
                             props.isLoadingMessages
@@ -1042,15 +1484,16 @@ export function HappyThread(props: {
                   ) : null}
                 </>
               )}
-              <div className="flex flex-col gap-3">
-                <ThreadPrimitive.Messages
-                  components={THREAD_MESSAGE_COMPONENTS}
-                />
+              {/* #6122: the reading anchor's line element is looked for inside this
+                  list only (READING_ANCHOR_LIST_ATTR), never in the status rows above. */}
+              <div className="flex flex-col gap-3" data-thread-message-list="">
+                <ThreadMessagesById />
               </div>
             </div>
           </div>
         </ThreadPrimitive.Viewport>
         <ScrollPositionRail scrollRef={viewportRef} />
+        <ScrollRecorderPanel />
       </ThreadPrimitive.Root>
     </HappyChatProvider>
   );

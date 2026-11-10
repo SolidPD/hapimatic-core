@@ -159,6 +159,28 @@ export interface GetSettingsRequest extends ControlRequest {
   subtype: "get_settings";
 }
 
+/**
+ * Issue #6169: ask Claude Code a side question (the `/btw` fork). Claude Code
+ * runs it as a one-shot fork that reuses the main conversation's cache prefix,
+ * denies every tool, writes nothing to the transcript and fires no hooks; the
+ * answer comes back at `control_response.response.response` as
+ * `{ response: string | null, synthetic: boolean }`. Hapimatic uses it only as
+ * the prompt-cache keep-alive. While it runs, Claude Code emits one
+ * `system/control_request_progress` line carrying the same `request_id`.
+ */
+export interface SideQuestionRequest extends ControlRequest {
+  subtype: "side_question";
+  question: string;
+}
+
+/** Issue #6169: the side-question answer `Query.askSideQuestion` returns. */
+export interface SideQuestionAnswer {
+  response: string | null;
+  synthetic: boolean;
+  /** When the request line was written to Claude's stdin (epoch ms). */
+  sentAt: number;
+}
+
 /** Issue #6166: the slice of the get_settings `applied` object Hapimatic reads. */
 export interface AppliedSettings {
   /** The effort the process applies after env overrides and model remaps: a

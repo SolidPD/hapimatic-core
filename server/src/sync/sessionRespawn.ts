@@ -27,6 +27,7 @@ import { access as fsAccess } from "node:fs/promises";
 import type { Session } from "@hapi/protocol/types";
 import { inheritSpawnPosture, respawnYoloFromPosture } from "@hapi/protocol";
 import type { SpawnSessionOptions } from "./syncEngine";
+import { inheritedSessionPins } from "./respawnBase";
 import type { SessionCache } from "./sessionCache";
 import type { RpcGateway } from "./rpcGateway";
 import type { EventPublisher } from "./eventPublisher";
@@ -492,6 +493,9 @@ export class SessionRespawn {
           // (mirrors safeMode/launcherKind) — else a respawn silently reverts to
           // the FULL stack (OR-4). Undefined for legacy/interactive sessions.
           sessionRole: session.metadata?.sessionRole,
+          // Issue #6171: the output style and the MCP set (reconnect dropped the
+          // style before #6171, so a styled session came back on the default).
+          ...inheritedSessionPins(session),
           // Issue #2434: preserve the model pin across the reconnect respawn
           // (mirrors safeMode/launcherKind/sessionRole). This is the resume
           // boundary #2092 reports: without it, a pinned session that reconnects
@@ -744,6 +748,9 @@ export class SessionRespawn {
       // with no recorded level yields a child on the node default, not the
       // binary default.
       effort: session.metadata?.effort,
+      // Issue #6171: a branched child keeps its parent's output style and MCP
+      // set (the style was dropped here before #6171).
+      ...inheritedSessionPins(session),
     });
 
     if (result.type === "success") {

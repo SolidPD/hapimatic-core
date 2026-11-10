@@ -20,6 +20,7 @@ import type { WebAppEnv } from "../../middleware/auth";
 import { isSafeMachinePath } from "../../../utils/pathSecurity";
 import { expandTilde } from "../../../utils/expandTilde";
 import { validateApiKeySpawn } from "../machines";
+import { resolveSpawnMcpSet } from "../../../services/mcpSetResolver";
 import { resolveModelFamily, type SpawnWarning } from "@hapi/protocol";
 import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
 import {
@@ -93,6 +94,7 @@ export async function spawnForPeer(
     sessionRole,
     outputStyle,
     nativeModelSelection,
+    mcpSet: requestedMcpSet,
     spawnCorrelationId,
   } = parsed.data;
 
@@ -162,12 +164,35 @@ export async function spawnForPeer(
     }
   }
 
+  // Issue #6171: THIS node owns the project and its MCP config, so it resolves
+  // the set (or the project's default) and refuses a project-disabled pick
+  // BEFORE the accept, so the refusal reaches the hub's caller at once.
+  const mcpResolution = resolveSpawnMcpSet({
+    requested: requestedMcpSet,
+    directory,
+    flavor: agent ?? "claude",
+    safeMode: safeMode === true,
+    cloneRepo,
+    catalog: deps.getMcpCatalog?.() ?? null,
+  });
+  if (!mcpResolution.ok) {
+    return c.json(
+      {
+        type: "error",
+        code: mcpResolution.code,
+        message: mcpResolution.message,
+        ...(mcpResolution.servers ? { servers: mcpResolution.servers } : {}),
+      },
+      mcpResolution.status
+    );
+  }
+
   // Issue #5879 (three-point spawn checklist, point 2): THIS node holds the
   // account and its usage, so it decides — synchronously, BEFORE the accept, so
   // a refusal reaches the hub's caller at once and nothing is spawned (the same
   // shape as the #5127 key check above; no background report is sent for it).
   // The read is deadline-bounded (2.5 s), well under the hub's 10 s timeout.
-  const spawnWarnings: SpawnWarning[] = [];
+  const spawnWarnings: SpawnWarning[] = [...mcpResolution.warnings];
   let pinnedAccount:
     | {
         accountUuid: string;
@@ -293,6 +318,9 @@ export async function spawnForPeer(
       // the peer-incoming hop (#1262 trap — un-enumerated here, a federated
       // gemini/codex spawn silently drops the peer's model + effort selection).
       nativeModelSelection,
+      // Issue #6171: the RESOLVED MCP set on the peer-incoming hop (#1262 trap —
+      // un-enumerated here, a federated spawn starts every server).
+      mcpSet: mcpResolution.mcpSet,
       // Issue #5127: the API-key binding on the peer-incoming hop (#1262 trap —
       // un-enumerated here, the session would bill this node's default).
       ...(apiKeyId !== undefined ? { apiKeyId } : {}),

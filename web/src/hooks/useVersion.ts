@@ -17,6 +17,9 @@ export interface VersionInfo {
    * instance (epic #3285 correction pass 1). Optional so an older server degrades
    * to the pre-correction active-only gate. */
   desktopEligible?: boolean;
+  /** #6447/#6449: present (and `true`) only while this instance's pins gate is
+   * open (`HAPI_PINS_ENABLED`). Absent keeps every Pins surface hidden. */
+  pinsEnabled?: true;
 }
 
 export function useVersion() {

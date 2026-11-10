@@ -22,6 +22,7 @@ import {
   type ThroughputCoverage,
   type ThroughputGithubSummary,
   type ThroughputIssuesPage,
+  type ThroughputKeepaliveSummary,
   type ThroughputLine,
   type ThroughputPercentiles,
   type ThroughputSummary,
@@ -31,6 +32,7 @@ import {
   type TurnMirrorOriginStatus,
 } from "@hapi/protocol";
 import type { ThroughputDigestStore } from "../store/throughput/digestStore";
+import type { ThroughputKeepaliveStore } from "../store/throughput/keepaliveStore";
 import type {
   IssueFactsRecord,
   ThroughputGithubStore,
@@ -43,6 +45,7 @@ import type {
   TokenSumsRow,
 } from "../store/throughput/rollupStore";
 import type { UsageSnapshotRow } from "../store/usageHistoryStore";
+import { ThroughputPricer, keepaliveLedgerCost } from "./pricing";
 import { trunkRedMs } from "./github/ciLogs";
 import type { GithubRepoConfig } from "./github/collector";
 import {
@@ -85,6 +88,8 @@ export interface ThroughputSummaryDeps {
   rollups: ThroughputRollupStore;
   github: ThroughputGithubStore;
   digests: ThroughputDigestStore;
+  /** Issue #6169: the node-local keep-alive ledger (absent: no keep-alive section). */
+  keepalive?: Pick<ThroughputKeepaliveStore, "sum">;
   /** This node's origin id (the local rollups' origin). */
   localOrigin: () => string;
   /** The mirror pull: `enabled` is null when this node is standalone. */
@@ -340,12 +345,18 @@ export class ThroughputSummaryService {
     totals.turns = Math.max(totals.turns, coverage.turns);
     const github = this.githubSummary(window, scope);
     const quota = this.quota(coverage.unattributedAccountShare);
+    const keepalive = this.keepaliveSummary(window, scope);
 
     const notes = [
       "Costs are API-equivalent, priced per model from the stored rate cards; 1-hour cache writes use the 1-hour rate.",
       "Headline figures are the ledger's; facts add the stage, model and context breakdowns, recovered turns and background agents.",
       "The window is whole UTC days.",
     ];
+    if (keepalive) {
+      notes.push(
+        "Keep-alive figures are this node's own and are estimates: each sent keep-alive is priced as a cache read of the session's context; a kept-warm reopening (a wait over an hour that still read at least 90% of its prefix from the cache) is credited with a 1-hour rewrite of that prefix, less the read. Kept warm counts every such reopening on this node, so the net is an upper bound on what keep-alives saved. Failed keep-alives are not priced, though a timed-out one may have been billed. Keep-alive spend is outside the turn ledger, so session totals and the cost-ceiling guard do not include it. Kept-warm counts start with the release that added them."
+      );
+    }
 
     return {
       window,
@@ -367,13 +378,70 @@ export class ThroughputSummaryService {
         start: histogramPercentiles(ctx.start),
         startMethodNote: STARTING_CONTEXT_METHOD_NOTE,
       },
-      idle: rollups
-        .idleByClass(fromDay, toDay, scope)
-        .map(i => ({ ...i, usd: round(i.usd) })),
+      idle: rollups.idleByClass(fromDay, toDay, scope).map(i => ({
+        cls: i.cls,
+        n: i.n,
+        w1: i.w1,
+        w5: i.w5,
+        usd: round(i.usd),
+        warmN: i.warmN,
+        avoidedUsd: round(i.avoidedUsd),
+      })),
+      ...(keepalive ? { keepalive } : {}),
       coverage,
       github,
       quota,
       notes,
+    };
+  }
+
+  /**
+   * Issue #6169: keep-alives on this node against the kept-warm reopenings of
+   * this node's own turns (the ledger is node-local; idle rollups also hold
+   * mirrored origins, which are left out so both sides count the same
+   * sessions). Absent when this node recorded no keep-alive in the window.
+   */
+  private keepaliveSummary(
+    window: ThroughputWindow,
+    scope: RollupScope
+  ): ThroughputKeepaliveSummary | undefined {
+    const ledger = this.deps.keepalive;
+    if (!ledger) return undefined;
+    const { fromDay, toDay } = daysOf(window);
+    let rows: ReturnType<typeof ledger.sum>;
+    try {
+      rows = ledger.sum(fromDay, toDay, scope.namespace);
+    } catch (error) {
+      // The ledger table's migration is fail-open: without it, the rest of the
+      // summary still serves.
+      console.warn("[throughput] keep-alive ledger unreadable:", error);
+      return undefined;
+    }
+    if (rows.length === 0) return undefined;
+    const { byOutcome, costUsd } = keepaliveLedgerCost(
+      new ThroughputPricer(this.deps.rollups.rateCards()),
+      rows,
+      window.toMs - 1 // inside [fromMs, toMs), as daysOf() reads the days
+    );
+    let keptWarmN = 0;
+    let avoidedUsd = 0;
+    const local = this.deps.localOrigin();
+    for (const i of this.deps.rollups.idleByClass(
+      fromDay,
+      toDay,
+      scope,
+      local
+    )) {
+      keptWarmN += i.warmN;
+      avoidedUsd += i.avoidedUsd;
+    }
+    return {
+      scope: "node",
+      byOutcome,
+      costUsd: round(costUsd),
+      keptWarmN,
+      avoidedUsd: round(avoidedUsd),
+      netUsd: round(avoidedUsd - costUsd),
     };
   }
 

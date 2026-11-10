@@ -6,6 +6,7 @@ import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
 import { checkCallerNamespace, checkFederationToken } from "./shared";
 import { logAndJson } from "../routeErrorHelper";
+import { archiveResponseBody } from "../pinRouteHelpers";
 import { spawnForPeer } from "./peerSpawn";
 import {
   dismissPendingSpawn,
@@ -119,7 +120,10 @@ export function createSessionLifecycleRoutes(
           }
         );
       }
-      return c.json({ ok: true });
+      // #6454: the open pins the session asked, for the hub to relay.
+      return c.json(
+        archiveResponseBody(engine.pins, sessionId, deps.pinsEnabled === true)
+      );
     }
   );
 

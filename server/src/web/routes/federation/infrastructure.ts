@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
 import { checkFederationToken, startTime } from "./shared";
-import { defineCapability } from "@hapi/protocol";
+import { defineCapability, McpSetSchema } from "@hapi/protocol";
 import { cataloged } from "../../../capabilities/cataloged";
 import { VERSION } from "../../../version.generated";
 import { gatherSystemHealth } from "../../../metrics/systemHealth";
@@ -122,6 +122,10 @@ export function createInfrastructureRoutes(
           ...("error" in spawnDefaults
             ? {}
             : { defaultEffort: spawnDefaults.effort }),
+          // Issue #6123: this node's user-facing web address, which a peer's
+          // node switcher opens; omitted when unset (already normalized at
+          // config load by loadFederationConfig).
+          ...(config.webUrl ? { webUrl: config.webUrl } : {}),
         },
       });
     }
@@ -587,6 +591,96 @@ export function createInfrastructureRoutes(
           500
         );
       }
+    }
+  );
+
+  // ─── Node-to-node endpoints: POST /federation/mcp-catalog, mcp-project-default ─
+  // Issue #6171: this node answers for a project on its own disk. Cached data only,
+  // because a `claude mcp list` poll starts every stdio server.
+  app.post(
+    "/federation/mcp-catalog",
+    cataloged(
+      defineCapability({
+        id: "federation.mcp-catalog",
+        domain: "federation",
+        surface: "rest",
+        description:
+          "List the MCP servers known for a directory on this node for a peer's New Session form.",
+        whenToUse:
+          "When a peer's New Session form or configuration modal targets this node.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/federation/mcp-catalog",
+        },
+        auth: "federation-token",
+        riskTier: "mutating",
+        availability: { scope: "operator" },
+      })
+    ),
+    async c => {
+      if (!checkFederationToken(deps, c.req.header("authorization"))) {
+        return c.json({ error: "Unauthorized" }, 401);
+      }
+      const body = await c.req.json().catch(() => null);
+      if (typeof body?.directory !== "string") {
+        return c.json({ type: "error", message: "Invalid body" }, 400);
+      }
+      const directory = expandTilde(body.directory.trim());
+      if (directory && !isSafeMachinePath(directory)) {
+        return c.json({ type: "error", message: "Access denied" }, 403);
+      }
+      const engine = deps.getSyncEngine();
+      if (!engine) {
+        return c.json({ type: "error", message: "Not connected" }, 503);
+      }
+      return c.json({
+        type: "success",
+        catalog: engine.getMcpCatalog().getCatalog(directory || undefined),
+      });
+    }
+  );
+
+  app.post(
+    "/federation/mcp-project-default",
+    cataloged(
+      defineCapability({
+        id: "federation.mcp-project-default",
+        domain: "federation",
+        surface: "rest",
+        description:
+          "Store or clear a project's default MCP set on this node for a peer.",
+        whenToUse: "When a peer's user saves a default for a project here.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/federation/mcp-project-default",
+        },
+        auth: "federation-token",
+        riskTier: "mutating",
+        availability: { scope: "operator" },
+      })
+    ),
+    async c => {
+      if (!checkFederationToken(deps, c.req.header("authorization"))) {
+        return c.json({ error: "Unauthorized" }, 401);
+      }
+      const body = await c.req.json().catch(() => null);
+      const set =
+        body?.set === null ? null : McpSetSchema.safeParse(body?.set).data;
+      if (typeof body?.directory !== "string" || set === undefined) {
+        return c.json({ type: "error", message: "Invalid body" }, 400);
+      }
+      const directory = expandTilde(body.directory.trim());
+      if (!directory || !isSafeMachinePath(directory)) {
+        return c.json({ type: "error", message: "Access denied" }, 403);
+      }
+      const engine = deps.getSyncEngine();
+      if (!engine) {
+        return c.json({ type: "error", message: "Not connected" }, 503);
+      }
+      engine.getMcpCatalog().setProjectDefault(directory, set);
+      return c.json({ type: "success" });
     }
   );
 

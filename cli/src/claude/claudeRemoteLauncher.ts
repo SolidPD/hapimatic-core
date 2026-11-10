@@ -23,12 +23,17 @@ import {
   createMcpStatusHandler,
 } from "./services/capabilityHandlers";
 import {
+  CacheKeepaliveTracker,
+  createCacheKeepaliveHandler,
+} from "./services/cacheKeepaliveHandler";
+import {
   ABORT_META,
   SWITCH_META,
   MCP_TOGGLE_META,
   SET_PERMISSION_MODE_META,
   GET_CONTEXT_USAGE_META,
   MCP_STATUS_META,
+  CACHE_KEEPALIVE_META,
 } from "@/api/rpc/capabilityMeta";
 import { delay } from "@/utils/time";
 import { formatClaudeMessageForInk } from "@/ui/messageFormatterInk";
@@ -66,6 +71,7 @@ import {
   withAccountConfigDir,
 } from "./accountTokenInjection";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
+import { CACHE_KEEPALIVE_RPC_METHOD } from "@hapi/protocol";
 import {
   RemoteLauncherBase,
   type RemoteLauncherDisplayContext,
@@ -115,10 +121,23 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
    * requests to Claude Code's headless handler without restarting the process.
    */
   private currentQuery: Query | null = null;
+  /**
+   * Issue #6169: the prompt-cache keep-alive state of the live query — the last
+   * cache touch, the TTL of the last write, and whether a turn is in flight.
+   * Reported on the keepAlive tick; read by the `cache-keepalive` RPC handler.
+   */
+  private readonly keepalive: CacheKeepaliveTracker;
 
   constructor(session: Session) {
     super(process.env.DEBUG ? session.logPath : undefined);
     this.session = session;
+    this.keepalive = new CacheKeepaliveTracker(() =>
+      [
+        session.getModelMode() ?? "",
+        session.getRawModel() ?? "",
+        session.getEffort() ?? "",
+      ].join("|")
+    );
   }
 
   protected createDisplay(
@@ -200,13 +219,20 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     // owns transport/policy/persistence; the launcher only owns the
     // ephemeral `currentQuery` reference, which the service reads via
     // callback so it observes the latest value at every invocation.
+    const mcpToggle = createRuntimeRemoteHandler({
+      sessionPath: session.path,
+      sessionId: session.sessionId,
+      getQuery: () => this.currentQuery,
+    });
     session.client.rpcHandlerManager.registerHandler(
       "mcp-toggle",
-      createRuntimeRemoteHandler({
-        sessionPath: session.path,
-        sessionId: session.sessionId,
-        getQuery: () => this.currentQuery,
-      }),
+      // Issue #6169: a toggle changes the tool list — the first part of the
+      // cache prefix — so the keep-alive must not warm the old prefix.
+      async (payload: unknown) => {
+        const result = await mcpToggle(payload);
+        if (result.ok) this.keepalive.onToolsChanged();
+        return result;
+      },
       // Issue #2421: backfill the remote-launcher mcp-toggle meta (#2417
       // annotated only the local launcher). The cleanup stub re-registers
       // mcp-toggle meta-less on teardown, which clears this via the
@@ -272,9 +298,29 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     );
     session.client.rpcHandlerManager.registerHandler(
       "mcp-status",
-      createMcpStatusHandler({ sessionPath: session.path }),
+      createMcpStatusHandler({
+        sessionPath: session.path,
+        // Issue #6171: the live query, so the status shows the session's set.
+        getQuery: () => this.currentQuery,
+      }),
       MCP_STATUS_META
     );
+
+    // Issue #6169: the prompt-cache keep-alive. Only this (SDK remote) launcher
+    // has the control channel `side_question` needs, so only it registers the
+    // method and reports the cache state; the server's scheduler calls it only
+    // on sessions that registered it. `getQuery` is read FRESH (null after
+    // teardown → no_active_query); cleanup() re-registers it meta-less.
+    session.client.rpcHandlerManager.registerHandler(
+      CACHE_KEEPALIVE_RPC_METHOD,
+      createCacheKeepaliveHandler({
+        getQuery: () => this.currentQuery,
+        tracker: this.keepalive,
+        isThinking: () => session.thinking,
+      }),
+      CACHE_KEEPALIVE_META
+    );
+    this.session.setPromptCacheReporter(() => this.keepalive.snapshot());
 
     const permissionHandler = new PermissionHandler(session);
     this.permissionHandler = permissionHandler;
@@ -401,7 +447,12 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
       string,
       { parentToolCallId: string | null }
     >();
+    const keepalive = this.keepalive;
     function onMessage(message: SDKMessage) {
+      // Issue #6169: the raw SDK stream drives the keep-alive cache clock (a
+      // turn start, a tool result's follow-up request, a turn end with its
+      // cache-write TTL). Before any filter, like the trackers below.
+      keepalive.onSdkMessage(message);
       formatClaudeMessageForInk(message, messageBuffer);
       permissionHandler.onMessage(message);
 
@@ -766,6 +817,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                   };
                 }
                 permissionHandler.handleModeChange(effectivePerm);
+                // Issue #6169: a prompt reaches Claude — a turn starts.
+                this.keepalive.onPromptPushed();
                 return p;
               }
 
@@ -783,6 +836,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 if ((modeHash && msg.hash !== modeHash) || msg.isolate) {
                   logger.debug("[remote]: mode has changed, pending message");
                   pending = msg;
+                  // Issue #6169: this query is ending; a new process relaunches
+                  // with the parked message, so no keep-alive for this one.
+                  this.keepalive.onInputEnded();
                   return null;
                 }
                 modeHash = msg.hash;
@@ -797,12 +853,14 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                   mode = { ...mode, permissionMode: effectivePerm };
                 }
                 permissionHandler.handleModeChange(effectivePerm);
+                this.keepalive.onPromptPushed();
                 return {
                   message: msg.message,
                   mode,
                 };
               }
 
+              this.keepalive.onInputEnded();
               return null;
             },
             onSessionFound: sessionId => {
@@ -810,6 +868,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             },
             onThinkingChange: session.onThinkingChange,
             onContextUsage: session.onContextUsage,
+            // Issue #6171: each MCP server's context cost, from the same reply.
+            onMcpContextCosts: session.onMcpContextCosts,
             // Issue #6166: the applied effort read back from Claude, tied to
             // the query (process) it describes.
             onAppliedEffort: session.onAppliedEffort,
@@ -874,6 +934,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             },
             onQueryCreated: (q: Query) => {
               this.currentQuery = q;
+              // Issue #6169: a new Claude process has no cache parameters until
+              // its first turn completes.
+              this.keepalive.onQueryStarted();
             },
             signal: controller.signal,
           });
@@ -1190,6 +1253,19 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     // after teardown (e.g. during a mode switch) degrades to method:"config"
     // (the durable pin) instead of reaching a stale/cleared Query.
     this.session.setLiveQueryAccessor(null);
+
+    // Issue #6169: stop advertising the keep-alive (meta-less, so the server's
+    // capability probe skips this session) and stop reporting a cache clock.
+    this.session.client.rpcHandlerManager.registerHandler(
+      CACHE_KEEPALIVE_RPC_METHOD,
+      createCacheKeepaliveHandler({
+        getQuery: () => null,
+        tracker: this.keepalive,
+        isThinking: () => this.session.thinking,
+      }),
+      NO_META_TEARDOWN
+    );
+    this.session.setPromptCacheReporter(null);
 
     if (this.handleSessionFound) {
       this.session.removeSessionFoundCallback(this.handleSessionFound);

@@ -151,7 +151,21 @@ export type FormStateInput = {
    * byte-identical (append-only, R10 no-regression).
    */
   isEditMode?: boolean;
+  /**
+   * Issue #6171: the Create form is in Standard mode (not a scheduled run).
+   * Absent ⇒ true. The MCP picker is a Standard-mode, Claude-only field.
+   */
+  standardMode?: boolean;
+  /**
+   * Issue #6171: the spawn target can choose MCP servers (a remote node
+   * advertises `spawn:mcp-set`; a local target always can). Absent ⇒ true.
+   */
+  targetSupportsMcpSet?: boolean;
 };
+
+/** Issue #6171: why the MCP picker is disabled for an older node. */
+export const MCP_SET_NODE_UNSUPPORTED_NOTE =
+  "This node's Hapimatic version cannot choose MCP servers yet, so the session starts with every server.";
 
 /**
  * The derived form state: per-field UI gating (`fields`) + the agent-gated
@@ -235,9 +249,11 @@ export type FormState = {
      */
     opencodeNativeModel: FieldState;
     /**
-     * Issue #2149 (edit-and-relaunch): the MCP-server multi-select. The create
-     * flow never modeled MCP, so this is `visible` ONLY in edit mode; `disabled`
-     * only when the form is busy. Append-only — create-mode consumers ignore it.
+     * Issue #2149 (edit-and-relaunch) + #6171: the MCP-server multi-select.
+     * Visible in edit mode, and on the Create form for a Claude session in
+     * Standard mode without safe mode (safe mode drops MCP customizations).
+     * Disabled when busy, or — creating — when the target node cannot choose
+     * MCP servers (`note` gives the reason).
      */
     mcpServers: FieldState;
   };
@@ -470,9 +486,9 @@ export function deriveFormState(input: FormStateInput): FormState {
       // #3349 opencode native provider/model picker — the opencode-native catalog
       // (only when the OpenRouter picker is NOT active — dual-source exclusion).
       opencodeNativeModel: { visible: showOpencodePicker, disabled: busy },
-      // #2149 (edit-and-relaunch): MCP multi-select — visible only in edit mode
-      // (the create flow never modeled MCP), disabled only when busy.
-      mcpServers: { visible: isEditMode, disabled: busy },
+      // #2149 (edit-and-relaunch) / #6171: MCP multi-select — in edit mode, and
+      // on the Create form for a Claude, Standard-mode, non-safe-mode spawn.
+      mcpServers: mcpServersField(input, { isEditMode, isClaude, busy }),
     },
     effective: {
       agent: input.agent,
@@ -583,4 +599,20 @@ export function coerceGitTypeForClone(
   value: SessionType
 ): SessionType {
   return cloneRepo && value === "worktree" ? "simple" : value;
+}
+
+/** Issue #6171: the MCP picker's gating (see `FormState.fields.mcpServers`). */
+function mcpServersField(
+  input: FormStateInput,
+  flags: { isEditMode: boolean; isClaude: boolean; busy: boolean }
+): FieldState {
+  if (flags.isEditMode) return { visible: true, disabled: flags.busy };
+  const visible =
+    flags.isClaude && input.standardMode !== false && !input.safeMode;
+  const unsupported = input.targetSupportsMcpSet === false;
+  return {
+    visible,
+    disabled: flags.busy || unsupported,
+    ...(unsupported ? { note: MCP_SET_NODE_UNSUPPORTED_NOTE } : {}),
+  };
 }

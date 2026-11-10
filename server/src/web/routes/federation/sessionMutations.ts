@@ -5,6 +5,7 @@ import {
   defineCapability,
   isModelModeAllowedForFlavor,
   isPermissionModeAllowedForFlavor,
+  mcpLiveToggleRefusal,
 } from "@hapi/protocol";
 import {
   AgentTranscriptQuerySchema,
@@ -422,6 +423,8 @@ export function createSessionMutationRoutes(
         if (result.ok) return c.json(result, 200);
         if (result.code === "local_mode_not_supported")
           return c.json(result, 501);
+        // Issue #6171: refused by engine.mcpToggle before any write.
+        if (result.code === "hapi_protected") return c.json(result, 400);
         return c.json(result, 409);
       } catch (err) {
         deps.errorLogger?.warn("[Federation] mcpToggle failed", {
@@ -814,6 +817,13 @@ export function createSessionMutationRoutes(
     }
   );
 
+  /** Issue #6171: the MCP-set relaunch refusals that are a bad request. */
+  const MCP_SET_BAD_REQUEST_CODES = new Set([
+    "invalid_request",
+    "mcp_set_agent_unsupported",
+    "mcp_set_safe_mode_unsupported",
+  ]);
+
   // ─── Node-to-node endpoint: POST /federation/sessions/:id/relaunch ───
   // Issue #2149: federation half of the launcher/safeMode relaunch.
   // SessionService.relaunch on the HUB proxies here when this node owns the
@@ -830,7 +840,7 @@ export function createSessionMutationRoutes(
         domain: "session-lifecycle",
         surface: "rest",
         description:
-          "Relaunch a session on the node that owns it, applying a new launcher or safe-mode selection and restarting the process. Peer-incoming receiver for a remote-owned session.",
+          "Relaunch a session on the node that owns it, applying a new launcher, safe-mode or MCP set selection and restarting the process. Peer-incoming receiver for a remote-owned session.",
         whenToUse:
           "When relaunching a session whose process lives on a remote federation node.",
         invocation: {
@@ -882,14 +892,22 @@ export function createSessionMutationRoutes(
         }
         const code = result.code ?? "unknown";
         return c.json(
-          { ok: false, error: result.message, code },
+          {
+            ok: false,
+            error: result.message,
+            code,
+            // Issue #6171: the servers a project-disabled refusal names.
+            ...(result.servers ? { servers: result.servers } : {}),
+          },
           code === "not_found"
             ? 404
             : code === "relaunch_and_rollback_failed"
               ? 502
               : code === "unknown"
                 ? 500
-                : 409
+                : MCP_SET_BAD_REQUEST_CODES.has(code)
+                  ? 400
+                  : 409
         );
       } catch (err) {
         deps.errorLogger?.warn("[Federation] relaunch failed", {
@@ -1064,6 +1082,18 @@ export function createSessionMutationRoutes(
       const parsed = federationMcpSetDesiredSchema.safeParse(body);
       if (!parsed.success) {
         return c.json({ error: "Invalid body" }, 400);
+      }
+
+      // Issue #6171: refused before anything is queued or staged.
+      const refusal = mcpLiveToggleRefusal(
+        session.metadata?.mcpSet,
+        parsed.data.desired
+      );
+      if (refusal) {
+        return c.json(
+          { ok: false, error: refusal.message, code: refusal.code },
+          refusal.code === "hapi_protected" ? 400 : 409
+        );
       }
 
       try {

@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { createConfiguration, type ConfigSource } from "./configuration";
 import { Store } from "./store";
 import { TelemetryStore } from "./store/telemetryStore";
+import { createTelemetryExecutorFromEnv } from "./telemetry/executor";
 import { setCapabilityTelemetrySink } from "./capabilities/cataloged";
 import { writeBootSelfKnowledge } from "./capabilities/selfKnowledgeBootWriter";
 import { writeBootNodeDocs } from "./support/nodeDocs";
@@ -74,6 +75,8 @@ import { SystemEventQueue } from "./heartbeat/systemEvents";
 import { WorkflowReconcileService } from "./workflow/workflowReconcileService";
 import { loadWorkflowReconcileConfig } from "./config/workflowReconcileConfig";
 import { InitiativeEventObserver } from "./sync/initiativeEventObserver";
+import { createPinDeadlineLoop } from "./sync/pinDeadlines";
+import { resolvePinAnswersTimeZone } from "./sync/pinSubmission";
 import { WebhookGapDetector } from "./workflow/webhookGapDetector";
 import { loadGitHubWebhookConfig } from "./config/githubWebhookConfig";
 // #1274: SchedulerService now lives in `builtin.scheduler` and is constructed by
@@ -152,6 +155,7 @@ import { JobRegistry, SupervisedLoop } from "@hapi/protocol";
 import { getSettingsFile, readSettingsOrThrow } from "./config/settings";
 import * as transcriptIndexer from "./services/transcriptIndexer";
 import * as throughput from "./throughput";
+import * as cacheKeepalive from "./cacheKeepalive";
 import * as turnMirrorWiring from "./federation/turnMirrorWiring";
 import { JobAlertRouter } from "./systemJobs/jobAlertRouter";
 import {
@@ -248,6 +252,7 @@ let remoteTerminalProxy: RemoteTerminalProxy | null = null;
 let cleanupLoop: SupervisedLoop | null = null;
 let walCheckpointLoop: SupervisedLoop | null = null;
 let cpuSamplerLoop: SupervisedLoop | null = null; // #6156
+let pinDeadlineLoop: SupervisedLoop | null = null; // #6452
 let notificationPurgeLoop: SupervisedLoop | null = null; // #4913
 let feedbackSinkLoop: SupervisedLoop | null = null; // #2911
 let notificationService: NotificationService | null = null;
@@ -308,7 +313,7 @@ async function main() {
       sessionId: event.sessionId,
     });
   });
-  // Backfill any missing daily aggregates on startup
+  // Backfill any missing daily aggregates on startup (in-thread; #4213 owns this boot job).
   try {
     const days = telemetryStore.aggregateMissing();
     if (days > 0)
@@ -330,6 +335,16 @@ async function main() {
     console.error("[ScorecardStore] Rollup rebuild failed:", err);
   }
   const errorLogger = new ErrorLogger(store.errorLogs);
+  // Issue #6516: the Analytics reads run in a query worker so a scan of
+  // telemetry.db never blocks this thread. Built after `store` (its migrations
+  // must finish before the worker opens hapi.db read-only).
+  const telemetryExecutor = createTelemetryExecutorFromEnv({
+    telemetryPath: join(config.dataDir, "telemetry.db"),
+    hapiPath: config.dbPath,
+    telemetryStore,
+    getTurnAnalytics: () => store.turnAnalytics,
+    errorLogger,
+  });
   const jwtSecret = await getOrCreateJwtSecret();
   const vapidKeys = await getOrCreateVapidKeys(config.dataDir);
   const vapidSubject = process.env.VAPID_SUBJECT ?? "mailto:admin@hapi.run";
@@ -1377,6 +1392,7 @@ async function main() {
     desktopProxyHandler,
     errorLogger,
     getTelemetryStore: () => telemetryStore,
+    telemetryExecutor,
     getScorecardStore: () => scorecardStore,
     getWebhookGapDetector: () => webhookGapDetector,
   });
@@ -1434,6 +1450,7 @@ async function main() {
           console.warn("[walCheckpointLoop] PRAGMA optimize failed:", err);
         }
         telemetryStore.walCheckpoint();
+        // In-thread through TelemetryStore, not the query worker: #4213 owns this periodic job.
         const aggregated = telemetryStore.aggregateMissing();
         if (aggregated > 0) {
           console.log(
@@ -1463,6 +1480,19 @@ async function main() {
     tick: () => recordCpuSample(),
   });
   cpuSamplerLoop.start();
+
+  // #6452: fire each due automatic pick once. Started after listen so a pick
+  // that fell due while the server was down is handled on the first tick
+  // (fired, or rescheduled 15 minutes out when over an hour late); inert (a
+  // "stopped" row) while Pins is off.
+  pinDeadlineLoop = createPinDeadlineLoop({
+    engine: syncEngine,
+    getTimeZone: () => resolvePinAnswersTimeZone(config.dataDir),
+    node: jobNodeId,
+    registry: jobRegistry,
+    log: (message, context) => console.log(message, context ?? ""),
+  });
+  pinDeadlineLoop.start();
   transcriptIndexer.start({ config, jobNodeId, jobRegistry, syncEngine });
   // Issue #6164 (A1): throughput telemetry loops + the routes' summary service.
   throughput.start({
@@ -1475,6 +1505,18 @@ async function main() {
     usageService,
     getNodeRegistry: () => nodeRegistry,
     errorLogger,
+  });
+
+  // Issue #6169 (C2): prompt-cache keep-alive for sessions idle on a person.
+  cacheKeepalive.start({
+    settingsFile,
+    bootSettings: settings,
+    jobNodeId,
+    jobRegistry,
+    syncEngine,
+    store,
+    errorLogger,
+    isHandoffHeld: sid => contextWatermarkService?.isHeld(sid) ?? false,
   });
 
   turnMirrorWiring.startTurnMirrorPull({
@@ -1583,8 +1625,11 @@ async function main() {
     notificationPurgeLoop?.stop();
     walCheckpointLoop?.stop();
     cpuSamplerLoop?.stop();
+    pinDeadlineLoop?.stop();
     transcriptIndexer.stop();
     throughput.stop(); // issue #6164
+    telemetryExecutor.stop(); // issue #6516: never waits for the worker's close
+    cacheKeepalive.stop(); // issue #6169
     turnMirrorWiring.stopTurnMirrorPull(); // issue #4614
     // #1271: the Telegram bot's stop() moved into the extension's
     // `host.lifecycle.onShutdown` hook, drained further down this handler.

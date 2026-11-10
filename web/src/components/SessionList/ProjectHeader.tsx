@@ -26,6 +26,11 @@ import {
   splitDragHandle,
   type SortableDragHandle,
 } from "./SortableListEntry";
+import {
+  openPinsArchiveNote,
+  sumOpenPins,
+  withOpenPinsNote,
+} from "@/lib/pins/archiveWarning";
 
 // ── #4538: row-2 node band + icon discs ──────────────────────────────────
 // Row-2 node band: a `::before` layer on line 2, painted BEHIND its content
@@ -512,7 +517,12 @@ export function ProjectHeader(props: {
         isOpen={disconnectAllOpen}
         onClose={() => setDisconnectAllOpen(false)}
         title="Disconnect All Sessions"
-        description={`Disconnect all ${connectedSessions.length} active session${connectedSessions.length === 1 ? "" : "s"} in "${projectName}"?`}
+        description={withOpenPinsNote(
+          `Disconnect all ${connectedSessions.length} active session${connectedSessions.length === 1 ? "" : "s"} in "${projectName}"?`,
+          openPinsArchiveNote(sumOpenPins(connectedSessions), {
+            several: connectedSessions.length > 1,
+          })
+        )}
         confirmLabel="Disconnect All"
         confirmingLabel="Disconnecting..."
         onConfirm={handleDisconnectAll}

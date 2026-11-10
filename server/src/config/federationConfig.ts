@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { FederationConfigSchema, type FederationConfig } from "@hapi/protocol";
+import {
+  FederationConfigSchema,
+  normalizeNodeWebUrl,
+  type FederationConfig,
+} from "@hapi/protocol";
 import type { Settings } from "./settings";
 import { localNodeDisplayLabel } from "./nodeLabel";
 
@@ -13,6 +17,33 @@ export function loadFederationConfig(
   const raw = settings.federation;
   if (!raw?.enabled) {
     return null;
+  }
+
+  // Issue #6123: this node's user-facing web address. Normalized here, before
+  // the parse below, because that parse is unguarded at boot (index.ts) and a
+  // typo in a display-only setting must never stop the server: an invalid
+  // value is dropped with a warning. `||` so an empty env falls through.
+  const rawWebUrl = process.env.FEDERATION_WEB_URL || raw.webUrl;
+  const webUrl = normalizeNodeWebUrl(rawWebUrl);
+  if (rawWebUrl && !webUrl) {
+    console.warn(
+      "[federation] ignoring invalid webUrl (FEDERATION_WEB_URL / federation.webUrl): it must be an http(s) URL without a username or password"
+    );
+  }
+
+  // Issue #6483: the turn-mirror opt-out (#4614). Carried only as a real
+  // boolean, for the reason given for webUrl above: a hand-edited "true" or 1
+  // is dropped with a warning (the mirror keeps running, as it did before this
+  // fix) instead of stopping the server. null reads as unset.
+  const rawTurnMirrorDisabled: unknown = raw.turnMirrorDisabled;
+  const turnMirrorDisabled =
+    typeof rawTurnMirrorDisabled === "boolean"
+      ? rawTurnMirrorDisabled
+      : undefined;
+  if (rawTurnMirrorDisabled != null && turnMirrorDisabled === undefined) {
+    console.warn(
+      "[federation] ignoring invalid turnMirrorDisabled (federation.turnMirrorDisabled): it must be true or false"
+    );
   }
 
   const merged = {
@@ -39,6 +70,10 @@ export function loadFederationConfig(
     // Absolute path to the vanilla Claude CLI on this node (issue #933).
     // Falls back to auto-detection if not set.
     claudePath: raw.claudePath,
+    // Issue #6123: omitted when unset or invalid (see above).
+    ...(webUrl ? { webUrl } : {}),
+    // Issue #6483: omitted when unset or invalid (see above).
+    ...(turnMirrorDisabled !== undefined ? { turnMirrorDisabled } : {}),
   };
 
   return FederationConfigSchema.parse(merged);

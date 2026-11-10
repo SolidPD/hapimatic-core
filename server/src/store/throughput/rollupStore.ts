@@ -5,6 +5,7 @@ import {
   rateCardsGeneration,
   type RateCardSource,
 } from "./rateCardSource";
+import { tableExists, tableHasColumns } from "../turns/schema";
 import {
   ROLLUP_TABLES,
   readThroughputState,
@@ -81,6 +82,12 @@ export interface IdleRollupRow {
   w1: number;
   w5: number;
   usd: number;
+  /** #6169: reopenings that read >= 90% of their prefix from the cache. */
+  warmN: number;
+  /** #6169: cache-read tokens of those kept-warm reopenings. */
+  warmCr: number;
+  /** #6169: what rewriting those tokens (1-hour write) would have cost, less the read. */
+  avoidedUsd: number;
 }
 
 export interface SessionRollupRow extends TokenSumsRow {
@@ -273,10 +280,34 @@ export function decodeCursor(cursor: string | null | undefined): number {
 }
 
 export class ThroughputRollupStore {
+  private warmColumns: boolean | null = null;
+  private keepaliveTable: boolean | null = null;
+
   constructor(
     private readonly db: Database,
     private readonly now: () => number = Date.now
   ) {}
+
+  /**
+   * #6169: whether the kept-warm idle columns exist. Their ADD COLUMN is
+   * fail-open at boot, so a DB where it failed keeps the pre-#6169 shape and
+   * these reads and writes fall back to it rather than throwing. Checked once
+   * (migrations run only at boot).
+   */
+  private hasWarmColumns(): boolean {
+    this.warmColumns ??= tableHasColumns(this.db, "throughput_rollup_idle", [
+      "warm_n",
+      "warm_cr",
+      "avoided_usd",
+    ]);
+    return this.warmColumns;
+  }
+
+  /** #6169: whether the keep-alive ledger table exists (its block is fail-open too). */
+  private hasKeepaliveTable(): boolean {
+    this.keepaliveTable ??= tableExists(this.db, "throughput_keepalive_daily");
+    return this.keepaliveTable;
+  }
 
   // ─────────────────────────── writer side ───────────────────────────
 
@@ -354,9 +385,16 @@ export class ThroughputRollupStore {
       `INSERT INTO throughput_rollup_ctx (ns, origin, day, kind, bin, n)
        VALUES (@ns, @origin, @day, @kind, @bin, @n)`
     );
+    const warm = this.hasWarmColumns();
     const insIdle = db.prepare(
-      `INSERT INTO throughput_rollup_idle (ns, origin, day, cls, n, w1, w5, usd)
-       VALUES (@ns, @origin, @day, @cls, @n, @w1, @w5, @usd)`
+      warm
+        ? `INSERT INTO throughput_rollup_idle (
+             ns, origin, day, cls, n, w1, w5, usd, warm_n, warm_cr, avoided_usd
+           ) VALUES (
+             @ns, @origin, @day, @cls, @n, @w1, @w5, @usd, @warmN, @warmCr, @avoided
+           )`
+        : `INSERT INTO throughput_rollup_idle (ns, origin, day, cls, n, w1, w5, usd)
+           VALUES (@ns, @origin, @day, @cls, @n, @w1, @w5, @usd)`
     );
     const insSession = db.prepare(
       `INSERT INTO throughput_rollup_session (
@@ -443,6 +481,9 @@ export class ThroughputRollupStore {
           w1: r.w1,
           w5: r.w5,
           usd: r.usd,
+          ...(warm
+            ? { warmN: r.warmN, warmCr: r.warmCr, avoided: r.avoidedUsd }
+            : {}),
         });
       }
       for (const r of bucket.session) {
@@ -536,11 +577,17 @@ export class ThroughputRollupStore {
     return removed;
   }
 
-  /** Delete rollups (and dirty marks) of days before `beforeDay`. */
+  /**
+   * Delete rollups (and dirty marks) of days before `beforeDay`, and the
+   * keep-alive ledger's rows of those days (#6169: not a rollup table, but it
+   * shares the window).
+   */
   pruneBefore(beforeDay: string): number {
     let removed = 0;
     const apply = this.db.transaction(() => {
-      for (const t of ROLLUP_TABLES) {
+      const tables: string[] = [...ROLLUP_TABLES];
+      if (this.hasKeepaliveTable()) tables.push("throughput_keepalive_daily");
+      for (const t of tables) {
         removed += this.db
           .prepare(`DELETE FROM ${t} WHERE day < ?`)
           .run(beforeDay).changes;
@@ -666,29 +713,54 @@ export class ThroughputRollupStore {
     return out;
   }
 
-  /** Post-idle rewrites by wait class. */
+  /**
+   * Post-idle reopenings by wait class: all of them (`n`), the kept-warm ones
+   * (`warmN`, #6169) and what the rewrites cost. `origin` narrows to one node's
+   * own turns (the keep-alive comparison, whose ledger is node-local).
+   */
   idleByClass(
     fromDay: string,
     toDay: string,
-    scope: RollupScope
-  ): Array<{ cls: string; n: number; w1: number; w5: number; usd: number }> {
+    scope: RollupScope,
+    origin?: string
+  ): Array<{
+    cls: string;
+    n: number;
+    w1: number;
+    w5: number;
+    usd: number;
+    warmN: number;
+    warmCr: number;
+    avoidedUsd: number;
+  }> {
+    const originSql = origin === undefined ? "" : " AND origin = $origin";
     return (
       this.db
         .prepare(
-          `SELECT cls, SUM(n) AS n, SUM(w1) AS w1, SUM(w5) AS w5, SUM(usd) AS usd
+          `SELECT cls, SUM(n) AS n, SUM(w1) AS w1, SUM(w5) AS w5, SUM(usd) AS usd, ${
+            this.hasWarmColumns()
+              ? "SUM(warm_n) AS warm_n, SUM(warm_cr) AS warm_cr, SUM(avoided_usd) AS avoided_usd"
+              : "0 AS warm_n, 0 AS warm_cr, 0 AS avoided_usd"
+          }
              FROM throughput_rollup_idle
-            WHERE day >= $from AND day <= $to AND ${SCOPE_SQL}
+            WHERE day >= $from AND day <= $to AND ${SCOPE_SQL}${originSql}
             GROUP BY cls ORDER BY usd DESC`
         )
-        .all({ from: fromDay, to: toDay, ...scopeParams(scope) }) as Array<
-        Record<string, unknown>
-      >
+        .all({
+          from: fromDay,
+          to: toDay,
+          ...scopeParams(scope),
+          ...(origin === undefined ? {} : { origin }),
+        }) as Array<Record<string, unknown>>
     ).map(r => ({
       cls: String(r.cls),
       n: num(r.n),
       w1: num(r.w1),
       w5: num(r.w5),
       usd: num(r.usd),
+      warmN: num(r.warm_n),
+      warmCr: num(r.warm_cr),
+      avoidedUsd: num(r.avoided_usd),
     }));
   }
 

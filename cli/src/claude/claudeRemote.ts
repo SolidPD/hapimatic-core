@@ -30,6 +30,7 @@ import {
 } from "./utils/generateHookSettings";
 import { readBoundApiKeyBinding } from "./accountTokenInjection";
 import type { EffortLevel } from "@hapi/protocol/effort";
+import type { McpServerUsage } from "@hapi/protocol";
 
 /**
  * Issue #6166: read back the effort (and model) the Claude process applies, via
@@ -89,6 +90,8 @@ export async function claudeRemote(opts: {
     contextUsedTokens: number;
     contextPercentage: number;
   }) => void;
+  // Issue #6171: each MCP server's context cost from the same per-turn reply.
+  onMcpContextCosts?: (servers: McpServerUsage[]) => void;
   // Issue #6166: the effort (and model) the Claude process actually applies,
   // read back once per query start via get_settings; `null` = it sends none.
   // Never fires after claudeRemote returns (`queryEnded` drops a late answer).
@@ -498,9 +501,12 @@ export async function claudeRemote(opts: {
       ) {
         contextUsageNeedsRefresh = false;
         const onContextUsage = opts.onContextUsage;
+        const onMcpContextCosts = opts.onMcpContextCosts;
         void response
-          .getContextUsage()
-          .then(u => {
+          .getTurnContextUsage()
+          .then(({ usage: u, mcpServers }) => {
+            // Issue #6171: the session decides whether this list is new.
+            onMcpContextCosts?.(mcpServers);
             // Strip the tier suffix (e.g. "claude-opus-4-8[1m]" ->
             // "claude-opus-4-8") so formatModelName matches. The "[" only ever
             // appears as the tier suffix in a model id.

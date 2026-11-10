@@ -8,8 +8,10 @@ import type { FederationDeps } from "./shared";
 import {
   FederationSpawnBodySchema,
   LOCAL_NODE_ID,
+  MCP_SET_CAPABILITY,
   defineCapability,
 } from "@hapi/protocol";
+import { floorAgentMcpEnable } from "../agentEscalation";
 import { cataloged } from "../../../capabilities/cataloged";
 import { createRateLimiter } from "../../middleware/rateLimit";
 import {
@@ -289,6 +291,32 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!parsed.success) {
         const message = parsed.error.issues[0]?.message ?? "Invalid body";
         return c.json({ type: "error", message }, 400);
+      }
+
+      // Issue #6171: an explicit MCP set. `enableForProject` writes the target
+      // project's config, so a non-bypass agent caller may not send it; and a
+      // peer built before #6171 would strip the field and start every server,
+      // so refuse here rather than report a spawn that ignored the pick. An
+      // omitted set passes through (the target applies its project default).
+      if (parsed.data.mcpSet !== undefined) {
+        const mcpFloor = floorAgentMcpEnable(
+          c,
+          deps.getSyncEngine(),
+          parsed.data.mcpSet
+        );
+        if (mcpFloor) return mcpFloor;
+        const targetNodeId = c.req.param("nodeId");
+        if (!registry.nodeSupports(targetNodeId, MCP_SET_CAPABILITY)) {
+          return c.json(
+            {
+              type: "error",
+              message:
+                "This node's Hapimatic version cannot choose MCP servers yet. Update it first, or start the session with every server.",
+              code: "mcp_set_node_unsupported",
+            },
+            409
+          );
+        }
       }
 
       // Issue #2822 (epic #2478 D2a): resolve the managed-peer parent HERE, on

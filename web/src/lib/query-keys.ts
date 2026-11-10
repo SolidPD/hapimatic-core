@@ -12,6 +12,22 @@ export const queryKeys = {
   // this separate key (never fetched from the server) makes them refetch-proof.
   optimisticMessages: (sessionId: string) =>
     ["optimistic-messages", sessionId] as const,
+  // #6449: a session's pins and one evidence file. Top-level prefixes, never
+  // under ["session", id]: TanStack matches by prefix, so a nested key would be
+  // refetched by every `session-updated` and invalidated by the view mutation.
+  // The evidence key carries the pin revision because agents overwrite paths.
+  pins: (sessionId: string) => ["pins", sessionId] as const,
+  // #6450: one pin, for a chat card, under the session's pins prefix so a
+  // removed session's cleanup and the reconnect's stale mark cover it.
+  pin: (sessionId: string, key: string) =>
+    ["pins", sessionId, "pin", key] as const,
+  // Every session's pins list (an SSE reconnect marks them all stale).
+  allPins: ["pins"] as const,
+  // #6454: every Project Manager dashboard in the namespace, across nodes.
+  // Under the pins prefix, so an SSE reconnect marks it stale with the rest.
+  pinDashboards: ["pins", "dashboards"] as const,
+  pinEvidence: (sessionId: string, path: string, revision: number) =>
+    ["pin-evidence", sessionId, path, revision] as const,
   // #3559 (R6): per-issue approval-gate state for the server-driven approval card.
   // Keyed by session + challengeId (the issue number) so each gate polls its own
   // cache entry.
@@ -246,6 +262,10 @@ export const queryKeys = {
   mcpBatchState: (sessionId: string) => ["mcp-batch-state", sessionId] as const,
   repoIssues: (directory: string, nodeId?: string) =>
     ["repo-issues", directory, nodeId ?? LOCAL_NODE_ID] as const,
+  // Issue #6171: the MCP catalog for a project on a node. The prefix
+  // ["mcp-catalog"] is invalidated by every mcp-status-updated event.
+  mcpCatalog: (directory: string, nodeId?: string) =>
+    ["mcp-catalog", directory, nodeId ?? LOCAL_NODE_ID] as const,
   // hapimatic-private#4481: Create-page Branch control listing.
   gitBranches: (directory: string, nodeId?: string) =>
     ["git-branches", directory, nodeId ?? LOCAL_NODE_ID] as const,

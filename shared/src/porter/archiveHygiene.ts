@@ -5,7 +5,7 @@
  * An archive copied off a machine cannot be recalled, so every Porter archive
  * is checked before its path is printed or it is uploaded: by BOTH generated
  * export scripts as their last step (bash and PowerShell, from the rules
- * below), by `scripts/verify-porter-archive-hygiene-v1.sh` (the operator and CI
+ * below), by `scripts/verify-porter-archive-hygiene-v2.sh` (the operator and CI
  * form, which embeds the SAME bash lines), and, for premium descriptors, by the
  * importer as a backstop. `scripts/verify-porter-secret-hygiene.sh` is a
  * different tool: it scans the source machine's TRANSCRIPTS for secrets that
@@ -158,7 +158,7 @@ export function premiumDescriptorJq(): string {
  * when the archive is clean, 1 on any hit, 2 when it cannot be listed or
  * extracted. Needs tar, gzip, grep and jq. Safe under `set -eu` and
  * `set -o pipefail` (every grep runs in an `if`, and no pipe stops early).
- * Both the bash exporter and `scripts/verify-porter-archive-hygiene-v1.sh` run
+ * Both the bash exporter and `scripts/verify-porter-archive-hygiene-v2.sh` run
  * these exact lines; a test pins the script's copy to this output.
  */
 export function archiveHygieneShellLines(): string[] {

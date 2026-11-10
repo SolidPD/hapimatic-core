@@ -64,10 +64,16 @@ import { tokens } from "@/design/tokens";
 import { ThemePicker } from "@/components/settings/ThemePicker";
 import { BackupKeySection } from "@/components/settings/sections/BackupKeySection";
 import { SessionHandoffSection } from "@/components/settings/sections/SessionHandoffSection";
+import { PinsDefaultsSection } from "@/components/settings/sections/PinsDefaultsSection";
 import { OnboardingSection } from "@/components/settings/sections/OnboardingSection";
 import { VoiceInputSection } from "@/components/settings/sections/VoiceInputSection";
 import { useScrollToLocationHash } from "@/hooks/useScrollToLocationHash";
+import { useVersion } from "@/hooks/useVersion";
 import { ArrowRightLeft, ShieldCheck, Sliders } from "lucide-react";
+import {
+  isScrollRecorderEnabled,
+  setScrollRecorderEnabled,
+} from "@/lib/scrollCauseRecorder";
 import {
   useBackupIdentityStatus,
   isBackupProvisioned,
@@ -202,6 +208,37 @@ function ToggleRow(props: {
       {props.description && (
         <p className="text-xs text-[var(--app-hint)]">{props.description}</p>
       )}
+    </section>
+  );
+}
+
+/**
+ * #6122: the scroll-cause recorder switch. Off by default; when on, a chat thread shows a
+ * small REC panel whose Copy exports a log of every scroll-position change and its cause.
+ */
+function DiagnosticsSection() {
+  const [recorderOn, setRecorderOn] = useState(isScrollRecorderEnabled);
+  const [saveFailed, setSaveFailed] = useState(false);
+  return (
+    <section className="flex flex-col gap-2">
+      <SectionHeading>Diagnostics</SectionHeading>
+      <ToggleRow
+        label="Scroll recorder"
+        checked={recorderOn}
+        onChange={value => {
+          // Show what was stored, not what was asked for: a full or blocked storage
+          // keeps the old value, and the recorder follows the stored one.
+          setSaveFailed(!setScrollRecorderEnabled(value));
+          setRecorderOn(isScrollRecorderEnabled());
+        }}
+        description="Off by default. Records what moves the chat scroll position, for troubleshooting. Turn it on, open a session (it starts with the next session you open), reproduce the problem, then tap Copy in the chat."
+      />
+      {saveFailed ? (
+        <p className="text-xs text-red-400">
+          The switch could not be saved because this site's browser storage is
+          full or blocked.
+        </p>
+      ) : null}
     </section>
   );
 }
@@ -492,6 +529,9 @@ export default function AdminPreferencesPage() {
   } = useDefaultOutputStyle(api);
   // #2624 (B): the 🌐 engine — per-key inherit flags + provenance.
   const fedSettings = useFederationSettings(api);
+  // #6451: the Pins defaults show only while this instance's Pins gate is open,
+  // the read `useSessionViewOptions` gates the Pins tab on.
+  const pinsEnabled = useVersion().data?.pinsEnabled === true;
   const { localNode, remoteNodes } = useFederatedSessions(api);
   // #4906 D2: the Backup Key section's gate, the same fail-closed derivation the
   // retired Keys page used.
@@ -1013,6 +1053,16 @@ export default function AdminPreferencesPage() {
             ))}
           </div>
         </section>
+
+        {/* Diagnostics (#6122): the scroll-cause recorder. Per device and instance,
+            client-only (no backend reads it), so it lives in localStorage. */}
+        <DiagnosticsSection />
+
+        {/* Pins defaults (#6451): what a session's Pins tab opens with. A
+            federation setting. Self-contained with its own bordered heading, so
+            it sits with the other such sections: placed among the plain rows
+            above, the rows after it read as part of it. */}
+        {pinsEnabled ? <PinsDefaultsSection api={api} /> : null}
 
         {/* Session Handoff (folded from /settings/watermark — Settings reorg).
             #4906: no menu row; the section stays deep-linkable via #session-handoff. */}

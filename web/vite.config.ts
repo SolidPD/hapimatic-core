@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { findChunkCycle, vendorChunkFor } from "./src/lib/vendorChunks";
 
 const base = process.env.VITE_BASE_URL || "/";
 // Dev instance uses icons with red DEV badge, production uses clean icons
@@ -78,6 +79,32 @@ function checkAppVersionParity(version: string, failOnMismatch: boolean): void {
   console.warn(message);
 }
 
+/**
+ * Fails the build on a static-import cycle between output chunks (#3098). A
+ * chunk in a cycle can run before a chunk it reads from has initialized, which
+ * blanks the app with "Cannot access … before initialization". Rollup printed
+ * no warning for the cycle the first `manualChunks` version produced.
+ */
+function failOnChunkCycle(): Plugin {
+  return {
+    name: "hapi-fail-on-chunk-cycle",
+    apply: "build",
+    generateBundle(_options, bundle) {
+      const imports: Record<string, string[]> = {};
+      for (const output of Object.values(bundle)) {
+        if (output.type === "chunk") imports[output.fileName] = output.imports;
+      }
+      const cycle = findChunkCycle(imports);
+      if (cycle) {
+        this.error(
+          `Static import cycle between chunks: ${cycle.join(" -> ")}. ` +
+            "Adjust the manualChunks groups in src/lib/vendorChunks.ts."
+        );
+      }
+    },
+  };
+}
+
 /** Everything but the per-build `define` (#3491). */
 const sharedConfig: UserConfig = {
   server: {
@@ -96,6 +123,7 @@ const sharedConfig: UserConfig = {
   },
   plugins: [
     react(),
+    failOnChunkCycle(),
     VitePWA({
       // Issue #1793: SW registration is fully MANUAL (lib/sw-update.ts
       // registerServiceWorker) — even prompt-mode virtual:pwa-register attaches
@@ -155,7 +183,12 @@ const sharedConfig: UserConfig = {
       },
       injectManifest: {
         globPatterns: ["**/*.{js,css,html,ico,png,svg,woff,woff2}"],
-        maximumFileSizeToCacheInBytes: 4 * 1024 * 1024, // 4 MiB — main bundle crossed 3 MiB by ~1 KB (broke injectManifest at #1079 close); code-splitting is the real fix (follow-up)
+        // 4 MiB. #3098 code-split the main bundle (lazy route pages, emoji grid and shiki, plus
+        // the vendor chunks in src/lib/vendorChunks.ts): 4,205,958 B -> 1,954,159 B, so the
+        // largest file has about 2.2 MB of headroom here and a real regression still fails the
+        // build. History: #1079 raised it from 3 to 4 MiB when the main bundle crossed 3 MiB;
+        // #6123 raised it to 5 MiB when ms-dev's main bundle sat 1,559 bytes under 4 MiB.
+        maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
       },
       devOptions: {
         enabled: true,
@@ -181,6 +214,14 @@ const sharedConfig: UserConfig = {
     // .map files into web/dist/ → embedded into the single-exe binary →
     // served as /assets/*.map HTTP responses to end users.
     sourcemap: !!process.env.SENTRY_AUTH_TOKEN && !isDev,
+    rollupOptions: {
+      output: {
+        // #3098: the eager vendor packages get their own chunks, matched by
+        // package name. src/lib/vendorChunks.ts says why a substring match or
+        // a catch-all chunk is unsafe.
+        manualChunks: vendorChunkFor,
+      },
+    },
   },
 };
 

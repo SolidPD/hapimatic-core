@@ -6,9 +6,13 @@ import { cataloged } from "../../capabilities/cataloged";
 import type { WebAppEnv } from "../middleware/auth";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
+import { resolvePinsEnabled } from "../../config/pinsConfig";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { AvailabilityContext, CatalogEntry } from "@hapi/protocol";
-import type { LiveCatalog } from "../../capabilities/catalogCollector";
+import {
+  withoutClosedPinsUi,
+  type LiveCatalog,
+} from "../../capabilities/catalogCollector";
 import {
   annotateAndFilterCatalog,
   type AnnotatedLiveCatalog,
@@ -79,6 +83,26 @@ const USER_FALLBACK_CONTEXT: AvailabilityContext = {
   scope: "user",
   nodeCapabilities: [],
 };
+
+/**
+ * #6447 (R15): a peer's catalog lists the pin routes it serves, but a hub whose gate
+ * is closed answers 404 for them, so it must not advertise them on the peer's behalf.
+ */
+function withoutClosedPinRoutes<
+  C extends { rest: CatalogEntry[]; ui: CatalogEntry[] },
+>(peer: C): C {
+  if (resolvePinsEnabled()) return peer;
+  return {
+    ...peer,
+    rest: peer.rest.filter(
+      e =>
+        e.invocation.kind !== "rest" ||
+        !/\/pins(?:\/|$)/.test(e.invocation.path)
+    ),
+    // #6449: nor the Pins tab's `ui` entry, by its exact id.
+    ui: withoutClosedPinsUi(peer.ui, false),
+  };
+}
 
 /**
  * Narrow a live catalog by `?domain=` / `?surface=`. `?surface=X` keeps only the
@@ -222,7 +246,9 @@ export function createCapabilityCatalogRoutes(options: {
             // node's context (#3749 Task 4). Relay it verbatim, applying only the
             // local domain/surface narrowing.
             const peer = (await resp.json()) as AnnotatedLiveCatalog;
-            return c.json(filterCatalog(peer, domain, surface));
+            return c.json(
+              filterCatalog(withoutClosedPinRoutes(peer), domain, surface)
+            );
           }
           if (resp.status === 404) {
             // Older binary with no receiver → the hub's own catalog, user-scope
@@ -305,7 +331,9 @@ export function createCapabilityCatalogRoutes(options: {
             const resp = await fetch(receiverUrl.toString(), { headers });
             if (resp.ok) {
               const peer = (await resp.json()) as AnnotatedLiveCatalog;
-              return c.json(filterCatalog(peer, domain, surface));
+              return c.json(
+                filterCatalog(withoutClosedPinRoutes(peer), domain, surface)
+              );
             }
             // Non-2xx from the owning node → fall through to the 404 below.
           } catch {

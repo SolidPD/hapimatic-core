@@ -17,6 +17,10 @@ import {
   renderHoistedImages,
 } from "@/components/AssistantChat/messages/toolImages";
 import { CollapsibleSectionRow } from "@/components/AssistantChat/messages/CollapsibleSectionRow";
+import {
+  collectPinKeysDeep,
+  ToolPinCards,
+} from "@/components/AssistantChat/messages/PinChatShims";
 import { getToolIcon } from "@/components/ToolCard/knownTools";
 import { Button } from "@/components/ui/button";
 
@@ -166,6 +170,12 @@ export function ToolRunGroup(props: {
     () => memberBlocks.flatMap(collectImagesDeep),
     [memberBlocks]
   );
+  // #6450: the same for pins. A pin_post inside "13 tool calls…" would never
+  // show while the run is collapsed; its card renders beside the images strip.
+  const memberPins = useMemo(
+    () => [...new Set(memberBlocks.flatMap(collectPinKeysDeep))],
+    [memberBlocks]
+  );
 
   const { visible, defaultState } = chatSections.toolRuns;
   // A hidden section starts as a collapsed ghost (reveal affordance) regardless
@@ -280,6 +290,11 @@ export function ToolRunGroup(props: {
       {!effectiveOpen && memberImages.length > 0 ? (
         <div data-cat="tools" className="py-1">
           {renderHoistedImages(memberImages)}
+        </div>
+      ) : null}
+      {!effectiveOpen && memberPins.length > 0 ? (
+        <div data-cat="tools" className="py-1">
+          <ToolPinCards pinKeys={memberPins} />
         </div>
       ) : null}
     </>

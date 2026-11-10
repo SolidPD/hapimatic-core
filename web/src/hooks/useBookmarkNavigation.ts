@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Bookmark } from "@hapi/protocol";
+import { recordScrollWrite } from "@/lib/scrollCauseRecorder";
 import {
   attachUserTakeoverListeners,
   startPostSnapCorrection,
@@ -44,8 +45,9 @@ export interface BookmarkNavigationState {
 }
 
 const SCROLL_START_DELAY_MS = 50;
-const AUTO_PAGE_POLL_INTERVAL_MS = 50;
-const AUTO_PAGE_POLL_MAX_WAIT_MS = 8000;
+/** Exported for the pin chat jump (#6453), which pages the same way. */
+export const AUTO_PAGE_POLL_INTERVAL_MS = 50;
+export const AUTO_PAGE_POLL_MAX_WAIT_MS = 8000;
 
 // #3146: land the tapped spot a small inset below the viewport top so it isn't
 // flush against the very edge. The bookmark is an arbitrary scroll position, so
@@ -60,6 +62,16 @@ const SCROLL_INSET_PX = 8;
 const SETTLE_POLL_INTERVAL_MS = 50;
 const SETTLE_MAX_WAIT_MS = 1000;
 const SETTLE_STABLE_EPSILON_PX = 1;
+
+/**
+ * What a scroll spot needs: a bookmark's anchor fields. A pin's chat jump
+ * (#6453, `useChatJump`) does not use these: it lands on the pin's card or its
+ * posting message through `pinTargetSelectors`, at offset 0.
+ */
+export type SpotAnchor = Pick<
+  Bookmark,
+  "messageId" | "blockId" | "offsetPx" | "anchorHeightPx"
+>;
 
 /** A bookmark's anchor element as resolved in the current DOM. */
 export interface ResolvedBookmarkAnchor {
@@ -86,7 +98,7 @@ export interface ResolvedBookmarkAnchor {
  */
 export function resolveBookmarkAnchor(
   scope: ParentNode,
-  bookmark: Bookmark,
+  bookmark: SpotAnchor,
   strip?: HTMLElement | null
 ): ResolvedBookmarkAnchor | null {
   if (bookmark.blockId) {
@@ -129,7 +141,7 @@ export function resolveBookmarkAnchor(
  * its height ratio is a fair proxy for re-layout.
  */
 export function bookmarkSpotOffsetPx(
-  bookmark: Bookmark,
+  bookmark: SpotAnchor,
   anchor: ResolvedBookmarkAnchor
 ): number {
   const capturedHeight = bookmark.anchorHeightPx;
@@ -145,6 +157,99 @@ export function bookmarkSpotOffsetPx(
     }
   }
   return bookmark.offsetPx;
+}
+
+export interface ScrollSpotOptions {
+  /** The first scroll's behavior; the settled snap is always instant. */
+  behavior: ScrollBehavior;
+  /** The scroll recorder's cause label. */
+  cause: string;
+  /** See `BookmarkNavigationOptions.createResizeObserver`. */
+  createResizeObserver?: ResizeObserverFactory;
+}
+
+/**
+ * Scroll `viewport` so the spot `offsetPx()` below `el`'s top lands at the top
+ * inset, then hold it there while the layout above it settles: the #2515 settle
+ * poll, then one instant snap, then the #3878 post-snap correction. `offsetPx`
+ * is read on every measurement, so an offset that scales with the anchor's live
+ * height follows it. A user who takes over (wheel, touch, keys) cancels it; so
+ * does the returned function. Shared by the bookmark navigation and the pin
+ * chat jump (#6453).
+ */
+export function scrollSpotToTop(
+  viewport: HTMLElement,
+  el: HTMLElement,
+  offsetPx: () => number,
+  opts: ScrollSpotOptions
+): () => void {
+  const scrollOnce = (behavior: ScrollBehavior) => {
+    const vpTop = viewport.getBoundingClientRect().top;
+    const anchorTop = el.getBoundingClientRect().top;
+    const delta = anchorTop + offsetPx() - vpTop - SCROLL_INSET_PX;
+    const before = viewport.scrollTop;
+    viewport.scrollBy({ top: delta, behavior });
+    recordScrollWrite(
+      opts.cause,
+      viewport,
+      before,
+      viewport.scrollTop,
+      `delta=${Math.round(delta)} ${behavior}`
+    );
+  };
+  scrollOnce(opts.behavior);
+
+  // Post-layout re-anchor (#2515, extended by #3878). Phase 1 polls the spot's
+  // viewport-relative position until it stops moving (or a budget elapses),
+  // then snaps onto the settled position with ONE instant correction. Phase 2
+  // (#3878) catches the resizes that land AFTER that first quiet window (a late
+  // image decode, a load-older prepend's reflow): a debounced ResizeObserver
+  // applies at most one ABSOLUTE `scrollTop` correction per resize burst,
+  // hard-capped — never a repeating programmatic-scroll poll (the #3158 K10
+  // contract; iOS WebKit paints that as flicker). No highlight (#3146).
+  const deadline = Date.now() + SETTLE_MAX_WAIT_MS;
+  const spotTop = (): number => el.getBoundingClientRect().top + offsetPx();
+  let lastTop = spotTop();
+  let timerId: ReturnType<typeof setTimeout> | null = null;
+  let stopCorrection: (() => void) | null = null;
+  const listenerAbort = new AbortController();
+
+  const cleanup = () => {
+    if (timerId !== null) {
+      clearTimeout(timerId);
+      timerId = null;
+    }
+    stopCorrection?.();
+    stopCorrection = null;
+    listenerAbort.abort();
+  };
+
+  const tick = () => {
+    timerId = null;
+    const top = spotTop();
+    const stable = Math.abs(top - lastTop) < SETTLE_STABLE_EPSILON_PX;
+    lastTop = top;
+    if (stable || Date.now() >= deadline) {
+      scrollOnce("auto");
+      // spotTop() re-reads the offset, so a block that grows after the snap is
+      // followed proportionally.
+      stopCorrection = startPostSnapCorrection({
+        viewport,
+        targetTop: () => (el.isConnected ? spotTop() : null),
+        createResizeObserver: opts.createResizeObserver,
+        onUserScroll: cleanup,
+      });
+      return;
+    }
+    timerId = setTimeout(tick, SETTLE_POLL_INTERVAL_MS);
+  };
+
+  // A user who takes over during the settle or correction window wins — never
+  // yank them back (#2515 R3; the cancel set is widened by #3878 to taps and
+  // navigation keys).
+  attachUserTakeoverListeners(viewport, listenerAbort.signal, cleanup);
+  timerId = setTimeout(tick, SETTLE_POLL_INTERVAL_MS);
+  return cleanup;
 }
 
 /** One rendered bookmark: its record + the resolved anchor element in the DOM. */
@@ -241,97 +346,6 @@ export function useBookmarkNavigation(
     settleCancelRef.current?.();
   }, []);
 
-  /** Scroll the viewport so the tapped spot (anchorTop + offsetPx) lands at the top inset. */
-  const scrollToSpot = useCallback(
-    (entry: RenderedBookmark, behavior: ScrollBehavior) => {
-      const viewport = viewportRef.current;
-      if (!viewport) return;
-      const vpTop = viewport.getBoundingClientRect().top;
-      const anchorTop = entry.anchorEl.getBoundingClientRect().top;
-      const delta =
-        anchorTop +
-        bookmarkSpotOffsetPx(entry.bookmark, entry) -
-        vpTop -
-        SCROLL_INSET_PX;
-      viewport.scrollBy({ top: delta, behavior });
-    },
-    [viewportRef]
-  );
-
-  // Post-layout re-anchor (#2515, extended by #3878). Phase 1 polls the tapped
-  // spot's viewport-relative position until it stops moving (or a budget
-  // elapses), then snaps onto the settled position with ONE instant correction.
-  // Phase 2 (#3878) catches the resizes that land AFTER that first quiet window
-  // (a late image decode, a load-older prepend's reflow): a debounced
-  // ResizeObserver applies at most one ABSOLUTE `scrollTop` correction per resize
-  // burst, hard-capped — never a repeating programmatic-scroll poll (the #3158
-  // K10 contract; iOS WebKit paints that as flicker). The spot offset is
-  // re-scaled against the anchor's live height on every measurement. No
-  // highlight (#3146).
-  const startReanchor = useCallback(
-    (entry: RenderedBookmark) => {
-      settleCancelRef.current?.();
-
-      const viewport = viewportRef.current;
-      const deadline = Date.now() + SETTLE_MAX_WAIT_MS;
-      const spotTop = (): number =>
-        entry.anchorEl.getBoundingClientRect().top +
-        bookmarkSpotOffsetPx(entry.bookmark, entry);
-      let lastTop = spotTop();
-      let timerId: ReturnType<typeof setTimeout> | null = null;
-      let stopCorrection: (() => void) | null = null;
-      const listenerAbort = new AbortController();
-
-      const cleanup = () => {
-        if (timerId !== null) {
-          clearTimeout(timerId);
-          timerId = null;
-        }
-        stopCorrection?.();
-        stopCorrection = null;
-        listenerAbort.abort();
-        if (settleCancelRef.current === cleanup) {
-          settleCancelRef.current = null;
-        }
-      };
-
-      const tick = () => {
-        timerId = null;
-        const top = spotTop();
-        const stable = Math.abs(top - lastTop) < SETTLE_STABLE_EPSILON_PX;
-        lastTop = top;
-        if (stable || Date.now() >= deadline) {
-          scrollToSpot(entry, "auto");
-          if (!viewport) {
-            cleanup();
-            return;
-          }
-          // spotTop() re-scales the offset against the anchor's live height,
-          // so a block that grows after the snap is followed proportionally.
-          stopCorrection = startPostSnapCorrection({
-            viewport,
-            targetTop: () => (entry.anchorEl.isConnected ? spotTop() : null),
-            createResizeObserver: createResizeObserverRef.current,
-            onUserScroll: cleanup,
-          });
-          return;
-        }
-        timerId = setTimeout(tick, SETTLE_POLL_INTERVAL_MS);
-      };
-
-      // A user who takes over during the settle or correction window wins —
-      // never yank them back (#2515 R3; the cancel set is widened by #3878 to
-      // taps and navigation keys).
-      if (viewport) {
-        attachUserTakeoverListeners(viewport, listenerAbort.signal, cleanup);
-      }
-
-      settleCancelRef.current = cleanup;
-      timerId = setTimeout(tick, SETTLE_POLL_INTERVAL_MS);
-    },
-    [viewportRef, scrollToSpot]
-  );
-
   const navigateToEntry = useCallback(
     (entry: RenderedBookmark, index: number) => {
       const targetId = entry.bookmark.id;
@@ -345,14 +359,27 @@ export function useBookmarkNavigation(
         typeof window !== "undefined" &&
         typeof window.matchMedia === "function" &&
         window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      scrollToSpot(entry, prefersReducedMotion ? "auto" : "smooth");
+      const viewport = viewportRef.current;
+      if (viewport) {
+        // The tapped spot (anchorTop + offsetPx, re-scaled against the anchor's
+        // live height) lands at the top inset and is held through the settle.
+        settleCancelRef.current = scrollSpotToTop(
+          viewport,
+          entry.anchorEl,
+          () => bookmarkSpotOffsetPx(entry.bookmark, entry),
+          {
+            behavior: prefersReducedMotion ? "auto" : "smooth",
+            cause: "bookmark-nav",
+            createResizeObserver: createResizeObserverRef.current,
+          }
+        );
+      }
       setTimeout(() => {
         setCursorId(targetId);
         setCurrentIndex(index);
       }, SCROLL_START_DELAY_MS);
-      startReanchor(entry);
     },
-    [scrollToSpot, cancelReanchor, startReanchor]
+    [viewportRef, cancelReanchor]
   );
 
   const recomputeState = useCallback(() => {

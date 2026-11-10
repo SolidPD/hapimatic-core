@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { Hono, type Context } from "hono";
 import {
+  RELEASE_HEALTH_DEFAULT_SINCE_DAYS,
+  RELEASE_HEALTH_MAX_SINCE_DAYS,
+  RELEASE_HEALTH_VERSION_PATTERN,
   THROUGHPUT_BREAKDOWN_DIMS,
   defineCapability,
   type ThroughputBreakdownDim,
@@ -11,6 +14,10 @@ import {
   issueCsvHeader,
   issueCsvLine,
 } from "../../throughput/github/issueFacts";
+import {
+  getReleaseHealthService,
+  type ReleaseHealthService,
+} from "../../throughput/releaseHealth";
 import {
   parseCursor,
   resolveWindow,
@@ -29,9 +36,13 @@ import type { WebAppEnv } from "../middleware/auth";
  *   GET /telemetry/throughput/tests       per-test catches (CI and agents)
  *   GET /telemetry/throughput/digests     stored weekly digests
  *   GET /telemetry/throughput/digests/:id one digest
+ *   GET /telemetry/throughput/release-health  per-version health on this
+ *                                         node (#6173), node owner only
  *
- * Everything but the summary names accounts, sessions, issues or tests, so it
- * is `mutating` tier and listed in `SENSITIVE_READ_MATCHERS`. Every read is
+ * Everything but the summary and release health names accounts, sessions,
+ * issues or tests, so it is `mutating` tier and listed in
+ * `SENSITIVE_READ_MATCHERS`; release health reports versions and counts only
+ * (`readonly`). Every read is
  * scoped by the caller's namespace. Breakdown, issues and tests page at 200
  * rows; the digest list returns the newest 104 (the retention), unpaged.
  */
@@ -39,10 +50,13 @@ export function createThroughputRoutes(opts: {
   getService: () => ThroughputSummaryService | null;
   /** The node's owning namespace (from its own CLI token), or null. */
   getOwnerNamespace: () => string | null;
+  /** #6173: release health (defaults to the throughput boot module's handle). */
+  getReleaseHealth?: () => ReleaseHealthService | null;
   now?: () => number;
 }): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   const now = opts.now ?? Date.now;
+  const getReleaseHealth = opts.getReleaseHealth ?? getReleaseHealthService;
 
   const scopeOf = (c: Context<WebAppEnv>): RollupScope => {
     const namespace = c.get("namespace");
@@ -283,6 +297,68 @@ export function createThroughputRoutes(opts: {
       if (!service) return unavailable(c);
       const digest = service.digest(c.req.param("id"), scopeOf(c));
       return digest ? c.json(digest) : c.json({ error: "Not found" }, 404);
+    }
+  );
+
+  // #6173 (D3): read by scripts/release-train-v1.sh on the dev hub and on prod.
+  // Node owner only, because server error rows mostly carry a NULL namespace.
+  app.get(
+    "/telemetry/throughput/release-health",
+    cataloged(
+      defineCapability({
+        id: "telemetry.throughput-release-health",
+        domain: "telemetry",
+        surface: "rest",
+        description:
+          "Return each app version's health on this node (uptime, unclean restarts, floods, error-minutes per hour by source), with an optional candidate-vs-baseline rise verdict.",
+        whenToUse:
+          "When judging whether a release behaved worse than the one before it on this node, as the release train's gate does.",
+        invocation: {
+          kind: "rest",
+          method: "GET",
+          path: "/api/telemetry/throughput/release-health",
+        },
+        auth: "jwt",
+        riskTier: "readonly",
+        availability: { scope: "user", mountedWhen: "getThroughputSummary" },
+        telemetry: "off",
+      })
+    ),
+    async c => {
+      const service = getReleaseHealth();
+      if (!service) return unavailable(c);
+      if (!scopeOf(c).isOwner) {
+        return c.json({ error: "Release health is for the node owner" }, 403);
+      }
+      const sinceRaw = c.req.query("sinceDays");
+      const sinceDays =
+        sinceRaw === undefined || sinceRaw === ""
+          ? RELEASE_HEALTH_DEFAULT_SINCE_DAYS
+          : /^\d+$/.test(sinceRaw)
+            ? Number(sinceRaw)
+            : Number.NaN;
+      if (
+        !Number.isInteger(sinceDays) ||
+        sinceDays < 1 ||
+        sinceDays > RELEASE_HEALTH_MAX_SINCE_DAYS
+      ) {
+        return badRequest(
+          c,
+          `sinceDays must be a whole number from 1 to ${RELEASE_HEALTH_MAX_SINCE_DAYS}`
+        );
+      }
+      const candidate = c.req.query("candidate");
+      const baseline = c.req.query("baseline");
+      if ((candidate === undefined) !== (baseline === undefined)) {
+        return badRequest(c, "candidate and baseline must be given together");
+      }
+      for (const v of [candidate, baseline]) {
+        if (v !== undefined && !RELEASE_HEALTH_VERSION_PATTERN.test(v)) {
+          return badRequest(c, "versions look like 1.0.2075 or 1.0.2075-AA");
+        }
+      }
+      c.header("Cache-Control", "no-store");
+      return c.json(await service.report({ sinceDays, candidate, baseline }));
     }
   );
 

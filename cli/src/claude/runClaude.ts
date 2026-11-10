@@ -22,6 +22,8 @@ import {
   type SessionHookData,
 } from "@/claude/utils/startHookServer";
 import { TurnReporter } from "@/claude/utils/turnReporter";
+import { createPinStopNudge } from "@/claude/utils/pinStopNudge";
+import { configuration } from "@/configuration";
 import { makeGitProbe } from "@/claude/utils/gitProbe";
 import { resolveActiveLauncher } from "@/claude/launcherDispatch";
 import {
@@ -29,11 +31,15 @@ import {
   cleanupHookSettingsFile,
 } from "@/claude/utils/generateHookSettings";
 import { resolveProfileExcludes } from "@/daemon/roleProfiles";
-import type { SessionRole } from "@hapi/protocol";
+import type { McpSetLaunchPayload, SessionRole } from "@hapi/protocol";
 import {
   HAPI_MCP_SERVER_NAME,
   scrubHapiFromDisabledMcps,
 } from "@/claude/utils/scrubHapiOnSpawn";
+import {
+  buildMcpProbeSettings,
+  prepareSessionMcpPolicy,
+} from "@/claude/utils/mcpSessionPolicy";
 import { registerKillSessionHandler } from "./registerKillSessionHandler";
 import type { Session } from "./session";
 import {
@@ -60,6 +66,7 @@ import {
   isModelModeAllowedForFlavor,
   isPermissionModeAllowedForFlavor,
   resolveRawModelForMode,
+  stampedMcpSet,
 } from "@hapi/protocol";
 import type { ModelMode } from "@hapi/protocol/modes";
 import { isEffortLevel, type EffortLevel } from "@hapi/protocol/effort";
@@ -121,6 +128,11 @@ export interface StartOptions {
    *  metadata so a respawn preserves it. A --settings scalar `outputStyle` wins
    *  over ~/.claude/settings.local.json (Task 1 spike, Claude Code 2.1.x). */
   outputStyle?: string;
+  /** Issue #6171: the MCP set and the server's known names, from
+   *  --hapi-mcp-set (commands/claude.ts drops an unreadable value). Becomes
+   *  `deniedMcpServers` in the generated --settings file and is stamped into
+   *  metadata so a respawn keeps it. */
+  mcpSet?: McpSetLaunchPayload;
 }
 
 /** `/proc/self/cgroup`'s v2 path, or a reason it is unknown (never throws). */
@@ -163,6 +175,13 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   // silently drop the --mcp-config injection built below. Non-fatal: spawn
   // proceeds even if the scrub fails (logged at WARN).
   await scrubHapiFromDisabledMcps(workingDirectory);
+  // Issue #6171: resolve the MCP set (none = every server, as before), turn its
+  // `enableForProject` names on for the project beside the scrub above, and set
+  // HAPI_MCP_SET_ENABLED for the Claude child. Never throws.
+  const mcpPolicy = await prepareSessionMcpPolicy(
+    options.mcpSet,
+    workingDirectory
+  );
 
   const initialState: AgentState = {};
   const { api, session, sessionInfo } = await bootstrapSession({
@@ -176,27 +195,30 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   logger.debug(`Session created: ${sessionInfo.id}`);
 
   // Extract SDK metadata in background and update session when ready
-  extractSDKMetadataAsync(async sdkMetadata => {
-    logger.debug(
-      "[start] SDK metadata extracted, updating session:",
-      sdkMetadata
-    );
-    try {
-      // Update session metadata with tools and slash commands
-      session.updateMetadata(currentMetadata => ({
-        ...currentMetadata,
-        tools: sdkMetadata.tools,
-        slashCommands: sdkMetadata.slashCommands,
-      }));
-      logger.debug("[start] Session metadata updated with SDK capabilities");
-    } catch (error) {
-      logger.debug("[start] Failed to update session metadata:", error);
-      logger.reportCaught(error, {
-        category: "claude-metadata-update",
-        severity: "warn",
-      });
-    }
-  });
+  extractSDKMetadataAsync(
+    async sdkMetadata => {
+      logger.debug(
+        "[start] SDK metadata extracted, updating session:",
+        sdkMetadata
+      );
+      try {
+        // Update session metadata with tools and slash commands
+        session.updateMetadata(currentMetadata => ({
+          ...currentMetadata,
+          tools: sdkMetadata.tools,
+          slashCommands: sdkMetadata.slashCommands,
+        }));
+        logger.debug("[start] Session metadata updated with SDK capabilities");
+      } catch (error) {
+        logger.debug("[start] Failed to update session metadata:", error);
+        logger.reportCaught(error, {
+          category: "claude-metadata-update",
+          severity: "warn",
+        });
+      }
+    },
+    { settings: buildMcpProbeSettings(mcpPolicy) }
+  );
 
   // Start HAPI MCP server. This launcher owns an `allowedTools` list, so it may
   // be handed the operator tools (#4450 R7); the server lists them only on an
@@ -269,6 +291,19 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   // dropped all three pins (they were still `undefined`) — the durable respawn
   // metadata came back with no model/effort pin.
 
+  // Issue #6455: the Pins nudge answers Claude Code's Stop hook. Stop fires for
+  // every launcher, so this is not scoped to non-sdk ones. With the Pins gate
+  // closed there is no callback and the Stop branch is unchanged; a safe-mode
+  // session has no hook settings, so no Stop hook and no nudge.
+  const pinNudge =
+    happyServer.pinsEnabled === true
+      ? createPinStopNudge({
+          selfSessionId: session.sessionId,
+          serverUrl: configuration.serverUrl,
+          getCliApiToken: () => configuration.cliApiToken,
+        })
+      : null;
+
   // Start Hook server for receiving Claude session notifications
   const hookServer = await startHookServer({
     onSessionHook: (sessionId, data) => {
@@ -326,6 +361,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     // too, so turns must be recorded uniformly. The reporter (attached to the
     // session in onSessionReady) owns idempotency + the monotonic clock.
     onTurnOpen: (data: SessionHookData) => {
+      pinNudge?.onTurnOpen();
       currentSessionRef.current?.turnReporter?.open({
         ccSessionId: data.session_id ?? data.sessionId,
         cwd: data.cwd,
@@ -338,6 +374,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         transcriptPath: data.transcript_path,
       });
     },
+    onStopDecision: pinNudge ? data => pinNudge.onStop(data) : undefined,
   });
   logger.debug(`[START] Hook server started on port ${hookServer.port}`);
 
@@ -359,12 +396,17 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   // Issue #4568 (F1): an API-key session's settings file names its
   // `apiKeyHelper` (vault id + mask, never the key); the launcher verifies the
   // binding before the first turn.
+  // Issue #6171: the MCP set's deny list and connector switch ride the same
+  // file. Safe mode drops this file, and the server refuses a set in safe mode.
   const hookSettingsPath = generateHookSettingsFile(
     hookServer.port,
     hookServer.token,
-    profileExcludes,
-    options.outputStyle,
-    readBoundApiKeyBinding() ?? undefined
+    {
+      claudeMdExcludes: profileExcludes,
+      outputStyle: options.outputStyle,
+      apiKeyBinding: readBoundApiKeyBinding() ?? undefined,
+      mcpPolicy,
+    }
   );
   logger.debug(
     `[START] Generated hook settings file: ${hookSettingsPath}` +
@@ -560,6 +602,15 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     // server-side respawn paths (model/account switch, reconnect) re-source it
     // from metadata.outputStyle. Absence = no key = default (fail-open).
     ...(options.outputStyle ? { outputStyle: options.outputStyle } : {}),
+    // Issue #6171: stamp the MCP set in the same atomic write so every respawn
+    // re-sources it. Stamped explicitly for `all` too (a spread cannot clear an
+    // older `only`); `enableForProject` is single-use and never stamped. No set
+    // leaves any stored value alone, which a resume then keeps. Stamped only
+    // when its policy applied: when it could not, the session starts every
+    // server, and the record must not claim a set (#6171 review CLI-5).
+    ...(options.mcpSet && mcpPolicy
+      ? { mcpSet: stampedMcpSet(options.mcpSet.set) }
+      : {}),
     // Issue #6218 (absorbs #5353 R3): stamp the posture the session STARTS in, in
     // the same atomic CLI-side write, so every server respawn (reconnect, account
     // switch, token-refresh restart, relaunch, config restart, branch) derives its

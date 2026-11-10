@@ -16,6 +16,7 @@ import { existsSync, readFileSync } from "node:fs";
 import {
   ANTHROPIC_LOGIN_CAPABILITY,
   SHARED_API_KEYS_CAPABILITY,
+  MCP_SET_CAPABILITY,
   KNOWN_AGENT_IDS,
   resolveToolCapabilities,
 } from "@hapi/protocol";
@@ -138,6 +139,9 @@ export function detectCapabilities(opts?: {
       "spawn-session",
       ANTHROPIC_LOGIN_CAPABILITY,
       SHARED_API_KEYS_CAPABILITY,
+      // Issue #6171: static too — this binary honors `mcpSet` on a spawn and serves
+      // the MCP catalog. An older peer would strip the field and start every server.
+      MCP_SET_CAPABILITY,
     ];
 
     for (const agent of KNOWN_AGENT_IDS) {

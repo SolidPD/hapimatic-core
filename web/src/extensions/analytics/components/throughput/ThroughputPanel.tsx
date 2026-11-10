@@ -128,15 +128,32 @@ export function ThroughputPanel({
           </p>
         </Section>
         <Section title="Waits">
+          {/* #6169: a reopening that read its prefix from the cache ("kept
+              warm") is not a rewrite; Cost already prices only what was written. */}
           <SimpleTable
-            head={["After an idle gap, started by", "Rewrites", "Cost"]}
+            head={[
+              "After an idle gap, started by",
+              "Rewrites",
+              "Kept warm",
+              "Cost",
+            ]}
             rows={s.idle.map(i => [
               labelOf(i.cls),
-              formatCount(i.n),
+              formatCount(i.n - (i.warmN ?? 0)),
+              formatCount(i.warmN ?? 0),
               formatUsd(i.usd),
             ])}
-            empty="No post-idle cache rewrites in this window."
+            empty="No reopenings after an idle gap in this window."
           />
+          {s.keepalive ? (
+            <p className="mt-2 text-xs text-[var(--app-muted)]">
+              Keep-alives on this node:{" "}
+              {formatCount(s.keepalive.byOutcome.sent)} sent ·{" "}
+              {formatUsd(s.keepalive.costUsd)} · rewrites avoided{" "}
+              {formatCount(s.keepalive.keptWarmN)} ·{" "}
+              {formatUsd(s.keepalive.avoidedUsd)}
+            </p>
+          ) : null}
         </Section>
       </div>
 

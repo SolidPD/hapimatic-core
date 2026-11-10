@@ -77,6 +77,25 @@ export function createMockApiClient(): Record<string, Mock> {
   return {
     getSessions: vi.fn(),
     getSession: vi.fn(),
+    // #6449: Pins tab
+    listSessionPins: vi.fn(),
+    getSessionPin: vi.fn(),
+    setSessionPinStarred: vi.fn(),
+    setSessionPinDeadline: vi.fn(),
+    markSessionPinSeen: vi.fn(),
+    // #6450: Submit staged pin answers
+    submitPinAnswers: vi.fn(),
+    // #6454: the Project Managers dashboards (a 404-free empty snapshot).
+    getPinDashboards: vi.fn(async () => ({
+      dashboards: [],
+      sessions: {},
+      nodes: [],
+      partial: false,
+    })),
+    // #6455: dismiss a pin
+    dismissSessionPin: vi.fn(),
+    // #6453: Save to session folder
+    savePinFiles: vi.fn(),
     getMessages: vi.fn(),
     getMessagesAfter: vi.fn(),
     // #3559 (R6): approval-gate state read surface for the server-driven card.

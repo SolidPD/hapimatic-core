@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { type CSSProperties, type ReactNode } from "react";
-import { useNavigate } from "@tanstack/react-router";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
+import { Pin } from "lucide-react";
 import { SESSION_VIEWS, type SessionView } from "@hapi/protocol/schemas";
 import type { Session } from "@hapi/protocol/types";
 import type { ApiClient } from "@/api/client";
 import { tokens } from "@/design/tokens";
-import { useUpdateSessionView } from "@/hooks/mutations/useUpdateSessionView";
-import { useVersion } from "@/hooks/useVersion";
+import { useSessionOpenPinCount } from "@/hooks/queries/useSession";
+import { useSessionViewOptions } from "@/hooks/useSessionViewOptions";
+import { useSelectSessionView } from "@/hooks/useSelectSessionView";
 import {
   DesktopIcon,
   FilesIcon,
@@ -17,21 +24,31 @@ import { BareButton } from "@/components/ui/BareButton";
 import {
   SESSION_VIEW_LABELS,
   isSessionViewAvailable,
-  markOpenRedirectConsumed,
-  sessionViewToPath,
-  writeCachedSessionView,
+  isSessionViewVisible,
 } from "@/lib/session-view";
-import { getStorageKey } from "@/lib/storage-keys";
-import { THREAD_FULLSCREEN_STORAGE_BASE } from "@/lib/thread-fullscreen-context";
+import { applyTabRowFade, computeThreadFade } from "@/lib/threadFade";
+import { preloadSessionViewPages } from "@/routes/lazyPages";
 
 const VIEW_ICONS: Record<
   SessionView,
   (props: { className?: string }) => ReactNode
 > = {
   chat: MessageSquareIcon,
+  pins: Pin,
   terminal: TerminalMonitorIcon,
   desktop: DesktopIcon,
   files: FilesIcon,
+};
+
+// #6449: exact component dimensions from mockup v6 (:76-79), kept in inline
+// styles like the tab width, out of Tailwind arbitrary [Npx] values.
+const PINS_ROW_ICON: CSSProperties = { width: "11px", height: "11px" };
+const PINS_BADGE: CSSProperties = {
+  minWidth: "13px",
+  height: "13px",
+  padding: "0 3px",
+  fontSize: "9px",
+  lineHeight: "13px",
 };
 
 /**
@@ -52,6 +69,15 @@ const VIEW_ICONS: Record<
  * the change: card box at x=4 / tab at x=16 (402px) and 128 / 140 (1280px) —
  * the `px-3` that round 3 added to meet the content edge was exactly the 12px
  * the operator flagged as a regression.
+ *
+ * #6449 (Pins): the Pins tab sits between Chat and Terminal and renders only
+ * while the pins gate is open and the session's open-pin count is known, or
+ * while it is the active view (`isSessionViewVisible`). While it renders, the
+ * whole row switches to the
+ * mockup-v6 geometry: 72px tabs, 11px icons, and a sideways scroller with
+ * scroll-linked edge fades. While it does not, the row is exactly the pre-#6449
+ * row (84px tabs, 12px icons, no scroller) — the PM ruling for Matt,
+ * 2026-11-07 — so nothing changes until Pins is turned on.
  */
 export function ViewPicker(props: {
   session: Session;
@@ -60,36 +86,64 @@ export function ViewPicker(props: {
   activeView: SessionView | null;
 }) {
   const { session, api, activeView } = props;
-  const navigate = useNavigate();
-  const { updateView } = useUpdateSessionView(api, session.id);
+  const selectView = useSelectSessionView(api, session.id);
   // Epic #3285 correction pass 1: the Desktop tab is greyed on an instance that
   // cannot serve a desktop (server-reported eligibility; see session-view.ts).
-  const desktopEligible = useVersion().data?.desktopEligible;
+  // #6449: the same options decide whether the Pins tab renders at all.
+  const viewOptions = useSessionViewOptions(session.id);
+  const { openPinCount } = useSessionOpenPinCount(session.id);
+  const visibleViews = SESSION_VIEWS.filter(view =>
+    isSessionViewVisible(view, viewOptions, activeView)
+  );
+  const pinsRow = visibleViews.includes("pins");
+  const tabListRef = useRef<HTMLDivElement>(null);
+
+  // #6449: scroll-linked edge fades on the 72px row (the `.thread-fade` math
+  // turned sideways, written as CSS variables — no re-render per scroll frame;
+  // the View Picker mounts on every session view). Attached only while the
+  // Pins row renders, and re-measured when the tab set changes.
+  const tabSetKey = visibleViews.join(",");
+  useLayoutEffect(() => {
+    const row = tabListRef.current;
+    if (!pinsRow || !row) return;
+    const update = () =>
+      applyTabRowFade(
+        row,
+        computeThreadFade({
+          scrollTop: row.scrollLeft,
+          scrollHeight: row.scrollWidth,
+          clientHeight: row.clientWidth,
+        })
+      );
+    update();
+    row.addEventListener("scroll", update, { passive: true });
+    const observer =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(row);
+    return () => {
+      row.removeEventListener("scroll", update);
+      observer?.disconnect();
+    };
+  }, [pinsRow, tabSetKey]);
+
+  // #6449 (R2): keep the active tab in view inside the sideways scroller.
+  useLayoutEffect(() => {
+    const row = tabListRef.current;
+    if (!pinsRow || !row || !activeView) return;
+    const tab = row.querySelector<HTMLElement>('[aria-selected="true"]');
+    if (typeof tab?.scrollIntoView === "function") {
+      tab.scrollIntoView({ inline: "nearest", block: "nearest" });
+    }
+  }, [pinsRow, activeView, tabSetKey]);
+
+  // #3098: the views behind these tabs load on demand. Load them while the
+  // current view is idle, so the first tab switch renders at once instead of
+  // waiting for the view's code.
+  useEffect(() => preloadSessionViewPages(), []);
 
   const handleSelect = (view: SessionView) => {
     if (view === activeView) return;
-    // Synchronous no-flash cache write + disarm this open's auto-redirect (an
-    // explicit tap is a deliberate choice), then navigate and persist. Persist is
-    // fire-and-forget — the optimistic hook updates every cache and rolls back on
-    // failure; the localStorage value self-corrects on the next server reconcile.
-    writeCachedSessionView(session.id, view);
-    markOpenRedirectConsumed(session.id);
-    // #3638 (D2=(a)): switching to a non-chat view (Terminal/Desktop/Files) exits
-    // full-screen DURABLY — clear the per-device flag so returning to Chat is not
-    // a surprise re-maximize. Session→session switches keep it (mockup panel F).
-    if (view !== "chat") {
-      try {
-        localStorage.setItem(
-          getStorageKey(THREAD_FULLSCREEN_STORAGE_BASE),
-          "0"
-        );
-      } catch {
-        // localStorage unavailable/full — non-fatal; the visible exit still
-        // happens via SessionChat's route unmount.
-      }
-    }
-    navigate({ to: sessionViewToPath(view, session.id) });
-    void updateView(view).catch(() => {});
+    selectView(view);
   };
 
   return (
@@ -105,16 +159,23 @@ export function ViewPicker(props: {
         // 2026-09-07) took the panel to the 8px `--radius-lg` token — the
         // closest token to the E9 frame's 10px — so 6px keeps the tab arc
         // ≥1.9px inside the panel arc at every point. Computed, then measured.
-        className="mx-auto flex w-full max-w-content items-end gap-1 pt-1.5"
+        //
+        // #6449: the Pins row scrolls sideways. `overflow-x: auto` forces
+        // `overflow-y: auto`, which would clip each tab's `-mb-px` seat on the
+        // divider (fixture P3); `pb-px -mb-px` gives the seat back.
+        ref={tabListRef}
+        className={`mx-auto flex w-full max-w-content items-end gap-1 pt-1.5${
+          pinsRow
+            ? " tab-row-fade -mb-px overflow-x-auto scrollbar-none pb-px"
+            : ""
+        }`}
         role="tablist"
         aria-label="Session view"
       >
-        {SESSION_VIEWS.map(view => {
+        {visibleViews.map(view => {
           const Icon = VIEW_ICONS[view];
           const isActive = view === activeView;
-          const available = isSessionViewAvailable(view, session, {
-            desktopEligible,
-          });
+          const available = isSessionViewAvailable(view, session, viewOptions);
           const accent = tokens.view[view];
           // Fixed folder-tab geometry (E6 mockup: 84px equal width sized to
           // "Terminal", 3px vertical padding) lives in the inline style — exact
@@ -122,7 +183,8 @@ export function ViewPicker(props: {
           // arbitrary [Npx] values. The active accent (color + color-mix bg/border
           // from the --view-accent-* token) rides the same object.
           const tabStyle: CSSProperties = {
-            width: "84px",
+            // #6449: 72px (mockup v6) only while the Pins tab renders.
+            width: pinsRow ? "72px" : "84px",
             paddingTop: "3px",
             paddingBottom: "3px",
             ...(isActive
@@ -133,6 +195,11 @@ export function ViewPicker(props: {
                 }
               : {}),
           };
+          // #6449 (R3): the open-pin count, up to 999, inside the Pins tab.
+          const badge =
+            view === "pins" && openPinCount !== undefined && openPinCount > 0
+              ? Math.min(openPinCount, 999)
+              : null;
           return (
             <BareButton
               key={view}
@@ -140,15 +207,36 @@ export function ViewPicker(props: {
               role="tab"
               aria-selected={isActive}
               disabled={!available}
-              title={SESSION_VIEW_LABELS[view]}
+              title={
+                badge === null
+                  ? SESSION_VIEW_LABELS[view]
+                  : `${SESSION_VIEW_LABELS[view]} · ${badge} need you`
+              }
               onClick={() => handleSelect(view)}
               style={tabStyle}
               className={`-mb-px box-border inline-flex items-center justify-center gap-1 rounded-t-md border border-b-0 border-[var(--app-border)] text-[length:var(--text-caption)] font-semibold ${
                 isActive ? "" : "text-[var(--app-hint)]"
-              } ${available ? "" : "cursor-not-allowed opacity-30"}`}
+              } ${available ? "" : "cursor-not-allowed opacity-30"}${
+                pinsRow ? " flex-none whitespace-nowrap" : ""
+              }`}
             >
-              <Icon className="h-3 w-3" />
+              {pinsRow ? (
+                <span className="inline-flex shrink-0" style={PINS_ROW_ICON}>
+                  <Icon className="h-full w-full" />
+                </span>
+              ) : (
+                <Icon className="h-3 w-3" />
+              )}
               {SESSION_VIEW_LABELS[view]}
+              {badge === null ? null : (
+                <span
+                  aria-label={`${badge} open pins`}
+                  style={PINS_BADGE}
+                  className="rounded-full bg-[var(--view-accent-pins)] text-center font-bold tabular-nums text-[var(--app-bg)]"
+                >
+                  {badge}
+                </span>
+              )}
             </BareButton>
           );
         })}

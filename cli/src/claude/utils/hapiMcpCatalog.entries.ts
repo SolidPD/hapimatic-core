@@ -230,4 +230,83 @@ export const mcpCatalogEntries = [
     riskTier: "destructive",
     availability: { scope: "operator" },
   }),
+  // Issue #6448: the pin tools, registered only while the server reports the
+  // Pins gate open (`HAPY_MCP_PIN_TOOL_NAMES`). `gate: "pins"` keeps them out of
+  // Tier-0 and both self-knowledge docs, which cannot know an instance's gate,
+  // and out of the served catalog while the gate is closed. They stay Tier-1
+  // until #6458 decides how Tier-0 and the self-knowledge doc present Pins.
+  defineCapability({
+    id: "session-introspection.pin-post",
+    domain: "session-introspection",
+    surface: "mcp",
+    description:
+      "Pin a decision or steps for the operator under a stable key; re-posting the key updates that pin. An error result says whether it was saved.",
+    whenToUse: "To ask the operator a decision you need, in the Pins tab.",
+    invocation: { kind: "mcp", tool: "pin_post" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user", gate: "pins" },
+  }),
+  defineCapability({
+    id: "session-introspection.pin-update",
+    domain: "session-introspection",
+    surface: "mcp",
+    description:
+      "Replace one of this session's existing pins in full, by key; fails if the key does not exist.",
+    whenToUse: "To revise a pin you already posted.",
+    invocation: { kind: "mcp", tool: "pin_update" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user", gate: "pins" },
+  }),
+  defineCapability({
+    id: "session-introspection.pin-withdraw",
+    domain: "session-introspection",
+    surface: "mcp",
+    description:
+      "Withdraw one of this session's pins when its question no longer applies.",
+    whenToUse:
+      "To take back a question the operator no longer needs to answer.",
+    invocation: { kind: "mcp", tool: "pin_withdraw" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user", gate: "pins" },
+  }),
+  defineCapability({
+    id: "session-introspection.pin-get",
+    domain: "session-introspection",
+    surface: "mcp",
+    description:
+      "Read this session's pins with their answer history: one pin in full by key, or every open and live pin.",
+    whenToUse:
+      "After a compaction or restart, to re-read pins instead of asking again.",
+    invocation: { kind: "mcp", tool: "pin_get" },
+    auth: "cli-token",
+    riskTier: "readonly",
+    availability: { scope: "user", gate: "pins" },
+  }),
+  defineCapability({
+    id: "session-introspection.pin-resolve",
+    domain: "session-introspection",
+    surface: "mcp",
+    description:
+      "Record a decision the operator gave in the chat on the matching pin, so it does not go stale.",
+    whenToUse: "When the operator answered a pinned question in the chat.",
+    invocation: { kind: "mcp", tool: "pin_resolve" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user", gate: "pins" },
+  }),
+  defineCapability({
+    id: "session-introspection.pin-folder",
+    domain: "session-introspection",
+    surface: "mcp",
+    description:
+      "Get the folder for one pin's files, kept out of git and deleted with the session, and the GeneratedFiles/pins/ folder Save copies into.",
+    whenToUse: "Before writing pages, images or mockups a pin will show.",
+    invocation: { kind: "mcp", tool: "pin_folder" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user", gate: "pins" },
+  }),
 ];

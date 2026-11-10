@@ -8,6 +8,7 @@ import {
   TerminalKeyboardExpandedPreferenceSchema,
   ShareApiKeysByDefaultPreferenceSchema,
   AccountsUsageViewPreferenceSchema,
+  PinsViewPreferenceSchema,
   FEDERATION_SETTING_KEYS,
   FederationSettingsBlockSchema,
   FederationSettingsSyncSchema,
@@ -110,6 +111,12 @@ export const SETTING_REGISTRY: Record<
   // (Bars / Arcs / Chips). No A-local storage; unset ⇒ every section is Bars.
   accountsUsageView: {
     schema: AccountsUsageViewPreferenceSchema,
+  },
+  // Federation-native (#6451): the Pins tab's default filters, sort, direction
+  // and grouping. No A-local storage; unset ⇒ the built-in view. The schema is
+  // loose, so a newer node's unknown field drops alone, not the whole value.
+  pinsView: {
+    schema: PinsViewPreferenceSchema,
   },
 };
 

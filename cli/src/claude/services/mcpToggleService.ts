@@ -22,6 +22,7 @@
  * invocation, not at handler-creation.
  */
 
+import { mcpLiveToggleRefusal } from "@hapi/protocol";
 import { McpToggleRequestSchema } from "@hapi/protocol/schemas";
 import type {
   McpToggleErrorCode,
@@ -132,6 +133,22 @@ async function applyDurableDisabledToggle(
   return { homeError };
 }
 
+/**
+ * Issue #6171: turning `hapi` off cuts the session off from Hapimatic's own
+ * tools. The server refuses it too; this guards a direct RPC.
+ */
+function refuseHapiOff(request: {
+  serverName: string;
+  enabled: boolean;
+}): McpToggleResponse | null {
+  const refusal = mcpLiveToggleRefusal(undefined, {
+    [request.serverName]: request.enabled,
+  });
+  return refusal
+    ? { ok: false, error: refusal.message, code: refusal.code }
+    : null;
+}
+
 export interface RuntimeRemoteHandlerOptions {
   /** Project directory passed verbatim to {@link applyDisabledServerToggle}. */
   sessionPath: string;
@@ -170,6 +187,9 @@ export function createRuntimeRemoteHandler(
   return async (payload: unknown): Promise<McpToggleResponse> => {
     const parsed = McpToggleRequestSchema.safeParse(payload);
     if (!parsed.success) return INVALID_PAYLOAD;
+    // Issue #6171: never turn `hapi` off — refused before the durable write.
+    const refusal = refuseHapiOff(parsed.data);
+    if (refusal) return refusal;
 
     const { homeError: configWriteError } = await applyDurableDisabledToggle(
       opts.sessionPath,
@@ -256,6 +276,9 @@ export function createCleanupHandler(
   return async (payload: unknown): Promise<McpToggleResponse> => {
     const parsed = McpToggleRequestSchema.safeParse(payload);
     if (!parsed.success) return INVALID_PAYLOAD;
+    // Issue #6171: never turn `hapi` off — refused before the durable write.
+    const refusal = refuseHapiOff(parsed.data);
+    if (refusal) return refusal;
 
     const { homeError } = await applyDurableDisabledToggle(
       opts.sessionPath,

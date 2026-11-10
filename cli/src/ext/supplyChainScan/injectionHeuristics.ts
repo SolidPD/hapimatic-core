@@ -46,8 +46,15 @@ export const INJECTION_KNOWN_GAPS: readonly string[] = [
  * Written as explicit escapes (not literal invisibles) so the source stays lint-clean and
  * the intent is legible: U+200B/C/D (zero-width space/non-joiner/joiner), U+2060 (word
  * joiner), U+FEFF (BOM / zero-width no-break space), U+180E (Mongolian vowel separator).
+ *
+ * One U+200D is exempt: the joiner inside an emoji ZWJ sequence (\uD83D\uDE4B\u200D\u2642\uFE0F, \uD83D\uDC69\uD83C\uDFFD\u200D\uD83D\uDCBB, \u2764\uFE0F\u200D\uD83D\uDD25), that is a
+ * U+200D preceded by an Extended_Pictographic code point (optionally followed by VS16 or a
+ * skin-tone modifier) AND followed by another. It glues two pictographs into one glyph and
+ * can carry no hidden text (issue #3989). A U+200D missing a pictograph on either side
+ * still fires, as does every other code point listed.
  */
-const ZERO_WIDTH_RE = /\u200B|\u200C|\u200D|\u2060|\uFEFF|\u180E/u;
+const ZERO_WIDTH_RE =
+  /\u200B|\u200C|(?<!\p{Extended_Pictographic}[\uFE0F\p{Emoji_Modifier}]?)\u200D|\u200D(?!\p{Extended_Pictographic})|\u2060|\uFEFF|\u180E/u;
 
 /** Excerpt a match to a bounded, single-line snippet for the finding message. */
 function excerpt(text: string, max = 120): string {
@@ -117,36 +124,105 @@ const BASE64_BLOB_RE = /[A-Za-z0-9+/]{200,}={0,2}/;
 /** All HTML comments in a document (global) — scanned for buried imperative overrides. */
 const HTML_COMMENT_RE = /<!--([\s\S]*?)-->/g;
 
+/** Every rule id {@link scanForInjection} can emit, for callers that validate a rule name. */
+export const INJECTION_RULES: readonly string[] = [
+  "injection.imperative-override",
+  "injection.tool-forcing",
+  "injection.exfil-order",
+  "injection.secrecy-order",
+  "injection.exfil-url",
+  "injection.hidden-zero-width",
+  "injection.hidden-comment-instruction",
+  "injection.encoded-blob",
+];
+
 /**
- * Scan a markdown/text document for prompt-injection patterns. Returns one
- * {@link ScanFinding} per fired rule (deduped by rule id). An empty array means no
- * pattern matched — which, per R6, is NOT a guarantee of safety.
- *
- * @param content the raw markdown/text to scan
- * @param location optional path/label for the finding message (e.g. the file name)
+ * A finding plus where its match lies: the 1-based line it starts on and that line's full text
+ * (no newline), and the line it ends on and the full text of every line it spans (newline-joined).
+ * A match can cross a line break (a `\s+` pattern in wrapped text), so the premium release gate
+ * pins a reviewed finding to `spanText`, never to the first line alone (issue #3989).
  */
-export function scanForInjection(
+export interface LocatedInjectionFinding extends ScanFinding {
+  line: number;
+  lineText: string;
+  endLine: number;
+  spanText: string;
+}
+
+/** The 1-based line and the full text of the line that contains `index`. */
+function lineAt(
+  content: string,
+  index: number
+): { line: number; lineText: string } {
+  const start = content.lastIndexOf("\n", index - 1) + 1;
+  const end = content.indexOf("\n", index);
+  let line = 1;
+  for (let i = content.indexOf("\n"); i !== -1 && i < start; ) {
+    line++;
+    i = content.indexOf("\n", i + 1);
+  }
+  return {
+    line,
+    lineText: content.slice(start, end === -1 ? content.length : end),
+  };
+}
+
+/** The lines a match of `length` characters at `index` spans: first and last, and their text. */
+function spanAt(
+  content: string,
+  index: number,
+  length: number
+): { line: number; lineText: string; endLine: number; spanText: string } {
+  const last = index + Math.max(length, 1) - 1;
+  const start = content.lastIndexOf("\n", index - 1) + 1;
+  const end = content.indexOf("\n", last);
+  return {
+    ...lineAt(content, index),
+    endLine: lineAt(content, last).line,
+    spanText: content.slice(start, end === -1 ? content.length : end),
+  };
+}
+
+/**
+ * {@link scanForInjection} with each finding's position: the same rules, the same
+ * first-match-per-rule policy, the same messages, plus the lines that match spans.
+ */
+export function locateInjectionFindings(
   content: string,
   location?: string
-): ScanFinding[] {
-  const findings: ScanFinding[] = [];
+): LocatedInjectionFinding[] {
+  const findings: LocatedInjectionFinding[] = [];
   const seen = new Set<string>();
   const where = location ? ` in ${location}` : "";
 
   const add = (
     rule: string,
     severity: ScanFinding["severity"],
-    detail: string
+    detail: string,
+    index: number,
+    length: number
   ): void => {
     if (seen.has(rule)) return; // one finding per rule per document
     seen.add(rule);
-    findings.push({ severity, rule, message: `${detail}${where}` });
+    findings.push({
+      severity,
+      rule,
+      message: `${detail}${where}`,
+      ...spanAt(content, index, length),
+    });
   };
 
   // 1. Imperative-override / tool-forcing / exfil-order patterns.
   for (const p of OVERRIDE_PATTERNS) {
     const m = content.match(p.re);
-    if (m) add(p.rule, p.severity, `${p.label}: "${excerpt(m[0])}"`);
+    if (m)
+      add(
+        p.rule,
+        p.severity,
+        `${p.label}: "${excerpt(m[0])}"`,
+        m.index ?? 0,
+        m[0].length
+      );
   }
 
   // 2. Exfil-URL detection (named hosts first, then raw-IP endpoints).
@@ -155,7 +231,9 @@ export function scanForInjection(
     add(
       "injection.exfil-url",
       "high",
-      `outbound URL to a known exfil/paste host: "${excerpt(exfilHost[0])}"`
+      `outbound URL to a known exfil/paste host: "${excerpt(exfilHost[0])}"`,
+      exfilHost.index ?? 0,
+      exfilHost[0].length
     );
   } else {
     const rawIp = content.match(RAW_IP_URL_RE);
@@ -163,28 +241,36 @@ export function scanForInjection(
       add(
         "injection.exfil-url",
         "medium",
-        `outbound URL to a raw IP address (names expected, not bare IPs): "${excerpt(rawIp[0])}"`
+        `outbound URL to a raw IP address (names expected, not bare IPs): "${excerpt(rawIp[0])}"`,
+        rawIp.index ?? 0,
+        rawIp[0].length
       );
     }
   }
 
   // 3a. Hidden instructions — zero-width / invisible characters.
-  if (ZERO_WIDTH_RE.test(content)) {
+  const zeroWidth = content.match(ZERO_WIDTH_RE);
+  if (zeroWidth) {
     add(
       "injection.hidden-zero-width",
       "medium",
-      "zero-width / invisible characters present (used to hide instructions from a human reviewer)"
+      "zero-width / invisible characters present (used to hide instructions from a human reviewer)",
+      zeroWidth.index ?? 0,
+      zeroWidth[0].length
     );
   }
 
   // 3b. Hidden instructions — imperative-override text buried inside an HTML comment.
   for (const comment of content.matchAll(HTML_COMMENT_RE)) {
     const inner = comment[1];
-    if (OVERRIDE_PATTERNS.some(p => p.re.test(inner))) {
+    const hit = OVERRIDE_PATTERNS.map(p => inner.match(p.re)).find(m => m);
+    if (hit) {
       add(
         "injection.hidden-comment-instruction",
         "high",
-        `imperative-override text hidden inside an HTML comment: "${excerpt(inner)}"`
+        `imperative-override text hidden inside an HTML comment: "${excerpt(inner)}"`,
+        (comment.index ?? 0) + "<!--".length + (hit.index ?? 0),
+        hit[0].length
       );
       break;
     }
@@ -197,9 +283,28 @@ export function scanForInjection(
     add(
       "injection.encoded-blob",
       "low",
-      `long opaque base64-like blob (${blob[0].length} chars) — an easy carrier for a hidden payload; verify its contents`
+      `long opaque base64-like blob (${blob[0].length} chars) — an easy carrier for a hidden payload; verify its contents`,
+      blob.index ?? 0,
+      blob[0].length
     );
   }
 
   return findings;
+}
+
+/**
+ * Scan a markdown/text document for prompt-injection patterns. Returns one
+ * {@link ScanFinding} per fired rule (deduped by rule id). An empty array means no
+ * pattern matched — which, per R6, is NOT a guarantee of safety.
+ *
+ * @param content the raw markdown/text to scan
+ * @param location optional path/label for the finding message (e.g. the file name)
+ */
+export function scanForInjection(
+  content: string,
+  location?: string
+): ScanFinding[] {
+  return locateInjectionFindings(content, location).map(
+    ({ severity, rule, message }) => ({ severity, rule, message })
+  );
 }

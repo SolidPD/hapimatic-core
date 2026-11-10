@@ -49,6 +49,14 @@ import { createExtAssetsRoutes } from "./routes/extAssets";
 import { createExtensionPrefsRoutes } from "./routes/extensionPrefs";
 import { createExtensionAdminRoutes } from "./routes/extensionAdmin";
 import { createBookmarksRoutes } from "./routes/bookmarks";
+import { createCliPinRoutes } from "./routes/cliPins";
+import { createPinsRoutes } from "./routes/pins";
+import { createPinDashboardsRoutes } from "./routes/pinDashboards";
+import { resolvePinsEnabled } from "../config/pinsConfig";
+import {
+  resolvePinAnswersTimeZone,
+  resolvePinPreferenceTimeZone,
+} from "../sync/pinSubmission";
 import {
   createAdminVmRoutes,
   resolveVmParityLedgerPath,
@@ -105,6 +113,7 @@ import { createCliRoutes } from "./routes/cli";
 import { createPushRoutes } from "./routes/push";
 import { createTimeLogRoutes } from "./routes/timeLog";
 import { createGitBranchesRoutes } from "./routes/gitBranches";
+import { createMcpCatalogRoutes } from "./routes/mcpCatalog";
 import { createWorktreeRemovalRoutes } from "./routes/worktreeRemoval";
 import { createSessionMetadataRoutes } from "./routes/sessionMetadata";
 import { createTranscriptRoutes } from "./routes/transcripts";
@@ -216,6 +225,7 @@ import type { ContextWatermarkService } from "../watermark/contextWatermarkServi
 import type { SSEManager } from "../sse/sseManager";
 import type { EmbeddedWebAsset } from "./embeddedAssets";
 import { pollMcpStatusOnDemand } from "../utils/mcpPoller";
+import { findCanonicalGitRoot } from "@hapi/protocol/gitRoot";
 import type { Store } from "../store";
 import type { ErrorLogger } from "../logging/errorLogger";
 import { HTTPException } from "hono/http-exception";
@@ -337,6 +347,12 @@ export function buildWebApp(options: {
   getTelemetryStore?: () =>
     | import("../store/telemetryStore").TelemetryStore
     | null;
+  /**
+   * Issue #6516: where the Analytics reads run (the worker executor in the
+   * server). Absent: the telemetry routes run in-thread, and `/api/health`
+   * reports no `telemetryExecutor` metric.
+   */
+  telemetryExecutor?: import("../telemetry/executor").TelemetryExecutor | null;
   /** Issue #3128: the Harness Scorecard store (run/gate/conformance/rating). */
   getScorecardStore?: () =>
     | import("../store/scorecardStore").ScorecardStore
@@ -507,6 +523,32 @@ export function buildWebApp(options: {
     })
   );
 
+  // Issue #6447: built per request, like the sessions routes' closure below.
+  // `localNode` is declared further down; this only runs once a request arrives.
+  const getPinSessionService = (): SessionService | null => {
+    const engine = options.getSyncEngine();
+    if (!engine) return null;
+    return new SessionService(
+      engine,
+      options.getNodeRegistry(),
+      options.federationApiToken,
+      localNode,
+      options.errorLogger
+    );
+  };
+
+  // Issue #6447: the pin routes agents call, a sibling /cli route with its own
+  // CLI-token bearer auth, because cli.ts is at its max-lines ceiling.
+  app.route(
+    "/cli",
+    createCliPinRoutes(options.getSyncEngine, {
+      pinsEnabled: resolvePinsEnabled(),
+      getSessionService: getPinSessionService,
+      getNodeRegistry: options.getNodeRegistry,
+      errorLogger: options.errorLogger,
+    })
+  );
+
   // #1772: the impact-analysis SUBMIT endpoint (peer → server), a sibling /cli
   // route with its own CLI-token bearer auth. Kept a separate factory (not folded
   // into createCliRoutes) so its coordinator dep is isolated.
@@ -535,7 +577,11 @@ export function buildWebApp(options: {
     createHealthRoutes(
       options.jwtSecret,
       options.errorLogger,
-      createHealthReadTokenVerifier(configuration.settingsFile)
+      createHealthReadTokenVerifier(configuration.settingsFile),
+      // #6516: the telemetry executor's state, a deploy check's surface.
+      options.telemetryExecutor
+        ? () => options.telemetryExecutor?.status() ?? null
+        : undefined
     )
   );
 
@@ -760,6 +806,11 @@ export function buildWebApp(options: {
   app.route(
     "/api",
     createFederationRoutes({
+      pinsEnabled: resolvePinsEnabled(),
+      getPinAnswersTimeZone: browserZone =>
+        resolvePinAnswersTimeZone(configuration.dataDir, browserZone),
+      getPinPreferenceTimeZone: () =>
+        resolvePinPreferenceTimeZone(configuration.dataDir),
       getSyncEngine: options.getSyncEngine,
       getSseManager: options.getSseManager,
       getNodeRegistry: options.getNodeRegistry,
@@ -769,6 +820,8 @@ export function buildWebApp(options: {
       // Epic #1855 (Sub-Issue C #1858): local usage source for the federation
       // /accounts/usage aggregator + peer receiver.
       getUsageService: () => usageService,
+      // Issue #6171: a peer-incoming spawn's project default + disabled check.
+      getMcpCatalog: () => options.getSyncEngine()?.getMcpCatalog() ?? null,
       // Issue #3809 (epic #3345, D5 = C): local providerUsage[] source for the
       // federation /accounts/usage aggregator + peer receiver (sibling of usage[]).
       getProviderUsageService: () => providerUsageService,
@@ -1026,6 +1079,35 @@ export function buildWebApp(options: {
   // re-asserts caller-namespace ownership (#1097). Node-local (RULING D2=A) — no
   // federation proxy. Guarded by the auth-differential test in routes/bookmarks.test.ts.
   app.route("/api", createBookmarksRoutes(options.store));
+
+  // Issue #6447 (epic #6446): session pins for the web client. 🔴 The MOUNT POSITION
+  // *IS* the auth, as for the bookmarks above. Unlike bookmarks these are federated:
+  // a pin lives beside its session, so a peer-owned session goes to its node.
+  app.route(
+    "/api",
+    createPinsRoutes(options.getSyncEngine, {
+      pinsEnabled: resolvePinsEnabled(),
+      getSessionService: getPinSessionService,
+      getNodeRegistry: options.getNodeRegistry,
+      errorLogger: options.errorLogger,
+      getTimeZone: browserZone =>
+        resolvePinAnswersTimeZone(configuration.dataDir, browserZone),
+      getPreferenceTimeZone: () =>
+        resolvePinPreferenceTimeZone(configuration.dataDir),
+    })
+  );
+
+  // Issue #6454: the Project Manager dashboards across the federation. The MOUNT
+  // POSITION is the auth, as for the pin routes above.
+  app.route(
+    "/api",
+    createPinDashboardsRoutes(options.getSyncEngine, {
+      pinsEnabled: resolvePinsEnabled(),
+      getNodeRegistry: options.getNodeRegistry,
+      localNode,
+      errorLogger: options.errorLogger,
+    })
+  );
 
   // Notifications inbox (#4913, epic #4912): list / unread-count / read /
   // dismiss / dismiss-all under /api/notifications. 🔴 The MOUNT POSITION *IS*
@@ -1365,6 +1447,8 @@ export function buildWebApp(options: {
       // Issue #5879: the spawn account-headroom check reads this node's usage.
       getUsageService: () => usageService,
       getAccountService: () => accountService,
+      // Issue #6171: a project's default MCP set and the project-disabled check.
+      getMcpCatalog: () => options.getSyncEngine()?.getMcpCatalog() ?? null,
     })
   );
   // hapimatic-private#4481: Create-page Branch control listing (local + federated).
@@ -1373,6 +1457,14 @@ export function buildWebApp(options: {
     createGitBranchesRoutes({
       getNodeRegistry: options.getNodeRegistry,
       errorLogger: options.errorLogger,
+    })
+  );
+  // Issue #6171: the MCP picker's catalog and project defaults (local + federated).
+  app.route(
+    "/api",
+    createMcpCatalogRoutes({
+      getSyncEngine: options.getSyncEngine,
+      getNodeRegistry: options.getNodeRegistry,
     })
   );
   // Issue #4450: the operator-only `remove_worktree` route (destructive; the
@@ -1716,6 +1808,8 @@ export function buildWebApp(options: {
         // the already-threaded Store (it needs the private db handle), so no
         // index.ts wiring is required.
         getTurnAnalytics: () => options.store.turnAnalytics,
+        // #6516: the worker executor built at boot (index.ts).
+        executor: options.telemetryExecutor,
       })
     );
   }
@@ -1772,13 +1866,13 @@ export function buildWebApp(options: {
           const config = JSON.parse(raw);
           const projects = config?.projects;
           if (projects && typeof projects === "object") {
-            // Use exact-match on `projects[projectDir]` only — mirrors Claude
-            // Code's runtime scoping. A previous longest-prefix-match fallback
-            // (a session at `<root>/.worktrees/X` inheriting `<root>`'s list)
-            // displayed servers as Disabled even though Claude treats them as
-            // Enabled at the worktree cwd, making toggles look like no-ops to
-            // the user. See #1177.
-            const disabled = projects[projectDir]?.disabledMcpServers;
+            // Key by the canonical git root — Claude Code's runtime scoping,
+            // measured on 2.1.312 for a main checkout, a worktree and a repo
+            // subdirectory (#6171). The pre-#6171 exact-path read saw nothing for
+            // a worktree session, so it showed disabled servers as enabled.
+            const disabled =
+              projects[findCanonicalGitRoot(projectDir) ?? projectDir]
+                ?.disabledMcpServers;
             if (Array.isArray(disabled) && disabled.length > 0) {
               const disabledSet = new Set(
                 disabled.filter(
@@ -1874,6 +1968,8 @@ export function buildWebApp(options: {
     getRpcRegistry: options.getRpcRegistry,
     errorLogger: options.errorLogger,
     extensionEntries: options.extensionCatalogEntries,
+    // #6448: the pin tools are listed only where Pins is on.
+    openGates: resolvePinsEnabled() ? ["pins"] : [],
   });
   // #3744 (Sub-Issue D): build the audit provider on the SAME fully-mounted `app`
   // (walks the identical route table `buildCatalogProvider` sees), for the same

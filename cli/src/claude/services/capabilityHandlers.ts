@@ -291,19 +291,44 @@ export interface McpStatusHandlerOptions {
   sessionPath: string;
   /** Injectable for tests; defaults to the real `pollMcpStatus`. */
   poll?: (cwd?: string) => Promise<McpStatusUpdate | null>;
+  /** Issue #6171: the live SDK query, read at call time (null between them). */
+  getQuery?: () => Pick<Query, "getMcpServerStatus"> | null;
 }
 
 /**
- * `mcp-status` (readonly) — the session's live MCP server status, read from the
- * EXISTING live source (`pollMcpStatus` → `claude mcp list` in the session
- * cwd). No Query control_request bridge: no `mcp_status` subtype exists in
- * `sdk/types.ts` (expert-review ruling 1B-28).
+ * `mcp-status` (readonly) — the session's live MCP server status.
+ *
+ * Issue #6171: with a live query it asks THIS Claude process (`mcp_status`,
+ * measured on Claude Code 2.1.312), which reflects the session's own MCP set —
+ * a denied server is absent. This supersedes expert-review ruling 1B-28, which
+ * found no such subtype in `sdk/types.ts`; Claude Code answers it all the same.
+ * With no query, or when that read fails (an older binary), it falls back to
+ * the existing source, `pollMcpStatus` → `claude mcp list` in the session cwd
+ * (Fallback Preservation Rule).
  */
 export function createMcpStatusHandler(
   opts: McpStatusHandlerOptions
 ): () => Promise<McpStatusResponse> {
   const poll = opts.poll ?? pollMcpStatus;
   return async (): Promise<McpStatusResponse> => {
+    const query = opts.getQuery?.() ?? null;
+    if (query) {
+      try {
+        const servers = await query.getMcpServerStatus();
+        return {
+          ok: true,
+          status: {
+            servers,
+            checkedAt: new Date().toISOString(),
+            projectDir: opts.sessionPath,
+          },
+        };
+      } catch (err) {
+        logger.debug(
+          `[mcp-status] live read failed, polling instead: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
     const status = await poll(opts.sessionPath);
     if (!status) {
       return {

@@ -813,7 +813,7 @@ export function tableHasColumns(
   return columns.every(c => present.has(c));
 }
 
-function tableExists(db: Database, table: string): boolean {
+export function tableExists(db: Database, table: string): boolean {
   return (
     db
       .prepare(
@@ -824,7 +824,7 @@ function tableExists(db: Database, table: string): boolean {
 }
 
 /** A PRAGMA-guarded `ALTER TABLE … ADD COLUMN`, fail-open like every block here. */
-function addColumnIfMissing(
+export function addColumnIfMissing(
   db: Database,
   table: string,
   column: string,

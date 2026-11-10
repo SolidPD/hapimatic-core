@@ -12,10 +12,14 @@
  * 1 — the Row-1 badge had shipped as raw email text).
  *
  * The label is the account **nickname** (operator-set, resolved by the consumer
- * via `useAccountLabel`: nickname → displayName → email local part) cut to the
- * `ACCOUNT_CHIP_MAX_CHARS` budget, so the chip's width is bounded by a known
- * worst case (operator ruling 2026-09-05). The monogram is the label's initial
- * ("W" for Work, "M" for Mose — as in the E6 mockups) unless the operator pinned
+ * via `useAccountLabel`: nickname → displayName → email local part), shown in
+ * full: #6449 replaced the 10-character cap of the 2026-09-05 ruling with full
+ * nicknames everywhere (Matt's ruling, 2026-11-06, Pins brief round 4). The
+ * chip (`min-w-0 max-w-full`, `truncate` on the label) ellipsizes by width only
+ * when its container has no room — in the session list's fixed 76px account
+ * slot (`rowAnchors.ts`), a long nickname still ellipsizes there. The
+ * monogram is the label's initial ("W" for Work, "M" for Mose — as in the E6
+ * mockups) unless the operator pinned
  * one or two letters ("NF"; `ACCOUNT_MONO_MAX_CHARS`), in which case the bubble
  * widens into a pill; its color is a stable per-email hash so the same account
  * is the same color everywhere.
@@ -25,7 +29,6 @@
  * owns the tap target and its pointer-event isolation.
  */
 import {
-  ACCOUNT_CHIP_MAX_CHARS,
   accountMonogram,
   accountShortName,
   truncateAccountLabel,
@@ -83,7 +86,7 @@ export function AccountChip(props: {
   compact?: boolean;
   /** Disconnected/staged state → dashed border. */
   dashed?: boolean;
-  /** Character budget for the label (default `ACCOUNT_CHIP_MAX_CHARS`). */
+  /** An optional character budget for the label; absent = no cut (#6449). */
   maxChars?: number;
   /** #3982: the auto-colour hash seed for an email-less account (a provider
    * account passes its uuid — the same `email || uuid` seed AccountMonogramEditor
@@ -105,7 +108,7 @@ export function AccountChip(props: {
     monogram,
     compact = false,
     dashed = false,
-    maxChars = ACCOUNT_CHIP_MAX_CHARS,
+    maxChars,
     colorSeed,
     className = "",
     labelClassName,

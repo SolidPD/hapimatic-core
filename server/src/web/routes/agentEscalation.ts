@@ -71,6 +71,7 @@ import {
   isPermissionModeAllowedForFlavor,
   isYoloEquivalentMode,
   KNOWN_AGENT_IDS,
+  type McpSet,
 } from "@hapi/protocol";
 import {
   clampSpawnPermissionMode,
@@ -295,6 +296,31 @@ export function floorAgentSpawnPosture(
   );
   return { yolo: isYoloEquivalentMode(permissionMode), permissionMode };
 }
+
+/**
+ * Issue #6171: an MCP set's `enableForProject` turns servers on for the whole
+ * project (a write to `~/.claude.json` that every later session in it reads), so
+ * an agent caller that is not in a bypass mode may not send it through the
+ * capability channel. Narrowing a set (no `enableForProject`) stays allowed: it
+ * only takes servers away from the one session. No header, or a bypass-mode
+ * caller, passes. Returns the 403 response, or `null` to proceed.
+ */
+export function floorAgentMcpEnable(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null,
+  mcpSet: McpSet | undefined
+): Response | null {
+  if (mcpSet?.mode !== "only" || !mcpSet.enableForProject?.length) {
+    return null;
+  }
+  return classifyCaller(c, engine) === "pass"
+    ? null
+    : escalationRefused(c, MCP_ENABLE_REFUSED_ERROR);
+}
+
+/** #6171: the refusal text for `enableForProject` from a non-bypass agent. */
+const MCP_ENABLE_REFUSED_ERROR =
+  "A session that is not in a bypass permission mode cannot turn an MCP server on for a whole project through the capability channel";
 
 /** #6218 (D5-a): the refusal text for an explicit posture above the caller's. */
 const SPAWN_RANK_REFUSED_ERROR =

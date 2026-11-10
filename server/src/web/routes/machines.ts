@@ -2,7 +2,7 @@
 import { Hono } from "hono";
 import { resolveLocalNodeIdentity } from "../../config/nodeLabel";
 import { z } from "zod";
-import { optionalSessionNameSchema } from "@hapi/protocol";
+import { McpSetSchema, optionalSessionNameSchema } from "@hapi/protocol";
 import {
   EffortLevelSchema,
   ModelModeSchema,
@@ -37,7 +37,9 @@ import {
   type SpawnWarning,
 } from "@hapi/protocol";
 import { requireMachine } from "./guards";
-import { floorAgentSpawnPosture } from "./agentEscalation";
+import { floorAgentMcpEnable, floorAgentSpawnPosture } from "./agentEscalation";
+import { resolveSpawnMcpSet } from "../../services/mcpSetResolver";
+import type { McpCatalogService } from "../../services/mcpCatalogService";
 import { logAndJson } from "./routeErrorHelper";
 import { cataloged } from "../../capabilities/cataloged";
 import { createRateLimiter } from "../middleware/rateLimit";
@@ -144,6 +146,10 @@ export const spawnBodySchema = z.object({
    *  GEMINI_MODEL env; codex id + effort → config.toml bake). Interpreted by
    *  AGENT at the daemon; threaded field-by-field daemon-ward (#1262). */
   nativeModelSelection: NativeModelSelectionSchema.optional(),
+  /** Issue #6171: the MCP servers the session starts with. Omitted = the
+   *  project's default when one is stored, else every server (today). Claude
+   *  only; threaded field-by-field daemon-ward (#1262). */
+  mcpSet: McpSetSchema.optional(),
   /** Issue #1565: opt-in to the early-return spawn path. When true the route
    *  acks {type:"accepted", sessionId} before the heavy work and surfaces
    *  completion via lifecycleState + the spawn-failed SSE. Omitted/false =
@@ -241,6 +247,10 @@ export function createMachinesRoutes(
     // no warning. A missing snapshot or row is what warns usage_unavailable.
     getUsageService?: () => UsageService | null;
     getAccountService?: () => AccountService | null;
+    // Issue #6171: this node's MCP catalog, for a project's default set and the
+    // project-disabled refusal. Absent ⇒ no default and no project check; an
+    // explicit set is still checked against the agent and safe mode.
+    getMcpCatalog?: () => McpCatalogService | null;
   }
 ): Hono<WebAppEnv> {
   const errorLogger = options?.errorLogger ?? null;
@@ -390,6 +400,33 @@ export function createMachinesRoutes(
           400
         );
       }
+      // Issue #6171: the MCP set. `enableForProject` writes the project's config,
+      // so a non-bypass agent caller may not send it; then the set (or the
+      // project's default) is resolved and a project-disabled pick refused 409,
+      // all before any spawn work.
+      const mcpFloor = floorAgentMcpEnable(c, engine, parsed.data.mcpSet);
+      if (mcpFloor) return mcpFloor;
+      const mcpResolution = resolveSpawnMcpSet({
+        requested: parsed.data.mcpSet,
+        directory: parsed.data.directory,
+        flavor: spawnFlavor,
+        safeMode: parsed.data.safeMode === true,
+        cloneRepo: parsed.data.cloneRepo,
+        catalog: options?.getMcpCatalog?.() ?? null,
+      });
+      if (!mcpResolution.ok) {
+        return c.json(
+          {
+            error: mcpResolution.message,
+            code: mcpResolution.code,
+            ...(mcpResolution.servers
+              ? { servers: mcpResolution.servers }
+              : {}),
+          },
+          mcpResolution.status
+        );
+      }
+
       // Issue #5127: a key homed on another node is confirmed with its home
       // NOW, before dispatch, so an offline or unticked home fails this request
       // (naming the home) instead of a spawn that reports it later. A bare id
@@ -420,7 +457,7 @@ export function createMachinesRoutes(
       // Runs BEFORE the early-return placeholder/SSE/inbox writes, so a refusal
       // leaves nothing behind. Un-pinned spawns are never checked (#5460); the
       // daemon's resolver picks their account. API-key spawns bind no account.
-      const spawnWarnings: SpawnWarning[] = [];
+      const spawnWarnings: SpawnWarning[] = [...mcpResolution.warnings];
       let accountSource: SpawnAccount["source"] | undefined;
       let accountEmail: string | null = null;
       if (
@@ -562,6 +599,10 @@ export function createMachinesRoutes(
         // dropped here, so the daemon would never set GEMINI_MODEL / bake the
         // codex config.toml model + effort).
         nativeModelSelection: parsed.data.nativeModelSelection,
+        // Issue #6171: the RESOLVED MCP set (the request's, else the project's
+        // default; none = every server, byte-identical to before) — #1262 trap: an
+        // un-enumerated field is dropped here and the session starts every server.
+        mcpSet: mcpResolution.mcpSet,
         // Issue #2479: parent linkage for a managed peer. parentSessionId is the
         // RESOLVED store uuid (tag→uuid done above). Default the relationship to
         // "spawn" for any parent-linked spawn (the syncEngine.spawnSession choke
@@ -694,7 +735,9 @@ export function createMachinesRoutes(
           // Issue #5879: defense in depth — the headroom refusal happens above,
           // but any future engine-level `account_exhausted` must surface as a 409,
           // never as a 200 with an error body.
-          result.code === ACCOUNT_EXHAUSTED_CODE)
+          result.code === ACCOUNT_EXHAUSTED_CODE ||
+          // Issue #6171: refused above; defense in depth for an engine-level one.
+          result.code === "mcp_server_project_disabled")
       ) {
         // Issue #4461 (R6): name the refusing node and the account — for
         // account_unrefreshable only; the other 409 bodies are unchanged.

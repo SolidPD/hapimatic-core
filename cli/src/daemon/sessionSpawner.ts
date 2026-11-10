@@ -65,6 +65,7 @@ import {
   harnessSupportsPermissionModeSeed,
   harnessSupportsSessionRole,
   harnessSupportsOutputStyle,
+  harnessSupportsMcpSet,
 } from "./harnessGates";
 import {
   spawnSessionInTmux,
@@ -99,6 +100,7 @@ import {
 import type { ProviderId } from "@hapi/protocol";
 import {
   EFFORT_LEVELS,
+  encodeMcpSetLaunchArg,
   isYoloEquivalentMode,
   resolveSpawnPosture,
 } from "@hapi/protocol";
@@ -867,6 +869,13 @@ export function createSessionSpawner(
     // file. Free-form (built-in or custom name); no enum validation — an unknown
     // style is silently no-op'd by Claude Code (Task 1 spike, fail-open).
     const outputStyle = options.outputStyle;
+    // Issue #6171: the MCP set + server-stamped known names, encoded once as the
+    // --hapi-mcp-set argument for both spawn paths. Claude only; no set = no flag
+    // (byte-identical to before).
+    const mcpSetArg =
+      options.mcpSet && harnessSupportsMcpSet(agent)
+        ? encodeMcpSetLaunchArg(options.mcpSet, options.mcpKnown ?? [])
+        : undefined;
     // Issue #1660: per-session launcher override → injected as
     // HAPI_CLAUDE_LAUNCHER on the spawned process env (both spawn paths below,
     // the same channel as HAPI_ACCOUNT_UUID) so the resolver's env tier wins
@@ -1882,6 +1891,8 @@ export function createSessionSpawner(
         // spawn path too (the #1262 trap — the direct-spawn argv push above and
         // the tmuxSpawnAdapter destructure are BOTH dead without this handoff).
         outputStyle,
+        // Issue #6171: the encoded MCP set on the tmux path too (#1262 trap).
+        mcpSetArg,
         // #3731 (R0b): an explicit RPC token still wins; otherwise a strictly
         // unbound claude spawn receives the node's instance credential. The adapter
         // writes it into the 0600 env file (never a command line), where it is
@@ -2884,6 +2895,11 @@ export function createSessionSpawner(
       // into the generated --settings file so all four launcher kinds honor it.
       if (outputStyle && harnessSupportsOutputStyle(agent)) {
         args.push("--hapi-output-style", outputStyle);
+      }
+      // Issue #6171: the MCP set — Hapimatic-internal; runClaude builds the deny
+      // list from it. The direct path passes argv as an array, so no escaping.
+      if (mcpSetArg) {
+        args.push("--hapi-mcp-set", mcpSetArg);
       }
       // Issue #1733: route the OpenRouter model to the codex child via
       // --hapi-model so its EnhancedMode.model resolves to it (provider

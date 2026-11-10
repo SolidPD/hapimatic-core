@@ -55,10 +55,10 @@ export interface Settings {
    *
    * The transient secret identity lives at `~/.config/hapimatic/age-identity.pending.txt`
    * (0600), is served to the authenticated user exactly once, and is shredded from
-   * the VM on acknowledgement (`server/src/config/backupAgeIdentity.ts`). It is
-   * deliberately NOT stored here because settings.json is inside the `.hapimatic-private`
-   * backup set (`backup.sh:108`) — a pending identity here would be captured by a
-   * nightly backup before the user ever saves it, and be circular for disaster recovery.
+   * the VM on acknowledgement (`server/src/config/backupAgeIdentity.ts`). It is kept
+   * out of settings.json because that file is a long-lived config store, and the key
+   * must leave the VM entirely once acknowledged. No backup holds it: `backup-exclude.list`
+   * leaves it out (#6246, Matt's ruling Q1), because every backup is encrypted to it.
    *
    * ⚠️ Custody is INVERTED relative to `porterAgeKeys`: the porter identity is
    * instance-held and never leaves the process; this backup identity is user-held
@@ -102,6 +102,21 @@ export interface Settings {
     claudePath?: string;
     /** Per-node opt-out for the turn-ledger mirror pull loop (issue #4614). */
     turnMirrorDisabled?: boolean;
+    /** This node's user-facing web address, which peers' node switchers open
+     *  (issue #6123). Env `FEDERATION_WEB_URL` overrides it. */
+    webUrl?: string;
+  };
+  /**
+   * Prompt-cache keep-alive (issue #6169); see `server/src/cacheKeepalive/config.ts`.
+   * Every field is optional; ranges are `CACHE_KEEPALIVE_RANGES` in `@hapi/protocol`.
+   */
+  cacheKeepalive?: {
+    enabled?: boolean;
+    contextThresholdTokens?: number;
+    intervalMinutes?: number;
+    deadlineMinutes?: number;
+    capHours?: number;
+    typingQuietMinutes?: number;
   };
   /** Throughput telemetry (issue #6164); see `server/src/throughput/config.ts`. */
   throughput?: {

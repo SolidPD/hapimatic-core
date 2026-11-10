@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
   AccountExhaustionSchema,
+  MCP_SET_CAPABILITY,
   SpawnWarningSchema,
   type AccountExhaustion,
   type SpawnWarning,
@@ -25,6 +26,7 @@ import type {
   SessionWorkflowStateResponse,
   UiCollapseState,
 } from "@hapi/protocol/types";
+import { McpToggleErrorCodeSchema } from "@hapi/protocol/schemas";
 import type {
   AgentTranscriptQuery,
   ApplySessionConfig,
@@ -182,7 +184,14 @@ function switchAccountCodeToStatus(code: string | undefined): number {
 export type RelaunchServiceResult =
   | { type: "success" }
   | { type: "not-found" }
-  | { type: "error"; message: string; status: number; code: string };
+  | {
+      type: "error";
+      message: string;
+      status: number;
+      code: string;
+      /** Issue #6171: the servers an `mcp_server_project_disabled` names. */
+      servers?: string[];
+    };
 
 /** Map a SessionRelaunch error code to an HTTP status (issue #2149). */
 function relaunchCodeToStatus(code: string | undefined): number {
@@ -192,9 +201,16 @@ function relaunchCodeToStatus(code: string | undefined): number {
     case "not_found":
     case "api_key_not_found":
       return 404;
-    // Issue #4568 (SF-3): the same 400 the spawn route returns for a key session.
+    // Issue #4568 (SF-3): the same 400 the spawn route returns for a key
+    // session; issue #6171: the MCP set refusals, as on the spawn route.
     case "api_key_launcher_unsupported":
+    case "invalid_request":
+    case "mcp_set_agent_unsupported":
+    case "mcp_set_safe_mode_unsupported":
       return 400;
+    case "mcp_server_project_disabled":
+    case "mcp_set_node_unsupported":
+      return 409;
     // Issue #5819: `api_key_not_shared` — a cross-node placement whose key was
     // unshared, refused before the teardown (the session keeps running).
     case "not_active":
@@ -314,6 +330,21 @@ export class SessionService {
   }
 
   /**
+   * Issue #6447: forward a pin request to the node that owns the session. One
+   * generic method, because `localOrProxyMutation` drops the peer's body and a pin
+   * route must return the record, and because this file is near its `max-lines`.
+   */
+  proxyPinRequest(
+    sessionId: string,
+    pathSuffix: string,
+    method: string,
+    namespace: string,
+    body?: unknown
+  ): Promise<ProxyResult> {
+    return this.proxyToNode(sessionId, pathSuffix, method, namespace, body);
+  }
+
+  /**
    * The send half of {@link proxyToNode}, for a node already resolved. Issue
    * #4461: `switchPaymentMethod` resolves the node ONCE and keeps it, so an
    * `account_unrefreshable` refusal is stamped with the node that answered — a
@@ -379,12 +410,18 @@ export class SessionService {
       const exhaustion = AccountExhaustionSchema.safeParse(
         (errBody as { exhaustion?: unknown }).exhaustion
       );
+      // Issue #6171: the servers a peer's `mcp_server_project_disabled` names.
+      const servers = (errBody as { servers?: unknown }).servers;
       return {
         type: "error",
         message,
         status: resp.status,
         ...(typeof code === "string" ? { code } : {}),
         ...(exhaustion.success ? { exhaustion: exhaustion.data } : {}),
+        ...(Array.isArray(servers) &&
+        servers.every(name => typeof name === "string")
+          ? { servers: servers as string[] }
+          : {}),
       };
     } catch (error) {
       // Both branches leave `code` undefined: switchPaymentMethod maps that to
@@ -508,7 +545,14 @@ export class SessionService {
         code: "session_not_found",
       };
     }
-    return { ok: false, error: result.message, code: "transport_failed" };
+    // #6171 review SS-3: a peer's refusal (hapi_protected,
+    // mcp_set_requires_relaunch) keeps its code; anything else is transport.
+    const code = McpToggleErrorCodeSchema.safeParse(result.code);
+    return {
+      ok: false,
+      error: result.message,
+      code: code.success ? code.data : "transport_failed",
+    };
   }
 
   /**
@@ -796,7 +840,27 @@ export class SessionService {
         message: result.message,
         status: relaunchCodeToStatus(result.code),
         code: result.code ?? "unknown",
+        ...(result.servers ? { servers: result.servers } : {}),
       };
+    }
+
+    // Issue #6171: `RelaunchRequestSchema` is `.passthrough()`, so a peer built
+    // before #6171 would accept `mcpSet`, ignore it and report success. Refuse
+    // before the proxy instead.
+    if (overrides.mcpSet !== undefined && this.registry) {
+      const owner = this.registry.findNodeForSession(sessionId);
+      if (
+        owner &&
+        !this.registry.nodeSupports(owner.nodeId, MCP_SET_CAPABILITY)
+      ) {
+        return {
+          type: "error",
+          message:
+            "This session's node runs a Hapimatic version that cannot choose MCP servers yet. Update it first.",
+          status: 409,
+          code: "mcp_set_node_unsupported",
+        };
+      }
     }
 
     const result = await this.proxyToNode(
@@ -811,11 +875,14 @@ export class SessionService {
       return { type: "success" };
     }
     if (result.type === "not-found") return { type: "not-found" };
+    // #6171 review SS-3: keep the peer's code (409 mcp_server_project_disabled
+    // and its servers, 400 hapi_protected), not a transport failure.
     return {
       type: "error",
       message: result.message,
       status: result.status,
-      code: "transport_failed",
+      code: result.code ?? "transport_failed",
+      ...(result.servers ? { servers: result.servers } : {}),
     };
   }
 
@@ -891,7 +958,8 @@ export class SessionService {
   ): Promise<
     | { type: "success"; snapshot: McpBatchSnapshot }
     | { type: "not-found" }
-    | { type: "error"; message: string; status: number }
+    // `code`: a peer's refusal code (#6171 delta review DS-2).
+    | { type: "error"; message: string; status: number; code?: string }
   > {
     if (this.isLocalSession(sessionId)) {
       const snapshot = this.engine.setMcpDesired(sessionId, desired);

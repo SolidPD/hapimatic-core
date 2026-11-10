@@ -327,6 +327,18 @@ export function backgroundFacts(
   return { n: launched, sm };
 }
 
+/**
+ * #6169: a post-idle reopening counts as "kept warm" when its opening call read
+ * at least this share of its prefix from the cache (a keep-alive, or a wait
+ * shorter than the cache TTL). Observed: cold cr 11,291 of 48,319 → not warm;
+ * warm cr 48,076 of 48,365 → warm.
+ */
+export const WARM_READ_SHARE = 0.9;
+
+function isWarmCall(c: TranscriptCall): boolean {
+  return c.occupancy > 0 && c.cr >= WARM_READ_SHARE * c.occupancy;
+}
+
 function idleFacts(
   mainCalls: readonly TranscriptCall[],
   input: TurnFactsInput
@@ -338,6 +350,8 @@ function idleFacts(
     w1: number;
     w5: number;
     model: string | null;
+    warm: boolean;
+    cr: number;
   }> = [];
   const opening = mainCalls[0];
   if (
@@ -353,6 +367,8 @@ function idleFacts(
       w1: opening.w1,
       w5: w5Of(opening),
       model: opening.model,
+      warm: isWarmCall(opening),
+      cr: opening.cr,
     });
   }
   for (let i = 1; i < mainCalls.length; i += 1) {
@@ -366,16 +382,25 @@ function idleFacts(
         w1: cur.w1,
         w5: w5Of(cur),
         model: cur.model,
+        warm: isWarmCall(cur),
+        cr: cur.cr,
       });
     }
   }
   if (gaps.length === 0) return null;
   const c: Record<string, number[]> = {};
   for (const g of gaps) {
+    // [n, w1, w5] plus, only once a class has a kept-warm gap, [warmN, warmCr]
+    // (#6169). Readers use `v[3] ?? 0`, so cold classes and facts written
+    // before #6169 read as no kept-warm gaps, and cold facts are unchanged.
     const cur = (c[g.cls] ??= [0, 0, 0]);
     cur[0] = (cur[0] ?? 0) + 1;
     cur[1] = (cur[1] ?? 0) + g.w1;
     cur[2] = (cur[2] ?? 0) + g.w5;
+    if (g.warm) {
+      cur[3] = (cur[3] ?? 0) + 1;
+      cur[4] = (cur[4] ?? 0) + g.cr;
+    }
   }
   const top = [...gaps]
     .sort((a, b) => b.w1 + b.w5 - (a.w1 + a.w5) || a.at - b.at)

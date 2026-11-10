@@ -369,6 +369,169 @@ textarea[placeholder*="notes"] {
   );
 }
 
+/* #6449: the View Picker's Pins row scrolls sideways (72px tabs); this is the
+ * `.thread-fade` mask turned `to right`, driven by --tab-row-fade-left and
+ * --tab-row-fade-right from lib/threadFade.ts (applyTabRowFade). A 0px edge
+ * means no fade on that side, so an unscrolled row that fits shows none. */
+.tab-row-fade {
+  --tab-row-fade-left: 0px;
+  --tab-row-fade-right: 0px;
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--tab-row-fade-left),
+    #000 calc(100% - var(--tab-row-fade-right)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--tab-row-fade-left),
+    #000 calc(100% - var(--tab-row-fade-right)),
+    transparent 100%
+  );
+}
+
+/* #6449: the Pins Ledger's Completed rows (mockup v6 :172-181). Receded
+ * (desaturated, 11.5px type) with answer, time, channel, and receipt columns
+ * aligned across rows; below 600px wide the time and channel columns collapse
+ * and hide, as in the mockup. In CSS because a hover and a media query cannot
+ * be inline styles. */
+.pins-completed-row {
+  --c-ans: clamp(110px, 26%, 230px);
+  --c-time: 88px;
+  --c-via: 64px;
+  display: grid;
+  /* The receipt column is 76px: the mockup's 52px clipped "Withdrawn"
+   * (its pill measures 74px at 10px bold). */
+  grid-template-columns:
+    18px minmax(0, 1fr) var(--c-ans) var(--c-time) var(--c-via)
+    76px 32px;
+  column-gap: 8px;
+  opacity: 0.62;
+  filter: saturate(0.25);
+  font-size: 11.5px;
+}
+.pins-completed-row:hover {
+  opacity: 0.85;
+}
+@media (max-width: 600px) {
+  .pins-completed-row {
+    --c-ans: clamp(84px, 30%, 140px);
+    --c-time: 0px;
+    --c-via: 0px;
+    column-gap: 6px;
+  }
+  .pins-completed-row .pins-c-time,
+  .pins-completed-row .pins-c-via {
+    visibility: hidden;
+  }
+}
+
+/* #6449: an expanded pin (mockup v6 :288-289): indented under the row's
+ * title, nearly flush on a phone. */
+.pins-detail {
+  padding: 6px 6px 10px 42px;
+}
+@media (max-width: 440px) {
+  .pins-detail {
+    padding-left: 8px;
+    padding-right: 4px;
+  }
+}
+
+/* #6454: the Project Managers section (mockup v6 :183-249, B3 lane boxes, L5
+ * rows). In CSS because a hover and a media query cannot be inline styles.
+ * A lane row is a fixed grid, so stage icons line up across lanes and the
+ * "+N" queue cell never shifts them: letter, name, the eight-cell track,
+ * +N, Open, and the chevron box. The track column is 8 cells of 17px (13px
+ * on a phone) plus 1px gaps; the name truncates first. */
+.pins-pm {
+  margin-top: 4px;
+}
+.pins-pm-other {
+  opacity: 0.55;
+}
+.pins-pm-other:hover,
+.pins-pm-other:focus-within {
+  opacity: 0.8;
+}
+.pins-lane-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 143px 34px 26px 26px;
+  column-gap: 6px;
+  align-items: center;
+  min-height: 32px;
+  padding: 2px;
+}
+.pins-lane-row:hover {
+  background: var(--app-hover);
+}
+.pins-track {
+  display: inline-flex;
+  gap: 1px;
+  align-items: center;
+}
+.pins-track > span {
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  border-radius: 4px;
+}
+.pins-pm-open-label {
+  display: inline;
+}
+/* A lane session (L5 "sb two", mockup :229-236): name and chips on the left,
+ * the task or the wait on the right; stacked on a phone (mockup :256-266). */
+.pins-lane-session {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(118px, 46%);
+  column-gap: 8px;
+  row-gap: 2px;
+  align-items: center;
+}
+.pins-lane-session > .pins-ls-name {
+  grid-column: 1;
+  grid-row: 1;
+}
+.pins-lane-session > .pins-ls-chips {
+  grid-column: 1;
+  grid-row: 2;
+}
+.pins-lane-session > .pins-ls-task {
+  grid-column: 2;
+  grid-row: 1 / 3;
+}
+@media (max-width: 520px) {
+  .pins-lane-session {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 3px;
+  }
+  .pins-lane-session > .pins-ls-chips {
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+  .pins-lane-session > .pins-ls-task {
+    grid-column: 1;
+    grid-row: 3;
+  }
+}
+@media (max-width: 440px) {
+  .pins-lane-row {
+    grid-template-columns: 18px minmax(0, 1fr) 111px 26px 24px 24px;
+  }
+  .pins-track > span {
+    width: 13px;
+    height: 13px;
+    font-size: 9px;
+  }
+  .pins-pm-open-label {
+    display: none;
+  }
+}
+
 .aui-md-codeblock pre.shiki {
   margin: 0;
   padding: 0.5rem;

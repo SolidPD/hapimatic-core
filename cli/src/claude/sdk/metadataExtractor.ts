@@ -13,11 +13,19 @@ export interface SDKMetadata {
   slashCommands?: string[];
 }
 
+export interface SDKMetadataProbeOptions {
+  /** Issue #6171: inline `--settings` JSON carrying only the session's MCP keys,
+   *  so a server the session denies does not start in the probe either. */
+  settings?: string;
+}
+
 /**
  * Extract SDK metadata by running a minimal query and capturing the init message
  * @returns SDK metadata containing tools and slash commands
  */
-export async function extractSDKMetadata(): Promise<SDKMetadata> {
+export async function extractSDKMetadata(
+  probe: SDKMetadataProbeOptions = {}
+): Promise<SDKMetadata> {
   const abortController = new AbortController();
 
   try {
@@ -34,6 +42,8 @@ export async function extractSDKMetadata(): Promise<SDKMetadata> {
         allowedTools: ["Bash(echo)"],
         maxTurns: 1,
         abort: abortController.signal,
+        // Claude Code reads `--settings` as a file path or a JSON string.
+        ...(probe.settings ? { settingsPath: probe.settings } : {}),
       },
     });
 
@@ -76,9 +86,10 @@ export async function extractSDKMetadata(): Promise<SDKMetadata> {
  * Fires the extraction and updates metadata when complete
  */
 export function extractSDKMetadataAsync(
-  onComplete: (metadata: SDKMetadata) => void
+  onComplete: (metadata: SDKMetadata) => void,
+  probe: SDKMetadataProbeOptions = {}
 ): void {
-  extractSDKMetadata()
+  extractSDKMetadata(probe)
     .then(metadata => {
       if (metadata.tools || metadata.slashCommands) {
         onComplete(metadata);

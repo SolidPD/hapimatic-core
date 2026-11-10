@@ -5,10 +5,16 @@
  * user edit a running session's launch parameters and apply them, routing each
  * changed field to the correct plane:
  *
- *  - **Live-plane** params (modelMode / effort / rawModel / permission mode / MCP
- *    set) apply IN PLACE via their existing mutations — no teardown, no cache bust
- *    beyond the field's own (KD-2). This is why most acceptance criteria are met
- *    without any new respawn machinery.
+ *  - **Live-plane** params (modelMode / effort / rawModel / permission mode, and
+ *    the MCP toggles of a session WITHOUT a chosen MCP set) apply IN PLACE via
+ *    their existing mutations — no teardown, no cache bust beyond the field's own
+ *    (KD-2).
+ *  - **The MCP set** of a session started with one (issue #6171, `mcpSet.mode ===
+ *    "only"`): Claude Code reads the session's deny list at start, so a change is
+ *    the `mcpSet` field, applied LAST through the relaunch route. With an account
+ *    switch also staged it is saved first (`persistOnly`) and the switch's
+ *    restart applies it — one restart, not two; a disconnected session saves it
+ *    the same way and applies it on reconnect.
  *  - **Spawn-frozen** flags (launcher / safeMode) are NOT on this surface (E9,
  *    epic #3285, operator ruling 2026-09-06): they are spawn-time flags that the
  *    earlier modal "applied" by tearing the session down and respawning it, so
@@ -44,12 +50,13 @@ import {
   MODEL_MODE_LABELS,
   stripModelTierSuffix,
   type EffortLevel,
+  type McpSet,
   type ModelMode,
   type PermissionMode,
 } from "@hapi/protocol";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { Session } from "@/types/api";
-import type { ApiClient } from "@/api/client";
+import { ApiError, type ApiClient } from "@/api/client";
 import type { AgentType } from "@/components/NewSession/types";
 import type { SpawnInput } from "@/hooks/mutations/useSpawnSession";
 import { effortLevelsForCurrent } from "@/components/AssistantChat/ModelModePicker";
@@ -69,7 +76,7 @@ import {
 } from "@/components/NewSession/spawnCommand";
 import { estimateCacheImpact, type EditableField } from "@/lib/cacheImpact";
 import { useSessionActions } from "@/hooks/mutations/useSessionActions";
-import { useMcpStatus } from "@/hooks/useMcpStatus";
+import { useMcpCatalog } from "@/hooks/queries/useMcpCatalog";
 import { useSessionTokenStats } from "@/hooks/queries/useSessionTokenStats";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import { Spinner } from "@/components/Spinner";
@@ -181,6 +188,8 @@ export type EditSessionParamsInput = {
     /** #3348: the non-claude native model recorded at spawn — the display source
      *  for the gemini/codex active-model row. */
     nativeModel?: string;
+    /** Issue #6171: the MCP set the session started with, if any. */
+    mcpSet?: McpSet;
   } | null;
 };
 
@@ -281,7 +290,28 @@ function EditSessionParamsForm({
   const projectDir = session.metadata?.path;
 
   const actions = useSessionActions(api, session.id, flavor);
-  const mcp = useMcpStatus(projectDir);
+
+  // Issue #4823 / #6171: the session's node. A remote session's MCP list and
+  // API keys live on THAT node (the hub's own would be the wrong list).
+  const { localNode } = useFederationLocalNode(api);
+  const effectiveNodeId = nodeId ?? session.nodeId;
+  const isRemoteSession =
+    effectiveNodeId != null &&
+    effectiveNodeId !== LOCAL_NODE_ID &&
+    localNode != null &&
+    effectiveNodeId !== localNode.nodeId;
+
+  // Issue #6171: the MCP servers known for the session's project on its node.
+  const mcpCatalog = useMcpCatalog({
+    api,
+    directory: projectDir ?? "",
+    nodeId: isRemoteSession ? effectiveNodeId : undefined,
+  });
+  const catalog = mcpCatalog.catalog;
+  // A session started with a chosen set changes servers by relaunch only.
+  const sessionMcpSet = session.metadata?.mcpSet;
+  const setSessionServers =
+    sessionMcpSet?.mode === "only" ? sessionMcpSet.servers : null;
   const { data: tokenStats } = useSessionTokenStats(api, session.id);
   const { copied, copy } = useCopyToClipboard();
 
@@ -314,15 +344,33 @@ function EditSessionParamsForm({
     [session]
   );
 
-  // The current MCP desired set (name → enabled) — a server is enabled unless it
-  // is in `disabledServers`. Seeded once; the diff baseline for the MCP field.
+  // The current MCP desired set (name → enabled) — the diff baseline. A set
+  // session's server is on when its set names it; any other session's is on
+  // unless it is off for the project. Either way a server off for the project is
+  // off: a set (e.g. stamped from a default) can name one that never started,
+  // and showing it on would turn it on project-wide at the next unrelated Apply
+  // (#6171 review W3).
+  // A set saved for the next start (persistOnly, or a disconnected save) keeps
+  // its `enableForProject`: those servers turn on at that start, so they count
+  // as on here (#6171 delta review DW-2).
+  const pendingEnable = useMemo(
+    () =>
+      new Set(
+        sessionMcpSet?.mode === "only"
+          ? (sessionMcpSet.enableForProject ?? [])
+          : []
+      ),
+    [sessionMcpSet]
+  );
   const currentMcp = useMemo(() => {
     const map: Record<string, boolean> = {};
-    for (const s of mcp.servers) {
-      map[s.name] = !mcp.disabledServers.includes(s.name);
+    for (const s of catalog?.servers ?? []) {
+      map[s.name] =
+        (!s.projectDisabled || pendingEnable.has(s.name)) &&
+        (setSessionServers ? setSessionServers.includes(s.name) : true);
     }
     return map;
-  }, [mcp.servers, mcp.disabledServers]);
+  }, [catalog, setSessionServers, pendingEnable]);
 
   const [draft, setDraft] = useState<Draft>({
     mcpDesired: {},
@@ -459,15 +507,9 @@ function EditSessionParamsForm({
   // Issue #4823 (R6): the keys group is disabled — with the reason — when the
   // server would refuse a key target. Launcher: the RAW recorded kind (a missing
   // kind is refused: the respawn would use the node's default launcher; NOT
-  // `current.launcher`, which defaults it to "sdk"). Remote: keys are node-local.
-  // Local mode: a live session the terminal controls (a stopped session stages).
-  const { localNode } = useFederationLocalNode(api);
-  const effectiveNodeId = nodeId ?? session.nodeId;
-  const isRemoteSession =
-    effectiveNodeId != null &&
-    effectiveNodeId !== LOCAL_NODE_ID &&
-    localNode != null &&
-    effectiveNodeId !== localNode.nodeId;
+  // `current.launcher`, which defaults it to "sdk"). Remote: keys are node-local
+  // (`isRemoteSession`, above). Local mode: a live session the terminal controls
+  // (a stopped session stages).
   const keysDisabledReason =
     session.metadata?.launcherKind !== "sdk"
       ? "API-key billing requires the SDK launcher — start a new session on an API key."
@@ -523,10 +565,12 @@ function EditSessionParamsForm({
     if (shown.effort !== current.effort) s.add("effort");
     if (shown.permissionMode !== current.permissionMode)
       s.add("permissionMode");
-    if (Object.keys(mcpDelta).length > 0) s.add("mcp");
+    // #6171: a set session's change is the relaunch-only `mcpSet` field.
+    if (Object.keys(mcpDelta).length > 0)
+      s.add(setSessionServers ? "mcpSet" : "mcp");
     if (accountStaged) s.add("account");
     return s;
-  }, [shown, current, mcpDelta, accountStaged]);
+  }, [shown, current, mcpDelta, accountStaged, setSessionServers]);
 
   const hasChanges = changedFields.size > 0;
 
@@ -614,14 +658,29 @@ function EditSessionParamsForm({
       modelMode: shown.modelMode !== "default" ? shown.modelMode : undefined,
       effort: shown.effort || undefined,
       rawModel: shown.rawModel || undefined,
+      // #6171 review W5: the shown servers as a real set, so the copied command
+      // keeps `--mcp-none` and `--mcp-enable-for-project`; with no list yet, a
+      // set session's own set. Claude only: a spawn refuses a set for any other
+      // agent (delta review DW-3).
+      mcpSet:
+        agent !== "claude"
+          ? undefined
+          : catalog
+            ? nextMcpSet()
+            : setSessionServers
+              ? sessionMcpSet
+              : undefined,
     };
     const display: SpawnDisplayContext = {
       machineLabel: nodeLabel ?? "this machine",
     };
-    const enabledMcp = Object.entries(shown.mcpDesired)
-      .filter(([, enabled]) => enabled)
-      .map(([name]) => name)
-      .sort();
+    const enabledMcp =
+      agent === "claude"
+        ? Object.entries(shown.mcpDesired)
+            .filter(([, enabled]) => enabled)
+            .map(([name]) => name)
+            .sort()
+        : [];
     return assembleSpawnCommand(spawnInput, display, enabledMcp);
   }
 
@@ -635,19 +694,92 @@ function EditSessionParamsForm({
     if (changedFields.has("permissionMode"))
       await actions.setPermissionMode(shown.permissionMode);
     if (changedFields.has("mcp")) await actions.setMcpDesired(mcpDelta);
+    // Issue #6171: a set session's new set. Saved without a restart when an
+    // account switch (which restarts anyway) or a reconnect will apply it;
+    // otherwise relaunched LAST, after everything above is on the record.
+    const nextSet = changedFields.has("mcpSet") ? nextMcpSet() : null;
+    const saveSetOnly =
+      nextSet !== null && (changedFields.has("account") || isDisconnected);
+    if (nextSet && saveSetOnly)
+      await actions.relaunchSession({ mcpSet: nextSet, persistOnly: true });
     // Round 14: the account switch goes LAST — it restarts the session, and the
     // live-plane fields above must already be persisted on the record first.
     // Issue #4823: the staged payment method may be an account OR an API key.
-    if (changedFields.has("account") && shownAccountUuid)
-      await accountActions.selectAccount(shownAccountUuid);
-    else if (changedFields.has("account") && shownApiKeyId)
-      await accountActions.selectApiKey(shownApiKeyId);
+    try {
+      if (changedFields.has("account") && shownAccountUuid)
+        await accountActions.selectAccount(shownAccountUuid);
+      else if (changedFields.has("account") && shownApiKeyId)
+        await accountActions.selectApiKey(shownApiKeyId);
+    } catch (e) {
+      // #6171 review SS-2: a switch refused before the server stopped the
+      // session leaves it running its old set, so the set saved above must not
+      // stay on the record. Not after the stop (delta review DW-1): a rollback
+      // respawn already started the saved set, and a session left disconnected
+      // starts it at its reconnect. Not for a disconnected session either: its
+      // set was saved for the reconnect on its own merits.
+      const code = e instanceof ApiError ? e.code : undefined;
+      const stopped =
+        code === "switch_failed_rolled_back" ||
+        code === "switch_failed_rollback_failed";
+      if (nextSet && saveSetOnly && !isDisconnected && !stopped) {
+        await actions
+          .relaunchSession({
+            mcpSet: restorableSessionSet(),
+            persistOnly: true,
+          })
+          .catch(() => undefined);
+      }
+      throw e;
+    }
+    if (nextSet && !saveSetOnly)
+      await actions.relaunchSession({ mcpSet: nextSet });
+  }
+
+  /**
+   * Issue #6171: the session's own set, as the relaunch route accepts it: a
+   * server off for the project only with its pending enable, which the route
+   * otherwise refuses (and which never started without one).
+   */
+  function restorableSessionSet(): McpSet | undefined {
+    if (sessionMcpSet?.mode !== "only") return sessionMcpSet;
+    const offForProject = new Set(
+      (catalog?.servers ?? [])
+        .filter(server => server.projectDisabled)
+        .map(server => server.name)
+    );
+    const servers = sessionMcpSet.servers.filter(
+      name => !offForProject.has(name) || pendingEnable.has(name)
+    );
+    const enableForProject = servers.filter(name => pendingEnable.has(name));
+    return {
+      mode: "only",
+      servers,
+      ...(enableForProject.length > 0 ? { enableForProject } : {}),
+    };
+  }
+
+  /** Issue #6171: the set a changed set session moves to. */
+  function nextMcpSet(): Extract<McpSet, { mode: "only" }> {
+    const servers = (catalog?.servers ?? [])
+      .filter(s => shown.mcpDesired[s.name])
+      .map(s => s.name)
+      .sort();
+    const enableForProject = (catalog?.servers ?? [])
+      .filter(s => shown.mcpDesired[s.name] && s.projectDisabled)
+      .map(s => s.name)
+      .sort();
+    return {
+      mode: "only",
+      servers,
+      ...(enableForProject.length > 0 ? { enableForProject } : {}),
+    };
   }
 
   async function handleApply() {
     setError(null);
     try {
-      // Every field on this surface is live-plane (E9) — no relaunch path.
+      // Live-plane fields apply in place; a set session's MCP set relaunches
+      // (issue #6171), last.
       await applyLivePlaneChanges();
       onClose();
     } catch (e) {
@@ -666,7 +798,7 @@ function EditSessionParamsForm({
   const setAllMcpServers = (enabled: boolean) =>
     setDraft(d => {
       const next = { ...d.mcpDesired };
-      for (const s of mcp.servers) next[s.name] = enabled;
+      for (const s of catalog?.servers ?? []) next[s.name] = enabled;
       return { ...d, mcpDesired: next };
     });
 
@@ -714,13 +846,17 @@ function EditSessionParamsForm({
                   {shownEmail ? (
                     <>
                       {/* E9 `.ddl`: the entity chip keeps its full nickname
-                        (shrink-0); the EMAIL is the element that ellipsizes. */}
-                      <AccountChip
-                        email={shownEmail}
-                        label={accountLabel}
-                        monogram={accountMonogram}
-                        className="shrink-0"
-                      />
+                        (shrink-0); the EMAIL is the element that ellipsizes.
+                        #6449: with no character cap, the chip stops at 60% so
+                        the email keeps room (a wrapper, because the chip's own
+                        max-w-full would race a max-width class). */}
+                      <span className="flex min-w-0 max-w-[60%] shrink-0">
+                        <AccountChip
+                          email={shownEmail}
+                          label={accountLabel}
+                          monogram={accountMonogram}
+                        />
+                      </span>
                       <span className="min-w-0 truncate text-[var(--app-hint)]">
                         {shownEmail}
                       </span>
@@ -729,11 +865,12 @@ function EditSessionParamsForm({
                     <>
                       {/* #4823: a STAGED key names itself the way a bound key
                         does — "Anthropic API · <label>" (label, else masked). */}
-                      <AccountChip
-                        email={API_KEY_CHIP_IDENTITY}
-                        label={apiKeyDisplayName(stagedKey)}
-                        className="shrink-0"
-                      />
+                      <span className="flex min-w-0 max-w-[60%] shrink-0">
+                        <AccountChip
+                          email={API_KEY_CHIP_IDENTITY}
+                          label={apiKeyDisplayName(stagedKey)}
+                        />
+                      </span>
                       <span
                         data-testid="config-account-api-key"
                         className="min-w-0 truncate text-[var(--app-hint)]"
@@ -746,11 +883,12 @@ function EditSessionParamsForm({
                     <>
                       {/* #4568: an API-key session names its KEY — it binds no
                         account (a staged account switch above still wins). */}
-                      <AccountChip
-                        email={API_KEY_CHIP_IDENTITY}
-                        label={resolvedAccount.keyName}
-                        className="shrink-0"
-                      />
+                      <span className="flex min-w-0 max-w-[60%] shrink-0">
+                        <AccountChip
+                          email={API_KEY_CHIP_IDENTITY}
+                          label={resolvedAccount.keyName}
+                        />
+                      </span>
                       <span
                         data-testid="config-account-api-key"
                         className="min-w-0 truncate text-[var(--app-hint)]"
@@ -944,15 +1082,27 @@ function EditSessionParamsForm({
             </div>
           )}
 
-          {/* MCP Servers (live plane) — collapsible subsection (R5): the
-            subheading IS the header, Enable/Disable-All only when expanded. */}
+          {/* MCP Servers — collapsible subsection (R5): the subheading IS the
+            header, Enable/Disable-All only when expanded. Live toggles for a
+            session without a chosen set; a set session relaunches (#6171). */}
           {fields.mcpServers.visible && (
             <McpServersSection
-              mcp={mcp}
+              servers={catalog?.servers ?? []}
+              isLoading={mcpCatalog.isLoading}
               desired={shown.mcpDesired}
               disabled={fields.mcpServers.disabled}
               onToggleServer={setMcpServer}
               onSetAll={setAllMcpServers}
+              projectEnableNote={
+                setSessionServers
+                  ? "Applying this also turns these on for this project."
+                  : "Turning these on also turns them on for this project."
+              }
+              note={
+                setSessionServers
+                  ? "This session started with a chosen set of MCP servers, which Claude Code reads at start, so applying a change relaunches it."
+                  : undefined
+              }
             />
           )}
 

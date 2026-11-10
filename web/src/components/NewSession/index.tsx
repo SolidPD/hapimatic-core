@@ -36,8 +36,10 @@ import { selectOptimalAccountUuid } from "@/lib/selectOptimalAccount";
 import type { LinkedIssue } from "@hapi/protocol/types";
 import {
   findUsageRowHardLock,
+  MCP_SET_CAPABILITY,
   resolveModelFamily,
   validateSessionName,
+  type McpSet,
 } from "@hapi/protocol";
 import type { AgentType, SessionMode, SessionType } from "./types";
 import { ActionButtons } from "./ActionButtons";
@@ -77,6 +79,7 @@ import type { AccountUsage, EffortLevel } from "@hapi/protocol";
 import type { RedactedAccount } from "@/types/api";
 import { AgentSelector } from "./AgentSelector";
 import { CapabilityChips } from "./CapabilityChips";
+import { McpSetField } from "./McpSetField";
 import { ProviderModelFields } from "./ProviderModelFields";
 import { AccountSelector } from "./AccountSelector";
 import {
@@ -290,6 +293,13 @@ export const NewSession = forwardRef<
     [isRemoteTarget, remoteNodeId, props.remoteNodes]
   );
   const selectedNodeHomeDir = selectedRemoteNode?.homeDir;
+  // Issue #6171: a remote node chooses MCP servers only from the release that
+  // advertises it; this node always can.
+  const targetSupportsMcpSet = isRemoteTarget
+    ? (selectedRemoteNode?.capabilities?.includes(MCP_SET_CAPABILITY) ?? false)
+    : true;
+  // Issue #6171: the MCP set McpSetField reports (undefined = send none).
+  const [mcpSet, setMcpSet] = useState<McpSet | undefined>(undefined);
 
   // #4417 (Task 8): advisory spawn-capacity notice for the selected target. A local
   // target polls the daemon; a remote target reads the federation summary fields. The
@@ -1014,8 +1024,12 @@ export const NewSession = forwardRef<
         // #3349: opencode native provider + model selections.
         selectedOpencodeProvider,
         selectedOpencodeModel,
+        // #6171: the MCP picker is a Standard-mode field, per target.
+        standardMode: sessionMode === "standard",
+        targetSupportsMcpSet,
       }),
     [
+      targetSupportsMcpSet,
       agent,
       effort,
       rawModel,
@@ -1110,8 +1124,16 @@ export const NewSession = forwardRef<
       // it — claude-only + omit when "default"/empty — so non-claude/default
       // spawns stay byte-identical (R2).
       outputStyle,
+      // #6171: only while the picker shows for a target that can honor it, and
+      // only once the user touched it (McpSetField reports undefined before).
+      mcpSet:
+        formState.fields.mcpServers.visible && targetSupportsMcpSet
+          ? mcpSet
+          : undefined,
     }),
     [
+      targetSupportsMcpSet,
+      mcpSet,
       spawnTarget,
       directory,
       formState,
@@ -1862,6 +1884,19 @@ export const NewSession = forwardRef<
                 {props.api ? (
                   <CapabilityChips agent={agent} api={props.api} />
                 ) : null}
+                {/* #6171: the MCP servers the session starts with. A memoized
+                  child that owns its catalog read, so catalog data never
+                  re-renders this form; it reports only the resulting set. */}
+                <McpSetField
+                  api={props.api ?? null}
+                  visible={formState.fields.mcpServers.visible}
+                  disabled={formState.fields.mcpServers.disabled}
+                  disabledReason={formState.fields.mcpServers.note}
+                  directory={directory}
+                  nodeId={remoteNodeId}
+                  directoryExists={pathExistence[directory.trim()] !== false}
+                  onChange={setMcpSet}
+                />
                 {/* #2626 (D): per-session output style — Claude-only session
                   config (output styles are a Claude concept). #4568: reads its
                   OWN field state — the launcher's disabled flag now also carries

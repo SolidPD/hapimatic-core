@@ -5,7 +5,7 @@ import { useAppContext } from "@/lib/app-context";
 import { useAppGoBack } from "@/hooks/useAppGoBack";
 import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
-import { BarChart3 } from "lucide-react";
+import { AlertTriangle, BarChart3 } from "lucide-react";
 import { BackIcon } from "@/components/icons";
 import { TitleChip } from "@/components/settings/SettingsSectionHeader";
 import {
@@ -18,6 +18,7 @@ import {
   useTelemetryComparison,
   useTelemetryTokenEstimates,
   useTelemetrySessionAggregates,
+  type TelemetryFailure,
 } from "../hooks/useTelemetry";
 import { UsageOverview } from "../components/UsageOverview";
 import { UsageBarChart } from "../components/UsageBarChart";
@@ -51,6 +52,55 @@ const INTERVALS = [
   { label: "Day", value: "day" },
   { label: "Week", value: "week" },
 ];
+
+/**
+ * The causes a 503 from the Analytics routes names (issue #6516), most
+ * serious first: when several queries fail, the notice names the worst.
+ */
+const TELEMETRY_FAILURE_CAUSES: Array<[code: string, text: string]> = [
+  [
+    "telemetry_unavailable",
+    "The Analytics query worker is unavailable on this server.",
+  ],
+  ["telemetry_timeout", "An Analytics query took too long."],
+  ["telemetry_busy", "The server is busy with other Analytics queries."],
+];
+
+function TelemetryFailureNotice(props: {
+  failures: TelemetryFailure[];
+  total: number;
+}) {
+  const { failures, total } = props;
+  const named = TELEMETRY_FAILURE_CAUSES.find(([code]) =>
+    failures.some(f => f.code === code)
+  );
+  const title = named ? named[1] : failures[0].message;
+  // A failed first load leaves its panel on the empty state; a failed refetch
+  // keeps the earlier results on screen (TanStack Query keeps `data`), so the
+  // copy counts the two apart (#6516 A-3).
+  const stale = failures.filter(f => f.hasData).length;
+  const empty = failures.length - stale;
+  const panels =
+    stale === 0
+      ? "their panels show no data."
+      : empty === 0
+        ? "their panels show older results."
+        : `${empty} ${empty === 1 ? "panel shows" : "panels show"} no data and ${stale} ${stale === 1 ? "shows" : "show"} older results.`;
+  // A compact alert row (the CapacityNotice shape), not a centred StatePanel:
+  // it sits above the tabs, so every line it takes pushes the panels down.
+  return (
+    <div
+      role="alert"
+      data-testid="analytics-telemetry-failure"
+      className="mb-3 flex items-start gap-1.5 rounded-md border border-red-500/30 bg-red-500/10 px-2.5 py-1.5 text-[length:var(--text-caption)] leading-snug text-red-400"
+    >
+      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
+      <span>
+        {title} {failures.length} of {total} Analytics queries failed; {panels}
+      </span>
+    </div>
+  );
+}
 
 export default function AnalyticsPage(props?: { onBack?: () => void }) {
   const { api } = useAppContext();
@@ -88,46 +138,86 @@ export default function AnalyticsPage(props?: { onBack?: () => void }) {
   }, [selectedRange]);
 
   // ── MVP data hooks ──────────────────────────────────
-  const { summary, isLoading: summaryLoading } = useTelemetrySummary(api, {
+  const {
+    summary,
+    isLoading: summaryLoading,
+    failure: summaryFailure,
+  } = useTelemetrySummary(api, {
     fileType: fileType || undefined,
     startTime,
   });
 
-  const { buckets, isLoading: timeseriesLoading } = useTelemetryTimeseries(
-    api,
-    { interval, startTime }
-  );
+  const {
+    buckets,
+    isLoading: timeseriesLoading,
+    failure: timeseriesFailure,
+  } = useTelemetryTimeseries(api, { interval, startTime });
 
-  const { files, isLoading: filesLoading } = useTelemetryFiles(api, {
+  const {
+    files,
+    isLoading: filesLoading,
+    failure: filesFailure,
+  } = useTelemetryFiles(api, {
     fileType: fileType || undefined,
   });
 
   // ── Phase 2 data hooks ─────────────────────────────
-  const { stats: durationStats, isLoading: durationLoading } =
-    useTelemetryDurationStats(api, {
-      fileType: fileType || undefined,
-    });
+  const {
+    stats: durationStats,
+    isLoading: durationLoading,
+    failure: durationFailure,
+  } = useTelemetryDurationStats(api, {
+    fileType: fileType || undefined,
+  });
 
-  const { rates: outcomeRates, isLoading: outcomeLoading } =
-    useTelemetryOutcomeRates(api, {
-      fileType: fileType || undefined,
-    });
+  const {
+    rates: outcomeRates,
+    isLoading: outcomeLoading,
+    failure: outcomeFailure,
+  } = useTelemetryOutcomeRates(api, {
+    fileType: fileType || undefined,
+  });
 
-  const { anomalies, isLoading: anomaliesLoading } = useTelemetryAnomalies(api);
+  const {
+    anomalies,
+    isLoading: anomaliesLoading,
+    failure: anomaliesFailure,
+  } = useTelemetryAnomalies(api);
 
-  const { estimates: tokenEstimates, isLoading: tokensLoading } =
-    useTelemetryTokenEstimates(api, {
-      fileType: fileType || undefined,
-      startTime,
-    });
+  const {
+    estimates: tokenEstimates,
+    isLoading: tokensLoading,
+    failure: tokensFailure,
+  } = useTelemetryTokenEstimates(api, {
+    fileType: fileType || undefined,
+    startTime,
+  });
 
-  const { sessions, isLoading: sessionsLoading } =
-    useTelemetrySessionAggregates(api, { startTime });
+  const {
+    sessions,
+    isLoading: sessionsLoading,
+    failure: sessionsFailure,
+  } = useTelemetrySessionAggregates(api, { startTime });
 
-  const { comparison, isLoading: comparisonLoading } = useTelemetryComparison(
-    api,
-    comparisonPeriods
-  );
+  const {
+    comparison,
+    isLoading: comparisonLoading,
+    failure: comparisonFailure,
+  } = useTelemetryComparison(api, comparisonPeriods);
+
+  // Issue #6516: name the cause of any failed telemetry query; the panels
+  // whose queries succeeded keep rendering below the notice.
+  const failures = [
+    summaryFailure,
+    timeseriesFailure,
+    filesFailure,
+    durationFailure,
+    outcomeFailure,
+    anomaliesFailure,
+    tokensFailure,
+    sessionsFailure,
+    comparisonFailure,
+  ].filter((f): f is TelemetryFailure => Boolean(f));
 
   const prevLabel = `Previous ${selectedRange?.label ?? "7d"}`;
   const currLabel = `Current ${selectedRange?.label ?? "7d"}`;
@@ -196,6 +286,10 @@ export default function AnalyticsPage(props?: { onBack?: () => void }) {
               ))}
             </div>
           </div>
+
+          {failures.length > 0 && (
+            <TelemetryFailureNotice failures={failures} total={9} />
+          )}
 
           {/* Tabs */}
           <Tabs.Root defaultValue="overview">

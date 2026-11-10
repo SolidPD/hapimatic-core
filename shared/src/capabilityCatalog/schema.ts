@@ -18,7 +18,7 @@
 import { z } from "zod";
 import { RiskTierSchema } from "../riskTier";
 import { DOMAIN_SLUGS } from "./domains";
-import type { CatalogEntry } from "./types";
+import { CATALOG_GATES, type CatalogEntry } from "./types";
 
 /**
  * Plain-text allowlist (R6) applied to EVERY string the entry carries. Rejects
@@ -98,6 +98,7 @@ const availabilitySchema = z.strictObject({
   scope: z.enum(["operator", "user"]),
   minVersion: plainText("availability.minVersion", 32).optional(),
   mountedWhen: plainText("availability.mountedWhen", 120).optional(),
+  gate: z.enum(CATALOG_GATES).optional(),
 });
 
 /**

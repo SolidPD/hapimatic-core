@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { CLAUDE_AI_CONNECTOR_PREFIX } from "./mcpSet";
 import type { McpServerStatus } from "./schemas";
 
 /**
@@ -43,7 +44,10 @@ const VARIATION_SELECTOR = "️";
  * Leading-glyph → status. Accepts BOTH light (legacy) and heavy (current)
  * check/cross variants so the parser is version-agnostic across Claude Code
  * releases. `!` = needs-auth (unchanged across versions); `⏸` = a
- * project-scoped server awaiting approval (Claude Code v2.1.154+).
+ * project-scoped server awaiting approval (Claude Code v2.1.154+). `⊘` (disabled
+ * for the project the poll ran in) is left out on purpose (#6171): the global
+ * poll runs in the daemon's cwd, so it says nothing about another project, and
+ * the server stays `unknown`.
  */
 const GLYPH_STATUS: Record<string, McpServerStatus["status"]> = {
   "✓": "connected", // ✓ light check (legacy)
@@ -152,8 +156,6 @@ export function parseMcpList(stdout: string): McpListParseResult {
   return { servers, unparsedLines };
 }
 
-const HOSTED_PREFIX = "claude.ai ";
-
 /**
  * Reclassify Anthropic-hosted connectors (the `claude.ai ` display-name prefix)
  * from `connected` to `hosted`. Pure; shared by both pollers (was duplicated).
@@ -162,7 +164,7 @@ export function classifyHostedServers(
   servers: McpServerStatus[]
 ): McpServerStatus[] {
   return servers.map(s =>
-    s.name.startsWith(HOSTED_PREFIX) && s.status === "connected"
+    s.name.startsWith(CLAUDE_AI_CONNECTOR_PREFIX) && s.status === "connected"
       ? { ...s, status: "hosted" as const }
       : s
   );

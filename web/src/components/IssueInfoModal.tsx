@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useState } from "react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
+import { isIssueRepo } from "@hapi/protocol";
 import type { ApiClient } from "@/api/client";
 import type { CurrentIssue } from "@/types/github";
 import { SimpleMarkdown } from "@/components/SimpleMarkdown";
@@ -13,8 +14,16 @@ interface IssueLabel {
   color: string;
 }
 
+/**
+ * The issue to show. The session header passes its full linked issue; a pin's
+ * issue link (#6453) knows only the repository and number, and the modal fetches
+ * the rest.
+ */
+export type IssueInfoModalIssue = Pick<CurrentIssue, "repo" | "number"> &
+  Partial<Pick<CurrentIssue, "title" | "url" | "state">>;
+
 interface IssueInfoModalProps {
-  issue: CurrentIssue;
+  issue: IssueInfoModalIssue;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   api: ApiClient | null;
@@ -83,7 +92,9 @@ function Spinner() {
  * Near-fullscreen modal displaying GitHub issue details:
  * number + title, collapsible labels section, and markdown body.
  *
- * Fetches labels and body from the server API on open.
+ * Fetches labels and body from the server API on open, and the title and state
+ * when the caller did not pass them. A repository that is not `owner/repo` never
+ * opens, because there is nothing to fetch.
  */
 export function IssueInfoModal({
   issue,
@@ -93,20 +104,30 @@ export function IssueInfoModal({
 }: IssueInfoModalProps) {
   const [labelsOpen, setLabelsOpen] = useState(true);
 
-  const [owner, repo] = issue.repo.split("/");
+  const validRepo = isIssueRepo(issue.repo);
+  const [owner, repo] = validRepo ? issue.repo.split("/") : ["", ""];
   const { details, isLoading, error } = useGitHubIssue(
     api,
     owner,
     repo,
     issue.number,
-    { enabled: open }
+    { enabled: open && validRepo }
   );
 
+  const title = issue.title ?? details?.title;
+  const state = issue.state ?? details?.state;
+  const url =
+    issue.url ?? `https://github.com/${issue.repo}/issues/${issue.number}`;
+  // No colour until the state is known, so an open issue never flashes closed.
   const stateColor =
-    issue.state === "closed" ? "text-purple-400" : "text-green-400";
+    state === "closed"
+      ? "text-purple-400"
+      : state === "open"
+        ? "text-green-400"
+        : "text-[var(--app-hint)]";
 
   return (
-    <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
+    <DialogPrimitive.Root open={open && validRepo} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/80" />
         <DialogPrimitive.Content
@@ -121,7 +142,9 @@ export function IssueInfoModal({
         >
           {/* Hidden accessible title */}
           <DialogPrimitive.Title className="sr-only">
-            Issue #{issue.number}: {issue.title}
+            {title === undefined
+              ? `Issue #${issue.number}`
+              : `Issue #${issue.number}: ${title}`}
           </DialogPrimitive.Title>
 
           {/* Header */}
@@ -131,23 +154,27 @@ export function IssueInfoModal({
                 <span className={`text-sm font-semibold ${stateColor}`}>
                   #{issue.number}
                 </span>
-                <span
-                  className={`text-[length:var(--text-caption-xs)] px-1.5 py-0.5 rounded-full font-medium ${
-                    issue.state === "closed"
-                      ? "bg-purple-400/15 text-purple-400"
-                      : "bg-green-400/15 text-green-400"
-                  }`}
-                >
-                  {issue.state === "closed" ? "Closed" : "Open"}
-                </span>
+                {state !== undefined && (
+                  <span
+                    className={`text-[length:var(--text-caption-xs)] px-1.5 py-0.5 rounded-full font-medium ${
+                      state === "closed"
+                        ? "bg-purple-400/15 text-purple-400"
+                        : "bg-green-400/15 text-green-400"
+                    }`}
+                  >
+                    {state === "closed" ? "Closed" : "Open"}
+                  </span>
+                )}
               </div>
               <a
-                href={issue.url}
+                href={url}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-sm font-medium text-[var(--app-fg)] hover:text-[var(--app-link)] transition-colors inline-flex items-center gap-1.5"
               >
-                <span className="break-words">{issue.title}</span>
+                <span className="break-words">
+                  {title ?? `${issue.repo}#${issue.number}`}
+                </span>
                 <ExternalLinkIcon className="shrink-0 opacity-50" />
               </a>
             </div>

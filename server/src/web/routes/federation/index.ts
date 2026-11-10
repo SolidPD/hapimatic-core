@@ -13,6 +13,7 @@ import { createOutputStyleSyncRoutes } from "./outputStyleSync";
 import { createSettingsSyncReceiverRoutes } from "./settingsSync";
 import { createWebClientRoutes } from "./webClient";
 import { createQueueMutationRoutes } from "./queueMutations";
+import { createPinMutationRoutes } from "./pinMutations";
 import { createFederationAccountRoutes } from "./accounts";
 import { createFederationAccountHealthRoutes } from "./accountHealth";
 import { createFederationAnthropicLoginRoutes } from "./anthropicLogin";
@@ -28,6 +29,7 @@ import { createFederationTurnFeedRoutes } from "./turnFeed";
 import { createFederationSpawnRosterRoutes } from "./spawnRoster";
 import { createFederationCapabilitiesRoutes } from "./capabilities";
 import { createFederationNotificationRoutes } from "./notifications";
+import { createFederationPinDashboardRoutes } from "./pinDashboards";
 
 export type { FederationDeps } from "./shared";
 
@@ -53,6 +55,8 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   app.route("/", createWebClientRoutes(deps));
   // Issue #1325: server-backed message queue federation receivers.
   app.route("/", createQueueMutationRoutes(deps));
+  // Issue #6447: pin receivers, the owning node's half of a proxied pin request.
+  app.route("/", createPinMutationRoutes(deps));
   // Issue #1452 (Sub-Issue F): node-to-node active-account receivers.
   app.route("/", createFederationAccountRoutes(deps));
   // Issue #4461 (epic #4460 A): per-node account health — hub aggregator (JWT
@@ -97,5 +101,8 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   // Issue #4913: peer-incoming notification receivers (fed-token + caller
   // namespace, local rows only) behind the hub's /api/notifications fan-out.
   app.route("/", createFederationNotificationRoutes(deps));
+  // Issue #6454: peer-incoming Project Manager dashboards (fed-token + caller
+  // namespace, local dashboards only) behind the hub's /api/pins/dashboards.
+  app.route("/", createFederationPinDashboardRoutes(deps));
   return app;
 }

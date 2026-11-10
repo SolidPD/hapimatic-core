@@ -15,6 +15,7 @@ import {
 import type {
   CostRollupRow,
   CovRollupRow,
+  IdleRollupRow,
   MirrorSourceRow,
   RollupBucket,
   ThroughputRollupStore,
@@ -22,6 +23,7 @@ import type {
 import {
   ThroughputPricer,
   addPricedLine,
+  avoidedRewriteUsd,
   emptyPricedLine,
   type PriceTokens,
   type PricedLine,
@@ -401,17 +403,7 @@ export function buildBucket(
       n: number;
     }
   >();
-  const idle = new Map<
-    string,
-    {
-      ns: string | null;
-      cls: string;
-      n: number;
-      w1: number;
-      w5: number;
-      usd: number;
-    }
-  >();
+  const idle = new Map<string, IdleRollupRow>();
   const session = new Map<
     string,
     RollupBucket["session"][number] & { lastIssueAt: number }
@@ -566,6 +558,8 @@ export function buildBucket(
         const n = v[0] ?? 0;
         const w1 = v[1] ?? 0;
         const w5 = v[2] ?? 0;
+        const warmN = v[3] ?? 0;
+        const warmCr = v[4] ?? 0;
         const usd = pricer.price(r.model, r.startedAtMs, {
           in: 0,
           out: 0,
@@ -574,6 +568,13 @@ export function buildBucket(
           w5,
           wu: 0,
         }).total;
+        // #6169: a kept-warm reopening read its prefix instead of rewriting it.
+        const avoidedUsd = avoidedRewriteUsd(
+          pricer,
+          r.model,
+          r.startedAtMs,
+          warmCr
+        );
         const ik = k(r.ns, cls);
         const cell = idle.get(ik) ?? {
           ns: r.ns,
@@ -582,11 +583,17 @@ export function buildBucket(
           w1: 0,
           w5: 0,
           usd: 0,
+          warmN: 0,
+          warmCr: 0,
+          avoidedUsd: 0,
         };
         cell.n += n;
         cell.w1 += w1;
         cell.w5 += w5;
         cell.usd += usd;
+        cell.warmN += warmN;
+        cell.warmCr += warmCr;
+        cell.avoidedUsd += avoidedUsd;
         idle.set(ik, cell);
       }
     }

@@ -42,6 +42,7 @@ import type {
   StoredAccount,
   SessionView,
   UiCollapseState,
+  CacheKeepaliveResponse,
 } from "@hapi/protocol";
 import {
   JOB_KIND_IN_PROCESS_LOOP,
@@ -87,8 +88,17 @@ import type { CapabilityMeta } from "../socket/handlers/cli/rpcHandlers";
 import type { SSEManager } from "../sse/sseManager";
 import { EventPublisher, type SyncEventListener } from "./eventPublisher";
 import { MachineCache, type Machine } from "./machineCache";
-import { MessageService, type SendMessageResult } from "./messageService";
+import {
+  MessageService,
+  type MessageRecordStep,
+  type SendMessageResult,
+} from "./messageService";
 import { isNewUserFacingAssistantContent } from "./needsReviewContent";
+import { PinService } from "./pinService";
+import { PinFenceIngest } from "./pinFenceIngest";
+import { PinPromptMirror } from "./pinPromptMirror";
+import { PinTurnCheck } from "./pinTurnCheck";
+import { resolvePinsEnabled } from "../config/pinsConfig";
 import type { MessageOrigin, SentFrom } from "./sentFrom";
 import {
   APPROVAL_TOKEN_HOOK_ID,
@@ -102,6 +112,7 @@ import { loadApprovalTokensConfig } from "../config/approvalTokensConfig";
 import { loadApprovalHygieneConfig } from "../config/approvalHygieneConfig";
 import { TimelogResetService } from "./timelogReset";
 import { McpConfigStore } from "./mcpConfigStore";
+import { McpCatalogService } from "../services/mcpCatalogService";
 import { SessionRespawn } from "./sessionRespawn";
 import {
   AccountRestart,
@@ -160,7 +171,11 @@ import {
   liveSessionIdSet,
   reapOrphanedClaims,
 } from "../store/fileClaimLifecycle";
-import type { FileClaimSyncSnapshot } from "@hapi/protocol";
+import {
+  mcpLiveToggleRefusal,
+  type FileClaimSyncSnapshot,
+  type McpSet,
+} from "@hapi/protocol";
 import type {
   TurnFeedDigest,
   TurnFeedPage,
@@ -348,6 +363,16 @@ export interface SpawnSessionOptions {
     modelId?: string;
     reasoningEffort?: string;
   };
+  /** Issue #6171: the MCP set the session starts with, already resolved by the
+   *  spawn route or the peer receiver (a respawn carries the session's own via
+   *  `inheritedSessionPins`). Absent = every server. Forwarded daemon-ward as
+   *  `--hapi-mcp-set` (#1262 enumeration — guarded by
+   *  syncEngine.spawnMcpSet.test.ts). */
+  mcpSet?: McpSet;
+  /** Issue #6171: server-stamped by `spawnSession` when `mcpSet` narrows — every
+   *  server name known for the project, which the wrapper turns into the deny
+   *  list. Callers leave it unset. */
+  mcpKnown?: string[];
   /** Issue #1661: reconnect kill-vs-reattach intent for the REUSED tmux-window
    *  spawn path. Default true preserves switch/token-refresh/model-restart
    *  semantics (intentional process replacement). reconnectSession passes false
@@ -490,6 +515,17 @@ export class SyncEngine {
   private readonly sessionCache: SessionCache;
   private readonly machineCache: MachineCache;
   private readonly messageService: MessageService;
+  /** #6447: the one writer of pins, so that every change publishes. */
+  readonly pins: PinService;
+  /**
+   * #6448: reads `hapi_pin` fences in assistant messages into pins. #6455/#6456
+   * call its `ingestText` with a turn's assembled text.
+   */
+  readonly pinFences: PinFenceIngest;
+  /** #6455: mirrors each prompt a session is blocked on as a `prompt:` pin. */
+  readonly pinPrompts: PinPromptMirror;
+  /** #6455: the Stop-hook turn check and Detected pins; Sub-Issue J (#6456) will reuse `detect`. */
+  readonly pinTurns: PinTurnCheck;
   /** #3563: in-memory USER-APPROVAL mint records for orphaned-grant detection. */
   private readonly orphanGrantStore = new OrphanGrantStore();
   private readonly rpcGateway: RpcGateway;
@@ -512,6 +548,7 @@ export class SyncEngine {
   private readonly sessionLifecycleOps: SessionLifecycleOps;
   private readonly sessionRelaunch: SessionRelaunch;
   private readonly mcpBatchCoordinator: McpBatchCoordinator;
+  private readonly mcpCatalog: McpCatalogService;
 
   /**
    * Issue #1456 (Sub-Issue J): target-account validator for switchAccount().
@@ -684,6 +721,9 @@ export class SyncEngine {
     this.eventPublisher = new EventPublisher(sseManager, event =>
       this.resolveNamespace(event)
     );
+    this.pins = new PinService(store.pins, this.eventPublisher, sessionId =>
+      store.messages.getMaxSeq(sessionId)
+    );
     this.sessionCache = new SessionCache(store, this.eventPublisher, {
       // Escalate to process cleanup when a session has been inactive
       // for >5 minutes. Archives the session, which triggers killSession
@@ -800,6 +840,46 @@ export class SyncEngine {
       // #4914: a gate denial also raises a prompt-blocked notification.
       notifyUser: input => this.notifyUser(input),
     });
+    // #6448: the fence path writes through `pins` like the routes, so it reads
+    // the Pins gate itself, once, as the NodeRegistry does.
+    this.pinFences = new PinFenceIngest({
+      pins: this.pins,
+      notify: (sid, text) =>
+        this.messageService.persistPinFenceNotice(sid, text),
+      pinsEnabled: resolvePinsEnabled(),
+      errorLogger: this.errorLogger,
+    });
+    // #6455: two more writers that bypass the routes. The mirror reads the gate
+    // once, like the fence reader; the turn check is reached only through the
+    // gated CLI route. The mirror's listener does no database work (it queues),
+    // and its own guard keeps a fault away from every other listener.
+    this.pinPrompts = new PinPromptMirror({
+      pins: this.pins,
+      getSession: sid => this.sessionCache.getSession(sid),
+      listSessions: () => this.sessionCache.getSessions(),
+      findMessageId: (sid, needle) =>
+        store.messages.findRecentMessageIdContaining(sid, needle),
+      pinsEnabled: resolvePinsEnabled(),
+      errorLogger: this.errorLogger,
+    });
+    this.pinTurns = new PinTurnCheck({
+      pins: this.pins,
+      getRecentMessages: (sid, options) =>
+        store.messages.getRecentMessagesBounded(sid, options),
+    });
+    this.eventPublisher.subscribe(event => {
+      try {
+        this.pinPrompts.onEvent(event);
+      } catch (error) {
+        this.errorLogger?.debug("pin prompt mirror: listener failed", {
+          category: "pin-prompt",
+          context: {
+            error: error instanceof Error ? error.message : String(error),
+          },
+          persist: false,
+        });
+      }
+    });
     // #3331 (Task 9): register the USER-APPROVAL token-verify gate on the
     // #3124 message-hook stage. This is the FIRST production registration of a
     // message hook — nothing registered before. The gate resolves each session's
@@ -823,6 +903,12 @@ export class SyncEngine {
     this.mcpConfigStore = new McpConfigStore({
       sessionCache: this.sessionCache,
       getMcpStatus: projectDir => this.getMcpStatus(projectDir),
+    });
+    // Issue #6171: the MCP picker's list and the names a session's deny list uses.
+    this.mcpCatalog = new McpCatalogService({
+      getMcpStatus: projectDir => this.getMcpStatus(projectDir),
+      defaults: store.mcpProjectDefaults,
+      stats: store.mcpServerStats,
     });
     this.mcpBatchCoordinator = new McpBatchCoordinator({
       getCurrentState: sessionId =>
@@ -995,8 +1081,12 @@ export class SyncEngine {
       spawnSession: opts => this.spawnSession(opts),
       getTurnLifecycle: () => this.turnLifecycle,
       apiKeyPlacementRefusal: session => this.apiKeyPlacementRefusal(session),
+      getMcpCatalog: () => this.mcpCatalog,
     });
     this.reloadAll();
+    // #6455: after the reload, so the sweep sees every session (the cache starts
+    // empty); it settles prompt pins a restart left open. Queued, never inline.
+    this.pinPrompts.start();
     this.inactivityTimer = setInterval(() => {
       this.jobRegistry?.update("sync-inactivity-expiry", {
         lastTickAt: Date.now(),
@@ -1116,6 +1206,15 @@ export class SyncEngine {
     return this.sessionCache.getChildBranchCount(parentSessionId);
   }
 
+  /** #6447: one grouped query, because the federation poll reads this per node. */
+  getOpenPinCounts(): Map<string, number> {
+    return this.pins.countOpenBySession();
+  }
+
+  getOpenPinCount(sessionId: string): number {
+    return this.pins.countOpen(sessionId);
+  }
+
   getSession(sessionId: string): Session | undefined {
     return this.sessionCache.getSession(sessionId);
   }
@@ -1169,6 +1268,11 @@ export class SyncEngine {
    */
   getCapabilityMeta(sessionId: string, method: string): CapabilityMeta | null {
     return this.rpcGateway.getCapabilityMeta(sessionId, method);
+  }
+
+  /** Issue #6169: the method is registered with meta on the session's CLI. */
+  hasSessionMethod(sessionId: string, method: string): boolean {
+    return this.rpcGateway.hasSessionMethod(sessionId, method);
   }
 
   /**
@@ -1328,9 +1432,20 @@ export class SyncEngine {
     return this.mcpStatusByProject.get("__global__") ?? null;
   }
 
+  /** Issue #6171: the MCP picker's data source for this node. */
+  getMcpCatalog(): McpCatalogService {
+    return this.mcpCatalog;
+  }
+
   updateMcpStatus(status: McpStatusUpdate): void {
     const key = status.projectDir ?? "__global__";
     this.mcpStatusByProject.set(key, status);
+    // Issue #6171: the names outlive this memory-only cache.
+    try {
+      this.store.mcpServerStats.touchNames(status.servers.map(s => s.name));
+    } catch {
+      // Best-effort: the live cache above still answers until a restart.
+    }
     this.eventPublisher.emit({
       type: "mcp-status-updated" as const,
       data: status,
@@ -1397,6 +1512,30 @@ export class SyncEngine {
     }
 
     this.eventPublisher.emit(event);
+
+    // #6448: read `hapi_pin` fences only AFTER the message's own event is out, and
+    // in a guard of their own, so a fault here can never drop or delay that
+    // event. The scan does no database work; the writes run deferred.
+    if (event.type === "message-received" && event.sessionId && event.message) {
+      try {
+        const session = this.sessionCache.getSession(event.sessionId);
+        this.pinFences.onMessage(
+          event.sessionId,
+          session?.namespace,
+          event.message,
+          session?.metadata?.flavor
+        );
+      } catch (error) {
+        this.errorLogger?.debug("hapi_pin: fence ingestion failed", {
+          category: "pin-fence",
+          sessionId: event.sessionId,
+          context: {
+            error: error instanceof Error ? error.message : String(error),
+          },
+          persist: false,
+        });
+      }
+    }
   }
 
   handleSessionAlive(payload: {
@@ -1411,6 +1550,8 @@ export class SyncEngine {
     appliedEffort?: string | null;
     appliedModel?: string;
     appliedForEffort?: string | null;
+    // Issue #6169: CLI-reported prompt-cache state (validated in sessionCache).
+    promptCache?: unknown;
     // Composer-chip pin integrity: pinned raw model id; `null` = pin cleared.
     rawModel?: string | null;
     resolvedModel?: string;
@@ -2600,6 +2741,9 @@ export class SyncEngine {
       // through to MessageService.sendMessage, which stamps it into
       // content.meta.origin and forwards it to the message-hook stage.
       origin?: MessageOrigin;
+      // #6452: an in-transaction record step (pins answers commit with their
+      // message); see MessageService.sendMessage.
+      record?: MessageRecordStep;
     }
   ): Promise<SendMessageResult> {
     // #3124: forward the delivery result (a gate-class message hook can deny —
@@ -2871,7 +3015,25 @@ export class SyncEngine {
     serverName: string,
     enabled: boolean
   ): Promise<McpToggleResponse> {
+    // Issue #6171: refused here, before the RPC, because the CLI handler writes
+    // the project's config before its SDK call. One check for the route and the
+    // federation receiver, which both reach this method.
+    const refusal = mcpLiveToggleRefusal(
+      this.sessionCache.getSession(sessionId)?.metadata?.mcpSet,
+      { [serverName]: enabled }
+    );
+    if (refusal) {
+      return { ok: false, error: refusal.message, code: refusal.code };
+    }
     return await this.rpcGateway.mcpToggle(sessionId, serverName, enabled);
+  }
+
+  /** Issue #6169: prompt-cache keep-alive; never throws (see the gateway). */
+  async cacheKeepalive(
+    sessionId: string,
+    request: { deadlineAt: number }
+  ): Promise<CacheKeepaliveResponse> {
+    return await this.rpcGateway.cacheKeepalive(sessionId, request);
   }
 
   // Issue #2256: delegate set-model to the rpcGateway (mirrors mcpToggle). The
@@ -2914,10 +3076,10 @@ export class SyncEngine {
 
   /**
    * Read the per-project `disabledMcpServers` list from ~/.claude.json
-   * (exact-match on `projects[projectDir]`, #1180). Thin delegator to
-   * McpConfigStore, retained on the facade for the #1180 contract test and
-   * any private-method consumer. Behavior lives in `mcpConfigStore.ts`
-   * (issue #2080).
+   * (keyed by the canonical git root, #6171; the exact path before, #1180).
+   * Thin delegator to McpConfigStore, retained on the facade for the #1180
+   * contract test and any private-method consumer. Behavior lives in
+   * `mcpConfigStore.ts` (issue #2080).
    */
   private readDisabledServersFromConfig(projectDir: string): string[] {
     return this.mcpConfigStore.readDisabledServersFromConfig(projectDir);
@@ -3039,6 +3201,30 @@ export class SyncEngine {
       turns: this.store.turns.getTurnBreakdown(key),
       ...(backgroundAgentUsage ? { backgroundAgentUsage } : {}),
     };
+  }
+
+  /**
+   * Whether a session holds a message with this `localId` (#6454): where an
+   * earlier attempt of a pin Submit was delivered. A store error is thrown, and
+   * the route answers it like any other store failure.
+   */
+  hasMessageLocalId(sessionId: string, localId: string): boolean {
+    return this.store.messages.hasLocalId(sessionId, localId);
+  }
+
+  /**
+   * A session's turn totals alone (#6454): the Project Manager dashboards read
+   * one per lane session, so this skips the per-turn breakdown that
+   * `getSessionTokenStats` also reads. Keyed by `session.id`, like it.
+   * Fail-open: null on any read error.
+   */
+  getSessionTotals(sessionId: string): SessionTokenTotals | null {
+    try {
+      const session = this.getSession(sessionId);
+      return session ? this.store.turns.getSessionTotals(session.id) : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -3724,6 +3910,17 @@ export class SyncEngine {
         if (levels) opts.modelEffortLevels = levels;
       } catch {
         // Fail-open — the daemon falls back to its static-catalog lookup.
+      }
+    }
+
+    // Issue #6171: stamp the names a narrowing MCP set must deny, fresh for every
+    // spawn and respawn. Here at the choke point so no path forwards a stale list.
+    if (opts.mcpSet?.mode === "only") {
+      try {
+        opts.mcpKnown = this.mcpCatalog.knownNames(opts.directory);
+      } catch {
+        // The wrapper still denies the names it reads from the config itself.
+        opts.mcpKnown = [];
       }
     }
 

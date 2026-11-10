@@ -3,10 +3,10 @@
  * MCP config disk-store delegate (issue #2080 — extracted from syncEngine.ts).
  *
  * Reads/writes the per-project `disabledMcpServers` list in `~/.claude.json`
- * (`projects[projectDir].disabledMcpServers`) and computes a session's current
- * MCP state map for the batch coordinator. Complements `mcpBatchCoordinator.ts`
- * (which owns the RPC toggle pipeline) — this delegate owns only the durable
- * disk layer + the state-map computation.
+ * (`projects[<canonical git root>].disabledMcpServers`, #6171) and computes a
+ * session's current MCP state map for the batch coordinator. Complements
+ * `mcpBatchCoordinator.ts` (which owns the RPC toggle pipeline) — this delegate
+ * owns only the durable disk layer + the state-map computation.
  *
  * Carries the `isSafeMachinePath` path-security guard (#1098) on every write so
  * the server-side fallback path is not a softer target than the CLI path.
@@ -20,6 +20,7 @@ import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { findCanonicalGitRoot } from "@hapi/protocol/gitRoot";
 import { isSafeMachinePath } from "../utils/pathSecurity";
 import type { McpStatusUpdate, McpToggleResponse } from "@hapi/protocol/types";
 import type { SessionCache } from "./sessionCache";
@@ -61,7 +62,7 @@ export class McpConfigStore {
     // The cached status only contains servers reported by the daemon's MCP
     // poller (typically just the connected ones, often nothing right after
     // a server restart). The authoritative disabled list lives in
-    // ~/.claude.json under `projects[projectDir].disabledMcpServers`.
+    // ~/.claude.json under `projects[<canonical git root>].disabledMcpServers`.
     //
     // Without this enrichment, the batch coordinator's `current` map is
     // missing all disabled servers — `computePending` then sees
@@ -91,15 +92,15 @@ export class McpConfigStore {
   }
 
   /**
-   * Read the per-project `disabledMcpServers` list from ~/.claude.json
-   * using exact-match on `projects[projectDir]` only.
+   * Read the per-project `disabledMcpServers` list from ~/.claude.json, keyed
+   * by the canonical git root.
    *
-   * Mirrors Claude Code's runtime scoping (and the route-side enrichment
-   * at `GET /api/mcp-status`, fixed in #1177/#1178). A previous longest-
-   * prefix fallback caused worktree sessions to inherit their parent
-   * project's disabled list, making the batch coordinator's `current`
-   * map disagree with what Claude actually treats as disabled at the
-   * session cwd. See #1180.
+   * Mirrors Claude Code's runtime scoping (and the route-side enrichment at
+   * `GET /api/mcp-status`): measured on 2.1.312, a main checkout, a worktree
+   * and a repo subdirectory all read the root's entry and ignore one under
+   * their own path (#6171). This replaces the exact-path read from #1180, which
+   * returned nothing for every worktree session. A path outside any git repo
+   * keeps its own key.
    *
    * Returns `[]` on any failure (file missing, parse error, no project
    * entry, no disabled list). Failures are silent because this function
@@ -114,7 +115,9 @@ export class McpConfigStore {
       const projects = config?.projects;
       if (!projects || typeof projects !== "object") return [];
 
-      const disabled = projects[projectDir]?.disabledMcpServers;
+      const disabled =
+        projects[findCanonicalGitRoot(projectDir) ?? projectDir]
+          ?.disabledMcpServers;
       if (!Array.isArray(disabled)) return [];
       return disabled.filter((s): s is string => typeof s === "string");
     } catch {
@@ -185,7 +188,10 @@ export class McpConfigStore {
     }
     config.projects ??= {};
     const projects = config.projects;
-    const project = (projects[projectDir] ??= {}) as Record<string, unknown>;
+    // #6171: the key Claude Code reads. A raw worktree path would create an
+    // entry nothing ever consults.
+    const projectKey = findCanonicalGitRoot(projectDir) ?? projectDir;
+    const project = (projects[projectKey] ??= {}) as Record<string, unknown>;
     const existing: string[] = Array.isArray(project.disabledMcpServers)
       ? (project.disabledMcpServers as unknown[]).filter(
           (s): s is string => typeof s === "string"

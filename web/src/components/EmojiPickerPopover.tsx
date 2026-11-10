@@ -1,14 +1,41 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import EmojiPicker, {
-  Theme,
-  EmojiStyle,
-  SuggestionMode,
-} from "emoji-picker-react";
-import { searchEmojis } from "@/lib/emojiSearch";
-import { recordRecentEmoji } from "@/lib/emojiRecents";
+import {
+  useState,
+  useRef,
+  useEffect,
+  useCallback,
+  type ReactElement,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { BareButton } from "@/components/ui/BareButton";
+import { lazyWithPreload } from "@/lib/lazyWithPreload";
+
+const PICKER_WIDTH = 300;
+const PICKER_HEIGHT = 350;
+// Height of the custom search-input row that sits above the picker/results.
+const INPUT_HEIGHT = 40;
+const GRID_HEIGHT = PICKER_HEIGHT - INPUT_HEIGHT;
+
+/** The grid's footprint, shown while it loads or if its chunk cannot load. */
+function EmptyGrid(): ReactElement {
+  return (
+    <div style={{ width: `${PICKER_WIDTH}px`, height: `${GRID_HEIGHT}px` }} />
+  );
+}
+
+// #3098: the picker grid (emoji-picker-react + the emojilib search index) loads
+// on demand; this trigger renders on every session row. Pressing or focusing
+// the trigger preloads it, so the grid normally renders with the search input
+// rather than after a loading box. If its chunk cannot load, the error stays
+// out of the error boundary and the picker keeps its input and Remove button
+// (main.tsx's vite:preloadError handler still reloads the app once per boot).
+const EmojiPickerBody = lazyWithPreload(
+  () => import("@/components/EmojiPickerBody"),
+  { fallback: <EmptyGrid />, onLoadError: EmptyGrid }
+);
+const preloadEmojiPickerBody = (): void => {
+  EmojiPickerBody.preload().catch(() => {});
+};
 
 type EmojiPickerPopoverProps = {
   emoji: string | null | undefined;
@@ -106,14 +133,9 @@ export function EmojiPickerPopover({
   // Position the picker centered horizontally in the visible viewport,
   // and vertically centered within the visible area (above the keyboard).
   // Min top offset accounts for iOS status bar + Hapimatic header (~90px).
-  const pickerHeight = 350;
-  const pickerWidth = 300;
-  // Height of the custom search-input row that sits above the picker/results.
-  const INPUT_HEIGHT = 40;
-  const searchResults = useMemo(() => searchEmojis(search, 80), [search]);
   const minTop = vp.top + 90;
-  const maxTop = vp.top + vp.height - pickerHeight - 8;
-  const centerTop = vp.top + (vp.height - pickerHeight) / 2;
+  const maxTop = vp.top + vp.height - PICKER_HEIGHT - 8;
+  const centerTop = vp.top + (vp.height - PICKER_HEIGHT) / 2;
   const clampedTop = Math.max(minTop, Math.min(centerTop, maxTop));
 
   return (
@@ -121,6 +143,8 @@ export function EmojiPickerPopover({
       <BareButton
         ref={triggerRef}
         type="button"
+        onPointerDown={preloadEmojiPickerBody}
+        onFocus={preloadEmojiPickerBody}
         onClick={e => {
           e.stopPropagation();
           if (!disabled) setIsOpen(!isOpen);
@@ -168,12 +192,12 @@ export function EmojiPickerPopover({
             className="fixed z-50 rounded-lg shadow-2xl border border-[var(--app-border)] overflow-hidden bg-[var(--app-bg)]"
             style={{
               top: `${clampedTop}px`,
-              left: `calc(50% - ${pickerWidth / 2}px)`,
-              width: `${pickerWidth}px`,
+              left: `calc(50% - ${PICKER_WIDTH / 2}px)`,
+              width: `${PICKER_WIDTH}px`,
             }}
           >
             {/* Custom search input — replaces the picker's built-in search
-                bar (searchDisabled below) so we can drive keyword-augmented
+                bar (searchDisabled in EmojiPickerBody) so we can drive keyword-augmented
                 search across the emojilib dataset. */}
             <input
               autoCapitalize="none"
@@ -188,52 +212,12 @@ export function EmojiPickerPopover({
               style={{ height: `${INPUT_HEIGHT}px` }}
             />
 
-            {search.trim() === "" ? (
-              <EmojiPicker
-                theme={Theme.DARK}
-                emojiStyle={EmojiStyle.NATIVE}
-                width={pickerWidth}
-                height={pickerHeight - INPUT_HEIGHT}
-                searchDisabled={true}
-                // Newest pick first. The library default (FREQUENT) sorts by
-                // use count, so a fresh pick ranked behind old favorites.
-                suggestedEmojisMode={SuggestionMode.RECENT}
-                onEmojiClick={emojiData => handleSelect(emojiData.emoji)}
-                previewConfig={{ showPreview: false }}
-              />
-            ) : (
-              <div
-                className="flex flex-wrap content-start gap-0.5 overflow-y-auto p-2"
-                style={{ height: `${pickerHeight - INPUT_HEIGHT}px` }}
-              >
-                {searchResults.length > 0 ? (
-                  searchResults.map(result => (
-                    <Button
-                      key={result.char}
-                      type="button"
-                      variant="ghost"
-                      title={result.name.replace(/_/g, " ")}
-                      aria-label={result.name.replace(/_/g, " ")}
-                      onClick={e => {
-                        e.stopPropagation();
-                        // The library records picks from its own grid only,
-                        // so a pick from these search results is recorded
-                        // here for its Recently Used row.
-                        recordRecentEmoji(result.char);
-                        handleSelect(result.char);
-                      }}
-                      className="flex h-8 w-8 items-center justify-center rounded p-0 text-xl font-normal hover:bg-[var(--app-hover)]"
-                    >
-                      {result.char}
-                    </Button>
-                  ))
-                ) : (
-                  <div className="p-3 text-sm text-[var(--app-hint)]">
-                    No emojis match "{search}".
-                  </div>
-                )}
-              </div>
-            )}
+            <EmojiPickerBody
+              search={search}
+              width={PICKER_WIDTH}
+              height={GRID_HEIGHT}
+              onSelect={handleSelect}
+            />
             {emoji && (
               <Button
                 type="button"

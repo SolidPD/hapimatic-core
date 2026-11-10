@@ -6,6 +6,11 @@
    dedicated `shared/src/preferences.ts`) is a candidate follow-up. */
 import { z } from "zod";
 import {
+  MCP_SET_MAX_SERVERS,
+  McpServerNameSchema,
+  McpSetSchema,
+} from "./mcpSet";
+import {
   CLAUDE_PERMISSION_MODES,
   DEFAULT_SPAWN_PERMISSION_MODE,
   MODEL_MODES,
@@ -19,6 +24,15 @@ import { SPEND_LIMIT_VARIANTS } from "./apiErrorClasses";
 import { AccountMonogramSchema } from "./accountMonogram";
 import { StoredNotificationSchema } from "./notifications";
 import { ProviderIdSchema } from "./providerAuthState";
+import { PromptCacheStateSchema } from "./cacheKeepalive";
+import {
+  PIN_CHANGES,
+  PIN_KINDS,
+  PIN_RISKS,
+  PIN_STAKES,
+  PIN_STATUSES,
+  type PinKind,
+} from "./pins";
 
 export const PermissionModeSchema = z.enum(PERMISSION_MODES);
 /** Issue #2346: the Claude-only permission-mode subset (no codex modes). The
@@ -489,6 +503,11 @@ export const MetadataSchema = z
      *  reverts to the machine default. Optional: legacy/default-style sessions
      *  won't have it. */
     outputStyle: z.string().optional(),
+    /** Issue #6171: the MCP set this session started with, stamped CLI-side like
+     *  outputStyle so every respawn path re-applies it. `all` is stamped too,
+     *  because the metadata spread cannot clear a key. Absent = the project's list
+     *  decides. `.catch` so a malformed stamp never fails the whole metadata. */
+    mcpSet: McpSetSchema.optional().catch(undefined),
     /** Issue #3348: the non-claude native model SELECTED at spawn (a gemini model
      *  id or a codex ChatGPT-token model id), recorded SERVER-SIDE from the spawn
      *  body so the in-session UI can DISPLAY the active model for a flavor whose
@@ -641,12 +660,20 @@ export const UiCollapseStateSchema = z.object({
 
 export type UiCollapseState = z.infer<typeof UiCollapseStateSchema>;
 
-// Issue #3286 (View Picker · epic #3028 Sub A): the four selectable session
-// views. claude-pty is intentionally EXCLUDED (D5(a) — it stays a secondary
-// affordance, not a tab). DEFAULT_SESSION_VIEW is the shared source of truth
-// consumed on BOTH sides (server field default + the web no-flash localStorage
-// default), per the Frontend/Backend Preference Sync rule in web/CLAUDE.md.
-export const SESSION_VIEWS = ["chat", "terminal", "desktop", "files"] as const;
+// Issue #3286 (View Picker · epic #3028 Sub A): the selectable session views,
+// in tab order. claude-pty is intentionally EXCLUDED (D5(a) — it stays a
+// secondary affordance, not a tab). DEFAULT_SESSION_VIEW is the shared source of
+// truth consumed on BOTH sides (server field default + the web no-flash
+// localStorage default), per the Frontend/Backend Preference Sync rule in
+// web/CLAUDE.md. #6449: "pins" sits between Chat and Terminal; the web shows its
+// tab only while the pins gate is open (web/src/lib/session-view.ts).
+export const SESSION_VIEWS = [
+  "chat",
+  "pins",
+  "terminal",
+  "desktop",
+  "files",
+] as const;
 export type SessionView = (typeof SESSION_VIEWS)[number];
 export const DEFAULT_SESSION_VIEW: SessionView = "chat";
 export const SessionViewSchema = z.enum(SESSION_VIEWS);
@@ -803,6 +830,11 @@ export const SessionSchema = z
      *  message, so the chip uses the measurement only while this equals the
      *  current request — a pending pick is not shown as a mismatch. */
     appliedForEffort: z.string().nullable().optional(),
+    /** Issue #6169: the CLI-reported prompt-cache state (last cache touch, TTL
+     *  of the last write, idle start) the keep-alive scheduler reads. Fed from
+     *  the keepAlive tick by the SDK remote launcher only; absent elsewhere.
+     *  Live only: never persisted, never in the session summary. */
+    promptCache: PromptCacheStateSchema.nullable().optional(),
     // Issue #1469: first-order context window + live usage, sourced per turn
     // from Claude Code's get_context_usage. contextWindowTokens replaces the
     // deleted web-side [1m]-suffix heuristic (the actual 200k-vs-1M fix).
@@ -905,6 +937,75 @@ export const McpStatusUpdateSchema = z.object({
 });
 
 export type McpStatusUpdate = z.infer<typeof McpStatusUpdateSchema>;
+
+// ── MCP catalog (issue #6171) ────────────────────────────────────────
+// What the New Session picker and the Edit modal list for a project on a node.
+// No `url`: it can hold a stdio command line or query tokens, and the picker shows
+// names only.
+
+/** Memory one running copy of a server costs: median and max of PSS + SwapPss per
+ *  process tree on this node. Trees with a browser child are split out, because
+ *  they cost far more than an idle server. */
+export const McpServerRamCostSchema = z.object({
+  medianMb: z.number().nonnegative(),
+  maxMb: z.number().nonnegative(),
+  instances: z.number().int().nonnegative(),
+  sampledAt: z.string(),
+  withBrowser: z
+    .object({
+      medianMb: z.number().nonnegative(),
+      instances: z.number().int().nonnegative(),
+    })
+    .optional(),
+});
+export type McpServerRamCost = z.infer<typeof McpServerRamCostSchema>;
+
+/** Tokens a server adds to a session's context, from the last session that measured
+ *  it. Deferred tool schemas are loaded on demand and are not in the window. */
+export const McpServerContextCostSchema = z.object({
+  inContextTokens: z.number().nonnegative(),
+  deferredTokens: z.number().nonnegative(),
+  toolCount: z.number().int().nonnegative(),
+  sampledAt: z.string(),
+});
+export type McpServerContextCost = z.infer<typeof McpServerContextCostSchema>;
+
+export const McpCatalogEntrySchema = z.object({
+  name: z.string(),
+  status: McpServerStatusSchema.shape.status,
+  /** Off for this project (`disabledMcpServers` under the canonical git root). */
+  projectDisabled: z.boolean(),
+  /** Runs on Anthropic's servers, so it has no local process. */
+  hosted: z.boolean(),
+  ram: McpServerRamCostSchema.optional(),
+  context: McpServerContextCostSchema.optional(),
+});
+export type McpCatalogEntry = z.infer<typeof McpCatalogEntrySchema>;
+
+export const McpCatalogResponseSchema = z.object({
+  servers: z.array(McpCatalogEntrySchema),
+  /** The project key: the canonical git root, else the directory. */
+  projectRoot: z.string().nullable(),
+  /** The set stored for this project, or null when none is. */
+  projectDefault: McpSetSchema.nullable(),
+  checkedAt: z.string().nullable(),
+  /** True when no global poll has finished yet, so the list may be short. */
+  stale: z.boolean(),
+});
+export type McpCatalogResponse = z.infer<typeof McpCatalogResponseSchema>;
+
+/** POST /cli/mcp-costs: per-server measurements from a daemon or a session. */
+export const McpCostsUpdateSchema = z.object({
+  ram: z
+    .array(McpServerRamCostSchema.extend({ name: McpServerNameSchema }))
+    .max(MCP_SET_MAX_SERVERS)
+    .optional(),
+  context: z
+    .array(McpServerContextCostSchema.extend({ name: McpServerNameSchema }))
+    .max(MCP_SET_MAX_SERVERS)
+    .optional(),
+});
+export type McpCostsUpdate = z.infer<typeof McpCostsUpdateSchema>;
 
 // ── MCP Batch Coordinator (issue #989 follow-up) ─────────────────────
 // Server-side worker reconciles desired vs current MCP state. Survives
@@ -1336,6 +1437,20 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
     type: z.literal("notifications-cleared"),
     namespace: z.string().min(1),
     dismissedAt: z.number(),
+  }),
+  // Issue #6447 (epic #6446): a session's pin changed. An invalidation plus one
+  // number: it carries no pin content, because a client refetches the record (the
+  // #3018 rationale above) and agent text stays out of the SSE and bridge streams.
+  // `openPinCount` lets the tab badge and the hub's cached summary update with no
+  // refetch; a client must not invalidate the session lists on this event (#6208).
+  // Session-scoped, so it stays out of HOST_GLOBAL_EVENT_TYPES.
+  SessionChangedSchema.extend({
+    type: z.literal("pin-changed"),
+    key: z.string(),
+    change: z.enum(PIN_CHANGES),
+    revision: z.number().int(),
+    status: z.enum(PIN_STATUSES),
+    openPinCount: z.number().int().nonnegative(),
   }),
 ]);
 
@@ -1904,6 +2019,133 @@ export type AccountsUsageViewPreference = z.infer<
 >;
 export const ACCOUNTS_USAGE_VIEW_DEFAULT: AccountsUsageViewPreference = {};
 
+// The Pins tab's default view, set in Preferences (#6451, epic #6446 E). A
+// federation-native key like `accountsUsageView`. A session's own choices stay
+// on the device (web `lib/pins/viewState.ts`); this is only what a session
+// with no saved choice opens with. The schema is LOOSE on purpose: every field
+// is optional and catches to undefined, so a value written by a newer node (a
+// new facet value, sort or grouping) loses only that one field on an older
+// node, where a strict schema would drop the whole record (the registry checks
+// both the wire value and the stored value with this one schema). Known gap:
+// an edit made on that older node writes the whole record back without the
+// field, so the newer node loses it too (the #6451 sink follow-up).
+export const PINS_VIEW_SORTS = [
+  "priority",
+  "deadline",
+  "updated",
+  "created",
+  "kind",
+  "title",
+  "source",
+] as const;
+export const PINS_VIEW_GROUPS = [
+  "status",
+  "kind",
+  "source",
+  "window",
+  "none",
+] as const;
+export const PINS_VIEW_DIRECTIONS = ["desc", "asc"] as const;
+export type PinsViewSort = (typeof PINS_VIEW_SORTS)[number];
+export type PinsViewGroup = (typeof PINS_VIEW_GROUPS)[number];
+export type PinsViewDirection = (typeof PINS_VIEW_DIRECTIONS)[number];
+
+function withAll<const T extends readonly string[]>(
+  values: T
+): readonly ["all", ...T] {
+  return ["all", ...values] as const;
+}
+
+/** Every Filter facet's values, "all" first. The content lists come from the
+ * pin constants, so a new kind, stakes or risk cannot be missed. Dashboards
+ * (H) are not in the Kind facet; they are not listed in the Pins view. */
+export const PINS_VIEW_FACETS = {
+  status: withAll(["action", "completed"] as const),
+  kind: withAll(
+    PIN_KINDS.filter(
+      (kind): kind is Exclude<PinKind, "dashboard"> => kind !== "dashboard"
+    )
+  ),
+  blocking: withAll(["yes", "no"] as const),
+  stakes: withAll(PIN_STAKES),
+  risk: withAll(PIN_RISKS),
+  deadline: withAll(["has", "soon", "none"] as const),
+  decidedBy: withAll(["operator", "auto", "agent"] as const),
+  answer: withAll(["chosen", "none"] as const),
+  comments: withAll(["yes"] as const),
+  files: withAll(["yes"] as const),
+  starred: withAll(["yes"] as const),
+  changed: withAll(["yes"] as const),
+  source: withAll(["this", "other"] as const),
+} as const;
+export type PinsViewFacet = keyof typeof PINS_VIEW_FACETS;
+export type PinsViewFacetValue<F extends PinsViewFacet = PinsViewFacet> =
+  (typeof PINS_VIEW_FACETS)[F][number];
+export type PinsViewFilters = {
+  [F in PinsViewFacet]: PinsViewFacetValue<F>;
+};
+
+/**
+ * One loose field: a value this build cannot read becomes undefined. The
+ * return type is left inferred: it is Zod's optional-with-catch enum type,
+ * which spelled out would only repeat this expression.
+ */
+function looseEnum<const T extends readonly string[]>(values: T) {
+  return z.enum(values).optional().catch(undefined);
+}
+
+export const PinsViewFiltersPreferenceSchema = z.object({
+  status: looseEnum(PINS_VIEW_FACETS.status),
+  kind: looseEnum(PINS_VIEW_FACETS.kind),
+  blocking: looseEnum(PINS_VIEW_FACETS.blocking),
+  stakes: looseEnum(PINS_VIEW_FACETS.stakes),
+  risk: looseEnum(PINS_VIEW_FACETS.risk),
+  deadline: looseEnum(PINS_VIEW_FACETS.deadline),
+  decidedBy: looseEnum(PINS_VIEW_FACETS.decidedBy),
+  answer: looseEnum(PINS_VIEW_FACETS.answer),
+  comments: looseEnum(PINS_VIEW_FACETS.comments),
+  files: looseEnum(PINS_VIEW_FACETS.files),
+  starred: looseEnum(PINS_VIEW_FACETS.starred),
+  changed: looseEnum(PINS_VIEW_FACETS.changed),
+  source: looseEnum(PINS_VIEW_FACETS.source),
+});
+export const PinsViewPreferenceSchema = z.object({
+  filters: PinsViewFiltersPreferenceSchema.optional().catch(undefined),
+  sort: looseEnum(PINS_VIEW_SORTS),
+  dir: looseEnum(PINS_VIEW_DIRECTIONS),
+  group: looseEnum(PINS_VIEW_GROUPS),
+});
+export type PinsViewPreference = z.infer<typeof PinsViewPreferenceSchema>;
+/** No defaults set: every field falls back to {@link PINS_VIEW_BUILTIN}. */
+export const PINS_VIEW_DEFAULT: PinsViewPreference = {};
+/** The built-in view: every facet "all", Priority, Descending, by Status. It
+ * reproduces C's list exactly (#6449 `groupPins`). */
+export const PINS_VIEW_BUILTIN: {
+  filters: PinsViewFilters;
+  sort: PinsViewSort;
+  dir: PinsViewDirection;
+  group: PinsViewGroup;
+} = {
+  filters: {
+    status: "all",
+    kind: "all",
+    blocking: "all",
+    stakes: "all",
+    risk: "all",
+    deadline: "all",
+    decidedBy: "all",
+    answer: "all",
+    comments: "all",
+    files: "all",
+    starred: "all",
+    changed: "all",
+    source: "all",
+  },
+  sort: "priority",
+  dir: "desc",
+  group: "status",
+};
+
 // ── Federation-global settings layer (#2624, epic #2622 Sub-Issue B) ──
 //
 // The generic per-node settings model: each registered setting has a
@@ -1925,7 +2167,8 @@ export const ACCOUNTS_USAGE_VIEW_DEFAULT: AccountsUsageViewPreference = {};
 // in the browser. `shareApiKeysByDefault` (#5127) is federation-native too: the
 // initial state of the add forms' "Make available to all nodes" checkbox.
 // `accountsUsageView` (#4467) is federation-native: each Accounts-page provider
-// section's usage view (Bars / Arcs / Chips).
+// section's usage view (Bars / Arcs / Chips). `pinsView` (#6451) is
+// federation-native: the Pins tab's default filters, sort and grouping.
 export const FEDERATION_SETTING_KEYS = [
   "chatSections",
   "defaultOutputStyle",
@@ -1933,6 +2176,7 @@ export const FEDERATION_SETTING_KEYS = [
   "terminalKeyboardExpanded",
   "shareApiKeysByDefault",
   "accountsUsageView",
+  "pinsView",
 ] as const;
 export type FederationSettingKey = (typeof FEDERATION_SETTING_KEYS)[number];
 
@@ -2160,6 +2404,10 @@ export const McpToggleRequestSchema = z
 export type McpToggleRequest = z.infer<typeof McpToggleRequestSchema>;
 
 export const McpToggleErrorCodeSchema = z.enum([
+  /** Issue #6171: `hapi` stays on in every session. */
+  "hapi_protected",
+  /** Issue #6171: this session started with an MCP set; changing it needs a relaunch. */
+  "mcp_set_requires_relaunch",
   "local_mode_not_supported",
   "server_not_found",
   "transport_failed",
@@ -2390,10 +2638,11 @@ export type McpSetDesiredRequest = z.infer<typeof McpSetDesiredRequestSchema>;
 
 /**
  * Issue #2149 — request body for `POST /api/sessions/:id/relaunch` (and the
- * federation receiver). v1 overrides cover ONLY the spawn-frozen params that have
- * NO live-mutation plane — `launcher` and `safeMode`. The live-plane params
- * (modelMode / permission-mode / MCP / effort / rawModel) are NOT relaunch
- * overrides: they apply in place via their own routes (KD-2). All fields optional;
+ * federation receiver). The overrides cover the spawn-frozen params that have
+ * NO live-mutation plane — `launcher`, `safeMode` and (#6171) the session's MCP
+ * set. The live-plane params (modelMode / permission-mode / per-server MCP
+ * toggles / effort / rawModel) are NOT relaunch overrides: they apply in place
+ * via their own routes (KD-2). All fields optional;
  * an empty body is a no-op `--resume` relaunch with unchanged params. Modeled on
  * `spawnBodySchema` (machines.ts) and reuses `ClaudeRemoteLauncherKindSchema`;
  * `.passthrough()` for federation forward-compat, matching the sibling
@@ -2406,6 +2655,12 @@ export const RelaunchRequestSchema = z
     launcher: ClaudeRemoteLauncherKindSchema.optional(),
     /** `--safe-mode` toggle — spawn-frozen, relaunch-only. */
     safeMode: z.boolean().optional(),
+    /** Issue #6171: the session's new MCP set. The deny list is read at start, so
+     *  a change needs a relaunch. */
+    mcpSet: McpSetSchema.optional(),
+    /** Issue #6171: save `mcpSet` on the session with no respawn, for a stopped
+     *  session or when an account switch is about to restart it anyway. */
+    persistOnly: z.boolean().optional(),
   })
   .passthrough();
 export type RelaunchRequest = z.infer<typeof RelaunchRequestSchema>;

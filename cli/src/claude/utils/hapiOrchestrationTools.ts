@@ -36,6 +36,7 @@ import {
   type PermissionMode,
 } from "@hapi/protocol/modes";
 import { EffortLevelSchema } from "@hapi/protocol/schemas";
+import { McpSetSchema, type McpSet } from "@hapi/protocol";
 
 /** The request a typed tool hands to `call()` — the `hapi_call` input. */
 export type TypedCallRequest = {
@@ -90,6 +91,7 @@ export type SpawnSessionArgs = {
   model?: string;
   modelMode?: string;
   effort?: EffortLevel;
+  mcpSet?: McpSet;
 };
 
 export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
@@ -164,6 +166,11 @@ export const spawnSessionTool: OrchestrationToolSpec<SpawnSessionArgs> = {
     // effort on a non-Claude spawn and ignores it, so the description says so.
     effort: EffortLevelSchema.optional().describe(
       "Claude sessions only. Reasoning effort: low, medium, high, xhigh or max. Omit it to use the target node's default (xhigh unless the node sets HAPI_DEFAULT_EFFORT or settings.json defaultEffort)."
+    ),
+    // Issue #6171: the shared schema, because this zod object strips unknown
+    // keys and a hand-copied shape would drift.
+    mcpSet: McpSetSchema.optional().describe(
+      'Claude sessions only. The MCP servers the peer starts with: {"mode":"only","servers":["name", ...]} (names as `claude mcp list` prints them; an empty list keeps only hapi) or {"mode":"all"}. Omit it to use the project\'s default set, else every server. hapi is always on. A server that is off for the project is refused unless listed in enableForProject, which turns it on for the whole project.'
     ),
   }) as z.ZodType<SpawnSessionArgs>,
   segments: ["machineId"],

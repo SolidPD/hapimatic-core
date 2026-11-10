@@ -15,6 +15,12 @@ import { getToolIcon } from "@/components/ToolCard/knownTools";
 import { useHappyChatContext } from "@/components/AssistantChat/context";
 import { useMessageDetailOverride } from "@/components/AssistantChat/messages/HiddenToolSummary";
 import { CompactChevron } from "@/components/AssistantChat/messages/CompactChevron";
+import {
+  collectPinKeysDeep,
+  pinToolKey,
+  ToolPinCard,
+  ToolPinCards,
+} from "@/components/AssistantChat/messages/PinChatShims";
 import { CliOutputBlock } from "@/components/CliOutputBlock";
 import {
   extractImagesFromResult,
@@ -309,9 +315,12 @@ function HappyNestedBlockList(props: { blocks: ChatBlock[] }) {
           // here has the variable it references.
           if (hints.toolCards === "hidden" && !forceFull) {
             const hiddenImages = collectImagesDeep(block);
-            return hiddenImages.length ? (
+            // #6450: a hidden pin_post still shows its pin, like a screenshot.
+            const hiddenPins = collectPinKeysDeep(block);
+            return hiddenImages.length || hiddenPins.length ? (
               <div key={`tool:${block.id}`} className="py-1">
                 {renderHoistedImages(hiddenImages)}
+                <ToolPinCards pinKeys={hiddenPins} />
               </div>
             ) : null;
           }
@@ -323,6 +332,7 @@ function HappyNestedBlockList(props: { blocks: ChatBlock[] }) {
           // renders its own image, so a deep collect here would double-render it (V4).
           const hoistedImages = extractImagesFromResult(block.tool.result);
           const registerDescriptor = extractRegisterDescriptor(block);
+          const pinKey = pinToolKey(block);
 
           const toolBody = (
             <>
@@ -384,6 +394,7 @@ function HappyNestedBlockList(props: { blocks: ChatBlock[] }) {
                 toolBody
               )}
               {renderHoistedImages(hoistedImages)}
+              {pinKey ? <ToolPinCard pinKey={pinKey} /> : null}
             </div>
           );
         }
@@ -475,6 +486,9 @@ export function HappyToolMessage(props: ToolCallMessagePartProps) {
   // by OutputOnlyToolPart (AssistantMessage.tsx), so region B never needs a deep collect.
   const hoistedImages = extractImagesFromResult(block.tool.result);
   const registerDescriptor = extractRegisterDescriptor(block);
+  // #6450: a pin_post / pin_update call shows its pin below the tool row,
+  // always visible like a hoisted image, however the row is collapsed.
+  const pinKey = pinToolKey(block);
 
   const toolBody = (
     <>
@@ -542,6 +556,7 @@ export function HappyToolMessage(props: ToolCallMessagePartProps) {
         toolBody
       )}
       {renderHoistedImages(hoistedImages)}
+      {pinKey ? <ToolPinCard pinKey={pinKey} /> : null}
     </div>
   );
 }

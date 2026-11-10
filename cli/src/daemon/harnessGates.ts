@@ -82,6 +82,16 @@ export function harnessSupportsOutputStyle(agent: string | undefined): boolean {
 }
 
 /**
+ * Whether an agent honors Hapimatic's per-session MCP set (`--hapi-mcp-set`,
+ * issue #6171). The set rides `deniedMcpServers` in the generated `--settings`
+ * file, which only Claude Code reads; the manifests carry no MCP axis yet, so
+ * this is Claude-only like the server's own refusal of a set for another agent.
+ */
+export function harnessSupportsMcpSet(agent: string | undefined): boolean {
+  return agent === "claude" || !agent;
+}
+
+/**
  * Whether an agent takes a starting permission-mode seed
  * (`--hapi-permission-mode`, issue #6218): a harness with RUNTIME permission
  * modes (Claude, Codex) can start in a mode other than its default. Gemini and

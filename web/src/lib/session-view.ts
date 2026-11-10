@@ -19,6 +19,7 @@ import { getStorageKey } from "@/lib/storage-keys";
 
 export const SESSION_VIEW_LABELS: Record<SessionView, string> = {
   chat: "Chat",
+  pins: "Pins",
   terminal: "Terminal",
   desktop: "Desktop",
   files: "Files",
@@ -60,6 +61,28 @@ export type SessionViewAvailabilityOptions = {
    * the version query is in flight.
    */
   desktopEligible?: boolean;
+  /**
+   * #6449: whether this instance's pins gate is open (`GET /api/version`
+   * `pinsEnabled: true`). Default-CLOSED: anything but a literal `true` keeps
+   * the Pins view unavailable, because the gate opens only on `true`
+   * (server/src/web/middleware/pinsGate.ts).
+   */
+  pinsEnabled?: boolean;
+  /**
+   * #6449: whether the session's detail response carried a numeric
+   * `openPinCount` — the owning node's gate is open and it serves pins. `0` is a
+   * known count. Absent means the node cannot serve pins (R19).
+   */
+  pinCountKnown?: boolean;
+};
+
+/**
+ * #6449: the availability options plus whether the inputs have arrived, from
+ * `useSessionViewOptions`. `settled` is true once the version has been read
+ * successfully and the session detail query has answered.
+ */
+export type SessionViewOptions = SessionViewAvailabilityOptions & {
+  settled: boolean;
 };
 
 /**
@@ -74,6 +97,12 @@ export type SessionViewAvailabilityOptions = {
  *   (`opts.desktopEligible !== false`) — the server only proxies a desktop on
  *   Pro-and-up cloud VMs, so on a home instance (RP1/RP2/SL7) the tab is greyed
  *   instead of erroring.
+ * - **pins** (#6449) requires the pins gate open on this instance AND a known
+ *   open-pin count for the session. Pins records live on the server, so an
+ *   inactive session's Pins view still works (no `session.active` test).
+ *
+ * A view this build does not know (a newer or older peer's value) is
+ * unavailable (R20).
  */
 export function isSessionViewAvailable(
   view: SessionView,
@@ -89,7 +118,27 @@ export function isSessionViewAvailable(
       return session.active === true && opts.desktopEligible !== false;
     case "files":
       return session.active === true && Boolean(session.metadata?.path);
+    case "pins":
+      return opts.pinsEnabled === true && opts.pinCountKnown === true;
+    default:
+      return false;
   }
+}
+
+/**
+ * #6449: whether a view's tab is rendered at all. Every view but Pins always
+ * renders (an unavailable one greys out); Pins renders only while its gate is
+ * open and the count is known — or while it is the active view, so a later
+ * poll that lacks the count does not pull the tab out from under the page.
+ */
+export function isSessionViewVisible(
+  view: SessionView,
+  opts: SessionViewAvailabilityOptions,
+  activeView: SessionView | null
+): boolean {
+  if (view !== "pins") return true;
+  if (opts.pinsEnabled !== true) return false;
+  return opts.pinCountKnown === true || activeView === "pins";
 }
 
 // ── No-flash localStorage cache (R7) ────────────────────────────────────────
@@ -131,11 +180,53 @@ export function computeEffectiveSessionView(
   session: Session,
   sessionId: string
 ): SessionView {
-  return (
-    session.persistedView ??
-    readCachedSessionView(sessionId) ??
-    DEFAULT_SESSION_VIEW
-  );
+  const persisted = session.persistedView;
+  // R20: a persisted value this build does not know resolves like no value.
+  const known =
+    persisted && (SESSION_VIEWS as readonly string[]).includes(persisted)
+      ? persisted
+      : null;
+  return known ?? readCachedSessionView(sessionId) ?? DEFAULT_SESSION_VIEW;
+}
+
+/** #6453: the Pins link a session URL carries: `?at=` (`"at"`) or `?pin=` (`"pin"`). */
+export type OpenRedirectLink = "at" | "pin" | null;
+
+export type OpenRedirectDecision =
+  | { kind: "none" }
+  | { kind: "pending" }
+  | { kind: "jump" }
+  | { kind: "reveal" }
+  | { kind: "redirect"; view: SessionView };
+
+/**
+ * #6449: the open-redirect decision, shared by the `SessionChat` redirect and
+ * the full-screen restore so they never disagree.
+ * A persisted Pins view waits ("pending", do not mark consumed) until the
+ * version has been read successfully and the detail query has answered,
+ * because Pins availability depends on both; every other view keeps its
+ * pre-#6449 behavior.
+ * #6453 (R13): a Pins link works only while the Pins gate is open, so it waits
+ * for the same inputs. A `?pin=` link opens the Pins tab ("reveal") and a
+ * `?at=` link keeps the chat ("jump"); with the gate closed either is ignored
+ * and the persisted view wins, as before G.
+ */
+export function pendingOpenRedirect(
+  session: Session,
+  sessionId: string,
+  opts: SessionViewOptions,
+  link: OpenRedirectLink = null
+): OpenRedirectDecision {
+  if (link === "pin" && !opts.settled) return { kind: "pending" };
+  if (link === "pin" && opts.pinsEnabled === true) return { kind: "reveal" };
+  const view = computeEffectiveSessionView(session, sessionId);
+  if (view === "chat") return { kind: "none" };
+  if (link === "at" && !opts.settled) return { kind: "pending" };
+  if (link === "at" && opts.pinsEnabled === true) return { kind: "jump" };
+  if (view === "pins" && !opts.settled) return { kind: "pending" };
+  return isSessionViewAvailable(view, session, opts)
+    ? { kind: "redirect", view }
+    : { kind: "none" };
 }
 
 // ── One-shot open-redirect guard (Back-loop-safe) ───────────────────────────

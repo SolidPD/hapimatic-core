@@ -39,6 +39,10 @@ export const PROGRAMMATIC_SENT_FROM_VALUES = [
   "handoff", // successor-handoff packet delivery (successorHandoffWiring.ts)
   "system-notice", // server-injected notices, e.g. the model-downgrade halt notice
   "self-update", // self-update impact-analysis peer seed prompt (impactOrchestrator.ts)
+  // #6452: an automatic pick the server sends when a pin's deadline passes. Not
+  // the operator: it must not reset the runaway ceiling guard (#5254), abort an
+  // auto-recovery, or run user-prompt hooks.
+  "pin-deadline",
 ] as const;
 
 /** The `sentFrom` union both `sendMessage` signatures accept. */

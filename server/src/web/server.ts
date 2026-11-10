@@ -129,6 +129,8 @@ export async function startWebServer(options: {
   getTelemetryStore?: () =>
     | import("../store/telemetryStore").TelemetryStore
     | null;
+  /** Issue #6516: where the Analytics reads run; forwarded to buildWebApp. */
+  telemetryExecutor?: import("../telemetry/executor").TelemetryExecutor | null;
   /** Issue #3128: the Harness Scorecard store, forwarded to createWebApp. */
   getScorecardStore?: () =>
     | import("../store/scorecardStore").ScorecardStore
@@ -173,6 +175,7 @@ export async function startWebServer(options: {
     embeddedAssetMap,
     errorLogger: options.errorLogger,
     getTelemetryStore: options.getTelemetryStore,
+    telemetryExecutor: options.telemetryExecutor,
     getScorecardStore: options.getScorecardStore,
     getWebhookGapDetector: options.getWebhookGapDetector,
     getRpcRegistry: options.getRpcRegistry,

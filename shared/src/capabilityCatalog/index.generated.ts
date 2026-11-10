@@ -1702,6 +1702,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When a peer browses this node's files to pick a spawn directory."
   },
   {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "List the MCP servers known for a directory on this node for a peer's New Session form.",
+    "domain": "federation",
+    "id": "federation.mcp-catalog",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/mcp-catalog"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a peer's New Session form or configuration modal targets this node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Store or clear a project's default MCP set on this node for a peer.",
+    "domain": "federation",
+    "id": "federation.mcp-project-default",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/mcp-project-default"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a peer's user saves a default for a project here."
+  },
+  {
     "auth": "jwt",
     "availability": {
       "scope": "user"
@@ -3928,6 +3968,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To check an instance's security posture, or tighten its credential file modes with --fix."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Start the telemetry query worker the way the server does and run one ping job against a scratch database (issue #6516).",
+    "domain": "harness-admin",
+    "id": "harness-admin.cli-selftest",
+    "invocation": {
+      "command": "selftest",
+      "kind": "cli"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "cli",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To check that a binary's bundled telemetry query worker starts (the build runs it on every binary it can execute)."
   },
   {
     "auth": "none",
@@ -6796,6 +6855,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When an agent or the UI enumerates available capabilities."
   },
   {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List the MCP servers known for a project on a node, with each server's project state, RAM and context cost, and the project's default set.",
+    "domain": "mcp",
+    "id": "mcp.catalog",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/mcp-catalog"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the New Session form or the session configuration modal lists MCP servers."
+  },
+  {
     "auth": "cli-token",
     "availability": {
       "scope": "operator"
@@ -6813,6 +6892,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To list, add, remove, or check MCP servers from the CLI."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Record measured per-server MCP RAM and context cost for this node over the CLI-token surface.",
+    "domain": "mcp",
+    "id": "mcp.cli-update-costs",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/mcp-costs"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a daemon samples MCP process memory or a session measures MCP context cost."
   },
   {
     "auth": "cli-token",
@@ -6909,6 +7008,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To list sessions."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Store or clear a project's default MCP set on a node. The default pre-fills the New Session form and applies to spawns that name no set.",
+    "domain": "mcp",
+    "id": "mcp.project-default",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/mcp-project-default"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user saves or clears a project's default MCP set."
   },
   {
     "auth": "jwt",
@@ -8814,6 +8933,246 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Send the operator's staged pin answers as one user message and record them, on the node that owns the session. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pin-answers",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pin-answers"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When submitting pin answers to a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Move, stop, or restart a pin's automatic pick on the node that owns the session. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-deadline",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/federation/sessions/:id/pins/:key/deadline"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When changing the automatic pick of a pin whose session lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Dismiss a pin on the node that owns the session. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-dismiss",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pins/:key/dismiss"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When dismissing a pin of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Make a pin's folder in the session's folder and name it, on the node that owns the session. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-folder",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pins/:key/folder"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an agent asks for a pin folder for a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Read one of a session's pins on the node that owns it. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-get",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/federation/sessions/:id/pins/:key"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When reading a pin of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "List a session's pins on the node that owns it. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-list",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/federation/sessions/:id/pins"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When listing the pins of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Post or update a pin on the node that owns the session. Peer-incoming; a hub's CLI route proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-put",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/federation/sessions/:id/pins/:key"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When posting a pin to a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Record a decision an agent reports on a pin, on the node that owns the session. Peer-incoming; a hub's CLI route proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-resolve",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pins/:key/resolve"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When resolving a pin of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Copy a pin's files into its folder under GeneratedFiles/pins/ and record the save, on the node that owns the session. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-save",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pins/:key/save"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When saving a pin's files for a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Mark a pin seen on the node that owns the session. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-seen",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/federation/sessions/:id/pins/:key/seen"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When marking a pin seen on a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Star or unstar a pin on the node that owns the session. Peer-incoming; the hub proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-star",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/federation/sessions/:id/pins/:key/star"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When starring a pin of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Withdraw a pin on the node that owns the session. Peer-incoming; a hub's CLI route proxies here for a remote-owned session.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-withdraw",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pins/:key/withdraw"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When withdrawing a pin of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Read a session's token-usage totals and per-turn breakdown from the node that owns it. Peer-incoming receiver behind namespace ownership.",
     "domain": "session-introspection",
     "id": "session-introspection.api-federation-sessions-token-stats",
@@ -9029,6 +9388,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Read one of a session's pins by its key, with its answer history.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-get-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/cli/sessions/:id/pins/:key"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an agent re-reads one pin it has raised."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Submit a peer-to-server impact-analysis artifact over the CLI-token surface.",
     "domain": "session-introspection",
     "id": "session-introspection.cli-impact-artifact",
@@ -9043,6 +9422,106 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When a peer session reports its impact-analysis result."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List a session's pins with their answer history, so an agent that lost its context can re-read instead of asking again.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-list-pins",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/cli/sessions/:id/pins"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an agent re-reads the pins it has raised, for example after a compaction."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Make the folder for one pin's files in the session's folder, kept out of git and deleted with the session, and name it and the GeneratedFiles/pins/ folder Save copies into.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-pin-folder",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/sessions/:id/pins/:key/folder"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an agent is about to write files a pin will show (pin_folder)."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Check whether a turn ends on an ask no pin covers: nudge mode answers block or none; detect mode pins the unpinned ask from the stored messages.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-pin-turn-end",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/sessions/:id/pins/turn-end"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When Hapimatic's Stop hook decides whether to nudge the agent to pin a decision, or pins it anyway."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Post a pin, or replace one, by its key: a decision or steps that need the operator. A re-post with the same content changes nothing. With mustExist=1 an absent key is an error.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-put-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/cli/sessions/:id/pins/:key"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an agent raises or updates a decision for the operator."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Record a decision the operator made in free text in the chat, so the pin does not go stale. Always recorded as reported by the agent, never as the operator's own answer.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-resolve-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/sessions/:id/pins/:key/resolve"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an agent acts on a decision the operator gave in the chat rather than on the pin."
   },
   {
     "auth": "cli-token",
@@ -9105,6 +9584,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "When orphan-adoption heals the parent stamp of a session whose spawn timed out after the daemon succeeded."
   },
   {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Withdraw a pin an agent raised, when the question no longer applies.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-withdraw-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/sessions/:id/pins/:key/withdraw"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an agent no longer needs the operator's answer."
+  },
+  {
     "auth": "jwt",
     "availability": {
       "scope": "user"
@@ -9143,6 +9642,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the user opens a session and needs its complete state."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Dismiss one of a session's pins on the operator's behalf, which closes it without an answer. A session cannot dismiss its own pins.",
+    "domain": "session-introspection",
+    "id": "session-introspection.dismiss-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/sessions/:id/pins/:key/dismiss"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user dismisses a pin."
   },
   {
     "auth": "federation-token",
@@ -9223,6 +9742,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "off",
     "trusted": true,
     "whenToUse": "When the hub aggregates sessions across the mesh and needs this node's roster."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Return this node's Project Manager dashboard pins in the caller's namespace, with the facts of the sessions their lanes name (POST because the node proxy only issues POST).",
+    "domain": "session-introspection",
+    "id": "session-introspection.federation-pin-dashboards",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/pins/dashboards"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub gathers Project Manager dashboards from a peer node for the Pins tab."
   },
   {
     "auth": "federation-token",
@@ -9344,6 +9883,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "whenToUse": "To read how much of the context window the session has used."
   },
   {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read one of a session's pins by its key, with its answer history.",
+    "domain": "session-introspection",
+    "id": "session-introspection.get-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/sessions/:id/pins/:key"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When showing a single pin."
+  },
+  {
     "auth": "cli-token",
     "availability": {
       "scope": "user"
@@ -9427,6 +9986,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "List every Project Manager dashboard pin in the caller's namespace across federated nodes, with each lane session's name, model, account, node, status, open pins, stage, and cost.",
+    "domain": "session-introspection",
+    "id": "session-introspection.list-pin-dashboards",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/pins/dashboards"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When rendering the Project Managers section of the Pins tab."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List a session's pins: the decisions, steps, and dashboards it has raised for the operator, with the open count.",
+    "domain": "session-introspection",
+    "id": "session-introspection.list-pins",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/sessions/:id/pins"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When rendering a session's Pins tab."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Enumerate an agent's available slash commands. A read tagged mutating (tool group, R4).",
     "domain": "session-introspection",
     "id": "session-introspection.list-slash-commands",
@@ -9440,6 +10039,166 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To list the slash commands available to the session's agent."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Mark one of a session's pins seen at its current revision, which clears its New marker until it changes again.",
+    "domain": "session-introspection",
+    "id": "session-introspection.mark-pin-seen",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/sessions/:id/pins/:key/seen"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user opens a pin."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "gate": "pins",
+      "scope": "user"
+    },
+    "description": "Get the folder for one pin's files, kept out of git and deleted with the session, and the GeneratedFiles/pins/ folder Save copies into.",
+    "domain": "session-introspection",
+    "id": "session-introspection.pin-folder",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "pin_folder"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "Before writing pages, images or mockups a pin will show."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "gate": "pins",
+      "scope": "user"
+    },
+    "description": "Read this session's pins with their answer history: one pin in full by key, or every open and live pin.",
+    "domain": "session-introspection",
+    "id": "session-introspection.pin-get",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "pin_get"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "After a compaction or restart, to re-read pins instead of asking again."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "gate": "pins",
+      "scope": "user"
+    },
+    "description": "Pin a decision or steps for the operator under a stable key; re-posting the key updates that pin. An error result says whether it was saved.",
+    "domain": "session-introspection",
+    "id": "session-introspection.pin-post",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "pin_post"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To ask the operator a decision you need, in the Pins tab."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "gate": "pins",
+      "scope": "user"
+    },
+    "description": "Record a decision the operator gave in the chat on the matching pin, so it does not go stale.",
+    "domain": "session-introspection",
+    "id": "session-introspection.pin-resolve",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "pin_resolve"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the operator answered a pinned question in the chat."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "gate": "pins",
+      "scope": "user"
+    },
+    "description": "Replace one of this session's existing pins in full, by key; fails if the key does not exist.",
+    "domain": "session-introspection",
+    "id": "session-introspection.pin-update",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "pin_update"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To revise a pin you already posted."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "gate": "pins",
+      "scope": "user"
+    },
+    "description": "Withdraw one of this session's pins when its question no longer applies.",
+    "domain": "session-introspection",
+    "id": "session-introspection.pin-withdraw",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "pin_withdraw"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To take back a question the operator no longer needs to answer."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Copy one pin's files into its folder under GeneratedFiles/pins/ in the session's folder and record it, so the next Submit tells the agent. A session cannot save its own pins.",
+    "domain": "session-introspection",
+    "id": "session-introspection.save-pin-files",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/sessions/:id/pins/:key/save"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user presses Save to session folder on a pin."
   },
   {
     "auth": "jwt",
@@ -9526,6 +10285,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Move, stop, or restart the automatic pick on one of a session's open pins: an instant at least a minute and at most a year away, or off. Refuses an agent caller.",
+    "domain": "session-introspection",
+    "id": "session-introspection.set-pin-deadline",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/sessions/:id/pins/:key/deadline"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user changes or turns off a pin's automatic pick in the deadline dialog."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Persist the session-list search and filter bar state (query, active filters, sort) for the web UI.",
     "domain": "session-introspection",
     "id": "session-introspection.set-search-filter-preference",
@@ -9560,6 +10339,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When populating a session's slash-command menu."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Star or unstar one of a session's pins, which floats it to the top of the session's Action Items.",
+    "domain": "session-introspection",
+    "id": "session-introspection.star-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/sessions/:id/pins/:key/star"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user stars or unstars a pin."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Send the operator's staged pin answers to a session as one user message and record them on its pins, each against the revision it was made on. Refuses an agent caller.",
+    "domain": "session-introspection",
+    "id": "session-introspection.submit-pin-answers",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/sessions/:id/pin-answers"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user submits staged pin answers."
   },
   {
     "auth": "jwt",
@@ -9985,7 +10804,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
-    "description": "Relaunch a session on the node that owns it, applying a new launcher or safe-mode selection and restarting the process. Peer-incoming receiver for a remote-owned session.",
+    "description": "Relaunch a session on the node that owns it, applying a new launcher, safe-mode or MCP set selection and restarting the process. Peer-incoming receiver for a remote-owned session.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.api-federation-sessions-relaunch",
     "invocation": {
@@ -10045,7 +10864,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
-    "description": "Persist a session's selected view (chat, terminal, desktop, files) on the node that owns it. Peer-incoming PUT field receiver for a remote-owned session.",
+    "description": "Persist a session's selected view (chat, pins, terminal, desktop, files) on the node that owns it. Peer-incoming PUT field receiver for a remote-owned session.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.api-federation-sessions-view",
     "invocation": {
@@ -10371,6 +11190,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the user clears out several sessions at once."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Renew an idle session's prompt cache through a Claude Code side question the agent never sees. Used by the server's keep-alive scheduler.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.cache-keepalive",
+    "invocation": {
+      "kind": "rpc",
+      "method": "cache-keepalive"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rpc",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To keep a waiting session's prompt cache warm."
   },
   {
     "auth": "jwt",
@@ -10993,7 +11831,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Relaunch an active session with new spawn-frozen params (launcher, safe mode) via teardown and resume respawn.",
+    "description": "Relaunch an active session with new spawn-frozen params (launcher, safe mode, MCP set) via teardown and resume respawn, or save a new MCP set on a stopped session.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.relaunch",
     "invocation": {
@@ -11006,7 +11844,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "When the user changes a session's launcher or safe-mode setting."
+    "whenToUse": "When the user changes a session's launcher, safe-mode setting or MCP servers."
   },
   {
     "auth": "jwt",
@@ -11231,7 +12069,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Persist a session's selected view (chat, terminal, desktop, or files) so it syncs across devices.",
+    "description": "Persist a session's selected view (chat, pins, terminal, desktop, or files) so it syncs across devices.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.view",
     "invocation": {
@@ -11909,6 +12747,27 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
       "mountedWhen": "getThroughputSummary",
       "scope": "user"
     },
+    "description": "Return each app version's health on this node (uptime, unclean restarts, floods, error-minutes per hour by source), with an optional candidate-vs-baseline rise verdict.",
+    "domain": "telemetry",
+    "id": "telemetry.throughput-release-health",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/telemetry/throughput/release-health"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When judging whether a release behaved worse than the one before it on this node, as the release train's gate does."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "mountedWhen": "getThroughputSummary",
+      "scope": "user"
+    },
     "description": "Return the throughput summary for a window: API-equivalent cost and cache split by source, stage, model, node and day, context, waits, delivery, quota and coverage.",
     "domain": "telemetry",
     "id": "telemetry.throughput-summary",
@@ -12438,6 +13297,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To point a human at a session's file tree."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "A session's Pins tab, when Pins is enabled: the decisions, steps, and reviews it needs from you.",
+    "domain": "ui",
+    "id": "ui.session-pins",
+    "invocation": {
+      "kind": "ui",
+      "location": "/sessions/$sessionId/pins"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "ui",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To point a human at the decisions a session is waiting on."
   },
   {
     "auth": "jwt",

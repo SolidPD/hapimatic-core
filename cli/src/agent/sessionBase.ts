@@ -14,10 +14,15 @@ import type {
 } from "@hapi/protocol/schemas";
 import {
   FALLBACK_CLAUDE_MODELS,
+  HAPI_MCP_SERVER_NAME,
   clampEffortToModel,
   isEffortLevel,
+  mcpServerContextTokens,
+  normalizeMcpServerName,
   resolveModelEffortLevels,
   type EffortLevel,
+  type McpServerUsage,
+  type PromptCacheState,
 } from "@hapi/protocol";
 import { BackgroundAgentTracker } from "@/claude/utils/backgroundAgentTracker";
 import { getProjectPath } from "@/claude/utils/path";
@@ -123,6 +128,9 @@ export class AgentSessionBase<Mode> {
   protected appliedForEffort?: EffortLevel | null;
   // Issue #6166: one mismatch warning per distinct launch/applied/model triple.
   private readonly warnedEffortMismatches = new Set<string>();
+  // Issue #6169: the prompt-cache keep-alive state, published by the SDK remote
+  // launcher (the only one with a control channel); null elsewhere.
+  private promptCacheReporter: (() => PromptCacheState | null) | null = null;
   // Issue #1469: first-order context window + live usage, pushed per turn from
   // get_context_usage (see onContextUsage). Propagated via keepAlive runtime.
   protected contextWindowTokens?: number;
@@ -452,6 +460,10 @@ export class AgentSessionBase<Mode> {
     // always-assign contract as rateLimited — the server normalises null to
     // absent (K11) so a clear lands and a dropped tick self-heals next tick.
     backgroundAgents: BackgroundAgentsSnapshot | null;
+    // Issue #6169: always present (null when no launcher reports it), the same
+    // always-assign contract — the keep-alive scheduler must never read a cache
+    // clock left behind by an ended query.
+    promptCache: PromptCacheState | null;
   } {
     return {
       permissionMode: this.permissionMode,
@@ -472,7 +484,13 @@ export class AgentSessionBase<Mode> {
       blockedOnTuiPrompt: this.blockedOnTuiPrompt,
       rateLimited: this.rateLimited,
       backgroundAgents: this.backgroundAgentTracker.snapshot(),
+      promptCache: this.promptCacheReporter?.() ?? null,
     };
+  }
+
+  /** Issue #6169: the SDK remote launcher publishes (and on teardown clears) its tracker. */
+  setPromptCacheReporter(fn: (() => PromptCacheState | null) | null): void {
+    this.promptCacheReporter = fn;
   }
 
   getPermissionMode(): SessionPermissionMode | undefined {
@@ -583,6 +601,48 @@ export class AgentSessionBase<Mode> {
       } but it was launched with --effort ${launched}: a CLAUDE_CODE_EFFORT_LEVEL value (process env or a settings.json env block) or the model's supported levels`
     );
   }
+
+  /** Issue #6171: the server-name list last reported, so a session reports once. */
+  private lastMcpCostsSignature: string | null = null;
+
+  /**
+   * Issue #6171: each MCP server's context cost, from the per-turn
+   * get_context_usage reply, for the New Session picker. Reported once per
+   * session, and again only when the server list changes (a toggle, a
+   * relaunch). Fire-and-forget: a failed report only leaves the numbers older.
+   * `hapi` is left out; every session has it.
+   */
+  onMcpContextCosts = (servers: McpServerUsage[]): void => {
+    const rows = servers.filter(
+      server => normalizeMcpServerName(server.name) !== HAPI_MCP_SERVER_NAME
+    );
+    if (rows.length === 0) return;
+    const signature = rows
+      .map(server => normalizeMcpServerName(server.name))
+      .sort()
+      .join("\n");
+    if (signature === this.lastMcpCostsSignature) return;
+    this.lastMcpCostsSignature = signature;
+    const sampledAt = new Date().toISOString();
+    void this.api
+      .updateMcpCosts({
+        context: rows.map(server => ({
+          name: server.name,
+          inContextTokens: mcpServerContextTokens(server),
+          deferredTokens: server.deferredTokens,
+          toolCount: server.loadedTools + server.deferredTools,
+          sampledAt,
+        })),
+      })
+      .catch(error => {
+        // Report again next turn rather than lose the sample.
+        this.lastMcpCostsSignature = null;
+        logger.debug(
+          `[${this.sessionLabel}] MCP context cost report failed:`,
+          error
+        );
+      });
+  };
 
   // Issue #1469: replaces onModelResolved. Receives the first-order per-turn
   // model name (bare) + context window + live usage from get_context_usage,

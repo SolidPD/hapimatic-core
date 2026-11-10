@@ -275,13 +275,16 @@ export function App() {
   const isTerminalView = Boolean(
     matchRoute({ to: "/sessions/$sessionId/terminal" })
   );
+  // #6449: the Pins view, matching Terminal.
+  const isPinsView = Boolean(matchRoute({ to: "/sessions/$sessionId/pins" }));
   const showBackButton =
     !isTelegram &&
     (isSessionView ||
       isNewSessionView ||
       isFilesView ||
       isFileView ||
-      isTerminalView);
+      isTerminalView ||
+      isPinsView);
 
   const { isSyncing, startSync, endSync } = useSyncingState();
   const syncTokenRef = useRef(0);
@@ -406,6 +409,14 @@ export function App() {
 
     const invalidations = [
       queryClient.invalidateQueries({ queryKey: queryKeys.sessions }),
+      // #6449: `pin-changed` frames sent during the gap never arrived. Mark
+      // every cached pins list stale (no fetch); an open Pins page refetches
+      // its own on `hapi:sseConnected`, and any other loads fresh on its next
+      // visit instead of showing a list from before the gap.
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.allPins,
+        refetchType: "none",
+      }),
       ...(selectedSessionId
         ? [
             queryClient.invalidateQueries({

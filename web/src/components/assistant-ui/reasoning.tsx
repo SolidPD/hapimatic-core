@@ -310,6 +310,10 @@ export const ReasoningGroup: FC<
       ) : null}
 
       <div
+        // #6122: closed, the body is laid out but clipped to zero height, so a block
+        // inside it is not where its document order says. The thread's reading anchor
+        // never picks one (hooks/useReadingAnchor.ts).
+        data-scroll-anchor-skip={isOpen ? undefined : ""}
         className={cn(
           "overflow-hidden transition-all duration-200 ease-in-out",
           isOpen

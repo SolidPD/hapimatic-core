@@ -9,7 +9,19 @@ import {
   type RefObject,
 } from "react";
 import * as PopoverPrimitive from "@radix-ui/react-popover";
+import { Activity, ExternalLink } from "lucide-react";
 import { NodeBadge } from "@/components/NodeBadge";
+import { NodeHealthModal } from "@/components/NodeHealthModal";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { MENU_TITLE } from "@/components/ui/menuPrimitives";
 import { useAppContext } from "@/lib/app-context";
 import {
   federationHealthAvailable,
@@ -20,6 +32,12 @@ import {
   computeChipPlacement,
   type ChipObstacle,
 } from "@/lib/titleBarChipPlacement";
+import {
+  buildNodeSwitchRows,
+  hasOtherNodes,
+  NODE_STATUS_TEXT_CLASS,
+  type NodeSwitchRow,
+} from "@/lib/nodeSwitcher";
 
 /**
  * TitleBarNodeChip — the UI host node's `NodeBadge` in the app title bar
@@ -33,10 +51,21 @@ import {
  * health dot when it would pass the wordmark's clearance gap, and not rendered
  * when even the dot would.
  *
- * Hover shows "You are using <node>'s web UI" through the badge's `title`; on
- * touch a 500ms long-press opens the same text in a small popover and swallows
- * the click that ends it. Capture phase is required because `NodeBadge` stops
- * propagation at its button. A plain tap opens the Node Health modal.
+ * Node switcher (issue #6123): when the federation nodes read lists at least
+ * one other node, the chip is a `DropdownMenu` trigger. The menu's header says
+ * "You are using <node>'s web UI" (it replaces the long-press hint, which could
+ * not coexist: Radix opens a menu on pointerdown), the UI host is the first row
+ * marked current, every other node with a valid web address opens its web UI
+ * in this tab, a node that is offline or has no valid address is listed but
+ * disabled ("offline" / "no address"), and a "Node health" row opens the Node
+ * Health modal. The menu refetches the nodes read when it opens.
+ *
+ * With no other node (a standalone install, every customer VM, a spoke, a
+ * worktree instance — ruling D4 A) the chip is exactly as #4468 shipped it:
+ * hover shows the hint through the badge's `title`; on touch a 500ms
+ * long-press opens the same text in a small popover and swallows the click that
+ * ends it (capture phase, because `NodeBadge` stops propagation at its button);
+ * a plain tap opens the Node Health modal.
  *
  * Mount it only where an app context exists: `NodeBadge` calls `useAppContext`,
  * which throws on the pre-auth screens (`BrandedFrame` gates on `appCtx?.api`).
@@ -60,6 +89,38 @@ const HINT_CLASS =
 
 export function titleBarChipHint(nodeLabel: string): string {
   return `You are using ${nodeLabel}'s web UI`;
+}
+
+/**
+ * A highlighted (hovered or keyboard-focused) node row takes the menu's
+ * standard mint highlight (`focus:bg-accent`). Its coloured secondary text
+ * switches to the highlight's dark foreground there, or it would vanish into
+ * the mint. Applies under a `group` row only.
+ */
+const ROW_HIGHLIGHT_TEXT = "group-data-[highlighted]:text-accent-foreground";
+
+/** The status word on a node row, coloured like the Node Health modal's. */
+function NodeRowStatus({ row }: { row: NodeSwitchRow }): ReactElement {
+  if (row.current) {
+    return (
+      <span className="shrink-0 text-[length:var(--text-caption)] font-medium">
+        current
+      </span>
+    );
+  }
+  // An online or degraded node with no valid web address cannot be opened.
+  const noAddress = !row.href && row.status !== "offline";
+  return (
+    <span
+      className={`shrink-0 text-[length:var(--text-caption)] font-medium ${
+        noAddress
+          ? "text-[var(--app-hint)]"
+          : NODE_STATUS_TEXT_CLASS[row.status]
+      } ${ROW_HIGHLIGHT_TEXT}`}
+    >
+      {noAddress ? "no address" : row.status}
+    </span>
+  );
 }
 
 interface Placed {
@@ -217,9 +278,18 @@ export function TitleBarNodeChip({
     longPressed.current = false;
   };
 
+  // #6123: the switcher menu's "Node health" row opens this chip-level modal (a
+  // sibling of the menu, never inside its trigger or content: portal events
+  // bubble through the React tree). The ref keeps the closing menu from pulling
+  // focus back to the trigger while the dialog takes it.
+  const [healthOpen, setHealthOpen] = useState(false);
+  const openingHealth = useRef(false);
+
   // While the chip is not shown (hidden placement, not laid out) the popover
   // root is unmounted and cannot close itself: drop the hint, any pending
   // press and an armed click-swallow, so none of them surface when it returns.
+  // Also close the switcher's Node Health modal, which renders outside the
+  // hidden branch and would otherwise outlive the chip.
   const shown = Boolean(placement && !placement.hidden);
   useEffect(() => {
     if (shown) return;
@@ -229,11 +299,14 @@ export function TitleBarNodeChip({
     }
     longPressed.current = false;
     setHintOpen(false);
+    setHealthOpen(false);
   }, [shown]);
 
   if (!localNode) return null;
 
   const hint = titleBarChipHint(nodeLabel);
+  const rows = buildNodeSwitchRows(data);
+  const switcher = hasOtherNodes(rows);
 
   return (
     <>
@@ -254,7 +327,144 @@ export function TitleBarNodeChip({
           interactive={false}
         />
       </div>
-      {placement && !placement.hidden ? (
+      {placement && !placement.hidden && switcher ? (
+        // #6123: not modal — a modal menu closing under the opening Node
+        // Health dialog can leave the page unclickable (BrowseRow.tsx).
+        <DropdownMenu
+          modal={false}
+          onOpenChange={open => {
+            if (open) void refetch();
+          }}
+        >
+          <DropdownMenuTrigger asChild>
+            {/* Zero padding (`size="bare"`), so the trigger is exactly the
+                measurer's width and the placement thresholds still hold. The
+                badge is static: the interactive one stops pointerdown, which
+                is the event Radix opens the menu on. */}
+            <Button
+              type="button"
+              variant="ghostStatic"
+              size="bare"
+              className="absolute top-1/2 z-10 flex -translate-y-1/2 select-none font-normal hover:opacity-80 [-webkit-touch-callout:none]"
+              style={{ left: placement.left }}
+              aria-label={`${nodeLabel} — switch node`}
+              data-testid="titlebar-node-chip"
+              data-switcher="true"
+              onContextMenu={e => e.preventDefault()}
+            >
+              <NodeBadge
+                nodeId={localNode.nodeId}
+                nodeLabel={nodeLabel}
+                nodeStatus="online"
+                title={`${hint} — switch node`}
+                collapsed={placement.collapsed}
+                labelAsReceived
+                resourceHealth={resourceHealth}
+                interactive={false}
+              />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="start"
+            className="chip-scope max-h-[85vh] min-w-[220px] max-w-[calc(100vw-16px)] overflow-y-auto p-0.5" /* design-tokens-allow: 220px menu min-width fits badge + status + host on one row at 393px; no spacing token that wide */
+            data-testid="titlebar-node-menu"
+            onCloseAutoFocus={event => {
+              // Keyboard users get focus back on the chip, except when the
+              // menu closes because Node Health is opening and needs it.
+              if (openingHealth.current) {
+                openingHealth.current = false;
+                event.preventDefault();
+              }
+            }}
+          >
+            <DropdownMenuLabel
+              className={MENU_TITLE}
+              data-testid="titlebar-node-menu-hint"
+            >
+              {hint}
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator className="my-0.5" />
+            {rows.map(row => {
+              const badge = (
+                <NodeBadge
+                  nodeId={row.nodeId}
+                  nodeLabel={row.nodeLabel}
+                  nodeUrl={row.nodeUrl}
+                  nodeStatus={row.status}
+                  labelAsReceived={row.current}
+                  resourceHealth={resourceHealth}
+                  interactive={false}
+                />
+              );
+              if (row.current) {
+                return (
+                  <DropdownMenuItem
+                    key={row.nodeId}
+                    className="bg-[var(--app-accent)]/15 text-[var(--app-accent)] focus:bg-[var(--app-accent)]/20 focus:text-[var(--app-accent)]"
+                    title={hint}
+                    data-testid={`titlebar-node-row-${row.nodeId}`}
+                    data-current="true"
+                  >
+                    {badge}
+                    <NodeRowStatus row={row} />
+                  </DropdownMenuItem>
+                );
+              }
+              if (!row.href) {
+                // Disabled items take no pointer events, so a title would
+                // never show: the reason is the visible status word.
+                return (
+                  <DropdownMenuItem
+                    key={row.nodeId}
+                    disabled
+                    data-testid={`titlebar-node-row-${row.nodeId}`}
+                  >
+                    {badge}
+                    <NodeRowStatus row={row} />
+                  </DropdownMenuItem>
+                );
+              }
+              return (
+                <DropdownMenuItem
+                  key={row.nodeId}
+                  asChild
+                  className="group"
+                  data-testid={`titlebar-node-row-${row.nodeId}`}
+                >
+                  {/* Same tab (D3, ruled by Matt 2026-11-07): choosing a
+                      node replaces this page with that node's web UI. */}
+                  <a
+                    href={row.href}
+                    title={`Open ${row.nodeLabel}'s web UI`}
+                    className="no-underline"
+                  >
+                    {badge}
+                    <NodeRowStatus row={row} />
+                    <span
+                      className={`min-w-0 flex-1 truncate text-[var(--app-hint)] ${ROW_HIGHLIGHT_TEXT}`}
+                    >
+                      {row.host}
+                    </span>
+                    <ExternalLink aria-hidden="true" />
+                  </a>
+                </DropdownMenuItem>
+              );
+            })}
+            <DropdownMenuSeparator className="my-0.5" />
+            <DropdownMenuItem
+              title={`Health and resource metrics for ${nodeLabel}`}
+              data-testid="titlebar-node-menu-health"
+              onSelect={() => {
+                openingHealth.current = true;
+                setHealthOpen(true);
+              }}
+            >
+              <Activity aria-hidden="true" />
+              Node health
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : placement && !placement.hidden ? (
         <PopoverPrimitive.Root open={hintOpen} onOpenChange={setHintOpen}>
           <PopoverPrimitive.Anchor
             className="absolute top-1/2 z-10 flex -translate-y-1/2 select-none [-webkit-touch-callout:none]"
@@ -309,6 +519,16 @@ export function TitleBarNodeChip({
             </PopoverPrimitive.Content>
           </PopoverPrimitive.Portal>
         </PopoverPrimitive.Root>
+      ) : null}
+      {healthOpen ? (
+        <NodeHealthModal
+          nodeId={localNode.nodeId}
+          nodeLabel={nodeLabel}
+          nodeStatus="online"
+          labelAsReceived
+          open={healthOpen}
+          onOpenChange={setHealthOpen}
+        />
       ) : null}
     </>
   );

@@ -20,6 +20,7 @@ import { parseApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { configuration } from "@/configuration";
 import { logger } from "@/ui/logger";
 import { getHappyCliCommand } from "@/utils/spawnHappyCLI";
+import type { SessionMcpPolicy } from "./mcpSessionPolicy";
 
 function shellQuote(value: string): string {
   if (value.length === 0) {
@@ -215,13 +216,28 @@ export function buildNodeDocsReadRules(
  * Verified live: `claudeMdExcludes` in a `--settings` file skips `@`-imported
  * memory files and MERGES with the user-level array (issue #2155 Task 1 spike).
  */
+export interface HookSettingsOptions {
+  /** Issue #2155: the role profile's `@`-include exclusions. */
+  claudeMdExcludes?: string[];
+  /** Issue #2626: the per-session output style. */
+  outputStyle?: string;
+  /** Issue #4568 (F1): an API-key session's helper binding. */
+  apiKeyBinding?: ApiKeyHelperBinding;
+  /** Issue #6171: the session's MCP set, as `resolveSessionMcpPolicy` built it. */
+  mcpPolicy?: Pick<SessionMcpPolicy, "deny" | "connectorsOff"> | null;
+}
+
 export function generateHookSettingsFile(
   port: number,
   token: string,
-  claudeMdExcludes: string[] = [],
-  outputStyle?: string,
-  apiKeyBinding?: ApiKeyHelperBinding
+  options: HookSettingsOptions = {}
 ): string {
+  const {
+    claudeMdExcludes = [],
+    outputStyle,
+    apiKeyBinding,
+    mcpPolicy,
+  } = options;
   const hooksDir = join(configuration.happyHomeDir, "tmp", "hooks");
   mkdirSync(hooksDir, { recursive: true });
 
@@ -270,6 +286,8 @@ export function generateHookSettingsFile(
     apiKeyHelper?: string;
     promptCacheTtl?: string;
     permissions?: { allow: string[] };
+    deniedMcpServers?: Array<{ serverName: string }>;
+    disableClaudeAiConnectors?: boolean;
   } = {
     hooks: {
       SessionStart: hookEntry,
@@ -293,6 +311,21 @@ export function generateHookSettingsFile(
   // Claude Code 2.1.x).
   if (outputStyle) {
     settings.outputStyle = outputStyle;
+  }
+
+  // Issue #6171: the session's MCP set. A deny entry stops that server from
+  // starting in this process only (nothing shared is written); measured on
+  // Claude Code 2.1.312, it matches the exact `claude mcp list` name for stdio,
+  // plugin and connector servers. `disableClaudeAiConnectors` also covers a
+  // connector added since the server's last poll. Both keys are omitted with no
+  // set or a `mode: "all"` set, so such a file is exactly as before #6171.
+  if (mcpPolicy && mcpPolicy.deny.length > 0) {
+    settings.deniedMcpServers = mcpPolicy.deny.map(serverName => ({
+      serverName,
+    }));
+  }
+  if (mcpPolicy?.connectorsOff) {
+    settings.disableClaudeAiConnectors = true;
   }
 
   // Issue #4568 (F1): an API-key session's credential. Claude Code reads the key

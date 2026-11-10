@@ -6,7 +6,8 @@
  * (bulk). Each performs tmux-window cleanup (#1628 direct-reap ride-along),
  * worktree cleanup (with the #1364 sibling-ownership guard), DB/cache removal,
  * file-claim release (#1968/#2088), and MCP batch-coordinator state teardown
- * (#1102). Refs #1349/#1364/#1628/#1968/#2088/#1102.
+ * (#1102), then, last, the session's pin files (#6453, `reapPinFiles`).
+ * Refs #1349/#1364/#1628/#1968/#2088/#1102/#6453.
  *
  * 🔴 These are PARALLEL SIBLINGS, NOT an orchestration: `deleteSessions` runs its
  * own batch cleanup whose #1364 sibling check treats WITHIN-batch siblings as
@@ -43,6 +44,16 @@ import type { McpBatchCoordinator } from "./mcpBatchCoordinator";
 import type { Store } from "../store";
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { LoopCronLifecycleCoupler } from "./loopCronLifecycle";
+import { reapSessionPinFiles } from "./pinFiles";
+
+/** #6453: the sessions whose pin files a delete reaps; one with no folder has none. */
+function pinReapsFor(
+  candidates: readonly { sessionId: string; path: string | undefined }[]
+): { sessionId: string; path: string }[] {
+  return candidates.flatMap(({ sessionId, path }) =>
+    typeof path === "string" && path !== "" ? [{ sessionId, path }] : []
+  );
+}
 
 /** One tmux cleanup a bulk delete gathers before the records go (#1349). */
 type BulkTmuxCleanup = {
@@ -160,6 +171,10 @@ export class SessionDeletion {
     // (which is the HAPI_SESSION_ID env var passed when spawning)
     const sessionTag = this.sessionCache.getSessionTag(sessionId);
     const worktree = session?.metadata?.worktree;
+    // #6453: captured now, because the record (and its metadata) goes below.
+    const pinReaps = pinReapsFor([
+      { sessionId, path: session?.metadata?.path },
+    ]);
 
     if (opts?.detachCleanup) {
       // #6210: delete the record and answer the caller now; tmux then worktree
@@ -167,18 +182,62 @@ export class SessionDeletion {
       // (e.g. the session is still active), no cleanup runs at all.
       await this.sessionCache.deleteSession(sessionId);
       this.afterSessionDeleted(sessionId);
-      void this.runDeleteCleanups(
-        sessionId,
-        machineId,
-        sessionTag,
-        worktree
-      ).catch(err => this.logDetachedCleanupFailure(err, sessionId));
+      void this.runDeleteCleanups(sessionId, machineId, sessionTag, worktree)
+        // #6453: last, after the worktree step (see `reapPinFiles`).
+        .then(() => this.reapPinFiles(pinReaps))
+        .catch(err => this.logDetachedCleanupFailure(err, sessionId));
       return;
     }
 
     await this.runDeleteCleanups(sessionId, machineId, sessionTag, worktree);
     await this.sessionCache.deleteSession(sessionId);
     this.afterSessionDeleted(sessionId);
+    // #6453: only once the record delete succeeded, which throws for an active
+    // session, and after the worktree step.
+    await this.reapPinFiles(pinReaps);
+  }
+
+  /**
+   * #6453: remove each deleted session's pin files, `<path>/.hapi/pins/<id>/`.
+   * Always the last step of a delete: the record is gone (so a delete that threw
+   * reaps nothing), and the worktree step has run, so a worktree moved to
+   * `.worktrees/.trash/` took its pin files with it and its path no longer exists,
+   * which makes this a no-op. Never put this beside the `UserFileUploads`
+   * removal in `sessionCache.deleteSession`: the detached path deletes the record
+   * BEFORE the worktree soft-delete, so it would destroy a worktree session's pin
+   * files before they could ride to the trash. Never throws; failures are logged.
+   */
+  private async reapPinFiles(
+    entries: readonly { sessionId: string; path: string }[]
+  ): Promise<void> {
+    for (const { sessionId, path } of entries) {
+      try {
+        const result = await reapSessionPinFiles(path, sessionId);
+        if ("refused" in result) {
+          this.errorLogger?.warn(
+            `Pin files for session ${sessionId} not removed: ${result.refused}`,
+            { category: "sync", sessionId }
+          );
+        } else if ("error" in result) {
+          this.errorLogger?.warn(
+            `Pin files for session ${sessionId} not removed: ${result.error}`,
+            { category: "sync", sessionId }
+          );
+        } else if (result.removed) {
+          this.errorLogger?.info(`Removed pin files for session ${sessionId}`, {
+            category: "sync",
+            sessionId,
+          });
+        }
+      } catch (err) {
+        this.errorLogger?.warn(
+          `Pin files for session ${sessionId} not removed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          { category: "sync", sessionId }
+        );
+      }
+    }
   }
 
   /**
@@ -317,8 +376,11 @@ export class SessionDeletion {
     // Gather tmux cleanup info before deleting from cache
     const tmuxCleanups: BulkTmuxCleanup[] = [];
     const worktreeCleanups: BulkWorktreeCleanup[] = [];
+    // #6453: each session's folder, read now, because the records go below.
+    const pinCandidates: { sessionId: string; path: string | undefined }[] = [];
     for (const id of sessionIds) {
       const session = this.sessionCache.getSession(id);
+      pinCandidates.push({ sessionId: id, path: session?.metadata?.path });
       const machineId = session?.metadata?.machineId;
       const sessionTag = this.sessionCache.getSessionTag(id);
       if (machineId && sessionTag) {
@@ -399,11 +461,16 @@ export class SessionDeletion {
 
     // #6210: the cache delete above is done, so a `detachCleanup` caller is
     // answered now and the tmux + worktree cleanups below finish in the background.
+    // #6453: pin files are reaped last, and only for ids actually deleted.
+    const deleted = new Set(result.deleted);
+    const pinReaps = pinReapsFor(
+      pinCandidates.filter(({ sessionId }) => deleted.has(sessionId))
+    );
     const cleanups = this.runBulkCleanups(
       tmuxCleanups,
       worktreeCleanups,
       opts?.detachCleanup ? sessionIds : undefined
-    );
+    ).then(() => this.reapPinFiles(pinReaps));
     if (opts?.detachCleanup) {
       void cleanups.catch(err => this.logDetachedCleanupFailure(err));
     } else {

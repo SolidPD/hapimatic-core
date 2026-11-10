@@ -42,6 +42,7 @@ const SCHEDULED_SENT_FROM: ReadonlySet<string> = new Set([
   "scheduler",
   "heartbeat",
   "watchdog",
+  "pin-deadline", // #6452: an automatic pick fired by a pin's deadline
 ]);
 const UNKNOWN_SENT_FROM: ReadonlySet<string> = new Set([
   "handoff",

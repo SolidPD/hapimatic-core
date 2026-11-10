@@ -10,6 +10,7 @@ import { createAuthMiddleware } from "../middleware/auth";
 import { createHealthReadAuthMiddleware } from "../middleware/healthReadAuth";
 import type { HealthReadTokenVerifier } from "../../config/healthReadToken";
 import type { ErrorLogger } from "../../logging/errorLogger";
+import type { TelemetryExecutorStatus } from "../../telemetry/executor";
 
 // The system-health metric-gathering logic was extracted to
 // `../../metrics/systemHealth` (#1445) so the federation peer-metrics endpoint
@@ -32,12 +33,33 @@ export interface HealthMetrics {
   sessionsP95Ms: number | null;
   closeWaitCount: number | null;
   listenPort: number;
+  /**
+   * Issue #6516: the Analytics query executor. Present when the server runs
+   * one. `mode` is `worker`, `degraded` (the worker is unusable) or `inline`
+   * (the kill switch).
+   */
+  telemetryExecutor?: Pick<
+    TelemetryExecutorStatus,
+    "mode" | "selftest" | "aggregateDebtDays"
+  >;
 }
 
 export interface HealthResponse {
   status: "ok" | "warn";
   reasons: string[];
   metrics: HealthMetrics;
+}
+
+/** A health read must never fail on the executor's account. */
+function readTelemetryExecutorStatus(
+  get: (() => TelemetryExecutorStatus | null) | undefined
+): TelemetryExecutorStatus | null {
+  if (!get) return null;
+  try {
+    return get();
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -54,7 +76,8 @@ export interface HealthResponse {
 export function createHealthRoutes(
   jwtSecret?: Uint8Array,
   errorLogger?: ErrorLogger | null,
-  healthReadVerifier?: HealthReadTokenVerifier
+  healthReadVerifier?: HealthReadTokenVerifier,
+  getTelemetryExecutorStatus?: () => TelemetryExecutorStatus | null
 ): Hono {
   const app = new Hono();
 
@@ -84,14 +107,36 @@ export function createHealthRoutes(
       );
     }
 
+    // #6516 (R13): a degraded Analytics worker, or skipped aggregate days
+    // awaiting recompute, is a deploy check's warn, never silent.
+    const telemetry = readTelemetryExecutorStatus(getTelemetryExecutorStatus);
+    if (telemetry?.mode === "degraded") {
+      reasons.push(
+        `telemetry query worker unavailable: ${telemetry.cause ?? "unknown"}`
+      );
+    }
+    if (telemetry && telemetry.aggregateDebtDays > 0) {
+      reasons.push(
+        `telemetry aggregates pending recompute for ${telemetry.aggregateDebtDays} day(s)`
+      );
+    }
+
+    const metrics: HealthMetrics = {
+      sessionsP95Ms,
+      closeWaitCount,
+      listenPort,
+    };
+    if (telemetry) {
+      metrics.telemetryExecutor = {
+        mode: telemetry.mode,
+        selftest: telemetry.selftest,
+        aggregateDebtDays: telemetry.aggregateDebtDays,
+      };
+    }
     const response: HealthResponse = {
       status: reasons.length === 0 ? "ok" : "warn",
       reasons,
-      metrics: {
-        sessionsP95Ms,
-        closeWaitCount,
-        listenPort,
-      },
+      metrics,
     };
     return c.json(response);
   });

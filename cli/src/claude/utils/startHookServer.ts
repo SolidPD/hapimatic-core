@@ -71,6 +71,12 @@ export function isBlockingPromptNotification(data: SessionHookData): boolean {
   );
 }
 
+/** A Stop hook answer that keeps the turn going (#6455). */
+export type StopHookDecision = { decision: "block"; reason: string };
+
+/** How long the Stop branch waits for `onStopDecision` before it lets the turn end. */
+export const STOP_DECISION_TIMEOUT_MS = 4000;
+
 export interface HookServerOptions {
   /** Called when a session hook is received with a valid session ID. */
   onSessionHook: (sessionId: string, data: SessionHookData) => void;
@@ -110,6 +116,16 @@ export interface HookServerOptions {
    * #1611 R4 / #1654) finalizes at the launcher interrupt sites instead.
    */
   onTurnFinalize?: (data: SessionHookData) => void;
+  /**
+   * Issue #6455: asked on every top-level Stop. A `block` answer goes back to
+   * Claude Code as the hook's JSON decision, which keeps the turn going, so the
+   * Stop does not clear thinking or finalize the turn; the next Stop does. Null,
+   * a throw, or no answer within `stopDecisionTimeoutMs` lets the turn end. No
+   * callback leaves the Stop branch exactly as before.
+   */
+  onStopDecision?: (data: SessionHookData) => Promise<StopHookDecision | null>;
+  /** Overrides `STOP_DECISION_TIMEOUT_MS` (tests). */
+  stopDecisionTimeoutMs?: number;
   /** Optional token to require for hook requests. */
   token?: string;
 }
@@ -131,6 +147,34 @@ function readHookToken(req: IncomingMessage): string | null {
   return header ?? null;
 }
 
+/** The Stop decision, or null when it fails, is malformed or comes too late. */
+async function decideStop(
+  decide: NonNullable<HookServerOptions["onStopDecision"]>,
+  data: SessionHookData,
+  timeoutMs: number
+): Promise<StopHookDecision | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const late = new Promise<null>(resolve => {
+      timer = setTimeout(() => resolve(null), timeoutMs);
+    });
+    const answer = await Promise.race([decide(data), late]);
+    if (
+      answer?.decision === "block" &&
+      typeof answer.reason === "string" &&
+      answer.reason.length > 0
+    ) {
+      return { decision: "block", reason: answer.reason };
+    }
+    return null;
+  } catch (error) {
+    logger.debug("[hookServer] Stop decision failed:", error);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Start a dedicated HTTP server for receiving Claude session hooks.
  */
@@ -143,7 +187,10 @@ export async function startHookServer(
     onNotification,
     onTurnOpen,
     onTurnFinalize,
+    onStopDecision,
   } = options;
+  const stopDecisionTimeoutMs =
+    options.stopDecisionTimeoutMs ?? STOP_DECISION_TIMEOUT_MS;
   const hookToken = options.token || randomBytes(16).toString("hex");
 
   return new Promise((resolve, reject) => {
@@ -225,12 +272,27 @@ export async function startHookServer(
               return;
             }
             if (eventName === "Stop") {
+              const decision = onStopDecision
+                ? await decideStop(onStopDecision, data, stopDecisionTimeoutMs)
+                : null;
+              if (decision) {
+                // Issue #6455 (DQ2 = A): the turn goes on, so it is neither
+                // idle nor finalized; the next Stop, never blocked twice, is.
+                if (!res.headersSent && !res.writableEnded) {
+                  res
+                    .writeHead(200, { "Content-Type": "application/json" })
+                    .end(JSON.stringify(decision));
+                }
+                return;
+              }
               onThinkingChange?.(false);
               // Issue #1664: finalize the open turn (clean completion). The
               // interrupt path has no Stop hook and finalizes at the launcher
               // interrupt sites instead.
               onTurnFinalize?.(data);
-              res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
+              if (!res.headersSent && !res.writableEnded) {
+                res.writeHead(200, { "Content-Type": "text/plain" }).end("ok");
+              }
               return;
             }
             // Issue #1653: Notification hook (a TUI prompt is waiting for the

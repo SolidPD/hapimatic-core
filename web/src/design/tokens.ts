@@ -80,6 +80,40 @@ export const tokens = {
     terminal: "var(--view-accent-terminal)",
     desktop: "var(--view-accent-desktop)",
     files: "var(--view-accent-files)",
+    pins: "var(--view-accent-pins)",
+  },
+
+  // Pins Ledger (#6449) — section outlines, the section header bar, and the
+  // star; `pinKind` holds the per-kind icon colors. Each a `var(--pins-*)`
+  // reference (tokens.css); NESTED groups like `view` above, excluded from
+  // `DesignToken`, one level deep so the no-raw-hex test covers them.
+  pins: {
+    sectionAction: "var(--pins-section-action)",
+    sectionCompleted: "var(--pins-section-completed)",
+    sectionHeaderBg: "var(--pins-section-header-bg)",
+    star: "var(--pins-star)",
+    timeline: "var(--pins-timeline)",
+    sectionPm: "var(--pins-section-pm)",
+  },
+  // Project Manager lane colors (#6454): A to H, then `other` for any later letter.
+  pinsLane: {
+    a: "var(--pins-lane-a)",
+    b: "var(--pins-lane-b)",
+    c: "var(--pins-lane-c)",
+    d: "var(--pins-lane-d)",
+    e: "var(--pins-lane-e)",
+    f: "var(--pins-lane-f)",
+    g: "var(--pins-lane-g)",
+    h: "var(--pins-lane-h)",
+    other: "var(--pins-lane-other)",
+  },
+  pinKind: {
+    decision: "var(--pins-kind-decision)",
+    steps: "var(--pins-kind-steps)",
+    variants: "var(--pins-kind-variants)",
+    review: "var(--pins-kind-review)",
+    dashboard: "var(--pins-kind-dashboard)",
+    detected: "var(--pins-kind-detected)",
   },
 
   // Decorative section-hue accents (#3335) — one accessor per JS-consumed

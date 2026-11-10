@@ -6,7 +6,7 @@ import type { SpawnResponse } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { ModelMode, PermissionMode } from "@hapi/protocol/modes";
-import type { EffortLevel } from "@hapi/protocol";
+import type { EffortLevel, McpSet } from "@hapi/protocol";
 
 // Exported so the shared spawn-command assembler (NewSession/spawnCommand.ts,
 // #1949 A2) and the formState memo (#1950 A3) build from ONE payload definition.
@@ -103,6 +103,10 @@ export type SpawnInput = {
    *  trailing options object; kept out of SpawnSelections, so the command
    *  preview never shows it. Both branches forward it. */
   forceAccount?: boolean;
+  /** Issue #6171: the MCP servers the session starts with. Rides the trailing
+   *  options object (never a new positional); both branches forward it. Absent
+   *  ⇒ the target's project default, else every server. */
+  mcpSet?: McpSet;
 };
 
 export function useSpawnSession(api: ApiClient | null): {
@@ -126,7 +130,8 @@ export function useSpawnSession(api: ApiClient | null): {
         input.parentRelationship ||
         input.sourceBranch ||
         input.forceAccount ||
-        input.permissionMode
+        input.permissionMode ||
+        input.mcpSet
           ? {
               parentSessionId: input.parentSessionId,
               parentRelationship: input.parentRelationship,
@@ -135,6 +140,8 @@ export function useSpawnSession(api: ApiClient | null): {
               ...(input.permissionMode
                 ? { permissionMode: input.permissionMode }
                 : {}),
+              // #6171: the MCP set rides the same trailing object.
+              ...(input.mcpSet ? { mcpSet: input.mcpSet } : {}),
             }
           : undefined;
 

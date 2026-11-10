@@ -6,6 +6,9 @@ import { queryKeys } from "@/lib/query-keys";
 export interface GitHubIssueDetails {
   labels: Array<{ name: string; color: string }>;
   body: string;
+  /** #6453: a link opened from a bare reference knows only the repo and number. */
+  title: string;
+  state: "open" | "closed";
 }
 
 export function useGitHubIssue(
@@ -26,7 +29,12 @@ export function useGitHubIssue(
       if (!result.success || !result.issue) {
         throw new Error(result.error ?? "Failed to fetch issue details");
       }
-      return { labels: result.issue.labels, body: result.issue.body };
+      return {
+        labels: result.issue.labels,
+        body: result.issue.body,
+        title: result.issue.title,
+        state: result.issue.state,
+      };
     },
     enabled:
       (options?.enabled ?? true) && Boolean(api && owner && repo && number > 0),

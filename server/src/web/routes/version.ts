@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import { configuration } from "../../configuration";
 import { VERSION, VERSION_TIMESTAMP } from "../../version.generated";
 import { desktopTierAllowed, readVmTier } from "../desktopProxy";
+import { resolvePinsEnabled } from "../../config/pinsConfig";
 
 export interface VersionInfo {
   version: string;
@@ -35,6 +36,12 @@ export interface VersionInfo {
    * user open a view that can only error (epic #3285 correction pass 1).
    */
   desktopEligible: boolean;
+  /**
+   * The Pins gate (issue #6447), read by the web client and the session process.
+   * Present only while open, so nothing Pins-related appears while it is closed:
+   * read it as `=== true`.
+   */
+  pinsEnabled?: true;
 }
 
 export function createVersionRoutes(): Hono {
@@ -67,6 +74,7 @@ export function createVersionRoutes(): Hono {
         // getConfiguration(); a module-load read would throw before startup init).
         ssoEnabled: configuration.googleOAuthEnabled,
         desktopEligible: desktopTierAllowed(readVmTier()),
+        ...(resolvePinsEnabled() ? { pinsEnabled: true as const } : {}),
       });
     }
   );

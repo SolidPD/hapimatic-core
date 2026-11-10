@@ -14,6 +14,12 @@ import type {
   SyncEvent,
 } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
+import {
+  createPinRefetchCoalescer,
+  patchOpenPinCount,
+  removePinQueries,
+} from "@/lib/pinEvents";
+import { notePinChange, noteSessionUpdate } from "@/lib/pins/dashboardEvents";
 import { upsertMessagesInCache } from "@/lib/messages";
 import { parseSseStream } from "@/lib/sse-stream";
 import { updateLastSeenSeq } from "@/lib/seq-tracker";
@@ -318,6 +324,9 @@ export function useSSE(options: {
         recheckPendingKeepalives(queryClient, pendingKeepalives);
       });
 
+    // #6449: `pin-changed` frames coalesce into one sync per session.
+    const pinRefetch = createPinRefetchCoalescer(queryClient);
+
     const handleSyncEvent = (event: SyncEvent) => {
       if (event.type === "message-received") {
         // Track highest seen seq for backfill on reconnect
@@ -345,6 +354,10 @@ export function useSSE(options: {
       // skipped: they would change nothing on screen but re-render the whole
       // chat. The rest of this handler, including the onEvent callback at the
       // end, still runs.
+      // #6454: a lane's or a Project Manager's running state, on any page.
+      if (event.type === "session-updated")
+        noteSessionUpdate(queryClient, event);
+
       const skipRefetchForKeepalive =
         event.type === "session-updated" &&
         classifySessionUpdate(
@@ -375,6 +388,9 @@ export function useSSE(options: {
             void queryClient.removeQueries({
               queryKey: queryKeys.optimisticMessages(event.sessionId),
             });
+            // #6449: and its pins list and evidence.
+            pinRefetch.cancel(event.sessionId);
+            removePinQueries(queryClient, event.sessionId);
           } else {
             // Use refetchQueries instead of invalidateQueries to force immediate
             // refetch. This ensures session.thinking state updates propagate
@@ -384,6 +400,16 @@ export function useSSE(options: {
             });
           }
         }
+      }
+
+      // #6449: a pin of this session changed. Once the burst settles, a
+      // mounted Pins page fetches the changed pins; the badge count is patched
+      // in place; the session lists are never invalidated (#6208). No early
+      // return — control still reaches onEventRef.current(event) below.
+      if (event.type === "pin-changed") {
+        pinRefetch.schedule(event.sessionId, event.key);
+        patchOpenPinCount(queryClient, event.sessionId, event.openPinCount);
+        notePinChange(queryClient, event); // #6454: the Project Managers section
       }
 
       if (event.type === "machine-updated") {
@@ -416,6 +442,9 @@ export function useSSE(options: {
         void queryClient.invalidateQueries({
           queryKey: queryKeys.mcpStatus(projectDir),
         });
+        // Issue #6171: a global poll's event carries no project, so every
+        // catalog (one per project and node) refetches on its next read.
+        void queryClient.invalidateQueries({ queryKey: ["mcp-catalog"] });
       }
 
       // Issue #989 follow-up: live-update the batch coordinator snapshot
@@ -938,6 +967,7 @@ export function useSSE(options: {
       window.removeEventListener("online", onOnline);
       unsubscribeQueryCache();
       pendingKeepalives.clear();
+      pinRefetch.dispose();
       controller.abort();
       attemptControllerRef.current?.abort();
       if (reconnectTimerRef.current) {

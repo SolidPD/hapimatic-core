@@ -84,6 +84,9 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       // Include messageCount and childBranchCount so remote session lists
       // display the same indicators as local sessions.
       const allSessions = engine.getSessions();
+      // #6447: one grouped query, because this route runs on every federation poll.
+      const pinCounts =
+        deps.pinsEnabled === true ? engine.getOpenPinCounts() : null;
       const sessions = allSessions.map(s =>
         toSessionSummary(
           s,
@@ -91,7 +94,8 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
           engine.getChildBranchCountForSession(s.id),
           // #1804 (A2): the owning node resolves its own sessions' workflow badges
           // so they propagate through the existing federation all-sessions poll.
-          engine.getSessionWorkflowBadge(s.id)
+          engine.getSessionWorkflowBadge(s.id),
+          pinCounts ? (pinCounts.get(s.id) ?? 0) : undefined
         )
       );
 
@@ -146,7 +150,13 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       }
 
       const messageCount = engine.getMessageCountForSession(sessionId);
-      return c.json({ session, messageCount });
+      return c.json({
+        session,
+        messageCount,
+        ...(deps.pinsEnabled === true
+          ? { openPinCount: engine.getOpenPinCount(sessionId) }
+          : {}),
+      });
     }
   );
 

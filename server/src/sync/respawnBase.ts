@@ -4,6 +4,24 @@ import { respawnYoloFromPosture } from "@hapi/protocol";
 import type { SpawnSessionOptions } from "./syncEngine";
 
 /**
+ * Issue #6171: the per-session pins EVERY respawn and inheriting spawn carries
+ * from the session's metadata — the output style (#2626) and the MCP set — in one
+ * place, so a path can no longer pick up one and drop the other (before #6171,
+ * reconnect, branch and the watermark successor all dropped `outputStyle`).
+ * Spread by `buildRespawnBase`, the inline config restart, reconnect, branch and
+ * the successor. Both are absent for a session that never had them, so such a
+ * spawn is unchanged.
+ */
+export function inheritedSessionPins(
+  session: Pick<Session, "metadata">
+): Pick<SpawnSessionOptions, "outputStyle" | "mcpSet"> {
+  return {
+    outputStyle: session.metadata?.outputStyle,
+    mcpSet: session.metadata?.mcpSet,
+  };
+}
+
+/**
  * Issue #2149 — the canonical "respawn base": the SUPERSET of spawn fields a
  * teardown + `--resume` respawn MUST preserve so the session comes back identical
  * except for the field(s) the caller overrides.
@@ -76,9 +94,9 @@ export function buildRespawnBase(
     // Issue #2155: preserve the role-scoped profile — else a respawn reverts to
     // the FULL stack (OR-4).
     sessionRole: session.metadata?.sessionRole,
-    // Issue #2626: preserve the per-session output style — else a respawn reverts
-    // to the machine default.
-    outputStyle: session.metadata?.outputStyle,
+    // Issue #2626 / #6171: preserve the output style and the MCP set — else a
+    // respawn reverts to the machine default style and starts every server.
+    ...inheritedSessionPins(session),
     // Issue #2434 / #2456: preserve the model axis + effort. Load-bearing for the
     // BARE-base rollback respawn; the primary spawn overrides these when relevant.
     modelMode: session.metadata?.modelMode,

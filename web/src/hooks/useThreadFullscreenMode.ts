@@ -16,9 +16,10 @@ import {
   THREAD_FULLSCREEN_STORAGE_BASE,
 } from "@/lib/thread-fullscreen-context";
 import {
-  computeEffectiveSessionView,
   hasConsumedOpenRedirect,
-  isSessionViewAvailable,
+  pendingOpenRedirect,
+  type OpenRedirectLink,
+  type SessionViewOptions,
 } from "@/lib/session-view";
 
 /**
@@ -57,8 +58,12 @@ export interface ThreadFullscreenMode {
 export function useThreadFullscreenMode(params: {
   session: Session;
   inSplitPane?: boolean;
+  /** #6449: the same view options the open-redirect uses (useSessionViewOptions). */
+  viewOptions: SessionViewOptions;
+  /** #6453 (R13): the page's Pins link, which the open-redirect weighs. */
+  link?: OpenRedirectLink;
 }): ThreadFullscreenMode {
-  const { session, inSplitPane } = params;
+  const { session, inSplitPane, viewOptions, link = null } = params;
   const { setThreadFullscreen } = useThreadFullscreen();
   const [isFullscreen, setIsFullscreen] = useState(false);
   // X2 (trust-critical): holds ONLY the user's in-place deviations from
@@ -166,11 +171,12 @@ export function useThreadFullscreenMode(params: {
     const sid = session.id;
     if (restoredForSessionRef.current === sid) return;
     if (!hasConsumedOpenRedirect(sid)) {
-      const ev = computeEffectiveSessionView(session, sid);
-      if (ev !== "chat" && isSessionViewAvailable(ev, session)) {
-        // A non-chat open-redirect is pending — defer until it settles.
-        return;
-      }
+      // #6449: decided exactly as the open-redirect decides it, so the two
+      // never disagree. A redirect about to fire, or a Pins view still waiting
+      // for its inputs, defers the restore until it settles, as does a `?pin=`
+      // reveal; a `?at=` jump (#6453) keeps the chat, so the restore goes ahead.
+      const decision = pendingOpenRedirect(session, sid, viewOptions, link);
+      if (decision.kind !== "none" && decision.kind !== "jump") return;
     }
     restoredForSessionRef.current = sid;
     let on = false;
@@ -191,7 +197,7 @@ export function useThreadFullscreenMode(params: {
       if (!inSplitPane) setThreadFullscreen(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session, enterFullscreen]);
+  }, [session, enterFullscreen, viewOptions, link]);
 
   return {
     isFullscreen,

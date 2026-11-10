@@ -50,6 +50,8 @@ export type SocketServerDeps = {
     appliedEffort?: string | null;
     appliedModel?: string;
     appliedForEffort?: string | null;
+    // Issue #6169: CLI-reported prompt-cache state (validated in sessionCache).
+    promptCache?: unknown;
     rawModel?: string | null;
     resolvedModel?: string;
     contextWindowTokens?: number;

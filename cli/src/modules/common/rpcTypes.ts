@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { PermissionMode } from "@hapi/protocol/modes";
+import type { McpSet } from "@hapi/protocol";
 
 export interface SpawnSessionOptions {
   machineId?: string;
@@ -133,6 +134,13 @@ export interface SpawnSessionOptions {
    *  through every spawn hop (the #1262 trap); any un-enumerated hop silently
    *  drops it (guarded by apiMachine.spawnOutputStyle.test.ts). */
   outputStyle?: string;
+  /** Issue #6171: the MCP set the session starts with, and the server-stamped
+   *  names known for the project. The daemon hands both to the claude child as
+   *  `--hapi-mcp-set <json>`; runClaude turns them into `deniedMcpServers` in the
+   *  generated --settings file. Threaded field-by-field through every spawn hop
+   *  (the #1262 trap; guarded by apiMachine.spawnMcpSet.test.ts). */
+  mcpSet?: McpSet;
+  mcpKnown?: string[];
   /** Issue #3348: bundled non-claude native model selection. `modelId` is the
    *  gemini model id (the daemon sets `GEMINI_MODEL` in the gemini spawn env) OR
    *  the codex ChatGPT-token model id (the daemon bakes it into

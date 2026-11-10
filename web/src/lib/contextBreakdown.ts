@@ -12,12 +12,22 @@
  * MCP rows into one section, and move deferred rows (tool schemas loaded on
  * demand, not in the context window) into their own list.
  */
-import type {
-  ContextUsageCategory,
-  ContextUsageDetail,
-  TurnTokenBreakdown,
+import {
+  groupMcpServers,
+  mcpServerContextTokens,
+  type ContextUsageCategory,
+  type ContextUsageDetail,
+  type TurnTokenBreakdown,
 } from "@hapi/protocol";
 import { formatTokens } from "@/lib/formatTokens";
+
+// Issue #6171: these moved to @hapi/protocol, where the CLI reads them too.
+export {
+  groupMcpServers,
+  mcpServerContextTokens,
+  normalizeMcpServerName,
+  type McpServerUsage,
+} from "@hapi/protocol";
 
 export type ContextSectionKey =
   | "system-prompt"
@@ -105,78 +115,6 @@ export function buildContextSections(detail: ContextUsageDetail): {
     });
   }
   return { sections, deferred };
-}
-
-/**
- * The key `mcpTools[].serverName` carries for a raw server name, so the raw
- * `mcpInstructions[].serverName` can be joined to its tools. Mirrors Claude
- * Code (2.1.302): it replaces every character outside `[a-zA-Z0-9_-]` with
- * `_`, and for a `claude.ai ` name also collapses `_` runs and trims an edge
- * `_`; a tool's `serverName` is then the segment of `mcp__<server>__<tool>`
- * before the next `__`. Idempotent on a tool's `serverName`.
- */
-export function normalizeMcpServerName(name: string): string {
-  let normalized = name.replace(/[^a-zA-Z0-9_-]/g, "_");
-  if (name.startsWith("claude.ai ")) {
-    normalized = normalized.replace(/_+/g, "_").replace(/^_|_$/g, "");
-  }
-  return normalized.split("__")[0] || normalized;
-}
-
-export interface McpServerUsage {
-  /** The raw server name when known (from the instructions), else the tools'. */
-  name: string;
-  /** Tools whose schemas are in the context window. */
-  loadedTokens: number;
-  loadedTools: number;
-  /** Deferred tool schemas — not in the context window. */
-  deferredTokens: number;
-  /** The server's instructions (Claude Code 2.1.316+); 0 when not reported. */
-  instructionTokens: number;
-}
-
-/** In-context tokens a server costs: its loaded tool schemas plus its instructions. */
-export function mcpServerContextTokens(server: McpServerUsage): number {
-  return server.loadedTokens + server.instructionTokens;
-}
-
-/** One row per MCP server, largest in-context cost first. */
-export function groupMcpServers(detail: ContextUsageDetail): McpServerUsage[] {
-  const servers = new Map<string, McpServerUsage>();
-  const entry = (name: string): McpServerUsage => {
-    const key = normalizeMcpServerName(name);
-    let server = servers.get(key);
-    if (!server) {
-      server = {
-        name,
-        loadedTokens: 0,
-        loadedTools: 0,
-        deferredTokens: 0,
-        instructionTokens: 0,
-      };
-      servers.set(key, server);
-    }
-    return server;
-  };
-  for (const tool of detail.mcpTools ?? []) {
-    const server = entry(tool.serverName);
-    if (tool.isLoaded === false) {
-      server.deferredTokens += tool.tokens;
-    } else {
-      server.loadedTokens += tool.tokens;
-      server.loadedTools += 1;
-    }
-  }
-  for (const instruction of detail.mcpInstructions ?? []) {
-    const server = entry(instruction.serverName);
-    server.name = instruction.serverName;
-    server.instructionTokens += instruction.tokens;
-  }
-  return [...servers.values()].sort(
-    (a, b) =>
-      mcpServerContextTokens(b) - mcpServerContextTokens(a) ||
-      b.deferredTokens - a.deferredTokens
-  );
 }
 
 /**

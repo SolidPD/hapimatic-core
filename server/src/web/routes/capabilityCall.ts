@@ -21,6 +21,7 @@ import type {
 } from "../../capabilities/availabilityContext";
 import { auditInvoke, isEntryInvocable } from "./capabilityPolicy";
 import { CALLER_SESSION_HEADER } from "./agentEscalation";
+import { extendTelemetryRequestTimeout } from "../../telemetry/executor";
 
 /**
  * The generic tier-gated REST invoker (issue #3751, epic #3740 Sub-Issue K —
@@ -562,6 +563,14 @@ export function createCapabilityCallRoutes(options: {
       if (dispatchBody !== undefined) {
         headers.set("Content-Type", "application/json");
         init.body = JSON.stringify(dispatchBody);
+      }
+
+      // #6516: the in-process re-entry carries no Bun env, so a telemetry
+      // route cannot extend its own idle timeout; extend the OUTER request,
+      // which is the connection Bun would otherwise reset while the target
+      // waits on the telemetry executor.
+      if (url.pathname.startsWith("/api/telemetry/")) {
+        extendTelemetryRequestTimeout(c.env, c.req.raw);
       }
 
       try {

@@ -46,7 +46,12 @@ export type AccountExhaustion = z.infer<typeof AccountExhaustionSchema>;
 
 /** A non-fatal note a spawn or rebind response carries. */
 export const SpawnWarningSchema = z.object({
-  code: z.enum(["usage_unavailable", "forced_exhausted_account"]),
+  code: z.enum([
+    "usage_unavailable",
+    "forced_exhausted_account",
+    // Issue #6171: a project default names a server that is off for the project.
+    "mcp_default_server_disabled",
+  ]),
   message: z.string(),
 });
 

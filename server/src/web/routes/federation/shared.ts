@@ -9,6 +9,7 @@ import type { PeerAnnouncer } from "../../../federation/peerAnnouncer";
 import type { ErrorLogger } from "../../../logging/errorLogger";
 import type { AccountService } from "../../../services/accountService";
 import type { UsageService } from "../../../accounts/usageService";
+import type { McpCatalogService } from "../../../services/mcpCatalogService";
 import type { ProviderUsageService } from "../../../accounts/providerUsageService";
 import type { ProviderAuthFacts } from "../../../services/providerAuthState";
 import type { CodexLoginService } from "../../../services/codexLoginService";
@@ -34,6 +35,17 @@ import type { WebAppEnv } from "../../middleware/auth";
 import type { NotificationService } from "../../../notifications/notificationService";
 
 export type FederationDeps = {
+  // Issue #6447: the Pins gate. Absent reads as closed, so a federation test stub
+  // that omits it serves no pin route and no count.
+  pinsEnabled?: boolean;
+  // Issue #6450: the zone for a proxied Submit's summary line: the operator's
+  // Time Log zone, else the zone the browser sent. Optional because federation
+  // test stubs omit it; absent ⇒ the browser's zone, else the host's.
+  getPinAnswersTimeZone?: (browserZone?: string) => Promise<string>;
+  // Issue #6452: the operator's Time Log zone, or null when none is set, carried
+  // on proxied pin reads. This node's, because its loop fires automatic picks.
+  // Optional because federation test stubs omit it; absent ⇒ null.
+  getPinPreferenceTimeZone?: () => Promise<string | null>;
   // Issue #4913: the LOCAL-node notifications service for the peer-incoming
   // /federation/notifications/* receivers. Optional because federation test
   // stubs omit it (mirrors getSystemJobsService).
@@ -54,6 +66,10 @@ export type FederationDeps = {
   // /federation/accounts/usage aggregator + peer receiver. Optional because
   // federation test stubs omit it (mirrors getLeaseStore / getSystemJobsService).
   getUsageService?: () => UsageService | null;
+  // Issue #6171: this node's MCP catalog, for a peer-incoming spawn's project
+  // default and project-disabled refusal. Optional because federation test stubs
+  // omit it; absent ⇒ no default and no project check.
+  getMcpCatalog?: () => McpCatalogService | null;
   // Issue #3809 (epic #3345, D5 = C): the LOCAL-node non-Anthropic provider usage
   // source for the /federation/accounts/usage aggregator (local providerUsage[])
   // + peer receiver. Optional (federation test stubs omit it, mirrors

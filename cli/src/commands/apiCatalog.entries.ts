@@ -220,6 +220,19 @@ export const cliCatalogEntries = [
     availability: { scope: "operator" },
   }),
   defineCapability({
+    id: "harness-admin.cli-selftest",
+    domain: "harness-admin",
+    surface: "cli",
+    description:
+      "Start the telemetry query worker the way the server does and run one ping job against a scratch database (issue #6516).",
+    whenToUse:
+      "To check that a binary's bundled telemetry query worker starts (the build runs it on every binary it can execute).",
+    invocation: { kind: "cli", command: "selftest" },
+    auth: "cli-token",
+    riskTier: "readonly",
+    availability: { scope: "operator" },
+  }),
+  defineCapability({
     id: "machine-daemon.cli-daemon",
     domain: "machine-daemon",
     surface: "cli",

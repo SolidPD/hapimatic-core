@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback } from "react";
+import { useCallback, useEffect } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { X, Settings as SettingsIcon } from "lucide-react";
 import { useSwipeBack } from "@/hooks/useSwipeBack";
@@ -9,6 +9,7 @@ import { TitleChip } from "@/components/settings/SettingsSectionHeader";
 import { Button } from "@/components/ui/button";
 import { CONTENT_MAX_WIDTH } from "@/lib/layout-thresholds";
 import { UpdateDrawerBanner } from "@/components/UpdateAvailableBadge";
+import { preloadSettingsPages } from "@/routes/lazyPages";
 
 /**
  * SettingsDrawer — a right-anchored, URL-driven slide-in MENU for the settings area.
@@ -64,6 +65,11 @@ export function SettingsDrawer() {
     },
   });
   const { isSplit } = useSplitViewContext();
+  // #3098: the settings pages load on demand. Load them while the menu is
+  // open, so the page a row opens renders at once instead of waiting for its
+  // code. This only loads their code: nothing renders here, so the #1035
+  // render-once invariant above still holds.
+  useEffect(() => (isOpen ? preloadSettingsPages() : undefined), [isOpen]);
   // #3280 Task 5: split is a two-pane layout ONLY on the pane host (`/sessions`).
   // On any other route (a full `/settings/*` page) the content is single-column
   // even when `isSplit` is still true in context (collapse is visual — R4), so

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /* eslint-disable max-lines -- Cohesive session-state cache; architecture-hotspot-review.md verdict is "Keep" (not a decomposition target). Crossed 1500 in #2862 (tag-keyed pending-parent map for the timeout-after-success fix); matches the grandfathering on sibling orchestrators syncEngine.ts / nodeRegistry.ts / store/index.ts. */
 import { AgentStateSchema, MetadataSchema } from "@hapi/protocol/schemas";
-import { scrubThenCap } from "@hapi/protocol";
+import { PromptCacheStateSchema, scrubThenCap } from "@hapi/protocol";
 import type {
   AuthBinding,
   BackgroundAgentEntry,
@@ -538,6 +538,8 @@ export class SessionCache {
     appliedEffort?: string | null;
     appliedModel?: string;
     appliedForEffort?: string | null;
+    // Issue #6169: the CLI-reported prompt-cache state, validated below.
+    promptCache?: unknown;
     // Composer-chip pin integrity: pinned raw model id riding the keepAlive tick.
     // Always-assign contract: `null` = the pin was cleared (family-mode pick), so
     // a stale id is dropped; absent (old CLI binary) = leave the record untouched.
@@ -678,6 +680,18 @@ export class SessionCache {
     session.appliedEffort = payload.appliedEffort;
     session.appliedModel = payload.appliedModel;
     session.appliedForEffort = payload.appliedForEffort;
+    // Issue #6169: always-assign the keep-alive cache state (the SDK remote
+    // launcher sends it every tick; anything else, or a malformed value, reads
+    // as absent, which the keep-alive scheduler treats as "no cache state").
+    // Deliberately outside the change-detection set below: it moves every turn,
+    // and its only reader (the keep-alive loop) polls instead of listening.
+    // Most heartbeats carry null (every pty/tmux/local session, and an sdk
+    // session before its first turn): skip the parse for those.
+    const promptCache =
+      payload.promptCache == null
+        ? null
+        : PromptCacheStateSchema.safeParse(payload.promptCache);
+    session.promptCache = promptCache?.success ? promptCache.data : undefined;
     // Composer-chip pin integrity: the pinned raw model self-heals from the
     // keepAlive tick (mirrors effort); `null` clears a stale pin.
     if (payload.rawModel !== undefined) {
@@ -901,6 +915,8 @@ export class SessionCache {
     session.appliedEffort = undefined;
     session.appliedModel = undefined;
     session.appliedForEffort = undefined;
+    // Issue #6169 (dead-session clear): no process, no cache to keep warm.
+    session.promptCache = undefined;
     session.thinkingAt = t;
 
     // Record archive guard so heartbeats arriving after disconnect
@@ -982,6 +998,8 @@ export class SessionCache {
         session.appliedEffort = undefined;
         session.appliedModel = undefined;
         session.appliedForEffort = undefined;
+        // Issue #6169 (dead-session clear): same for the keep-alive cache state.
+        session.promptCache = undefined;
         this.publisher.emit({
           type: "session-updated",
           sessionId: session.id,

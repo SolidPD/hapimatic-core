@@ -85,6 +85,20 @@ export const uiCatalogEntries = [
     riskTier: "readonly",
     availability: { scope: "user" },
   }),
+  // #6449: listed by the one-entry-per-route convention; the server hides it
+  // while the pins gate is closed (catalogCollector.ts, capabilityCatalog.ts).
+  defineCapability({
+    id: "ui.session-pins",
+    domain: "ui",
+    surface: "ui",
+    description:
+      "A session's Pins tab, when Pins is enabled: the decisions, steps, and reviews it needs from you.",
+    whenToUse: "To point a human at the decisions a session is waiting on.",
+    invocation: { kind: "ui", location: "/sessions/$sessionId/pins" },
+    auth: "jwt",
+    riskTier: "readonly",
+    availability: { scope: "user" },
+  }),
   defineCapability({
     id: "ui.session-claude-pty",
     domain: "ui",

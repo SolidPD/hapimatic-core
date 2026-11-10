@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { ComponentPropsWithoutRef } from "react";
-import ReactMarkdown from "react-markdown";
+import { useMemo, type ComponentPropsWithoutRef } from "react";
+import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import remarkGemoji from "remark-gemoji";
@@ -52,7 +52,7 @@ function Pre(props: ComponentPropsWithoutRef<"pre">) {
   );
 }
 
-const components = {
+const components: Components = {
   code: Code,
   pre: Pre,
   h1: (p: ComponentPropsWithoutRef<"h1">) => (
@@ -143,12 +143,34 @@ const components = {
   ),
 };
 
+const DEFAULT_REMARK_PLUGINS = [remarkGfm, remarkBreaks, remarkGemoji];
+
 interface SimpleMarkdownProps {
   content: string;
   className?: string;
+  /**
+   * #6453: plugins run after the defaults (the Pins issue references). Pass a
+   * stable list, because a new one re-parses.
+   */
+  remarkPlugins?: NonNullable<Options["remarkPlugins"]>;
+  /** #6453: renderers merged over the defaults. Pass a stable object. */
+  components?: Components;
 }
 
 export function SimpleMarkdown(props: SimpleMarkdownProps) {
+  const { remarkPlugins: extraPlugins, components: extraComponents } = props;
+  const remarkPlugins = useMemo(
+    () =>
+      extraPlugins
+        ? [...DEFAULT_REMARK_PLUGINS, ...extraPlugins]
+        : DEFAULT_REMARK_PLUGINS,
+    [extraPlugins]
+  );
+  const merged = useMemo(
+    () =>
+      extraComponents ? { ...components, ...extraComponents } : components,
+    [extraComponents]
+  );
   return (
     <div
       className={cn(
@@ -156,10 +178,7 @@ export function SimpleMarkdown(props: SimpleMarkdownProps) {
         props.className
       )}
     >
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkBreaks, remarkGemoji]}
-        components={components}
-      >
+      <ReactMarkdown remarkPlugins={remarkPlugins} components={merged}>
         {preserveBlankLines(props.content)}
       </ReactMarkdown>
     </div>

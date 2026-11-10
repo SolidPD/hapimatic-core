@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { hashKey, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ApiClient } from "@/api/client";
 import {
   classifySessionLoadFailure,
@@ -8,7 +15,7 @@ import {
   RECONNECT_ESCALATE_AFTER_MS,
   type SessionLoadFailure,
 } from "@/lib/nodeAvailability";
-import type { Session } from "@/types/api";
+import type { Session, SessionResponse } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 
 function errorText(err: unknown): string | null {
@@ -37,6 +44,8 @@ export function useSession(
 ): {
   session: Session | null;
   messageCount: number;
+  /** #6449: the open-pin count; absent while the node's pins gate is closed. */
+  openPinCount?: number;
   isLoading: boolean;
   error: string | null;
   /**
@@ -177,6 +186,7 @@ export function useSession(
   return {
     session: query.data?.session ?? null,
     messageCount: query.data?.messageCount ?? 0,
+    openPinCount: query.data?.openPinCount,
     isLoading: query.isLoading,
     error: errorText(query.error),
     loadFailure,
@@ -187,4 +197,87 @@ export function useSession(
     refetch: query.refetch,
     retry,
   };
+}
+
+/**
+ * #6449: a session's open-pin count and whether its detail query has answered,
+ * read from the query cache without fetching, so the tab row follows the
+ * detail poll without owning it.
+ *
+ * It subscribes to the query cache rather than calling `useQuery` with
+ * `skipToken`: every `useQuery` observer writes its options (its `queryFn`
+ * included) onto the shared query on each render, so a reader with no fetch
+ * function would leave `useSession`'s next poll failing with "Missing
+ * queryFn" (the #4469 finding, `components/FanOut/sessionsCache.ts`). Each
+ * value is a primitive, so a caller re-renders only when it changes.
+ */
+export function useSessionOpenPinCount(sessionId: string | null): {
+  openPinCount: number | undefined;
+  detailSettled: boolean;
+} {
+  const queryClient = useQueryClient();
+  const key = queryKeys.session(sessionId ?? "unknown");
+  const hash = hashKey(key);
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      queryClient.getQueryCache().subscribe(event => {
+        if (event.query.queryHash === hash) onChange();
+      }),
+    [queryClient, hash]
+  );
+  const readCount = () =>
+    sessionId
+      ? queryClient.getQueryData<SessionResponse>(key)?.openPinCount
+      : undefined;
+  const readSettled = () => {
+    if (!sessionId) return false;
+    const status = queryClient.getQueryState(key)?.status;
+    return status === "success" || status === "error";
+  };
+  const openPinCount = useSyncExternalStore(subscribe, readCount, readCount);
+  const detailSettled = useSyncExternalStore(
+    subscribe,
+    readSettled,
+    readSettled
+  );
+  return { openPinCount, detailSettled };
+}
+
+/**
+ * #6453: the repositories a bare `#N` in a pin can mean, read from the cached
+ * session detail without fetching (the reader pattern of
+ * `useSessionOpenPinCount`, for the same #4469 reason). A pin always renders
+ * inside a view that has loaded the detail; before it has, both are null and a
+ * bare reference stays plain text.
+ */
+export function useSessionIssueRepos(sessionId: string | null): {
+  repoIdentity: string | null;
+  linkedIssueRepo: string | null;
+} {
+  const queryClient = useQueryClient();
+  const key = queryKeys.session(sessionId ?? "unknown");
+  const hash = hashKey(key);
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      queryClient.getQueryCache().subscribe(event => {
+        if (event.query.queryHash === hash) onChange();
+      }),
+    [queryClient, hash]
+  );
+  const read = () =>
+    sessionId
+      ? queryClient.getQueryData<SessionResponse>(key)?.session
+      : undefined;
+  const readRepo = () => read()?.metadata?.repoIdentity?.name ?? null;
+  const readLinked = () => read()?.linkedIssue?.repo ?? null;
+  const repoIdentity = useSyncExternalStore(subscribe, readRepo, readRepo);
+  const linkedIssueRepo = useSyncExternalStore(
+    subscribe,
+    readLinked,
+    readLinked
+  );
+  return useMemo(
+    () => ({ repoIdentity, linkedIssueRepo }),
+    [repoIdentity, linkedIssueRepo]
+  );
 }
