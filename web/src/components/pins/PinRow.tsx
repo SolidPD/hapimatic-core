@@ -7,6 +7,7 @@ import { PinDetail } from "@/components/pins/PinDetail";
 import { PinSignals } from "@/components/pins/PinSignals";
 import { ReservedPinPill } from "@/components/pins/ReservedPinParts";
 import {
+  PIN_BOX_CLASS,
   PIN_PILL_CLASS as PILL_CLASS,
   PIN_PILL_STYLE as PILL_STYLE,
   PinDetailsToggle,
@@ -28,10 +29,11 @@ import {
 import { useStagedPin, useStepTicks } from "@/lib/pins/staging";
 
 // Mockup v6 :144-169, with the session list's 32px chevron box (the issue
-// names it; the mockup drew 26px).
+// names it; the mockup drew 26px). #6555: 32px, because the pin's box adds a
+// 1px border above and below, so a collapsed pin is still 34px tall.
 const ROW_STYLE: CSSProperties = {
   gridTemplateColumns: "18px 18px minmax(0, 1fr) auto auto 32px",
-  minHeight: "34px",
+  minHeight: "32px",
 };
 const STAR_ICON: CSSProperties = { width: "13px", height: "13px" };
 const NEW_DOT: CSSProperties = {
@@ -158,6 +160,11 @@ export type PinRowProps = {
    * `pin-row-<sessionId>-<key>`; the default keeps `pin-row-<key>`.
    */
   rowId?: string;
+  /**
+   * #6555: where the pin is shown. The chat card passes `"chat"`, so a pin's
+   * detail there offers no button that leads to the chat it is already in.
+   */
+  mode?: "tab" | "chat";
 };
 
 /**
@@ -165,6 +172,9 @@ export type PinRowProps = {
  * dot and title, signals, the answer pill, and the details chevron. The title
  * and the chevron toggle the pin in place (R7); the star and every indicator
  * sit in click-stopping wrappers, so a tap shows a tooltip without toggling.
+ * #6555: the pin is one rounded box (`PIN_BOX_CLASS`) that holds the row and,
+ * when it is open, its detail. The row keeps the element id and the observer
+ * ref, because a reveal scrolls the row, not the whole box, to the centre.
  * Memoized: the list passes the pin's cached view model and primitives with
  * stable handlers.
  */
@@ -178,14 +188,12 @@ export const PinRow = memo(function PinRow(props: PinRowProps) {
     [observe, pin.key]
   );
   return (
-    <>
+    <div data-pin-box className={PIN_BOX_CLASS}>
       <div
         id={props.rowId ?? `pin-row-${pin.key}`}
         ref={armed ? undefined : register}
-        className={`grid items-center gap-x-1.5 border-b px-0.5 py-0.5 ${
-          expanded
-            ? "border-transparent bg-[var(--app-subtle-bg)]"
-            : "border-[var(--app-divider)] hover:bg-[var(--app-hover)]"
+        className={`grid items-center gap-x-1.5 px-0.5 py-0.5 ${
+          expanded ? "bg-[var(--app-subtle-bg)]" : "hover:bg-[var(--app-hover)]"
         }`}
         style={ROW_STYLE}
       >
@@ -256,7 +264,9 @@ export const PinRow = memo(function PinRow(props: PinRowProps) {
           onToggle={toggle}
         />
       </div>
-      {expanded ? <PinDetail model={model} actions={props.actions} /> : null}
-    </>
+      {expanded ? (
+        <PinDetail model={model} actions={props.actions} mode={props.mode} />
+      ) : null}
+    </div>
   );
 });

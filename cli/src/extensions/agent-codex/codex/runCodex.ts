@@ -7,6 +7,7 @@ import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler"
 import type { AgentState } from "@/api/types";
 import type { CodexSession } from "./session";
 import { parseCodexCliOverrides } from "./utils/codexCliOverrides";
+import { CodexStartError } from "./types";
 import { bootstrapSession } from "@/agent/sessionFactory";
 import {
   createModeChangeHandler,
@@ -182,7 +183,17 @@ export async function runCodex(opts: {
       },
     });
   } catch (error) {
-    lifecycle.markCrash(error);
+    if (error instanceof CodexStartError) {
+      // #6263 R4: name the cause in the archive reason instead of
+      // "Session crashed"; the launcher already showed it in the chat, and
+      // archiveAndClose flushes that event before the socket closes.
+      lifecycle.setExitCode(1);
+      lifecycle.setArchiveReason(
+        `Codex failed to start: ${formatFailureReason(error.summary ?? error.detail)}`
+      );
+    } else {
+      lifecycle.markCrash(error);
+    }
     logger.debug("[codex] Loop error:", error);
   } finally {
     const localFailure = sessionWrapperRef.current?.localLaunchFailure;

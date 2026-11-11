@@ -50,10 +50,13 @@ const SECTION_ICON: CSSProperties = { width: "14px", height: "14px" };
 /**
  * #6449 (R4): one Ledger section in the H2 outlined treatment (mockup v6
  * :117-133): a 1px outline in the section color around a header bar that
- * reads as a header, not a row, and the rows it contains. The bar is the
+ * reads as a header, not a row, and the pins it contains. #6555: each pin is
+ * its own rounded box, and the body spaces the boxes 4px apart (design rule
+ * R10-a); its 4px of padding also leaves a first or last pin's reveal flash
+ * room inside the section's clipped outline. The bar is the
  * shared `GroupToggleHeader` (its standalone form, so the tooltip covers the
  * bar alone); the tooltip names the action and the count. A collapsed
- * section's rows are not mounted at all.
+ * section's pins are not mounted at all.
  */
 export function PinsSection(props: {
   id: string;
@@ -110,7 +113,7 @@ export function PinsSection(props: {
         </div>
       </HoverTooltip>
       {props.open ? (
-        <div id={bodyId} className="pb-0.5 pl-3.5 pr-1 pt-0.5">
+        <div id={bodyId} className="flex flex-col gap-1 p-1 pl-3.5">
           {props.children}
         </div>
       ) : null}

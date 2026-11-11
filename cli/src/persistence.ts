@@ -82,6 +82,16 @@ interface Settings {
    *  daemon unit; absent → `xhigh` (`SPAWN_DEFAULT_EFFORT_LEVEL`). An invalid
    *  value is ignored with a warning (`resolveSpawnEffort`). */
   defaultEffort?: EffortLevel;
+  /** Issue #6263: the remote Codex transport — `mcp` (`codex mcp-server`,
+   *  removed in Codex CLI 0.154.0), `app-server` (`codex app-server`), or
+   *  `auto` (by Codex version; the default). Overridden by the
+   *  `HAPI_CODEX_TRANSPORT` env var; an invalid value means `auto`. Read by the
+   *  session wrapper at start, so no restart is needed. */
+  codexTransport?: "auto" | "mcp" | "app-server";
+  /** Issue #6263: the Codex executable a session runs (the version probe and
+   *  both transports). Overridden by `HAPI_CODEX_BIN`; absent → `codex` from
+   *  PATH. */
+  codexBin?: string;
 }
 
 /**
@@ -104,6 +114,8 @@ export const SETTINGS_DISPLAY = {
   maxConcurrentSessions: "public",
   halCanonicalCheckoutPath: "public",
   defaultEffort: "public",
+  codexTransport: "public",
+  codexBin: "public",
 } as const satisfies Record<keyof Settings, "public" | "secret">;
 
 const defaultSettings: Settings = {};

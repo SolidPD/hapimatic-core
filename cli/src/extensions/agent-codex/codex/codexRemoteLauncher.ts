@@ -5,14 +5,27 @@ import os from "node:os";
 import fs from "node:fs";
 import { join } from "node:path";
 
-import { CodexMcpClient } from "./codexMcpClient";
+import {
+  connectCodexTransport,
+  createCodexTransport,
+  formatCodexStartFailure,
+  summarizeCodexStartFailure,
+  toCodexStartError,
+  type CodexTransport,
+} from "./codexTransport";
+import { readCodexVersion, resolveCodexBin } from "./codexVersion";
+import { readSettings } from "@/persistence";
 import { CodexPermissionHandler } from "./utils/permissionHandler";
 import { ReasoningProcessor } from "./utils/reasoningProcessor";
 import { DiffProcessor } from "./utils/diffProcessor";
 import { logger } from "@/ui/logger";
 import { NO_META_TEARDOWN } from "@/api/rpc/types";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
-import type { CodexSessionConfig } from "./types";
+import {
+  CodexStartError,
+  type CodexEvent,
+  type CodexSessionConfig,
+} from "./types";
 import { buildHapiMcpBridge } from "./utils/buildHapiMcpBridge";
 import { emitReadyIfIdle } from "./utils/emitReadyIfIdle";
 import type { CodexSession } from "./session";
@@ -21,7 +34,6 @@ import { hasCodexCliOverrides } from "./utils/codexCliOverrides";
 import { buildCodexStartConfig } from "./utils/codexStartConfig";
 import { convertCodexEvent } from "./utils/codexEventConverter";
 import { AgentTurnReporter } from "@/agent/utils/agentTurnReporter";
-import type { CodexEvent } from "./codexMcpClient";
 import type { ProviderUsageSnapshotWindow } from "@hapi/protocol/schemas";
 import {
   RemoteLauncherBase,
@@ -149,9 +161,12 @@ function enrichWithSignalContext(detail: string): string {
   return `${detail} (killed by ${sigName})`;
 }
 
-class CodexRemoteLauncher extends RemoteLauncherBase {
+export class CodexRemoteLauncher extends RemoteLauncherBase {
   private readonly session: CodexSession;
-  private readonly client: CodexMcpClient;
+  // #6263: built at the start of runMainLoop from the Codex version and the
+  // instance settings (createCodexTransport); replaced by the MCP fallback
+  // when an automatic app-server start fails.
+  private client: CodexTransport | null = null;
   private permissionHandler: CodexPermissionHandler | null = null;
   private reasoningProcessor: ReasoningProcessor | null = null;
   private diffProcessor: DiffProcessor | null = null;
@@ -162,7 +177,6 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
   constructor(session: CodexSession) {
     super(process.env.DEBUG ? session.logPath : undefined);
     this.session = session;
-    this.client = new CodexMcpClient();
   }
 
   protected createDisplay(
@@ -174,7 +188,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
   private async handleAbort(): Promise<void> {
     logger.debug("[Codex] Abort requested - stopping current task");
     try {
-      if (this.client.hasActiveSession()) {
+      if (this.client?.hasActiveSession()) {
         this.storedSessionIdForResume = this.client.storeSessionForResume();
         logger.debug(
           "[Codex] Stored session for resume:",
@@ -183,6 +197,10 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
       }
 
       this.abortController.abort();
+      // A turn whose first stop Codex did not confirm still runs; its abort
+      // signal has already fired, so stop it directly (#6263). On exit or
+      // switch, settle it at once: cleanup's disconnect stops the child.
+      this.client?.stopActiveTurn?.({ leaving: this.shouldExit });
       this.session.queue.reset();
       this.permissionHandler?.reset();
       this.reasoningProcessor?.abort();
@@ -243,7 +261,19 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
   protected async runMainLoop(): Promise<void> {
     const session = this.session;
     const messageBuffer = this.messageBuffer;
-    const client = this.client;
+
+    // #6263: pick the transport from the Codex version (probed with the
+    // configured executable) and the instance settings.
+    const settings = await readSettings();
+    const codexBin = resolveCodexBin(process.env, settings);
+    const codexVersion = readCodexVersion(codexBin);
+    const selection = createCodexTransport({
+      version: codexVersion,
+      settings,
+      env: process.env,
+    });
+    let client: CodexTransport = selection.transport;
+    this.client = client;
 
     function findCodexResumeFile(sessionId: string | null): string | null {
       if (!sessionId) return null;
@@ -491,8 +521,20 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
     });
     const codexModelId = session.client.getMetadata()?.nativeModel ?? undefined;
 
-    client.setPermissionHandler(permissionHandler);
-    client.setHandler(msg => {
+    // Fail-open (sendProviderUsageSnapshot swallows) — a pacing signal must
+    // never disturb the codex session.
+    const sendPacingSnapshot = (rateLimits: unknown): void => {
+      if (!isRecord(rateLimits)) return;
+      const windows = extractCodexRateLimitWindows(rateLimits);
+      if (windows.length > 0) {
+        session.client.sendProviderUsageSnapshot({
+          provider: "openai",
+          windows,
+        });
+      }
+    };
+
+    const handleCodexEvent = (msg: CodexEvent): void => {
       logger.debug(`[Codex] MCP message: ${JSON.stringify(msg)}`);
 
       if (msg.type === "agent_message") {
@@ -520,6 +562,25 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
       } else if (msg.type === "turn_aborted") {
         messageBuffer.addMessage("Turn aborted", "status");
         sendReady();
+      } else if (msg.type === "hapi_notice") {
+        // #6263: a transport decision the user should see (e.g. a resume that
+        // failed and started a new thread).
+        const notice = typeof msg.message === "string" ? msg.message : "";
+        if (notice) {
+          messageBuffer.addMessage(notice, "status");
+          session.sendSessionEvent({ type: "message", message: notice });
+        }
+      } else if (msg.type === "task_failed") {
+        // #6263 R8 (app-server only): a failed turn shows its text once.
+        const failure =
+          typeof msg.error === "string" && msg.error.length > 0
+            ? msg.error
+            : "unknown error";
+        messageBuffer.addMessage(`Task failed: ${failure}`, "status");
+        session.sendSessionEvent({
+          type: "message",
+          message: `Codex turn failed: ${failure}`,
+        });
       }
 
       if (msg.type === "task_started") {
@@ -535,11 +596,20 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
           session.onThinkingChange(true);
         }
       }
-      if (msg.type === "task_complete" || msg.type === "turn_aborted") {
+      if (
+        msg.type === "task_complete" ||
+        msg.type === "turn_aborted" ||
+        msg.type === "task_failed"
+      ) {
         // Issue #3352: finalize the turn boundary — the accumulated usage rides
-        // turn:finalize. `interrupted` on a user abort, else `completed`.
+        // turn:finalize. `interrupted` on a user abort, `errored` on a failed
+        // app-server turn (#6263), else `completed`.
         turnReporter.finalize(
-          msg.type === "turn_aborted" ? "interrupted" : "completed"
+          msg.type === "turn_aborted"
+            ? "interrupted"
+            : msg.type === "task_failed"
+              ? "errored"
+              : "completed"
         );
         if (session.thinking) {
           logger.debug("thinking completed");
@@ -595,17 +665,11 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         });
         // Issue #3809: forward the OpenAI pacing snapshot (the `rate_limits`
         // sibling of `info`) over the SAME /cli socket the turn reporter uses.
-        // Fail-open (sendProviderUsageSnapshot swallows) — a pacing signal must
-        // never disturb the codex session.
-        if (isRecord(msg.rate_limits)) {
-          const windows = extractCodexRateLimitWindows(msg.rate_limits);
-          if (windows.length > 0) {
-            session.client.sendProviderUsageSnapshot({
-              provider: "openai",
-              windows,
-            });
-          }
-        }
+        sendPacingSnapshot(msg.rate_limits);
+      }
+      if (msg.type === "rate_limits") {
+        // #6263: the app-server transport reports rate limits on their own.
+        sendPacingSnapshot(msg.rate_limits);
       }
       if (msg.type === "patch_apply_begin") {
         const { call_id, auto_approved, changes } = msg;
@@ -655,7 +719,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
           diffProcessor.processDiff(msg.unified_diff);
         }
       }
-    });
+    };
+    const attachTransport = (transport: CodexTransport): void => {
+      transport.setPermissionHandler(permissionHandler);
+      transport.setHandler(handleCodexEvent);
+    };
+    attachTransport(client);
 
     const { server: happyServer, mcpServers } = await buildHapiMcpBridge(
       session.client
@@ -716,7 +785,41 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
       }
     };
 
-    await client.connect();
+    // #6263 R3/R4: a failed start becomes a chat message and a CodexStartError
+    // (runCodex turns it into the archive reason). Under automatic selection
+    // with an unreadable version, a failed app-server start first falls back to
+    // the MCP transport, the path that existed for that case before #6263.
+    const reportStartFailure = (error: CodexStartError): CodexStartError => {
+      const host = os.hostname();
+      const sentence = formatCodexStartFailure(error, host);
+      error.summary = summarizeCodexStartFailure(error, host);
+      logger.warn(`[codex] ${sentence}`);
+      messageBuffer.addMessage(sentence, "status");
+      session.sendSessionEvent({ type: "message", message: sentence });
+      logger.reportCaught(error, {
+        category: "codex-start",
+        severity: "error",
+      });
+      return error;
+    };
+    try {
+      client = await connectCodexTransport({
+        selection,
+        attach: attachTransport,
+      });
+    } catch (error) {
+      throw reportStartFailure(
+        toCodexStartError(error, {
+          transport: client.kind,
+          version: codexVersion,
+          bin: selection.bin,
+        })
+      );
+    } finally {
+      // On success `client` may be the MCP fallback, which cleanup must close.
+      // On failure every attempted transport has already closed its child.
+      this.client = client;
+    }
 
     let wasCreated = false;
     let currentModeHash: string | null = null;
@@ -727,6 +830,8 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
       hash: string;
     } | null = null;
     let nextExperimentalResume: string | null = null;
+    // #6263 R10: the session id whose resume file was found, for nativeResume.
+    let nextExperimentalResumeId: string | null = null;
     let first = true;
 
     while (!this.shouldExit) {
@@ -771,6 +876,9 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
         try {
           const prevSessionId = client.getSessionId();
           nextExperimentalResume = findCodexResumeFile(prevSessionId);
+          nextExperimentalResumeId = nextExperimentalResume
+            ? prevSessionId
+            : null;
           if (nextExperimentalResume) {
             logger.debug(
               `[Codex] Found resume file for session ${prevSessionId}: ${nextExperimentalResume}`
@@ -803,9 +911,12 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
       try {
         if (!wasCreated) {
           let resumeFile: string | null = null;
+          let resumeId: string | null = null;
           if (nextExperimentalResume) {
             resumeFile = nextExperimentalResume;
+            resumeId = nextExperimentalResumeId;
             nextExperimentalResume = null;
+            nextExperimentalResumeId = null;
             logger.debug(
               "[Codex] Using resume file from mode change:",
               resumeFile
@@ -816,6 +927,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             );
             if (abortResumeFile) {
               resumeFile = abortResumeFile;
+              resumeId = this.storedSessionIdForResume;
               logger.debug(
                 "[Codex] Using resume file from aborted session:",
                 resumeFile
@@ -830,6 +942,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             const localResumeFile = findCodexResumeFile(session.sessionId);
             if (localResumeFile) {
               resumeFile = localResumeFile;
+              resumeId = session.sessionId;
               logger.debug(
                 "[Codex] Using resume file from local session:",
                 localResumeFile
@@ -860,8 +973,28 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             startConfig.config.experimental_resume = resumeFile;
           }
 
+          // #6263 R10: the app-server transport resumes the thread natively
+          // with the system prompt alone (taken from buildCodexStartConfig, so
+          // a later change there reaches this path); the transcript summary in
+          // startConfig stays the fallback and the MCP transport's behavior.
+          const nativeResume =
+            resumeFile && resumeId
+              ? {
+                  threadId: resumeId,
+                  developerInstructions: String(
+                    buildCodexStartConfig({
+                      message: message.message,
+                      mode: message.mode,
+                      first,
+                      mcpServers,
+                      cliOverrides: session.codexCliOverrides,
+                    }).config?.developer_instructions ?? ""
+                  ),
+                }
+              : undefined;
           await client.startSession(startConfig, {
             signal: this.abortController.signal,
+            nativeResume,
           });
           wasCreated = true;
           first = false;
@@ -889,16 +1022,18 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
             "[Codex] Marked session as not created after abort for proper resume"
           );
         } else {
-          const errorDetail = enrichWithSignalContext(
-            error instanceof Error ? error.message : String(error)
-          );
-          messageBuffer.addMessage(
-            `Process exited unexpectedly: ${errorDetail}`,
-            "status"
-          );
+          // #6263: a reconnect that cannot start Codex says so in the same
+          // words as a failed first start.
+          const errorMessage =
+            error instanceof CodexStartError
+              ? formatCodexStartFailure(error, os.hostname())
+              : `Process exited unexpectedly: ${enrichWithSignalContext(
+                  error instanceof Error ? error.message : String(error)
+                )}`;
+          messageBuffer.addMessage(errorMessage, "status");
           session.sendSessionEvent({
             type: "message",
-            message: `Process exited unexpectedly: ${errorDetail}`,
+            message: errorMessage,
           });
           if (client.hasActiveSession()) {
             this.storedSessionIdForResume = client.storeSessionForResume();
@@ -931,7 +1066,7 @@ class CodexRemoteLauncher extends RemoteLauncherBase {
   protected async cleanup(): Promise<void> {
     logger.debug("[codex-remote]: cleanup start");
     try {
-      await this.client.disconnect();
+      await this.client?.disconnect();
     } catch (error) {
       logger.debug("[codex-remote]: Error disconnecting client", error);
       logger.reportCaught(error, {

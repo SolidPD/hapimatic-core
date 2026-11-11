@@ -223,7 +223,7 @@ function LaneSessionPins(props: {
   if (models.length === 0) return null;
   return (
     <PinsContext.Provider value={context}>
-      <div className="border-b border-[var(--app-divider)]">
+      <div className="flex flex-col gap-1 py-1">
         {models.map(model => (
           <PinRow
             key={model.pin.key}
@@ -567,7 +567,9 @@ export const LaneBox = memo(function LaneBox(props: {
         </HoverTooltipButton>
       </div>
       {open ? (
-        <div className="pb-1 pl-2 pr-1">
+        // #6555: 4px each side (was 8px on the left). Measured on a 320px
+        // screen, a lane's pin had 244px for its action row; this gives 248px.
+        <div className="px-1 pb-1">
           {lane.sessions.length === 0 ? (
             <div className="border-b border-[var(--app-divider)] px-0.5 py-1.5 text-[length:var(--text-caption)] text-[var(--app-hint)]">
               No session running

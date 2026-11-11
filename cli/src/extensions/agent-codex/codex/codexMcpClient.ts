@@ -5,53 +5,34 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  ElicitRequestSchema,
+  type CallToolResult,
+} from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import { logger } from "@/ui/logger";
 import { buildHarnessChildEnv } from "@/sandbox/secretEnvVars";
 import { isProcessAlive, killProcess } from "@/utils/process";
-import type { CodexSessionConfig, CodexToolResponse } from "./types";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
+import {
+  CodexStartError,
+  appendStderrTail,
+  stderrCause,
+  type CodexEvent,
+  type CodexSessionConfig,
+  type CodexToolResponse,
+} from "./types";
+import type { CodexTransport } from "./codexTransport";
+import { CodexPermissionHandler } from "./utils/permissionHandler";
+import {
+  CODEX_MIN_SUPPORTED,
+  codexTestedMaxFor,
+  readCodexVersion,
+  warnIfUnverifiedCodexVersion,
+} from "./codexVersion";
 
-/** Event emitted by the Codex MCP server via codex/event notifications */
-export interface CodexEvent {
-  type?: string;
-  session_id?: string;
-  sessionId?: string;
-  conversation_id?: string;
-  conversationId?: string;
-  // codex mcp-server >= 0.144.6 identifies the session by threadId
-  thread_id?: string;
-  threadId?: string;
-  // agent_message
-  message?: string;
-  // agent_reasoning / agent_reasoning_delta
-  text?: string;
-  delta?: string;
-  // exec_command_begin / exec_command_end / exec_approval_request
-  command?: string;
-  output?: string;
-  error?: string;
-  call_id?: string;
-  // patch_apply_begin
-  auto_approved?: boolean;
-  changes?: Record<string, unknown>;
-  // patch_apply_end
-  stdout?: string;
-  stderr?: string;
-  success?: boolean;
-  // turn_diff
-  unified_diff?: string;
-  data?: {
-    session_id?: string;
-    sessionId?: string;
-    conversation_id?: string;
-    conversationId?: string;
-    thread_id?: string;
-    threadId?: string;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
+// #6263: CodexEvent moved to ./types (shared by both transports).
+export type { CodexEvent } from "./types";
 
 /** Shape of a Codex MCP call-tool response with optional identifier fields */
 interface CodexCallToolResponse extends CallToolResult {
@@ -73,11 +54,6 @@ interface CodexCallToolResponse extends CallToolResult {
     [key: string]: unknown;
   };
 }
-import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { CodexPermissionHandler } from "./utils/permissionHandler";
-import { execFileSync } from "child_process";
-import { randomUUID } from "node:crypto";
-
 type ElicitResponseValue = string | number | boolean | string[];
 type ElicitRequestedSchema = {
   type?: string;
@@ -214,89 +190,15 @@ function buildElicitationResult(
 
 const DEFAULT_TIMEOUT = 14 * 24 * 60 * 60 * 1000; // 14 days, which is the half of the maximum possible timeout (~28 days for int32 value in NodeJS)
 
-/**
- * Range of codex CLI versions whose `threadId` session-contract Hapimatic is
- * verified against. 0.144.6 is the first version carrying the verified `threadId`
- * contract; the client is tested through 0.147.0.
- */
-const CODEX_MIN_SUPPORTED = "0.144.6";
-const CODEX_TESTED_MAX = "0.147.0";
-
-/**
- * Read and parse the installed codex CLI version, e.g. "0.147.0" or
- * "0.148.0-alpha.3". Returns null when codex is not installed or the version
- * output cannot be parsed. Read once here and reused by getCodexMcpCommand and
- * checkSupportedCodexVersion. Uses execFileSync (no shell) — the argument list is
- * static, so there is no injection surface.
- */
-function parseCodexVersion(): string | null {
-  try {
-    const version = execFileSync("codex", ["--version"], {
-      encoding: "utf8",
-    }).trim();
-    const match = version.match(/codex-cli\s+(\d+\.\d+\.\d+(?:-alpha\.\d+)?)/);
-    return match ? match[1] : null;
-  } catch (error) {
-    logger.debug("[CodexMCP] Error reading codex version:", error);
-    return null;
-  }
-}
-
-/** Compare two X.Y.Z version strings, ignoring any -alpha suffix. Returns -1 / 0 / 1. */
-function compareStableVersion(a: string, b: string): number {
-  const pa = a.split("-")[0].split(".").map(Number);
-  const pb = b.split("-")[0].split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    const da = pa[i] ?? 0;
-    const db = pb[i] ?? 0;
-    if (da !== db) return da < db ? -1 : 1;
-  }
-  return 0;
-}
-
-/**
- * Warn (never throw) when the installed codex version is outside the range whose
- * threadId contract Hapimatic is verified against, and return the detected version.
- *
- * Below CODEX_MIN_SUPPORTED the legacy sessionId/conversationId contract still works
- * and the retained fallback capture layers (extractIdentifiers / updateIdentifiersFromEvent)
- * serve it, so a connect-time throw would regress a working install. Above
- * CODEX_TESTED_MAX (or an -alpha prerelease) the contract MAY still hold, so a hard
- * fail would be its own regression. Returns null when codex is absent / unparseable —
- * stay silent in that case (mirrors getCodexMcpCommand's tolerant default).
- */
-function checkSupportedCodexVersion(): string | null {
-  const versionStr = parseCodexVersion();
-  if (!versionStr) return null;
-
-  const isAlpha = versionStr.includes("-alpha.");
-  if (compareStableVersion(versionStr, CODEX_MIN_SUPPORTED) < 0) {
-    logger.warn(
-      `[CodexMCP] Installed codex ${versionStr} is BELOW the verified minimum ` +
-        `${CODEX_MIN_SUPPORTED}. Hapimatic's Codex threadId contract is verified for ` +
-        `>= ${CODEX_MIN_SUPPORTED} (tested through ${CODEX_TESTED_MAX}); on this older ` +
-        `codex only the legacy sessionId contract applies and Codex sessions may fail.`
-    );
-  } else if (
-    isAlpha ||
-    compareStableVersion(versionStr, CODEX_TESTED_MAX) > 0
-  ) {
-    logger.warn(
-      `[CodexMCP] Installed codex ${versionStr} is ABOVE the tested maximum ` +
-        `${CODEX_TESTED_MAX}${isAlpha ? " (prerelease)" : ""}. Hapimatic's Codex ` +
-        `threadId contract is tested through ${CODEX_TESTED_MAX}; if Codex sessions ` +
-        `misbehave, update Hapimatic.`
-    );
-  }
-  return versionStr;
-}
+/** Lines of Codex stderr kept for a start-failure message. */
 
 /**
  * Get the correct MCP subcommand based on installed codex version
- * Versions >= 0.43.0-alpha.5 use 'mcp-server', older versions use 'mcp'
+ * Versions >= 0.43.0-alpha.5 use 'mcp-server', older versions use 'mcp'.
+ * Codex 0.154.0 removed `mcp-server`; the transport selector (#6263) routes
+ * those versions to the app-server transport, so this is not reached there.
  */
-function getCodexMcpCommand(): string {
-  const versionStr = parseCodexVersion();
+function getCodexMcpCommand(versionStr: string | null): string {
   if (!versionStr) return "mcp-server"; // Default to newer command if we can't parse
 
   const [major, minor, patch] = versionStr.split(/[-.]/).map(Number);
@@ -314,7 +216,8 @@ function getCodexMcpCommand(): string {
   return "mcp"; // Older versions use mcp
 }
 
-export class CodexMcpClient {
+export class CodexMcpClient implements CodexTransport {
+  readonly kind = "mcp" as const;
   private client: Client;
   private transport: StdioClientTransport | null = null;
   private connected: boolean = false;
@@ -325,13 +228,20 @@ export class CodexMcpClient {
   private threadId: string | null = null;
   private sessionId: string | null = null;
   private conversationId: string | null = null;
-  // Version detected at connect() by checkSupportedCodexVersion(); surfaced in the
-  // continueSession "No active session" guard so an out-of-range codex is named.
+  // Version detected at connect(); surfaced in the continueSession "No active
+  // session" guard so an out-of-range codex is named.
   private detectedCodexVersion: string | null = null;
   private handler: ((event: CodexEvent) => void) | null = null;
   private permissionHandler: CodexPermissionHandler | null = null;
+  // #6263: the executable to run and, when the caller already probed it, its
+  // version (`undefined` = probe at connect).
+  private readonly codexBin: string;
+  private readonly knownVersion: string | null | undefined;
+  private stderrTail: string[] = [];
 
-  constructor() {
+  constructor(options: { bin?: string; version?: string | null } = {}) {
+    this.codexBin = options.bin ?? "codex";
+    this.knownVersion = options.version;
     this.client = new Client(
       { name: "hapi-codex-client", version: "1.0.0" },
       { capabilities: { elicitation: {} } }
@@ -375,13 +285,18 @@ export class CodexMcpClient {
   async connect(): Promise<void> {
     if (this.connected) return;
 
-    const mcpCommand = getCodexMcpCommand();
+    const version =
+      this.knownVersion !== undefined
+        ? this.knownVersion
+        : readCodexVersion(this.codexBin);
+    const mcpCommand = getCodexMcpCommand(version);
     // Surface a loud warning at connect time (before any turn) when the installed
     // codex version is outside the verified threadId-contract range. Never throws —
     // pre-0.144.6 installs keep working on the legacy fallback layers.
-    this.detectedCodexVersion = checkSupportedCodexVersion();
+    warnIfUnverifiedCodexVersion(version, "mcp");
+    this.detectedCodexVersion = version;
     logger.debug(
-      `[CodexMCP] Connecting to Codex MCP server using command: codex ${mcpCommand}`
+      `[CodexMCP] Connecting to Codex MCP server using command: ${this.codexBin} ${mcpCommand}`
     );
 
     // #3813: strip secrets at this wrapper→child seam via the shared per-flavor
@@ -400,19 +315,86 @@ export class CodexMcpClient {
         {} as Record<string, string>
       )
     );
-    this.transport = new StdioClientTransport({
-      command: "codex",
+    // #6263: pipe stderr (it was inherited) so a failed start can name its
+    // cause, and so Codex warnings (e.g. 0.153.4's mcp-server deprecation)
+    // reach the log file.
+    const transport = new StdioClientTransport({
+      command: this.codexBin,
       args: [mcpCommand],
       env: codexChildEnv,
+      stderr: "pipe",
+    });
+    this.transport = transport;
+    this.stderrTail = [];
+    transport.stderr?.on("data", (chunk: Buffer | string) => {
+      for (const text of appendStderrTail(this.stderrTail, chunk.toString())) {
+        logger.debug(`[CodexMCP][stderr] ${text}`);
+      }
     });
 
     // Register request handlers for Codex permission methods
     this.registerPermissionHandlers();
 
-    await this.client.connect(this.transport);
+    try {
+      await this.client.connect(transport);
+    } catch (error) {
+      throw await this.failConnect(error, version);
+    }
     this.connected = true;
 
     logger.debug("[CodexMCP] Connected to Codex");
+  }
+
+  /**
+   * #6263: a failed connect leaves `connected` false, so disconnect() would
+   * return early and leave the child running. Close it here, then describe the
+   * failure as a CodexStartError.
+   */
+  private async failConnect(
+    error: unknown,
+    version: string | null
+  ): Promise<CodexStartError> {
+    const transport = this.transport;
+    const pid = transport?.pid ?? null;
+    // Judged before the close below, which ends the child either way.
+    const exited = pid === null || !isProcessAlive(pid);
+    try {
+      await this.client.close();
+    } catch {
+      // expected: the client may never have attached the transport.
+    }
+    try {
+      await transport?.close();
+    } catch {
+      // expected: the transport may already be closed.
+    }
+    if (pid !== null && isProcessAlive(pid)) {
+      await killProcess(pid, true);
+    }
+    this.transport = null;
+
+    const code = (error as { code?: unknown } | null)?.code;
+    const message = error instanceof Error ? error.message : String(error);
+    const kind =
+      code === "ENOENT"
+        ? "not-installed"
+        : exited
+          ? "exited-at-startup"
+          : "initialize-failed";
+    // An exited child names its cause on stderr; a failed handshake in a live
+    // child is named by the error.
+    const detail =
+      kind === "exited-at-startup"
+        ? (stderrCause(this.stderrTail) ?? message)
+        : message;
+    return new CodexStartError({
+      kind,
+      transport: "mcp",
+      codexVersion: version,
+      codexBin: this.codexBin,
+      detail,
+      cause: error,
+    });
   }
 
   private registerPermissionHandlers(): void {
@@ -520,7 +502,7 @@ export class CodexMcpClient {
       throw new Error(
         `No active session. Call startSession first. (${versionHint}; ` +
           `Hapimatic's Codex threadId contract is verified for >= ${CODEX_MIN_SUPPORTED}, ` +
-          `tested through ${CODEX_TESTED_MAX} — on older codex the legacy sessionId ` +
+          `tested through ${codexTestedMaxFor("mcp")} — on older codex the legacy sessionId ` +
           `contract applies; if you see this on a modern codex, update Hapimatic.)`
       );
     }

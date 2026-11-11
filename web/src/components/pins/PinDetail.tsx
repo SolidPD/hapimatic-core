@@ -196,7 +196,7 @@ export function PinDetail(props: {
   return (
     <div
       id={`pin-detail-${pin.key}`}
-      className="pins-detail border-b border-[var(--app-divider)] bg-[var(--app-subtle-bg)]"
+      className="pins-detail bg-[var(--app-subtle-bg)]"
     >
       {summary ?? null}
       {moot ? (

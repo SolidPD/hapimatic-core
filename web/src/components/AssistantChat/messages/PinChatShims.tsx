@@ -111,13 +111,16 @@ export function collectPinKeysDeep(block: ChatBlock): string[] {
   return keys;
 }
 
-/** Reserves the collapsed row, so a card that loads late moves nothing. */
+/**
+ * Reserves an open pin's collapsed box (34px), so a card that loads late moves
+ * nothing. A settled pin's box is 4px shorter, so its card settles by 4px.
+ */
 function Placeholder() {
   return (
     <div
       aria-busy="true"
-      className="my-1 rounded-md border border-[var(--app-divider)]"
-      style={{ minHeight: "36px" }}
+      className="my-1 rounded-md border border-[var(--app-border)]"
+      style={{ minHeight: "34px" }}
     />
   );
 }

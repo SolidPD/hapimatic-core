@@ -103,6 +103,16 @@ export const PIN_PILL_CLASS =
   "inline-flex items-center justify-center gap-0.5 whitespace-nowrap rounded-full border px-1.5 font-bold tabular-nums";
 
 /**
+ * #6555 (design rule R10-a): one pin is one rounded object. The box holds the
+ * pin's row and, when it is open, its detail, and sits 4px from the next box
+ * (the gap belongs to the list that contains the boxes). It adds an outline
+ * and no padding. `PinRow` and `CompletedPinRow` both render it, so the Pins
+ * tab, a lane box, and the chat card cannot drift apart.
+ */
+export const PIN_BOX_CLASS =
+  "min-w-0 overflow-hidden rounded-md border border-[var(--app-border)]";
+
+/**
  * Stops a click from reaching the row. On a touch screen a tooltip trigger is
  * a Radix Popover trigger whose click still bubbles, and React portals bubble
  * the bubble's own clicks through the React tree too (`ui/tooltip.tsx`), so
@@ -240,13 +250,19 @@ export function usePinsContext(): PinsContextValue {
 const HIGHLIGHT_DURATION_MS = 800;
 const HIGHLIGHT_CLASS = "animate-message-highlight";
 
-/** Restart the flash on a row (the `highlightMessage` pattern). */
+/**
+ * Restart the flash on a row (the `highlightMessage` pattern). The flash is an
+ * outward shadow, which a pin's box would clip if it stayed on the row inside
+ * it (#6555), so a pin's row flashes its box. An element with no pin box
+ * around it (a lane box) flashes itself.
+ */
 export function flashRow(element: HTMLElement): void {
-  element.classList.remove(HIGHLIGHT_CLASS);
-  void element.offsetWidth; // a reflow, so re-adding the class restarts it
-  element.classList.add(HIGHLIGHT_CLASS);
+  const target = element.closest<HTMLElement>("[data-pin-box]") ?? element;
+  target.classList.remove(HIGHLIGHT_CLASS);
+  void target.offsetWidth; // a reflow, so re-adding the class restarts it
+  target.classList.add(HIGHLIGHT_CLASS);
   window.setTimeout(
-    () => element.classList.remove(HIGHLIGHT_CLASS),
+    () => target.classList.remove(HIGHLIGHT_CLASS),
     HIGHLIGHT_DURATION_MS
   );
 }

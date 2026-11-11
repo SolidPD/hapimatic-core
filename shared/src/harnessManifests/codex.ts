@@ -9,6 +9,15 @@ import { CODEX_REASONING_EFFORTS } from "../codexModelCatalog";
  * (`codex --version` + `codex --help` / `codex exec --help` / `codex mcp --help`).
  * ⚠️ Codex is volatile — see sibling epic members #2196 (`wire_api=responses`)
  * and #3060 (session death); re-verify the `mcp` / `headlessExec` axes on upgrade.
+ *
+ * Remote session transport (#6263): Codex CLI 0.154.0 removed
+ * `codex mcp-server`. The remote launcher drives `codex mcp-server` below
+ * 0.154.0 and `codex app-server` from 0.154.0 (automatic by version; override
+ * `HAPI_CODEX_TRANSPORT` / settings `codexTransport`). Verified live in a
+ * Hapimatic session on 0.147.0 over both transports, and the app-server
+ * transport headless on 0.166.0 and 0.167.0 (a scratch CODEX_HOME through
+ * OpenRouter). See `CODEX_TRANSPORT_VERIFIED_VERSIONS` in
+ * `cli/src/extensions/agent-codex/codex/codexVersion.ts`.
  */
 export const codexManifest: HarnessManifest = {
   agentId: "codex",
@@ -28,7 +37,8 @@ export const codexManifest: HarnessManifest = {
     placement: "project-root",
     semantics: "AGENTS.md",
   },
-  // verified: 0.147.0 — no `acp` subcommand (`app-server`/`mcp-server` are not ACP).
+  // verified: 0.147.0 — no `acp` subcommand (`app-server`/`mcp-server` are not
+  // ACP; `mcp-server` was removed in 0.154.0, #6263).
   acp: { server: "absent", client: "absent" },
   // verified: 0.147.0 — `codex exec` + `codex review` run non-interactively;
   // `codex exec --json` prints JSONL events.

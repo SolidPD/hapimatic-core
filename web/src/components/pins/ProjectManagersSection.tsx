@@ -96,7 +96,10 @@ export function ProjectManagersSection(props: {
       open={props.open}
       onToggle={props.onToggle}
     >
-      <div className="px-1 pb-1">
+      {/* #6555: no inset of its own. The section body already insets its
+          children, and a second inset here left a lane's pin too narrow for
+          its action row on a 320px screen. */}
+      <div>
         {missing ? (
           <p
             className="truncate px-1 py-0.5 text-[length:var(--text-caption)] text-[var(--status-warn)]"

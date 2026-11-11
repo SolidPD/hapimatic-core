@@ -3,6 +3,7 @@ import { memo, useCallback, type CSSProperties } from "react";
 import { Bot, Timer, User } from "lucide-react";
 import { PinDetail } from "@/components/pins/PinDetail";
 import {
+  PIN_BOX_CLASS,
   PinDetailsToggle,
   PinIndicator,
   PinKindBadge,
@@ -24,7 +25,9 @@ const RECEIPT_ICON: CSSProperties = { width: "11px", height: "11px" };
 // Mockup v6 :172-181. The grid, the recede (opacity, saturation, 11.5px
 // type), and the narrow-screen columns live in index.css
 // (`pins-completed-row`), because a hover and a media query cannot be inline.
-const ROW_STYLE: CSSProperties = { minHeight: "30px" };
+// #6555: 28px, because the pin's box adds a 1px border above and below, so a
+// collapsed completed pin is still 30px tall.
+const ROW_STYLE: CSSProperties = { minHeight: "28px" };
 const CELL = "min-w-0 truncate";
 
 function Receipt(props: { model: PinViewModel; armed: boolean }) {
@@ -77,6 +80,8 @@ export type CompletedPinRowProps = {
   armed: boolean;
   onToggle: (key: string) => void;
   observe: (key: string, element: Element | null) => void;
+  /** #6555: where the pin is shown; the chat card passes `"chat"`. */
+  mode?: "tab" | "chat";
 };
 
 /**
@@ -84,6 +89,9 @@ export type CompletedPinRowProps = {
  * channel, and receipt columns align across rows (`pins-completed-row` in
  * index.css; below 600px the time and channel columns collapse and hide, as
  * in mockup v6). Expanded: how and when it was completed, the note, and Text.
+ * #6555: the pin is one rounded box (`PIN_BOX_CLASS`) around the row and its
+ * detail. `pins-completed-row` stays on the row, so the row recedes and the
+ * box's outline does not.
  */
 export const CompletedPinRow = memo(function CompletedPinRow(
   props: CompletedPinRowProps
@@ -102,12 +110,12 @@ export const CompletedPinRow = memo(function CompletedPinRow(
   const channel = completedChannel(pin);
   const note = settlingAnswerNote(pin);
   return (
-    <>
+    <div data-pin-box className={PIN_BOX_CLASS}>
       <div
         id={`pin-row-${pin.key}`}
         ref={armed ? undefined : register}
         onClick={toggle}
-        className="pins-completed-row cursor-pointer items-center border-b border-[var(--app-divider)] py-px pl-1.5 pr-0.5 text-[var(--app-hint)]"
+        className="pins-completed-row cursor-pointer items-center py-px pl-1.5 pr-0.5 text-[var(--app-hint)]"
         style={ROW_STYLE}
       >
         <PinKindBadge kind={pin.kind} armed={armed} />
@@ -151,6 +159,7 @@ export const CompletedPinRow = memo(function CompletedPinRow(
       {expanded ? (
         <PinDetail
           model={model}
+          mode={props.mode}
           summary={
             <div className="text-[length:var(--text-body)] text-[var(--app-fg)]">
               <p>{completedSummary(pin, timeZone)}</p>
@@ -163,6 +172,6 @@ export const CompletedPinRow = memo(function CompletedPinRow(
           }
         />
       ) : null}
-    </>
+    </div>
   );
 });

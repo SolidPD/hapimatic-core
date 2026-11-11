@@ -455,6 +455,32 @@ export function buildSandboxEnv(
   return out;
 }
 
+/** Issue #6263: the daemon env switches a tmux-persisted Codex wrapper reads. */
+export const CODEX_SWITCH_ENV_VARS = [
+  "HAPI_CODEX_TRANSPORT",
+  "HAPI_CODEX_BIN",
+] as const;
+
+/**
+ * Issue #6263 (R16): forward the Codex transport switches into the
+ * tmux-persisted worker. The worker inherits the FROZEN tmux-server env, not
+ * the daemon's, so a daemon `Environment=HAPI_CODEX_TRANSPORT=…` reaches the
+ * Codex wrapper (which resolves the transport at start) only via this forward
+ * — the same reason {@link buildSandboxEnv} forwards its kill-switches. With
+ * neither variable set the result is empty and the spawn env is unchanged.
+ * `settings.json` needs no forward: the worker gets `HAPI_HOME` and reads it.
+ */
+export function buildCodexSwitchEnv(
+  env: NodeJS.ProcessEnv = process.env
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of CODEX_SWITCH_ENV_VARS) {
+    const value = env[name];
+    if (value !== undefined) out[name] = value;
+  }
+  return out;
+}
+
 /**
  * Issue #3179 (K7): stable deployed-fix marker. #3184 greps the deployed
  * sl7 binary and the daemon log for it — do NOT reword.
@@ -1229,6 +1255,9 @@ export async function spawnSessionInTmux(
     // Issue #1734 (OmniBox Phase 0b): forward the sandbox kill-switch + inject
     // the loopback egress-proxy vars (gated on the sandbox + a live broker).
     Object.assign(envVars, buildSandboxEnv());
+
+    // Issue #6263 (R16): forward the Codex transport switches (unset → nothing).
+    Object.assign(envVars, buildCodexSwitchEnv());
 
     // Merge additional environment variables (e.g., worktree vars)
     if (extraEnv) {

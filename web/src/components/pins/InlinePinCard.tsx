@@ -109,8 +109,8 @@ export default function InlinePinCard(props: {
     return record.isPending ? (
       <div
         aria-busy="true"
-        className="my-1 rounded-md border border-[var(--app-divider)]"
-        style={{ minHeight: "36px" }}
+        className="my-1 rounded-md border border-[var(--app-border)]"
+        style={{ minHeight: "34px" }}
       />
     ) : (
       <>{fallback}</>
@@ -121,10 +121,7 @@ export default function InlinePinCard(props: {
   const settled = model.pin.status !== "open" && model.pin.status !== "live";
   return (
     <PinsContext.Provider value={context}>
-      <div
-        data-pin-card={model.pin.key}
-        className="my-1 overflow-hidden rounded-md border border-[var(--app-border)]"
-      >
+      <div data-pin-card={model.pin.key} className="my-1 rounded-md">
         {settled ? (
           <CompletedPinRow
             model={model}
@@ -132,6 +129,7 @@ export default function InlinePinCard(props: {
             armed={armed}
             onToggle={toggle}
             observe={observe}
+            mode="chat"
           />
         ) : (
           <PinRow
@@ -143,6 +141,7 @@ export default function InlinePinCard(props: {
             onToggle={toggle}
             onStar={starPin}
             observe={observe}
+            mode="chat"
           />
         )}
       </div>

@@ -253,7 +253,10 @@ export const ProjectManagerBlock = memo(function ProjectManagerBlock(props: {
         </span>
       </div>
       {expanded ? (
-        <div className="pb-1 pl-2">
+        // #6555: the lanes sit 4px in from the header (was 8px). With the lane
+        // body's 4px, a lane's pin has 252px for its action row on a 320px
+        // screen (Pins PM ruling L1, 2026-11-10).
+        <div className="pb-1 pl-1">
           {pm.degraded ? (
             <div className="py-1 text-[length:var(--text-caption)] text-[var(--app-hint)]">
               A lane on this dashboard could not be read, so it is not shown
