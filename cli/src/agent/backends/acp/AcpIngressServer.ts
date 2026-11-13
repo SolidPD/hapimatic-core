@@ -36,7 +36,9 @@ import { startHookServer } from "@/claude/utils/startHookServer";
 import {
   generateHookSettingsFile,
   cleanupHookSettingsFile,
+  type HookSettingsOptions,
 } from "@/claude/utils/generateHookSettings";
+import { resolveSessionCompactionEnv } from "@/claude/utils/sessionCompaction";
 import { HAPI_MCP_SERVER_NAME } from "@/claude/utils/scrubHapiOnSpawn";
 import { PushableAsyncIterable } from "@/utils/PushableAsyncIterable";
 import { asString, isObject } from "@/agent/utils";
@@ -103,6 +105,22 @@ export interface AcpIngressServerOptions {
    * drift from its 20+ field contract.
    */
   driverRunner?: typeof claudeRemote;
+}
+
+/**
+ * Issue #6570: the hook-settings options an ACP editor session's `--settings` file
+ * gets. ACP never runs `runClaude` (it drives `claudeRemote` through its driver),
+ * so it resolves the node's compact-at value itself. ACP has no safe-mode branch,
+ * so its sessions always carry the `env` block when the value resolves enabled.
+ * The resolver is a parameter so a test can check what is passed without driving
+ * `session/new` (whose bootstrap is not test-reachable, ruling D8).
+ */
+export function acpHookSettingsOptions(
+  resolveCompactionEnv: () => Record<string, string> | null = () =>
+    resolveSessionCompactionEnv()
+): HookSettingsOptions {
+  const env = resolveCompactionEnv();
+  return env ? { env } : {};
 }
 
 export class AcpIngressServer {
@@ -209,7 +227,8 @@ export class AcpIngressServer {
     const hookServer = await startHookServer({ onSessionHook: () => {} });
     const hookSettingsPath = generateHookSettingsFile(
       hookServer.port,
-      hookServer.token
+      hookServer.token,
+      acpHookSettingsOptions()
     );
     const mcpServers: Record<string, unknown> = {
       [HAPI_MCP_SERVER_NAME]: { type: "http", url: happyServer.url },

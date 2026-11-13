@@ -19,11 +19,20 @@ export function ThroughputTestsTable({
   api: ApiClient | null;
   range: ThroughputRange;
 }) {
-  const { page, isLoading } = useThroughputTests(api, range);
+  const { page, isLoading, error } = useThroughputTests(api, range);
   if (isLoading) {
     return (
       <div className="py-6 text-center text-xs text-[var(--app-muted)]">
         Loading...
+      </div>
+    );
+  }
+  // #6367: a failed request is not "no failing tests". The error wins over a
+  // cached page, as in the summary and the breakdown.
+  if (error) {
+    return (
+      <div className="py-6 text-center text-xs text-[var(--app-muted)]">
+        Could not load the failing tests ({error}).
       </div>
     );
   }

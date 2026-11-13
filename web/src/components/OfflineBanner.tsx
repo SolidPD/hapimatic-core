@@ -11,7 +11,7 @@ export function OfflineBanner() {
   // R4 (#2779): pad past the iOS notch / Dynamic Island — see SyncingBanner.
   return (
     <div
-      className="fixed top-0 left-0 right-0 bg-amber-500 text-white text-center py-2 text-sm font-medium z-50"
+      className="fixed top-0 inset-x-[var(--content-gutter)] bg-amber-500 text-white text-center py-2 text-sm font-medium z-50"
       style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top, 0.5rem))" }}
     >
       You're offline. Some features may be unavailable.

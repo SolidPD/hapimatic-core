@@ -57,6 +57,7 @@ import {
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { Session } from "@/types/api";
 import { ApiError, type ApiClient } from "@/api/client";
+import { apiErrorServerMessage } from "@/lib/apiErrorMessage";
 import type { AgentType } from "@/components/NewSession/types";
 import type { SpawnInput } from "@/hooks/mutations/useSpawnSession";
 import { effortLevelsForCurrent } from "@/components/AssistantChat/ModelModePicker";
@@ -783,7 +784,12 @@ function EditSessionParamsForm({
       await applyLivePlaneChanges();
       onClose();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to apply changes");
+      // Issue #6617 (D7-1): a refused mode change (a running tmux or pty
+      // session) carries a message saying how to make it; show it as is.
+      setError(
+        apiErrorServerMessage(e) ??
+          (e instanceof Error ? e.message : "Failed to apply changes")
+      );
     }
   }
 

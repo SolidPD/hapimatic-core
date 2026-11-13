@@ -7,6 +7,10 @@ import { ClaudeRemoteLauncherKindSchema } from "./launcherResolver";
 import { isQualifiedApiKeyRef, isUsableNodeIdForSharing } from "./apiKeyRef";
 import { McpSetSchema } from "./mcpSet";
 import {
+  isSpawnModelArgValue,
+  isSpawnOutputStyleArgValue,
+} from "./spawnArgValues";
+import {
   ApiKeyStatusSchema,
   DaemonCapSourceSchema,
   EffortLevelSchema,
@@ -46,6 +50,15 @@ export const LOCAL_NODE_LABEL = "This node";
  * without the tag is refused before any proxy call (`node_login_unsupported`).
  */
 export const ANTHROPIC_LOGIN_CAPABILITY = "accounts:anthropic-login";
+
+/**
+ * Issue #6586: advertised by every node whose binary serves the billable
+ * interval feed (`POST /api/federation/interval-feed`), in every
+ * `HAPI_BILLABLE_INTERVALS` mode, because a node switched to `off` still serves
+ * the intervals closed before the switch. A puller sends no request to a polled
+ * peer without it, so an older peer logs no `auth` warning every minute.
+ */
+export const INTERVAL_FEED_CAPABILITY = "billable:interval-feed";
 
 /**
  * Issue #5127: advertised by every node whose binary serves the shared-API-key
@@ -297,8 +310,15 @@ export const FederationSpawnBodySchema = z.object({
    *  default launcher (env > settings > sdk). */
   launcher: ClaudeRemoteLauncherKindSchema.optional(),
   /** Issue #1733: gateway model id ("provider/model") for an OpenRouter-routed
-   *  Codex session on the receiving node. Mirrors the local spawnBodySchema. */
-  model: z.string().optional(),
+   *  Codex session on the receiving node. Mirrors the local spawnBodySchema.
+   *  Issue #5348: refused when the spawned hapi would read it as a flag. */
+  model: z
+    .string()
+    .refine(v => isSpawnModelArgValue(v), {
+      message:
+        "must start with a letter or a digit and hold no whitespace (#5348)",
+    })
+    .optional(),
   /** Issue #3349 (D4(a)): native-vs-OpenRouter routing discriminator for the
    *  receiving node. Mirrors the local spawnBodySchema (#1262 — the federation
    *  hop is the "worst" silent-drop site; this mirror closes it). Absent → the
@@ -316,8 +336,15 @@ export const FederationSpawnBodySchema = z.object({
   /** Issue #2456: specific pinned raw Claude model id (full-catalog "More
    *  models" selection) for the receiving node. Mirrors the local
    *  spawnBodySchema; threaded daemon-ward as --hapi-raw-model. Harmless
-   *  (schema-dropped) on older peers. */
-  rawModel: z.string().optional(),
+   *  (schema-dropped) on older peers. Issue #5348: refused when the spawned
+   *  hapi would read the trimmed value as a flag. */
+  rawModel: z
+    .string()
+    .refine(v => isSpawnModelArgValue(v), {
+      message:
+        "must start with a letter or a digit and hold no whitespace (#5348)",
+    })
+    .optional(),
   /** Issue #1953 (A6): clone-on-spawn repo ("owner/repo") for the receiving
    *  node. Mirrors the local spawnBodySchema; the peer clones it on spawn. */
   cloneRepo: z.string().optional(),
@@ -330,8 +357,15 @@ export const FederationSpawnBodySchema = z.object({
    *  spawnBodySchema; the peer threads it daemon-ward as --hapi-output-style.
    *  Lockstep-deploy caveat: a stale peer schema-STRIPS this field → the style
    *  is silently unset on the old peer (harmless), the same caveat the effort
-   *  field documents. */
-  outputStyle: z.string().optional(),
+   *  field documents. Issue #5348: refused when the spawned hapi would read it
+   *  as a flag. */
+  outputStyle: z
+    .string()
+    .refine(v => isSpawnOutputStyleArgValue(v), {
+      message:
+        "must not start with a dash or with whitespace, nor end with whitespace (#5348)",
+    })
+    .optional(),
   /** Issue #3348: bundled non-claude native model selection (gemini id →
    *  GEMINI_MODEL env; codex id + effort → config.toml bake) for the receiving
    *  node. Mirrors the local spawnBodySchema; the peer conveys it per-agent at

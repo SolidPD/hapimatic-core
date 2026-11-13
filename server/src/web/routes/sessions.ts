@@ -5,6 +5,7 @@ import {
   getPermissionModesForFlavor,
   isModelModeAllowedForFlavor,
   isPermissionModeAllowedForFlavor,
+  isSpawnModelArgValue,
   mcpLiveToggleRefusal,
   toSessionSummary,
   type SessionSummary,
@@ -127,7 +128,15 @@ const effortSchema = z.object({
   effort: EffortLevelSchema,
 });
 const rawModelSchema = z.object({
-  rawModel: z.string().min(1).max(200),
+  // Issue #5348: refused when the spawned hapi would read the trimmed value as a flag.
+  rawModel: z
+    .string()
+    .min(1)
+    .max(200)
+    .refine(v => isSpawnModelArgValue(v), {
+      message:
+        "must start with a letter or a digit and hold no whitespace (#5348)",
+    }),
 });
 
 // Issue #2082: the 8 per-session field-mutation schemas moved to the shared

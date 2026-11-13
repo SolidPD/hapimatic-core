@@ -45,8 +45,10 @@ import {
  * UI the user is in. The chip is the UI host; a session header's badge is that
  * session's node. The two may differ and look identical by design.
  *
- * Position (`computeChipPlacement`): the chip's center sits at half the measured
- * wordmark `<Link>`'s left edge, nudged right past the back arrow (and, while
+ * Position (`computeChipPlacement`): the chip's center sits halfway between the
+ * content column's letterbox (0 wide until the window is wider than the column)
+ * and the measured wordmark `<Link>`'s left edge, nudged right past the back
+ * arrow (and, while
  * iPad multitasking, the window-control zone — ruling H-1 A), collapsed to the
  * health dot when it would pass the wordmark's clearance gap, and not rendered
  * when even the dot would.
@@ -121,6 +123,17 @@ function NodeRowStatus({ row }: { row: NodeSwitchRow }): ReactElement {
       {noAddress ? "no address" : row.status}
     </span>
   );
+}
+
+/**
+ * The width of the brand letterbox left of the header's inner container: the
+ * used value of its `mx-auto` margin, which is 0 until the window is wider than
+ * the content column (`max-w-content`). The chip is placed right of it, so it
+ * never sits out in the letterbox. An unreadable value (jsdom) counts as 0.
+ */
+function letterboxWidth(container: HTMLElement): number {
+  const margin = Number.parseFloat(getComputedStyle(container).marginLeft);
+  return Number.isFinite(margin) && margin > 0 ? margin : 0;
 }
 
 interface Placed {
@@ -212,6 +225,7 @@ export function TitleBarNodeChip({
     }
     const p = computeChipPlacement({
       wordmarkLeft: wordmarkRect.left,
+      leftBound: letterboxWidth(container),
       chipWidth,
       obstacles,
     });

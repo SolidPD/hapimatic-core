@@ -11,9 +11,10 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { PIN_LIST_MAX_LIMIT } from "@hapi/protocol";
+import { normalizePinId, PIN_LIST_MAX_LIMIT } from "@hapi/protocol";
 import type { ApiClient } from "@/api/client";
 import { CompletedPinRow } from "@/components/pins/CompletedPinRow";
+import { PinFoundElsewhere } from "@/components/pins/PinFoundElsewhere";
 import { PinRow } from "@/components/pins/PinRow";
 import { PinsSection } from "@/components/pins/PinsSection";
 import { PinsTimeline } from "@/components/pins/PinsTimeline";
@@ -27,7 +28,13 @@ import {
 } from "@/components/pins/pinsShared";
 import { ProjectManagersSection } from "@/components/pins/ProjectManagersSection";
 import { Button } from "@/components/ui/button";
-import { useMarkPinSeen, usePins, useStarPin } from "@/hooks/queries/usePins";
+import { usePinDashboards } from "@/hooks/queries/usePinDashboards";
+import {
+  useMarkPinSeen,
+  usePinByIdLookup,
+  usePins,
+  useStarPin,
+} from "@/hooks/queries/usePins";
 import { usePinsViewDefaults } from "@/hooks/usePinsViewDefaults";
 import { usePinDeadlineOf } from "@/lib/pins/deadline";
 import { formatPinAge, formatPinTime, toPinViewModel } from "@/lib/pins/ledger";
@@ -263,10 +270,44 @@ export function PinsView(props: {
     }),
     [sessionId, viewNow, deadlineOf, viewStaged, held]
   );
-  const built = useMemo(
-    () => (models ? buildPinsView(models, view, deferredSearch, ctx) : null),
-    [models, view, deferredSearch, ctx]
+  // #6574 (FIND1): a search that is a pin ID, in any form a paste carries.
+  const idQuery = useMemo(
+    () => normalizePinId(deferredSearch),
+    [deferredSearch]
   );
+  const built = useMemo(
+    () =>
+      models ? buildPinsView(models, view, deferredSearch, ctx, idQuery) : null,
+    [models, view, deferredSearch, ctx, idQuery]
+  );
+  // "In the tab" is decided against every listed pin, completed ones included,
+  // never against the filtered view, so a facet never sends a pin that is here to
+  // the lookup. A dashboard is not listed here (the Project Managers section is
+  // outside search), so it is looked up and shown as a line.
+  const localIdHit = useMemo(
+    () =>
+      idQuery && models
+        ? (models.find(
+            m => m.pin.pinId === idQuery && m.pin.kind !== "dashboard"
+          )?.pin.key ?? null)
+        : null,
+    [idQuery, models]
+  );
+  const elsewhere = usePinByIdLookup(
+    api,
+    idQuery,
+    props.enabled && idQuery !== null && localIdHit === null && models !== null
+  );
+  const dashboards = usePinDashboards(api, props.enabled && idQuery !== null);
+  const laneSessionIds = useMemo<ReadonlySet<string>>(() => {
+    const response =
+      dashboards.data?.kind === "ok" ? dashboards.data.response : null;
+    const ids = new Set<string>();
+    for (const dashboard of response?.dashboards ?? []) {
+      for (const id of Object.values(dashboard.refs)) ids.add(id);
+    }
+    return ids;
+  }, [dashboards.data]);
   const layoutKey = `${facetKey}|${deferredSearch}|${view.group}`;
 
   // #6453 (R12): a `?pin=` link reveals its pin once per key, through the same
@@ -283,6 +324,19 @@ export function PinsView(props: {
     revealPin(revealKey);
     onRevealConsumed?.();
   }, [revealKey, built, revealPin, onRevealConsumed]);
+
+  // #6574: a pasted ID of a pin in this tab reveals it, past the facets and into
+  // its open section, once per ID.
+  const revealedId = useRef<string | null>(null);
+  useEffect(() => {
+    if (!idQuery || !localIdHit) {
+      revealedId.current = null;
+      return;
+    }
+    if (revealedId.current === idQuery) return;
+    revealedId.current = idQuery;
+    revealPin(localIdHit);
+  }, [idQuery, localIdHit, revealPin]);
 
   // R9: once a revealed pin is listed, open its section, then scroll its row
   // into view and flash it.
@@ -374,7 +428,16 @@ export function PinsView(props: {
         />
       ) : null}
       <div className="pb-3">
-        {built.shown === 0 && built.filtered ? (
+        {idQuery !== null && localIdHit === null ? (
+          <PinFoundElsewhere
+            pinId={idQuery}
+            lookup={elsewhere.data}
+            loading={elsewhere.isPending && elsewhere.fetchStatus !== "idle"}
+            failed={elsewhere.isError}
+            currentSessionId={sessionId}
+            laneSessionIds={laneSessionIds}
+          />
+        ) : built.shown === 0 && built.filtered ? (
           <EmptyLine>
             No pins match.{" "}
             <Button

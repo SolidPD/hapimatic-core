@@ -5,10 +5,13 @@
  * `--resume <id>`, plus `--fork-session` for a branch; both apply to the first
  * spawn only.
  */
+import { CLAUDE_SESSION_ID_PATTERN } from "@hapi/protocol";
 
-/** A Claude Code session id (a UUID). It becomes a file name, so nothing else passes. */
-const SESSION_ID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * A Claude Code session id (a UUID). It becomes a file name, so nothing else passes.
+ * Shared with the daemon's spawn-value check (#5348), so both use one pattern.
+ */
+const SESSION_ID = CLAUDE_SESSION_ID_PATTERN;
 
 /**
  * The session id after the first `--resume`, or null when there is none, the

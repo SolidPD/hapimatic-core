@@ -96,7 +96,7 @@ export type SessionInfoSource = {
   tag?: string | null;
   createdAt?: number;
   updatedAt?: number;
-  thinkingStartedAt?: number;
+  thinkingStartedAt?: number | null;
   serverAccumulatedMs?: number;
   rateLimited?: { resetText: string } | null;
   permissionMode?: string;

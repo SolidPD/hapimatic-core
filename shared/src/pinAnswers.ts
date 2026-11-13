@@ -20,6 +20,14 @@ import { APPROVAL_TOKEN_PATTERN } from "./pins";
 // message (`server/src/services/approvalTokens.ts`), and an agent knows its own
 // pending token: carried in an option label, it would mint the agent's own
 // approval on the operator's Submit. Pins never carry approvals (brief §C).
+//
+// ## Extending `hapi_pin_answers/1`
+//
+// A new optional field on an entry is the documented extension, not a version
+// bump, because readers are loose: `automaticPick` (#6452), `savedTo` (#6453),
+// `dismissed` with `title` (#6539) and `pinId` (#6574, placed right after `kind`)
+// each arrived this way. Renaming, removing or re-ordering an existing field is a
+// version bump.
 
 export const PIN_ANSWERS_SCHEMA = "hapi_pin_answers/1";
 export const PIN_ANSWERS_FENCE_LANGUAGE = "hapi_pin_answers";
@@ -63,6 +71,18 @@ export type PinAnswersEntry = {
   /** The revision the operator answered, which may be older than the pin's. */
   rev: number;
   kind: string;
+  /**
+   * #6574: the pin's server-owned ID, when it has one, so the agent can name the
+   * pin to another session. An identity field like `pin`, `rev` and `kind`.
+   */
+  pinId?: string;
+  /**
+   * #6539: the operator dismissed this pin without answering it, and the pin is
+   * closed. Such an entry carries no `answer`; it may carry a `note`.
+   */
+  dismissed?: true;
+  /** The dismissed pin's title, so the agent need not look the key up. */
+  title?: string;
   answer?: { choice: string; label: string };
   note?: string;
   questions?: string[];
@@ -85,6 +105,9 @@ const PinAnswersEntrySchema = z
     pin: z.string(),
     rev: z.number().int(),
     kind: z.string(),
+    pinId: z.string().optional(),
+    dismissed: z.literal(true).optional(),
+    title: z.string().optional(),
     answer: z
       .object({ choice: z.string(), label: z.string() })
       .loose()
@@ -185,7 +208,17 @@ function cleanEntry(entry: PinAnswersEntry): PinAnswersEntry {
     pin: neutralizeApprovalTokens(entry.pin),
     rev: entry.rev,
     kind: entry.kind,
+    // #6574: the fourth identity field. The server mints it, but a record from a
+    // newer peer is read loosely, so it is cleaned like the key.
+    ...(entry.pinId !== undefined
+      ? { pinId: neutralizeApprovalTokens(entry.pinId) }
+      : {}),
   };
+  if (entry.dismissed === true) out.dismissed = true;
+  // #6539: the agent wrote the title, so it may carry a token like any label.
+  if (entry.title !== undefined) {
+    out.title = neutralizeApprovalTokens(entry.title);
+  }
   if (entry.answer) {
     out.answer = {
       choice: neutralizeApprovalTokens(entry.answer.choice),
@@ -216,12 +249,21 @@ function cleanEntry(entry: PinAnswersEntry): PinAnswersEntry {
   if (entry.savedTo !== undefined) {
     out.savedTo = neutralizeApprovalTokens(entry.savedTo);
   }
-  if (Object.keys(out).length <= 3) {
+  // Only identity fields (pin, rev, kind and, when present, pinId) means nothing to send.
+  if (Object.keys(out).length <= (out.pinId === undefined ? 3 : 4)) {
     throw new Error(
       `pin "${entry.pin}" has nothing to send; the caller drops such entries`
     );
   }
   return out;
+}
+
+/** `<key> (dismissed by you: <title>)`; a pin with no title drops the colon. */
+function dismissedItem(entry: PinAnswersEntry): string {
+  const title = entry.title === undefined ? "" : summaryToken(entry.title);
+  return title === ""
+    ? `${entry.pin} (dismissed by you)`
+    : `${entry.pin} (dismissed by you: ${title})`;
 }
 
 export type PinAnswersMessageInput = {
@@ -247,7 +289,8 @@ export type PinAnswersMessage =
 
 /**
  * The exact message: `Pins answers, <time>: <counts> (<item>, …)`, where an
- * item is `<key> → <choice>` for an answer, `<key> (saved to <folder>)` for an
+ * item is `<key> (dismissed by you: <title>)` for a dismissal (#6539),
+ * `<key> → <choice>` for an answer, `<key> (saved to <folder>)` for an
  * entry that carries only a save (#6453), or the bare `<key>` otherwise
  * (`Pins automatic pick, …` for an automatic pick, #6452),
  * a blank line, and the fenced block pretty-printed with two-space indent, which
@@ -259,17 +302,28 @@ export function formatPinAnswersMessage(
   if (input.entries.length === 0) return { ok: false, reason: "empty" };
   const pins = input.entries.map(cleanEntry);
   const local = formatPinAnswerTime(input.now, input.timeZone);
-  const answered = pins.filter(entry => entry.answer).length;
-  const other = pins.length - answered;
+  // #6539: a dismissal is counted apart, and checked first. The server puts
+  // `savedTo` on every entry of a pin with a saved folder, and a dismissed pin
+  // must read "dismissed by you", never "saved to".
+  const dismissed = pins.filter(entry => entry.dismissed === true).length;
+  const answered = pins.filter(
+    entry => entry.dismissed !== true && entry.answer
+  ).length;
+  const other = pins.length - answered - dismissed;
   const counts =
     `${answered} answer${answered === 1 ? "" : "s"}` +
+    (dismissed > 0
+      ? `, ${dismissed} dismissal${dismissed === 1 ? "" : "s"}`
+      : "") +
     (other > 0 ? `, ${other} other update${other === 1 ? "" : "s"}` : "");
   const items = pins.map(entry =>
-    entry.answer
-      ? `${entry.pin} → ${summaryToken(entry.answer.choice)}`
-      : entry.savedTo !== undefined
-        ? `${entry.pin} (saved to ${summaryToken(entry.savedTo)})`
-        : entry.pin
+    entry.dismissed === true
+      ? dismissedItem(entry)
+      : entry.answer
+        ? `${entry.pin} → ${summaryToken(entry.answer.choice)}`
+        : entry.savedTo !== undefined
+          ? `${entry.pin} (saved to ${summaryToken(entry.savedTo)})`
+          : entry.pin
   );
   const shown = items.slice(0, PIN_ANSWERS_SUMMARY_MAX_ITEMS);
   const more = items.length - shown.length;

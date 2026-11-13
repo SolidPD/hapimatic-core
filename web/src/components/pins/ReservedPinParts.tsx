@@ -1,18 +1,28 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useState, type CSSProperties } from "react";
+import type { CSSProperties } from "react";
 import { ArrowRight, X } from "lucide-react";
 import type { Pin } from "@hapi/protocol";
 import type { SessionView } from "@hapi/protocol/schemas";
-import { HoverTooltipButton } from "@/components/ui/tooltip";
-import { PIN_ACTION_CLASS } from "@/components/pins/PinAnswerControls";
+import {
+  PinActionButton,
+  PinActionRow,
+} from "@/components/pins/PinAnswerControls";
+import {
+  DISMISS_LABEL,
+  PinDismissAction,
+  useDismissStaging,
+  WILL_DISMISS,
+  WillDismissLine,
+} from "@/components/pins/PinDismissAction";
 import {
   PIN_PILL_CLASS,
   PIN_PILL_STYLE,
+  PinIndicator,
   PinTipButton,
   usePinsContext,
 } from "@/components/pins/pinsShared";
-import { useDismissPin } from "@/hooks/queries/usePins";
 import { useSelectSessionView } from "@/hooks/useSelectSessionView";
+import { ACTION_COLLAPSE_RANK } from "@/lib/pins/actionRowFit";
 import type { PinViewModel } from "@/lib/pins/ledger";
 import { pinChatAt } from "@/lib/pins/chatTarget";
 
@@ -23,6 +33,9 @@ import { pinChatAt } from "@/lib/pins/chatTarget";
  * ask the agent left in the chat without pinning; the operator can dismiss it.
  * #6453: "Go to chat" opens the chat at the spot the pin was raised
  * (`?at=pin:<key>`) when the pin knows it, else switches to Chat.
+ * #6539 (ruling Q1): a Detected pin's Dismiss, in its body and its row pill,
+ * confirms and is staged like an ordinary pin's (`useDismissStaging`), and goes
+ * with the next Submit. Nothing here calls the dismiss route.
  */
 
 const PROMPT_PREFIX = "prompt:";
@@ -31,8 +44,10 @@ const DETECTED_PREFIX = "detected:";
 
 const ICON: CSSProperties = { width: "12px", height: "12px" };
 const PILL_ICON: CSSProperties = { width: "11px", height: "11px" };
-const BUTTON_STYLE: CSSProperties = { height: "26px", fontSize: "11.5px" };
 const PILL_COLORS = "border-[var(--app-border)] text-[var(--app-hint)]";
+/** M1: the Dismiss pill reads as destructive, like the action row's Dismiss. */
+const DISMISS_PILL_COLORS =
+  "border-[var(--status-hot)] text-[var(--app-badge-error-text)]";
 
 export function isPromptPinKey(key: string): boolean {
   return key.startsWith(PROMPT_PREFIX);
@@ -71,8 +86,8 @@ function GoToViewButton(props: { pin: Pin; view: SessionView }) {
   const selectView = useSelectSessionView(api, sessionId);
   const name = VIEW_NAME[props.view] ?? props.view;
   return (
-    <HoverTooltipButton
-      type="button"
+    <PinActionButton
+      rank={ACTION_COLLAPSE_RANK.inChat}
       content={
         props.pin.status === "open" && isPromptPinKey(props.pin.key)
           ? `Open the ${name}, where the prompt is waiting for your answer`
@@ -84,34 +99,11 @@ function GoToViewButton(props: { pin: Pin; view: SessionView }) {
           props.view === "chat" ? pinChatAt(props.pin) : null
         )
       }
-      className={`${PIN_ACTION_CLASS} shrink-0`}
-      style={BUTTON_STYLE}
-    >
-      Go to {name}
-      <ArrowRight style={ICON} aria-hidden />
-    </HoverTooltipButton>
+      icon={<ArrowRight style={ICON} aria-hidden />}
+      iconAfter
+      label={`Go to ${name}`}
+    />
   );
-}
-
-/** Dismiss with a pending state; reports whether the last attempt failed. */
-function useDismiss(pin: Pin) {
-  const { api, sessionId } = usePinsContext();
-  const dismissPin = useDismissPin(api, sessionId);
-  const [pending, setPending] = useState(false);
-  const [failed, setFailed] = useState(false);
-  const dismiss = () => {
-    if (pending) return;
-    setPending(true);
-    setFailed(false);
-    dismissPin(pin.key).then(
-      () => setPending(false),
-      () => {
-        setPending(false);
-        setFailed(true);
-      }
-    );
-  };
-  return { dismiss, pending, failed };
 }
 
 /** A prompt pin: where the prompt is waiting, and a way there. */
@@ -137,7 +129,9 @@ export function PromptPinBody(props: {
 
 /**
  * A Detected pin: its context (rendered above by `PinDetail`) quotes the ask
- * and says Hapimatic found it; this adds the way to the chat and Dismiss.
+ * and says Hapimatic found it; this adds the way to the chat and Dismiss, or
+ * the Will dismiss line and Undo once a dismissal is staged. One line at every
+ * width (R13).
  */
 export function DetectedPinBody(props: {
   model: PinViewModel;
@@ -145,72 +139,72 @@ export function DetectedPinBody(props: {
 }) {
   const { pin } = props.model;
   const { sessionActive } = usePinsContext();
-  const { dismiss, pending, failed } = useDismiss(pin);
+  const dismissal = useDismissStaging(pin);
   const target = goTarget(pin, sessionActive, props.mode);
+  const open = pin.status === "open";
   return (
     <>
-      <div className="flex flex-wrap items-center gap-1">
+      {open ? <WillDismissLine flow={dismissal} /> : null}
+      <PinActionRow className={open && dismissal.staged ? "mt-2" : undefined}>
         {target ? <GoToViewButton pin={pin} view={target} /> : null}
-        {pin.status === "open" ? (
-          <HoverTooltipButton
-            type="button"
-            content="Dismiss this pin: nothing is needed from you"
-            aria-busy={pending}
-            disabled={pending}
-            onClick={dismiss}
-            className={PIN_ACTION_CLASS}
-            style={BUTTON_STYLE}
-          >
-            <X style={ICON} aria-hidden />
-            Dismiss
-          </HoverTooltipButton>
-        ) : null}
-      </div>
-      {failed ? (
-        <div className="mt-1.5 text-[length:var(--text-body-dense)] text-[var(--status-warn)]">
-          This pin was not dismissed. Try again.
-        </div>
-      ) : null}
+        {open ? <PinDismissAction flow={dismissal} /> : null}
+      </PinActionRow>
+      {open ? dismissal.dialog : null}
     </>
   );
 }
 
 /**
- * The answer-pill cell of a reserved pin's row: one tap dismisses an open
- * Detected pin, or opens the chat or terminal where a prompt is waiting.
+ * The answer-pill cell of a reserved pin's row: an open Detected pin's Dismiss
+ * (a press opens the confirm; once staged it is the Will dismiss pill), or the
+ * way to the chat or terminal where a prompt is waiting. #6539: `mode` is the
+ * row's, so a chat card offers no way to the chat it is already in, as its
+ * detail does not (`goTarget`).
  */
-export function ReservedPinPill(props: { pin: Pin; armed: boolean }) {
+export function ReservedPinPill(props: {
+  pin: Pin;
+  armed: boolean;
+  mode: "tab" | "chat";
+}) {
   const { pin, armed } = props;
   const { api, sessionId, sessionActive } = usePinsContext();
   const selectView = useSelectSessionView(api, sessionId);
-  const { dismiss, pending, failed } = useDismiss(pin);
+  const dismissal = useDismissStaging(pin);
   if (pin.status !== "open") return null;
   if (isDetectedPinKey(pin.key)) {
+    if (dismissal.staged) {
+      return (
+        <PinIndicator
+          armed={armed}
+          label={WILL_DISMISS}
+          className={`${PIN_PILL_CLASS} ${DISMISS_PILL_COLORS}`}
+          style={PIN_PILL_STYLE}
+        >
+          <X style={PILL_ICON} aria-hidden />
+          <span className="max-sm:hidden">{DISMISS_LABEL}</span>
+        </PinIndicator>
+      );
+    }
     return (
-      <PinTipButton
-        armed={armed}
-        type="button"
-        tooltip={
-          failed
-            ? "This pin was not dismissed. Click to try again"
-            : "Dismiss: nothing is needed from you"
-        }
-        aria-label="Dismiss pin"
-        aria-busy={pending}
-        disabled={pending}
-        onClick={dismiss}
-        className={`${PIN_PILL_CLASS} ${
-          failed
-            ? "border-[var(--status-warn)] text-[var(--status-warn)]"
-            : PILL_COLORS
-        } hover:bg-[var(--app-hover)] hover:text-[var(--app-fg)]`}
-        style={PIN_PILL_STYLE}
-      >
-        <X style={PILL_ICON} aria-hidden />
-      </PinTipButton>
+      <>
+        <PinTipButton
+          armed={armed}
+          type="button"
+          tooltip="Dismiss: nothing is needed from you"
+          aria-label="Dismiss pin"
+          aria-busy={dismissal.pending}
+          disabled={dismissal.pending}
+          onClick={dismissal.request}
+          className={`${PIN_PILL_CLASS} ${DISMISS_PILL_COLORS} hover:bg-[var(--app-badge-error-bg)] disabled:opacity-50`}
+          style={PIN_PILL_STYLE}
+        >
+          <X style={PILL_ICON} aria-hidden />
+        </PinTipButton>
+        {dismissal.dialog}
+      </>
     );
   }
-  const target = goTarget(pin, sessionActive, "tab");
+  const target = goTarget(pin, sessionActive, props.mode);
   if (!target) return null;
   const name = VIEW_NAME[target];
   return (

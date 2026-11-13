@@ -296,6 +296,8 @@ function matchesSearch(pin: Pin, query: string): boolean {
   const answer = completedAnswerText(pin);
   return [
     pin.key,
+    // #6574: for partial typing; a whole pasted ID matches exactly (`idQuery`).
+    pin.pinId ?? undefined,
     pin.title,
     pin.context,
     pin.plainText,
@@ -412,14 +414,20 @@ export type PinsViewResult = {
  * them). A key in `ctx.held` skips the facets and the search, but is grouped
  * and sorted like any other. A status this build does not know goes nowhere,
  * as in `groupPins`. Every grouping ends with Completed, omitted when empty.
+ *
+ * #6574: `idQuery` is the search normalized to a pin ID (`normalizePinId`), or
+ * null. When set, the search matches `pin.pinId` exactly instead of the substring
+ * rule, because a pasted ID in backticks, quotes or with a trailing dot never
+ * matches a substring.
  */
 export function buildPinsView(
   models: readonly PinViewModel[],
   view: Pick<PinsViewState, "filters" | "sort" | "dir" | "group">,
   search: string,
-  ctx: PinsViewContext
+  ctx: PinsViewContext,
+  idQuery: string | null = null
 ): PinsViewResult {
-  const query = normalizeSearchText(search.trim());
+  const query = idQuery ?? normalizeSearchText(search.trim());
   const facetsOn = isFilterActive(view.filters);
   const buckets = new Map<string, Bucket & { pins: PinViewModel[] }>();
   const completed: PinViewModel[] = [];
@@ -432,7 +440,9 @@ export function buildPinsView(
     if (!isOpen && !COMPLETED_STATUSES.has(pin.status)) continue;
     if (!ctx.held.has(pin.key)) {
       if (facetsOn && !passesFacets(model, view.filters, ctx)) continue;
-      if (query && !matchesSearch(pin, query)) continue;
+      if (idQuery !== null) {
+        if (pin.pinId !== idQuery) continue;
+      } else if (query && !matchesSearch(pin, query)) continue;
     }
     if (!isOpen) {
       completed.push(model);

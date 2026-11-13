@@ -150,7 +150,7 @@ export const DialogContent = React.forwardRef<
 
     const isThreeQuarter = !fullscreen && heightVariant === "threeQuarter";
     const baseClasses = fullscreen
-      ? "fixed left-0 top-0 right-0 z-50 bg-[var(--app-secondary-bg)] shadow-2xl"
+      ? "fixed inset-x-[var(--content-gutter)] top-0 z-50 bg-[var(--app-secondary-bg)] shadow-2xl"
       : cn(
           "fixed left-1/2 z-50 w-[calc(100vw-24px)] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-[var(--app-border)] bg-[var(--app-secondary-bg)] p-4 shadow-2xl transition-[top] duration-200 ease-out",
           isThreeQuarter ? "max-w-2xl" : "max-w-lg"

@@ -100,6 +100,7 @@ import {
 import type { ProviderId } from "@hapi/protocol";
 import {
   EFFORT_LEVELS,
+  checkSpawnArgValues,
   encodeMcpSetLaunchArg,
   isYoloEquivalentMode,
   resolveSpawnPosture,
@@ -343,6 +344,31 @@ export function createSessionSpawner(
         : agent === "gemini"
           ? "google"
           : "anthropic";
+
+    // Issue #5348 (R11, Matt 63-M5 a): every free-form value that becomes an argument
+    // of the spawned `hapi` is checked ONCE, here, before any side effect: every spawn
+    // path reaches this point (the spawn route, federation, the raw-model route,
+    // reconnect, branch, config/account/token restarts, successor, transcript resume,
+    // recovery through reconnect, the daemon's local control route). A dash-led value
+    // would be read as a flag: a resume id of `--yolo` started a session in bypass.
+    const badSpawnValue = checkSpawnArgValues({
+      agent,
+      rawModel: options.rawModel,
+      model: options.model,
+      outputStyle: options.outputStyle,
+      resumeSessionId,
+      sessionRole: options.sessionRole,
+    });
+    if (badSpawnValue) {
+      logger.warn(
+        `[DAEMON RUN] Session spawn refused: ${badSpawnValue.reason} (#5348)`
+      );
+      return {
+        type: "error",
+        errorMessage: `Spawn refused: ${badSpawnValue.reason}`,
+        code: "invalid_spawn_value",
+      };
+    }
 
     // Issue #4568 (R3/R4): an API-key spawn bills ONE vault Anthropic key and
     // nothing else — no account, no instance token, no explicit OAuth token, the

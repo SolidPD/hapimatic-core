@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { Context } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import {
   answerOnRecord,
@@ -23,9 +23,12 @@ import type {
   PinDismissRefusal,
   PinWriteResult,
 } from "../../sync/pinService";
+import { neutralizePinText, type PinByIdOutcome } from "../../sync/pinById";
 import type { PinSubmissionOutcome } from "../../sync/pinSubmission";
 import type { MessageOrigin } from "../../sync/sentFrom";
 import { limitRequestBody } from "../../utils/limitRequestBody";
+import type { WebAppEnv } from "../middleware/auth";
+import { createRateLimiter } from "../middleware/rateLimit";
 import {
   CALLER_SESSION_HEADER,
   resolveCallerSession,
@@ -486,6 +489,31 @@ export function refuseSelfPinAction(
 }
 
 /**
+ * The owner-only write floor on the CLI pin write routes (#6574, ruling D4, part
+ * of Matt's SEC1): when `X-Hapi-Session-Id` names a session other than the target,
+ * by its server id or its tag, refuse with 403 `pin_not_owned`, so a pin ID read
+ * from another session can never be turned into a write on that session's pins.
+ * The typed tools and the Stop hook stamp their own session's server id on their
+ * own session, so they pass. A caller sending its Claude session id in the header
+ * would be refused (no current caller does). Like the F5 floors it binds only a
+ * caller that sends the header; the missing server-side enforcement is L #6458's.
+ */
+export function refuseForeignPinWrite(
+  c: Context,
+  target: { id: string; tag: string | null } | null
+): Response | null {
+  const header = c.req.header(CALLER_SESSION_HEADER);
+  if (!header || !target) return null;
+  if (header === target.id || (target.tag !== null && header === target.tag)) {
+    return null;
+  }
+  return c.json(
+    { error: "A session can change only its own pins", code: "pin_not_owned" },
+    403
+  );
+}
+
+/**
  * Refuse a pin-answers Submit from any session's agent (#6450), whichever session it
  * names, because only the operator records operator answers: a PM can mint a JWT
  * from its CLI token, and `refuseSelfPinAction` covers only a session's own pins. A
@@ -591,4 +619,106 @@ export function forwardedOrigin(value: unknown): MessageOrigin | undefined {
     uid: typeof fwd.uid === "number" ? fwd.uid : undefined,
     sessionId: typeof fwd.sessionId === "string" ? fwd.sessionId : undefined,
   };
+}
+
+// ── Reads by pin ID (#6574) ───────────────────────────────────────────────
+
+/** Every by-ID read in a namespace counts here, whatever header it sends. */
+export const PIN_BY_ID_NAMESPACE_LIMIT = 120;
+/** A session that names itself in `X-Hapi-Session-Id` also counts here. */
+export const PIN_BY_ID_SESSION_LIMIT = 30;
+/** Seconds a 503 asks the caller to wait before trying again. */
+const PIN_BY_ID_RETRY_AFTER_SECONDS = 5;
+
+/**
+ * The two stacked rate limits of a by-ID read, because a miss costs one request
+ * per peer node. Every request counts against the namespace bucket; a request whose
+ * `X-Hapi-Session-Id` resolves to a known session in the namespace also counts
+ * against that session's bucket, so one looping agent cannot spend the namespace's
+ * budget alone. An absent or unknown header lands in the namespace bucket only, so
+ * rotating the header buys nothing. Each call builds fresh buckets (server/CLAUDE.md
+ * "Rate Limiting").
+ */
+export function pinByIdLimiters(
+  name: string,
+  getEngine: () => CallerSessionLookup | null
+): [MiddlewareHandler<WebAppEnv>, MiddlewareHandler<WebAppEnv>] {
+  const namespaceLimiter = createRateLimiter({
+    name: `${name}-namespace`,
+    limit: PIN_BY_ID_NAMESPACE_LIMIT,
+    keyFn: c => (c.get("namespace") ?? "anonymous") as string,
+  });
+  const sessionLimiter = createRateLimiter({
+    name: `${name}-session`,
+    limit: PIN_BY_ID_SESSION_LIMIT,
+    keyFn: c =>
+      `${c.get("namespace")}:${resolveCallerSession(c, getEngine())?.id ?? ""}`,
+  });
+  const perSession: MiddlewareHandler<WebAppEnv> = async (c, next) => {
+    if (!resolveCallerSession(c, getEngine())) return next();
+    return sessionLimiter(c, next);
+  };
+  return [namespaceLimiter, perSession];
+}
+
+/** The 400 for a path segment that is not a pin ID in any form a paste carries. */
+export function invalidPinIdResponse(c: Context): Response {
+  return c.json({ error: "That is not a pin ID", code: "invalid_pin_id" }, 400);
+}
+
+function offlineSentence(notAsked: readonly { nodeLabel: string }[]): string {
+  const labels = notAsked.map(node => node.nodeLabel);
+  return labels.length === 1
+    ? `${labels[0]} is offline`
+    : `${labels.join(", ")} are offline`;
+}
+
+/**
+ * The answer of a by-ID read, shared by the JWT and CLI routes. Every hit's pin has
+ * its approval tokens blanked (SEC1). A miss answers one body for an absent ID,
+ * another namespace's pin and a deleted pin (ruling D3); it names the nodes the
+ * registry knows are offline, which were not asked (ruling DA). Only transient
+ * trouble answers 503.
+ */
+export function pinByIdResponse(c: Context, outcome: PinByIdOutcome): Response {
+  switch (outcome.kind) {
+    case "found":
+      return c.json({
+        pin: neutralizePinText(outcome.pin),
+        openPinCount: outcome.openPinCount,
+        timeZone: outcome.timeZone,
+        session: outcome.session,
+      });
+    case "not_found":
+      return c.json(
+        {
+          error:
+            outcome.notAsked.length === 0
+              ? "No pin has that ID"
+              : `No pin has that ID on the nodes that answered; ${offlineSentence(outcome.notAsked)}`,
+          code: "pin_not_found",
+          notAsked: outcome.notAsked,
+        },
+        404
+      );
+    case "incomplete":
+      c.header("Retry-After", String(PIN_BY_ID_RETRY_AFTER_SECONDS));
+      return c.json(
+        {
+          error: "Some nodes could not be asked; try again",
+          code: "pin_lookup_incomplete",
+          nodes: outcome.nodes,
+        },
+        503
+      );
+    case "ambiguous":
+      return c.json(
+        {
+          error: "More than one pin has that ID; open it from its session",
+          code: "pin_id_ambiguous",
+          matches: outcome.matches,
+        },
+        409
+      );
+  }
 }

@@ -548,6 +548,17 @@ export class SessionLifecycleOps {
     if (!result || typeof result !== "object") {
       throw new Error("Invalid response from session config RPC");
     }
+    // Issue #6617 (D7-1): a wrapper that refuses the change (a running tmux or
+    // pty session) answers with the CLI's error envelope. Surface its message,
+    // which says how to make the change; nothing below runs, so the cached
+    // config stays as it was.
+    const envelope = result as { type?: unknown; errorMessage?: unknown };
+    if (
+      envelope.type === "error" &&
+      typeof envelope.errorMessage === "string"
+    ) {
+      throw new Error(envelope.errorMessage);
+    }
     const obj = result as {
       applied?: {
         permissionMode?: Session["permissionMode"];

@@ -288,11 +288,12 @@ container size (`--icon-btn-size` 32 / `--icon-slot` 34 in `index.css`). Use as
 
 Source: [decision-layout-adaptation.md](../../../docs/design/design-system/decision-layout-adaptation.md).
 
-| Token             | Value   | Purpose                 |
-| ----------------- | ------- | ----------------------- |
-| `--content-width` | `720px` | readable content column |
+| Token              | Value                                                | Purpose                                                                                                          |
+| ------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--content-width`  | `1024px`                                             | readable content column                                                                                          |
+| `--content-gutter` | `max(0px, calc((100vw - var(--content-width)) / 2))` | the brand letterbox on each side of the column; a `fixed` element offsets by it (`bun run check:content-bounds`) |
 
-> Mirrors `tailwind.config.ts` `maxWidth.content` (720px), consumed as the
+> Mirrors `tailwind.config.ts` `maxWidth.content` (1024px), consumed as the
 > `max-w-content` utility (router, `SplitPaneContentView`). **The Tailwind config
 > stays authoritative** for the `max-w-content` utility; this var exposes the same
 > audited value for the rare JS / arbitrary-value case. Content width is not

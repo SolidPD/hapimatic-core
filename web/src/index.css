@@ -531,6 +531,30 @@ textarea[placeholder*="notes"] {
     display: none;
   }
 }
+/* #6539 (Pins PM item 4): on a 320px screen a lane row's name cell had 37px,
+ * so the name showed no characters and its issue link and dot ran into the
+ * stage icons. Below 360px the row's Open goes (the open lane lists each
+ * session with its own Go to, and the Project Manager header keeps Open), the
+ * gaps tighten to 4px, the chevron column is 24px as below 440px, and the
+ * track cells are 11px: the name cell then has 85px at 320px, room for a few
+ * characters of the name, a four-digit issue link and the dot. */
+@media (max-width: 360px) {
+  .pins-lane-row {
+    grid-template-columns: 18px minmax(0, 1fr) 95px 26px 24px;
+    column-gap: 4px;
+  }
+  .pins-track > span {
+    width: 11px;
+    height: 11px;
+    font-size: 8px;
+  }
+  .pins-lane-name {
+    gap: 4px;
+  }
+  .pins-lane-open {
+    display: none;
+  }
+}
 
 .aui-md-codeblock pre.shiki {
   margin: 0;

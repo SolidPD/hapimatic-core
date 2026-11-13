@@ -11,7 +11,13 @@ import { CliExtensionHostImpl } from "@/ext/host";
 import { loadCliExtensions } from "@/ext/loader";
 import { scanFilesystemExtensions } from "@/ext/fsLoader";
 import { extensions as builtinCliExtensions } from "@/extensions.generated";
-import { resolveCommand } from "./registry";
+import {
+  SELFTEST_ARGV_REPORT_ENV,
+  argsBeforeMarker,
+  exitWithArgvReport,
+  planDispatch,
+} from "./dispatchPlan";
+import type { DispatchPlan } from "./dispatchPlan";
 import { apiKeyHelperCommand } from "./apiKeyHelper";
 import { securityCommand } from "./security";
 import { hookForwarderCommand } from "./hookForwarder";
@@ -32,18 +38,40 @@ const PRE_EXTENSION_COMMANDS = new Set([
   hookForwarderCommand.name,
 ]);
 
+/**
+ * Issue #5348: a refused command line (an end-of-options marker for a command that does
+ * not take it, or a claude argument the parser refuses) exits 1 here, before runtime
+ * assets are unpacked and before the command runs. Report mode exits first.
+ */
+function exitIfRefused(plan: DispatchPlan): void {
+  // Issue #5348 (R12, R15): `hapi selftest argv` report mode — the decision is written
+  // from this same plan and the process exits 86 before the refusal exit, the runtime
+  // assets and the command, on either dispatch path.
+  const reportPath = process.env[SELFTEST_ARGV_REPORT_ENV];
+  if (reportPath) {
+    exitWithArgvReport(reportPath, plan);
+  }
+  if (plan.refused !== undefined) {
+    console.error(plan.refused);
+    process.exit(1);
+  }
+}
+
 export async function runCli(): Promise<void> {
   const args = getCliArgs();
 
-  if (args.includes("-v") || args.includes("--version")) {
+  // Issue #5348 (R5): the version flag is read from the FIRST argument only, so a `-v`
+  // meant for a command (`hapi launcher status -v`) or after the marker reaches it.
+  if (args[0] === "-v" || args[0] === "--version") {
     console.log(`hapi version: ${CLI_VERSION}`);
     process.exit(0);
   }
 
   // A loader warning goes to stdout (logger.warn → console.log); see PRE_EXTENSION_COMMANDS.
   if (PRE_EXTENSION_COMMANDS.has(args[0])) {
-    const { command, context } = resolveCommand(args);
-    await command.run(context);
+    const plan = planDispatch(args);
+    exitIfRefused(plan);
+    await plan.command.run(plan.context);
     return;
   }
 
@@ -51,7 +79,7 @@ export async function runCli(): Promise<void> {
     process.env.DEV = "false";
   }
 
-  // Load CLI extensions BEFORE resolveCommand (issue #1270, Sub-Issue F) so
+  // Load CLI extensions BEFORE planDispatch (issue #1270, Sub-Issue F) so
   // extensions can register additional commands via host.commands.add(). Runs
   // AFTER the -v/--version early-exit (so version output stays fast) and the
   // PRE_EXTENSION_COMMANDS early dispatch above. Empty registry → no-op.
@@ -76,12 +104,19 @@ export async function runCli(): Promise<void> {
     : [];
   await loadCliExtensions(cliHost, [...builtinCliExtensions, ...fsCliEntries]);
 
-  const { command, context } = resolveCommand(args);
+  // After the extensions load, so an extension command resolves before it is refused.
+  const plan = planDispatch(args);
+  exitIfRefused(plan);
+  const { command, context } = plan;
 
   if (command.requiresRuntimeAssets) {
     await ensureRuntimeAssets();
     addBundledGitLfsToPath();
-    logger.debug("Starting hapi CLI with args: ", process.argv);
+    // Up to the marker only: the prompt after it is not written to the log.
+    logger.debug(
+      "Starting hapi CLI with args: ",
+      argsBeforeMarker(process.argv)
+    );
   }
 
   await command.run(context);

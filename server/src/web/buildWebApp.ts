@@ -51,6 +51,7 @@ import { createExtensionAdminRoutes } from "./routes/extensionAdmin";
 import { createBookmarksRoutes } from "./routes/bookmarks";
 import { createCliPinRoutes } from "./routes/cliPins";
 import { createPinsRoutes } from "./routes/pins";
+import { createPinByIdRoutes } from "./routes/pinById";
 import { createPinDashboardsRoutes } from "./routes/pinDashboards";
 import { resolvePinsEnabled } from "../config/pinsConfig";
 import {
@@ -112,6 +113,7 @@ import { createMachinesRoutes } from "./routes/machines";
 import { createCliRoutes } from "./routes/cli";
 import { createPushRoutes } from "./routes/push";
 import { createTimeLogRoutes } from "./routes/timeLog";
+import { createBillableTimeRoutes } from "./routes/billableTime";
 import { createGitBranchesRoutes } from "./routes/gitBranches";
 import { createMcpCatalogRoutes } from "./routes/mcpCatalog";
 import { createWorktreeRemovalRoutes } from "./routes/worktreeRemoval";
@@ -160,6 +162,7 @@ import { createConflictCheckRoutes } from "./routes/conflictCheck";
 import { liveSessionIdSet } from "../store/fileClaimLifecycle";
 import { createErrorLogRoutes } from "./routes/errorLogs";
 import { createPreferencesRoutes } from "./routes/preferences";
+import { createCompactAtPreferenceRoutes } from "./routes/compactAtPreference";
 import { createOnboardingPreferenceRoutes } from "./routes/onboardingPreference";
 import { createSpawnPermissionPreferenceRoutes } from "./routes/spawnPermissionPreference";
 import { createClaudeModelsRoutes } from "./routes/claudeModels";
@@ -545,6 +548,10 @@ export function buildWebApp(options: {
       pinsEnabled: resolvePinsEnabled(),
       getSessionService: getPinSessionService,
       getNodeRegistry: options.getNodeRegistry,
+      // #6574: the by-ID read names this node and its zone on a local hit.
+      localNode: () => resolveLocalNodeIdentity(options.federationConfig),
+      getPreferenceTimeZone: () =>
+        resolvePinPreferenceTimeZone(configuration.dataDir),
       errorLogger: options.errorLogger,
     })
   );
@@ -1109,6 +1116,20 @@ export function buildWebApp(options: {
     })
   );
 
+  // Issue #6574: read a pin by its ID across the federation. The MOUNT POSITION is
+  // the auth, as for the pin routes above.
+  app.route(
+    "/api",
+    createPinByIdRoutes(options.getSyncEngine, {
+      pinsEnabled: resolvePinsEnabled(),
+      getNodeRegistry: options.getNodeRegistry,
+      localNode,
+      getPreferenceTimeZone: () =>
+        resolvePinPreferenceTimeZone(configuration.dataDir),
+      errorLogger: options.errorLogger,
+    })
+  );
+
   // Notifications inbox (#4913, epic #4912): list / unread-count / read /
   // dismiss / dismiss-all under /api/notifications. 🔴 The MOUNT POSITION *IS*
   // the auth — these include MUTATION routes and MUST stay BELOW the global JWT
@@ -1483,6 +1504,15 @@ export function buildWebApp(options: {
       getLocalNodeId: () => options.federationConfig?.nodeId ?? null,
     })
   );
+  // Issue #6586: the billable-time read (#6204 and rp1-home#3142 consume it).
+  // JWT routes, mounted after the JWT middleware, next to the time log.
+  app.route(
+    "/api",
+    createBillableTimeRoutes(() => options.store, options.getSyncEngine, {
+      getNodeRegistry: options.getNodeRegistry,
+      getLocalNodeId: () => options.federationConfig?.nodeId ?? "standalone",
+    })
+  );
   // Issue #1675 (Sub M): admin session-metadata query surface (node-local,
   // read-only, JWT-gated). Mounted after the JWT middleware above.
   app.route("/api", createSessionMetadataRoutes(options.getSyncEngine));
@@ -1659,6 +1689,12 @@ export function buildWebApp(options: {
       getSyncEngine: options.getSyncEngine,
       getSseManager: options.getSseManager,
     })
+  );
+  // Issue #6570: the node's compact-at percentage for every Claude session (its
+  // own file — preferences.ts is at its line ceiling). After the JWT gate.
+  app.route(
+    "/api",
+    createCompactAtPreferenceRoutes(configuration.settingsFile)
   );
   // Issue #3865: node-local in-app onboarding tour state (its own file —
   // preferences.ts is at its line ceiling). After the JWT gate, like its sibling.

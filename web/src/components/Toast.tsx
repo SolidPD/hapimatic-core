@@ -340,7 +340,7 @@ export function ToastProvider({ children }: ToastProviderProps) {
       {toasts.length > 0 &&
         createPortal(
           <div
-            className="fixed bottom-0 left-0 right-0 z-[9999] flex flex-col-reverse items-center pointer-events-none"
+            className="fixed bottom-0 inset-x-[var(--content-gutter)] z-[9999] flex flex-col-reverse items-center pointer-events-none"
             style={{
               paddingBottom: "calc(24px + env(safe-area-inset-bottom, 0px))",
             }}

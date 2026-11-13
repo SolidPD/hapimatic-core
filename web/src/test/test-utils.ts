@@ -92,6 +92,8 @@ export function createMockApiClient(): Record<string, Mock> {
       nodes: [],
       partial: false,
     })),
+    // #6574: read a pin by its ID.
+    getPinById: vi.fn(),
     // #6455: dismiss a pin
     dismissSessionPin: vi.fn(),
     // #6453: Save to session folder

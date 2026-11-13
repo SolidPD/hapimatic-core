@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ApiClient, WatermarkStatus } from "@/api/client";
+import { porterErrorText } from "@/components/porter/porterErrors";
 
 /**
  * Server-authoritative admin hook for the context-watermark surface (#2587).
@@ -41,6 +42,9 @@ export function useWatermarkAdmin(api: ApiClient | null): UseWatermarkAdmin {
   // the first fetch resolved — the first-load race the authority flip introduces
   // (#2486). Reset by an explicit refresh().
   const userToggledRef = useRef(false);
+  // #6570 F1: counts user actions, so a refusal's late reconcile never shows its
+  // reason after the user has acted again.
+  const actionRef = useRef(0);
 
   const load = useCallback(
     async (respectToggle: boolean) => {
@@ -65,9 +69,7 @@ export function useWatermarkAdmin(api: ApiClient | null): UseWatermarkAdmin {
         setError(null);
       } catch (e) {
         if (!mountedRef.current) return;
-        setError(
-          e instanceof Error ? e.message : "Failed to load watermark status"
-        );
+        setError(porterErrorText(e, "Failed to load watermark status"));
       } finally {
         if (mountedRef.current) setLoading(false);
       }
@@ -88,10 +90,29 @@ export function useWatermarkAdmin(api: ApiClient | null): UseWatermarkAdmin {
     void load(false);
   }, [load]);
 
+  // #6570 F1, F2: R13 makes a save refusable. Show the server's reason, set AFTER
+  // the reconcile read settles, because that read's success clears `error`; the
+  // reason then stays until the user acts again or a save succeeds. `action` is the
+  // count taken when the user acted, so a save sent later hides it (review E1).
+  const failSave = useCallback(
+    (e: unknown, fallback: string, action: number) => {
+      if (!mountedRef.current) return;
+      const reason = porterErrorText(e, fallback);
+      void load(false).finally(() => {
+        if (mountedRef.current && actionRef.current === action) {
+          setError(reason);
+        }
+      });
+    },
+    [load]
+  );
+
   const setEnabled = useCallback(
     (value: boolean) => {
       // Mark that the user acted so an in-flight mount read cannot clobber this.
       userToggledRef.current = true;
+      const action = ++actionRef.current;
+      setError(null);
       // Optimistic: reflect the toggle immediately (the PUT below persists it).
       setStatus(prev => (prev ? { ...prev, enabled: value } : prev));
       if (!api) return;
@@ -108,22 +129,18 @@ export function useWatermarkAdmin(api: ApiClient | null): UseWatermarkAdmin {
           // `enabled` is already reconciled, so respect the toggle guard.
           void load(true);
         })
-        .catch(e => {
-          if (!mountedRef.current) return;
-          setError(
-            e instanceof Error ? e.message : "Failed to update watermark config"
-          );
-          // Reconcile the optimistic value back to server truth on failure.
-          void load(false);
-        });
+        // Reconcile the optimistic value back to server truth on failure.
+        .catch(e => failSave(e, "Failed to update watermark config", action));
     },
-    [api, load]
+    [api, load, failSave]
   );
 
   const setWatermarkPercent = useCallback(
     (percent: number) => {
       // Mark that the user acted so an in-flight mount read cannot clobber this.
       userToggledRef.current = true;
+      const action = ++actionRef.current;
+      setError(null);
       // Optimistic: reflect the new threshold immediately.
       setStatus(prev => (prev ? { ...prev, watermarkPercent: percent } : prev));
       if (!api) return;
@@ -138,17 +155,9 @@ export function useWatermarkAdmin(api: ApiClient | null): UseWatermarkAdmin {
           setError(null);
           void load(true);
         })
-        .catch(e => {
-          if (!mountedRef.current) return;
-          setError(
-            e instanceof Error
-              ? e.message
-              : "Failed to update watermark percent"
-          );
-          void load(false);
-        });
+        .catch(e => failSave(e, "Failed to update watermark percent", action));
     },
-    [api, load]
+    [api, load, failSave]
   );
 
   const disarm = useCallback(
@@ -163,7 +172,7 @@ export function useWatermarkAdmin(api: ApiClient | null): UseWatermarkAdmin {
         })
         .catch(e => {
           if (!mountedRef.current) return;
-          setError(e instanceof Error ? e.message : "Failed to disarm session");
+          setError(porterErrorText(e, "Failed to disarm session"));
         });
     },
     [api, load]

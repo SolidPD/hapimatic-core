@@ -44,7 +44,12 @@ import { logAndJson } from "./routeErrorHelper";
 import { cataloged } from "../../capabilities/cataloged";
 import { createRateLimiter } from "../middleware/rateLimit";
 import type { SSEManager } from "../../sse/sseManager";
-import { generateSessionId, defineCapability } from "@hapi/protocol";
+import {
+  generateSessionId,
+  defineCapability,
+  isSpawnModelArgValue,
+  isSpawnOutputStyleArgValue,
+} from "@hapi/protocol";
 import { addPendingSpawn, markSpawnFailed } from "../../sync/pendingSpawns";
 import { spawnFailedNotification } from "../../notifications/producerNotifications";
 
@@ -96,8 +101,16 @@ export const spawnBodySchema = z.object({
    *  web client when the selection equals the resolved global default. */
   launcher: ClaudeRemoteLauncherKindSchema.optional(),
   /** Issue #1733: gateway model id ("provider/model") for an OpenRouter-routed
-   *  Codex session. Forwarded daemon-ward as --hapi-model (#1262 enumeration). */
-  model: z.string().optional(),
+   *  Codex session. Forwarded daemon-ward as --hapi-model (#1262 enumeration).
+   *  Issue #5348: refused (400) when the spawned hapi would read the trimmed
+   *  value as a flag; the daemon's check is the guarantee. */
+  model: z
+    .string()
+    .refine(v => isSpawnModelArgValue(v), {
+      message:
+        "must start with a letter or a digit and hold no whitespace (#5348)",
+    })
+    .optional(),
   /** Issue #3349 (ruling D4(a)): native-vs-OpenRouter routing discriminator.
    *  `"native"` → the `model` above is an opencode native `provider/model` whose
    *  key is resolved from the #1955 apiKeys vault; `"openrouter"`/absent → the
@@ -123,8 +136,15 @@ export const spawnBodySchema = z.object({
    *  Threaded daemon-ward as --hapi-effort (#1262). */
   effort: EffortLevelSchema.optional(),
   /** Issue #2456: a specific pinned raw Claude model id ("More models" / full
-   *  catalog). Threaded daemon-ward as --hapi-raw-model (#1262). */
-  rawModel: z.string().optional(),
+   *  catalog). Threaded daemon-ward as --hapi-raw-model (#1262). Issue #5348:
+   *  refused (400) when the trimmed value would read as a flag. */
+  rawModel: z
+    .string()
+    .refine(v => isSpawnModelArgValue(v), {
+      message:
+        "must start with a letter or a digit and hold no whitespace (#5348)",
+    })
+    .optional(),
   /** Issue #1953 (A6): clone-on-spawn repo ("owner/repo"). Threaded daemon-ward
    *  so the daemon clones it into the working dir before launch (#1262). */
   cloneRepo: z.string().optional(),
@@ -140,8 +160,15 @@ export const spawnBodySchema = z.object({
    *  so runClaude injects it into the generated --settings file (#1262). Plain
    *  `z.string().optional()` — no enum: built-in AND custom style names are both
    *  valid, and an unknown name is silently no-op'd by Claude Code (Task 1 spike,
-   *  fail-open); the pre-select never sends "default"/unknown that would 400. */
-  outputStyle: z.string().optional(),
+   *  fail-open); the pre-select never sends "default"/unknown that would 400.
+   *  Issue #5348: a value the spawned hapi would read as a flag is refused. */
+  outputStyle: z
+    .string()
+    .refine(v => isSpawnOutputStyleArgValue(v), {
+      message:
+        "must not start with a dash or with whitespace, nor end with whitespace (#5348)",
+    })
+    .optional(),
   /** Issue #3348: bundled non-claude native model selection (gemini id →
    *  GEMINI_MODEL env; codex id + effort → config.toml bake). Interpreted by
    *  AGENT at the daemon; threaded field-by-field daemon-ward (#1262). */

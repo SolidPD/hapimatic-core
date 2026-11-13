@@ -52,10 +52,10 @@ function readSettingsLauncherSync(): string | undefined {
 
 /**
  * Resolve the active launcher from the priority chain (env > settings >
- * default) WITHOUT selecting the launcher function. Exposed so callers that
- * need the resolved KIND — e.g. `runClaude` scoping hook-driven thinking to
- * non-sdk launchers (issue #1611) — share the EXACT same resolution as
- * `selectClaudeRemoteLauncher`, rather than duplicating the env+settings read.
+ * default) WITHOUT selecting the launcher function. `runClaude` calls it once
+ * per wrapper and hands the result to loop(), which selects the launcher from
+ * it (issue #6617 round 5), so every use of the kind — the #1611 thinking
+ * scope, the #1613 stamp, the D7-1 refusal — is the launcher that runs.
  */
 export function resolveActiveLauncher(): ResolvedLauncher {
   const envValue = process.env.HAPI_CLAUDE_LAUNCHER;
@@ -63,9 +63,16 @@ export function resolveActiveLauncher(): ResolvedLauncher {
   return resolveLauncherKind(envValue, settingsValue);
 }
 
-export function selectClaudeRemoteLauncher(): LauncherFn {
-  const resolved = resolveActiveLauncher();
-
+/**
+ * Select the remote launcher for the ONE launcher the caller resolved. Issue
+ * #6617 round 5: runClaude resolves once and hands that value here through
+ * loop(), so the launcher that runs is the kind the D7-1 refusal holds; a
+ * second read of env and settings here could pick another kind after a
+ * `hapi launcher set` in the start window.
+ */
+export function selectClaudeRemoteLauncher(
+  resolved: ResolvedLauncher
+): LauncherFn {
   if (resolved.rejected) {
     logger.error(
       `[launcherDispatch] Rejected invalid HAPI_CLAUDE_LAUNCHER value: ${JSON.stringify(resolved.rejectedValue)}. ` +

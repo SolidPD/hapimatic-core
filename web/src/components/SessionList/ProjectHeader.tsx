@@ -21,6 +21,8 @@ import { useEffect, useRef, useState } from "react";
 import { NodeBadge, useNodeTone } from "@/components/NodeBadge";
 import { getShortPath } from "./grouping";
 import type { SessionGroup } from "./grouping";
+import type { ExpandCollapseAllScope } from "./bulkExpand";
+import { ExpandCollapseAllMenu } from "./ExpandCollapseAllMenu";
 import {
   isInteractiveTarget,
   splitDragHandle,
@@ -82,9 +84,22 @@ export function ProjectHeader(props: {
    * Supplied by SessionListContainer via SortableListEntry (always present now).
    */
   dragHandle?: SortableDragHandle;
+  /**
+   * The chevron's "Expand All / Collapse All" menu (right-click, or press and
+   * hold), acting on every project in the list. Absent: the chevron has no menu.
+   */
+  expandCollapseAll?: ExpandCollapseAllScope;
 }) {
-  const { group, isCollapsed, showNode, onToggle, api, onRefresh, dragHandle } =
-    props;
+  const {
+    group,
+    isCollapsed,
+    showNode,
+    onToggle,
+    api,
+    onRefresh,
+    dragHandle,
+    expandCollapseAll,
+  } = props;
   // #3114: split the drag handle — pointer/touch (`dragRowListeners`) arm the whole
   // header; the keyboard handler + a11y attributes go on the chevron (keyboard reorder
   // handle). Interactive header children are excluded from BOTH drag-arming (the guarded
@@ -483,30 +498,39 @@ export function ProjectHeader(props: {
 
             {/* Expand/Collapse chevron — col-1 (rightmost). #3114: also the KEYBOARD
               project-reorder handle (a11y attributes + dnd-kit onKeyDown); pointer/
-              touch reorder is armed by the whole header. Tap toggles collapse. */}
+              touch reorder is armed by the whole header. Tap toggles collapse.
+              Right-click, or press and hold, opens Expand All / Collapse All
+              for every project in the list (ExpandCollapseAllMenu). */}
             <div className="icon-col-1">
-              <button /* design-tokens-allow: dnd-kit keyboard reorder handle (#3114) — carries the sortable a11y {...dragAttributes} + dnd-kit onKeyDown; the guarded drag sensors EXCLUDE <button>, so converting would break keyboard drag (R3 off-limits) */
-                type="button"
-                {...dragAttributes}
-                onKeyDown={dragKeyDown}
-                onClick={e => {
-                  e.stopPropagation();
-                  onToggle();
-                }}
-                className="group/disc flex size-[var(--icon-btn-size)] items-center justify-center rounded-full text-white/70 hover:text-white transition-colors"
-                title={isCollapsed ? "Expand project" : "Collapse project"}
-                aria-label={isCollapsed ? "Expand project" : "Collapse project"}
-              >
-                <span
-                  data-testid="header-icon-disc"
-                  className={discClass(true)}
-                >
-                  <ChevronIcon
-                    className="h-3.5 w-3.5"
-                    collapsed={isCollapsed}
-                  />
-                </span>
-              </button>
+              <ExpandCollapseAllMenu scope={expandCollapseAll}>
+                {menu => (
+                  <button /* design-tokens-allow: dnd-kit keyboard reorder handle (#3114) — carries the sortable a11y {...dragAttributes} + dnd-kit onKeyDown; the guarded drag sensors EXCLUDE <button>, so converting would break keyboard drag (R3 off-limits) */
+                    type="button"
+                    {...dragAttributes}
+                    {...menu.pressProps}
+                    onKeyDown={dragKeyDown}
+                    onClick={menu.guardClick(e => {
+                      e.stopPropagation();
+                      onToggle();
+                    })}
+                    className={`group/disc flex size-[var(--icon-btn-size)] items-center justify-center rounded-full text-white/70 hover:text-white transition-colors${menu.className}`}
+                    title={`${isCollapsed ? "Expand project" : "Collapse project"}${menu.hint}`}
+                    aria-label={
+                      isCollapsed ? "Expand project" : "Collapse project"
+                    }
+                  >
+                    <span
+                      data-testid="header-icon-disc"
+                      className={discClass(true)}
+                    >
+                      <ChevronIcon
+                        className="h-3.5 w-3.5"
+                        collapsed={isCollapsed}
+                      />
+                    </span>
+                  </button>
+                )}
+              </ExpandCollapseAllMenu>
             </div>
           </div>
         </div>

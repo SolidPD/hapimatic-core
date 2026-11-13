@@ -16,6 +16,7 @@ import { describeErrorKind } from "@/persistence";
 import {
   API_KEY_HELPER_OUTRANKING_ENV_VARS,
   BINDING_ENV_VARS,
+  COMPACT_AT_INHERITED_ENV_VARS,
   SDK_SIGNAL_ENV_VARS,
   paneEnvUnsetNames,
 } from "@/claude/launcherShared";
@@ -157,6 +158,9 @@ export function buildTmuxSpawnEnv(
  * - both: ∪ {@link AGENT_FORBIDDEN_ENV_VARS} (#5847) — a tmux server an older
  *   daemon started keeps the federation token (or an onboarding var) in its
  *   table across `KillMode=process` restarts, and hands it to every new pane.
+ * - both: ∪ {@link COMPACT_AT_INHERITED_ENV_VARS} (#6570) — a server first created
+ *   from inside a session's tool Bash holds that session's `HAPI_COMPACT_AT_*`,
+ *   which must reach no other session.
  */
 export function buildServerGlobalScrubSet(sandboxOn: boolean): Set<string> {
   return new Set<string>([
@@ -164,6 +168,7 @@ export function buildServerGlobalScrubSet(sandboxOn: boolean): Set<string> {
     ...(sandboxOn ? omniboxServerEnvStrip() : BINDING_ENV_VARS),
     ...API_KEY_HELPER_OUTRANKING_ENV_VARS,
     ...AGENT_FORBIDDEN_ENV_VARS,
+    ...COMPACT_AT_INHERITED_ENV_VARS,
   ]);
 }
 

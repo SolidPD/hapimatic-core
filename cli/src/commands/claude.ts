@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import chalk from "chalk";
 import { execFileSync } from "node:child_process";
-import { z } from "zod";
-import { parseMcpSetLaunchArg } from "@hapi/protocol";
-import { SessionRoleSchema } from "@hapi/protocol/schemas";
-import type { StartOptions } from "@/claude/runClaude";
-import { parseSpawnPermissionSeed } from "@/claude/spawnPermissionSeed";
 import { configuration } from "@/configuration";
 import { readDaemonBuildSkew } from "@/daemon/controlClient";
 import { authAndSetupMachineIfNeeded } from "@/ui/auth";
@@ -15,6 +10,7 @@ import { spawnHappyCLI } from "@/utils/spawnHappyCLI";
 import { maybeAutoStartServer } from "@/utils/autoStartServer";
 import { withBunRuntimeEnv } from "@/utils/bunRuntime";
 import { formatDaemonBuildSkew } from "@/version";
+import { parseClaudeCommandArgs } from "./claudeCommandArgs";
 import { buildRootHelpText } from "./helpText";
 import type { CommandDefinition } from "./types";
 
@@ -60,107 +56,17 @@ function extractErrorInfo(error: unknown): {
 export const claudeCommand: CommandDefinition = {
   name: "default",
   requiresRuntimeAssets: true,
+  // Issue #5348: `hapi [options] -- "<prompt>"`; parseClaudeCommandArgs stops at the
+  // marker and takes exactly one prompt argument after it.
+  acceptsEndOfOptions: true,
   run: async ({ commandArgs }) => {
-    const args = [...commandArgs];
-
-    if (args.length > 0 && args[0] === "claude") {
-      args.shift();
+    // Issue #6400: the argv parser lives in claudeCommandArgs.ts (testable).
+    const parsed = parseClaudeCommandArgs(commandArgs);
+    if ("error" in parsed) {
+      console.error(chalk.red(parsed.error));
+      process.exit(1);
     }
-
-    const options: StartOptions = {};
-    let showHelp = false;
-    const unknownArgs: string[] = [];
-
-    for (let i = 0; i < args.length; i++) {
-      const arg = args[i];
-
-      if (arg === "-h" || arg === "--help") {
-        showHelp = true;
-        unknownArgs.push(arg);
-      } else if (arg === "--hapi-starting-mode") {
-        options.startingMode = z.enum(["local", "remote"]).parse(args[++i]);
-      } else if (arg === "--yolo") {
-        options.permissionMode = "bypassPermissions";
-        unknownArgs.push("--dangerously-skip-permissions");
-      } else if (arg === "--dangerously-skip-permissions") {
-        options.permissionMode = "bypassPermissions";
-        unknownArgs.push(arg);
-      } else if (arg === "--hapi-permission-mode") {
-        // Issue #6218: Hapimatic-internal (NOT forwarded to the claude child) —
-        // the daemon's starting-mode seed. Only a non-bypass Claude mode is
-        // accepted: bypass is `--yolo`'s job, and a saved posture outranks the
-        // seed in runClaude. Consumes the next token like --hapi-effort.
-        options.spawnPermissionMode = parseSpawnPermissionSeed(args[++i]);
-      } else if (arg === "--safe-mode") {
-        // Issue #1633: explicit branch — the catch-all below would slurp a
-        // following non-dash token as this boolean flag's value. The flag is
-        // forwarded to the claude child via claudeArgs; the launchers key
-        // their hapi-injection suppression off its presence there.
-        options.safeMode = true;
-        unknownArgs.push(arg);
-      } else if (arg === "--hapi-model-mode") {
-        // Issue #1633: Hapimatic-internal (NOT forwarded to the claude child)
-        // — seeds runClaude's model state so an explicit model selection
-        // survives a model-switch respawn / daemon recovery.
-        options.modelMode = args[++i];
-      } else if (arg === "--hapi-effort") {
-        // Issue #2456: Hapimatic-internal (NOT forwarded as-is) — seeds
-        // runClaude's effort state, which reaches the claude child as --effort
-        // (via the launcher argv). Consumes the next token like --hapi-model-mode.
-        options.effort = args[++i];
-      } else if (arg === "--hapi-node-default-effort") {
-        // Issue #6070: Hapimatic-internal (NOT forwarded to the claude child) —
-        // the node's pre-fit default effort when the spawn's effort was defaulted;
-        // runClaude records it so a model switch can re-fit the effort.
-        options.nodeDefaultEffort = args[++i];
-      } else if (arg === "--hapi-raw-model") {
-        // Issue #2456: Hapimatic-internal — seeds runClaude's currentModel with a
-        // specific pinned raw model id (precedence over --hapi-model-mode).
-        options.rawModel = args[++i];
-      } else if (arg === "--hapi-session-role") {
-        // Issue #2155: Hapimatic-internal (NOT forwarded to the claude child) —
-        // seeds runClaude's role so the role profile's claudeMdExcludes are
-        // merged into the hook-settings file and a respawn preserves the role.
-        // An unrecognized value is dropped → runClaude sees no role → the
-        // session loads the FULL stack (fail-open, R3). Consumes the next token
-        // via `++i` (like --hapi-model-mode) so the catch-all does not slurp it.
-        const parsedRole = SessionRoleSchema.safeParse(args[++i]);
-        if (parsedRole.success) {
-          options.sessionRole = parsedRole.data;
-        }
-      } else if (arg === "--hapi-output-style") {
-        // Issue #2626 (D): Hapimatic-internal — seeds runClaude's outputStyle,
-        // which is injected into the generated --settings file (the choke point
-        // every launcher delivers). Free-form (built-in or custom name); no enum
-        // validation — an unknown style is silently no-op'd by Claude Code
-        // (Task 1 spike, fail-open). Consumes the next token via `++i` like
-        // --hapi-effort so the catch-all does not slurp it.
-        options.outputStyle = args[++i];
-      } else if (arg === "--hapi-mcp-set") {
-        // Issue #6171: Hapimatic-internal — the MCP set and the known names,
-        // which runClaude turns into `deniedMcpServers`. Consumed via `++i` so the
-        // catch-all does not forward it to Claude. An unreadable value is dropped
-        // and logged: the session then starts every server (today's behavior).
-        const raw = args[++i];
-        const payload = parseMcpSetLaunchArg(raw);
-        if (payload) {
-          options.mcpSet = payload;
-        } else {
-          logger.warn("[CLAUDE] ignoring an unreadable --hapi-mcp-set value");
-        }
-      } else if (arg === "--started-by") {
-        options.startedBy = args[++i] as "daemon" | "terminal";
-      } else {
-        unknownArgs.push(arg);
-        if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
-          unknownArgs.push(args[++i]);
-        }
-      }
-    }
-
-    if (unknownArgs.length > 0) {
-      options.claudeArgs = [...(options.claudeArgs || []), ...unknownArgs];
-    }
+    const { options, showHelp } = parsed;
 
     if (showHelp) {
       console.log(buildRootHelpText());

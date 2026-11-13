@@ -76,6 +76,7 @@ export function PdfViewerModal({
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm" />
         <DialogPrimitive.Content
+          // content-bounds-allow: document viewers take the whole window over a 90% scrim (operator ruling 2026-11-13)
           className="fixed inset-0 z-50 flex flex-col"
           aria-describedby={undefined}
         >

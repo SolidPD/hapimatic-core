@@ -26,6 +26,8 @@ export const queryKeys = {
   // #6454: every Project Manager dashboard in the namespace, across nodes.
   // Under the pins prefix, so an SSE reconnect marks it stale with the rest.
   pinDashboards: ["pins", "dashboards"] as const,
+  // #6574: one pin read by its ID, under the pins prefix like the dashboards.
+  pinById: (pinId: string) => ["pins", "by-id", pinId] as const,
   pinEvidence: (sessionId: string, path: string, revision: number) =>
     ["pin-evidence", sessionId, path, revision] as const,
   // #3559 (R6): per-issue approval-gate state for the server-driven approval card.
@@ -257,6 +259,8 @@ export const queryKeys = {
   // Issue #4371: in-app support channel info from `GET /api/support/channel`.
   supportChannel: ["support-channel"] as const,
   searchFilterPreferences: ["search-filter-preferences"] as const,
+  /** Issue #6570: this node's compact-at preference (one read, shared by two sections). */
+  compactAtPreference: ["compact-at-preference"] as const,
   mcpStatus: (projectDir?: string) =>
     ["mcp-status", projectDir ?? "global"] as const,
   mcpBatchState: (sessionId: string) => ["mcp-batch-state", sessionId] as const,

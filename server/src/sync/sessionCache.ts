@@ -21,6 +21,14 @@ import type {
 import type { EffortLevel } from "@hapi/protocol/effort";
 import type { Store } from "../store";
 import type { StoredSession, StoredMessage } from "../store/types";
+import type { BillableIntervalTracker } from "../billable/intervalTracker";
+import type {
+  CloseLandedReport,
+  IntervalWriteService,
+} from "../billable/intervalWriteService";
+import type { BillableMode } from "../billable/mode";
+import { requestWaitRef } from "../billable/predicate";
+import { newUuidV7 } from "../store/turns/ids";
 import { clampAliveTime } from "./aliveTime";
 import { EventPublisher } from "./eventPublisher";
 import { buildSessionRecord } from "./sessionRecord";
@@ -52,6 +60,18 @@ export type SessionBindingSnapshot = Pick<
   | "apiKeyMasked"
   | "apiKeyPlacedBy"
 >;
+
+/** #6586: what a failed or absent tracker's `observe` stands for. */
+const NO_BILLABLE_OBSERVE = { closedMs: 0, changed: false } as const;
+
+/** #6586: the old-clock stretch's measurements when the tracker has none. */
+const NO_STRETCH_MEASUREMENTS = { intervalsMs: 0, waitMs: 0, trimMs: 0 };
+
+/** #6586: the ids of the requests the session lists as pending now. */
+function billableRequestIds(session: Session): Set<string> {
+  const requests = session.agentState?.requests;
+  return new Set(requests ? Object.keys(requests) : []);
+}
 
 /** A heartbeat the cache ignores (bad time, archive guard, unknown session). */
 const NO_ALIVE_EDGES: SessionAliveResult = {
@@ -126,6 +146,23 @@ export class SessionCache {
   /** The `expireInactive` tick period (`SyncEngine`'s inactivity timer). */
   private static readonly EXPECTED_TICK_MS = 5_000;
   private lastExpireTickAt: number | null = null;
+
+  /**
+   * Issue #6586: billable intervals. The effective mode comes from the tracker
+   * the engine passes in; a cache built without one runs as `off` (today's three
+   * timer sites, nothing recorded), so every existing construction is unchanged.
+   */
+  private readonly billableMode: BillableMode;
+  private readonly billableTracker?: BillableIntervalTracker;
+  private readonly billableWrites?: IntervalWriteService;
+  /**
+   * #6586 (`shadow` only): per session, the ids of the requests that are no wait
+   * of the turn now running — a request still pending at a no-turn keepAlive, or
+   * held when a process attached. Kept by the cache itself and never read from
+   * the tracker, so the stretch row's wait reference stays independent of the
+   * tracker's state. Dropped where the session is removed.
+   */
+  private readonly leftoverRequestIds: Map<string, Set<string>> = new Map();
   private onStallReset?: (gapMs: number, inactiveSessions: number) => void;
 
   /**
@@ -160,10 +197,21 @@ export class SessionCache {
     options?: {
       onForceKill?: (sessionId: string) => void;
       onStallReset?: (gapMs: number, inactiveSessions: number) => void;
+      billableTracker?: BillableIntervalTracker;
+      billableWrites?: IntervalWriteService;
     }
   ) {
     this.onForceKill = options?.onForceKill;
     this.onStallReset = options?.onStallReset;
+    this.billableTracker = options?.billableTracker;
+    this.billableWrites = options?.billableWrites;
+    this.billableMode = options?.billableTracker?.mode ?? "off";
+    if (this.billableMode === "shadow" && !this.billableWrites) {
+      // A wiring fault: shadow's stretch rows are enqueued by the cache itself.
+      console.error(
+        "[billable-intervals] shadow mode without a write service: no stretch rows will be recorded"
+      );
+    }
   }
 
   getSessions(): Session[] {
@@ -334,6 +382,7 @@ export class SessionCache {
         throw new Error("Failed to load session");
       })();
     this.applyPendingParentByTag(tag, session);
+    this.noteBillableAttach(session);
     return session;
   }
 
@@ -375,6 +424,8 @@ export class SessionCache {
   ): Session | null {
     let stored = storedSession ?? this.store.sessions.getSession(sessionId);
     if (!stored) {
+      // #6586: a deleted row closes its interval, whether or not it was cached.
+      this.billableRemoved(sessionId);
       const existed = this.sessions.delete(sessionId);
       if (existed) {
         this.publisher.emit({ type: "session-removed", sessionId });
@@ -485,10 +536,31 @@ export class SessionCache {
       }
     }
 
+    // #6586: a store write can add or answer a pending request; the tracker sees
+    // it here. In `on` the emit carries the live start explicitly (`null` when no
+    // billable interval is open), because the rebuilt record carries the previous
+    // start and a federation hub merging this payload would keep ticking.
+    let emitted: Session = session;
+    if (this.billableMode !== "off") {
+      const observed = this.callBillableTracker(
+        "observe",
+        session.id,
+        NO_BILLABLE_OBSERVE,
+        tracker => tracker.observe(session, Date.now(), "refresh")
+      );
+      if (this.billableMode === "on") {
+        this.applyBillableObserve(session, observed);
+        emitted = {
+          ...session,
+          thinkingStartedAt: session.thinkingStartedAt ?? null,
+        } as Session;
+      }
+    }
+
     this.publisher.emit({
       type: existing ? "session-updated" : "session-added",
       sessionId,
-      data: session,
+      data: emitted,
     });
     return session;
   }
@@ -626,26 +698,64 @@ export class SessionCache {
       payload.backgroundAgents
     );
 
-    // Server-side time accumulation: track thinking segments independently
-    // of the frontend timer. This ensures accurate time even when the PWA
-    // is backgrounded (iOS suspends JS execution).
-    if (!wasThinking && session.thinking) {
-      // Thinking started — record segment start
-      session.thinkingStartedAt = Date.now();
-    } else if (wasThinking && !session.thinking) {
-      // Thinking stopped — accumulate elapsed segment time
-      if (session.thinkingStartedAt) {
-        const elapsed = Date.now() - session.thinkingStartedAt;
-        session.serverAccumulatedMs =
-          (session.serverAccumulatedMs ?? 0) + elapsed;
-        session.thinkingStartedAt = undefined;
-        // Persist to DB on thinking stop (natural checkpoint)
-        this.store.sessions.updateSessionServerTime(
-          payload.sid,
-          session.serverAccumulatedMs,
-          session.namespace
-        );
+    // #6586: the hub clock and the old clock's state, read BEFORE the block, so
+    // the block's synchronous timer write (which can wait up to busy_timeout)
+    // never shows as a difference between the two clocks.
+    const billableNowMs = Date.now();
+    const legacyStart = session.thinkingStartedAt;
+    const legacyBefore = session.serverAccumulatedMs ?? 0;
+    let billableChanged = false;
+    if (this.billableMode !== "on") {
+      // Server-side time accumulation: track thinking segments independently
+      // of the frontend timer. This ensures accurate time even when the PWA
+      // is backgrounded (iOS suspends JS execution).
+      if (!wasThinking && session.thinking) {
+        // Thinking started — record segment start
+        session.thinkingStartedAt = Date.now();
+      } else if (wasThinking && !session.thinking) {
+        // Thinking stopped — accumulate elapsed segment time
+        if (session.thinkingStartedAt) {
+          const elapsed = Date.now() - session.thinkingStartedAt;
+          session.serverAccumulatedMs =
+            (session.serverAccumulatedMs ?? 0) + elapsed;
+          session.thinkingStartedAt = undefined;
+          // Persist to DB on thinking stop (natural checkpoint)
+          this.store.sessions.updateSessionServerTime(
+            payload.sid,
+            session.serverAccumulatedMs,
+            session.namespace
+          );
+        }
       }
+    }
+    if (this.billableMode === "shadow") {
+      this.callBillableTracker(
+        "observe",
+        session.id,
+        NO_BILLABLE_OBSERVE,
+        tracker => tracker.observe(session, billableNowMs, "alive")
+      );
+      this.recordLegacyStretch(
+        session,
+        legacyStart,
+        legacyBefore,
+        "stop",
+        this.billableSweepGap(billableNowMs)
+      );
+      // After the stretch row is built: a request still pending while the CLI
+      // reports no turn is no wait of the next turn (the tracker's mark 1).
+      if (!session.thinking) {
+        this.leftoverRequestIds.set(session.id, billableRequestIds(session));
+      }
+    } else if (this.billableMode === "on") {
+      const observed = this.callBillableTracker(
+        "observe",
+        session.id,
+        NO_BILLABLE_OBSERVE,
+        tracker => tracker.observe(session, billableNowMs, "alive")
+      );
+      this.applyBillableObserve(session, observed);
+      billableChanged = observed.changed;
     }
 
     // When thinking transitions true→false, bump updatedAt so the
@@ -780,6 +890,7 @@ export class SessionCache {
       rateLimitedChanged ||
       backgroundAgentsChanged ||
       modeChanged ||
+      billableChanged ||
       now - lastBroadcastAt > 10_000;
 
     if (shouldBroadcast) {
@@ -802,7 +913,12 @@ export class SessionCache {
           // clear instead of leaving a stale hub count (NEW-4383-1). The full
           // snapshot (agents list) rides this delta; #4387 projects counts from it.
           backgroundAgents: session.backgroundAgents ?? null,
-          thinkingStartedAt: session.thinkingStartedAt,
+          // #6586: in `on` an explicit null when no billable interval is open;
+          // in `shadow` and `off` today's value (the key set is unchanged).
+          thinkingStartedAt:
+            this.billableMode === "on"
+              ? (session.thinkingStartedAt ?? null)
+              : session.thinkingStartedAt,
           serverAccumulatedMs: session.serverAccumulatedMs ?? 0,
           permissionMode: session.permissionMode,
           modelMode: session.modelMode,
@@ -885,17 +1001,58 @@ export class SessionCache {
       return;
     }
 
-    // Finalize server-side time if session was thinking when it ended
-    if (session.thinking && session.thinkingStartedAt) {
-      const elapsed = Date.now() - session.thinkingStartedAt;
-      session.serverAccumulatedMs =
-        (session.serverAccumulatedMs ?? 0) + elapsed;
-      session.thinkingStartedAt = undefined;
-      this.store.sessions.updateSessionServerTime(
+    // #6586: read before the block (see the keepAlive edge).
+    const billableNowMs = Date.now();
+    const legacyStart = session.thinkingStartedAt;
+    const legacyBefore = session.serverAccumulatedMs ?? 0;
+    // `archived` is a server-side fact the CLI listener strips: a hub-originated end.
+    const hubOriginated = payload.archived === true;
+    if (this.billableMode !== "on") {
+      // Finalize server-side time if session was thinking when it ended
+      if (session.thinking && session.thinkingStartedAt) {
+        const elapsed = Date.now() - session.thinkingStartedAt;
+        session.serverAccumulatedMs =
+          (session.serverAccumulatedMs ?? 0) + elapsed;
+        session.thinkingStartedAt = undefined;
+        this.store.sessions.updateSessionServerTime(
+          payload.sid,
+          session.serverAccumulatedMs,
+          session.namespace
+        );
+      }
+    }
+    if (this.billableMode === "shadow") {
+      this.callBillableTracker(
+        "closeOnSessionEnd",
         payload.sid,
-        session.serverAccumulatedMs,
-        session.namespace
+        null,
+        tracker =>
+          tracker.closeOnSessionEnd(payload.sid, billableNowMs, {
+            hubOriginated,
+          })
       );
+      this.recordLegacyStretch(
+        session,
+        legacyStart,
+        legacyBefore,
+        "session_end",
+        this.billableSweepGap(billableNowMs)
+      );
+    } else if (this.billableMode === "on") {
+      const closed = this.callBillableTracker(
+        "closeOnSessionEnd",
+        payload.sid,
+        null,
+        tracker =>
+          tracker.closeOnSessionEnd(payload.sid, billableNowMs, {
+            hubOriginated,
+          })
+      );
+      if (closed) {
+        session.serverAccumulatedMs =
+          (session.serverAccumulatedMs ?? 0) + closed.durationMs;
+      }
+      session.thinkingStartedAt = undefined;
     }
 
     session.active = false;
@@ -935,6 +1092,8 @@ export class SessionCache {
         rateLimited: null,
         // Issue #4383: explicit null so #4387's bridge clears the hub count.
         backgroundAgents: null,
+        // #6586: in `on` the end carries the live start and the timer.
+        ...this.billableEndFields(session),
       },
     });
   }
@@ -970,17 +1129,52 @@ export class SessionCache {
             : SDK_SESSION_TIMEOUT_MS;
 
         if (now - session.activeAt <= sessionTimeoutMs) continue;
-        // Finalize server-side time before marking inactive
-        if (session.thinking && session.thinkingStartedAt) {
-          const elapsed = now - session.thinkingStartedAt;
-          session.serverAccumulatedMs =
-            (session.serverAccumulatedMs ?? 0) + elapsed;
-          session.thinkingStartedAt = undefined;
-          this.store.sessions.updateSessionServerTime(
-            session.id,
-            session.serverAccumulatedMs,
-            session.namespace
+        // #6586 stall guard (`on` only): after the hub itself was blocked, the
+        // overdue sweep runs before the queued keepAlives; flipping a live session
+        // here would un-bill the stall. The next tick decides.
+        if (this.billableMode === "on" && stallGapMs > sessionTimeoutMs) {
+          continue;
+        }
+        // #6586: read before the block (see the keepAlive edge).
+        const legacyStart = session.thinkingStartedAt;
+        const legacyBefore = session.serverAccumulatedMs ?? 0;
+        if (this.billableMode !== "on") {
+          // Finalize server-side time before marking inactive
+          if (session.thinking && session.thinkingStartedAt) {
+            const elapsed = now - session.thinkingStartedAt;
+            session.serverAccumulatedMs =
+              (session.serverAccumulatedMs ?? 0) + elapsed;
+            session.thinkingStartedAt = undefined;
+            this.store.sessions.updateSessionServerTime(
+              session.id,
+              session.serverAccumulatedMs,
+              session.namespace
+            );
+          }
+        }
+        if (this.billableMode === "shadow") {
+          this.callBillableTracker("closeOnExpiry", session.id, null, tracker =>
+            tracker.closeOnExpiry(session.id)
           );
+          this.recordLegacyStretch(
+            session,
+            legacyStart,
+            legacyBefore,
+            "expired",
+            stallGapMs
+          );
+        } else if (this.billableMode === "on") {
+          const closed = this.callBillableTracker(
+            "closeOnExpiry",
+            session.id,
+            null,
+            tracker => tracker.closeOnExpiry(session.id)
+          );
+          if (closed) {
+            session.serverAccumulatedMs =
+              (session.serverAccumulatedMs ?? 0) + closed.durationMs;
+          }
+          session.thinkingStartedAt = undefined;
         }
         session.active = false;
         session.thinking = false;
@@ -1009,6 +1203,8 @@ export class SessionCache {
             blockedOnTuiPrompt: null,
             rateLimited: null,
             backgroundAgents: null,
+            // #6586: in `on` the expiry carries the live start and the timer.
+            ...this.billableEndFields(session),
           },
         });
       }
@@ -1427,6 +1623,8 @@ export class SessionCache {
       throw new Error("Failed to delete session");
     }
 
+    // #6586: below every refusal, so a refused delete closes no interval.
+    this.billableRemoved(sessionId);
     this.sessions.delete(sessionId);
     this.lastBroadcastAtBySessionId.delete(sessionId);
     this.todoBackfillAttemptedSessionIds.delete(sessionId);
@@ -1529,6 +1727,8 @@ export class SessionCache {
 
       for (const id of toDelete) {
         const session = this.sessions.get(id);
+        // #6586: only ids that passed every refusal reach here.
+        this.billableRemoved(id);
         this.sessions.delete(id);
         this.lastBroadcastAtBySessionId.delete(id);
         this.todoBackfillAttemptedSessionIds.delete(id);
@@ -1886,6 +2086,195 @@ export class SessionCache {
 
   getMessageCountsByNamespace(namespace: string): Map<string, number> {
     return this.store.sessions.getMessageCountsByNamespace(namespace);
+  }
+
+  /**
+   * #6586: the write service's `onCloseLanded` (wired by the engine). In `on`,
+   * once a close has landed and no later close of the session is queued, memory
+   * takes the stored sum, so it converges on the stored timer after every close.
+   * While a later close is queued it does nothing, because the stored sum does
+   * not yet hold a duration memory already holds and the timer must not step
+   * back. In `shadow` and `off` the timer belongs to today's code.
+   */
+  applyBillableCloseLanded(report: CloseLandedReport): void {
+    if (this.billableMode !== "on") return;
+    if (report.laterCloseQueued) return;
+    const session = this.sessions.get(report.sessionId);
+    if (!session) return;
+    const memoryMs = session.serverAccumulatedMs ?? 0;
+    if (report.sessionTotalMs < memoryMs) {
+      // Memory counted a close the store does not hold (the write service set
+      // it aside, and logged that). The timer follows the store; say so here
+      // too, so the step back is tied to this session's timer.
+      console.warn(
+        `[billable-intervals] session ${report.sessionId} timer set back to the stored sum`,
+        { memoryMs, storedMs: report.sessionTotalMs }
+      );
+    }
+    session.serverAccumulatedMs = report.sessionTotalMs;
+  }
+
+  /**
+   * #6586: run one tracker call. The tracker catches its own failures; this
+   * catches what escapes it, so a billable fault never breaks a socket
+   * listener, a sweep or a delete. Logged to the console only, because the
+   * cache holds no error logger and a store write here could block (#3631).
+   */
+  private callBillableTracker<T>(
+    method: string,
+    sessionId: string,
+    fallback: T,
+    fn: (tracker: BillableIntervalTracker) => T
+  ): T {
+    const tracker = this.billableTracker;
+    if (!tracker) return fallback;
+    try {
+      return fn(tracker);
+    } catch (error) {
+      console.error(
+        `[billable-intervals] tracker ${method} failed for session ${sessionId}`,
+        error
+      );
+      return fallback;
+    }
+  }
+
+  /**
+   * #6586 (`on` only): apply an `observe` to the cached record: the closed time
+   * joins the timer at close time, and the live start becomes the start of the
+   * open billable interval (undefined while none is open).
+   */
+  private applyBillableObserve(
+    session: Session,
+    observed: { closedMs: number; changed: boolean }
+  ): void {
+    if (observed.closedMs > 0) {
+      session.serverAccumulatedMs =
+        (session.serverAccumulatedMs ?? 0) + observed.closedMs;
+    }
+    session.thinkingStartedAt =
+      this.callBillableTracker("openStartMs", session.id, null, tracker =>
+        tracker.openStartMs(session.id)
+      ) ?? undefined;
+  }
+
+  /**
+   * #6586: a CLI process attached (`getOrCreateSession`). The tracker closes what
+   * the previous process left open and marks the requests it left behind. In
+   * `on` the closed time joins the timer; in `shadow` the cache's own leftover
+   * set takes the same requests, replacing the previous set.
+   */
+  private noteBillableAttach(session: Session): void {
+    if (this.billableMode === "off") return;
+    const attached = this.callBillableTracker(
+      "noteProcessStart",
+      session.id,
+      null,
+      tracker => tracker.noteProcessStart(session, Date.now())
+    );
+    if (this.billableMode === "on") {
+      if (attached) {
+        session.serverAccumulatedMs =
+          (session.serverAccumulatedMs ?? 0) + attached.durationMs;
+      }
+      session.thinkingStartedAt = undefined;
+      return;
+    }
+    this.leftoverRequestIds.set(session.id, billableRequestIds(session));
+  }
+
+  /** #6586: a session's row is gone; close its interval and drop its state. */
+  private billableRemoved(sessionId: string): void {
+    this.leftoverRequestIds.delete(sessionId);
+    if (this.billableMode === "off") return;
+    this.callBillableTracker("closeOnRemoval", sessionId, null, tracker =>
+      tracker.closeOnRemoval(sessionId)
+    );
+  }
+
+  /** #6586: the gap since the last expiry sweep (0 before the first one). */
+  private billableSweepGap(nowMs: number): number {
+    return this.lastExpireTickAt === null ? 0 : nowMs - this.lastExpireTickAt;
+  }
+
+  /**
+   * #6586: the keys an end or expiry emit adds in `on`: the live start, which
+   * is gone, and the timer the close just set. Nothing in `shadow` and `off`,
+   * whose payloads stay byte-identical to today's.
+   */
+  private billableEndFields(
+    session: Session
+  ): { thinkingStartedAt: null; serverAccumulatedMs: number } | object {
+    if (this.billableMode !== "on") return {};
+    return {
+      thinkingStartedAt: null,
+      serverAccumulatedMs: session.serverAccumulatedMs ?? 0,
+    };
+  }
+
+  /**
+   * #6586 (`shadow` only): when the old clock's block has just closed a stretch,
+   * enqueue its row with the tracker's measurements of it and the wait the
+   * session's request records give for it. Enqueued by the cache, with the
+   * namespace from the session, so a tracker that failed or holds no entry
+   * still leaves a row (measurements 0) and the daily check lists the whole
+   * `legacy_ms`. `recorded_at_ms` is read at the enqueue.
+   */
+  private recordLegacyStretch(
+    session: Session,
+    legacyStart: number | null | undefined,
+    legacyBefore: number,
+    site: "stop" | "session_end" | "expired",
+    sweepGapMs: number
+  ): void {
+    if (this.billableMode !== "shadow") return;
+    if (legacyStart == null || session.thinkingStartedAt != null) return;
+    const tracker = this.billableTracker;
+    const writes = this.billableWrites;
+    if (!tracker || !writes) return;
+    try {
+      const legacyMs = (session.serverAccumulatedMs ?? 0) - legacyBefore;
+      const legacyEndedAtMs = legacyStart + legacyMs;
+      const measured = this.callBillableTracker(
+        "stretchMeasurements",
+        session.id,
+        NO_STRETCH_MEASUREMENTS,
+        t =>
+          t.stretchMeasurements(session.id, {
+            stretchStartedAtMs: legacyStart,
+            legacyEndedAtMs,
+          })
+      );
+      const waitRef = requestWaitRef(
+        session.agentState,
+        legacyStart,
+        legacyEndedAtMs,
+        this.leftoverRequestIds.get(session.id)
+      );
+      writes.enqueueLegacyStretch({
+        id: newUuidV7(),
+        hapi_session_id: session.id,
+        namespace: session.namespace,
+        node_id: tracker.nodeId,
+        launcher_kind: session.metadata?.launcherKind ?? "unknown",
+        stretch_started_at_ms: legacyStart,
+        legacy_ended_at_ms: legacyEndedAtMs,
+        legacy_ms: legacyMs,
+        intervals_ms: measured.intervalsMs,
+        wait_ms: measured.waitMs,
+        trim_ms: measured.trimMs,
+        wait_ref_ms: waitRef.ms,
+        wait_ref_incomplete: waitRef.incomplete ? 1 : 0,
+        sweep_gap_ms: sweepGapMs,
+        site,
+        recorded_at_ms: Date.now(),
+      });
+    } catch (error) {
+      console.error(
+        `[billable-intervals] stretch row not recorded for session ${session.id} (${site})`,
+        error
+      );
+    }
   }
 }
 

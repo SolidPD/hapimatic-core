@@ -17,6 +17,7 @@ import {
   mcpServerContextTokens,
   type ContextUsageCategory,
   type ContextUsageDetail,
+  type McpServerUsage,
   type TurnTokenBreakdown,
 } from "@hapi/protocol";
 import { formatTokens } from "@/lib/formatTokens";
@@ -115,6 +116,28 @@ export function buildContextSections(detail: ContextUsageDetail): {
     });
   }
   return { sections, deferred };
+}
+
+/**
+ * The label of an MCP server row: every raw server name it covers, joined with
+ * " + " (#6409 item 3), so a row two servers share is never named after one.
+ */
+export function mcpServerRowLabel(
+  server: Pick<McpServerUsage, "name" | "names">
+): string {
+  return server.names.length > 0 ? server.names.join(" + ") : server.name;
+}
+
+/**
+ * Why a row covers more than one server, or undefined for a one-server row:
+ * the servers share the tool prefix before `__`, so Claude Code reports their
+ * tools together and their costs cannot be split (#6409 item 3).
+ */
+export function mcpSharedKeyNote(
+  server: Pick<McpServerUsage, "name" | "names">
+): string | undefined {
+  if (server.names.length < 2) return undefined;
+  return `${mcpServerRowLabel(server)} share one tool prefix; Claude Code reports their tools together`;
 }
 
 /**
@@ -241,13 +264,23 @@ export function buildTrimSuggestions(
   for (const server of groupMcpServers(detail)) {
     const tokens = mcpServerContextTokens(server);
     if (tokens < MCP_SERVER_LARGE_TOKENS) continue;
-    suggestions.push({
-      id: `mcp:${server.name}`,
-      title: `MCP server ${server.name} loads ${formatTokens(tokens)} tokens`,
-      detail:
-        "Turn it off for sessions that do not use it; its tools and instructions load into every turn.",
-      tokens,
-    });
+    suggestions.push(
+      server.names.length > 1
+        ? {
+            id: `mcp:${server.name}`,
+            title: `MCP servers ${mcpServerRowLabel(server)} load ${formatTokens(tokens)} tokens together`,
+            detail:
+              "They share one tool prefix, so Claude Code reports their tools together and turning one off frees only part of this. Turn off the ones sessions do not use.",
+            tokens,
+          }
+        : {
+            id: `mcp:${server.name}`,
+            title: `MCP server ${server.name} loads ${formatTokens(tokens)} tokens`,
+            detail:
+              "Turn it off for sessions that do not use it; its tools and instructions load into every turn.",
+            tokens,
+          }
+    );
   }
 
   const skills = detail.skills;

@@ -28,6 +28,12 @@ import {
   withAccountConfigDir,
 } from "./accountTokenInjection";
 import {
+  localLaunchPermissionArgs,
+  permissionNarrowingHolds,
+  relaunchPermissionArgs,
+  settleLaunchPermissionMode,
+} from "./spawnPermissionSeed";
+import {
   createCleanupHandler,
   createLocalModeRejectionHandler,
 } from "./services/mcpToggleService";
@@ -39,6 +45,32 @@ import {
   SET_PERMISSION_MODE_META,
 } from "@/api/rpc/capabilityMeta";
 import { NO_META_TEARDOWN } from "@/api/rpc/types";
+
+/**
+ * Issue #5348 F2 (board-26 PM ruling, 2026-11-12): the session leaves local mode with the
+ * prompt after -- still undelivered (no Claude was started with it). Show it once in the
+ * chat and drop it: a stale prompt arriving on its own at a later local start is worse
+ * than a visible miss.
+ */
+function reportUndeliveredPrompt(
+  session: Session,
+  exitReason: "switch" | "exit" | null
+): void {
+  const prompt = session.takeUndeliveredPrompt();
+  if (prompt === undefined) return;
+  const why =
+    exitReason === "switch"
+      ? "the session switched to remote before Claude started"
+      : "Claude did not start";
+  try {
+    session.client.sendSessionEvent({
+      type: "message",
+      message: `The text after -- was not delivered because ${why}: ${prompt}`,
+    });
+  } catch (e) {
+    logger.warn("[local]: could not report the undelivered prompt", e);
+  }
+}
 
 export async function claudeLocalLauncher(
   session: Session
@@ -263,6 +295,8 @@ export async function claudeLocalLauncher(
       const accountToken = accountConfigDir
         ? null
         : await resolveAccountTokenForSession(session);
+      // Issue #5348 F2: set by claudeLocal just before it spawns Claude.
+      let started = false;
       try {
         await claudeLocal({
           path: session.path,
@@ -277,10 +311,44 @@ export async function claudeLocalLauncher(
           // ran the binary default (medium on Opus 5.5). A user's own --effort
           // passthrough wins. A new array: consumeOneTimeFlags below still
           // edits session.claudeArgs itself.
-          claudeArgs: appendEffortArg(
-            session.claudeArgs ?? [],
-            session.getEffort()
-          ),
+          // Issue #6400 P1: a session started with a terminal
+          // --permission-mode no longer forwards it, so its live mode is
+          // passed instead (a plain session is unchanged).
+          // Issue #6617 (Matt 43a / 43-local a / D1-1 / D3-1): with the switch
+          // on, the live mode decides the child's permission flags. A start in
+          // bypass narrowed in the UI drops the bypass token; the mode is named
+          // for a terminal --permission-mode start, a daemon-started session, a
+          // bypass start, and a session whose mode was set from the UI or a card
+          // (D3-1); an untouched plain terminal session keeps the user's own
+          // default. An unreadable mode is written back as `default` (R7 ii).
+          claudeArgs: permissionNarrowingHolds()
+            ? relaunchPermissionArgs(
+                appendEffortArg(session.claudeArgs ?? [], session.getEffort()),
+                settleLaunchPermissionMode(session, message =>
+                  logger.warn(`[local]: ${message}`)
+                ),
+                {
+                  appendMode:
+                    session.permissionModeFromFlag ||
+                    session.startedBy === "daemon" ||
+                    (session.claudeArgs ?? []).includes(
+                      "--dangerously-skip-permissions"
+                    ) ||
+                    session.permissionModeSetHere,
+                }
+              )
+            : localLaunchPermissionArgs(
+                appendEffortArg(session.claudeArgs ?? [], session.getEffort()),
+                session.permissionModeFromFlag
+                  ? session.getPermissionMode()
+                  : undefined,
+                session.permissionModeFromFlag
+              ),
+          // Issue #5348: the marker prompt, first spawn only (consumed below).
+          claudeTrailingArgs: session.claudeTrailingArgs,
+          onSpawn: () => {
+            started = true;
+          },
           mcpServers: session.mcpServers,
           allowedTools: session.allowedTools,
           hookSettingsPath: session.hookSettingsPath,
@@ -288,7 +356,8 @@ export async function claudeLocalLauncher(
 
         // Consume one-time Claude flags after spawn
         // For example we don't want to pass --resume flag after first spawn
-        session.consumeOneTimeFlags();
+        // Issue #5348 F2: the prompt after -- only when Claude was started with it.
+        session.consumeOneTimeFlags({ promptDelivered: started });
 
         // Normal exit
         if (!exitReason) {
@@ -322,6 +391,9 @@ export async function claudeLocalLauncher(
   } finally {
     // Resolve future
     exitFuture.resolve(undefined);
+
+    // Issue #5348 F2: leaving local mode with the prompt after -- undelivered.
+    reportUndeliveredPrompt(session, exitReason);
 
     // Set handlers to no-op
     session.client.rpcHandlerManager.registerHandler(

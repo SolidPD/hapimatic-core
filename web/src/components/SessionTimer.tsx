@@ -330,7 +330,7 @@ interface SessionTimerProps {
   /** Server-tracked accumulated thinking time in ms */
   serverAccumulatedMs?: number;
   /** Server-tracked timestamp when current thinking segment started */
-  serverThinkingStartedAt?: number;
+  serverThinkingStartedAt?: number | null;
   /** Compact mode for session list items */
   compact?: boolean;
 }

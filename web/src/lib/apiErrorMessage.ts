@@ -22,17 +22,30 @@ export function apiErrorMessage(err: unknown): string {
   if (!(err instanceof ApiError)) {
     return err instanceof Error ? err.message : String(err);
   }
-  let serverMessage: string | undefined;
-  if (err.body) {
-    try {
-      const parsed = JSON.parse(err.body) as { error?: unknown };
-      if (typeof parsed.error === "string") serverMessage = parsed.error;
-    } catch {
-      // Non-JSON body — fall through to the code / raw message below.
-    }
-  }
+  const serverMessage = apiErrorServerMessage(err);
   if (serverMessage) {
     return err.code ? `${serverMessage} (${err.code})` : serverMessage;
   }
   return err.code ? `${err.message} (${err.code})` : err.message;
+}
+
+/**
+ * The server's own message in an `ApiError`'s JSON `{ error }` body, verbatim,
+ * or `undefined` when there is none (not an `ApiError`, no body, a non-JSON
+ * body, or no string `error`). Issue #6617 (D7-1): the permission-mode picker
+ * shows it as is. It never appends the `code`, because `request()` fills `code`
+ * from the same `error` string when the body has no `code` field, and
+ * {@link apiErrorMessage} would then show the text twice.
+ */
+export function apiErrorServerMessage(err: unknown): string | undefined {
+  if (!(err instanceof ApiError) || !err.body) return undefined;
+  try {
+    const parsed = JSON.parse(err.body) as { error?: unknown };
+    return typeof parsed.error === "string" && parsed.error.length > 0
+      ? parsed.error
+      : undefined;
+  } catch {
+    // Non-JSON body: no server message.
+    return undefined;
+  }
 }

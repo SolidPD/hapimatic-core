@@ -88,7 +88,11 @@ export function useThroughputBreakdown(
 export function useThroughputTests(
   api: ApiClient | null,
   range: ThroughputRange
-): { page: ThroughputTestsPage | null; isLoading: boolean } {
+): {
+  page: ThroughputTestsPage | null;
+  isLoading: boolean;
+  error: string | null;
+} {
   const query = useQuery({
     queryKey: queryKeys.throughputTests(range.from, range.to),
     queryFn: async () => {
@@ -99,12 +103,17 @@ export function useThroughputTests(
     refetchInterval: FIVE_MIN,
     staleTime: FIVE_MIN,
   });
-  return { page: query.data ?? null, isLoading: query.isLoading };
+  return {
+    page: query.data ?? null,
+    isLoading: query.isLoading,
+    error: errorText(query.error, "Failed to load the failing tests"),
+  };
 }
 
 export function useThroughputDigests(api: ApiClient | null): {
   digests: DigestMeta[];
   isLoading: boolean;
+  error: string | null;
 } {
   const query = useQuery({
     queryKey: queryKeys.throughputDigests(),
@@ -116,13 +125,21 @@ export function useThroughputDigests(api: ApiClient | null): {
     refetchInterval: FIVE_MIN,
     staleTime: FIVE_MIN,
   });
-  return { digests: query.data?.digests ?? [], isLoading: query.isLoading };
+  return {
+    digests: query.data?.digests ?? [],
+    isLoading: query.isLoading,
+    error: errorText(query.error, "Failed to load the weekly digests"),
+  };
 }
 
 export function useThroughputDigest(
   api: ApiClient | null,
   id: string | null
-): { digest: DigestDetail | null; isLoading: boolean } {
+): {
+  digest: DigestDetail | null;
+  isLoading: boolean;
+  error: string | null;
+} {
   const query = useQuery({
     queryKey: queryKeys.throughputDigest(id ?? ""),
     queryFn: async () => {
@@ -132,5 +149,9 @@ export function useThroughputDigest(
     enabled: Boolean(api) && id !== null,
     staleTime: FIVE_MIN,
   });
-  return { digest: query.data ?? null, isLoading: query.isLoading };
+  return {
+    digest: query.data ?? null,
+    isLoading: query.isLoading,
+    error: errorText(query.error, "Failed to load the digest"),
+  };
 }

@@ -7,7 +7,13 @@ import { cataloged } from "../../capabilities/cataloged";
 import type { WebAppEnv } from "../middleware/auth";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { ContextWatermarkService } from "../../watermark/contextWatermarkService";
-import { saveContextWatermarkConfig } from "../../config/contextWatermarkConfig";
+import {
+  envEnabledOverride,
+  saveContextWatermarkConfig,
+  type ContextWatermarkConfig,
+  type ContextWatermarkEnabledSource,
+} from "../../config/contextWatermarkConfig";
+import { SettingsUnreadableError } from "../../config/settings";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { logAndJson } from "./routeErrorHelper";
 
@@ -53,6 +59,19 @@ const ConfigSchema = z
   .refine(d => d.enabled !== undefined || d.watermarkPercent !== undefined, {
     message: "At least one of `enabled` or `watermarkPercent` is required",
   });
+
+/**
+ * #6570 R11: which source decided `enabled`. The loader sets it; a config built
+ * without it (tests) falls back to the live variable, which is fixed for the
+ * process's life.
+ */
+function enabledSourceOf(
+  cfg: ContextWatermarkConfig
+): ContextWatermarkEnabledSource {
+  return (
+    cfg.enabledSource ?? (envEnabledOverride() === null ? "settings" : "env")
+  );
+}
 
 export function createWatermarkRoutes(
   getService: () => ContextWatermarkService | null,
@@ -104,6 +123,8 @@ export function createWatermarkRoutes(
         return c.json(
           {
             enabled: svc.isEnabled(),
+            // #6570 R11: "env" when HAPI_CONTEXT_WATERMARK_ENABLED decides `enabled`.
+            enabledSource: enabledSourceOf(cfg),
             watermarkPercent: cfg.watermarkPercent,
             roles: cfg.roles,
             states: svc.getStates(),
@@ -186,6 +207,7 @@ export function createWatermarkRoutes(
         return c.json(
           {
             enabled: saved.enabled,
+            enabledSource: enabledSourceOf(saved),
             watermarkPercent: saved.watermarkPercent,
             roles: saved.roles,
             // Only meaningful when `enabled` was in the request — true iff the env
@@ -197,6 +219,16 @@ export function createWatermarkRoutes(
           200
         );
       } catch (error) {
+        if (error instanceof SettingsUnreadableError) {
+          // #6570 R13: the save refused an unreadable settings.json and wrote
+          // nothing. A fixed message: a parse message can quote file content.
+          return logAndJson(
+            c,
+            new Error("Settings file is unreadable; nothing was saved"),
+            500,
+            { errorLogger, category: "context-watermark" }
+          );
+        }
         return logAndJson(c, error, 500, {
           errorLogger,
           category: "context-watermark",

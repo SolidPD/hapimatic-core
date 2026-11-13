@@ -141,6 +141,10 @@ export const AGENT_FORBIDDEN_ENV_VARS: ReadonlySet<string> = new Set([
   // server/daemon consumers (githubRest.ts token resolution) read their OWN process
   // env, which these per-child strips never touch.
   "GH_TOKEN",
+  // #5348 (R15): `hapi selftest argv`'s report mode. A child that inherited it would
+  // write a report and exit 86 instead of starting; only the selftest sets it, on the
+  // binary it runs itself.
+  "HAPI_SELFTEST_ARGV_REPORT",
   // #5764: the mesh-wide federation bearer. Only the server reads it
   // (server/src/config/federationConfig.ts); the daemon never does, and deletes
   // it from its own env at start (daemon/run.ts) — unlike the onboarding vars it

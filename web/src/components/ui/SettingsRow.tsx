@@ -20,7 +20,8 @@ import { cn } from "@/lib/utils";
  * - **Props / API**: `label`, `control` (trailing), `description?`, `asLabel?`
  *   (wrap the row in `<label>` for implicit native-input association — set this
  *   when `control` is a native `<input>`/`<Checkbox>` so a tap on the label toggles
- *   it), `disabled?` (dims + de-emphasizes the row), `className?`.
+ *   it), `htmlFor?` (with `asLabel`, the control's `id`; required when the label
+ *   holds a button), `disabled?` (dims + de-emphasizes the row), `className?`.
  * - **Composes**: any control primitive (`Checkbox`, a toggle `Button`, `Select`).
  * - **A11y**: with `asLabel`, the wrapping `<label>` associates a tap on the label
  *   text with the enclosed control; without it, the `control` must carry its own
@@ -38,6 +39,13 @@ export interface SettingsRowProps {
   description?: ReactNode;
   /** Wrap the row in `<label>` for implicit native-input association. */
   asLabel?: boolean;
+  /**
+   * With `asLabel`, the `id` of the control the label names. Set it whenever the
+   * `label` holds a button (an info button), because a `<label>` with no `for`
+   * names its FIRST labelable descendant, so a tap on the text would go to that
+   * button instead of toggling the control (#6570).
+   */
+  htmlFor?: string;
   /** Dim + de-emphasize (and, when `asLabel`, drop the pointer cursor). */
   disabled?: boolean;
   className?: string;
@@ -48,6 +56,7 @@ export function SettingsRow({
   control,
   description,
   asLabel = false,
+  htmlFor,
   disabled = false,
   className,
 }: SettingsRowProps) {
@@ -56,8 +65,11 @@ export function SettingsRow({
     asLabel && (disabled ? "cursor-default opacity-60" : "cursor-pointer"),
     !asLabel && disabled && "opacity-60"
   );
+  // #6570: `min-w-0` lets a label that truncates give way to its control, so
+  // the row never wraps and the control is never pushed out of the row. A
+  // wrapping label is unaffected (it still wraps at its longest word).
   const labelSpan = (
-    <span className="text-[length:var(--text-label-strong)] font-medium text-[var(--app-fg)]">
+    <span className="min-w-0 text-[length:var(--text-label-strong)] font-medium text-[var(--app-fg)]">
       {label}
     </span>
   );
@@ -65,7 +77,7 @@ export function SettingsRow({
   return (
     <div className={cn("flex flex-col gap-1", className)}>
       {asLabel ? (
-        <label className={rowClass}>
+        <label className={rowClass} htmlFor={htmlFor}>
           {labelSpan}
           {control}
         </label>

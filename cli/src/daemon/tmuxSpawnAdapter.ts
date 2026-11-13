@@ -382,6 +382,27 @@ export function buildAccountConfigIsolationEnv(
 }
 
 /**
+ * Issue #6617 (Matt D5-1, R8): forward the "a narrowing holds" switch into the
+ * tmux-persisted worker, which inherits the tmux server's frozen environment,
+ * not the daemon's, so a daemon `Environment=HAPI_PERMISSION_NARROWING_HOLDS=0`
+ * reaches the worker through this forward and no other way (#1575). Unlike the
+ * siblings above it ALWAYS writes a value, `"1"` when the daemon has none,
+ * because the tmux server keeps the environment it was created with
+ * (`TmuxManager`): with no forward, a `=0` frozen there when the server started
+ * would outlive the operator's removal of the line (finding S-5). A present
+ * value is forwarded verbatim; the wrapper's `permissionNarrowingHolds` owns
+ * the parse. The daemon records this value in `daemon.state.json`, which
+ * `hapi daemon status` prints.
+ */
+export function buildPermissionNarrowingEnv(
+  env: NodeJS.ProcessEnv = process.env
+): Record<string, string> {
+  return {
+    HAPI_PERMISSION_NARROWING_HOLDS: env.HAPI_PERMISSION_NARROWING_HOLDS ?? "1",
+  };
+}
+
+/**
  * Issue #3632: convert the OWNING SERVER's message-hook stage snapshot (threaded
  * to the daemon in the spawn RPC) into the child-env marker the rp1-home mint
  * fallback reads. This is a PURE builder (mirrors {@link buildAccountConfigIsolationEnv})
@@ -1263,6 +1284,12 @@ export async function spawnSessionInTmux(
     if (extraEnv) {
       Object.assign(envVars, extraEnv);
     }
+
+    // Issue #6617 (R8): the narrowing switch, ALWAYS with a value, applied after
+    // the extraEnv merge so nothing a caller passes overrides it. The env file
+    // below is sourced in the pane before the wrapper starts, so this value wins
+    // over the tmux server's frozen one.
+    Object.assign(envVars, buildPermissionNarrowingEnv());
 
     // #1734 (OmniBox Phase 0a — in-path security fix, UNGATED): deliver the
     // spawn env — including CLI_API_TOKEN and CLAUDE_CODE_OAUTH_TOKEN —

@@ -86,7 +86,7 @@ import {
   initializeRecovery,
   isTmuxPersistenceEnabled,
 } from "./recoveryIntegration";
-import {} from "./tmuxSpawnAdapter";
+import { buildPermissionNarrowingEnv } from "./tmuxSpawnAdapter";
 import { configuration } from "@/configuration";
 import {
   TokenRefreshService,
@@ -541,6 +541,11 @@ export async function startDaemon(
       startedWithCliVersion: CLI_VERSION,
       startedWithCliMtimeMs,
       daemonLogPath: logger.logFilePath,
+      // Issue #6617 (R8): the narrowing switch value every tmux worker this
+      // daemon spawns receives (the forward always writes one), so
+      // `hapi daemon status` shows which value is live for new sessions.
+      permissionNarrowingHolds:
+        buildPermissionNarrowingEnv().HAPI_PERMISSION_NARROWING_HOLDS,
       // #3731 (F2) + #4153: the daemon's OWN socket, accounts dir and token state.
       ...boot.record,
     };

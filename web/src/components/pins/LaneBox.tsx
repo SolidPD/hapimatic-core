@@ -487,7 +487,7 @@ export const LaneBox = memo(function LaneBox(props: {
   return (
     <div
       id={props.domId}
-      className="mt-1 overflow-hidden rounded-md"
+      className="overflow-hidden rounded-md"
       style={{
         border: `1px solid color-mix(in srgb, ${lane.color} 55%, transparent)`,
       }}
@@ -505,9 +505,11 @@ export const LaneBox = memo(function LaneBox(props: {
             {lane.letter}
           </span>
         </HoverTooltip>
-        <span className="flex min-w-0 items-center gap-1.5 text-[length:var(--text-body-dense)] font-semibold">
+        {/* #6539: the cell clips, so its issue link and dot never run into the
+            stage icons, and the name keeps a few characters before them. */}
+        <span className="pins-lane-name flex min-w-0 items-center gap-1.5 overflow-hidden text-[length:var(--text-body-dense)] font-semibold">
           <HoverTooltip content={lane.name}>
-            <span className="truncate">{lane.name}</span>
+            <span className="min-w-[2.2em] truncate">{lane.name}</span>
           </HoverTooltip>
           {lane.issue ? (
             <IssueLink issue={lane.issue} onOpen={setIssueOpen} />
@@ -543,13 +545,13 @@ export const LaneBox = memo(function LaneBox(props: {
                 params: { sessionId: first.id as string },
               });
             }}
-            className="grid place-items-center rounded-md bg-[var(--app-secondary-bg)] text-[var(--app-hint)] hover:text-[var(--app-fg)]"
+            className="pins-lane-open grid place-items-center rounded-md bg-[var(--app-secondary-bg)] text-[var(--app-hint)] hover:text-[var(--app-fg)]"
             style={CHEVRON_STYLE}
           >
             <ArrowRight className="h-3.5 w-3.5" aria-hidden />
           </HoverTooltipButton>
         ) : (
-          <span aria-hidden />
+          <span className="pins-lane-open" aria-hidden />
         )}
         <HoverTooltipButton
           type="button"

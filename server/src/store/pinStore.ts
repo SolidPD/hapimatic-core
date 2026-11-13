@@ -30,6 +30,7 @@ import {
   type DeadlineState,
   type DeadlineTransition,
 } from "./pinDeadlineRules";
+import { mintPinId } from "./pinIds";
 
 /** Raw `session_pins` row as stored (epoch-ms timestamps, JSON text columns). */
 type PinRow = {
@@ -58,6 +59,9 @@ type PinRow = {
   saved_revision: number | null;
   saved_at: number | null;
   save_reported_at: number | null;
+  // #6574, added by `migrateAddColumn` (store/index.ts); null only on a row an
+  // older binary inserted, until the next start's backfill.
+  pin_id?: string | null;
 };
 
 /** A pin's deadline as the scheduler reads it, with the content it must re-check (#6452). */
@@ -70,6 +74,8 @@ export type PinDeadlineRow = {
   /** The pin's current revision. */
   revision: number;
   content: PinContent;
+  /** #6574: the pin's ID, for the automatic pick's answers entry; null when it has none. */
+  pinId: string | null;
 };
 
 /** Where one page of `listDueDeadlines` ended: its last row, in the page's own order. */
@@ -147,6 +153,13 @@ export type PinAnswerInput = {
    * session's Project Manager (#6454).
    */
   deliveredTo?: string;
+  /**
+   * The operator dismissed the pin in a Submit (#6539). The entry is recorded
+   * with `dismissed: true` and `resolves: false`, so it is never read as an
+   * answer, and an open pin answered on its current revision closes as
+   * `dismissed`. A moot one changes nothing.
+   */
+  dismisses?: true;
   now?: number;
 };
 
@@ -324,6 +337,8 @@ export class PinStore {
       savedTo: row.saved_to ?? null,
       savedRevision: row.saved_revision ?? null,
       saveReportPending: isSaveReportPending(row),
+      // #6574: after the content spread, so content can never shadow the ID.
+      pinId: row.pin_id ?? null,
       createdAt: iso(row.created_at),
       updatedAt: iso(row.updated_at),
       deadlineAt: running ? iso(row.deadline_at as number) : null,
@@ -378,6 +393,17 @@ export class PinStore {
 
   get(sessionId: string, key: string): Pin | null {
     const row = this.getRow(sessionId, key);
+    return row ? this.rowToPin(row) : null;
+  }
+
+  /**
+   * #6574: the pin with this ID, on this node, or null. Namespace-unaware: the
+   * caller checks the namespace through the pin's session.
+   */
+  getByPinId(pinId: string): Pin | null {
+    const row = this.db
+      .prepare("SELECT * FROM session_pins WHERE pin_id = ?")
+      .get(pinId) as PinRow | null;
     return row ? this.rowToPin(row) : null;
   }
 
@@ -468,13 +494,18 @@ export class PinStore {
       now,
       newId: newDeadlineId,
     });
+    // #6574: minted only now, past both caps and the deadline: a capped return
+    // still commits the transaction, so an earlier mint would leave an issued ID
+    // with no pin. This is the only statement that writes pin_id.
+    const pinId = mintPinId(this.db, undefined, now);
     this.db
       .prepare(
         `INSERT INTO session_pins
            (session_id, key, status, revision, posted_seq, anchor_json,
             content_json, created_at, updated_at,
-            deadline_at, deadline_by, deadline_revision, deadline_id, deadline_changed_at)
-         VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            deadline_at, deadline_by, deadline_revision, deadline_id, deadline_changed_at,
+            pin_id)
+         VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         sessionId,
@@ -485,7 +516,8 @@ export class PinStore {
         canonical,
         now,
         now,
-        ...deadlineParams(deadline)
+        ...deadlineParams(deadline),
+        pinId
       );
     return {
       pin: this.rowToPin(this.getRow(sessionId, content.key) as PinRow),
@@ -616,18 +648,34 @@ export class PinStore {
     if (!row) return null;
     if (!isActive(row.status))
       return { pin: this.rowToPin(row), changed: false };
-    // #6452: a closed pin's deadline can never fire; `deadline_by` stays, because
-    // an operator's "off" survives a withdraw and re-post.
+    const changed = this.closeRow(sessionId, key, status, now);
+    return {
+      pin: this.rowToPin(this.getRow(sessionId, key) as PinRow),
+      changed,
+    };
+  }
+
+  /**
+   * The one statement that closes an active pin without an answer: the route's
+   * dismiss and withdraw (`closeActive`) and a Submit's dismissal (`answerRow`,
+   * #6539) both run it, so the status, `updated_at` (which `settledAt` reads)
+   * and the deadline clear cannot drift apart. #6452: a closed pin's deadline
+   * can never fire; `deadline_by` stays, because an operator's "off" survives a
+   * withdraw and re-post. True when a row changed.
+   */
+  private closeRow(
+    sessionId: string,
+    key: string,
+    status: PinStatus,
+    now: number
+  ): boolean {
     const result = this.db
       .prepare(
         `UPDATE session_pins SET status = ?, updated_at = ?, deadline_at = NULL
          WHERE session_id = ? AND key = ? AND status IN ('open', 'live')`
       )
       .run(status, now, sessionId, key);
-    return {
-      pin: this.rowToPin(this.getRow(sessionId, key) as PinRow),
-      changed: result.changes > 0,
-    };
+    return result.changes > 0;
   }
 
   /**
@@ -636,8 +684,9 @@ export class PinStore {
    * pin, is `moot` and
    * changes no status, so an answer can never settle a question it did not see. A
    * `resolves: false` entry (a question asked first) also leaves the status alone,
-   * and a dashboard stays `live`, because it is never answered. Null for an absent
-   * key.
+   * and a dashboard stays `live`, because it is never answered. A `dismisses`
+   * entry (#6539) is recorded as `dismissed`, never as an answer, and closes an
+   * open pin as `dismissed` unless it is moot. Null for an absent key.
    */
   answer(
     sessionId: string,
@@ -735,11 +784,15 @@ export class PinStore {
       ...(input.deliveredTo !== undefined
         ? { deliveredTo: input.deliveredTo }
         : {}),
-      resolves,
+      ...(input.dismisses === true ? { dismissed: true as const } : {}),
+      // A dismissal never resolves, whatever the caller passed: `settlingAnswer`
+      // and `answerOnRecord` must not read it as an answer (#6539).
+      resolves: input.dismisses === true ? false : resolves,
       moot,
     };
     const answers = [...(JSON.parse(row.answers_json) as PinAnswer[]), entry];
-    const settles = resolves && !moot && row.status === "open";
+    const settles =
+      input.dismisses !== true && resolves && !moot && row.status === "open";
     const status: PinStatus = !settles
       ? row.status
       : input.by === "auto"
@@ -762,6 +815,12 @@ export class PinStore {
         sessionId,
         key
       );
+    // #6539: the history entry is written above; the close itself is the same
+    // statement the dismiss route runs. A moot dismissal, or one on a dashboard
+    // (never dismissed by a Submit), leaves the pin as it is.
+    if (input.dismisses === true && !moot && row.status === "open") {
+      this.closeRow(sessionId, key, "dismissed", now);
+    }
     return {
       pin: this.rowToPin(this.getRow(sessionId, key) as PinRow),
       moot,
@@ -894,6 +953,7 @@ export class PinStore {
       status: row.status,
       revision: row.revision,
       content: JSON.parse(row.content_json) as PinContent,
+      pinId: row.pin_id ?? null,
     };
   }
 

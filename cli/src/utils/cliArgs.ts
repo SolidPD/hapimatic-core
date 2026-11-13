@@ -9,81 +9,54 @@ function resolveRawArgv(): string[] {
   return process.argv;
 }
 
-function isEntrypointPath(value: string, bunMain: string): boolean {
-  if (!value) {
-    return false;
-  }
-  if (value === bunMain) {
-    return true;
-  }
-  return /\.(c|m)?(ts|js)$/.test(value);
-}
+/** The runtime facts the prefix strip reads; injectable so the shapes can be tested. */
+export type CliRuntime = {
+  /** `process.execPath`: the bun binary in a source run, the binary file when compiled. */
+  execPath: string;
+  /** `Bun.main`: the entrypoint (`/$bunfs/root/<name>` when compiled); "" under Node. */
+  bunMain: string;
+};
 
-function hasRuntimeWrapper(
-  preArgs: string[],
-  execPath: string,
-  execBase: string,
-  bunMain: string
-): boolean {
-  if (preArgs.length === 0) {
-    return false;
-  }
-  if (preArgs[0] === "bun") {
-    return true;
-  }
-  if (preArgs.length < 2) {
-    return false;
-  }
-  if (preArgs[0] !== execPath && preArgs[0] !== execBase) {
-    return false;
-  }
-  return isEntrypointPath(preArgs[1], bunMain);
-}
+const SCRIPT_PATH = /\.(c|m)?(ts|js)$/;
 
-export function normalizeCliArgs(rawArgv: string[]): string[] {
+/**
+ * The user's arguments: `rawArgv` without its runtime prefix (hapimatic-private#5348).
+ *
+ * Only the prefix is removed: the runtime token (`bun`, the exec path or its basename)
+ * and AT MOST one entrypoint after it (`Bun.main`, or a script path under Node, where
+ * `Bun.main` is empty); or a leading `Bun.main` alone. A `--` is never removed or moved.
+ * On bun 1.4.4 a compiled binary's argv is `["bun", "/$bunfs/root/<name>", …]` with any
+ * user `--` passed through (even directly after the entrypoint), and a source run never
+ * receives a wrapper `--` (bun strips one directly after the script), so every `--` that
+ * reaches here is the user's. Consuming it gave `hapi -- --yolo` a bypass session.
+ *
+ * A shape it does not recognise is returned unchanged, never refused:
+ * `configuration.ts` calls `getCliArgs()` while the module loads.
+ */
+export function normalizeCliArgs(
+  rawArgv: string[],
+  runtime: CliRuntime = {
+    execPath: process.execPath,
+    bunMain: globalThis.Bun?.main ?? "",
+  }
+): string[] {
   if (!Array.isArray(rawArgv) || rawArgv.length === 0) {
     return [];
   }
-
-  const execPath = process.execPath;
-  const execBase = basename(execPath);
-  const bunMain = globalThis.Bun?.main ?? "";
-  const dashIndex = rawArgv.indexOf("--");
-  let argv = rawArgv.slice();
-  if (dashIndex >= 0) {
-    const preArgs = rawArgv.slice(0, dashIndex);
-    const postArgs = rawArgv.slice(dashIndex + 1);
-    argv = hasRuntimeWrapper(preArgs, execPath, execBase, bunMain)
-      ? postArgs
-      : [...preArgs, ...postArgs];
-  }
-
-  let startIndex = 0;
-  while (startIndex < argv.length) {
-    const value = argv[startIndex] || "";
-    const nextValue = argv[startIndex + 1] || "";
-    if (
-      value === "bun" &&
-      (nextValue === bunMain ||
-        nextValue === execPath ||
-        nextValue === execBase ||
-        isEntrypointPath(nextValue, bunMain))
-    ) {
-      startIndex += 2;
-      continue;
+  const { execPath, bunMain } = runtime;
+  const first = rawArgv[0];
+  let start = 0;
+  if (first === "bun" || first === execPath || first === basename(execPath)) {
+    start = 1;
+    const entry = rawArgv[1] ?? "";
+    const isEntrypoint = bunMain ? entry === bunMain : SCRIPT_PATH.test(entry);
+    if (isEntrypoint) {
+      start = 2;
     }
-    if (
-      value === execPath ||
-      value === execBase ||
-      isEntrypointPath(value, bunMain)
-    ) {
-      startIndex += 1;
-      continue;
-    }
-    break;
+  } else if (bunMain && first === bunMain) {
+    start = 1;
   }
-
-  return argv.slice(startIndex);
+  return rawArgv.slice(start);
 }
 
 export function getCliArgs(): string[] {

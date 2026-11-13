@@ -166,6 +166,14 @@ import {
 import type { TurnBillingBinding } from "../store/turns/types";
 import { isValidAgentId } from "./agentId";
 import { SessionCache } from "./sessionCache";
+import { BillableIntervalTracker } from "../billable/intervalTracker";
+import { IntervalWriteService } from "../billable/intervalWriteService";
+import type { BillableMode } from "../billable/mode";
+import {
+  nextReconcileDelayMs,
+  runBillableReconcile,
+  type ReconcileLive,
+} from "../billable/reconcile";
 import {
   filterClaimsToLiveSessions,
   liveSessionIdSet,
@@ -177,6 +185,7 @@ import {
   type McpSet,
 } from "@hapi/protocol";
 import type {
+  IntervalFeedPage,
   TurnFeedDigest,
   TurnFeedPage,
   TurnMirrorOriginStatus,
@@ -533,6 +542,9 @@ export class SyncEngine {
   private midnightResetTimer: NodeJS.Timeout | null = null;
   // #1968: periodic orphan-file-claim reaper (60s). See reapOrphanedFileClaims().
   private fileClaimReaperTimer: NodeJS.Timeout | null = null;
+  // #6586: the daily billable check, a setTimeout chain (armed unless off).
+  private billableReconcileTimer: NodeJS.Timeout | null = null;
+  private billableReconcileStopped = false;
   private mcpStatusByProject = new Map<string, McpStatusUpdate>();
   /**
    * Issue #2080: timelog + midnight-reset delegate. Owns the tzCache, the
@@ -692,6 +704,15 @@ export class SyncEngine {
   // #1963: register-only job-registry wiring (no watchdog — ratified scope).
   private readonly jobRegistry: JobRegistry | null;
   private readonly jobNode: string;
+  /**
+   * #6586: the billable mode this boot runs in (`off` when the caller ran no
+   * start-up step, or the step failed), and the queue and tracker the session
+   * cache drives. Built in every mode; in `off` the tracker is inert. The feed
+   * page, the daily check and the read API all read this one effective mode.
+   */
+  private readonly billableEffectiveMode: BillableMode;
+  private readonly billableWrites: IntervalWriteService;
+  private readonly billableTracker: BillableIntervalTracker;
 
   /**
    * #1969 (File Conflict Monitor Sub D): monotonic version stamped onto every
@@ -713,11 +734,33 @@ export class SyncEngine {
     rpcRegistry: RpcRegistry,
     sseManager: SSEManager,
     private readonly errorLogger?: ErrorLogger | null,
-    jobOpts?: { node?: string; jobRegistry?: JobRegistry | null }
+    jobOpts?: {
+      node?: string;
+      jobRegistry?: JobRegistry | null;
+      /** #6586: absent means `off` (no start-up step ran for this engine). */
+      billableMode?: BillableMode;
+    }
   ) {
     this.store = store;
     this.jobRegistry = jobOpts?.jobRegistry ?? null;
     this.jobNode = jobOpts?.node ?? "standalone";
+    this.billableEffectiveMode = jobOpts?.billableMode ?? "off";
+    // The landing closure reads `this.sessionCache` when it runs, on a later
+    // setTimeout tick of the write service, after the cache below is built.
+    this.billableWrites = new IntervalWriteService(
+      store.billableIntervals,
+      errorLogger ?? null,
+      {
+        onCloseLanded: report =>
+          this.sessionCache.applyBillableCloseLanded(report),
+      }
+    );
+    this.billableTracker = new BillableIntervalTracker(
+      this.billableWrites,
+      this.jobNode,
+      this.billableEffectiveMode,
+      errorLogger
+    );
     this.eventPublisher = new EventPublisher(sseManager, event =>
       this.resolveNamespace(event)
     );
@@ -829,6 +872,8 @@ export class SyncEngine {
           { category: "sync", context: { gapMs, inactiveSessions } }
         );
       },
+      billableTracker: this.billableTracker,
+      billableWrites: this.billableWrites,
     });
     this.machineCache = new MachineCache(store, this.eventPublisher);
     this.messageService = new MessageService(store, io, this.eventPublisher, {
@@ -1088,10 +1133,7 @@ export class SyncEngine {
     // empty); it settles prompt pins a restart left open. Queued, never inline.
     this.pinPrompts.start();
     this.inactivityTimer = setInterval(() => {
-      this.jobRegistry?.update("sync-inactivity-expiry", {
-        lastTickAt: Date.now(),
-      });
-      this.expireInactive();
+      this.runInactivityTick();
     }, 5_000);
 
     // Issue #1119: Fire any catch-up resets for midnight boundaries crossed
@@ -1140,9 +1182,99 @@ export class SyncEngine {
         lastError: null,
       });
     }
+
+    this.armBillableReconcile();
+  }
+
+  /**
+   * #6586: arm the daily billable check — 5 minutes after boot when there is no
+   * run row or the last is 24 h old, else when the last run turns 24 h old, so a
+   * restart never adds a second run inside 24 h. Scheduled from the engine and
+   * never from the midnight tick, which runs per namespace, replays missed days
+   * and is fire-and-forget. Nothing is armed in `off`.
+   */
+  private armBillableReconcile(): void {
+    if (this.billableEffectiveMode === "off") return;
+    let lastRunAtMs: number | null = null;
+    try {
+      const row = this.store
+        .getRawDb()
+        .prepare(
+          "SELECT MAX(run_at_ms) AS last FROM billable_reconcile WHERE row_type = 'run'"
+        )
+        .get() as { last: number | null } | null;
+      lastRunAtMs = row?.last ?? null;
+    } catch (error) {
+      // A failed read counts as no run: the check then runs 5 minutes after boot.
+      console.error("[billable-intervals] last reconcile run not read", error);
+    }
+    this.billableReconcileTimer = setTimeout(
+      () => {
+        void this.billableReconcileTick();
+      },
+      nextReconcileDelayMs({ lastRunAtMs, nowMs: Date.now() })
+    );
+  }
+
+  /** #6586: one daily check, then the next one 24 h later (unless stopped). */
+  private async billableReconcileTick(): Promise<void> {
+    try {
+      const mode = this.billableEffectiveMode;
+      if (mode === "off") return;
+      await runBillableReconcile({
+        db: this.store.getRawDb(),
+        mode,
+        nowMs: Date.now(),
+        live: this.buildBillableReconcileLive(),
+        errorLogger: this.errorLogger ?? null,
+      });
+    } catch (error) {
+      this.errorLogger?.error(
+        `Billable reconcile tick failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        {
+          category: "billable-intervals",
+          persist: false,
+          context: {
+            error: error instanceof Error ? error.message : String(error),
+          },
+        }
+      );
+    } finally {
+      if (!this.billableReconcileStopped) {
+        this.billableReconcileTimer = setTimeout(() => {
+          void this.billableReconcileTick();
+        }, 86_400_000);
+      }
+    }
+  }
+
+  /** #6586: what only the running server knows, for the daily check. */
+  private buildBillableReconcileLive(): ReconcileLive {
+    const tracker = this.billableTracker;
+    const writes = this.billableWrites;
+    return {
+      trackedOpenStartMs: sessionId => tracker.openStartMs(sessionId),
+      hasQueuedOp: sessionId => writes.hasQueuedOp(sessionId),
+      oldestQueuedOpAgeMs: () => writes.getCounters().oldestOpAgeMs,
+      cachedSessions: () =>
+        this.sessionCache.getSessions().map(session => ({
+          id: session.id,
+          namespace: session.namespace,
+          serverAccumulatedMs: session.serverAccumulatedMs ?? 0,
+        })),
+      counters: () => writes.getCounters(),
+      liveAttachCount: () => tracker.liveAttachCount(),
+    };
   }
 
   stop(): void {
+    this.billableReconcileStopped = true;
+    if (this.billableReconcileTimer) {
+      clearTimeout(this.billableReconcileTimer);
+      this.billableReconcileTimer = null;
+    }
     if (this.inactivityTimer) {
       clearInterval(this.inactivityTimer);
       this.inactivityTimer = null;
@@ -1155,6 +1287,21 @@ export class SyncEngine {
       clearInterval(this.fileClaimReaperTimer);
       this.fileClaimReaperTimer = null;
     }
+    // #6586: close every open billable interval at its last observed keepAlive
+    // (`hub_shutdown`) and flush the queue. Both are synchronous on purpose: the
+    // shutdown path reaches process.exit(0) with no await in between, so no
+    // keepAlive runs between these closes and the exit. A crash skips this; the
+    // next boot's start-up step repairs the rows at their last-seen time.
+    try {
+      this.billableTracker.shutdown();
+    } catch (error) {
+      console.error("[billable-intervals] shutdown close failed", error);
+    }
+    try {
+      this.billableWrites.stop();
+    } catch (error) {
+      console.error("[billable-intervals] write service stop failed", error);
+    }
     for (const name of [
       "sync-inactivity-expiry",
       "sync-midnight-reset",
@@ -1162,6 +1309,34 @@ export class SyncEngine {
       "sync-file-claim-reaper",
     ]) {
       this.jobRegistry?.update(name, { status: "stopped" });
+    }
+  }
+
+  /**
+   * The 5 s inactivity tick. #6586: one bad session must not exit the server
+   * (a throw from a setInterval callback is uncaught at the process level), so
+   * the expiry runs inside a try/catch. Logged with `persist: false`, because a
+   * failed sweep can sit inside a held SQLite lock (#3631).
+   */
+  private runInactivityTick(): void {
+    this.jobRegistry?.update("sync-inactivity-expiry", {
+      lastTickAt: Date.now(),
+    });
+    try {
+      this.expireInactive();
+    } catch (error) {
+      this.errorLogger?.error(
+        `Inactivity tick failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        {
+          category: "sync",
+          persist: false,
+          context: {
+            error: error instanceof Error ? error.message : String(error),
+          },
+        }
+      );
     }
   }
 
@@ -3326,6 +3501,37 @@ export class SyncEngine {
           ? adjustments[adjustments.length - 1]!.changeSeq
           : adjCursor,
     };
+  }
+
+  /**
+   * #6586: one page of this node's CLOSED billable intervals for the federation
+   * interval feed. Only closed rows, ordered by `change_seq`; `maxChangeSeq` is
+   * the mark over closed rows, so it never falls in steady state. One ledger
+   * identity per database serves both feeds. Served in every billable mode: in
+   * `off` it serves the rows closed before the switch.
+   */
+  getIntervalFeedPage(opts: {
+    cursor?: number;
+    limit?: number;
+  }): IntervalFeedPage {
+    const cursor = opts.cursor ?? 0;
+    const limit = Math.min(Math.max(opts.limit ?? 500, 1), 1000);
+    const intervals = this.store.intervalMirror.getFeedPage(cursor, limit);
+    return {
+      incarnation: this.store.turns.getLedgerIncarnation(),
+      mode: this.billableEffectiveMode,
+      maxChangeSeq: this.store.intervalMirror.getMaxClosedChangeSeq(),
+      intervals,
+      nextCursor:
+        intervals.length > 0
+          ? intervals[intervals.length - 1]!.changeSeq
+          : cursor,
+    };
+  }
+
+  /** #6586: the billable mode this boot runs in (`off` after a failed step). */
+  getBillableEffectiveMode(): BillableMode {
+    return this.billableEffectiveMode;
   }
 
   /** Per-day digest of this node's finalized turns for the #4614 drift check (R10). */

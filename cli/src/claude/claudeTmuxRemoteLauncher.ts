@@ -55,6 +55,7 @@ import {
 } from "./services/mcpToggleService";
 import { createLocalModeRejectionHandler as createSetPermissionModeLocalRejection } from "./services/setPermissionModeService";
 import { createAnsiQueryResponder } from "./utils/ansiQueryResponder";
+import { extractActivityEpochMs } from "./utils/activityEpoch";
 import {
   resolveAccountTokenForSession,
   resolveAccountConfigDirForSession,
@@ -65,7 +66,12 @@ import {
   resolveSpawnClaudeArgs,
   resolveSpawnContextWindow,
   readBoundAccountUuid,
+  applySpawnPermissionArgs,
 } from "./accountTokenInjection";
+import {
+  permissionNarrowingHolds,
+  settleLaunchPermissionMode,
+} from "./spawnPermissionSeed";
 import { accountStore } from "@/accounts/accountStore";
 import {
   registerActivePty,
@@ -364,25 +370,6 @@ async function resolveBoundAccountEmail(): Promise<string | null> {
   } catch {
     return null;
   }
-}
-
-/**
- * Issue #1653: best-effort epoch-ms extraction from a scanner message for the
- * blocked-on-TUI-prompt since-guard. Transcript entries carry an untyped ISO
- * `timestamp` (RawJSONLines is `.passthrough()` — cli/src/claude/types.ts; the
- * field is not on the typed shape, per fable-review [1653-4]). Returns
- * `undefined` when absent/unparseable, in which case the caller
- * (`clearTuiPromptOnActivity`) falls back to an unconditional clear.
- */
-function extractActivityEpochMs(message: unknown): number | undefined {
-  if (message && typeof message === "object" && "timestamp" in message) {
-    const ts = (message as { timestamp?: unknown }).timestamp;
-    if (typeof ts === "string") {
-      const ms = Date.parse(ts);
-      return Number.isNaN(ms) ? undefined : ms;
-    }
-  }
-  return undefined;
 }
 
 export async function claudeTmuxRemoteLauncher(
@@ -702,7 +689,10 @@ export async function claudeTmuxRemoteLauncher(
     // stripped) spawn args when account-bound with no explicit model selection,
     // so the child does not silently fall back to Sonnet 4.6 (#1506/#1509).
     // Resolved once per launcher invocation (outside the burst-load retry loop,
-    // mirroring `accountToken`) — every retry re-spawns with the same args.
+    // mirroring `accountToken`): model and effort stay once per entry.
+    // Issue #6617: with the switch on, the permission flags are NOT resolved
+    // here; each attempt applies them from the live mode at that attempt
+    // (below), so a narrowing before a retry reaches the retried child.
     // Issue #1551: SKIP the #1506 pin for a CLAUDE_CONFIG_DIR-isolated session —
     // native self-resolves the same entitled model (opus[1m] @ 1M) from the
     // isolated credentials, so the pin is redundant AND collides with native's
@@ -712,10 +702,16 @@ export async function claudeTmuxRemoteLauncher(
     // live in resolveSpawnClaudeArgs, which keys the pin off session.getModel()
     // (the #1506-resilient discriminator) instead of the display-overloaded
     // session.getModelMode() that previously leaked "opus" → dropped the pin.
+    const narrowingHolds = permissionNarrowingHolds();
+    logger.debug(
+      `[tmux-remote]: permission narrowing holds: ${narrowingHolds ? "on" : "off"} (#6617)`
+    );
     const claudeArgsWithModel = await resolveSpawnClaudeArgs(
       session,
       accountConfigDir,
-      claudeArgsForSpawn
+      claudeArgsForSpawn,
+      {},
+      { permission: !narrowingHolds }
     );
     // Issue #1488 (Gap 2) + #1556: derive the context window from the spawn
     // `--model` value (pinned entitled model or explicit user selection), OR —
@@ -757,6 +753,18 @@ export async function claudeTmuxRemoteLauncher(
       logger.debug(
         `[tmux-remote]: spawning claude in tmux window (attempt ${attempt + 1}/${retryBudget + 1})`
       );
+      // Issue #6617 (R3, R7 ii): the permission flags of THIS attempt, from the
+      // live mode now. An unreadable mode is written back as `default` first.
+      // `claudeArgsForSpawn` may still carry the start's bypass token; the step
+      // drops it unless the live mode is bypass. Switch off: today's args.
+      const attemptArgs = narrowingHolds
+        ? applySpawnPermissionArgs(
+            claudeArgsWithModel,
+            settleLaunchPermissionMode(session, message =>
+              logger.warn(`[tmux-remote]: ${message}`)
+            )
+          )
+        : claudeArgsWithModel;
       tmuxHandle = await claudeTmuxRemote({
         path: session.path,
         sessionId: session.sessionId,
@@ -766,7 +774,7 @@ export async function claudeTmuxRemoteLauncher(
           withAccountToken(session.claudeEnvVars, accountToken),
           accountConfigDir
         ),
-        claudeArgs: claudeArgsWithModel,
+        claudeArgs: attemptArgs,
         mcpServers: session.mcpServers,
         allowedTools: session.allowedTools,
         hookSettingsPath: session.hookSettingsPath,

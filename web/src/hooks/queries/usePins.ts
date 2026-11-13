@@ -9,9 +9,12 @@ import {
   type QueryKey,
 } from "@tanstack/react-query";
 import {
+  normalizePinId,
   PIN_LIST_MAX_LIMIT,
   PinGetResponseSchema,
   PinListResponseSchema,
+  PinByIdErrorBodySchema,
+  PinByIdResponseSchema,
   PinMutationResponseSchema,
   PinSaveResponseSchema,
   PinSubmissionResponseSchema,
@@ -473,6 +476,125 @@ export function usePins(
   });
 }
 
+/** #6574: a node named in a by-ID answer. */
+export type PinByIdNode = { nodeId: string; nodeLabel: string };
+/** #6574: one of two pins that answered to the same ID. */
+export type PinByIdMatch = PinByIdNode & { sessionId: string; key: string };
+/** #6574: the owning session of a pin read by its ID. */
+export type PinByIdSession = {
+  id: string;
+  name: string | null;
+  nodeId: string | null;
+  nodeLabel: string | null;
+};
+
+/** #6574: a pin read by its ID, as the Pins search shows it. */
+export type PinByIdLookup =
+  | {
+      kind: "found";
+      pin: Pin;
+      openPinCount: number;
+      timeZone: string | null;
+      session: PinByIdSession;
+    }
+  | { kind: "not_found"; notAsked: PinByIdNode[] }
+  | { kind: "ambiguous"; matches: PinByIdMatch[] }
+  | { kind: "rate_limited" }
+  | { kind: "incomplete"; nodes: PinByIdNode[] }
+  /** A plain 404: the Pins gate is closed, or the server predates the route. */
+  | { kind: "unavailable" };
+
+/** An error response's body, parsed loosely; null when it is not JSON. */
+function pinByIdErrorBody(
+  body: string | undefined
+): ReturnType<typeof PinByIdErrorBodySchema.parse> | null {
+  if (!body) return null;
+  try {
+    const parsed = PinByIdErrorBodySchema.safeParse(JSON.parse(body));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+const nodeLabels = (nodes: PinByIdNode[] | undefined): PinByIdNode[] =>
+  (nodes ?? []).map(({ nodeId, nodeLabel }) => ({ nodeId, nodeLabel }));
+
+async function fetchPinById(
+  api: ApiClient,
+  pinId: string,
+  signal?: AbortSignal
+): Promise<PinByIdLookup> {
+  try {
+    const parsed = PinByIdResponseSchema.safeParse(
+      await api.getPinById(pinId, { signal })
+    );
+    if (!parsed.success) {
+      throw new Error(
+        "The pin lookup answered with a body this page cannot read"
+      );
+    }
+    const { pin, openPinCount, timeZone, session } = parsed.data;
+    return {
+      kind: "found",
+      pin,
+      openPinCount,
+      timeZone: timeZone ?? null,
+      session: {
+        id: session?.id ?? pin.sessionId,
+        name: session?.name ?? null,
+        nodeId: session?.nodeId ?? null,
+        nodeLabel: session?.nodeLabel ?? null,
+      },
+    };
+  } catch (error) {
+    if (!(error instanceof ApiError)) throw error;
+    const body = pinByIdErrorBody(error.body);
+    if (error.status === 404) {
+      return body?.code === "pin_not_found"
+        ? { kind: "not_found", notAsked: nodeLabels(body.notAsked) }
+        : { kind: "unavailable" };
+    }
+    if (error.status === 409) {
+      return {
+        kind: "ambiguous",
+        matches: (body?.matches ?? []).map(m => ({
+          nodeId: m.nodeId,
+          nodeLabel: m.nodeLabel,
+          sessionId: m.sessionId,
+          key: m.key,
+        })),
+      };
+    }
+    if (error.status === 429) return { kind: "rate_limited" };
+    if (error.status === 503) {
+      return { kind: "incomplete", nodes: nodeLabels(body?.nodes) };
+    }
+    throw error;
+  }
+}
+
+/**
+ * #6574: read a pin by its ID for the Pins search, only for text that normalizes
+ * to an ID (a paste with backticks, quotes or a trailing dot included), so a
+ * search keystroke never sends a request.
+ */
+export function usePinByIdLookup(
+  api: ApiClient | null,
+  pinId: string | null,
+  enabled: boolean
+) {
+  const id = pinId === null ? null : normalizePinId(pinId);
+  return useQuery({
+    queryKey: queryKeys.pinById(id ?? ""),
+    queryFn: ({ signal }) =>
+      fetchPinById(api as ApiClient, id as string, signal),
+    enabled: enabled && api !== null && id !== null,
+    staleTime: 10_000,
+    retry: false,
+  });
+}
+
 function recordFromList(
   queryClient: QueryClient,
   sessionId: string,
@@ -605,6 +727,33 @@ function setStarred(
 }
 
 /**
+ * Cancel the list fetch and these pins' record fetches when they are in
+ * flight, so a response read before a write cannot land after it and undo it
+ * (#6449 for a star; #6539 for a Submit). Returns the query keys that were
+ * fetching: the caller invalidates them once its write has settled, so nothing
+ * the cancelled fetch carried is lost. Nothing in flight means no request.
+ */
+async function cancelPinFetches(
+  queryClient: QueryClient,
+  sessionId: string,
+  keys: readonly string[]
+): Promise<QueryKey[]> {
+  const queryKeysToGuard: QueryKey[] = [
+    queryKeys.pins(sessionId),
+    ...keys.map(key => queryKeys.pin(sessionId, key)),
+  ];
+  const cancelled = queryKeysToGuard.filter(
+    queryKey => queryClient.isFetching({ queryKey, exact: true }) > 0
+  );
+  await Promise.all(
+    queryKeysToGuard.map(queryKey =>
+      queryClient.cancelQueries({ queryKey, exact: true })
+    )
+  );
+  return cancelled;
+}
+
+/**
  * Star or unstar a pin: flipped in the caches at once, rolled back if the
  * request fails, then replaced by the server's pin. Starring publishes a
  * `pin-changed` event, so other devices follow.
@@ -621,18 +770,9 @@ export function useStarPin(api: ApiClient | null, sessionId: string) {
     onMutate: async vars => {
       // A fetch in flight would land the old star; cancel it now and run it
       // again once the star settles, so nothing it carried is lost.
-      const queryKeysToGuard = [
-        queryKeys.pins(sessionId),
-        queryKeys.pin(sessionId, vars.key),
-      ];
-      const cancelled = queryKeysToGuard.filter(
-        queryKey => queryClient.isFetching({ queryKey, exact: true }) > 0
-      );
-      await Promise.all(
-        queryKeysToGuard.map(queryKey =>
-          queryClient.cancelQueries({ queryKey, exact: true })
-        )
-      );
+      const cancelled = await cancelPinFetches(queryClient, sessionId, [
+        vars.key,
+      ]);
       const before = cachedPin(queryClient, sessionId, vars.key)?.starred;
       setStarred(queryClient, sessionId, vars.key, vars.starred);
       return { before, cancelled };
@@ -657,26 +797,6 @@ export function useStarPin(api: ApiClient | null, sessionId: string) {
     (key: string, starred: boolean) => mutate({ key, starred }),
     [mutate]
   );
-}
-
-/**
- * #6455: dismiss a pin. Dismissing publishes a `pin-changed` event, so other
- * devices follow; the response pin is written into the caches at once so this
- * one does not wait for it. The caller handles a refusal (the thrown `ApiError`).
- */
-export function useDismissPin(api: ApiClient | null, sessionId: string) {
-  const queryClient = useQueryClient();
-  const { mutateAsync } = useMutation({
-    mutationFn: async (key: string) => {
-      if (!api) throw new Error("Session unavailable");
-      return PinMutationResponseSchema.parse(
-        await api.dismissSessionPin(sessionId, key)
-      );
-    },
-    onSuccess: res =>
-      writePinsToCaches(queryClient, sessionId, [res.pin], res.openPinCount),
-  });
-  return mutateAsync;
 }
 
 /**
@@ -796,6 +916,14 @@ export function useMarkPinSeen(api: ApiClient | null, sessionId: string) {
  * server returns is written into the caches in one list update, and the session
  * badge follows the server's `openPinCount`. The caller handles refusals: the
  * thrown `ApiError` carries their `code`.
+ *
+ * #6539: a pins fetch in flight is cancelled right before that write and run
+ * again after it, so a dismissed (or answered) pin cannot be put back by a
+ * response read before the Submit. Unlike `useStarPin`, which cancels in
+ * `onMutate`, this write is not optimistic, and cancelling here also covers a
+ * fetch that starts while the request is out. Every dismissal in the UI reaches
+ * Completed through this write; no UI calls the dismiss route (`ApiClient.
+ * dismissSessionPin` stays for API callers).
  */
 export function useSubmitPinAnswers(api: ApiClient | null, sessionId: string) {
   const queryClient = useQueryClient();
@@ -808,7 +936,15 @@ export function useSubmitPinAnswers(api: ApiClient | null, sessionId: string) {
       if (request.dryRun) return res;
       const pins = res.entries.flatMap(entry => (entry.pin ? [entry.pin] : []));
       if (pins.length > 0) {
+        const cancelled = await cancelPinFetches(
+          queryClient,
+          sessionId,
+          pins.map(pin => pin.key)
+        );
         writePinsToCaches(queryClient, sessionId, pins, res.openPinCount);
+        for (const queryKey of cancelled) {
+          void queryClient.invalidateQueries({ queryKey, exact: true });
+        }
       }
       patchOpenPinCount(queryClient, sessionId, res.openPinCount);
       return res;

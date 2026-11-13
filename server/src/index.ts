@@ -42,6 +42,8 @@ import {
   createOpenEnrichStep,
 } from "./sync/turnEnrichment";
 import { SyncEngine, type SyncEvent } from "./sync/syncEngine";
+import { type BillableMode, resolveBillableMode } from "./billable/mode";
+import { runBillableStartup } from "./store/billable/startup";
 import { QueueDrainObserver } from "./sync/queueDrainObserver";
 import { OrphanGrantObserver } from "./sync/orphanGrantObserver";
 import { SpendLimitNoticeObserver } from "./sync/spendLimitNoticeObserver";
@@ -93,6 +95,7 @@ import {
 import { loadAutoSwitchConfig } from "./config/autoSwitchConfig";
 import { ContextWatermarkService } from "./watermark/contextWatermarkService";
 import { loadContextWatermarkConfig } from "./config/contextWatermarkConfig";
+import { seedCompactAtOnce } from "./config/compactAtConfig";
 import { DeferredApplyWatcher } from "./update/deferredApply";
 import {
   computeStatus,
@@ -486,13 +489,59 @@ async function main() {
   // loads its session cache, so their relaunches re-check the key is shared.
   store.backfillApiKeyPlacement(jobNodeId === "standalone" ? null : jobNodeId);
 
+  // Issue #6586: billable intervals. The mode is read here once (and nowhere
+  // else), and the start-up step runs in every mode BEFORE the SyncEngine loads
+  // every session's stored timer into memory (a running hub never re-reads it)
+  // and before the web server listens (the step treats every open row as left
+  // by a previous process, which holds only until the first CLI reconnects).
+  // A failed step runs this boot as `off`, so exactly one writer owns the
+  // timer and intervals recorded without a completed step are never
+  // subtracted from what the next good boot carries forward.
+  const billableResolved = resolveBillableMode();
+  let billableEffectiveMode: BillableMode = billableResolved.mode;
+  let billableStartupCounts = "";
+  try {
+    const result = runBillableStartup(store.getRawDb(), {
+      nodeId: jobNodeId,
+      mode: billableResolved.mode,
+      nowMs: Date.now(),
+    });
+    billableStartupCounts =
+      ` openingBalanceRows=${result.openingBalanceRows}` +
+      ` carriedForwardRows=${result.carriedForwardRows}` +
+      ` repairedRows=${result.repairedRows}` +
+      ` timersChanged=${result.timersChanged}`;
+  } catch (error) {
+    billableEffectiveMode = "off";
+    errorLogger.error(
+      `billable intervals start-up step failed; this boot runs as off: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      {
+        category: "billable-intervals",
+        context: {
+          error: error instanceof Error ? error.message : String(error),
+          resolvedMode: billableResolved.mode,
+        },
+      }
+    );
+  }
+  console.log(
+    `[Server] billable intervals mode=${billableEffectiveMode}` +
+      ` resolved=${billableResolved.mode} source=${billableResolved.source}` +
+      (billableResolved.rejectedValue !== undefined
+        ? ` rejected=${billableResolved.rejectedValue}`
+        : "") +
+      billableStartupCounts
+  );
+
   syncEngine = new SyncEngine(
     store,
     socketServer.io,
     socketServer.rpcRegistry,
     sseManager,
     errorLogger,
-    { node: jobNodeId, jobRegistry }
+    { node: jobNodeId, jobRegistry, billableMode: billableEffectiveMode }
   );
 
   // Issue #1883: out-of-band session-fatal escalation (G3). The notifier shells
@@ -695,6 +744,13 @@ async function main() {
   // enabled — this feature autonomously kills sessions. Constructed BEFORE
   // TurnLifecycle so its finalize step can be wired into the chain below.
   const cwEngine = syncEngine;
+  // Issue #6570 (R3, R4): seed the node's compact-at preference once, and turn a
+  // stored Session Handoff "on" off once, BEFORE the watermark config is read, so
+  // the service reads the switched-off value at this boot, not the next one. It
+  // never throws (an unreadable settings.json is logged and left alone).
+  await seedCompactAtOnce(getSettingsFile(config.dataDir), msg =>
+    console.log(msg)
+  );
   const contextWatermarkConfig = await loadContextWatermarkConfig(
     config.dataDir
   );
@@ -1525,6 +1581,7 @@ async function main() {
     jobRegistry,
     getNodeRegistry: () => nodeRegistry,
     turnMirror: store.turnMirror,
+    intervalMirror: store.intervalMirror, // issue #6586
   });
 
   // Invoke extension startup callbacks (issue #1270, locked §3b) — AFTER all

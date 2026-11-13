@@ -558,6 +558,20 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
    * Issue #6171: the same request as {@link getContextUsage}, whose reply also
    * lists each MCP tool and server instruction (F21), so one call gives both the
    * header figures (unchanged) and each server's context cost. No new request.
+   *
+   * #6409 item 1: this per-turn call keeps the full detail (no `detail` key) on
+   * purpose. Measured on Claude Code 2.1.321
+   * (https://github.com/MattStarfield/hapimatic-private/issues/6409#issuecomment-6788014732):
+   * - `detail: "summary"` gave the same header (`totalTokens`, `percentage`,
+   *   `maxTokens`, `model`) in 17 of 17 pairs at the first assistant message;
+   * - Claude Code memoizes full counts in each process (an in-memory cache keyed
+   *   by content), so a later read with nothing changed makes no count call
+   *   (median 36.7 ms, against 43.3 ms for summary);
+   * - every new process, a restart and a `--resume` included, makes 26 free
+   *   `count_tokens` calls on its first full read; an MCP toggle costs 2 and
+   *   `/compact` 3;
+   * - summary would turn the per-server costs below into local estimates about
+   *   20 % low.
    */
   async getTurnContextUsage(): Promise<{
     usage: ContextUsagePayload;

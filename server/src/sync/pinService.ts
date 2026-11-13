@@ -151,6 +151,17 @@ export class PinService {
     return pin ? { pin, openPinCount: this.store.countOpen(sessionId) } : null;
   }
 
+  /**
+   * #6574: the pin with this ID on this node and its session's open count, or
+   * null. Namespace-unaware, like the store: the by-ID lookup checks the session.
+   */
+  getByPinId(pinId: string): { pin: Pin; openPinCount: number } | null {
+    const pin = this.store.getByPinId(pinId);
+    return pin
+      ? { pin, openPinCount: this.store.countOpen(pin.sessionId) }
+      : null;
+  }
+
   upsert(
     session: PinSessionRef,
     content: PinContent,
@@ -309,19 +320,34 @@ export class PinService {
     return this.store.answerBatch(session.id, submission, items);
   }
 
-  /** One `answered` per pin a batch changed; a duplicate publishes nothing. */
+  /**
+   * One event per pin a batch changed; a duplicate publishes nothing. The event
+   * is `dismissed` for a pin this batch closed as dismissed (#6539), so every
+   * device moves it to Completed as Dismissed, and `answered` otherwise. A moot
+   * dismissal changed only the history, so it is `answered` too, as is a moot
+   * answer recorded on a pin that was dismissed before this batch.
+   */
   publishBatch(
     session: PinSessionRef,
     results: readonly PinBatchOutcome[]
   ): number {
-    const changed = new Map<string, Pin>();
+    const changed = new Map<string, { pin: Pin; live: boolean }>();
     for (const { key, result } of results) {
-      if (result && "pin" in result) changed.set(key, result.pin);
+      if (!result || !("pin" in result)) continue;
+      // `live`: at least one entry was made on the pin's current revision while
+      // it was open, so this batch could have closed it.
+      const live = (changed.get(key)?.live ?? false) || !result.moot;
+      changed.set(key, { pin: result.pin, live });
     }
     // Re-read: the record and any deadline change share one transaction, so the
     // newest row carries both (a Submit can turn a pick off with a question).
-    for (const [key, pin] of changed) {
-      this.publish(session, this.store.get(session.id, key) ?? pin, "answered");
+    for (const [key, { pin, live }] of changed) {
+      const fresh = this.store.get(session.id, key) ?? pin;
+      this.publish(
+        session,
+        fresh,
+        live && fresh.status === "dismissed" ? "dismissed" : "answered"
+      );
     }
     return this.store.countOpen(session.id);
   }

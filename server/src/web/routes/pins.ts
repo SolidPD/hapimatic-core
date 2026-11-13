@@ -46,6 +46,23 @@ import {
 } from "./pinRouteHelpers";
 
 /**
+ * #6539: the peer's Submit schema predates dismissals. Its strict entry schema
+ * refuses the unknown field before its own rules run, so the 400 reads
+ * `entries.0: Unrecognized key: "dismiss"`; nothing was sent. Matched on that
+ * text and nothing looser, so any other 400 passes through unchanged.
+ */
+function isPeerWithoutDismiss(result: {
+  status: number;
+  message: string;
+}): boolean {
+  return (
+    result.status === 400 &&
+    result.message.includes("Unrecognized key") &&
+    result.message.includes('"dismiss"')
+  );
+}
+
+/**
  * Session-scoped pin routes for the web client (issue #6447, epic #6446).
  *
  * ## 🔴 Auth comes from the MOUNT POSITION
@@ -611,6 +628,22 @@ export function createPinsRoutes(
             {
               error: "The session's node cannot receive pin answers yet",
               code: "pin_answers_unsupported",
+            },
+            501
+          );
+        }
+        // #6539: a peer that predates dismissals refuses the field, so nothing
+        // was sent. Say so plainly: the dialog then offers to send the other
+        // answers and keeps the dismissals staged.
+        if (
+          result.type === "error" &&
+          body.data.entries.some(entry => entry.dismiss === true) &&
+          isPeerWithoutDismiss(result)
+        ) {
+          return c.json(
+            {
+              error: "The session's node cannot receive dismissals yet",
+              code: "pin_dismiss_unsupported",
             },
             501
           );

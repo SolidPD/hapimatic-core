@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import {
   DECISION_SIGNAL_MAX_CHARS,
   defineCapability,
   describePinIssues,
+  normalizePinId,
   parsePinUpsert,
   PinFolderResponseSchema,
   PinGetResponseSchema,
@@ -20,6 +21,7 @@ import { configuration } from "../../configuration";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { SessionService } from "../../services/sessionService";
+import { enginePinByIdDeps, lookupPinById } from "../../sync/pinById";
 import type { PinSessionRef, PinService } from "../../sync/pinService";
 import type { SyncEngine } from "../../sync/syncEngine";
 import { parseAccessToken } from "../../utils/accessToken";
@@ -28,14 +30,18 @@ import { pinsGate } from "../middleware/pinsGate";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { resolveSessionForNamespace, type CliEnv } from "./cli";
 import {
+  invalidPinIdResponse,
   PIN_FILES_MISSING_ROUTE,
   pinAnswerResponse,
+  pinByIdLimiters,
+  pinByIdResponse,
   pinFolderResponse,
   pinPath,
   pinUpsertResponse,
   pinWriteResponse,
   proxiedPinResponse,
   readPinBody,
+  refuseForeignPinWrite,
   refuseReservedPinKey,
   withPinErrors,
 } from "./pinRouteHelpers";
@@ -74,8 +80,19 @@ export function createCliPinRoutes(
     getSessionService: () => Pick<SessionService, "proxyPinRequest"> | null;
     getNodeRegistry: () => Pick<
       NodeRegistry,
-      "locateSession" | "locateSessionByTag" | "updateCachedSessionOpenPinCount"
+      | "locateSession"
+      | "locateSessionByTag"
+      | "updateCachedSessionOpenPinCount"
+      // #6574: the by-ID read's fan-out.
+      | "getNodeSummaries"
+      | "getPinByIdOnNode"
+      | "isAwaitingInitialPoll"
+      | "getAllRemoteSessions"
     > | null;
+    /** #6574: this node, named on a local by-ID hit. */
+    localNode?: () => { nodeId: string; nodeLabel: string } | null;
+    /** #6574: this node's pin time zone, for a local by-ID hit. */
+    getPreferenceTimeZone?: () => Promise<string | null>;
     errorLogger?: ErrorLogger | null;
   }
 ): Hono<CliEnv> {
@@ -84,9 +101,10 @@ export function createCliPinRoutes(
   const { errorLogger } = options;
 
   // Bearer auth — DELIBERATELY replicated from createCliRoutes, as impactArtifact.ts
-  // does. In buildWebApp that router's `*` middleware also covers this path, but
+  // does. In buildWebApp that router's `*` middleware also covers these paths, but
   // only because it is mounted first, and these routes must not depend on the order.
-  app.use("/sessions/:id/pins/*", async (c, next) => {
+  // #6574: one named check for both route families.
+  const requireCliToken: MiddlewareHandler<CliEnv> = async (c, next) => {
     if (!options.pinsEnabled) return next();
     const raw = c.req.header("authorization");
     if (!raw) return c.json({ error: "Missing Authorization header" }, 401);
@@ -104,7 +122,9 @@ export function createCliPinRoutes(
     }
     c.set("namespace", parsedToken.namespace);
     return await next();
-  });
+  };
+  app.use("/sessions/:id/pins/*", requireCliToken);
+  app.use("/pins/by-id/*", requireCliToken);
 
   // Keyed per session: the default key is the namespace, and a node has one, so one
   // looping session would otherwise exhaust every lane on it. Keyed on the resolved
@@ -132,14 +152,29 @@ export function createCliPinRoutes(
         ?.updateCachedSessionOpenPinCount(sessionId, data.openPinCount);
     };
 
+  // #6574: each target carries its session's tag, for the owner-only write floor.
   type Target =
-    | { kind: "local"; pins: PinService; session: PinSessionRef }
+    | {
+        kind: "local";
+        pins: PinService;
+        session: PinSessionRef;
+        tag: string | null;
+      }
     | {
         kind: "remote";
         service: Pick<SessionService, "proxyPinRequest">;
         sessionId: string;
+        tag: string | null;
       }
     | { kind: "response"; response: Response };
+
+  /** The write floor's view of a resolved target, or null for a response target. */
+  const ownerOf = (target: Target) =>
+    target.kind === "local"
+      ? { id: target.session.id, tag: target.tag }
+      : target.kind === "remote"
+        ? { id: target.sessionId, tag: target.tag }
+        : null;
 
   const resolveTarget = (c: Context): Target => {
     const engine = getSyncEngine();
@@ -158,6 +193,7 @@ export function createCliPinRoutes(
         kind: "local",
         pins: engine.pins,
         session: { id: resolved.session.id, namespace },
+        tag: resolved.session.tag ?? null,
       };
     }
     const notFound: Target = {
@@ -187,7 +223,12 @@ export function createCliPinRoutes(
     }
     const service = options.getSessionService();
     if (!service) return notFound;
-    return { kind: "remote", service, sessionId: located.session.id };
+    return {
+      kind: "remote",
+      service,
+      sessionId: located.session.id,
+      tag: located.session.tag ?? null,
+    };
   };
 
   app.get(
@@ -304,14 +345,18 @@ export function createCliPinRoutes(
     writeLimiter,
     c =>
       withPinErrors(c, errorLogger, "cli-pins-put", async () => {
+        // #6574: the target and the owner floor come before the body, so a
+        // refused write never reads one.
+        const target = resolveTarget(c);
+        if (target.kind === "response") return target.response;
+        const foreign = refuseForeignPinWrite(c, ownerOf(target));
+        if (foreign) return foreign;
         const read = await readPinBody(c);
         if (!read.ok) return read.response;
         const key = c.req.param("key");
         const parsed = parsePinUpsert(key, read.body);
         if (!parsed.ok) return c.json({ error: parsed.error }, 400);
         const mustExist = c.req.query("mustExist") === "1";
-        const target = resolveTarget(c);
-        if (target.kind === "response") return target.response;
         if (target.kind === "local") {
           return pinUpsertResponse(
             c,
@@ -373,6 +418,8 @@ export function createCliPinRoutes(
         }
         const target = resolveTarget(c);
         if (target.kind === "response") return target.response;
+        const foreign = refuseForeignPinWrite(c, ownerOf(target));
+        if (foreign) return foreign;
         if (target.kind === "local") {
           const record = getSyncEngine()?.getSession(target.session.id);
           if (!record) return c.json({ error: "Session not found" }, 404);
@@ -427,6 +474,8 @@ export function createCliPinRoutes(
         if (reserved) return reserved;
         const target = resolveTarget(c);
         if (target.kind === "response") return target.response;
+        const foreign = refuseForeignPinWrite(c, ownerOf(target));
+        if (foreign) return foreign;
         if (target.kind === "local") {
           return pinWriteResponse(c, target.pins.withdraw(target.session, key));
         }
@@ -473,14 +522,16 @@ export function createCliPinRoutes(
         const key = c.req.param("key");
         const reserved = refuseReservedPinKey(c, key);
         if (reserved) return reserved;
+        const target = resolveTarget(c);
+        if (target.kind === "response") return target.response;
+        const foreign = refuseForeignPinWrite(c, ownerOf(target));
+        if (foreign) return foreign;
         const read = await readPinBody(c);
         if (!read.ok) return read.response;
         const body = PinResolveRequestSchema.safeParse(read.body);
         if (!body.success) {
           return c.json({ error: describePinIssues(body.error) }, 400);
         }
-        const target = resolveTarget(c);
-        if (target.kind === "response") return target.response;
         if (target.kind === "local") {
           return pinAnswerResponse(
             c,
@@ -537,14 +588,16 @@ export function createCliPinRoutes(
     writeLimiter,
     c =>
       withPinErrors(c, errorLogger, "cli-pins-turn-end", async () => {
+        const target = resolveTarget(c);
+        if (target.kind === "response") return target.response;
+        const foreign = refuseForeignPinWrite(c, ownerOf(target));
+        if (foreign) return foreign;
         const read = await readPinBody(c);
         if (!read.ok) return read.response;
         const body = TurnEndRequestSchema.safeParse(read.body);
         if (!body.success) {
           return c.json({ error: describePinIssues(body.error) }, 400);
         }
-        const target = resolveTarget(c);
-        if (target.kind === "response") return target.response;
         const engine = getSyncEngine();
         // Agents post to their own node; a session another node owns is not checked.
         if (target.kind === "remote" || !engine) {
@@ -557,5 +610,54 @@ export function createCliPinRoutes(
       })
   );
 
+  // #6574: read a pin by its ID, on this node or a peer, read-only. The same
+  // lookup and answer as `GET /api/pins/by-id/:pinId`; route arguments are
+  // `cataloged, gate, limiters`, so with Pins off it answers 404, never 429.
+  const [byIdNamespaceLimiter, byIdSessionLimiter] = pinByIdLimiters(
+    "cli-pins-by-id",
+    getSyncEngine
+  );
+  app.get(
+    "/pins/by-id/:pinId",
+    cataloged(
+      defineCapability({
+        id: "session-introspection.cli-get-pin-by-id",
+        domain: "session-introspection",
+        surface: "rest",
+        description:
+          "Read a pin by its ID (pin- and ten characters), read-only, wherever its session lives in the caller's namespace. Approval tokens in the pin are blanked.",
+        whenToUse:
+          "When an agent reads a pin another session raised, named by its ID (pin_get({id})).",
+        invocation: {
+          kind: "rest",
+          method: "GET",
+          path: "/cli/pins/by-id/:pinId",
+        },
+        auth: "cli-token",
+        riskTier: "readonly",
+        availability: { scope: "user" },
+      })
+    ),
+    gate,
+    byIdNamespaceLimiter,
+    byIdSessionLimiter,
+    c =>
+      withPinErrors(c, errorLogger, "cli-pins-by-id", async () => {
+        const pinId = normalizePinId(c.req.param("pinId"));
+        if (!pinId) return invalidPinIdResponse(c);
+        const engine = getSyncEngine();
+        if (!engine) return c.json({ error: "Not ready" }, 503);
+        const outcome = await lookupPinById(
+          enginePinByIdDeps(engine, {
+            registry: options.getNodeRegistry(),
+            getTimeZone: options.getPreferenceTimeZone,
+            localNode: options.localNode?.() ?? null,
+          }),
+          c.get("namespace"),
+          pinId
+        );
+        return pinByIdResponse(c, outcome);
+      })
+  );
   return app;
 }

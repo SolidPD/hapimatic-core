@@ -69,6 +69,16 @@ interface Settings {
   // spawn gate (clamped to [1, ceiling]); the SERVER is the sole writer
   // (KD-2 — sidesteps the CLI-locked vs server-unlocked settings.json race).
   maxConcurrentSessions?: number;
+  /** Issue #6570: the node's "compact at" percentage for every Claude session.
+   *  The SERVER is the sole writer (boot seed + the preference PUT); the session
+   *  wrapper READS it at start (`claude/utils/sessionCompaction.ts`, through the
+   *  shared `resolveCompactAt`) and writes the per-session `env` block. */
+  compactAt?: {
+    enabled: boolean;
+    percent: number;
+    seededFrom?: string;
+    seededAt?: string;
+  };
   /** Issue #3122: absolute path to the HAL canonical-content checkout (the
    *  rp1-home companion epic #1687 tree that owns `.claude/skills/<name>/
    *  envelope.yaml` + the sibling canonical SKILL.md). The skill-projection
@@ -112,6 +122,7 @@ export const SETTINGS_DISPLAY = {
   tmuxPersistenceEnabled: "public",
   launcher: "public",
   maxConcurrentSessions: "public",
+  compactAt: "public",
   halCanonicalCheckoutPath: "public",
   defaultEffort: "public",
   codexTransport: "public",
@@ -163,6 +174,10 @@ export interface DaemonLocallyPersistedState {
   /** Issue #4153 (A5): epoch ms of the last heartbeat (`lastHeartbeat` is a
    *  locale string). */
   lastHeartbeatAt?: number;
+  /** Issue #6617 (R8): the `HAPI_PERMISSION_NARROWING_HOLDS` value this daemon
+   *  forwards into every tmux worker it spawns (`"1"` when its own env has none),
+   *  so `hapi daemon status` reads back which value is live for new sessions. */
+  permissionNarrowingHolds?: string;
 }
 
 /**
@@ -189,6 +204,8 @@ export const DAEMON_STATE_DISPLAY = {
   pendingSince: "public",
   startedAt: "public",
   lastHeartbeatAt: "public",
+  // #6617: a switch value ("1", "0", "off", …) — no secret.
+  permissionNarrowingHolds: "public",
 } as const satisfies Record<
   keyof DaemonLocallyPersistedState,
   "public" | "secret"

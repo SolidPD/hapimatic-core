@@ -4,6 +4,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { StoredApiKey } from "@hapi/protocol/schemas";
+import type { CompactAtStored } from "@hapi/protocol";
 
 export interface Settings {
   machineId?: string;
@@ -24,6 +25,13 @@ export interface Settings {
   // spawn gate. Separate interface from the CLI's, but the JSON round-trips
   // because neither side strips unknown keys (KD-2).
   maxConcurrentSessions?: number;
+  /**
+   * Issue #6570: the node's "compact at" percentage for every Claude session it
+   * starts. The SERVER is the sole writer (`config/compactAtConfig.ts`: the boot
+   * seed and the preference PUT); the session wrapper only reads it. Validated by
+   * `CompactAtStoredSchema` in `@hapi/protocol`, which decides the effective value.
+   */
+  compactAt?: CompactAtStored;
   vapidKeys?: {
     publicKey: string;
     privateKey: string;
@@ -218,6 +226,10 @@ export async function writeSettings(
   await chmod(settingsFile, 0o600).catch(() => {});
 }
 
+/** The fixed refusal text: {@link SettingsUnreadableError}'s message and the 500 body routes return. */
+export const SETTINGS_UNREADABLE_MESSAGE =
+  "Settings file is unreadable; refusing to overwrite";
+
 /**
  * Thrown by {@link updateSettings} when `settings.json` exists but cannot be read
  * or parsed (issue #4463 Task 1, the contract #4056 Task 1 specifies). The message
@@ -229,7 +241,7 @@ export class SettingsUnreadableError extends Error {
   readonly settingsFile: string;
 
   constructor(settingsFile: string) {
-    super("Settings file is unreadable; refusing to overwrite");
+    super(SETTINGS_UNREADABLE_MESSAGE);
     this.name = "SettingsUnreadableError";
     this.settingsFile = settingsFile;
   }
@@ -288,4 +300,26 @@ export function updateSettings(
       }
     });
   return run;
+}
+
+/**
+ * {@link updateSettings} for a route handler (issue #6570 R13, ruling A1): resolves
+ * to `null` when the file is unreadable (nothing written, so the caller answers 500
+ * with {@link SETTINGS_UNREADABLE_MESSAGE}); every other error propagates. It
+ * replaces the `(await readSettings(f)) ?? {}` + `writeSettings` pattern, which
+ * turned an unreadable file into `{}` and wrote back one key, deleting
+ * `cliApiToken`, `apiKeys` and the federation keys.
+ */
+export async function updateSettingsOrRefuse(
+  settingsFile: string,
+  mutate: (current: Settings & Record<string, unknown>) => Settings
+): Promise<Settings | null> {
+  try {
+    return await updateSettings(settingsFile, current =>
+      mutate(current as Settings & Record<string, unknown>)
+    );
+  } catch (error) {
+    if (error instanceof SettingsUnreadableError) return null;
+    throw error;
+  }
 }

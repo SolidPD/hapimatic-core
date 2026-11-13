@@ -556,16 +556,20 @@ export function mootSentence(notice: MootNotice): string {
 }
 
 /**
- * True when a staged choice or tick was made on an older revision than the
- * pin's now; a note or a question alone is never stale (KD4).
+ * True when a staged choice, tick or dismissal was made on an older revision
+ * than the pin's now; a note or a question alone is never stale (KD4). A stale
+ * dismissal (#6539) is dropped at Submit and the pin stays open, so the row
+ * and the Submit dialog say so first.
  */
 export function stagedIsStale(
-  staged: Pick<StagedPin, "rev" | "choice" | "ticks"> | undefined,
+  staged: Pick<StagedPin, "rev" | "choice" | "ticks" | "dismiss"> | undefined,
   pin: Pick<Pin, "revision">
 ): boolean {
   if (!staged) return false;
   const answers =
-    staged.choice !== undefined || (staged.ticks?.length ?? 0) > 0;
+    staged.choice !== undefined ||
+    (staged.ticks?.length ?? 0) > 0 ||
+    staged.dismiss === true;
   return answers && staged.rev < pin.revision;
 }
 

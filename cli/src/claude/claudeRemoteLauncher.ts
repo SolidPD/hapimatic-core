@@ -4,6 +4,10 @@ import { Session } from "./session";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
 import { claudeRemote } from "./claudeRemote";
 import { PermissionHandler } from "./utils/permissionHandler";
+import {
+  permissionNarrowingHolds,
+  settleLaunchPermissionMode,
+} from "./spawnPermissionSeed";
 import { Future } from "@/utils/future";
 import {
   ChildExitError,
@@ -109,10 +113,26 @@ function enrichWithSignalContext(detail: string): string {
   return `${detail} (killed by ${sigName})`;
 }
 
+/**
+ * Issue #6617 (Matt 81a, 2026-11-12): who asked the current iteration to stop.
+ * `user` is the abort RPC (the Stop button, an abort request from a client);
+ * `permission-mode-switch` is the mode-switch stop (R13): the applier makes it
+ * when Claude Code refuses a live permission switch, when a switch lands while
+ * the screen shows another mode (Matt 93a), and when a recorded mode leaves
+ * the running child wider than the screen (round 4).
+ */
+type RequestedStop = "user" | "permission-mode-switch";
+
 class ClaudeRemoteLauncher extends RemoteLauncherBase {
   private readonly session: Session;
   private abortController: AbortController | null = null;
   private abortFuture: Future<void> | null = null;
+  /**
+   * Issue #6617 (Matt 81a): the stop that aborted the current iteration, or
+   * null when no stop was asked for. Reset when each iteration starts; the
+   * stop that actually aborts the iteration names it.
+   */
+  private requestedStop: RequestedStop | null = null;
   private permissionHandler: PermissionHandler | null = null;
   private handleSessionFound: ((sessionId: string) => void) | null = null;
   /**
@@ -153,6 +173,20 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     await this.abortFuture?.promise;
   }
 
+  /**
+   * Stop the current iteration without ending the launcher, recording who
+   * asked (#6617, Matt 81a). An aborted query fires no Stop hook, so the open
+   * turn is finalized as interrupted here (#1664); the loop goes on, so the
+   * next message starts a new query.
+   */
+  private async stopCurrentIteration(reason: RequestedStop): Promise<void> {
+    this.session.turnReporter?.finalize("interrupted");
+    if (this.abortController && !this.abortController.signal.aborted) {
+      this.requestedStop = reason;
+    }
+    await this.abort();
+  }
+
   private async handleAbortRequest(): Promise<void> {
     logger.debug("[remote]: doAbort");
     // Issue #1664 (Sub B): the abort RPC is the user "stop" (web-stop /
@@ -162,8 +196,22 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     // finalize — a turn left open by teardown is orphaned via the server sweep
     // (Key Decision 4). The reporter's idempotency guard makes this safe if a
     // Stop hook also raced in.
-    this.session.turnReporter?.finalize("interrupted");
-    await this.abort();
+    await this.stopCurrentIteration("user");
+  }
+
+  /**
+   * Issue #6617 (R13; Matt 81a): the applier ended a query whose child does
+   * not run the mode the screen shows (a refused live switch; a switch that
+   * landed on a moved screen, 93a; a recorded mode under a wider child, round
+   * 4), so that query is stopped under a reason of its own, not as a user
+   * abort: the applier posts the one chat line that says why, and the
+   * launcher posts no "Aborted by user" and counts no failed start for it.
+   */
+  private async handlePermissionModeSwitchStop(): Promise<void> {
+    logger.debug(
+      "[remote]: stopping the query a refused permission-mode switch was sent to"
+    );
+    await this.stopCurrentIteration("permission-mode-switch");
   }
 
   private async handleSwitchRequest(): Promise<void> {
@@ -248,6 +296,18 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     // Only the SDK remote launcher publishes it; non-sdk launchers never do, so
     // the handler degrades to method:"config" on those sessions.
     this.session.setLiveQueryAccessor(() => this.currentQuery);
+    // Issue #6617 (D4 g2-1): publish a way to end the query the applier stops:
+    // the one a failed or a mismatched live permission switch was sent to
+    // (93a), or the one whose child a recorded mode found wider (round 4). It
+    // ends only THAT query (a late landing or failure never touches a newer
+    // one), as a stop of its own (Matt 81a): the open turn is finalized as
+    // interrupted and the current iteration aborted, but the launcher loop
+    // goes on, so the next message starts a new query in the live mode.
+    this.session.setLiveQueryTerminator(query => {
+      if (this.currentQuery === query) {
+        void this.handlePermissionModeSwitchStop();
+      }
+    });
 
     // Issue #2346: register the "set-permission-mode" RPC handler beside
     // mcp-toggle (the launcher-registered control pattern — required for the 501
@@ -684,9 +744,18 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
       // message only so the SDK, permission handler, keepAlive, and UI all
       // reflect the correct mode.  Subsequent user changes from the UI are
       // respected normally.
-      const spawnBypass = session.claudeArgs?.includes(
-        "--dangerously-skip-permissions"
-      );
+      // Issue #6617 (Matt 43a / D2-1): with the narrowing switch on there is no
+      // override. The web client's message no longer carries the mode (runClaude
+      // derives it from the session), so a bypass start's first message already
+      // carries bypass; and because `spawnModeApplied` is local to each launcher
+      // instance, the override re-widened the session at every re-entry (a
+      // switch back from local) and undid a narrowing made before the first
+      // message. Instead every pulled message carries the LIVE mode (below), and
+      // each query start reads it again just before query() (startPermissionMode).
+      const narrowingHolds = permissionNarrowingHolds();
+      const spawnBypass =
+        !narrowingHolds &&
+        session.claudeArgs?.includes("--dangerously-skip-permissions");
       let spawnModeApplied = false;
 
       // Consecutive launch failure detection (Issue #638):
@@ -737,6 +806,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
         previousSessionId = session.sessionId;
         const controller = new AbortController();
         this.abortController = controller;
+        this.requestedStop = null;
         this.abortFuture = new Future<void>();
         let modeHash: string | null = null;
         let mode: EnhancedMode | null = null;
@@ -783,6 +853,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
           apiKeyBound || accountConfigDir
             ? null
             : await resolveAccountTokenForSession(session);
+        // Issue #6617 round 4: the mode this iteration's query starts in, noted
+        // on the session when the query is created (onQueryCreated, below).
+        let startedPermissionMode: ClaudePermissionMode | null = null;
         try {
           await claudeRemote({
             sessionId: session.sessionId,
@@ -791,6 +864,19 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             mcpServers: session.mcpServers,
             hookSettingsPath: session.hookSettingsPath,
             canCallTool: permissionHandler.handleToolCall,
+            // Issue #6617 (R1, R7 ii): with the switch on, every query start
+            // (the first included) runs in the live mode, read just before
+            // query(); an unreadable mode is written back as `default`.
+            startPermissionMode: narrowingHolds
+              ? () => {
+                  const live = settleLaunchPermissionMode(session, message =>
+                    logger.warn(`[remote]: ${message}`)
+                  );
+                  permissionHandler.handleModeChange(live);
+                  startedPermissionMode = live;
+                  return live;
+                }
+              : undefined,
             isAborted: (toolCallId: string) => {
               return permissionHandler.isAborted(toolCallId);
             },
@@ -804,6 +890,17 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 // the NEXT mode change (a second effort pick) passes the hash
                 // check and is fed into this process, which never applies it.
                 modeHash = p.hash;
+                // Issue #6617: with the switch on, the parked message carries
+                // the live mode, never the mode it was queued with.
+                if (narrowingHolds) {
+                  const live = settleLaunchPermissionMode(session, message =>
+                    logger.warn(`[remote]: ${message}`)
+                  );
+                  p = { ...p, mode: { ...p.mode, permissionMode: live } };
+                  permissionHandler.handleModeChange(live);
+                  this.keepalive.onPromptPushed();
+                  return p;
+                }
                 // Apply spawn-time bypass on first message
                 const effectivePerm =
                   spawnBypass && !spawnModeApplied
@@ -843,6 +940,22 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
                 }
                 modeHash = msg.hash;
                 mode = msg.mode;
+                // Issue #6617 (S11): with the switch on, the message carries the
+                // live mode, never the mode stamped when it was queued: a message
+                // queued before a narrowing would otherwise write its older mode
+                // back into the session.
+                if (narrowingHolds) {
+                  const live = settleLaunchPermissionMode(session, message =>
+                    logger.warn(`[remote]: ${message}`)
+                  );
+                  mode = { ...mode, permissionMode: live };
+                  permissionHandler.handleModeChange(live);
+                  this.keepalive.onPromptPushed();
+                  return {
+                    message: msg.message,
+                    mode,
+                  };
+                }
                 // Apply spawn-time bypass on first message
                 const effectivePerm =
                   spawnBypass && !spawnModeApplied
@@ -934,6 +1047,11 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             },
             onQueryCreated: (q: Query) => {
               this.currentQuery = q;
+              // Issue #6617 round 4: the child starts in the mode read just
+              // before query(); a card answer's recorded mode is compared with it.
+              if (startedPermissionMode) {
+                session.noteLiveChildMode(q, startedPermissionMode);
+              }
               // Issue #6169: a new Claude process has no cache parameters until
               // its first turn completes.
               this.keepalive.onQueryStarted();
@@ -947,9 +1065,25 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
           // process died immediately — count it as a launch failure just
           // like the throw path.
           const launchDurationMs = Date.now() - launchStartTime;
+          // Issue #6617 (Matt 81a): who asked this iteration to stop, if anyone.
+          const stoppedBy = controller.signal.aborted
+            ? this.requestedStop
+            : null;
           if (launchDurationMs >= MIN_HEALTHY_DURATION_MS) {
             consecutiveLaunchFailures = 0;
             consecutiveSignalFailures = 0;
+          } else if (stoppedBy !== null) {
+            // Issue #6617 (Matt 81a, 2026-11-12): a fast return because a stop
+            // was asked for (the user's, or the applier's mode-switch stop,
+            // R13) is not a failed start. It is not counted, writes no
+            // rapid-exit diagnostic and no error_logs entry, and leaves the count
+            // of real failures where it was, so stops between crashes never
+            // reset a crash loop's count.
+            logger.debug(
+              `[remote]: claudeRemote() returned in ${launchDurationMs}ms after a ` +
+                `requested stop (${stoppedBy}) — not a launch failure; the count ` +
+                `stays at ${consecutiveLaunchFailures}/${MAX_CONSECUTIVE_LAUNCH_FAILURES}`
+            );
           } else {
             consecutiveLaunchFailures++;
             logger.warn(
@@ -1004,7 +1138,15 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
           session.consumeOneTimeFlags();
 
-          if (!this.exitReason && controller.signal.aborted) {
+          // Issue #6617 (Matt 81a): "Aborted by user" is for a stop the user
+          // made. The mode-switch stop (R13: a refused or a mismatched live
+          // switch, or a recorded mode under a wider child) has one chat line,
+          // the applier's, which says why.
+          if (
+            !this.exitReason &&
+            controller.signal.aborted &&
+            stoppedBy !== "permission-mode-switch"
+          ) {
             session.client.sendSessionEvent({
               type: "message",
               message: "Aborted by user",
@@ -1253,6 +1395,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
     // after teardown (e.g. during a mode switch) degrades to method:"config"
     // (the durable pin) instead of reaching a stale/cleared Query.
     this.session.setLiveQueryAccessor(null);
+    this.session.setLiveQueryTerminator(null);
 
     // Issue #6169: stop advertising the keep-alive (meta-less, so the server's
     // capability probe skips this session) and stop reporting a cache clock.

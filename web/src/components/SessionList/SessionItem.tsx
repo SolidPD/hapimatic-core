@@ -77,6 +77,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import type { SessionSummary } from "@/types/api";
 import { getTodoProgress } from "./grouping";
+import type { ExpandCollapseAllScope } from "./bulkExpand";
+import { ExpandCollapseAllMenu } from "./ExpandCollapseAllMenu";
 import {
   isInteractiveTarget,
   splitDragHandle,
@@ -131,6 +133,12 @@ export function SessionItem(props: {
    * via SortableListEntry (the drag apparatus is always mounted now).
    */
   dragHandle?: SortableDragHandle;
+  /**
+   * The chevron's "Expand All / Collapse All" menu (right-click, or press and
+   * hold), acting on every session under this row's project. Absent (a
+   * non-list consumer): the chevron has no menu.
+   */
+  expandCollapseAll?: ExpandCollapseAllScope;
 }) {
   const {
     session: s,
@@ -152,6 +160,7 @@ export function SessionItem(props: {
     onRelHover,
     onFlashSession,
     dragHandle,
+    expandCollapseAll,
   } = props;
   // #3114: split the drag handle — pointer/touch (`dragRowListeners`) arm the whole
   // row; the keyboard handler + a11y attributes go on the chevron (keyboard reorder
@@ -926,30 +935,40 @@ export function SessionItem(props: {
               `attributes` + dnd-kit's keyboard `onKeyDown` (Enter/Space picks up
               for a keyboard drag) live here so they don't collide with the row's
               Enter/Space → navigate. Pointer/touch reorder is armed by the whole
-              row, not this button. */}
-            <button /* design-tokens-allow: dnd-kit keyboard reorder handle (#3114) — carries the sortable a11y {...dragAttributes} + dnd-kit onKeyDown; the guarded drag sensors EXCLUDE <button>, so converting would break keyboard drag (R3 off-limits) */
-              type="button"
-              {...dragAttributes}
-              onKeyDown={dragKeyDown}
-              onClick={e => {
-                e.stopPropagation();
-                onToggleExpanded();
-              }}
-              // #3285 alignment fix: the chevron occupies a full --icon-btn-size
-              // (32px) slot so its glyph centers 16px from the row's right edge —
-              // the SAME column as the icon-col-1 controls above it (app-bar gear,
-              // ProjectHeader chevron) and the SubheadingBar chevron slot, which
-              // already assume this width. The prior `px-1` (a 22px button) centered
-              // the glyph only 11px in, poking every row chevron 5px right of that
-              // column (the "jagged" right edge). Structural, not a tuned margin.
-              className="flex items-center justify-center shrink-0 rounded-md bg-[var(--app-secondary-bg)] text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-hover)] active:bg-[var(--app-hover)] transition-colors w-[var(--icon-btn-size)] self-stretch"
-              title={isExpanded ? "Hide details" : "Show details"}
-              aria-label={
-                isExpanded ? "Hide session details" : "Show session details"
-              }
-            >
-              <ChevronIcon className="h-3.5 w-3.5" collapsed={!isExpanded} />
-            </button>
+              row, not this button. Right-click, or press and hold, opens Expand
+              All / Collapse All for every session under this row's project
+              (ExpandCollapseAllMenu). */}
+            <ExpandCollapseAllMenu scope={expandCollapseAll}>
+              {menu => (
+                <button /* design-tokens-allow: dnd-kit keyboard reorder handle (#3114) — carries the sortable a11y {...dragAttributes} + dnd-kit onKeyDown; the guarded drag sensors EXCLUDE <button>, so converting would break keyboard drag (R3 off-limits) */
+                  type="button"
+                  {...dragAttributes}
+                  {...menu.pressProps}
+                  onKeyDown={dragKeyDown}
+                  onClick={menu.guardClick(e => {
+                    e.stopPropagation();
+                    onToggleExpanded();
+                  })}
+                  // #3285 alignment fix: the chevron occupies a full --icon-btn-size
+                  // (32px) slot so its glyph centers 16px from the row's right edge —
+                  // the SAME column as the icon-col-1 controls above it (app-bar gear,
+                  // ProjectHeader chevron) and the SubheadingBar chevron slot, which
+                  // already assume this width. The prior `px-1` (a 22px button) centered
+                  // the glyph only 11px in, poking every row chevron 5px right of that
+                  // column (the "jagged" right edge). Structural, not a tuned margin.
+                  className={`flex items-center justify-center shrink-0 rounded-md bg-[var(--app-secondary-bg)] text-[var(--app-hint)] hover:text-[var(--app-fg)] hover:bg-[var(--app-hover)] active:bg-[var(--app-hover)] transition-colors w-[var(--icon-btn-size)] self-stretch${menu.className}`}
+                  title={`${isExpanded ? "Hide details" : "Show details"}${menu.hint}`}
+                  aria-label={
+                    isExpanded ? "Hide session details" : "Show session details"
+                  }
+                >
+                  <ChevronIcon
+                    className="h-3.5 w-3.5"
+                    collapsed={!isExpanded}
+                  />
+                </button>
+              )}
+            </ExpandCollapseAllMenu>
           </div>
 
           {/* === EXPANDABLE SECTION === */}

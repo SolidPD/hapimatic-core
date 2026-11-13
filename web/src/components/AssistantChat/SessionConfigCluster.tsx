@@ -377,14 +377,17 @@ export function chipsOverflow(track: HTMLElement): boolean {
  * (see `chipsOverflow`) and steps DOWN (0 → 1 → 2 → 3) until the chips fit; a
  * resize resets to 0 (rAF-guarded) so the ladder re-evaluates from scratch on
  * width change. Steady-state cost is a few integer reads per render; no thrash
- * while idle.
+ * while idle. A resize also bumps `resizes`, because `setLevel(0)` does nothing
+ * when the level is already 0 (React skips a same-value update), and a track
+ * that fit in full and then narrowed would keep clipping its chips (#6574).
  */
-function useOverflowLadder(measureKey: string): {
+export function useOverflowLadder(measureKey: string): {
   chipsRef: React.RefObject<HTMLDivElement | null>;
   level: Level;
 } {
   const chipsRef = useRef<HTMLDivElement | null>(null);
   const [level, setLevel] = useState<Level>(0);
+  const [resizes, setResizes] = useState(0);
   const rafRef = useRef<number | null>(null);
 
   // Content changed → re-evaluate from full so the ladder can expand back when
@@ -402,7 +405,7 @@ function useOverflowLadder(measureKey: string): {
     if (chipsOverflow(el)) {
       setLevel(prev => (prev < MAX_LEVEL ? ((prev + 1) as Level) : prev));
     }
-  }, [level, measureKey]);
+  }, [level, measureKey, resizes]);
 
   useEffect(() => {
     const el = chipsRef.current;
@@ -413,6 +416,7 @@ function useOverflowLadder(measureKey: string): {
         rafRef.current = null;
         // Reset to full; the layout effect re-collapses to the fitting level.
         setLevel(0);
+        setResizes(n => n + 1);
       });
     });
     ro.observe(el);

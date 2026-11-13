@@ -14,6 +14,19 @@ import type { LocalLaunchExitReason } from "@/agent/localLaunchPolicy";
 import type { Query } from "./sdk/query";
 import { isResumeValue, stripOneTimeFlags } from "./utils/resumeArgs";
 
+/**
+ * What the in-place permission-mode applier reports (#2346). Issue #6617
+ * (D4 g2-1) adds `permissionSwitch`: on the SDK launcher, whether the live
+ * switch reached the running query within the wait (`applied`) or is still
+ * waiting, for example behind an open permission card (`pending`). `ended`
+ * (Matt 93a): it reached the query within the wait while the screen showed
+ * another mode, so that query was ended.
+ */
+export type PermissionModeApplyResult = {
+  method: "sdk" | "config";
+  permissionSwitch?: "applied" | "pending" | "ended";
+};
+
 type LocalLaunchFailure = {
   message: string;
   exitReason: LocalLaunchExitReason;
@@ -22,6 +35,17 @@ type LocalLaunchFailure = {
 export class Session extends AgentSessionBase<EnhancedMode> {
   readonly claudeEnvVars?: Record<string, string>;
   claudeArgs?: string[];
+  /**
+   * Issue #5348: the end-of-options marker and the ONE prompt argument after it
+   * (`["--", "<prompt>"]`). Kept out of {@link claudeArgs}, which the launchers search
+   * for a mode, a model, an effort and their own flags, so no prompt text sets a
+   * posture. Only the local launcher delivers it, LAST, after every flag it adds, and
+   * only at the first spawn: {@link consumeOneTimeFlags} clears it, so a same-process
+   * relaunch does not send the prompt again. F2: a pass that returned before spawning
+   * keeps it, and leaving local mode with it undelivered shows it once and drops it
+   * ({@link takeUndeliveredPrompt}).
+   */
+  claudeTrailingArgs?: string[];
   // Issue #1608: the runClaude-resolved spawn model (e.g. "opus[1m]" for an
   // entitled-default session; "sonnet"/"opus"/undefined for user selections).
   // Read ONLY by the PTY/tmux launcher arg-derivation (resolveSpawnClaudeArgs)
@@ -33,6 +57,12 @@ export class Session extends AgentSessionBase<EnhancedMode> {
   readonly hookSettingsPath: string;
   readonly startedBy: "daemon" | "terminal";
   readonly startingMode: "local" | "remote";
+  /**
+   * Issue #6400 P1: the session's starting mode came from a
+   * terminal `--permission-mode`, which is no longer forwarded in `claudeArgs`,
+   * so the local launcher passes the live mode to its claude child.
+   */
+  readonly permissionModeFromFlag: boolean;
   localLaunchFailure: LocalLaunchFailure | null = null;
   /**
    * Issue #1664 (epic #1662, Sub B): the per-turn telemetry reporter for this
@@ -51,6 +81,7 @@ export class Session extends AgentSessionBase<EnhancedMode> {
     sessionId: string | null;
     claudeEnvVars?: Record<string, string>;
     claudeArgs?: string[];
+    claudeTrailingArgs?: string[];
     mcpServers: Record<string, any>;
     messageQueue: MessageQueue2<EnhancedMode>;
     onModeChange: (mode: "local" | "remote") => void;
@@ -60,6 +91,8 @@ export class Session extends AgentSessionBase<EnhancedMode> {
     startingMode: "local" | "remote";
     hookSettingsPath: string;
     permissionMode?: PermissionMode;
+    /** Issue #6400 P1: see {@link Session.permissionModeFromFlag}. */
+    permissionModeFromFlag: boolean;
     modelMode?: SessionModelMode;
     model?: string;
     effort?: string;
@@ -88,6 +121,7 @@ export class Session extends AgentSessionBase<EnhancedMode> {
 
     this.claudeEnvVars = opts.claudeEnvVars;
     this.claudeArgs = opts.claudeArgs;
+    this.claudeTrailingArgs = opts.claudeTrailingArgs;
     this.model = opts.model;
     this.mcpServers = opts.mcpServers;
     this.allowedTools = opts.allowedTools;
@@ -95,6 +129,7 @@ export class Session extends AgentSessionBase<EnhancedMode> {
     this.startedBy = opts.startedBy;
     this.startingMode = opts.startingMode;
     this.permissionMode = opts.permissionMode;
+    this.permissionModeFromFlag = opts.permissionModeFromFlag;
     this.modelMode = opts.modelMode;
   }
 
@@ -134,6 +169,37 @@ export class Session extends AgentSessionBase<EnhancedMode> {
     return this.liveQueryAccessor ? this.liveQueryAccessor() : null;
   };
 
+  // Issue #6617 (D4 g2-1): the SDK launcher publishes a way to end the query
+  // the permission-mode applier stops (a failed live switch; a switch that
+  // landed on a moved screen, Matt 93a; a recorded mode under a wider child,
+  // round 4), beside the accessor above and cleared in its cleanup. Ending it
+  // stops the running turn without ending the launcher, so the next message
+  // starts a new query in the live mode.
+  private liveQueryTerminator: ((query: Query) => void) | null = null;
+
+  setLiveQueryTerminator = (fn: ((query: Query) => void) | null): void => {
+    this.liveQueryTerminator = fn;
+  };
+
+  endLiveQuery = (query: Query): void => {
+    this.liveQueryTerminator?.(query);
+  };
+
+  // Issue #6617 round 4 (the board-26 PM's option 2): the mode each live
+  // query's child is in, noted by the SDK launcher at the query's start and by
+  // the applier when a live switch lands. A write that switches nothing (a
+  // card answer's mode) compares it with the shown mode. Keyed by query, so a
+  // late landing on an old query never stands for a newer one.
+  private liveChildModes = new WeakMap<Query, PermissionMode>();
+
+  noteLiveChildMode = (query: Query, mode: PermissionMode): void => {
+    this.liveChildModes.set(query, mode);
+  };
+
+  getLiveChildMode = (query: Query): PermissionMode | undefined => {
+    return this.liveChildModes.get(query);
+  };
+
   // Issue #2346: runClaude publishes its in-place permission-mode applier here
   // (on launch) so the launcher-registered "set-permission-mode" RPC handler can
   // reach it without threading a callback through the loop→launcher plumbing. The
@@ -145,19 +211,49 @@ export class Session extends AgentSessionBase<EnhancedMode> {
   // the applier — this bridge (new RPC) and the set-session-config permissionMode
   // branch — share ONE closure (issue #2346 ruling D2, Task 5).
   private permissionModeApplier:
-    | ((mode: PermissionMode) => Promise<{ method: "sdk" | "config" }>)
+    | ((mode: PermissionMode) => Promise<PermissionModeApplyResult>)
     | null = null;
 
   setPermissionModeApplier = (
-    fn: ((mode: PermissionMode) => Promise<{ method: "sdk" | "config" }>) | null
+    fn: ((mode: PermissionMode) => Promise<PermissionModeApplyResult>) | null
   ): void => {
     this.permissionModeApplier = fn;
   };
 
   getPermissionModeApplier = ():
-    | ((mode: PermissionMode) => Promise<{ method: "sdk" | "config" }>)
+    | ((mode: PermissionMode) => Promise<PermissionModeApplyResult>)
     | null => {
     return this.permissionModeApplier;
+  };
+
+  // Issue #6617 (D4 g3-1): runClaude also publishes a RECORD-ONLY function: it
+  // records a mode chosen on a permission card or a plan approval where every
+  // later decision reads it (runClaude's own copy, the saved
+  // `metadata.permissionMode`, this session) and sends nothing to the live
+  // child. A card answer must never call the full applier above: the SDK reader
+  // handles a permission request inline, so a live switch sent from inside the
+  // answer would wait for a reply it cannot read until the answer returns.
+  private permissionModeRecorder: ((mode: PermissionMode) => void) | null =
+    null;
+
+  setPermissionModeRecorder = (
+    fn: ((mode: PermissionMode) => void) | null
+  ): void => {
+    this.permissionModeRecorder = fn;
+  };
+
+  getPermissionModeRecorder = (): ((mode: PermissionMode) => void) | null => {
+    return this.permissionModeRecorder;
+  };
+
+  // Issue #6617 (D3-1, refined): true once the mode has been set from the UI or
+  // an approval card (the recorder sets it). The local launcher then hands a
+  // terminal session's child the shown mode, `default` included; an untouched
+  // session keeps the user's own `permissions.defaultMode`.
+  permissionModeSetHere = false;
+
+  markPermissionModeSetHere = (): void => {
+    this.permissionModeSetHere = true;
   };
 
   recordLocalLaunchFailure = (
@@ -190,7 +286,17 @@ export class Session extends AgentSessionBase<EnhancedMode> {
    * `--fork-session` made each same-process relaunch of a branched session fork
    * again).
    */
-  consumeOneTimeFlags = (): void => {
+  consumeOneTimeFlags = (opts: { promptDelivered?: boolean } = {}): void => {
+    // Issue #5348: BEFORE the guard below. `hapi -- "review"` starts with no
+    // claudeArgs at all, so a clear placed after it would never run and every
+    // relaunch would send the prompt again. F2: the local launcher passes
+    // `promptDelivered: false` when it returned before spawning Claude (the abort
+    // was already set), so the text is kept for the next start or for
+    // takeUndeliveredPrompt.
+    if (this.claudeTrailingArgs && opts.promptDelivered !== false) {
+      logger.debug("[Session] Consumed the prompt after the -- marker");
+      this.claudeTrailingArgs = undefined;
+    }
     if (!this.claudeArgs) return;
 
     const before = this.claudeArgs;
@@ -212,5 +318,15 @@ export class Session extends AgentSessionBase<EnhancedMode> {
       `[Session] Consumed one-time flags, remaining args:`,
       this.claudeArgs
     );
+  };
+
+  /**
+   * Issue #5348 F2: the prompt after the -- marker that no Claude was started with,
+   * removed so it is never replayed at a later local start; undefined when none is left.
+   */
+  takeUndeliveredPrompt = (): string | undefined => {
+    const trailing = this.claudeTrailingArgs;
+    this.claudeTrailingArgs = undefined;
+    return trailing?.[trailing.length - 1];
   };
 }

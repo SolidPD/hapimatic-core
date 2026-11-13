@@ -38,6 +38,19 @@ import type { SessionGroup, FilterView } from "./grouping";
 import { LOCAL_NODE_ID } from "@hapi/protocol";
 import { useProjectExpandState, useExpandedSessions } from "./expandState";
 import {
+  buildClusters,
+  crossRepoPeerIds,
+  schedulerScheduleId,
+} from "./clusters";
+import {
+  allProjectsScope,
+  allSessionsScope,
+  applyGroupExpand,
+  collectGroupExpandTargets,
+  crossRepoClusterKey,
+  type ExpandCollapseAllScope,
+} from "./bulkExpand";
+import {
   SortableListEntry,
   type SortableDragHandle,
 } from "./SortableListEntry";
@@ -71,101 +84,13 @@ import {
   orderByCustom,
 } from "@/lib/sessionListManualOrder";
 
-/**
- * #2700 (epic #2698 F6): THE single definition of "scheduler-spawned session with a
- * schedule" — returns its `scheduleId`, or `undefined` for any other session. Every
- * scheduler-scope check in the list (the `scheduleId → sessions` lookup, the main-list
- * exclusion, and — once it lands — sibling #3172's delete prompt) keys on this one
- * expression so the scope can never drift between call sites.
- */
-export function schedulerScheduleId(s: SessionSummary): string | undefined {
-  const sid = s.metadata?.scheduleId;
-  return s.metadata?.source === "scheduler" && sid ? sid : undefined;
-}
-
-/**
- * #2700: a scheduler-spawned session is excluded from the main list ONLY when its
- * schedule is present in `knownScheduleIds` (every schedule in `props.schedules` gets a
- * row — matched or synthetic group — in the "all" and "schedules" views, whose nested
- * list shows it; the "sessions" view renders no schedule rows, unchanged by #2700). An orphan
- * (its one-shot schedule self-deleted) is NOT excluded, so it re-homes into the main
- * list instead of becoming an invisible-but-alive ghost — the schedule-level analogue
- * of `treeSortSessions`' branch-orphan fallback in grouping.ts.
- */
-export function isNestedUnderSchedule(
-  s: SessionSummary,
-  knownScheduleIds: ReadonlySet<string>
-): boolean {
-  const sid = schedulerScheduleId(s);
-  return sid !== undefined && knownScheduleIds.has(sid);
-}
-
-/**
- * Build parent→children clusters for a group's sessions (issue #466). Extracted from the
- * inline render logic so the same clustering feeds BOTH the render loop and the reorder
- * root-id computation. Scheduler-spawned sessions nested under a known schedule row are
- * excluded (orphans re-home here, #2700); each cluster is `[root, ...children]` in
- * depth-first order, and `depth` maps every session id to its branch depth (0 = root)
- * for indentation.
- */
-export function buildClusters(
-  sessions: SessionSummary[],
-  knownScheduleIds: ReadonlySet<string>,
-  excludePeerIds?: ReadonlySet<string>
-): {
-  clusters: SessionSummary[][];
-  depth: Map<string, number>;
-} {
-  const main = sessions.filter(
-    s =>
-      !isNestedUnderSchedule(s, knownScheduleIds) &&
-      // #3265: cross-repo managed peers render in the "managed peers" subheading,
-      // not as top-level clusters — exclude them here so they don't render twice.
-      !excludePeerIds?.has(s.id)
-  );
-  const depth = new Map<string, number>();
-  for (const s of main) {
-    if (!s.parentSessionId) depth.set(s.id, 0);
-  }
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const s of main) {
-      if (
-        s.parentSessionId &&
-        !depth.has(s.id) &&
-        depth.has(s.parentSessionId)
-      ) {
-        depth.set(s.id, depth.get(s.parentSessionId)! + 1);
-        changed = true;
-      }
-    }
-  }
-  const clusters: SessionSummary[][] = [];
-  let current: SessionSummary[] = [];
-  for (const s of main) {
-    const d = depth.get(s.id) ?? 0;
-    if (d === 0) {
-      if (current.length > 0) clusters.push(current);
-      current = [s];
-    } else {
-      current.push(s);
-    }
-  }
-  if (current.length > 0) clusters.push(current);
-  return { clusters, depth };
-}
-
-/**
- * #3265: the ids of a group's cross-repo managed peers, passed to `buildClusters`
- * so they are excluded from the top-level cluster pass (they render in the
- * "managed peers" subheading instead). Shared across all three `buildClusters`
- * call sites (render, rootIdsInOrder, first-drag seed) so the exclusion stays
- * consistent everywhere the cluster layout is computed.
- */
-function crossRepoPeerIds(group: SessionGroup): Set<string> {
-  return new Set((group.crossRepoManagedPeers ?? []).map(p => p.id));
-}
+// The clustering helpers live in ./clusters. Re-exported so existing imports of
+// them from this module keep working.
+export {
+  buildClusters,
+  isNestedUnderSchedule,
+  schedulerScheduleId,
+} from "./clusters";
 
 // ── Always-armed drag arming (issue #3114, extracted to guardedDragSensors #3537) ──
 // `DRAG_ACTIVATION`, `GuardedPointerSensor` and `GuardedTouchSensor` now live in
@@ -905,6 +830,103 @@ export function SessionList(props: {
     [frozen, manualActive, allGroups, knownScheduleIds]
   );
 
+  // ── Bulk expand / collapse: the chevron menus ────────────────────────────
+  // Right-click, or press and hold, a chevron for "Expand All / Collapse All"
+  // (ExpandCollapseAllMenu). On a project header "All" is every project in the
+  // list; on a session row it is every session under that row's project. Both
+  // act only on what the current view lists, so a bulk action never changes
+  // something that is not on screen.
+
+  // A project's schedule rows as the current view lists them. One definition
+  // for the render below and the bulk actions.
+  const scheduleContentFor = (
+    group: SessionGroup
+  ): {
+    groupSchedules: ScheduledTask[];
+    showHeartbeat: boolean;
+    hasScheduleContent: boolean;
+  } => {
+    const groupSchedules =
+      filterView !== "sessions"
+        ? (schedulesByGroupKey.get(group.groupKey) ?? [])
+        : [];
+    const showHeartbeat =
+      filterView !== "sessions" &&
+      heartbeatGroupKey === group.groupKey &&
+      !!props.heartbeatConfig;
+    return {
+      groupSchedules,
+      showHeartbeat,
+      hasScheduleContent: showHeartbeat || groupSchedules.length > 0,
+    };
+  };
+
+  // The "schedules" view lists only the projects that have schedule content.
+  const isGroupListed = (group: SessionGroup): boolean =>
+    filterView !== "schedules" || scheduleContentFor(group).hasScheduleContent;
+
+  const setAllProjectsExpanded = (expanded: boolean): void => {
+    for (const group of groupsToRender) {
+      if (!isGroupListed(group)) continue;
+      const isExpanded = !isGroupCollapsed(group);
+      if (isExpanded === expanded) continue;
+      setProjectExpanded(group.groupKey, expanded);
+    }
+  };
+
+  const projectsScope = allProjectsScope(setAllProjectsExpanded);
+
+  const setGroupSessionsExpanded = (
+    group: SessionGroup,
+    expanded: boolean
+  ): void => {
+    const { groupSchedules, hasScheduleContent } = scheduleContentFor(group);
+    // The "schedules" view lists no main-list sessions (only scheduled peers).
+    const showSessions = filterView !== "schedules";
+    applyGroupExpand(
+      collectGroupExpandTargets({
+        groupKey: group.groupKey,
+        clusters: showSessions
+          ? buildClusters(
+              group.sessions,
+              knownScheduleIds,
+              crossRepoPeerIds(group)
+            ).clusters
+          : [],
+        crossRepoPeers: showSessions ? (group.crossRepoManagedPeers ?? []) : [],
+        schedules: groupSchedules,
+        hasSchedulerSection: hasScheduleContent,
+        sessionsByScheduleId,
+      }),
+      expanded,
+      {
+        expandedSessions: {
+          ids: expandedSessions,
+          toggle: toggleSessionExpanded,
+        },
+        collapsedClusters: {
+          ids: collapsedBranchClusters,
+          toggle: toggleBranchCluster,
+        },
+        collapsedSchedulerGroups: {
+          ids: schedulerCollapsed,
+          toggle: toggleSchedulerCollapsed,
+        },
+        // This hook's set holds the OPENED ids despite its name: the render
+        // below passes `isSpawnedCollapsed={!spawnedSessionsCollapsed.has(id)}`.
+        openScheduledPeers: {
+          ids: spawnedSessionsCollapsed,
+          toggle: toggleSpawnedSessionsCollapsed,
+        },
+      }
+    );
+  };
+
+  const sessionsScopeFor = (group: SessionGroup): ExpandCollapseAllScope =>
+    allSessionsScope(group.displayName, expanded =>
+      setGroupSessionsExpanded(group, expanded)
+    );
+
   return (
     <div className="mx-auto w-full max-w-content flex flex-col">
       <div className="flex flex-col">
@@ -920,17 +942,11 @@ export function SessionList(props: {
         {(() => {
           const listItems = groupsToRender.map(group => {
             const isCollapsed = isGroupCollapsed(group);
-            const groupSchedules =
-              filterView !== "sessions"
-                ? (schedulesByGroupKey.get(group.groupKey) ?? [])
-                : [];
-            const showHeartbeat =
-              filterView !== "sessions" &&
-              heartbeatGroupKey === group.groupKey &&
-              !!props.heartbeatConfig;
+            const { groupSchedules, showHeartbeat, hasScheduleContent } =
+              scheduleContentFor(group);
             const showSessions = filterView !== "schedules";
-            const hasScheduleContent =
-              showHeartbeat || groupSchedules.length > 0;
+            // The chevron menu of every session row under this project.
+            const sessionsScope = sessionsScopeFor(group);
             // Pending remote-spawn stubs for this group. Issue #2150: rendered in
             // BOTH branches below — groups default to collapsed, and a stub hidden
             // behind a collapsed header is a spawn the user never sees fail.
@@ -957,6 +973,7 @@ export function SessionList(props: {
                       api={api}
                       onRefresh={props.onRefresh}
                       dragHandle={{ attributes, listeners }}
+                      expandCollapseAll={projectsScope}
                     />
                   )}
                 </SortableListEntry>
@@ -1057,6 +1074,7 @@ export function SessionList(props: {
                                         }
                                         onReconnect={undefined}
                                         branchDepth={0}
+                                        expandCollapseAll={sessionsScope}
                                       />
                                     ))
                                   }
@@ -1135,6 +1153,7 @@ export function SessionList(props: {
                             onRelHover={setHoverRelId}
                             onFlashSession={flashSession}
                             dragHandle={dragHandle}
+                            expandCollapseAll={sessionsScope}
                           />
                         );
 
@@ -1279,7 +1298,9 @@ export function SessionList(props: {
                         // separator (#2904) is not reintroduced (F6/CV5).
                         const crossRepoPeers =
                           group.crossRepoManagedPeers ?? [];
-                        const crossRepoCollapseKey = `${group.groupKey}:managed-peers`;
+                        const crossRepoCollapseKey = crossRepoClusterKey(
+                          group.groupKey
+                        );
                         const crossRepoCollapsed =
                           collapsedBranchClusters.has(crossRepoCollapseKey);
 

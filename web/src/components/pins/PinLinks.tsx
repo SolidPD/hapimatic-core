@@ -8,7 +8,7 @@ import {
 } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Components, Options } from "react-markdown";
-import { Folder, MessageSquareText, Save } from "lucide-react";
+import { Check, Folder, MessageSquareText, Save } from "lucide-react";
 import {
   effectiveSavedTo,
   pinFolderName,
@@ -22,7 +22,10 @@ import { ApiError } from "@/api/client";
 import { IssueInfoModal } from "@/components/IssueInfoModal";
 import { useToast } from "@/components/Toast";
 import { InlineMarkdownAnchor } from "@/components/assistant-ui/sharedMarkdownComponents";
-import { PIN_ACTION_CLASS } from "@/components/pins/PinAnswerControls";
+import {
+  PIN_ACTION_CLASS,
+  PinActionButton,
+} from "@/components/pins/PinAnswerControls";
 import { trimTrailingSlashes } from "@/components/pins/PinEvidence";
 import { usePinsContext } from "@/components/pins/pinsShared";
 import { HoverTooltip, HoverTooltipButton } from "@/components/ui/tooltip";
@@ -30,6 +33,7 @@ import { useGitHubIssue } from "@/hooks/queries/useGitHubIssue";
 import { useSavePinFiles } from "@/hooks/queries/usePins";
 import { useSessionIssueRepos } from "@/hooks/queries/useSession";
 import { useSelectSessionView } from "@/hooks/useSelectSessionView";
+import { ACTION_COLLAPSE_RANK } from "@/lib/pins/actionRowFit";
 import { pinChatAt } from "@/lib/pins/chatTarget";
 import {
   pinIssueRefs,
@@ -49,7 +53,6 @@ import { encodeBase64 } from "@/lib/utils";
 
 const ICON: CSSProperties = { width: "12px", height: "12px" };
 const LINE_ICON: CSSProperties = { width: "13px", height: "13px" };
-const BUTTON_STYLE: CSSProperties = { height: "26px", fontSize: "11.5px" };
 const FILE_LINK_STYLE: CSSProperties = { color: "var(--view-accent-files)" };
 const FILE_LINK_CLASS =
   "min-w-0 truncate font-mono underline decoration-dotted underline-offset-2";
@@ -274,12 +277,24 @@ function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
+/** Save's badge corner: the top right of its 12 px icon. */
+const SAVE_BADGE: CSSProperties = { top: "-3px", right: "-4px" };
+const SAVE_CHECK: CSSProperties = { width: "8px", height: "8px" };
+const SAVE_DOT: CSSProperties = {
+  width: "6px",
+  height: "6px",
+  top: "-2px",
+  right: "-3px",
+  background: "var(--status-warn)",
+};
+
 /**
- * "Save to session folder" (R6, R7): copies the pin's files into
- * `GeneratedFiles/pins/<folder>/`. After a save it reads "Saved to session
- * folder", and "Save again" once the pin has a newer revision than the one
- * saved. Below 640 px it reads "Save" / "Saved" and the tooltip names the
- * folder, so the action row stays one line (PM ruling A2, Nov 8). A success
+ * "Save" (R6, R7; #6539 R8): copies the pin's files into
+ * `GeneratedFiles/pins/<folder>/`. It reads "Save" in every state, and its
+ * icon says which (Pins PM ruling Q2): plain when never saved, a check badge
+ * when saved and current, an amber dot when the pin changed since its files
+ * were saved. The tooltip and the `aria-label` carry the state, and the label
+ * gives way to the icon when the action row runs out of room (R13). A success
  * stages D's `saved` marker so this device's Submit is enabled; the server
  * reports the save on whichever device submits next.
  */
@@ -292,18 +307,25 @@ export function PinSaveButton(props: { pin: Pin }) {
   if (sources.folders.length === 0 && sources.files.length === 0) return null;
   const folder = `GeneratedFiles/pins/${pinFolderName(pin.key)}/`;
   const savedRevision = pin.savedTo ? (pin.savedRevision ?? null) : null;
-  const [label, phoneLabel] = save.isPending
-    ? ["Saving…", "Saving…"]
-    : savedRevision === null
-      ? ["Save to session folder", "Save"]
+  const state: "never" | "current" | "changed" =
+    savedRevision === null
+      ? "never"
       : pin.revision > savedRevision
-        ? ["Save again", "Save again"]
-        : ["Saved to session folder", "Saved"];
+        ? "changed"
+        : "current";
+  const tooltip = save.isPending
+    ? "Saving…"
+    : state === "changed"
+      ? `This pin changed since its files were saved. Save copies the new files into ${folder} in this session's folder.`
+      : state === "current"
+        ? `Saved to ${folder} in this session's folder. Save copies them again.`
+        : `Copy this pin's files into ${folder} in this session's folder. Your next Submit tells the agent, which commits them.`;
   return (
-    <HoverTooltipButton
-      type="button"
-      content={`Copy this pin's files into ${folder} in this session's folder. Your next Submit tells the agent, which commits them.`}
+    <PinActionButton
+      rank={ACTION_COLLAPSE_RANK.save}
+      content={tooltip}
       disabled={save.isPending}
+      aria-busy={save.isPending}
       onClick={() =>
         save.mutate(pin.key, {
           onSuccess: res => {
@@ -324,16 +346,29 @@ export function PinSaveButton(props: { pin: Pin }) {
             showToast(`Not saved: ${saveError(error)}`, { type: "error" }),
         })
       }
-      aria-label={label}
-      className={PIN_ACTION_CLASS}
-      style={BUTTON_STYLE}
-    >
-      <Save style={ICON} aria-hidden />
-      <span className="max-sm:hidden">{label}</span>
-      <span className="sm:hidden" aria-hidden>
-        {phoneLabel}
-      </span>
-    </HoverTooltipButton>
+      aria-label={state === "changed" ? "Save again" : "Save"}
+      className={`${PIN_ACTION_CLASS} disabled:opacity-50`}
+      icon={
+        <span className="relative inline-flex" data-save-state={state}>
+          <Save style={ICON} aria-hidden />
+          {state === "current" ? (
+            <Check
+              style={{ ...SAVE_BADGE, ...SAVE_CHECK }}
+              strokeWidth={4}
+              className="absolute text-[var(--app-accent)]"
+              aria-hidden
+            />
+          ) : state === "changed" ? (
+            <span
+              style={SAVE_DOT}
+              className="absolute rounded-full"
+              aria-hidden
+            />
+          ) : null}
+        </span>
+      }
+      label="Save"
+    />
   );
 }
 
@@ -341,8 +376,9 @@ export function PinSaveButton(props: { pin: Pin }) {
  * "In chat" (R11): Chat, scrolled to where the pin was posted. Pins tab only,
  * because a chat card is already at that spot, and only when the pin knows
  * where (a fence's anchor or a tool post's seq). It switches the view the way a
- * View Picker tap does (`useSelectSessionView`), as I's "Go to chat" does. A square icon on a phone,
- * where the action row has no room for its label; the tooltip still names it.
+ * View Picker tap does (`useSelectSessionView`), as I's "Go to chat" does. Its
+ * label is the first to give way when the action row runs out of room (#6539,
+ * R13); the tooltip and the `aria-label` still name it.
  */
 export function PinChatButton(props: { pin: Pin }) {
   const { pin } = props;
@@ -351,16 +387,12 @@ export function PinChatButton(props: { pin: Pin }) {
   const at = pinChatAt(pin);
   if (via !== "pins" || at === null) return null;
   return (
-    <HoverTooltipButton
-      type="button"
+    <PinActionButton
+      rank={ACTION_COLLAPSE_RANK.inChat}
       content="Show where this was raised in the chat"
-      aria-label="In chat"
       onClick={() => selectView("chat", at)}
-      className={`${PIN_ACTION_CLASS} max-sm:px-1.5`}
-      style={BUTTON_STYLE}
-    >
-      <MessageSquareText style={ICON} aria-hidden />
-      <span className="max-sm:hidden">In chat</span>
-    </HoverTooltipButton>
+      icon={<MessageSquareText style={ICON} aria-hidden />}
+      label="In chat"
+    />
   );
 }

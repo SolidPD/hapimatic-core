@@ -9408,6 +9408,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Read a pin by its ID (pin- and ten characters), read-only, wherever its session lives in the caller's namespace. Approval tokens in the pin are blanked.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-get-pin-by-id",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/cli/pins/by-id/:pinId"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an agent reads a pin another session raised, named by its ID (pin_get({id}))."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Submit a peer-to-server impact-analysis artifact over the CLI-token surface.",
     "domain": "session-introspection",
     "id": "session-introspection.cli-impact-artifact",
@@ -9748,6 +9768,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Return the pin with this ID if this node holds it in the caller's namespace, with approval tokens blanked (POST because the node proxy only issues POST).",
+    "domain": "session-introspection",
+    "id": "session-introspection.federation-pin-by-id",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/pins/by-id/:pinId"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub looks a pin up by its ID across the federation for a session or the Pins search."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Return this node's Project Manager dashboard pins in the caller's namespace, with the facts of the sessions their lanes name (POST because the node proxy only issues POST).",
     "domain": "session-introspection",
     "id": "session-introspection.federation-pin-dashboards",
@@ -9901,6 +9941,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When showing a single pin."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read a pin by its ID (pin- and ten characters), read-only, wherever its session lives in the caller's namespace across federated nodes. Approval tokens in the pin are blanked.",
+    "domain": "session-introspection",
+    "id": "session-introspection.get-pin-by-id",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/pins/by-id/:pinId"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a session or the operator names a pin by its ID and needs its title, options, answers or owner."
   },
   {
     "auth": "cli-token",
@@ -11412,6 +11472,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Read this node's compact-at percentage and the token point where a session compacts",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.compact-at-preference",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/preferences/compact-at"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When showing or checking when Claude sessions on this machine compact their context."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Read the saved per-field default values that pre-fill the Create-Session form for new sessions.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.create-defaults-preference",
@@ -11911,6 +11991,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Set this node's compact-at percentage (a whole number from 50 to 95) or switch it off, for Claude sessions started afterwards",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.set-compact-at-preference",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/preferences/compact-at"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user changes when Claude sessions on this machine compact their context."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Replace the saved per-field Create-Session default values that pre-fill the new-session form.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.set-create-defaults-preference",
@@ -12148,6 +12248,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "jwt",
     "availability": {
+      "scope": "user"
+    },
+    "description": "Report this node's latest billable-time daily check: the run row and its detail rows in the caller's namespace.",
+    "domain": "telemetry",
+    "id": "telemetry.billable-time-reconcile-latest",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/billable-time/reconcile/latest"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When an operator or a billing consumer checks whether the node's stored timers and thinking intervals agree."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Report a session's billable thinking time: lifetime totals, closed intervals and local-day portions, with the owning node's mode and coverage.",
+    "domain": "telemetry",
+    "id": "telemetry.billable-time-session",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/billable-time/sessions/:id"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a billing consumer needs a session's billable time from stored thinking intervals."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
       "mountedWhen": "getTelemetryStore",
       "scope": "user"
     },
@@ -12267,6 +12407,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "off",
     "trusted": true,
     "whenToUse": "When the web UI shows token or turn analytics spanning all federation nodes."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Return this node's closed billable thinking intervals changed since the caller's cursor (the billable interval mirror feed).",
+    "domain": "telemetry",
+    "id": "telemetry.federation-interval-feed",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/interval-feed"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When a peer node's interval-mirror pull loop replicates this node's closed thinking intervals."
   },
   {
     "auth": "federation-token",

@@ -611,18 +611,34 @@ export class AgentSessionBase<Mode> {
    * session, and again only when the server list changes (a toggle, a
    * relaunch). Fire-and-forget: a failed report only leaves the numbers older.
    * `hapi` is left out; every session has it.
+   *
+   * #6409 item 3: a row that covers more than one server (raw names sharing
+   * the tool prefix before `__`) is left out too, because its cost is their
+   * combined cost and belongs to neither; the catalog shows "—" for them. The
+   * signature is built from raw names, so a server joining or leaving a key
+   * re-reports, and it is stored before the empty check, so a list that skips
+   * every row still counts as a change.
    */
   onMcpContextCosts = (servers: McpServerUsage[]): void => {
-    const rows = servers.filter(
-      server => normalizeMcpServerName(server.name) !== HAPI_MCP_SERVER_NAME
-    );
-    if (rows.length === 0) return;
-    const signature = rows
-      .map(server => normalizeMcpServerName(server.name))
-      .sort()
-      .join("\n");
+    const skipped = servers.filter(server => server.names.length > 1);
+    const rows = servers
+      .filter(server => server.names.length <= 1)
+      .filter(
+        server => normalizeMcpServerName(server.name) !== HAPI_MCP_SERVER_NAME
+      );
+    const signature = [
+      rows
+        .map(server => server.name)
+        .sort()
+        .join("\n"),
+      skipped
+        .flatMap(server => server.names)
+        .sort()
+        .join("\n"),
+    ].join("\n--\n");
     if (signature === this.lastMcpCostsSignature) return;
     this.lastMcpCostsSignature = signature;
+    if (rows.length === 0) return;
     const sampledAt = new Date().toISOString();
     void this.api
       .updateMcpCosts({

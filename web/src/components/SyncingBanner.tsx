@@ -15,7 +15,7 @@ export function SyncingBanner({ isSyncing }: { isSyncing: boolean }) {
   // resolves to the base 0.5rem = the former py-2 top, so no regression.
   return (
     <div
-      className="fixed top-0 left-0 right-0 bg-[var(--app-banner-bg)] text-[var(--app-banner-text)] text-center py-2 text-sm font-medium z-50 flex items-center justify-center gap-2 border-b border-[var(--app-divider)]"
+      className="fixed top-0 inset-x-[var(--content-gutter)] bg-[var(--app-banner-bg)] text-[var(--app-banner-text)] text-center py-2 text-sm font-medium z-50 flex items-center justify-center gap-2 border-b border-[var(--app-divider)]"
       style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top, 0.5rem))" }}
     >
       <Spinner

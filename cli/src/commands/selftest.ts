@@ -14,6 +14,9 @@ import type { CommandDefinition } from "./types";
  * it can execute and fails when it fails, so a binary whose worker cannot
  * start never ships. Not listed in the help text: it is a build check.
  *
+ * `hapi selftest argv` (issue #5348): see `selftestArgv.ts`. The build and CI run it
+ * on the binary they built, so the shipped binary's dispatch decisions are checked.
+ *
  * The scratch database is a zero-byte file (SQLite reads it as an empty
  * database), so this command needs no SQLite module of its own.
  */
@@ -58,10 +61,16 @@ export const selftestCommand: CommandDefinition = {
   requiresRuntimeAssets: false,
   run: async ({ commandArgs }) => {
     const target = commandArgs[0];
-    if (target !== "telemetry-worker") {
-      console.error("Usage: hapi selftest telemetry-worker");
-      process.exit(2);
+    if (target === "telemetry-worker") {
+      process.exit(await telemetryWorkerSelftest());
     }
-    process.exit(await telemetryWorkerSelftest());
+    if (target === "argv") {
+      // Issue #5348 (R12): the built binary's dispatch decisions. Loaded on demand:
+      // this module is imported on every start (the command registry).
+      const { runArgvSelftest } = await import("./selftestArgv");
+      process.exit(await runArgvSelftest());
+    }
+    console.error("Usage: hapi selftest telemetry-worker|argv");
+    process.exit(2);
   },
 };

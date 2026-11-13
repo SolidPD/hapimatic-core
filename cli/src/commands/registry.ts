@@ -90,6 +90,19 @@ export function registerCommand(definition: CommandDefinition): void {
       "Command name 'claude' is reserved (implicit default command)"
     );
   }
+  // Issue #5348: the end-of-options opt-in is for the core commands only, so an
+  // extension command always refuses `--` in runCli; and a name that starts with a
+  // dash (`--`, `-x`) would turn a marker or a flag into that command.
+  if (definition.acceptsEndOfOptions !== undefined) {
+    throw new Error(
+      `Command '${definition.name}' cannot take -- (acceptsEndOfOptions is for core commands only)`
+    );
+  }
+  if (definition.name.startsWith("-")) {
+    throw new Error(
+      `Command name '${definition.name}' cannot start with a dash`
+    );
+  }
   const { commands, map } = ensureRegistry();
   if (map.has(definition.name)) {
     throw new Error(

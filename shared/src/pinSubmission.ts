@@ -28,13 +28,27 @@ export const PIN_SUBMISSION_QUESTION_MAX_CHARS = 1000;
 export const PIN_SUBMISSION_TIME_ZONE_MAX_CHARS = 64;
 
 /**
+ * The fields a dismissal refuses beside it (#6539): each one answers the pin, or
+ * changes its automatic pick, which a dismissal ends.
+ */
+const PIN_DISMISS_EXCLUDES = [
+  "choice",
+  "label",
+  "steps",
+  "questions",
+  "automaticPick",
+] as const;
+
+/**
  * One pin's staged answer as the PWA sends it. Strict, so `by` can never come
  * from a client. `rev` is required, unlike the agent's resolve: an answer that
  * silently bound to the current revision would settle a question the operator
  * never saw, which is what `moot` exists to prevent. K and F add their own
  * optional fields here; G added `saved` (#6453): the device that saved a pin's
  * files stages it so its Submit is enabled, but the server's own record of the
- * unreported save decides what the message reports.
+ * unreported save decides what the message reports. N added `dismiss` (#6539):
+ * the operator dismissed the pin without answering it. A dismissal may carry a
+ * note and `saved`, and nothing else: an answer beside it would contradict it.
  */
 export const PinSubmissionEntrySchema = z
   .strictObject({
@@ -62,20 +76,38 @@ export const PinSubmissionEntrySchema = z
     automaticPick: z.literal(true).optional(),
     /** #6453: this device saved the pin's files ("Save to session folder"). */
     saved: z.literal(true).optional(),
+    /**
+     * #6539: close this pin as dismissed and tell the agent, in the same
+     * transaction as the message. An older node refuses the field (400), so a
+     * dismissal is never sent to a node that could not record it.
+     */
+    dismiss: z.literal(true).optional(),
     via: z.enum(PIN_SUBMISSION_VIAS),
   })
   .superRefine((entry, ctx) => {
     if (
       !hasPinAnswer(entry) &&
       entry.automaticPick === undefined &&
-      entry.saved !== true
+      entry.saved !== true &&
+      entry.dismiss !== true
     ) {
       ctx.addIssue({
         code: "custom",
         path: [],
         message:
-          "must carry a choice, a note, a question, steps, an automatic-pick change or a save",
+          "must carry a choice, a note, a question, steps, an automatic-pick change, a save or a dismissal",
       });
+    }
+    if (entry.dismiss === true) {
+      for (const field of PIN_DISMISS_EXCLUDES) {
+        if (entry[field] !== undefined) {
+          ctx.addIssue({
+            code: "custom",
+            path: [field],
+            message: "does not go with a dismissal",
+          });
+        }
+      }
     }
     if (entry.label !== undefined && entry.choice === undefined) {
       ctx.addIssue({
@@ -96,7 +128,8 @@ export type PinSubmissionEntry = z.infer<typeof PinSubmissionEntrySchema>;
 
 /**
  * True when an entry answers anything: a choice, a non-blank note, a question,
- * or steps. An entry that only carries `saved` (#6453) does not.
+ * or steps. An entry that only carries `saved` (#6453) does not, and neither
+ * does a dismissal (#6539), which closes the question without answering it.
  */
 export function hasPinAnswer(
   entry: Pick<PinSubmissionEntry, "choice" | "note" | "questions" | "steps">

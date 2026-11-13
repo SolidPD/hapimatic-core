@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { memo, useCallback, type CSSProperties, type ReactNode } from "react";
-import { Check, Star } from "lucide-react";
+import { Check, Star, X } from "lucide-react";
 import { isReservedPinKey } from "@hapi/protocol";
 import { tokens } from "@/design/tokens";
 import { PinDetail } from "@/components/pins/PinDetail";
+import {
+  DISMISS_LABEL,
+  WILL_DISMISS,
+} from "@/components/pins/PinDismissAction";
 import { PinSignals } from "@/components/pins/PinSignals";
 import { ReservedPinPill } from "@/components/pins/ReservedPinParts";
 import {
@@ -74,6 +78,28 @@ function AnswerPill(props: { model: PinViewModel; armed: boolean }) {
   const staleLabel = staged
     ? `You chose on revision ${staged.rev}; this pin is now revision ${pin.revision}`
     : "";
+  // #6539: a staged dismissal comes first, or a steps pin would never show it.
+  // A stale one is dropped at Submit and the pin stays open, so it says so.
+  if (staged?.dismiss === true) {
+    return (
+      <PinIndicator
+        armed={armed}
+        label={
+          stale
+            ? `You chose to dismiss revision ${staged.rev}; this pin is now revision ${pin.revision}, so Submit will not dismiss it. Undo, then Dismiss again`
+            : WILL_DISMISS
+        }
+        className={`${PILL_CLASS} text-[var(--app-badge-error-text)]`}
+        style={{
+          ...(stale ? STALE_STYLE : PILL_STYLE),
+          borderColor: "var(--status-hot)",
+        }}
+      >
+        <X style={CHECK_ICON} aria-hidden />
+        <span className="max-sm:hidden">{DISMISS_LABEL}</span>
+      </PinIndicator>
+    );
+  }
   if (pin.kind === "steps" && model.steps.length > 0) {
     const total = model.steps.length;
     const done = Math.min(total, Math.max(stepsSent(pin), checked.size));
@@ -252,7 +278,11 @@ export const PinRow = memo(function PinRow(props: PinRowProps) {
         />
         <span onClick={stopRowToggle} className="flex justify-end">
           {isReservedPinKey(pin.key) ? (
-            <ReservedPinPill pin={pin} armed={armed} />
+            <ReservedPinPill
+              pin={pin}
+              armed={armed}
+              mode={props.mode ?? "tab"}
+            />
           ) : (
             <AnswerPill model={model} armed={armed} />
           )}

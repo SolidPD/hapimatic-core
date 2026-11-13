@@ -24,6 +24,7 @@
  * expand/collapse.
  */
 import { useId, useState, type ReactNode } from "react";
+import { HAPI_MCP_SERVER_NAME } from "@hapi/protocol";
 import type { McpCatalogEntry } from "@hapi/protocol/schemas";
 import { formatMcp } from "@/components/session/badgeFormat";
 import { BareButton } from "@/components/ui/BareButton";
@@ -87,8 +88,17 @@ function statusTooltip(server: McpCatalogEntry): string {
   return `Last status check: ${STATUS_LABEL[server.status]}.`;
 }
 
+/**
+ * The other servers sharing this one's key, or none (#6409 item 3). Claude Code
+ * reports their tools together, so the catalog sends no number for them.
+ */
+function sharedKeyNames(server: McpCatalogEntry): string[] {
+  return server.sharedKeyWith ?? [];
+}
+
 /** `157 MB · 1.2k`, or the half that is known, or "—" until measured. */
 function costLabel(server: McpCatalogEntry): string {
+  if (sharedKeyNames(server).length > 0) return "—";
   const parts: string[] = [];
   if (server.ram) parts.push(`${server.ram.medianMb} MB`);
   if (server.context) parts.push(formatTokens(server.context.inContextTokens));
@@ -96,6 +106,15 @@ function costLabel(server: McpCatalogEntry): string {
 }
 
 function costTooltip(server: McpCatalogEntry): string {
+  const others = sharedKeyNames(server);
+  if (others.length > 0) {
+    const named = others
+      .map(name =>
+        name === HAPI_MCP_SERVER_NAME ? "Hapimatic's own server" : name
+      )
+      .join(", ");
+    return `Not shown: shares a tool prefix with ${named} on this node, so Claude Code reports their tools together.`;
+  }
   const lines: string[] = [];
   if (!server.ram && !server.context) {
     lines.push(
@@ -150,7 +169,11 @@ export function McpServersSection({
   const countLabel = formatMcp(connected, attention, failed);
 
   const selected = servers.filter(s => desired[s.name]);
-  const measured = selected.filter(s => s.ram);
+  // #6409 item 3: a shared-key server's memory belongs to no one of them, so
+  // the total leaves it out (and under-counts) rather than count it twice.
+  const measured = selected.filter(
+    s => s.ram && sharedKeyNames(s).length === 0
+  );
   const selectedMb = measured.reduce(
     (sum, s) => sum + (s.ram?.medianMb ?? 0),
     0

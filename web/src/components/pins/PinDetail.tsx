@@ -10,7 +10,6 @@ import {
 } from "react";
 import { Star, TextAlignStart } from "lucide-react";
 import { SimpleMarkdown } from "@/components/SimpleMarkdown";
-import { HoverTooltipButton } from "@/components/ui/tooltip";
 import { DecisionOptions } from "@/components/pins/DecisionOptions";
 import { PinEvidenceList } from "@/components/pins/PinEvidence";
 import {
@@ -25,12 +24,22 @@ import { StepsList } from "@/components/pins/StepsList";
 import {
   isAnswerablePin,
   isChoosablePin,
+  PinActionButton,
+  PinActionRow,
   PinAnswerButtons,
   PinAnswerFields,
   useAnswerPanels,
 } from "@/components/pins/PinAnswerControls";
 import { PinDeadlineLine } from "@/components/pins/PinDeadlineLine";
+import { PinIdControl } from "@/components/pins/PinIdControl";
+import {
+  isDismissablePin,
+  PinDismissAction,
+  useDismissStaging,
+  WillDismissLine,
+} from "@/components/pins/PinDismissAction";
 import { usePinsContext } from "@/components/pins/pinsShared";
+import { HoverTooltip } from "@/components/ui/tooltip";
 import {
   DetectedPinBody,
   isDetectedPinKey,
@@ -44,6 +53,7 @@ import {
   orderedOptions,
   type PinViewModel,
 } from "@/lib/pins/ledger";
+import { ACTION_COLLAPSE_RANK } from "@/lib/pins/actionRowFit";
 import { stageChoice, useStagedPin, useStepTicks } from "@/lib/pins/staging";
 
 /** SimpleMarkdown that skips re-parsing while its text is unchanged (#4110). */
@@ -74,7 +84,8 @@ export function GenericPinBody(props: PinBodyProps) {
 
 /**
  * Decision and variants pins (#6450 answers both by choice, KD12): an open pin
- * stages the chosen option; a closed or server-owned one is read-only.
+ * stages the chosen option; a closed or server-owned one is read-only, and so
+ * is one with a dismissal staged (#6539).
  */
 function DecisionBody(props: PinBodyProps) {
   const { model } = props;
@@ -85,7 +96,7 @@ function DecisionBody(props: PinBodyProps) {
   const options = orderedOptions(model);
   return (
     <>
-      {isChoosablePin(model) ? (
+      {isChoosablePin(model) && staged?.dismiss !== true ? (
         <DecisionOptions
           options={options}
           recommendedId={pin.recommended}
@@ -130,11 +141,13 @@ function StepsBody(props: PinBodyProps) {
     model.steps.map(step => step.id),
     via
   );
+  // #6539: a pin the operator chose to dismiss takes no ticks.
+  const dismissed = useStagedPin(sessionId, model.pin.key)?.dismiss === true;
   return (
     <StepsList
       steps={model.steps}
       checked={checked}
-      onToggle={isAnswerablePin(model.pin) ? toggle : undefined}
+      onToggle={isAnswerablePin(model.pin) && !dismissed ? toggle : undefined}
     />
   );
 }
@@ -169,6 +182,8 @@ function pinBodyFor(pin: { key: string; kind: string }): FC<PinBodyProps> {
  * #6453: issue references in the context open the issue viewer; the Files and
  * Issues lines follow the evidence; Save and In chat sit in the actions row,
  * from the pin itself rather than `actions`, so a completed pin has them too.
+ * #6539: the actions row is one line at every width (`PinActionRow`), and an
+ * open ordinary pin ends it with Dismiss, or Undo once a dismissal is staged.
  */
 export function PinDetail(props: {
   model: PinViewModel;
@@ -188,6 +203,15 @@ export function PinDetail(props: {
   const staged = useStagedPin(sessionId, pin.key);
   const moot = staged?.choice === undefined ? mootNotice(pin) : undefined;
   const markdown = usePinMarkdownProps();
+  const dismissable = summary === undefined && isDismissablePin(pin);
+  const dismissal = useDismissStaging(pin);
+  const { asking, toggleAsk } = panels;
+
+  // #6539: a question cannot go with a dismissal, so staging one closes an open
+  // question field for good (Undo does not re-open it).
+  useEffect(() => {
+    if (dismissal.staged && asking) toggleAsk();
+  }, [dismissal.staged, asking, toggleAsk]);
 
   useEffect(() => {
     if (isPinNew(pin)) markSeen(pin);
@@ -198,6 +222,19 @@ export function PinDetail(props: {
       id={`pin-detail-${pin.key}`}
       className="pins-detail bg-[var(--app-subtle-bg)]"
     >
+      {/* #6574 (Matt's pick C): the facts line opens every pin that has an ID, on
+          every surface that renders this detail. One line: the revision and key
+          truncate, the ID chip never does. Inside the pin's own box (R18). */}
+      {pin.pinId ? (
+        <div className="pins-facts mb-1.5 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-[length:var(--text-caption)] text-[var(--app-hint)]">
+          <PinIdControl pinId={pin.pinId} form="chip" />
+          <HoverTooltip content="The pin's revision and the key its agent gave it">
+            <span className="min-w-0 truncate">
+              Revision {pin.revision} · key {pin.key}
+            </span>
+          </HoverTooltip>
+        </div>
+      ) : null}
       {summary ?? null}
       {moot ? (
         <div className="mb-1.5 text-[length:var(--text-body-dense)] text-[var(--status-warn)]">
@@ -231,25 +268,23 @@ export function PinDetail(props: {
           Some parts of this pin cannot be shown; see Text.
         </div>
       ) : null}
-      <div className="mt-2 flex flex-wrap gap-1">
+      {dismissable ? <WillDismissLine flow={dismissal} /> : null}
+      <PinActionRow className="mt-2">
         {answerable ? <PinAnswerButtons model={model} panels={panels} /> : null}
         <PinSaveButton pin={pin} />
         {actions}
-        <HoverTooltipButton
-          type="button"
+        <PinActionButton
+          rank={ACTION_COLLAPSE_RANK.text}
           content="Show the plain-text version every pin carries"
-          aria-label="Text"
           aria-pressed={showText}
           onClick={() => setShowText(on => !on)}
-          className="inline-flex items-center gap-1 rounded-md border border-[var(--app-border)] px-2 font-semibold text-[var(--app-fg)] hover:bg-[var(--app-hover)] max-sm:px-1.5"
-          style={{ height: "26px", fontSize: "11.5px" }}
-        >
-          <TextAlignStart style={ACTION_ICON} aria-hidden />
-          {/* #6453 (PM ruling A2): a square icon on a phone, so the row stays one line. */}
-          <span className="max-sm:hidden">Text</span>
-        </HoverTooltipButton>
+          icon={<TextAlignStart style={ACTION_ICON} aria-hidden />}
+          label="Text"
+        />
         <PinChatButton pin={pin} />
-      </div>
+        {dismissable ? <PinDismissAction flow={dismissal} /> : null}
+      </PinActionRow>
+      {dismissable ? dismissal.dialog : null}
       {answerable ? <PinAnswerFields model={model} panels={panels} /> : null}
       {showText ? <PinTextView text={pin.plainText} /> : null}
     </div>

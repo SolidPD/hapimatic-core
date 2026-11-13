@@ -1,14 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { McpSetSchema, type McpSet } from "@hapi/protocol";
-
-/** Every value of a repeatable flag, in order. */
-function parseRepeatedFlag(args: string[], flag: string): string[] {
-  const values: string[] = [];
-  for (let i = 0; i < args.length - 1; i++) {
-    if (args[i] === flag) values.push(args[++i]!);
-  }
-  return values;
-}
+import { scanSpawnFlags } from "./apiSpawnFlags";
 
 /**
  * Issue #6171: the spawn's MCP set from `--mcp <name>` (repeatable),
@@ -16,14 +8,18 @@ function parseRepeatedFlag(args: string[], flag: string): string[] {
  * set: the project's default applies, else every server (today's behavior).
  * `hapi` stays on whatever the set says. The server is the authoritative check
  * (an agent other than Claude, safe mode, a server off for the project).
+ *
+ * Issue #6400: the names and flags come from {@link scanSpawnFlags}, so a flag
+ * counts only as its own token and every `--mcp` has a value (a trailing
+ * `--mcp` is refused, and `--mcp --mcp-all` is never a server name).
  */
-export function parseMcpSetFlags(
-  args: string[]
+export function mcpSetFromScan(
+  names: readonly string[],
+  booleans: ReadonlySet<string>
 ): { mcpSet?: McpSet } | { error: string } {
-  const names = parseRepeatedFlag(args, "--mcp");
-  const none = args.includes("--mcp-none");
-  const all = args.includes("--mcp-all");
-  const enable = args.includes("--mcp-enable-for-project");
+  const none = booleans.has("--mcp-none");
+  const all = booleans.has("--mcp-all");
+  const enable = booleans.has("--mcp-enable-for-project");
   if (all && (none || names.length > 0)) {
     return { error: "--mcp-all cannot be combined with --mcp or --mcp-none." };
   }
@@ -39,8 +35,8 @@ export function parseMcpSetFlags(
   if (!none && names.length === 0) return {};
   const parsed = McpSetSchema.safeParse({
     mode: "only",
-    servers: names,
-    ...(enable ? { enableForProject: names } : {}),
+    servers: [...names],
+    ...(enable ? { enableForProject: [...names] } : {}),
   });
   if (!parsed.success) {
     return {
@@ -48,4 +44,17 @@ export function parseMcpSetFlags(
     };
   }
   return { mcpSet: parsed.data };
+}
+
+/**
+ * The MCP set from bare spawn flags (no verb), scanned strictly
+ * ({@link scanSpawnFlags}). `resolveSpawnArgs` calls {@link mcpSetFromScan}
+ * on its own scan instead.
+ */
+export function parseMcpSetFlags(
+  args: string[]
+): { mcpSet?: McpSet } | { error: string } {
+  const scan = scanSpawnFlags(args);
+  if ("error" in scan) return scan;
+  return mcpSetFromScan(scan.repeated.get("--mcp") ?? [], scan.booleans);
 }

@@ -120,6 +120,17 @@ export function AppShell({
     };
   }, []);
 
+  // The content-column gutter (`--content-gutter`, tokens.css) is what every
+  // window-anchored element offsets by to stay inside the column. With the
+  // content region at full width (split view) there is no letterbox, so it is 0.
+  useEffect(() => {
+    if (!fullWidthContent) return;
+    document.documentElement.style.setProperty("--content-gutter", "0px");
+    return () => {
+      document.documentElement.style.removeProperty("--content-gutter");
+    };
+  }, [fullWidthContent]);
+
   return (
     <div
       ref={shellRef}

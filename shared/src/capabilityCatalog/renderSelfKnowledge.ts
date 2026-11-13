@@ -85,7 +85,14 @@ export const SELF_KNOWLEDGE_CEILING: Record<SelfKnowledgeScope, number> = {
   // word, because with HAPI_CAPABILITY_TIER0=0 it is the only rule a session
   // sees. Measured render 11,984 B before and 12,289 B after (+305 B, about 76
   // tokens). The 211 B margin is not room for another bullet.
-  user: 12500,
+  // RAISED to 13,000 B by #6570 (board-26 PM ruling B1, 2026-11-11; this PR
+  // is expert-review gated): the preamble gains the 258 B "Automatic
+  // compaction" bullet. Measured render 12,419 B before and 12,677 B after.
+  // The raise budgets the two lanes queued behind this one, so neither
+  // raises again: #6224 (the Files-tab capability line, 75 B) and #6559
+  // (`request_context_reset`, at most 100 B), leaving about 148 B spare.
+  // A lane that needs more than its budget raises again, in review.
+  user: 13000,
   // Greenfield: no replaced-doc anchor. Fits the current full user∪operator
   // render (~16 KB) with headroom for the catalog to fill as #3745 lands more
   // RPC entries, and catches the ~64–80 KB REST-inclusion runaway (R3). A

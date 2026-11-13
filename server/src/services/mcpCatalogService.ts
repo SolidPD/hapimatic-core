@@ -161,19 +161,60 @@ export class McpCatalogService {
     const names = new Set<string>([...rows.keys(), ...project.configured]);
     // With a live poll a stats name may be an uninstalled server, so it counts only
     // while the cache is cold. A name only in the disabled list is left out too: the
-    // list seeds names that may not exist here.
+    // list seeds names that may not exist here. A stats name the two rules in the
+    // shared-key pass below would skip with a live poll is skipped here too, or a
+    // cold cache would hide a survivor's numbers until the first poll.
     if (stale) {
-      for (const row of stats.values()) names.add(row.name);
+      const keys = new Set([...names].map(normalizeMcpServerName));
+      for (const [key, row] of stats) {
+        if (row.name === key ? keys.has(key) : names.has(key)) continue;
+        names.add(row.name);
+      }
     }
     names.delete(HAPI_MCP_SERVER_NAME);
 
+    // #6409 item 3: names that reduce to one key share one stats row, and Claude
+    // Code reports their tools together, so the row's numbers belong to neither.
+    // Every name known here counts: each listed name (poll rows, configured
+    // names, and the stats names on a cold cache), every raw stats name (with a
+    // live poll too) and `hapi`. A name only in the disabled list does not,
+    // because that list seeds names that may not exist here and never expires.
+    // With a live poll, a stats name equal to its own key is the store's "no raw
+    // name seen yet" form of another name, not a second server. And when a
+    // server named exactly the key is listed, the stored name may be a removed
+    // server's: the store never lets the key's own name replace it, and that
+    // server's writes keep the row from expiring, so counting it would hide
+    // the survivor's numbers for good. Built here rather than with knownNames(),
+    // which needs a directory, drops `hapi` and caps its list.
+    const namesByKey = new Map<string, Set<string>>();
+    const know = (name: string): void => {
+      const key = normalizeMcpServerName(name);
+      const known = namesByKey.get(key) ?? new Set<string>();
+      known.add(name);
+      namesByKey.set(key, known);
+    };
+    for (const name of names) know(name);
+    for (const [key, row] of stats) {
+      if (row.name === key || names.has(key)) continue;
+      know(row.name);
+    }
+    know(HAPI_MCP_SERVER_NAME);
+
     const servers = [...names].map((name): McpCatalogEntry => {
-      const row = stats.get(normalizeMcpServerName(name));
-      return {
+      const key = normalizeMcpServerName(name);
+      const entry: McpCatalogEntry = {
         name,
         status: rows.get(name)?.status ?? "unknown",
         projectDisabled: project.disabled.has(name),
         hosted: name.startsWith(CLAUDE_AI_CONNECTOR_PREFIX),
+      };
+      const sharedKeyWith = [...(namesByKey.get(key) ?? [])]
+        .filter(other => other !== name)
+        .sort();
+      if (sharedKeyWith.length > 0) return { ...entry, sharedKeyWith };
+      const row = stats.get(key);
+      return {
+        ...entry,
         ...(row?.ram ? { ram: row.ram } : {}),
         ...(row?.context ? { context: row.context } : {}),
       };

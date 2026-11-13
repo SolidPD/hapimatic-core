@@ -22,7 +22,12 @@ import {
 } from "@/components/ui/dialog";
 import { useToast } from "@/components/Toast";
 import { PinKindBadge } from "@/components/pins/pinsShared";
-import { usePins, useSubmitPinAnswers } from "@/hooks/queries/usePins";
+import {
+  usePins,
+  useSetPinDeadline,
+  useSubmitPinAnswers,
+} from "@/hooks/queries/usePins";
+import { restoredPickAt } from "./PinDismissAction";
 import { useSessionProjectManager } from "@/hooks/queries/usePinDashboards";
 import {
   browserTimeZone,
@@ -64,6 +69,8 @@ type Phase =
   /** #6454: waiting for a resumed session to come back, then sending. */
   | { kind: "resuming"; preview: PinSubmissionResponse }
   | { kind: "unsupported" }
+  /** #6539: the session's node predates dismissals; nothing was sent. */
+  | { kind: "dismissUnsupported" }
   | { kind: "error"; message: string; preview?: PinSubmissionResponse };
 
 /** #6454: how often, and how long, Resume and send waits for the session. */
@@ -126,15 +133,64 @@ function refusalOf(error: unknown): Refusal | null {
 }
 
 /**
+ * #6539: the same Submit without its dismissals, under a new id, because the
+ * entry set changed and the old id may be on record somewhere. Its `submitted`
+ * holds only the pins it still sends, so the dismissals stay staged.
+ */
+function withoutDismissals(built: BuiltSubmission): BuiltSubmission {
+  const entries = (built.request?.entries ?? []).filter(
+    entry => entry.dismiss !== true
+  );
+  const kept = new Set(entries.map(entry => entry.key));
+  return {
+    request:
+      built.request && entries.length > 0
+        ? { ...built.request, submissionId: makeSubmissionId(), entries }
+        : null,
+    submitted: Object.fromEntries(
+      Object.entries(built.submitted).filter(([key]) => kept.has(key))
+    ),
+    stale: built.stale.filter(row => kept.has(row.key)),
+  };
+}
+
+/** #6539: dropped keys. A sent row under one is the pin's save (#6453), not its
+ *  dismissal or answer. */
+function droppedKeysOf(
+  entries: readonly { key: string; outcome: string }[]
+): Set<string> {
+  return new Set(entries.filter(e => e.outcome === "dropped").map(e => e.key));
+}
+
+/**
+ * #6539 R1: the server's code for a dismissal staged before the agent revised
+ * the pin. The pin stays open, so the dismissal stays staged (with any pick it
+ * holds) for the operator to Undo or redo, and is never forgotten.
+ */
+const STALE_DISMISS = "pin_dismiss_stale";
+
+/** "Sent 2 answers and 1 dismissal": dismissals are counted apart (#6539). */
+function sentToast(answers: number, dismissals: number): string {
+  const many = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
+  const parts = [
+    answers > 0 || dismissals === 0 ? many(answers, "answer") : null,
+    dismissals > 0 ? many(dismissals, "dismissal") : null,
+  ].filter(Boolean);
+  return `Sent ${parts.join(" and ")}`;
+}
+
+/**
  * One entry's answer, as the dialog lists it: "B. Wait", or "Steps 2/3 · Note".
  * #6453: a save reads "Saved", also for one the server added from another
  * device's Save (no request entry, but the result's pin has a saved folder).
+ * #6539: a dismissal reads "Dismiss", ahead of everything else.
  */
 function answerText(
   entry: PinSubmissionEntry | undefined,
   pin?: Parameters<typeof effectiveSavedTo>[0]
 ): string {
   if (!entry) return pin && effectiveSavedTo(pin) ? "Saved" : "";
+  if (entry.dismiss === true) return entry.note ? "Dismiss · Note" : "Dismiss";
   if (entry.choice !== undefined) {
     return `${entry.choice}${entry.label ? `. ${entry.label}` : ""}`;
   }
@@ -214,6 +270,17 @@ export function PinsSubmitDialog(props: {
   const setBusy = (on: boolean) => {
     busy.current = on;
     setWorking(on);
+  };
+  const { setDeadline } = useSetPinDeadline(api, sessionId);
+  // #6539: a dismissal that did not take gives back the pick it held off, as
+  // Undo does; a failed restore leaves the pin's line reading "off".
+  const releasePicks = (held: Record<string, StagedPin>, keys: string[]) => {
+    for (const key of keys) {
+      const pickAt = held[key]?.dismiss ? held[key]?.pickAt : undefined;
+      if (pickAt === undefined) continue;
+      const at = new Date(restoredPickAt(pickAt, Date.now())).toISOString();
+      void setDeadline(key, { at }).catch(() => undefined);
+    }
   };
   // #6454: where the answers go: the session (null) or its Project Manager.
   const [target, setTarget] = useState<string | null>(null);
@@ -340,6 +407,7 @@ export function PinsSubmitDialog(props: {
     "preview" in phase && phase.preview ? phase.preview : undefined;
   const sent = preview?.entries.filter(e => e.outcome === "sent") ?? [];
   const dropped = preview?.entries.filter(e => e.outcome === "dropped") ?? [];
+  const droppedKeys = droppedKeysOf(dropped);
   const titleOf = (key: string) =>
     pins.find(pin => pin.key === key)?.title ?? key;
   const kindOf = (key: string) =>
@@ -419,8 +487,52 @@ export function PinsSubmitDialog(props: {
     setPhase(withPreview(phaseForError(error), last));
   };
   refusedRef.current = refused;
+  const currentBuilt = built;
+  const currentPreview = preview;
 
-  const send = async (to: string | null = target) => {
+  /**
+   * #6539 (ruling D2): the session's node cannot take dismissals, so send the
+   * other answers through the normal Submit, which records them, and leave
+   * every dismissal staged with its note and its held pick. One press: the dry
+   * run for the smaller request, then the send under the same new id.
+   */
+  const sendWithoutDismissals = async () => {
+    if (!built || busy.current) return;
+    const next = withoutDismissals(built);
+    const request = requestFor(next.request, target);
+    if (!request) return;
+    setBuilt(next);
+    setBusy(true);
+    setPhase({ kind: "checking" });
+    let nextPreview: PinSubmissionResponse;
+    try {
+      nextPreview = await submit({ ...request, dryRun: true });
+    } catch (error) {
+      setBusy(false);
+      await refused(error, undefined, next.request);
+      return;
+    }
+    setBusy(false);
+    if (!alive.current) return;
+    if (!nextPreview.entries.some(e => e.outcome === "sent")) {
+      setPhase({ kind: "empty", dropped: nextPreview.entries });
+      return;
+    }
+    setPhase({ kind: "preview", preview: nextPreview });
+    // #6539 R2: what this dry run drops is shown, with its reason, before
+    // anything is sent; the operator then presses Send.
+    if (nextPreview.entries.some(e => e.outcome === "dropped")) return;
+    await send(target, { built: next, preview: nextPreview });
+  };
+
+  const send = async (
+    to: string | null = target,
+    // #6539: a request built in this same turn (Send without the dismissals),
+    // which the state this closure read does not hold yet.
+    override?: { built: BuiltSubmission; preview: PinSubmissionResponse }
+  ) => {
+    const built = override?.built ?? currentBuilt;
+    const preview = override?.preview ?? currentPreview;
     const request = requestFor(built?.request, to);
     if (!request || busy.current || !preview || !built) return;
     setBusy(true);
@@ -465,16 +577,36 @@ export function PinsSubmitDialog(props: {
         return;
       }
       settleStaging(sessionId, result, built.submitted);
+      const unmade = result.entries.filter(
+        e => (e.outcome !== "sent" || e.moot) && e.code !== STALE_DISMISS
+      );
+      const unmadeKeys = unmade.map(e => e.key);
+      releasePicks(built.submitted, unmadeKeys);
       if (allRecorded(result)) clearPendingSubmission(sessionId);
       const pending = result.entries.filter(
         e => e.outcome === "sent" && (e.recorded === false || e.moot)
       );
-      if (pending.length > 0) {
+      // #6539 R1: an entry the real Send dropped that the preview listed as
+      // sent (the agent revised the pin meanwhile) is shown, never closed on.
+      const shown = droppedKeysOf(preview.entries);
+      const lateDrop = result.entries.some(
+        e => e.outcome === "dropped" && !shown.has(e.key)
+      );
+      if (pending.length > 0 || lateDrop) {
         setPhase({ kind: "result", result });
         return;
       }
-      const n = result.entries.filter(e => e.outcome === "sent").length;
-      showToast(`Sent ${n} answer${n === 1 ? "" : "s"}`, { type: "success" });
+      const sentKeys = new Set(
+        result.entries.filter(e => e.outcome === "sent").map(e => e.key)
+      );
+      const droppedKeys = droppedKeysOf(result.entries);
+      const dismissals = request.entries.filter(
+        e =>
+          e.dismiss === true && sentKeys.has(e.key) && !droppedKeys.has(e.key)
+      ).length;
+      showToast(sentToast(sentKeys.size - dismissals, dismissals), {
+        type: "success",
+      });
       onOpenChange(false);
     } catch (error) {
       // A refusal (4xx) delivered nothing; a lost response may have.
@@ -535,7 +667,10 @@ export function PinsSubmitDialog(props: {
   };
 
   const sendPlain = async () => {
-    const request = built?.request;
+    // #6539 (KD9): a plain message records nothing, so a dismissal never goes
+    // out this way. It stays staged; only the other entries are sent and cleared.
+    const plain = built ? withoutDismissals(built) : null;
+    const request = plain?.request;
     if (!api || !request || busy.current) return;
     const text = fallbackText(request, pins, session.tag ?? sessionId);
     if (!text) {
@@ -554,7 +689,7 @@ export function PinsSubmitDialog(props: {
         return;
       }
       // Sent: the same answers must not go again with the next Submit.
-      if (built) clearSubmitted(sessionId, built.submitted);
+      if (plain) clearSubmitted(sessionId, plain.submitted);
       clearPendingSubmission(sessionId);
       showToast("Sent as a plain message. The pins stay open", {
         type: "info",
@@ -590,6 +725,14 @@ export function PinsSubmitDialog(props: {
     target === null &&
     typeof pinnedTarget !== "string";
   const pmName = pm?.name ?? "its Project Manager";
+  // #6539: what a node that cannot take dismissals can still be sent.
+  const isDismissal = (key: string) =>
+    built?.request?.entries.some(e => e.key === key && e.dismiss === true) ??
+    false;
+  const hasDismissals =
+    built?.request?.entries.some(e => e.dismiss === true) ?? false;
+  const hasOthers =
+    built?.request?.entries.some(e => e.dismiss !== true) ?? false;
   // Named wherever the dialog says which session it means: opened from a
   // Project Manager's page, "the session" would read as the page's own.
   const sessionName = session.name?.trim() || session.tag || null;
@@ -663,9 +806,19 @@ export function PinsSubmitDialog(props: {
                         Changed since you chose
                       </span>
                     ) : null}
-                    <span className="max-w-[40%] shrink-0 truncate text-[var(--app-hint)]">
+                    <span
+                      className={`max-w-[40%] shrink-0 truncate ${
+                        isDismissal(entry.key) && !droppedKeys.has(entry.key)
+                          ? "text-[var(--app-badge-error-text)]"
+                          : "text-[var(--app-hint)]"
+                      }`}
+                    >
                       {answerText(
-                        built?.request?.entries.find(e => e.key === entry.key),
+                        droppedKeys.has(entry.key)
+                          ? undefined
+                          : built?.request?.entries.find(
+                              e => e.key === entry.key
+                            ),
                         entry.pin
                       )}
                     </span>
@@ -684,7 +837,11 @@ export function PinsSubmitDialog(props: {
             </>
           ) : null}
           {phase.kind === "result" ? (
-            <ResultRows result={phase.result} titleOf={titleOf} />
+            <ResultRows
+              result={phase.result}
+              titleOf={titleOf}
+              isDismissal={isDismissal}
+            />
           ) : null}
           {phase.kind === "denied" ? (
             <Notice
@@ -709,7 +866,23 @@ export function PinsSubmitDialog(props: {
           {phase.kind === "unsupported" ? (
             <Notice
               title="This session's node is older and cannot receive pin answers"
-              text="Send them as a plain message instead? Pins will stay open."
+              text={
+                !hasOthers
+                  ? DISMISSALS_STAY
+                  : hasDismissals
+                    ? `Send your other answers as a plain message instead? Pins will stay open. ${DISMISSALS_STAY}`
+                    : "Send them as a plain message instead? Pins will stay open."
+              }
+            />
+          ) : null}
+          {phase.kind === "dismissUnsupported" ? (
+            <Notice
+              title="This session's node is older and cannot receive dismissals"
+              text={
+                hasOthers
+                  ? "Send your other answers now? The dismissals stay staged here."
+                  : DISMISSALS_STAY
+              }
             />
           ) : null}
           {phase.kind === "error" ? (
@@ -753,13 +926,27 @@ export function PinsSubmitDialog(props: {
               Resume and send
             </Button>
           ) : phase.kind === "unsupported" ? (
-            <Button type="button" onClick={() => void sendPlain()}>
-              Send as a message
-            </Button>
+            hasOthers ? (
+              <Button type="button" onClick={() => void sendPlain()}>
+                Send as a message
+              </Button>
+            ) : null
+          ) : phase.kind === "dismissUnsupported" ? (
+            // Only dismissals staged: nothing this node can take, so no send.
+            hasOthers ? (
+              <Button
+                type="button"
+                disabled={working}
+                onClick={() => void sendWithoutDismissals()}
+              >
+                Send without the dismissals
+              </Button>
+            ) : null
           ) : phase.kind === "empty" && staleKeys(phase, built).length > 0 ? (
             <Button
               type="button"
               onClick={() => {
+                releasePicks(built?.submitted ?? {}, staleKeys(phase, built));
                 dropPins(sessionId, staleKeys(phase, built));
                 onOpenChange(false);
               }}
@@ -854,25 +1041,37 @@ function allRecorded(result: PinSubmissionResponse): boolean {
 
 /**
  * What was sent and recorded leaves staging, and what the server dropped is
- * forgotten; an entry delivered but not yet recorded stays staged, so closing
- * before Retry loses nothing.
+ * forgotten, except a stale dismissal (#6539 R1), whose pin is still open; an
+ * entry delivered but not yet recorded stays staged, so closing before Retry
+ * loses nothing.
  */
 function settleStaging(
   sessionId: string,
   result: PinSubmissionResponse,
   submitted: Readonly<Record<string, Readonly<StagedPin>>>
 ): void {
+  // #6539 R1: a stale dismissal stays staged, even when the pin's save went.
+  const keep = new Set(
+    result.entries.filter(e => e.code === STALE_DISMISS).map(e => e.key)
+  );
   const done: Record<string, Readonly<StagedPin>> = {};
   for (const entry of result.entries) {
     const staged = submitted[entry.key];
-    if (entry.outcome === "sent" && entry.recorded !== false && staged) {
+    if (
+      entry.outcome === "sent" &&
+      entry.recorded !== false &&
+      staged &&
+      !keep.has(entry.key)
+    ) {
       done[entry.key] = staged;
     }
   }
   clearSubmitted(sessionId, done);
   dropPins(
     sessionId,
-    result.entries.filter(e => e.outcome === "dropped").map(e => e.key)
+    result.entries
+      .filter(e => e.outcome === "dropped" && !keep.has(e.key))
+      .map(e => e.key)
   );
 }
 
@@ -881,6 +1080,8 @@ function phaseForError(error: unknown): Phase {
   if (refusal?.code === "session_inactive") return { kind: "inactive" };
   if (refusal?.code === "pin_answers_unsupported")
     return { kind: "unsupported" };
+  if (refusal?.code === "pin_dismiss_unsupported")
+    return { kind: "dismissUnsupported" };
   if (refusal?.code === "pin_submission_empty") {
     return { kind: "empty", dropped: refusal.entries ?? [] };
   }
@@ -891,6 +1092,22 @@ function phaseForError(error: unknown): Phase {
       (error instanceof Error ? error.message : "Could not reach the session"),
   };
 }
+
+/**
+ * #6539 R1: why a pin was not sent, in plain words. A stale dismissal names
+ * what happened and that it is still staged; any other drop keeps the
+ * server's reason.
+ */
+export const STALE_DISMISS_TEXT =
+  "Not dismissed: the agent changed this pin after you chose to dismiss it. It is still marked Will dismiss.";
+function droppedText(entry: PinSubmissionResult): string {
+  if (entry.code === STALE_DISMISS) return STALE_DISMISS_TEXT;
+  return entry.reason ? `Not sent: ${entry.reason}` : "Not sent";
+}
+
+/** #6539: what happens to dismissals a node cannot take. */
+const DISMISSALS_STAY =
+  "The dismissals stay staged here. Undo on a pin releases it.";
 
 function Line(props: { text: string }) {
   return <div className="py-2 text-[var(--app-hint)]">{props.text}</div>;
@@ -945,38 +1162,75 @@ function DroppedRows(props: {
 function ResultRows(props: {
   result: PinSubmissionResponse;
   titleOf: (key: string) => string;
+  /** #6539: a dismissal is worded as one, never as an answer. */
+  isDismissal: (key: string) => boolean;
 }) {
   const sent = props.result.entries.filter(e => e.outcome === "sent");
-  const unrecorded = sent.filter(e => e.recorded === false).length;
+  const dropped = props.result.entries.filter(e => e.outcome === "dropped");
+  const droppedKeys = droppedKeysOf(props.result.entries);
+  const isDismissal = (key: string) =>
+    props.isDismissal(key) && !droppedKeys.has(key);
+  const unrecorded = sent.filter(e => e.recorded === false);
+  const undismissed = unrecorded.filter(e => isDismissal(e.key)).length;
+  const unanswered = unrecorded.length - undismissed;
+  const pins = (n: number) => `${n} pin${n === 1 ? "" : "s"}`;
+  const failures = [
+    unanswered > 0 ? `${pins(unanswered)} could not be marked answered` : null,
+    undismissed > 0 ? `${pins(undismissed)} could not be dismissed` : null,
+  ].filter(Boolean);
   return (
     <>
       <Line
         text={
-          unrecorded > 0
-            ? `Sent to the session. ${unrecorded} pin${unrecorded === 1 ? "" : "s"} could not be marked answered.`
+          failures.length > 0
+            ? `Sent to the session. ${failures.join(", and ")}.`
             : "Sent to the session."
         }
       />
       <ul className="border-t border-[var(--app-divider)]">
-        {sent.map(entry => (
-          <li
-            key={entry.key}
-            className="border-b border-[var(--app-divider)] py-1"
-          >
-            {/* The status on its own line, so a long one never hides the title. */}
-            <span className="block truncate">{props.titleOf(entry.key)}</span>
-            <span
-              className={`block text-[length:var(--text-caption)] ${entry.moot || entry.recorded === false ? "text-[var(--status-warn)]" : "text-[var(--app-hint)]"}`}
+        {sent.map(entry => {
+          const dismissal = isDismissal(entry.key);
+          return (
+            <li
+              key={entry.key}
+              className="border-b border-[var(--app-divider)] py-1"
             >
-              {entry.recorded === false
-                ? "Not marked answered yet"
-                : entry.moot
-                  ? "Recorded as moot: the pin changed since you chose"
-                  : "Recorded"}
-            </span>
-          </li>
-        ))}
+              {/* The status on its own line, so a long one never hides the title. */}
+              <span className="block truncate">{props.titleOf(entry.key)}</span>
+              <span
+                className={`block text-[length:var(--text-caption)] ${entry.moot || entry.recorded === false ? "text-[var(--status-warn)]" : "text-[var(--app-hint)]"}`}
+              >
+                {entry.recorded === false
+                  ? dismissal
+                    ? "Not dismissed yet"
+                    : "Not marked answered yet"
+                  : entry.moot
+                    ? dismissal
+                      ? "Not dismissed: the pin changed since you chose to dismiss"
+                      : "Recorded as moot: the pin changed since you chose"
+                    : dismissal
+                      ? "Dismissed"
+                      : "Recorded"}
+              </span>
+            </li>
+          );
+        })}
       </ul>
+      {dropped.length > 0 ? (
+        <ul className="mt-2">
+          {dropped.map((entry, index) => (
+            <li
+              key={`${entry.key}:${index}`}
+              className="border-b border-[var(--app-divider)] py-1"
+            >
+              <span className="block truncate">{props.titleOf(entry.key)}</span>
+              <span className="block text-[length:var(--text-caption)] text-[var(--status-warn)]">
+                {droppedText(entry)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </>
   );
 }

@@ -39,7 +39,11 @@ import {
 } from "@/accounts/legacyConfigDirMigration";
 import { logger } from "@/ui/logger";
 import { isTenantVm, tenantSignInRequiredMessage } from "@/accounts/tenantMode";
-import { withPermissionModeArg } from "@/claude/spawnPermissionSeed";
+import {
+  permissionNarrowingHolds,
+  relaunchPermissionArgs,
+  withPermissionModeArg,
+} from "@/claude/spawnPermissionSeed";
 
 /**
  * Multi-account OAuth (epic #1446, Sub-Issue D): per-session account-token
@@ -909,10 +913,37 @@ export async function buildEntitledModelArgs(
     return base;
   }
   // Defensive: respect a model already present in claudeArgs.
-  if (base.includes("--model")) return base;
+  if (hasModelArg(base)) return base;
   const model = await resolveEntitledModelForBoundAccount(deps);
   if (!model) return base;
   return [...base, "--model", model];
+}
+
+/**
+ * Whether a claude argv already names a model, as `--model <m>` or
+ * `--model=<m>` (#6400). Claude Code accepts both spellings and keeps the LAST
+ * `--model`, so an appended model would override a caller's `=` form; every
+ * appender in this module skips when this is true, as {@link appendEffortArg}
+ * does for `--effort=` (#6166).
+ */
+export function hasModelArg(args: readonly string[]): boolean {
+  return args.some(a => a === "--model" || a.startsWith("--model="));
+}
+
+/**
+ * The model the claude child runs: the value of the LAST `--model <m>` or
+ * `--model=<m>` token, or `undefined` (#6400). Claude Code keeps the last model
+ * flag in either spelling (measured on 2.1.321), so the window follows it; an
+ * argv with at most one model flag reads exactly as the old `indexOf` did.
+ */
+function explicitModelArg(args: readonly string[]): string | undefined {
+  let model: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--model") model = args[++i];
+    else if (a.startsWith("--model=")) model = a.slice("--model=".length);
+  }
+  return model;
 }
 
 /**
@@ -931,6 +962,22 @@ export function appendEffortArg(
     return args;
   }
   return [...args, "--effort", effort];
+}
+
+/**
+ * Issue #6617 (Matt 43a, 2026-11-11): the permission step of a tmux / pty
+ * child's argv. Switch on, the live mode decides the flags, the bypass tokens
+ * included ({@link relaunchPermissionArgs}), so a session started in bypass and
+ * narrowed in the UI relaunches in the narrower mode. Switch off, the
+ * pre-#6617 step ({@link withPermissionModeArg}).
+ */
+export function applySpawnPermissionArgs(
+  args: string[],
+  mode: string | undefined
+): string[] {
+  return permissionNarrowingHolds()
+    ? relaunchPermissionArgs(args, mode, { appendMode: true })
+    : withPermissionModeArg(args, mode);
 }
 
 /**
@@ -966,7 +1013,8 @@ export async function resolveSpawnClaudeArgs(
   >,
   accountConfigDir: string | null,
   claudeArgs: string[] | undefined,
-  deps: ResolveAccountTokenDeps = {}
+  deps: ResolveAccountTokenDeps = {},
+  opts: { permission?: boolean } = {}
 ): Promise<string[]> {
   const base = claudeArgs ?? [];
   const mode = session.getModelMode();
@@ -978,9 +1026,16 @@ export async function resolveSpawnClaudeArgs(
   // Issue #6218: the LIVE permission mode reaches the tmux / pty child as
   // `--permission-mode` on every return path too. It is read per launch, so a
   // relaunch follows the session's saved mode, not the start-time seed.
+  // Issue #6617: the live mode also decides the bypass tokens (a start in
+  // bypass narrowed in the UI drops them). `{ permission: false }` skips the
+  // step, for the tmux launcher, which applies it per attempt instead.
   const permissionMode = session.getPermissionMode();
-  const withEffort = (args: string[]): string[] =>
-    withPermissionModeArg(appendEffortArg(args, effort), permissionMode);
+  const withEffort = (args: string[]): string[] => {
+    const withEff = appendEffortArg(args, effort);
+    return opts.permission === false
+      ? withEff
+      : applySpawnPermissionArgs(withEff, permissionMode);
+  };
 
   // Issue #1633: an EXPLICIT user model selection must reach the child's argv
   // on BOTH paths — before this, nothing ever appended it: the isolated path
@@ -997,7 +1052,7 @@ export async function resolveSpawnClaudeArgs(
     mode !== "default" &&
     raw !== undefined &&
     raw !== ENTITLED_PIN_MODEL &&
-    !base.includes("--model")
+    !hasModelArg(base)
   ) {
     return withEffort([...base, "--model", raw]);
   }
@@ -1013,7 +1068,7 @@ export async function resolveSpawnClaudeArgs(
     mode === "default" &&
     raw !== undefined &&
     raw !== ENTITLED_PIN_MODEL &&
-    !base.includes("--model")
+    !hasModelArg(base)
   ) {
     return withEffort([...base, "--model", raw]);
   }
@@ -1049,7 +1104,8 @@ export function resolveContextWindowForModel(
  * covering BOTH the host/env-token path AND the CLAUDE_CONFIG_DIR-isolated path.
  *
  * Precedence:
- *   1. An explicit `--model` in the spawn args wins: resolve the window from it.
+ *   1. An explicit `--model <m>` or `--model=<m>` (#6400) in the spawn args
+ *      wins: resolve the window from it.
  *      This covers a user selection (incl. the isolated explicit-selection pin
  *      #1633 appends via `resolveSpawnClaudeArgs`) AND the entitled `opus[1m]`
  *      pin the env-token path appends via `buildEntitledModelArgs`. Preserves
@@ -1072,8 +1128,7 @@ export async function resolveSpawnContextWindow(
   accountConfigDir: string | null,
   deps: ResolveAccountTokenDeps = {}
 ): Promise<number | undefined> {
-  const modelIdx = spawnArgs.indexOf("--model");
-  const explicitModel = modelIdx >= 0 ? spawnArgs[modelIdx + 1] : undefined;
+  const explicitModel = explicitModelArg(spawnArgs);
   if (explicitModel) return resolveContextWindowForModel(explicitModel);
   if (accountConfigDir) {
     const entitled = await resolveEntitledModelForBoundAccount(deps);

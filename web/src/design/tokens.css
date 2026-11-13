@@ -556,6 +556,13 @@
      as a :root token for the rare JS / arbitrary-value case. Content width is
      not theme-swappable, so config residence does not violate the swap contract. */
   --content-width: 1024px;
+  /* The brand letterbox on each side of the content column: 0 until the window
+     is wider than the column. Everything Hapimatic draws stays inside the
+     column, so a `fixed` element that anchors to a window edge offsets by this
+     (`inset-x-[var(--content-gutter)]`, `right-[calc(var(--content-gutter)+1rem)]`);
+     `bun run check:content-bounds` fails one that does not. AppShell sets it to
+     0px on <html> while the content region is full width (split view). */
+  --content-gutter: max(0px, calc((100vw - var(--content-width)) / 2));
 
   /* ── shadcn/ui semantic tokens — mapped to Hapimatic --app-* values ──── */
   --background: #1c1c1e;

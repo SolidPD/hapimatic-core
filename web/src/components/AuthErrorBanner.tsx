@@ -15,7 +15,7 @@ export function AuthErrorBanner({
   // R4 (#2779): pad past the iOS notch / Dynamic Island — see SyncingBanner.
   return (
     <div
-      className="fixed top-0 left-0 right-0 bg-red-600 text-white text-center py-2 text-sm font-medium z-50 flex items-center justify-center gap-2"
+      className="fixed top-0 inset-x-[var(--content-gutter)] bg-red-600 text-white text-center py-2 text-sm font-medium z-50 flex items-center justify-center gap-2"
       style={{ paddingTop: "max(0.5rem, env(safe-area-inset-top, 0.5rem))" }}
     >
       <span>Session expired. Please log in again.</span>

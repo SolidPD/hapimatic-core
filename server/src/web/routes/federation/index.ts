@@ -26,9 +26,11 @@ import { createSystemJobsReceiverRoutes } from "./systemJobs";
 import { createFederationHealthRoutes } from "./health";
 import { createFederationTelemetryRoutes } from "./telemetry";
 import { createFederationTurnFeedRoutes } from "./turnFeed";
+import { createFederationIntervalFeedRoutes } from "./intervalFeed";
 import { createFederationSpawnRosterRoutes } from "./spawnRoster";
 import { createFederationCapabilitiesRoutes } from "./capabilities";
 import { createFederationNotificationRoutes } from "./notifications";
+import { createFederationPinByIdRoutes } from "./pinById";
 import { createFederationPinDashboardRoutes } from "./pinDashboards";
 
 export type { FederationDeps } from "./shared";
@@ -91,6 +93,9 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   app.route("/", createFederationTelemetryRoutes(deps));
   // Issue #4614: turn-ledger mirror feed (fed-token receivers) + status (JWT).
   app.route("/", createFederationTurnFeedRoutes(deps));
+  // #6586: the billable interval feed, a separate route so a malformed interval
+  // row can never poison a turn page.
+  app.route("/", createFederationIntervalFeedRoutes(deps));
   // Issue #1936 (producer for rp1-home#1054): PM spawn-roster federation read path —
   // hub aggregator (JWT GET) + peer-incoming query receiver (fed-token POST).
   app.route("/", createFederationSpawnRosterRoutes(deps));
@@ -104,5 +109,8 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   // Issue #6454: peer-incoming Project Manager dashboards (fed-token + caller
   // namespace, local dashboards only) behind the hub's /api/pins/dashboards.
   app.route("/", createFederationPinDashboardRoutes(deps));
+  // Issue #6574: peer-incoming read of a pin by its ID (fed-token + caller
+  // namespace, local pins only) behind the hub's /api/pins/by-id fan-out.
+  app.route("/", createFederationPinByIdRoutes(deps));
   return app;
 }

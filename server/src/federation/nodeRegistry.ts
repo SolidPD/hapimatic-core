@@ -1544,8 +1544,17 @@ export class NodeRegistry {
     if (typeof data.active === "boolean") session.active = data.active;
     if (typeof data.activeAt === "number") session.activeAt = data.activeAt;
     if (typeof data.updatedAt === "number") session.updatedAt = data.updatedAt;
-    if (typeof data.thinkingStartedAt === "number")
-      session.thinkingStartedAt = data.thinkingStartedAt;
+    // Issue #6586 (mirrors #1647 rateLimited): an explicit null — sent only by a
+    // node in billable `on` when no billable interval is open — clears the
+    // cached start; an absent key (an older peer, or a node in shadow or off)
+    // leaves it. The receive is an unvalidated cast, so any other type is ignored.
+    if ("thinkingStartedAt" in data) {
+      if (typeof data.thinkingStartedAt === "number") {
+        session.thinkingStartedAt = data.thinkingStartedAt;
+      } else if (data.thinkingStartedAt === null) {
+        session.thinkingStartedAt = null;
+      }
+    }
     if (typeof data.serverAccumulatedMs === "number")
       session.serverAccumulatedMs = data.serverAccumulatedMs;
     // Issue #1647: carry the rate-limited delta through the federation real-time
@@ -2828,6 +2837,25 @@ export class NodeRegistry {
     });
   }
 
+  /**
+   * Read a page of a remote origin's closed billable intervals (issue #6586).
+   * Built on `readPeerRoute`, never `proxyToNode`, because the puller must tell
+   * an old peer (`unsupported`: 404, or the JWT middleware's 401 "Invalid
+   * token" for a route it does not have) from a broken one (`unreachable`). The
+   * `ok` body is untrusted: the puller validates it as an `IntervalFeedPage`.
+   */
+  async getIntervalFeedOnNode(
+    nodeId: string,
+    opts: { cursor?: number; limit?: number }
+  ): Promise<PeerReadOutcome> {
+    return this.readPeerRoute(
+      nodeId,
+      "/api/federation/interval-feed",
+      "Interval-feed",
+      { body: { cursor: opts.cursor, limit: opts.limit } }
+    );
+  }
+
   /** Proxy a remote origin's turn-feed drift digest (issue #4614). POST-only. */
   async getTurnFeedDigestOnNode(
     nodeId: string
@@ -2950,6 +2978,24 @@ export class NodeRegistry {
     );
   }
 
+  /**
+   * #6574: ask a peer whether it holds the pin with this ID in the caller's
+   * namespace. The receiver answers 200 `{found}` for a hit and a miss alike,
+   * because this read maps a 404 to `unsupported`.
+   */
+  async getPinByIdOnNode(
+    nodeId: string,
+    pinId: string,
+    namespace: string
+  ): Promise<PeerReadOutcome> {
+    return this.readPeerRoute(
+      nodeId,
+      `/api/federation/pins/by-id/${encodeURIComponent(pinId)}`,
+      "Pin by ID",
+      { namespace, timeoutMs: NOTIFICATION_PROXY_TIMEOUT_MS }
+    );
+  }
+
   // ── Notifications (issue #4913) ─────────────────────────────────────────
   // Hub → peer proxies for the /api/notifications fan-out. Each forwards the
   // caller's namespace (the receivers fail closed without it, #1097) and uses a
@@ -3040,12 +3086,13 @@ export class NodeRegistry {
    *   - any other 2xx → `ok` with the parsed body, for the caller to validate.
    * `label` names the read in the malformed message. `namespace` forwards the
    * caller as `X-Hapi-Caller-Namespace`, for a receiver that scopes to it (#6454).
+   * `body` is posted in place of `{}` (#6586: the interval feed's cursor).
    */
   private async readPeerRoute(
     nodeId: string,
     endpoint: string,
     label: string,
-    options: { namespace?: string; timeoutMs?: number } = {}
+    options: { namespace?: string; timeoutMs?: number; body?: unknown } = {}
   ): Promise<PeerReadOutcome> {
     const state = this.nodeStates.get(nodeId);
     if (!state || state.status === "offline") {
@@ -3057,7 +3104,7 @@ export class NodeRegistry {
       res = await this.fetchWithAuth(
         url,
         "POST",
-        {},
+        options.body ?? {},
         options.timeoutMs ?? FETCH_TIMEOUT_MS,
         options.namespace
           ? { "X-Hapi-Caller-Namespace": options.namespace }

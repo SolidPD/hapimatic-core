@@ -65,6 +65,8 @@ import { ThemePicker } from "@/components/settings/ThemePicker";
 import { BackupKeySection } from "@/components/settings/sections/BackupKeySection";
 import { SessionHandoffSection } from "@/components/settings/sections/SessionHandoffSection";
 import { PinsDefaultsSection } from "@/components/settings/sections/PinsDefaultsSection";
+import { CompactAtSection } from "@/components/settings/sections/CompactAtSection";
+import { useCompactAtPreference } from "@/hooks/useCompactAtPreference";
 import { OnboardingSection } from "@/components/settings/sections/OnboardingSection";
 import { VoiceInputSection } from "@/components/settings/sections/VoiceInputSection";
 import { useScrollToLocationHash } from "@/hooks/useScrollToLocationHash";
@@ -532,6 +534,9 @@ export default function AdminPreferencesPage() {
   // #6451: the Pins defaults show only while this instance's Pins gate is open,
   // the read `useSessionViewOptions` gates the Pins tab on.
   const pinsEnabled = useVersion().data?.pinsEnabled === true;
+  // #6570: ONE read of this node's Compact at, shared by its section and by
+  // Session Handoff (whose "at or above Compact at" warning compares against it).
+  const compactAt = useCompactAtPreference(api);
   const { localNode, remoteNodes } = useFederatedSessions(api);
   // #4906 D2: the Backup Key section's gate, the same fail-closed derivation the
   // retired Keys page used.
@@ -1064,6 +1069,10 @@ export default function AdminPreferencesPage() {
             above, the rows after it read as part of it. */}
         {pinsEnabled ? <PinsDefaultsSection api={api} /> : null}
 
+        {/* Compact at (#6570): when every Claude session this machine starts
+            compacts. Above Session Handoff, separate from it. */}
+        <CompactAtSection compactAt={compactAt} />
+
         {/* Session Handoff (folded from /settings/watermark — Settings reorg).
             #4906: no menu row; the section stays deep-linkable via #session-handoff. */}
         <section
@@ -1076,7 +1085,7 @@ export default function AdminPreferencesPage() {
             accent={tokens.cyan}
             title="Session Handoff"
           />
-          <SessionHandoffSection />
+          <SessionHandoffSection compactAt={compactAt} />
         </section>
 
         {/* Backup Key (#2507; #4906 D2: moved here from the retired Keys page, no

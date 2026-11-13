@@ -2,6 +2,7 @@
 import { z } from "zod";
 import { isUnsafePathSegment } from "./capabilityCatalog/pathSegment";
 import { addLaneIssues, PinLanesSchema } from "./pinDashboard";
+import { isPinIdShaped } from "./pinId";
 import { canonicalJson, utf8ByteLength } from "./throughput";
 
 // Pins: every decision a session needs from the operator, as a typed record
@@ -124,6 +125,13 @@ export const PinKeySchema = z
   .refine(
     key => !APPROVAL_TOKEN_PATTERN.test(key),
     "must not contain an approval token (USER-APPROVAL-…)"
+  )
+  // #6574 (R10): a key shaped like a pin ID would be read as one by anyone who
+  // pastes it, and every pin already has a server-owned ID; refuse it so a key and
+  // an ID can never be confused.
+  .refine(
+    key => !isPinIdShaped(key),
+    "must not look like a pin ID (pin- and ten characters): the server gives every pin its own ID; read another session's pin with pin_get({id})"
   );
 
 /** True for a key only the server may create, withdraw, or resolve (#6455). */
@@ -510,6 +518,11 @@ export const PinAnswerSchema = z
      * session: its Project Manager, because this session was not running (#6454).
      */
     deliveredTo: z.string().max(200).optional(),
+    /**
+     * The operator dismissed the pin in a Submit (#6539). Such an entry has
+     * `resolves: false`, so it is never read as the pin's answer.
+     */
+    dismissed: z.literal(true).optional(),
   })
   .loose();
 export type PinAnswer = z.infer<typeof PinAnswerSchema>;
@@ -569,6 +582,13 @@ export type Pin = PinContent & {
   savedTo?: string | null;
   savedRevision?: number | null;
   saveReportPending?: boolean;
+  /**
+   * #6574: the pin's server-owned ID (`pin-` and ten characters,
+   * `shared/src/pinId.ts`), minted when the pin is first posted and never changed or
+   * reused. Server-owned like `savedTo`: an agent never sends it. Optional because a
+   * peer older than P omits it; read a missing value as null.
+   */
+  pinId?: string | null;
   /** ISO-8601 UTC. */
   createdAt: string;
   /** ISO-8601 UTC. Moves on a content or status change, not on a star or a mark-seen. */
@@ -610,6 +630,8 @@ export const PinSchema = z
     savedTo: z.string().nullable().optional(),
     savedRevision: z.number().int().nullable().optional(),
     saveReportPending: z.boolean().optional(),
+    // #6574: optional, because a peer older than P omits it.
+    pinId: z.string().nullable().optional(),
     createdAt: z.string(),
     updatedAt: z.string(),
     deadlineAt: z.string().nullable().optional(),
@@ -683,6 +705,53 @@ export const PinGetResponseSchema = z
   })
   .loose();
 export type PinGetResponse = z.infer<typeof PinGetResponseSchema>;
+
+/** #6574: a node named in a by-ID answer. */
+export const PinByIdNodeSchema = z
+  .object({ nodeId: z.string(), nodeLabel: z.string() })
+  .loose();
+
+/**
+ * #6574: `GET /api/pins/by-id/:pinId` and `GET /cli/pins/by-id/:pinId`, the 200
+ * body: the pin (approval tokens blanked), its session's open count, the owning
+ * node's pin time zone, and the owning session. Loose, for a newer server.
+ */
+export const PinByIdResponseSchema = z
+  .object({
+    pin: PinSchema,
+    openPinCount: z.number().int(),
+    timeZone: z.string().nullable().optional(),
+    session: z
+      .object({
+        id: z.string(),
+        name: z.string().nullable().optional(),
+        nodeId: z.string().nullable().optional(),
+        nodeLabel: z.string().nullable().optional(),
+      })
+      .loose()
+      .optional(),
+  })
+  .loose();
+export type PinByIdResponse = z.infer<typeof PinByIdResponseSchema>;
+
+/**
+ * #6574: the body of a by-ID refusal: 404 `pin_not_found` (with `notAsked`, the
+ * offline nodes that were not asked), 409 `pin_id_ambiguous` (with `matches`), 503
+ * `pin_lookup_incomplete` (with `nodes`). Loose; every field optional.
+ */
+export const PinByIdErrorBodySchema = z
+  .object({
+    error: z.string().optional(),
+    code: z.string().optional(),
+    notAsked: z.array(PinByIdNodeSchema).optional(),
+    nodes: z.array(PinByIdNodeSchema).optional(),
+    matches: z
+      .array(
+        PinByIdNodeSchema.extend({ sessionId: z.string(), key: z.string() })
+      )
+      .optional(),
+  })
+  .loose();
 
 /**
  * Every pin write. `changed` is false for a no-op. A resolve also carries

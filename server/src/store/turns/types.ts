@@ -27,6 +27,27 @@ export type TurnStatus =
   | "orphaned";
 
 /**
+ * The turn statuses whose `duration_ms` is an estimate of a turn span (issue
+ * #6586, R12). A turn row's `duration_ms` is a turn span, never billable time:
+ * billable time is the stored thinking intervals (`thinking_intervals`).
+ *
+ * - `orphaned`: a row swept by the hub (`TurnStore.markOrphaned`). Its end is
+ *   taken from a transcript watermark, or from its own start when the transcript
+ *   is gone, and its `duration_ms` is NULL when the watermark could not be read.
+ * - `interrupted`: a row finalized by the CLI (`TurnFinalizeEvent.outcome`; the
+ *   sweep produces `orphaned` only) as an open-to-finalize span that can include
+ *   idle time.
+ *
+ * Neither is billable time.
+ */
+export const ESTIMATED_TURN_STATUSES = ["orphaned", "interrupted"] as const;
+
+/** True for a turn status whose span is an estimate ({@link ESTIMATED_TURN_STATUSES}). */
+export function isEstimatedTurnStatus(status: TurnStatus | string): boolean {
+  return (ESTIMATED_TURN_STATUSES as readonly string[]).includes(status);
+}
+
+/**
  * Canonical `turn_events.kind` values. Modeled as a TS union, NOT a SQL CHECK
  * constraint (Key Decision K1): the epic reserves kinds that are wired later
  * (`cron_started` / `cron_stopped`), and a rigid CHECK enum would force a table

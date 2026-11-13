@@ -60,6 +60,7 @@ import {
 // (hooks/queries/usePins.ts), so they stay out of the main bundle, whose size
 // `maximumFileSizeToCacheInBytes` in vite.config.ts caps for the PWA precache.
 import type {
+  Pin,
   PinDashboardsResponse,
   PinDeadlineRequest,
   PinGetResponse,
@@ -114,7 +115,12 @@ import type {
   CapabilityCatalogResponse,
   CapabilityAuditResponse,
 } from "@/types/capabilities";
-import type { AccountMonogram, GateDenialOutcome } from "@hapi/protocol";
+import type {
+  AccountMonogram,
+  CompactAtPreferencePatch,
+  CompactAtPreferenceResponse,
+  GateDenialOutcome,
+} from "@hapi/protocol";
 import type {
   AccountsResponse,
   AccountUsageHistoryResponse,
@@ -320,6 +326,21 @@ const TELEMETRY_REPORT_OPTS: RequestReportOptions = {
 };
 
 /**
+ * Issue #6367: the five throughput reads under `/api/telemetry/throughput/*`
+ * answer 503 from exactly one place, the `unavailable` helper in
+ * `server/src/web/routes/throughput.ts`, when the throughput service is null:
+ * `HAPI_THROUGHPUT_DISABLED=1`, `settings.throughput.disabled`, or the
+ * subsystem did not start. That is a designed answer, so it is not reported;
+ * a 500 or the digest detail's 404 still is. Only the report is suppressed:
+ * the ApiError is still thrown, so the Throughput tab keeps saying
+ * "Throughput telemetry is not available on this node". Kept apart from
+ * {@link TELEMETRY_REPORT_OPTS}, whose 503s come from the #6516 executor.
+ */
+const THROUGHPUT_REPORT_OPTS: RequestReportOptions = {
+  expectedStatuses: [503],
+};
+
+/**
  * Issue #6516 A-2: how long an Analytics read may take before the client gives
  * up. The server answers every telemetry request within its executor's bounds
  * (`server/src/telemetry/executor.ts`): a job waits at most 600 s in the queue
@@ -382,6 +403,19 @@ const FEEDBACK_INBOX_WRITE_EXPECTED = [409, 502, 503, 504] as const;
 /** …and of Convert: 422 is the feedback label missing in the target repo. */
 const FEEDBACK_INBOX_CONVERT_EXPECTED = [409, 422, 502, 503, 504] as const;
 
+/** #6574: `GET /api/pins/by-id/:pinId`'s 200 body, as the server sends it. */
+export type PinByIdResponse = {
+  pin: Pin;
+  openPinCount: number;
+  timeZone: string | null;
+  session: {
+    id: string;
+    name: string | null;
+    nodeId: string | null;
+    nodeLabel: string | null;
+  };
+};
+
 export class ApiError extends Error {
   status: number;
   code?: string;
@@ -427,6 +461,9 @@ export interface BulkDeleteSessionsResponse {
 
 export interface WatermarkStatus {
   enabled: boolean;
+  /** #6570 R11: "env" when HAPI_CONTEXT_WATERMARK_ENABLED decides `enabled`
+   *  (the switch is then disabled). Absent from a server before #6570. */
+  enabledSource?: "env" | "settings";
   watermarkPercent: number;
   roles: string[];
   states: WatermarkState[];
@@ -522,6 +559,8 @@ export interface ApprovalStateResponse {
  */
 export interface WatermarkConfigUpdateResult {
   enabled: boolean;
+  /** #6570 R11 (see {@link WatermarkStatus}). */
+  enabledSource?: "env" | "settings";
   watermarkPercent: number;
   roles: string[];
   forcedByEnv: boolean;
@@ -2456,6 +2495,27 @@ export class ApiClient {
   }
 
   /**
+   * #6574: read any pin in the caller's namespace by its ID, across nodes. Raw
+   * JSON, parsed in the Pins chunk (`usePinByIdLookup`). Its refusals are expected
+   * outcomes the search line explains: 404 no such pin (naming offline nodes in
+   * `notAsked`), 409 two nodes hold it, 429 too many lookups, 503 some nodes could
+   * not be asked; the `ApiError` carries the body.
+   */
+  async getPinById(
+    pinId: string,
+    opts?: { signal?: AbortSignal }
+  ): Promise<PinByIdResponse> {
+    return await this.request<PinByIdResponse>(
+      `/api/pins/by-id/${encodeURIComponent(pinId)}`,
+      opts?.signal ? { signal: opts.signal } : undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [404, 409, 429, 503] }
+    );
+  }
+
+  /**
    * #6453: copy a pin's files into `GeneratedFiles/pins/<folder>/` in the
    * session's folder and record the save. The caller validates the response.
    * Its refusals are expected outcomes the Save button explains (409 nothing to
@@ -4064,6 +4124,25 @@ export class ApiClient {
     );
   }
 
+  // ── Compact at (issue #6570) ─────────────────────────────────────────
+
+  /** GET this node's compact-at percentage and the token point where a session compacts. */
+  async getCompactAtPreference(): Promise<CompactAtPreferenceResponse> {
+    return await this.request<CompactAtPreferenceResponse>(
+      "/api/preferences/compact-at"
+    );
+  }
+
+  /** PUT `{ enabled?, percent? }`; returns the same shape as the GET. */
+  async setCompactAtPreference(
+    patch: CompactAtPreferencePatch
+  ): Promise<CompactAtPreferenceResponse> {
+    return await this.request<CompactAtPreferenceResponse>(
+      "/api/preferences/compact-at",
+      { method: "PUT", body: JSON.stringify(patch) }
+    );
+  }
+
   // ── Auto-recover preference (epic #1231 sub-issue E) ─────────────────
 
   async getAutoRecoverPreference(): Promise<AutoRecoverPreference> {
@@ -4810,6 +4889,24 @@ export class ApiClient {
     );
   }
 
+  /**
+   * One throughput read (#6367): its designed 503 is not reported
+   * ({@link THROUGHPUT_REPORT_OPTS}), and it keeps the 30 s default timeout,
+   * because the throughput routes read node-local rollups on the request path
+   * rather than going through the #6516 query executor. Every throughput
+   * getter goes through here, so a new one cannot miss the option.
+   */
+  private async throughputRequest<T>(path: string): Promise<T> {
+    return await this.request<T>(
+      path,
+      undefined,
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      THROUGHPUT_REPORT_OPTS
+    );
+  }
+
   async getTelemetrySummary(
     filters?: {
       fileType?: string;
@@ -4984,7 +5081,7 @@ export class ApiClient {
       from: String(range.from),
       to: String(range.to),
     });
-    return await this.request<ThroughputSummary>(
+    return await this.throughputRequest<ThroughputSummary>(
       `/api/telemetry/throughput/summary?${params.toString()}`
     );
   }
@@ -5001,7 +5098,7 @@ export class ApiClient {
       to: String(range.to),
     });
     if (cursor) params.set("cursor", cursor);
-    return await this.request<ThroughputBreakdown>(
+    return await this.throughputRequest<ThroughputBreakdown>(
       `/api/telemetry/throughput/breakdown?${params.toString()}`
     );
   }
@@ -5015,19 +5112,21 @@ export class ApiClient {
       from: String(range.from),
       to: String(range.to),
     });
-    return await this.request<ThroughputTestsPage>(
+    return await this.throughputRequest<ThroughputTestsPage>(
       `/api/telemetry/throughput/tests?${params.toString()}`
     );
   }
 
   /** The stored weekly digests, newest first. */
   async getThroughputDigests(): Promise<DigestList> {
-    return await this.request<DigestList>("/api/telemetry/throughput/digests");
+    return await this.throughputRequest<DigestList>(
+      "/api/telemetry/throughput/digests"
+    );
   }
 
   /** One stored weekly digest. */
   async getThroughputDigest(id: string): Promise<DigestDetail> {
-    return await this.request<DigestDetail>(
+    return await this.throughputRequest<DigestDetail>(
       `/api/telemetry/throughput/digests/${encodeURIComponent(id)}`
     );
   }

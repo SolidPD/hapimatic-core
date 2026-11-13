@@ -26,6 +26,7 @@ import {
 } from "../config/timeLogConfig";
 import type { PinBatchAnswer, PinBatchOutcome } from "../store/pinStore";
 import { RecordVetoError } from "./messageService";
+import { DETECTED_PIN_PREFIX } from "./pinTurnCheck";
 import type { MessageOrigin } from "./sentFrom";
 import type { Session, SyncEngine } from "./syncEngine";
 
@@ -116,8 +117,12 @@ function check(
   seen.add(entry.key);
   if (!pin) return drop("no longer exists", "pin_missing");
   // #6455 mirrors native prompts as `prompt:` pins, which resolve through their
-  // own control; `detected:` pins are dismiss-only.
-  if (isReservedPinKey(pin.key)) {
+  // own control; `detected:` pins are dismiss-only, so a dismissal is the one
+  // entry a Submit takes for them (#6539, ruling Q1).
+  if (
+    isReservedPinKey(pin.key) &&
+    !(entry.dismiss === true && pin.key.startsWith(DETECTED_PIN_PREFIX))
+  ) {
     return drop("answered through its own prompt", "pin_reserved");
   }
   if (pin.kind === "dashboard") {
@@ -128,6 +133,12 @@ function check(
     return drop("unknown revision", "pin_unknown_revision");
   }
   const stale = entry.rev < pin.revision;
+  // #6539 (KD-stale): a stale choice is sent and recorded moot, but a stale
+  // dismissal is dropped and the pin stays open, because a dismissal closes a
+  // question and must never close one the operator did not see.
+  if (entry.dismiss === true && stale) {
+    return drop("changed since you chose to dismiss", "pin_dismiss_stale");
+  }
   // Only the current revision can refuse a choice or a step count: an older one
   // may have offered what the current one removed, and is recorded moot.
   if (!stale) {
@@ -145,6 +156,22 @@ function check(
     }
   }
   return { kept: { entry, pin, stale } };
+}
+
+/** What a dismissal's history entry reads (#6539). */
+const PIN_DISMISSED_TEXT = "Dismissed";
+
+/**
+ * #6453: an entry that only says "saved". A dismissal that also carries a save
+ * is a dismissal (#6539), and is checked like one.
+ */
+function isSavedOnly(entry: PinSubmissionEntry): boolean {
+  return (
+    entry.saved === true &&
+    !hasPinAnswer(entry) &&
+    !entry.automaticPick &&
+    entry.dismiss !== true
+  );
 }
 
 function cleanNote(entry: PinSubmissionEntry): string | undefined {
@@ -174,7 +201,13 @@ function messageEntry(kept: Kept): PinAnswersEntry {
     pin: pin.key,
     rev: entry.rev,
     kind: pin.kind,
-    ...(entry.choice !== undefined
+    // #6574: the pin's ID, so the agent can name it to another session.
+    ...(pin.pinId ? { pinId: pin.pinId } : {}),
+    // #6539: a dismissal names the pin's title and carries no answer.
+    ...(entry.dismiss === true
+      ? { dismissed: true as const, title: clean(pin.title) }
+      : {}),
+    ...(entry.dismiss !== true && entry.choice !== undefined
       ? { answer: { choice: entry.choice, label: label ?? entry.choice } }
       : {}),
     ...(note ? { note } : {}),
@@ -191,6 +224,7 @@ function saveEntry(pin: Pin): PinAnswersEntry {
     pin: pin.key,
     rev: pin.revision,
     kind: pin.kind,
+    ...(pin.pinId ? { pinId: pin.pinId } : {}),
     savedTo: effectiveSavedTo(pin) ?? "",
   };
 }
@@ -209,9 +243,13 @@ function reportOf(pin: Pin, timeZone: string): PinAutomaticPick | undefined {
   return undefined;
 }
 
-/** Whether an entry settles its pin, which makes a pick change moot. */
+/**
+ * Whether an entry settles its pin, which makes a pick change moot. A
+ * dismissal closes it too (#6539), so it reports no pick change either.
+ */
 function resolves(entry: PinSubmissionEntry): boolean {
   return (
+    entry.dismiss === true ||
     entry.choice !== undefined ||
     (entry.steps !== undefined && entry.steps.done === entry.steps.total)
   );
@@ -226,6 +264,8 @@ function hasRunningPick(pin: Pin): boolean {
  * One pin's entries in record order: each question, then the note on its own
  * when nothing else carries it, then the partial steps or the resolving answer.
  * The settling entry is last, so it is also the newest, which `trimAnswers` keeps.
+ * A dismissal (#6539) is one entry, with its note, and nothing else: the schema
+ * refuses a choice, steps or questions beside it.
  */
 function batchItems(kept: Kept, deliveredTo?: string): PinBatchAnswer[] {
   const { entry, pin } = kept;
@@ -237,6 +277,17 @@ function batchItems(kept: Kept, deliveredTo?: string): PinBatchAnswer[] {
     ...(deliveredTo !== undefined ? { deliveredTo } : {}),
   };
   const note = cleanNote(entry);
+  if (entry.dismiss === true) {
+    return [
+      {
+        ...base,
+        text: PIN_DISMISSED_TEXT,
+        dismisses: true,
+        ...(note ? { note } : {}),
+        resolves: false,
+      },
+    ];
+  }
   const items: PinBatchAnswer[] = (entry.questions ?? []).map(question => ({
     ...base,
     text: clean(question),
@@ -411,7 +462,7 @@ export async function submitPinAnswers(
     dropped.push({ key, reason, code, outcome: "dropped" });
   const savedOnly: PinSubmissionEntry[] = [];
   for (const entry of request.entries) {
-    if (entry.saved === true && !hasPinAnswer(entry) && !entry.automaticPick) {
+    if (isSavedOnly(entry)) {
       savedOnly.push(entry);
       continue;
     }
@@ -822,6 +873,7 @@ function changedAtOf(
 function messageCarries(item: Kept): boolean {
   const { entry } = item;
   return (
+    entry.dismiss === true ||
     entry.choice !== undefined ||
     (entry.note?.trim() ?? "") !== "" ||
     (entry.questions?.length ?? 0) > 0 ||
@@ -936,6 +988,7 @@ export async function firePinDeadline(
           pin: content.key,
           rev: row.revision,
           kind: content.kind,
+          ...(row.pinId ? { pinId: row.pinId } : {}),
           answer: { choice: pick.option, label: option?.label ?? pick.option },
           automaticPick: {
             at: new Date(firedAt).toISOString(),
@@ -1015,8 +1068,7 @@ function replay(
     if (seen.has(key)) continue;
     seen.add(key);
     const pin = live.get(key);
-    const savedOnly =
-      entry.saved === true && !hasPinAnswer(entry) && !entry.automaticPick;
+    const savedOnly = isSavedOnly(entry);
     if (savedOnly && pin?.savedTo && pin.saveReportPending !== true) {
       entries.push({ key, outcome: "sent", recorded: true, pin });
     } else if (pin && wasRecordedBy(pin, request.submissionId)) {

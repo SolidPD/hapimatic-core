@@ -282,6 +282,7 @@ export function BookmarkGutter({ messageId }: { messageId: string }) {
       {menuPos
         ? createPortal(
             <div
+              // content-bounds-allow: invisible click-away layer behind the bookmark menu; it draws nothing
               className="fixed inset-0 z-[70] select-none [-webkit-touch-callout:none]"
               onClick={() => setMenuPos(null)}
               onContextMenu={e => {

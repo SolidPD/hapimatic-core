@@ -18,6 +18,11 @@ export async function claudeLocal(opts: {
   path: string;
   claudeEnvVars?: Record<string, string>;
   claudeArgs?: string[];
+  /** Issue #5348: `["--", "<prompt>"]`, appended after every flag. */
+  claudeTrailingArgs?: string[];
+  /** Issue #5348 F2: called just before Claude is spawned, so the caller knows the
+   *  prompt after -- went out. Not called when the abort was already set. */
+  onSpawn?: () => void;
   allowedTools?: string[];
   hookSettingsPath: string;
 }) {
@@ -86,6 +91,12 @@ export async function claudeLocal(opts: {
   }
   logger.debug(`[ClaudeLocal] Using hook settings: ${opts.hookSettingsPath}`);
 
+  // Issue #5348 (R9): the end-of-options marker and its one prompt argument go LAST,
+  // so Claude reads the prompt as text and every flag above still takes effect.
+  if (opts.claudeTrailingArgs) {
+    args.push(...opts.claudeTrailingArgs);
+  }
+
   // Prepare environment variables
   // Note: Local mode uses global Claude installation
   // Issue #3731 (R1): the account binding comes ONLY from the explicit
@@ -97,14 +108,21 @@ export async function claudeLocal(opts: {
     opts.claudeEnvVars
   );
 
+  // Issue #5348: the flags only; the prompt after the -- marker is not written to the log.
+  const loggedArgs = opts.claudeTrailingArgs
+    ? args.slice(0, args.length - opts.claudeTrailingArgs.length)
+    : args;
   logger.debug(
-    `[ClaudeLocal] Spawning claude with args: ${JSON.stringify(args)}`
+    `[ClaudeLocal] Spawning claude with args: ${JSON.stringify(loggedArgs)}${
+      opts.claudeTrailingArgs ? " (+ the prompt after --)" : ""
+    }`
   );
 
   // Spawn the process
   try {
     process.stdin.pause();
     const claudePath = getDefaultClaudeCodePath();
+    opts.onSpawn?.();
     await spawnWithAbort({
       command: claudePath,
       args,

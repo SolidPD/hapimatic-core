@@ -37,11 +37,16 @@ import {
   resolveSpawnContextWindow,
 } from "./accountTokenInjection";
 import {
+  permissionNarrowingHolds,
+  settleLaunchPermissionMode,
+} from "./spawnPermissionSeed";
+import {
   createCleanupHandler,
   createLocalModeRejectionHandler,
 } from "./services/mcpToggleService";
 import { createLocalModeRejectionHandler as createSetPermissionModeLocalRejection } from "./services/setPermissionModeService";
 import { createAnsiQueryResponder } from "./utils/ansiQueryResponder";
+import { extractActivityEpochMs } from "./utils/activityEpoch";
 import {
   registerActivePty,
   unregisterActivePty,
@@ -251,6 +256,12 @@ export async function claudePtyLauncher(
     configDir: accountConfigDir ?? undefined,
     onMessage: message => {
       forwardToChat(message);
+      // Issue #6586 (as tmux does, #1653 clear-site (ii)): transcript activity
+      // means Claude has moved past a pending TUI prompt, so the blocked flag
+      // clears and billing resumes. The since-guard inside
+      // clearTuiPromptOnActivity skips backlog older than the prompt; it is a
+      // no-op when nothing is blocked.
+      session.clearTuiPromptOnActivity(extractActivityEpochMs(message));
       toolErrorDetector.processMessage(message, session.sessionId);
       // Detect and report Anthropic API errors to the error log system (#1232)
       apiErrorDetector.processMessage(message, session.sessionId);
@@ -459,6 +470,14 @@ export async function claudePtyLauncher(
     // live in resolveSpawnClaudeArgs, which keys the pin off session.getModel()
     // (the #1506-resilient discriminator) instead of the display-overloaded
     // session.getModelMode() that previously leaked "opus" → dropped the pin.
+    // Issue #6617 (R3, R7 ii): with the switch on, the live mode decides the
+    // child's permission flags (inside resolveSpawnClaudeArgs); an unreadable
+    // mode is written back as `default` first, so the screen shows what runs.
+    if (permissionNarrowingHolds()) {
+      settleLaunchPermissionMode(session, message =>
+        logger.warn(`[pty]: ${message}`)
+      );
+    }
     const claudeArgs = await resolveSpawnClaudeArgs(
       session,
       accountConfigDir,

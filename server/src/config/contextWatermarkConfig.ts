@@ -18,11 +18,25 @@
  * requirement is the force-OFF.)
  */
 
-import { getSettingsFile, readSettings, writeSettings } from "./settings";
+import {
+  getSettingsFile,
+  readSettings,
+  updateSettings,
+  type Settings,
+} from "./settings";
+
+/** Which source decided `enabled` (#6570 R11): the env variable or settings.json. */
+export type ContextWatermarkEnabledSource = "env" | "settings";
 
 export interface ContextWatermarkConfig {
   /** R5 kill-switch. Default false. Env `HAPI_CONTEXT_WATERMARK_ENABLED` overrides. */
   enabled: boolean;
+  /**
+   * #6570 R11: `"env"` when `HAPI_CONTEXT_WATERMARK_ENABLED` decides `enabled` (it
+   * forces the feature on or off), else `"settings"`. Always set by the loader;
+   * optional only so hand-built test configs need not carry it.
+   */
+  enabledSource?: ContextWatermarkEnabledSource;
   /** Hand off once a session has used this share of its context window (percent).
    *  Default 85 (#2587); user-editable via the admin UI + PUT /api/watermark/config. */
   watermarkPercent: number;
@@ -63,8 +77,9 @@ function getDefaults(): ContextWatermarkConfig {
  * Resolve the env kill-switch to an explicit boolean, or `null` when the env var
  * is absent/blank (→ defer to settings.json). Truthy: "1"/"true"/"yes";
  * falsy: "0"/"false"/"no". Any other value is treated as absent (defer).
+ * Exported for the #6570 compact-at seed, which notes when the variable decides.
  */
-function envEnabledOverride(): boolean | null {
+export function envEnabledOverride(): boolean | null {
   const raw = process.env.HAPI_CONTEXT_WATERMARK_ENABLED;
   if (raw == null) return null;
   const v = raw.trim().toLowerCase();
@@ -97,6 +112,7 @@ export async function loadContextWatermarkConfig(
     // The env override, when present, wins in BOTH directions — a force-off must
     // beat a settings `enabled: true`.
     enabled: envOverride ?? settingsEnabled,
+    enabledSource: envOverride === null ? "settings" : "env",
     watermarkPercent:
       typeof cw.watermarkPercent === "number" && cw.watermarkPercent > 0
         ? cw.watermarkPercent
@@ -129,20 +145,30 @@ export async function loadContextWatermarkConfig(
   };
 }
 
-/** Persist context-watermark config updates to settings.json. */
+/**
+ * Persist context-watermark config updates to settings.json.
+ *
+ * #6570 R13: through `updateSettings`, so an unreadable settings.json is refused
+ * with `SettingsUnreadableError` and left byte-identical. The prior
+ * `(await readSettings(...)) ?? {}` + `writeSettings` replaced an unreadable file
+ * with this one key, deleting `cliApiToken`, `apiKeys` and the federation keys.
+ * The merge is over the stored block, so keys this type does not name (the #6570
+ * `compactAtSwitchOffAt` marker) survive.
+ */
 export async function saveContextWatermarkConfig(
   dataDir: string,
   updates: Partial<ContextWatermarkConfig>
 ): Promise<ContextWatermarkConfig> {
   const settingsFile = getSettingsFile(dataDir);
-  const settings = (await readSettings(settingsFile)) ?? {};
-  const raw = (settings as Record<string, unknown>).contextWatermark;
-  const existing = raw && typeof raw === "object" ? raw : {};
-
-  const merged = { ...existing, ...updates };
-  (settings as Record<string, unknown>).contextWatermark = merged;
-
-  await writeSettings(settingsFile, settings);
+  await updateSettings(settingsFile, current => {
+    const raw = (current as Record<string, unknown>).contextWatermark;
+    const existing =
+      raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    return {
+      ...current,
+      contextWatermark: { ...existing, ...updates },
+    } as Settings;
+  });
 
   return loadContextWatermarkConfig(dataDir);
 }

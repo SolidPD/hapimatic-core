@@ -19,7 +19,10 @@ import type { Pin, PinSubmissionRequest } from "@hapi/protocol";
 export type StagedVia = "pins" | "chat";
 
 export type StagedPin = {
-  /** The pin's revision at the last choice or tick; a note or question keeps it. */
+  /**
+   * The pin's revision at the last choice, tick or dismissal; a note or question
+   * keeps it.
+   */
   rev: number;
   kind: string;
   choice?: string;
@@ -38,6 +41,18 @@ export type StagedPin = {
    * only: the server's own record of the unreported save decides what is sent.
    */
   saved?: true;
+  /**
+   * #6539: the operator chose to dismiss this pin. It stays open, marked Will
+   * dismiss, until Submit closes it and tells the agent. A dismissal carries a
+   * note and `saved` and nothing else: staging it drops a choice, questions and
+   * ticks.
+   */
+  dismiss?: true;
+  /**
+   * #6539 (ruling Q4): the automatic pick's time (epoch ms) that staging the
+   * dismissal turned off, so Undo can turn it back on. Only beside `dismiss`.
+   */
+  pickAt?: number;
   updatedAt: number;
 };
 
@@ -83,7 +98,8 @@ export function hasUpdates(entry: StagedPin | undefined): boolean {
     Boolean(entry.note?.trim()) ||
     (entry.questions?.length ?? 0) > 0 ||
     (ticks > 0 && ticks !== (entry.ticksSent ?? 0)) ||
-    entry.saved === true
+    entry.saved === true ||
+    entry.dismiss === true
   );
 }
 
@@ -128,6 +144,8 @@ function isStagedPin(value: unknown): value is StagedPin {
     (v.note === undefined || typeof v.note === "string") &&
     (v.ticksSent === undefined || typeof v.ticksSent === "number") &&
     (v.saved === undefined || v.saved === true) &&
+    (v.dismiss === undefined || v.dismiss === true) &&
+    (v.pickAt === undefined || typeof v.pickAt === "number") &&
     strings(v.questions) &&
     strings(v.ticks)
   );
@@ -314,13 +332,19 @@ function mutate(
   notify(sessionId, changed);
 }
 
+/**
+ * `mutate` deletes an entry this calls empty. A dismissal is content on its own
+ * (#6539), or one staged with no note would be deleted as it is written;
+ * `pickAt` is not, because it only says what Undo restores.
+ */
 function isEmptyEntry(entry: StagedPin): boolean {
   return (
     entry.choice === undefined &&
     !entry.note &&
     !entry.questions?.length &&
     !entry.ticks?.length &&
-    entry.saved !== true
+    entry.saved !== true &&
+    entry.dismiss !== true
   );
 }
 
@@ -334,7 +358,10 @@ function base(
 
 // ── Writers ──────────────────────────────────────────────────────────────────
 
-/** Choose an option; the revision and the label are taken as they are now. */
+/**
+ * Choose an option; the revision and the label are taken as they are now. A
+ * choice replaces a staged dismissal (#6539): the last act wins.
+ */
 export function stageChoice(
   sessionId: string,
   pin: StagingPin,
@@ -342,13 +369,53 @@ export function stageChoice(
   via: StagedVia
 ): void {
   mutate(sessionId, [pin.key], entry => ({
-    ...base(entry, pin, via),
+    ...withoutDismiss(base(entry, pin, via)),
     rev: pin.revision,
     kind: pin.kind,
     choice: option.id,
     label: option.label,
     via,
   }));
+}
+
+function withoutDismiss(entry: StagedPin): StagedPin {
+  const { dismiss: _dismiss, pickAt: _pickAt, ...rest } = entry;
+  return rest;
+}
+
+/**
+ * #6539: stage a dismissal. The pin stays open, marked Will dismiss, until
+ * Submit. It binds to the revision the operator confirmed (unlike a note, which
+ * keeps an older entry's), keeps the note and a staged save, and drops what a
+ * dismissal contradicts: a choice, questions and ticks. `pickAt` is the
+ * automatic pick's time when confirming turned the pick off (ruling Q4).
+ */
+export function stageDismiss(
+  sessionId: string,
+  pin: StagingPin,
+  via: StagedVia,
+  pickAt?: number
+): void {
+  mutate(sessionId, [pin.key], entry => ({
+    rev: pin.revision,
+    kind: pin.kind,
+    via,
+    ...(entry?.note ? { note: entry.note } : {}),
+    ...(entry?.saved === true ? { saved: true as const } : {}),
+    dismiss: true,
+    ...(pickAt !== undefined ? { pickAt } : {}),
+    updatedAt: 0,
+  }));
+}
+
+/** #6539: Undo. Removes the staged dismissal and its held pick time, nothing else. */
+export function unstageDismiss(sessionId: string, key: string): void {
+  mutate(sessionId, [key], entry => {
+    if (!entry || (entry.dismiss !== true && entry.pickAt === undefined)) {
+      return entry;
+    }
+    return withoutDismiss(entry);
+  });
 }
 
 export function clearChoice(sessionId: string, key: string): void {
@@ -370,6 +437,9 @@ export function toggleTick(
   via: StagedVia
 ): void {
   mutate(sessionId, [pin.key], entry => {
+    // #6539: a dismissed pin's steps are read-only; a tick beside a dismissal
+    // would contradict it, like a question.
+    if (entry?.dismiss === true) return entry;
     const current = base(entry, pin, via);
     const ticks = new Set(current.ticks ?? []);
     if (ticks.has(stepId)) ticks.delete(stepId);
@@ -400,7 +470,11 @@ export function setNote(
   });
 }
 
-/** Add a question; false when it is empty or the pin already has five. */
+/**
+ * Add a question; false when it is empty, the pin already has five, or a
+ * dismissal is staged (#6539): a question beside a dismissal would be dropped
+ * unsent, so it is refused here, where the caller can say so.
+ */
 export function addQuestion(
   sessionId: string,
   pin: StagingPin,
@@ -408,8 +482,11 @@ export function addQuestion(
   via: StagedVia
 ): boolean {
   const text = question.trim().slice(0, STAGED_QUESTION_MAX_CHARS);
-  const existing = load(sessionId)[pin.key]?.questions?.length ?? 0;
-  if (!text || existing >= STAGED_QUESTIONS_MAX) return false;
+  const staged = load(sessionId)[pin.key];
+  const existing = staged?.questions?.length ?? 0;
+  if (!text || existing >= STAGED_QUESTIONS_MAX || staged?.dismiss === true) {
+    return false;
+  }
   mutate(sessionId, [pin.key], entry => {
     const current = base(entry, pin, via);
     return { ...current, questions: [...(current.questions ?? []), text] };
@@ -454,6 +531,8 @@ export function canStageRecommendation(
     ANSWERABLE_KINDS.has(pin.kind) &&
     !isReservedKey(pin.key) &&
     entry?.choice === undefined &&
+    // #6539: a pin the operator chose to dismiss takes no recommendation.
+    entry?.dismiss !== true &&
     pin.recommended !== undefined &&
     (pin.options ?? []).some(option => option.id === pin.recommended)
   );

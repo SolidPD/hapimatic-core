@@ -245,8 +245,18 @@ export function normalizeMcpServerName(name: string): string {
 }
 
 export interface McpServerUsage {
-  /** The raw server name when known (from the instructions), else the tools'. */
+  /**
+   * The raw server name when known (the first of {@link names} from the
+   * instructions), else the tools'.
+   */
   name: string;
+  /**
+   * Every raw server name this row covers, from Claude Code's instruction rows
+   * in reply order, else the tools' key. More than one means the servers share
+   * the tool prefix before `__`, so Claude Code reports their tools together
+   * and their costs cannot be split (#6409 item 3).
+   */
+  names: string[];
   /** Tools whose schemas are in the context window. */
   loadedTokens: number;
   loadedTools: number;
@@ -274,6 +284,7 @@ export function groupMcpServers(
     if (!server) {
       server = {
         name,
+        names: [],
         loadedTokens: 0,
         loadedTools: 0,
         deferredTokens: 0,
@@ -294,10 +305,18 @@ export function groupMcpServers(
       server.loadedTools += 1;
     }
   }
+  // `names` comes from the instructions only: a tool's key is the prefix before
+  // `__`, so an ordinary `my__x` server would otherwise read as two servers.
   for (const instruction of detail.mcpInstructions ?? []) {
     const server = entry(instruction.serverName);
-    server.name = instruction.serverName;
+    if (!server.names.includes(instruction.serverName)) {
+      server.names.push(instruction.serverName);
+    }
     server.instructionTokens += instruction.tokens;
+  }
+  for (const server of servers.values()) {
+    if (server.names.length === 0) server.names = [server.name];
+    server.name = server.names[0];
   }
   return [...servers.values()].sort(
     (a, b) =>

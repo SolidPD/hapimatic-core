@@ -29,6 +29,8 @@ import {
   generateApiKeyHelperSettingsFile,
 } from "./utils/generateHookSettings";
 import { readBoundApiKeyBinding } from "./accountTokenInjection";
+import { sdkStartPermissionMode } from "./spawnPermissionSeed";
+import type { ClaudePermissionMode } from "@hapi/protocol/modes";
 import type { EffortLevel } from "@hapi/protocol/effort";
 import type { McpServerUsage } from "@hapi/protocol";
 
@@ -122,6 +124,14 @@ export async function claudeRemote(opts: {
    * fooled into thinking all attachments were delivered.
    */
   onMissingAttachments?: (missingPaths: string[]) => void;
+
+  /**
+   * Issue #6617 (Matt 43a / D2-1): the mode this query starts in, read
+   * synchronously just before `query()`. The launcher supplies it with the
+   * narrowing switch on (the session's live mode); without it the start mode is
+   * the pre-#6617 {@link sdkStartPermissionMode} value.
+   */
+  startPermissionMode?: () => ClaudePermissionMode;
 }) {
   const debugPrefix = "[claudeRemote][async-debug]";
 
@@ -268,12 +278,13 @@ export async function claudeRemote(opts: {
   // called programmatically — claudeArgs like --dangerously-skip-permissions
   // are not automatically applied to the SDK options the way they are in
   // claudeLocal.ts (where they're passed as subprocess CLI args).
-  const spawnTimeBypass = opts.claudeArgs?.includes(
-    "--dangerously-skip-permissions"
+  // Issue #6617: with the narrowing switch on, the spawn-time flag is not
+  // consulted at a query start; the launcher's `startPermissionMode` callback
+  // is, just before `query()` below. This value stays the switch-off path.
+  const effectivePermissionMode = sdkStartPermissionMode(
+    opts.claudeArgs,
+    initial.mode.permissionMode
   );
-  const effectivePermissionMode = spawnTimeBypass
-    ? "bypassPermissions"
-    : initial.mode.permissionMode;
 
   // Issue #4568 (F1): an API-key session's ONLY credential is the
   // `apiKeyHelper` in its settings file. Safe mode drops the hook settings file
@@ -379,6 +390,15 @@ export async function claudeRemote(opts: {
       content: initialContent,
     },
   });
+
+  // Issue #6617 (R1, finding 6617-M2): read the start mode HERE, after the
+  // image read above (the one await between the message pull and the query),
+  // so a narrowing made during that read still holds. Synchronous, and there is
+  // no await from here to onQueryCreated, so the child starts in the mode the
+  // screen shows now.
+  if (opts.startPermissionMode) {
+    sdkOptions.permissionMode = opts.startPermissionMode();
+  }
 
   // Start the loop
   const response = query({

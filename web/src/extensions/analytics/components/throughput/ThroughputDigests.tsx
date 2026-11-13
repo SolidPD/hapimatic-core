@@ -13,15 +13,28 @@ import { pillClass } from "./format";
  * selected one's report (the latest by default).
  */
 export function ThroughputDigests({ api }: { api: ApiClient | null }) {
-  const { digests, isLoading } = useThroughputDigests(api);
+  const { digests, isLoading, error } = useThroughputDigests(api);
   const [picked, setPicked] = useState<string | null>(null);
   const id = picked ?? digests[0]?.id ?? null;
-  const { digest, isLoading: digestLoading } = useThroughputDigest(api, id);
+  const {
+    digest,
+    isLoading: digestLoading,
+    error: digestError,
+  } = useThroughputDigest(api, id);
 
   if (isLoading) {
     return (
       <div className="py-6 text-center text-xs text-[var(--app-muted)]">
         Loading...
+      </div>
+    );
+  }
+  // #6367: a failed list is not "no digest yet". The error wins over a cached
+  // list, as in the summary and the breakdown.
+  if (error) {
+    return (
+      <div className="py-6 text-center text-xs text-[var(--app-muted)]">
+        Could not load the weekly digests ({error}).
       </div>
     );
   }
@@ -48,7 +61,17 @@ export function ThroughputDigests({ api }: { api: ApiClient | null }) {
           </button>
         ))}
       </div>
-      {digestLoading || !digest ? (
+      {/* #6367: loading, then error, then !digest. Checking the error after
+          !digest would leave a failed detail on "Loading..." for good. */}
+      {digestLoading ? (
+        <div className="py-6 text-center text-xs text-[var(--app-muted)]">
+          Loading...
+        </div>
+      ) : digestError ? (
+        <div className="py-6 text-center text-xs text-[var(--app-muted)]">
+          Could not load the digest ({digestError}).
+        </div>
+      ) : !digest ? (
         <div className="py-6 text-center text-xs text-[var(--app-muted)]">
           Loading...
         </div>

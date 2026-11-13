@@ -15,6 +15,11 @@ import { deepEqual } from "@/utils/deepEqual";
 import { EnhancedMode, PermissionMode } from "../loop";
 import { getToolDescriptor } from "./getToolDescriptor";
 import { delay } from "@/utils/time";
+import { isClaudePermissionMode } from "@hapi/protocol/modes";
+import {
+  liveChildMode,
+  permissionNarrowingHolds,
+} from "../spawnPermissionSeed";
 import {
   BasePermissionHandler,
   type PendingPermissionRequest,
@@ -126,6 +131,9 @@ export class PermissionHandler extends BasePermissionHandler<
   private allowedBashLiterals = new Set<string>();
   private allowedBashPrefixes = new Set<string>();
   private permissionMode: PermissionMode = "default";
+  // Issue #6617: the narrowing switch, read once per handler (one per launcher
+  // entry, as the launcher reads it). Off, every decision below is today's.
+  private readonly narrowingHolds = permissionNarrowingHolds();
   private onPermissionRequestCallback?: (toolCallId: string) => void;
 
   constructor(session: Session) {
@@ -143,6 +151,30 @@ export class PermissionHandler extends BasePermissionHandler<
   handleModeChange(mode: PermissionMode) {
     this.permissionMode = mode;
     this.session.setPermissionMode(mode);
+  }
+
+  /**
+   * Issue #6617 (D4 g3-1): record a mode chosen on a permission card or a plan
+   * approval where every later decision reads it: the handler's copy and, through
+   * runClaude's record-only function, runClaude's own copy, the saved
+   * `metadata.permissionMode` and the session. Never the full applier: the SDK
+   * reader is awaiting this very answer, so a live switch sent from here would
+   * wait for a reply it cannot read and the answer would hang. Never called from
+   * {@link handleModeChange}, which runs on every message pull and query start.
+   * Round 4 (the board-26 PM's option 2): because nothing reaches the child, the
+   * recorder then ends a running query whose child is wider than this mode (a
+   * card answered with plan over an acceptEdits child), so the next message
+   * starts in the mode shown. A plan approval's child is in plan, the narrowest
+   * mode, so an approval never ends its query here; it relaunches as before.
+   */
+  private recordChosenMode(mode: PermissionMode): void {
+    this.permissionMode = mode;
+    const record = this.session.getPermissionModeRecorder();
+    if (record) {
+      record(mode);
+    } else {
+      this.session.setPermissionMode(mode);
+    }
   }
 
   /**
@@ -176,8 +208,20 @@ export class PermissionHandler extends BasePermissionHandler<
 
     // Update permission mode
     if (response.mode) {
-      this.permissionMode = response.mode;
-      this.session.setPermissionMode(response.mode);
+      if (!this.narrowingHolds) {
+        this.permissionMode = response.mode;
+        this.session.setPermissionMode(response.mode);
+      } else if (isClaudePermissionMode(response.mode)) {
+        this.recordChosenMode(response.mode);
+      } else {
+        // Issue #6617 (R7 i): a card answer can carry any string (the
+        // federation approve body does not validate it); one that is not a
+        // Claude mode is refused here, where it enters, and never recorded.
+        logger.warn(
+          `[permission]: card answer named mode ${JSON.stringify(response.mode)}, which is not a Claude mode; ignored (#6617)`
+        );
+        completion.mode = undefined;
+      }
     }
 
     // Handle ask_user_question
@@ -229,6 +273,13 @@ export class PermissionHandler extends BasePermissionHandler<
             { isolate: true }
           );
         } else {
+          // Issue #6617 (Task 4): an approval with no exit mode relaunches in
+          // `default`. Record it, so the relaunch, which reads the live mode,
+          // leaves plan instead of re-planning, and a later effort or model
+          // change does not put the older mode back.
+          if (this.narrowingHolds) {
+            this.recordChosenMode("default");
+          }
           this.session.queue.unshift(
             PLAN_FAKE_RESTART,
             {
@@ -310,7 +361,16 @@ export class PermissionHandler extends BasePermissionHandler<
     // Handle special cases
     //
 
-    if (!isAskUserQuestion && this.permissionMode === "bypassPermissions") {
+    // Issue #6617 (D6-1, ruled under Matt's 43a): with the switch on, the
+    // wrapper's own "allow" answers decide from the session's LIVE mode, so a
+    // narrowing inside a running turn stops them at once. The handler's copy is
+    // updated only by handleModeChange and a card answer, which a UI change
+    // never reaches; it stays the switch-off path.
+    const decisionMode: PermissionMode = this.narrowingHolds
+      ? liveChildMode(this.session.getPermissionMode())
+      : this.permissionMode;
+
+    if (!isAskUserQuestion && decisionMode === "bypassPermissions") {
       return {
         behavior: "allow",
         updatedInput: input as Record<string, unknown>,
@@ -319,7 +379,7 @@ export class PermissionHandler extends BasePermissionHandler<
 
     if (
       !isAskUserQuestion &&
-      this.permissionMode === "acceptEdits" &&
+      decisionMode === "acceptEdits" &&
       descriptor.edit
     ) {
       return {

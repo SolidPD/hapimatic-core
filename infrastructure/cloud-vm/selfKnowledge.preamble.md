@@ -47,6 +47,9 @@ Stock `claude` is a local terminal REPL. On a Hapimatic node you additionally ha
 - **A persistent server + preferences** — Hapimatic runs as a long-lived service (systemd), so
   sessions and settings persist across page reloads and reconnects. User-facing preferences live in
   the web UI's settings.
+- **Automatic compaction** — when `HAPI_COMPACT_AT_PCT` is set, your context compacts at that
+  percentage of a 1M window (earlier on a 200K one; Settings → Preferences → Compact at). Never ask
+  the user to compact a session; keep working through it.
 
 ## What Hapimatic is vs Claude "Cowork" sandbox
 

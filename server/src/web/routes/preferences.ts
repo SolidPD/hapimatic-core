@@ -6,7 +6,9 @@ import type { WebAppEnv } from "../middleware/auth";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { SSEManager } from "../../sse/sseManager";
 import {
+  SETTINGS_UNREADABLE_MESSAGE as UNREADABLE,
   readSettings,
+  updateSettingsOrRefuse,
   writeSettings,
   type Settings,
 } from "../../config/settings";
@@ -80,6 +82,12 @@ export function createPreferencesRoutes(
   opts?: PreferencesRouteOptions
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
+  // #6570 R13 (A1): one key through updateSettings; false = unreadable, bytes unchanged.
+  const saveKey = async (key: string, value: unknown) =>
+    (await updateSettingsOrRefuse(settingsFile, s => ({
+      ...s,
+      [key]: value,
+    }))) !== null;
 
   // GET /preferences/search-filter — read search/filter bar state
   app.get(
@@ -146,11 +154,8 @@ export function createPreferencesRoutes(
         );
       }
 
-      const settings = (await readSettings(settingsFile)) ?? {};
-      (settings as Settings & Record<string, unknown>).searchFilterPreferences =
-        parsed.data;
-      await writeSettings(settingsFile, settings);
-
+      const saved = await saveKey("searchFilterPreferences", parsed.data);
+      if (!saved) return c.json({ error: UNREADABLE }, 500);
       return c.json(parsed.data);
     }
   );
@@ -233,39 +238,40 @@ export function createPreferencesRoutes(
       }
       const patch = parsed.data;
 
-      const settings = (await readSettings(settingsFile)) ?? {};
-      // Merge over the RAW stored value (not the fail-closed-resolved accessor) so
-      // a WRITE never persists a fail-closed placeholder — fail closed on READ
-      // ONLY (Task 5(e)). Absent/malformed stored fields fall back to the shared
-      // default, never to `false`.
-      const rawStored = (settings as Settings & Record<string, unknown>)
-        .autoRecoverPreference;
-      const storedObj: Record<string, unknown> =
-        rawStored && typeof rawStored === "object"
-          ? (rawStored as Record<string, unknown>)
-          : {};
-      const storedEnabled =
-        typeof storedObj.enabled === "boolean"
-          ? storedObj.enabled
-          : AUTO_RECOVER_DEFAULT_ENABLED;
-      const storedClassOverrides = salvageClassOverrides(
-        storedObj.classOverrides
-      );
-
-      const mergedEnabled = patch.enabled ?? storedEnabled;
-      const mergedClassOverrides = {
-        ...(storedClassOverrides ?? {}),
-        ...(patch.classOverrides ?? {}),
+      let merged: AutoRecoverPreference = {
+        enabled: AUTO_RECOVER_DEFAULT_ENABLED,
       };
-      const merged: AutoRecoverPreference =
-        Object.keys(mergedClassOverrides).length > 0
-          ? { enabled: mergedEnabled, classOverrides: mergedClassOverrides }
-          : { enabled: mergedEnabled };
+      // #6570 R13 (A1): through updateSettings, so an unreadable file is refused.
+      const written = await updateSettingsOrRefuse(settingsFile, settings => {
+        // Merge over the RAW stored value (not the fail-closed-resolved accessor) so
+        // a WRITE never persists a fail-closed placeholder — fail closed on READ
+        // ONLY (Task 5(e)). Absent/malformed stored fields fall back to the shared
+        // default, never to `false`.
+        const rawStored = settings.autoRecoverPreference;
+        const storedObj: Record<string, unknown> =
+          rawStored && typeof rawStored === "object"
+            ? (rawStored as Record<string, unknown>)
+            : {};
+        const storedEnabled =
+          typeof storedObj.enabled === "boolean"
+            ? storedObj.enabled
+            : AUTO_RECOVER_DEFAULT_ENABLED;
+        const storedClassOverrides = salvageClassOverrides(
+          storedObj.classOverrides
+        );
 
-      (settings as Settings & Record<string, unknown>).autoRecoverPreference =
-        merged;
-      await writeSettings(settingsFile, settings);
-
+        const mergedEnabled = patch.enabled ?? storedEnabled;
+        const mergedClassOverrides = {
+          ...(storedClassOverrides ?? {}),
+          ...(patch.classOverrides ?? {}),
+        };
+        merged =
+          Object.keys(mergedClassOverrides).length > 0
+            ? { enabled: mergedEnabled, classOverrides: mergedClassOverrides }
+            : { enabled: mergedEnabled };
+        return { ...settings, autoRecoverPreference: merged };
+      });
+      if (!written) return c.json({ error: UNREADABLE }, 500);
       return c.json(merged);
     }
   );
@@ -415,26 +421,24 @@ export function createPreferencesRoutes(
       }
       const patch = parsed.data;
 
-      const settings = (await readSettings(settingsFile)) ?? {};
-      const rawStored = (settings as Settings & Record<string, unknown>)
-        .autoSwitchOnRateLimitPreference;
-      const storedObj: Record<string, unknown> =
-        rawStored && typeof rawStored === "object"
-          ? (rawStored as Record<string, unknown>)
-          : {};
-      const storedEnabled =
-        typeof storedObj.enabled === "boolean"
-          ? storedObj.enabled
-          : AUTO_SWITCH_ON_RATE_LIMIT_DEFAULT_ENABLED;
-
-      const merged: AutoSwitchOnRateLimitPreference = {
-        enabled: patch.enabled ?? storedEnabled,
+      let merged: AutoSwitchOnRateLimitPreference = {
+        enabled: AUTO_SWITCH_ON_RATE_LIMIT_DEFAULT_ENABLED,
       };
-
-      (
-        settings as Settings & Record<string, unknown>
-      ).autoSwitchOnRateLimitPreference = merged;
-      await writeSettings(settingsFile, settings);
+      // #6570 R13 (A1): through updateSettings, so an unreadable file is refused.
+      const written = await updateSettingsOrRefuse(settingsFile, settings => {
+        const rawStored = settings.autoSwitchOnRateLimitPreference;
+        const storedObj: Record<string, unknown> =
+          rawStored && typeof rawStored === "object"
+            ? (rawStored as Record<string, unknown>)
+            : {};
+        const storedEnabled =
+          typeof storedObj.enabled === "boolean"
+            ? storedObj.enabled
+            : AUTO_SWITCH_ON_RATE_LIMIT_DEFAULT_ENABLED;
+        merged = { enabled: patch.enabled ?? storedEnabled };
+        return { ...settings, autoSwitchOnRateLimitPreference: merged };
+      });
+      if (!written) return c.json({ error: UNREADABLE }, 500);
 
       return c.json(merged);
     }
@@ -501,24 +505,24 @@ export function createPreferencesRoutes(
           400
         );
       }
-      const settings = (await readSettings(settingsFile)) ?? {};
-      const rawStored = (settings as Settings & Record<string, unknown>)
-        .autoSelectOptimalAccountPreference;
-      const storedObj: Record<string, unknown> =
-        rawStored && typeof rawStored === "object"
-          ? (rawStored as Record<string, unknown>)
-          : {};
-      const storedEnabled =
-        typeof storedObj.enabled === "boolean"
-          ? storedObj.enabled
-          : AUTO_SELECT_OPTIMAL_ACCOUNT_DEFAULT_ENABLED;
-      const merged: AutoSelectOptimalAccountPreference = {
-        enabled: parsed.data.enabled ?? storedEnabled,
+      let merged: AutoSelectOptimalAccountPreference = {
+        enabled: AUTO_SELECT_OPTIMAL_ACCOUNT_DEFAULT_ENABLED,
       };
-      (
-        settings as Settings & Record<string, unknown>
-      ).autoSelectOptimalAccountPreference = merged;
-      await writeSettings(settingsFile, settings);
+      // #6570 R13 (A1): through updateSettings, so an unreadable file is refused.
+      const written = await updateSettingsOrRefuse(settingsFile, settings => {
+        const rawStored = settings.autoSelectOptimalAccountPreference;
+        const storedObj: Record<string, unknown> =
+          rawStored && typeof rawStored === "object"
+            ? (rawStored as Record<string, unknown>)
+            : {};
+        const storedEnabled =
+          typeof storedObj.enabled === "boolean"
+            ? storedObj.enabled
+            : AUTO_SELECT_OPTIMAL_ACCOUNT_DEFAULT_ENABLED;
+        merged = { enabled: parsed.data.enabled ?? storedEnabled };
+        return { ...settings, autoSelectOptimalAccountPreference: merged };
+      });
+      if (!written) return c.json({ error: UNREADABLE }, 500);
       return c.json(merged);
     }
   );
@@ -590,12 +594,8 @@ export function createPreferencesRoutes(
         );
       }
 
-      const settings = (await readSettings(settingsFile)) ?? {};
-      (
-        settings as Settings & Record<string, unknown>
-      ).createSessionPreferences = parsed.data;
-      await writeSettings(settingsFile, settings);
-
+      const saved = await saveKey("createSessionPreferences", parsed.data);
+      if (!saved) return c.json({ error: UNREADABLE }, 500);
       return c.json(parsed.data);
     }
   );
@@ -669,11 +669,8 @@ export function createPreferencesRoutes(
         );
       }
 
-      const settings = (await readSettings(settingsFile)) ?? {};
-      (settings as Settings & Record<string, unknown>).createSessionDefaults =
-        parsed.data;
-      await writeSettings(settingsFile, settings);
-
+      const saved = await saveKey("createSessionDefaults", parsed.data);
+      if (!saved) return c.json({ error: UNREADABLE }, 500);
       return c.json(parsed.data);
     }
   );
@@ -744,10 +741,8 @@ export function createPreferencesRoutes(
           400
         );
       }
-      const settings = (await readSettings(settingsFile)) ?? {};
-      (settings as Settings & Record<string, unknown>).openRouterFavorites =
-        parsed.data;
-      await writeSettings(settingsFile, settings);
+      const saved = await saveKey("openRouterFavorites", parsed.data);
+      if (!saved) return c.json({ error: UNREADABLE }, 500);
       return c.json(parsed.data);
     }
   );
@@ -820,10 +815,8 @@ export function createPreferencesRoutes(
           400
         );
       }
-      const settings = (await readSettings(settingsFile)) ?? {};
-      (settings as Settings & Record<string, unknown>).defaultModelPreference =
-        parsed.data;
-      await writeSettings(settingsFile, settings);
+      const saved = await saveKey("defaultModelPreference", parsed.data);
+      if (!saved) return c.json({ error: UNREADABLE }, 500);
       return c.json(parsed.data);
     }
   );

@@ -9,6 +9,12 @@ import { MessageQueue2 } from "@/utils/MessageQueue2";
 import { hashObject } from "@/utils/deterministicJson";
 import { extractSDKMetadataAsync } from "@/claude/sdk/metadataExtractor";
 import { applyModelInPlace } from "@/claude/applyModelInPlace";
+import {
+  PermissionModeChangeRefused,
+  createPermissionModeAppliers,
+} from "@/claude/applyPermissionModeInPlace";
+import { permissionNarrowingHolds } from "@/claude/spawnPermissionSeed";
+import { SdkRequestError } from "@/claude/sdk/types";
 import { readBackAppliedEffort } from "@/claude/claudeRemote";
 import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { getEnvironmentInfo } from "@/ui/doctor";
@@ -30,6 +36,7 @@ import {
   generateHookSettingsFile,
   cleanupHookSettingsFile,
 } from "@/claude/utils/generateHookSettings";
+import { resolveSessionCompactionEnv } from "@/claude/utils/sessionCompaction";
 import { resolveProfileExcludes } from "@/daemon/roleProfiles";
 import type { McpSetLaunchPayload, SessionRole } from "@hapi/protocol";
 import {
@@ -83,8 +90,13 @@ import {
 export interface StartOptions {
   model?: string;
   /** The HARD spawn-time posture: set only by `--yolo` /
-   *  `--dangerously-skip-permissions`, and it outranks a saved posture. */
+   *  `--dangerously-skip-permissions` / a terminal `--permission-mode`
+   *  (#6400 P1), and it outranks a saved posture. */
   permissionMode?: PermissionMode;
+  /** Issue #6400 P1: the hard mode came from a terminal
+   *  `--permission-mode` (not bypass), which is no longer forwarded to the
+   *  claude child, so the local launcher passes the session's live mode. */
+  permissionModeFromFlag?: boolean;
   /** Issue #6218: the starting-mode SEED from `--hapi-permission-mode` (a
    *  non-bypass Claude mode). A saved posture (`metadata.permissionMode`)
    *  outranks it, so a reconnect or daemon recovery of a session the user
@@ -94,6 +106,10 @@ export interface StartOptions {
   shouldStartDaemon?: boolean;
   claudeEnvVars?: Record<string, string>;
   claudeArgs?: string[];
+  /** Issue #5348: the end-of-options marker and the ONE prompt argument after it
+   *  (`["--", "<prompt>"]`), kept out of `claudeArgs` and appended LAST by the local
+   *  launcher at the first spawn only. The parser refuses it on a remote start. */
+  claudeTrailingArgs?: string[];
   startedBy?: "daemon" | "terminal";
   /** Issue #1633: session launched with --safe-mode (scaffolding disabled).
    *  Stamped into session metadata so server-side respawns preserve it. */
@@ -254,10 +270,20 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   // stream to derive Claude's thinking state from, so the web session status dot
   // stays stuck. Derive `thinking` from UserPromptSubmit/Stop lifecycle hooks
   // instead. Scoped to non-sdk launchers so the sdk launcher's existing
-  // stream-driven thinking is NOT double-driven (R5). Resolved from the same
-  // priority chain (env > settings > default) that selectClaudeRemoteLauncher
-  // uses, so the kind here matches the launcher the loop actually selects.
-  const activeLauncherKind = resolveActiveLauncher().kind;
+  // stream-driven thinking is NOT double-driven (R5). Issue #6617 round 5: the
+  // launcher is resolved ONCE, here (env > settings > default), and loop()
+  // selects the remote launcher from this same value, so the kind here IS the
+  // launcher that runs; the D7-1 refusal (`launcherKind` below) keys on it. A
+  // `hapi launcher set` after this read changes only later wrappers.
+  const activeLauncher = resolveActiveLauncher();
+  const activeLauncherKind = activeLauncher.kind;
+  // Issue #6617 (R8, Task 6b): the narrowing switch this wrapper runs with. A
+  // running wrapper keeps the value it started with, so this line, with
+  // `hapi daemon status` for new wrappers, is how a node reads back which value
+  // is live.
+  logger.info(
+    `permission narrowing holds: ${permissionNarrowingHolds() ? "on" : "off"} (HAPI_PERMISSION_NARROWING_HOLDS=${process.env.HAPI_PERMISSION_NARROWING_HOLDS ?? "unset"})`
+  );
 
   // #1613: Record the launcher kind resolved for THIS spawn onto session
   // metadata, FROZEN for the session's lifetime. Later `hapi launcher set`
@@ -398,6 +424,14 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   // binding before the first turn.
   // Issue #6171: the MCP set's deny list and connector switch ride the same
   // file. Safe mode drops this file, and the server refuses a set in safe mode.
+  // Issue #6570: the node's compact-at value rides it too, as the file's `env`
+  // block (R6). Safe mode drops the file anyway (#1633), so it is skipped there.
+  // The value is read once here: a running process keeps the value it started
+  // with, and a changed preference reaches new and restarted sessions only.
+  const compactionEnv =
+    options.safeMode === true
+      ? undefined
+      : (resolveSessionCompactionEnv() ?? undefined);
   const hookSettingsPath = generateHookSettingsFile(
     hookServer.port,
     hookServer.token,
@@ -406,6 +440,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       outputStyle: options.outputStyle,
       apiKeyBinding: readBoundApiKeyBinding() ?? undefined,
       mcpPolicy,
+      env: compactionEnv,
     }
   );
   logger.debug(
@@ -651,6 +686,12 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     );
   };
 
+  // Issue #6617 (D4 g3-1, g2-1, D1-1, D7-1): the applier below and a RECORD-ONLY
+  // twin now come from `createPermissionModeAppliers`, over runClaude's own
+  // state. `record` is what a permission card and a plan approval call (through
+  // the Session); `apply` adds the tmux/pty refusal and the bounded live switch.
+  // With the narrowing switch off, `apply` is the #2346 applier described next,
+  // line for line.
   // Issue #2346 (ruling D2, Task 5): ONE in-place permission-mode applier, shared
   // by BOTH callers — the EXISTING set-session-config permissionMode branch (the
   // product's only real mode path) and the new launcher-registered
@@ -664,24 +705,30 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   // Throws on a live-query failure — callers decide whether to swallow (the
   // set-session-config branch, whose other fields already applied) or shape it
   // (the new RPC, via the service's error mapping).
-  const applyPermissionModeInPlace = async (
-    mode: PermissionMode
-  ): Promise<{ method: "sdk" | "config" }> => {
-    currentPermissionMode = mode;
-    // Round 11 (epic #3285) durable pin — same write the set-session-config
-    // permissionMode branch did inline before #2346 folded it into this applier.
-    session.updateMetadata(currentMetadata => ({
-      ...currentMetadata,
-      permissionMode: mode,
-    }));
-    syncSessionModes();
-    const liveQuery = currentSessionRef.current?.getLiveQuery() ?? null;
-    if (liveQuery) {
-      await liveQuery.setPermissionMode(mode);
-      return { method: "sdk" };
-    }
-    return { method: "config" };
-  };
+  const { record: recordPermissionMode, apply: applyPermissionModeInPlace } =
+    createPermissionModeAppliers({
+      getCurrentMode: () => currentPermissionMode,
+      setCurrentMode: mode => {
+        currentPermissionMode = mode;
+      },
+      // Round 11 (epic #3285) durable pin — same write the set-session-config
+      // permissionMode branch did inline before #2346 folded it into this applier.
+      saveMode: mode =>
+        session.updateMetadata(currentMetadata => ({
+          ...currentMetadata,
+          permissionMode: mode,
+        })),
+      sync: syncSessionModes,
+      getSession: () => currentSessionRef.current,
+      postMessage: text =>
+        session.sendSessionEvent({ type: "message", message: text }),
+      sendEvent: event => session.sendSessionEvent(event),
+      log: {
+        info: message => logger.info(message),
+        warn: message => logger.warn(message),
+      },
+      launcherKind: activeLauncherKind,
+    });
   session.onUserMessage(message => {
     const sessionPermissionMode =
       currentSessionRef.current?.getPermissionMode();
@@ -908,6 +955,14 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       // at most once and only when the model actually changed (an effort-only /
       // permission-only / unchanged Apply reports method:"config").
       const modelBefore = currentModel;
+      // Issue #6617 (D4 g2-1): what happened to the live permission switch, when
+      // there was one; returned beside `method` (additive).
+      let permissionSwitch:
+        | "applied"
+        | "pending"
+        | "ended"
+        | "failed"
+        | undefined;
 
       if (config.permissionMode !== undefined) {
         // Issue #2346 (ruling D2): this is the product's ONLY real permission-mode
@@ -924,14 +979,31 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
           config.permissionMode
         );
         try {
-          await applyPermissionModeInPlace(resolvedPermissionMode);
+          ({ permissionSwitch } = await applyPermissionModeInPlace(
+            resolvedPermissionMode
+          ));
         } catch (err) {
+          // Issue #6617 (D7-1): a change refused on a running tmux / pty session
+          // recorded nothing; rethrow it, so the RPC answers with the CLI's error
+          // envelope and the user sees the refusal's message. Nothing else in
+          // this call is applied: this branch runs before the model and effort
+          // branches, and the web client sends each changed field on its own.
+          if (err instanceof PermissionModeChangeRefused) {
+            throw err;
+          }
           // The state resync + durable pin already applied inside the applier
-          // before the live-query call threw; only the live switch failed. Surface
-          // it (OR-3: never a silent, more-permissive divergence). Until Task 6
-          // removes the isPlan relaunch, the relaunch reconciles on the next
-          // message — which is exactly why Task 6 is HARD-GATED on this wiring
-          // verifying live before the relaunch is removed.
+          // before the live-query call threw; only the live switch failed.
+          // Issue #6617 (D4 g2-1): with the narrowing switch on, the applier has
+          // already ended the running query (unless the child exited, which the
+          // launcher's crash path handles) and posted one chat line, so the next
+          // message starts a new query in the shown mode. Nothing relaunches on
+          // a mode change any more (#2346 removed the isPlan relaunch).
+          if (permissionNarrowingHolds()) {
+            permissionSwitch =
+              err instanceof SdkRequestError && err.code === "claude_exited"
+                ? "failed"
+                : "ended";
+          }
           logger.warn(
             `[set-session-config] live permission switch to ${resolvedPermissionMode} failed: ${
               err instanceof Error ? err.message : String(err)
@@ -1060,6 +1132,9 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         // /model,/effort,/raw-model routes as {ok:true, method}. Old clients
         // ignore it (the `applied` envelope is unchanged).
         method,
+        // Issue #6617 (D4 g2-1): additive — what happened to a live permission
+        // switch. Older servers read only applied, method and effortRefit.
+        ...(permissionSwitch ? { permissionSwitch } : {}),
         // Issue #6070: additive — present only when a model switch re-fitted the
         // effort, so the server's tmux/pty restart respawns with it (`null` = no
         // effort; JSON keeps null where `applied.effort` would drop undefined).
@@ -1196,6 +1271,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       effort: currentEffort,
       // Round 11: the pin-aware initial posture (see initialPermissionMode).
       permissionMode: initialPermissionMode,
+      permissionModeFromFlag: options.permissionModeFromFlag === true,
       startingMode,
       messageQueue,
       api,
@@ -1204,12 +1280,19 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         toolName => `mcp__${HAPI_MCP_SERVER_NAME}__${toolName}`
       ),
       onModeChange: createModeChangeHandler(session),
+      // Issue #6617 round 5: the one read above, so the launcher that runs is
+      // the kind the D7-1 refusal holds.
+      launcher: activeLauncher,
       onSessionReady: sessionInstance => {
         currentSessionRef.current = sessionInstance;
         // Issue #2346 (ruling D2): publish the shared in-place applier onto the
         // Session so the launcher-registered "set-permission-mode" RPC handler can
         // reach it (mirror of #2256's setLiveQueryAccessor, opposite direction).
         sessionInstance.setPermissionModeApplier(applyPermissionModeInPlace);
+        // Issue #6617 (D4 g3-1): the record-only twin, for a permission card and
+        // a plan approval (the handler must never call the full applier). Round
+        // 4: it ends a running query whose child is wider than the mode recorded.
+        sessionInstance.setPermissionModeRecorder(recordPermissionMode);
         // Issue #1664: attach the per-turn reporter — one instance for the
         // session's whole lifetime (it survives local↔remote switches because
         // loop.ts holds a single Session). Emits are fire-and-forget over the
@@ -1232,6 +1315,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       session,
       claudeEnvVars: options.claudeEnvVars,
       claudeArgs: options.claudeArgs,
+      claudeTrailingArgs: options.claudeTrailingArgs,
       startedBy,
       hookSettingsPath,
     });

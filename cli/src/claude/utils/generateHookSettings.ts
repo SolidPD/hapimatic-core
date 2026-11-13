@@ -225,6 +225,16 @@ export interface HookSettingsOptions {
   apiKeyBinding?: ApiKeyHelperBinding;
   /** Issue #6171: the session's MCP set, as `resolveSessionMcpPolicy` built it. */
   mcpPolicy?: Pick<SessionMcpPolicy, "deny" | "connectorsOff"> | null;
+  /**
+   * Issue #6570: per-session environment values (the `env` settings key). Claude
+   * Code copies a settings `env` into its process environment, so every hook,
+   * tool and MCP child sees it, and a `--settings` file outranks
+   * `~/.claude/settings.json` and the launch environment. Used today for the
+   * compact-at keys (`resolveSessionCompactionEnv`); kept a generic record
+   * because this file is the channel for any per-session env value. Omitted
+   * when unset or empty, so the file is exactly as before #6570.
+   */
+  env?: Record<string, string>;
 }
 
 export function generateHookSettingsFile(
@@ -237,6 +247,7 @@ export function generateHookSettingsFile(
     outputStyle,
     apiKeyBinding,
     mcpPolicy,
+    env,
   } = options;
   const hooksDir = join(configuration.happyHomeDir, "tmp", "hooks");
   mkdirSync(hooksDir, { recursive: true });
@@ -288,6 +299,7 @@ export function generateHookSettingsFile(
     permissions?: { allow: string[] };
     deniedMcpServers?: Array<{ serverName: string }>;
     disableClaudeAiConnectors?: boolean;
+    env?: Record<string, string>;
   } = {
     hooks: {
       SessionStart: hookEntry,
@@ -350,6 +362,13 @@ export function generateHookSettingsFile(
   const docsReadRules = buildNodeDocsReadRules();
   if (docsReadRules.length > 0) {
     settings.permissions = { allow: docsReadRules };
+  }
+
+  // Issue #6570: per-session env values (the compact-at keys). Written LAST, so
+  // every key order before #6570 is unchanged, and omitted when there is nothing
+  // to write, so such a file is byte-identical to the pre-#6570 one (R7).
+  if (env && Object.keys(env).length > 0) {
+    settings.env = { ...env };
   }
 
   writeFileSync(filepath, JSON.stringify(settings, null, 4));

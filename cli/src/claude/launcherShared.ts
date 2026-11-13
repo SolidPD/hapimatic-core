@@ -13,6 +13,10 @@
 
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import {
+  HAPI_COMPACT_AT_CLAUDE_VALUE_ENV,
+  HAPI_COMPACT_AT_PCT_ENV,
+} from "@hapi/protocol";
 import { configuration } from "@/configuration";
 import {
   AGENT_FORBIDDEN_ENV_VARS,
@@ -81,6 +85,23 @@ export const BINDING_ENV_VARS = new Set([
   "HAPI_API_KEY_ID",
   "HAPI_API_KEY_MASKED",
   "HAPI_API_KEY_PLACED_BY",
+]);
+
+/**
+ * Issue #6570: Hapimatic's own compact-at keys, which reach a Claude session only
+ * through its per-session `--settings` file (`env` block). Claude Code copies a
+ * settings `env` into its process environment, so a `hapi claude` started inside
+ * another session (a tool's Bash, or a daemon or tmux server started from one)
+ * would otherwise pass the parent's values through. Stripped from the AMBIENT copy
+ * only, in {@link buildLauncherEnv} and {@link buildSdkSpawnEnv}, and unset in a tmux
+ * pane ({@link paneEnvUnsetNames}) and the tmux server's global table, so the keys are
+ * present if and only if this session's wrapper set them. An inherited
+ * `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is deliberately left alone: an operator's own
+ * launch value is theirs.
+ */
+export const COMPACT_AT_INHERITED_ENV_VARS: ReadonlySet<string> = new Set([
+  HAPI_COMPACT_AT_PCT_ENV,
+  HAPI_COMPACT_AT_CLAUDE_VALUE_ENV,
 ]);
 
 /**
@@ -166,6 +187,9 @@ export function buildLauncherEnv(
     // #4884 (PM ruling): an inherited ANTHROPIC_BASE_URL would send the
     // subscription sign-in to whatever address it names.
     if (SUBSCRIPTION_SESSION_STRIP_ENV_VARS.has(key)) continue;
+    // #6570: a parent session's compact-at keys; this session's come from its
+    // own --settings file.
+    if (COMPACT_AT_INHERITED_ENV_VARS.has(key)) continue;
     env[key] = value;
   }
   env.DISABLE_AUTOUPDATER = "1";
@@ -258,6 +282,9 @@ export function buildSdkSpawnEnv<V>(
     if (subscriptionChild && SUBSCRIPTION_SESSION_STRIP_ENV_VARS.has(key)) {
       continue;
     }
+    // Issue #6570: a parent session's compact-at keys; this session's come from
+    // its own --settings file.
+    if (COMPACT_AT_INHERITED_ENV_VARS.has(key)) continue;
     result[key] = value;
   }
   if (explicit) {
@@ -502,12 +529,20 @@ export function paneEnvUnsetNames(
   // after the wrapper exits (`env -u`, see paneEnvScrubNames in TmuxManager.ts),
   // so neither inherits a variable a failed global-table scrub missed. The
   // wrapper's own values come from its env file, so its environment is unchanged.
+  //
+  // #6570: the unset ALSO covers COMPACT_AT_INHERITED_ENV_VARS, for both
+  // consumers. buildLauncherEnv keeps them out of the env file, but a tmux server
+  // first created from inside a session's tool Bash holds the parent's
+  // HAPI_COMPACT_AT_* in its global table, and every pane would inherit them. A
+  // session's own values reach Claude Code through its --settings env block,
+  // never through the pane environment, so nothing re-applies one here.
   return [
     ...new Set([
       ...SDK_SIGNAL_ENV_VARS,
       ...BINDING_ENV_VARS,
       ...API_KEY_HELPER_OUTRANKING_ENV_VARS,
       ...AGENT_FORBIDDEN_ENV_VARS,
+      ...COMPACT_AT_INHERITED_ENV_VARS,
       ...(opts.subscriptionClaudePane
         ? SUBSCRIPTION_SESSION_STRIP_ENV_VARS
         : []),

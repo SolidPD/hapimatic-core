@@ -64,7 +64,8 @@ export interface OnboardingGuideProps {
 /**
  * The first-run wizard's panel (#6211). NON-modal, so the real page stays usable
  * beneath it: the user acts on the page, and a modal would block that. It sits at
- * the bottom on a phone and bottom-right on a desktop, below dialogs (`z-40`;
+ * the bottom on a phone and bottom-center of the content column on a desktop
+ * (never out in the letterbox: operator ruling 2026-11-12), below dialogs (`z-40`;
  * `Dialog` is `z-50`), so a real dialog such as Add to Anthropic opens over it. It
  * never advances by itself, so nothing jumps while the user reads. Every control is
  * `type="button"`, because `Button` has no default type and a page beneath may
@@ -92,7 +93,7 @@ export function OnboardingGuide({
       aria-modal="false"
       aria-label="Set up Hapimatic"
       data-testid="onboarding-guide"
-      className="fixed inset-x-0 bottom-0 z-40 flex max-h-[60dvh] flex-col gap-2 overflow-y-auto rounded-t-xl border-t border-[var(--app-border)] bg-[var(--app-secondary-bg)] p-4 pb-[calc(env(safe-area-inset-bottom)+1rem)] text-[var(--app-fg)] shadow-lg sm:inset-x-auto sm:bottom-4 sm:right-4 sm:w-96 sm:rounded-xl sm:border sm:pb-4"
+      className="fixed inset-x-[var(--content-gutter)] bottom-0 z-40 flex max-h-[60dvh] flex-col gap-2 overflow-y-auto rounded-t-xl border-t border-[var(--app-border)] bg-[var(--app-secondary-bg)] p-4 pb-[calc(env(safe-area-inset-bottom)+1rem)] text-[var(--app-fg)] shadow-lg sm:inset-x-auto sm:bottom-4 sm:left-1/2 sm:w-96 sm:-translate-x-1/2 sm:rounded-xl sm:border sm:pb-4"
     >
       <p
         aria-live="polite"

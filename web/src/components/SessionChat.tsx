@@ -38,6 +38,7 @@ import { useHappyRuntime } from "@/lib/assistant-runtime";
 import { SessionHeader } from "@/components/SessionHeader";
 import { SessionOfflineBar } from "@/components/session/SessionOfflineBar";
 import { useToast } from "@/components/Toast";
+import { apiErrorServerMessage } from "@/lib/apiErrorMessage";
 import { SessionNotes } from "@/components/SessionNotes";
 import { MAX_NOTES_LENGTH } from "@/hooks/useSessionNotesAutosave";
 import { parseNotes, type EffortLevel } from "@hapi/protocol";
@@ -522,7 +523,11 @@ export function SessionChat(props: {
       } catch (e) {
         haptic.notification("error");
         console.error("Failed to set permission mode:", e);
-        showToast("Failed to change permission mode", { type: "error" });
+        // #6617 (D7-1, G-d): every failure says it failed; the refusal's text
+        // (and any other server text) follows the prefix.
+        const msg = apiErrorServerMessage(e);
+        const text = "Failed to change permission mode";
+        showToast(msg ? `${text}: ${msg}` : text, { type: "error" });
       }
     },
     [setPermissionMode, props.onRefresh, haptic, showToast]

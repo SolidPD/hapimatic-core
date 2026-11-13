@@ -9,6 +9,7 @@ import { selectClaudeRemoteLauncher } from "./launcherDispatch";
 import { ApiClient } from "@/lib";
 import type { SessionModelMode } from "@/api/types";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
+import type { ResolvedLauncher } from "@hapi/protocol/launcherResolver";
 import { deriveModelModeFromRaw } from "@hapi/protocol";
 
 export type PermissionMode = ClaudePermissionMode;
@@ -32,6 +33,8 @@ interface LoopOptions {
   /** Issue #2456: reasoning-effort level, seeded from runClaude's currentEffort. */
   effort?: string;
   permissionMode?: PermissionMode;
+  /** Issue #6400 P1: required so a dropped hop fails typecheck. */
+  permissionModeFromFlag: boolean;
   startingMode?: "local" | "remote";
   startedBy?: "daemon" | "terminal";
   onModeChange: (mode: "local" | "remote") => void;
@@ -40,10 +43,19 @@ interface LoopOptions {
   api: ApiClient;
   claudeEnvVars?: Record<string, string>;
   claudeArgs?: string[];
+  /** Issue #5348: see {@link Session.claudeTrailingArgs}. */
+  claudeTrailingArgs?: string[];
   messageQueue: MessageQueue2<EnhancedMode>;
   allowedTools?: string[];
   onSessionReady?: (session: Session) => void;
   hookSettingsPath: string;
+  /**
+   * Issue #6617 round 5: the launcher runClaude resolved once. The remote
+   * launcher is selected from it, never from a second read of env and
+   * settings, so it is the kind the permission gate holds. Required so a
+   * dropped hop fails typecheck.
+   */
+  launcher: ResolvedLauncher;
 }
 
 export async function loop(opts: LoopOptions) {
@@ -61,6 +73,7 @@ export async function loop(opts: LoopOptions) {
     sessionId: null,
     claudeEnvVars: opts.claudeEnvVars,
     claudeArgs: opts.claudeArgs,
+    claudeTrailingArgs: opts.claudeTrailingArgs,
     mcpServers: opts.mcpServers,
     logPath: logPath,
     messageQueue: opts.messageQueue,
@@ -71,6 +84,7 @@ export async function loop(opts: LoopOptions) {
     startingMode,
     hookSettingsPath: opts.hookSettingsPath,
     permissionMode: opts.permissionMode ?? "default",
+    permissionModeFromFlag: opts.permissionModeFromFlag,
     modelMode,
     // Issue #1608: seed the launcher's entitled-pin discriminator. `opts.model`
     // is runClaude's `currentModel` ("opus[1m]" for an entitled-default session,
@@ -87,7 +101,7 @@ export async function loop(opts: LoopOptions) {
     startingMode: opts.startingMode,
     logTag: "loop",
     runLocal: claudeLocalLauncher,
-    runRemote: selectClaudeRemoteLauncher(),
+    runRemote: selectClaudeRemoteLauncher(opts.launcher),
     onSessionReady: opts.onSessionReady,
   });
 }

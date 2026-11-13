@@ -50,6 +50,8 @@ type Parsed = {
   flags: Map<string, string | true>;
   /** Passed through to ssh: everything after `ssh`'s own options. */
   rest: string[];
+  /** A top-level `--` was seen (also a bare trailing one), #5348. */
+  endOfOptions: boolean;
 };
 
 const VALUE_FLAGS = new Set([
@@ -67,10 +69,12 @@ export function parseCompanionArgs(args: string[]): Parsed {
   const positionals: string[] = [];
   const flags = new Map<string, string | true>();
   let rest: string[] = [];
+  let endOfOptions = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] ?? "";
     if (arg === "--") {
       rest = args.slice(i + 1);
+      endOfOptions = true;
       break;
     }
     if (arg.startsWith("--")) {
@@ -96,16 +100,41 @@ export function parseCompanionArgs(args: string[]): Parsed {
       continue;
     }
     // `ssh` takes its ssh arguments or remote command straight after its own
-    // options, like `ssh host cmd`: the first one starts the pass-through. A
-    // `--` cannot be relied on, because the top-level argument normalizer
-    // (`utils/cliArgs.ts`) drops everything before the first `--`.
+    // options, like `ssh host cmd`: the first one starts the pass-through, and so
+    // does a `--` (handled above). Only `ssh` takes the marker (#5348).
     if (positionals[0] === "ssh") {
       rest = args.slice(i);
       break;
     }
     positionals.push(arg);
   }
-  return { positionals, flags, rest };
+  return { positionals, flags, rest, endOfOptions };
+}
+
+const MARKER_REFUSAL =
+  "hapi companion takes -- only for ssh: hapi companion ssh [options] -- <command>.";
+
+/**
+ * Issue #5348 (R4): the refusal for a companion command line that carries the
+ * end-of-options marker for any subcommand but `ssh`, or undefined when it may run.
+ * A line the parser rejects returns undefined: the command reports that error itself.
+ */
+export function companionMarkerRefusal(args: string[]): string | undefined {
+  let parsed: Parsed;
+  try {
+    parsed = parseCompanionArgs(args);
+  } catch {
+    return undefined;
+  }
+  return markerRefusal(parsed);
+}
+
+function markerRefusal(parsed: Parsed): string | undefined {
+  const sub = parsed.positionals[0];
+  if (sub === "ssh") return undefined;
+  return parsed.endOfOptions || parsed.rest.length > 0
+    ? MARKER_REFUSAL
+    : undefined;
 }
 
 const value = (p: Parsed, name: string): string | undefined => {
@@ -123,6 +152,8 @@ function integerFlag(p: Parsed, name: string): number | undefined {
 
 export async function runCompanionCommand(args: string[]): Promise<number> {
   const parsed = parseCompanionArgs(args);
+  const refusal = markerRefusal(parsed);
+  if (refusal) throw new Error(refusal);
   const [sub, ...positionals] = parsed.positionals;
   if (!sub || sub === "help" || parsed.flags.has("help")) {
     process.stdout.write(`${COMPANION_HELP}\n`);
@@ -175,6 +206,9 @@ export async function runCompanionCommand(args: string[]): Promise<number> {
 export const companionCommand: CommandDefinition = {
   name: "companion",
   requiresRuntimeAssets: false,
+  // Issue #5348: `hapi companion ssh … -- <command>`; every other companion
+  // subcommand refuses the marker (companionMarkerRefusal).
+  acceptsEndOfOptions: true,
   run: async ({ commandArgs }) => {
     let code: number;
     try {

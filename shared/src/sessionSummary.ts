@@ -213,7 +213,7 @@ export type SessionSummary = {
    */
   backgroundAgents?: BackgroundAgentsSummary | null;
   /** Server-tracked: timestamp when current thinking segment began */
-  thinkingStartedAt?: number;
+  thinkingStartedAt?: number | null;
   /** Server-tracked: total accumulated thinking time in ms */
   serverAccumulatedMs?: number;
   activeAt: number;

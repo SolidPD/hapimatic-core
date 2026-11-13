@@ -17,6 +17,8 @@ import {
   buildTrimSuggestions,
   groupMcpServers,
   mcpServerContextTokens,
+  mcpServerRowLabel,
+  mcpSharedKeyNote,
   unitemizedMcpTokens,
   type ContextSection,
   type ContextSectionKey,
@@ -475,7 +477,14 @@ function hasDetail(key: ContextSectionKey): boolean {
   );
 }
 
-type ItemRow = { key: string; label: string; note?: string; tokens: number };
+type ItemRow = {
+  key: string;
+  label: string;
+  note?: string;
+  /** The row's tooltip; the label when absent. */
+  title?: string;
+  tokens: number;
+};
 
 function ItemList({ rows, testId }: { rows: ItemRow[]; testId: string }) {
   if (rows.length === 0) {
@@ -494,7 +503,7 @@ function ItemList({ rows, testId }: { rows: ItemRow[]; testId: string }) {
         >
           <span
             className="min-w-0 flex-1 truncate text-[var(--app-fg)]"
-            title={row.label}
+            title={row.title ?? row.label}
           >
             {row.label}
             {row.note ? (
@@ -573,6 +582,10 @@ function SectionDetail({
             ...capped(
               groupMcpServers(detail).map(server => {
                 const notes: string[] = [];
+                // #6409 item 3: first, so it survives the label's truncation
+                // at 393 px; the row's title carries the full sentence.
+                const sharedNote = mcpSharedKeyNote(server);
+                if (sharedNote) notes.push("shared tool prefix");
                 if (server.loadedTools > 0) {
                   notes.push(
                     `${server.loadedTools} tool${server.loadedTools === 1 ? "" : "s"}`
@@ -589,9 +602,12 @@ function SectionDetail({
                   );
                 }
                 return {
-                  key: server.name,
-                  label: server.name,
+                  // Prefixed, so a server named `__more` or `__unitemized`
+                  // cannot share a reserved row's key.
+                  key: `mcp:${server.name}`,
+                  label: mcpServerRowLabel(server),
                   note: notes.join(" · "),
+                  title: sharedNote,
                   tokens: mcpServerContextTokens(server),
                 };
               })

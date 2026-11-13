@@ -2,7 +2,8 @@
 import axios from "axios";
 import chalk from "chalk";
 import { PmSpawnReconciliationStatusSchema, type McpSet } from "@hapi/protocol";
-import { parseMcpSetFlags } from "./apiSpawnMcpFlags";
+import { mcpSetFromScan } from "./apiSpawnMcpFlags";
+import { SPAWN_USAGE, scanSpawnFlags } from "./apiSpawnFlags";
 import {
   BULK_SESSION_MAX_IDS,
   BulkSessionResultSchema,
@@ -82,7 +83,7 @@ export type ResolvedSpawnArgs = {
    *  mode, validated strictly here; the server checks it against the harness. */
   permissionMode?: string;
   /** Issue #6171: the MCP servers the session starts with (see
-   *  {@link parseMcpSetFlags}). Absent → the project's default, else every
+   *  {@link mcpSetFromScan}). Absent → the project's default, else every
    *  server, and the request body is byte-identical to before. */
   mcpSet?: McpSet;
 };
@@ -119,6 +120,9 @@ export function boundAccountLine(
  * the settings read (R2). Returns a `{ error }` shape — never throws — so the
  * caller controls exit.
  *
+ * Issue #6400: every flag comes from one strict {@link scanSpawnFlags} pass,
+ * which refuses a malformed command before the settings read.
+ *
  * `readSettingsFn` is injectable for unit tests, matching the codebase's
  * no-mocking test style (the test passes a plain stub, not a module mock).
  * `settingsPath` is injectable the same way, and names the file in the
@@ -133,12 +137,12 @@ export async function resolveSpawnArgs(
   parentSessionIdEnv: string | undefined = process.env.HAPI_SESSION_ID,
   settingsPath: string = configuration.settingsFile
 ): Promise<ResolvedSpawnArgs | SpawnArgsError> {
-  const dir = parseFlag(args, "--dir");
+  const scan = scanSpawnFlags(args.slice(1)); // args[0] is the verb (#6400)
+  if ("error" in scan) return scan;
+
+  const dir = scan.values.get("--dir");
   if (!dir) {
-    return {
-      error:
-        "Usage: hapi api sessions spawn --dir <path> [--machine <id>] [--name <display-name>] [--session-role <role>] [--model-mode <mode>] [--effort <level>] [--yolo | --permission-mode <mode>] [--mcp <name>]... [--mcp-none | --mcp-all] [--mcp-enable-for-project] [--parent-session-id <id>]",
-    };
+    return { error: SPAWN_USAGE };
   }
 
   // Issue #2155: validate --session-role strictly at the CLI (human-facing
@@ -146,7 +150,7 @@ export async function resolveSpawnArgs(
   // silently loading the full stack. The server contract itself fail-opens on
   // an unknown role (machines.ts `.catch(undefined)`), but the CLI is a
   // convenience wrapper where an explicit error is the better UX.
-  const sessionRoleRaw = parseFlag(args, "--session-role");
+  const sessionRoleRaw = scan.values.get("--session-role");
   if (
     sessionRoleRaw !== undefined &&
     !SessionRoleSchema.safeParse(sessionRoleRaw).success
@@ -161,7 +165,7 @@ export async function resolveSpawnArgs(
   // --session-role above. The server's flavor guard (machines.ts) is the
   // AUTHORITATIVE check — it also rejects a Claude mode on a non-Claude spawn,
   // which the CLI cannot know here (the spawn's agent is server-side default).
-  const modelModeRaw = parseFlag(args, "--model-mode");
+  const modelModeRaw = scan.values.get("--model-mode");
   if (
     modelModeRaw !== undefined &&
     !ModelModeSchema.safeParse(modelModeRaw).success
@@ -174,7 +178,7 @@ export async function resolveSpawnArgs(
   // Issue #6166: validate --effort strictly at the CLI, like --model-mode. It
   // applies to Claude sessions only — the server ignores an effort on another
   // agent's spawn.
-  const effortRaw = parseFlag(args, "--effort");
+  const effortRaw = scan.values.get("--effort");
   let effort: EffortLevel | undefined;
   if (effortRaw !== undefined) {
     const parsed = EffortLevelSchema.safeParse(effortRaw);
@@ -190,8 +194,8 @@ export async function resolveSpawnArgs(
   // node's default spawn permission mode server-side, so a PM lane that needs a
   // bypass peer must pass --yolo. The server is the authoritative check (the
   // mode against the harness, and --yolo against the mode).
-  const yolo = args.includes("--yolo");
-  const permissionModeRaw = parseFlag(args, "--permission-mode");
+  const yolo = scan.booleans.has("--yolo");
+  const permissionModeRaw = scan.values.get("--permission-mode");
   if (
     permissionModeRaw !== undefined &&
     !PermissionModeSchema.safeParse(permissionModeRaw).success
@@ -202,11 +206,11 @@ export async function resolveSpawnArgs(
   }
 
   // Issue #6171: the MCP set, validated before the machine lookup.
-  const mcp = parseMcpSetFlags(args);
+  const mcp = mcpSetFromScan(scan.repeated.get("--mcp") ?? [], scan.booleans);
   if ("error" in mcp) return mcp;
 
   // An explicit --machine wins and avoids consulting settings.json (R2).
-  let machineId = parseFlag(args, "--machine");
+  let machineId = scan.values.get("--machine");
   if (!machineId) {
     const settings = await readSettingsFn();
     machineId = settings.machineId;
@@ -219,14 +223,14 @@ export async function resolveSpawnArgs(
     };
   }
 
-  const name = parseFlag(args, "--name");
+  const name = scan.values.get("--name");
   // Issue #2479: default the parent link to the caller's HAPI_SESSION_ID so a
   // spawn issued from inside a session (a hook, or Sub-Issue R's hapi-spawn.sh)
   // auto-links the new managed peer to its spawner. An explicit flag wins. The
   // value may be a session TAG (HAPI_SESSION_ID is the tag) — the server
   // resolves tag→uuid before persisting (machines.ts, expert-review D1a).
   const parentSessionId =
-    parseFlag(args, "--parent-session-id") ?? parentSessionIdEnv;
+    scan.values.get("--parent-session-id") ?? parentSessionIdEnv;
   return {
     dir,
     machineId,

@@ -18,7 +18,7 @@
 export interface ElapsedSessionLike {
   serverAccumulatedMs?: number;
   thinking?: boolean;
-  thinkingStartedAt?: number;
+  thinkingStartedAt?: number | null;
   isWaitingForUserQuestion?: boolean;
 }
 
@@ -30,7 +30,7 @@ export interface ElapsedSessionLike {
 export function elapsedWithLiveSegment(
   serverAccumulatedMs: number | undefined,
   ticking: boolean,
-  thinkingStartedAt: number | undefined,
+  thinkingStartedAt: number | null | undefined,
   nowMs: number
 ): number {
   const base = serverAccumulatedMs ?? 0;

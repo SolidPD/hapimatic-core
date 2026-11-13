@@ -156,7 +156,15 @@ export function harnessEgressHosts(): string[] {
  * Order is load-bearing: like the `agent:<name>` set, `tool:<name>` tags are an
  * ORDERED federation cross-validation input. {@link resolveToolCapabilities}
  * always emits an allowlist-ordered sublist, and both twins APPEND it (never
- * interleave) after the `agent:*` / `gateway:*` tags (R2/R6).
+ * interleave) after the `agent:*` / `gateway:*` tags (R2/R6). New entries are
+ * therefore only ever appended to the END of this list, so every existing tag
+ * keeps its position.
+ *
+ * A name here is the tool's BINARY name, not its product name, because both
+ * twins probe with `Bun.which(<name>)`: Graphviz is `dot`, never `graphviz`.
+ * The entries after `renode` are the wiring-harness drawing toolchain (`wireviz`,
+ * Graphviz `dot`, Ghostscript `gs`, MuPDF `mutool`) and `freecadcmd`, the
+ * headless FreeCAD (`freecad` keeps meaning the GUI binary).
  */
 export const TOOL_CAPABILITY_ALLOWLIST = [
   "kicad-cli",
@@ -165,6 +173,11 @@ export const TOOL_CAPABILITY_ALLOWLIST = [
   "ngspice",
   "simavr",
   "renode",
+  "wireviz",
+  "dot",
+  "gs",
+  "mutool",
+  "freecadcmd",
 ] as const;
 
 /** The `tool:` capability-tag prefix. Kept here so no usage site hard-codes a

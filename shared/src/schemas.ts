@@ -17,6 +17,7 @@ import {
   PERMISSION_MODES,
 } from "./modes";
 import { EFFORT_LEVELS } from "./effort";
+import { isSpawnModelArgValue } from "./spawnArgValues";
 import { ClaudeRemoteLauncherKindSchema } from "./launcherResolver";
 import { FileClaimSyncSnapshotSchema } from "./fileClaims";
 import { hookCoverageRecordSchema } from "./messageHookConfig";
@@ -99,7 +100,17 @@ export const ApplySessionConfigSchema = z
     permissionMode: PermissionModeSchema.optional(),
     modelMode: ModelModeSchema.optional(),
     effort: EffortLevelSchema.optional(),
-    rawModel: z.string().min(1).max(200).optional(),
+    // Issue #5348: refused when the spawned hapi would read the trimmed value as a
+    // flag (the check is a lazy call: spawnArgValues.ts imports this module).
+    rawModel: z
+      .string()
+      .min(1)
+      .max(200)
+      .refine(v => isSpawnModelArgValue(v), {
+        message:
+          "must start with a letter or a digit and hold no whitespace (#5348)",
+      })
+      .optional(),
   })
   .refine(v => Object.values(v).some(x => x !== undefined), {
     message: "At least one config field required",
@@ -762,7 +773,7 @@ export const SessionSchema = z
     thinking: z.boolean(),
     thinkingAt: z.number(),
     /** Server-tracked: timestamp when current thinking segment began */
-    thinkingStartedAt: z.number().optional(),
+    thinkingStartedAt: z.number().nullish(),
     /** Server-tracked: total accumulated thinking time in ms */
     serverAccumulatedMs: z.number().optional(),
     /**
@@ -979,6 +990,13 @@ export const McpCatalogEntrySchema = z.object({
   hosted: z.boolean(),
   ram: McpServerRamCostSchema.optional(),
   context: McpServerContextCostSchema.optional(),
+  /**
+   * #6409 item 3: the other known server names on this node that reduce to
+   * the same key (the tool prefix before `__`). Claude Code reports their tools
+   * together, so such an entry carries no `ram` or `context` number. Optional,
+   * and no reader validates the catalog at runtime, so an older reader ignores it.
+   */
+  sharedKeyWith: z.array(z.string()).optional(),
 });
 export type McpCatalogEntry = z.infer<typeof McpCatalogEntrySchema>;
 

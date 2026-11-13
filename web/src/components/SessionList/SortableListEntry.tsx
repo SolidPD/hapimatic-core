@@ -41,8 +41,14 @@ export type SortableDragHandle = {
  * by BOTH the guarded sensors (which veto activation) AND the row/header tap-navigation
  * guards (which skip navigation) — keeping them in one place makes it impossible for
  * the drag-arm exclusion and the nav guard to diverge.
+ *
+ * `[role="menu"]` covers a menu a row opens (the chevron's Expand All / Collapse
+ * All menu). Such a menu is portaled to `<body>`, but its React events still
+ * bubble to the row that owns it, so a press on the menu's own padding would
+ * otherwise arm a drag of that row, or a tap there open the session.
  */
-export const INTERACTIVE_SELECTOR = "button, input, a, .icon-row";
+export const INTERACTIVE_SELECTOR =
+  'button, input, a, .icon-row, [role="menu"]';
 
 /** True when the pointer/click target is (inside) an interactive child. */
 export function isInteractiveTarget(target: EventTarget | null): boolean {

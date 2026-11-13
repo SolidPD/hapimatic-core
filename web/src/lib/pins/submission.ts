@@ -56,7 +56,9 @@ export type BuiltSubmission = {
  * One request entry from a staged pin, or null when it has nothing new: a
  * choice, a non-empty note, its questions, ticks whose count differs from what
  * the server already has, and a save (#6453). `rev` is the staged revision, never the pin's
- * current one, so a choice made on r2 of a pin now at r3 is recorded moot.
+ * current one, so a choice made on r2 of a pin now at r3 is recorded moot. A
+ * staged dismissal (#6539) is sent on its own, with only its note and a staged
+ * save, because the server refuses anything else beside it.
  */
 function entryFor(
   key: string,
@@ -64,6 +66,16 @@ function entryFor(
   pin: Pin | undefined
 ): PinSubmissionEntry | null {
   const note = staged.note?.trim() ? staged.note : undefined;
+  if (staged.dismiss === true) {
+    return {
+      key,
+      rev: staged.rev,
+      via: staged.via,
+      dismiss: true,
+      ...(note ? { note } : {}),
+      ...(staged.saved === true ? { saved: true as const } : {}),
+    };
+  }
   const questions = staged.questions?.length
     ? [...staged.questions]
     : undefined;
@@ -157,7 +169,8 @@ export function buildSubmissionRequest(input: {
     }
   }
   // #6452 (ruling D5): each pending automatic-pick change rides along. A pin
-  // answered by choice settles, so its change no longer matters to the agent.
+  // answered by choice settles, so its change no longer matters to the agent;
+  // a dismissed pin closes, so its entry is left alone too (#6539).
   const reports = pendingDeadlineReports(input.pins).sort((a, b) =>
     PIN_SORTS.priority(a, b)
   );
@@ -165,7 +178,7 @@ export function buildSubmissionRequest(input: {
     const index = entries.findIndex(entry => entry.key === pin.key);
     const entry = entries[index];
     if (entry) {
-      if (entry.choice === undefined) {
+      if (entry.choice === undefined && entry.dismiss !== true) {
         entries[index] = { ...entry, automaticPick: true };
       }
       continue;

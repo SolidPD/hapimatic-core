@@ -300,9 +300,13 @@ async function buildTarget(
 
   if (isHostTarget(platform, arch)) {
     await selftestTelemetryWorker(outfile, target);
+    await selftestArgv(outfile, target);
   } else {
     console.log(
       `[build:exe] ${target}: telemetry-worker selftest skipped (this host cannot run the binary; degraded mode covers it at runtime)`
+    );
+    console.log(
+      `[build:exe] ${target}: argv selftest skipped (this host cannot run the binary; a named limit of #5348 R12)`
     );
   }
 }
@@ -333,6 +337,31 @@ async function selftestTelemetryWorker(
     if (code !== 0) {
       throw new Error(
         `${target}: telemetry-worker selftest failed (exit ${code}); the binary's bundled query worker does not start`
+      );
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Issue #5348 (R12): run the built binary's `selftest argv` and fail the build when it
+ * fails, so a binary that drops or widens a `--` never ships. The verb runs the binary
+ * itself in report mode for each case; HOME and HAPI_HOME are scratch dirs here too.
+ */
+async function selftestArgv(outfile: string, target: string): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), "hapi-build-argv-selftest-"));
+  try {
+    const proc = Bun.spawn({
+      cmd: [outfile, "selftest", "argv"],
+      env: { ...process.env, HOME: home, USERPROFILE: home, HAPI_HOME: home },
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const code = await proc.exited;
+    if (code !== 0) {
+      throw new Error(
+        `${target}: argv selftest failed (exit ${code}); the binary's dispatch of a command line is wrong`
       );
     }
   } finally {

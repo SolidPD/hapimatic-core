@@ -10,6 +10,7 @@ import {
   type AutomaticPickState,
 } from "@/lib/pins/deadline";
 import type { PinViewModel } from "@/lib/pins/ledger";
+import { useStagedPin } from "@/lib/pins/staging";
 import { useMinuteNow } from "@/lib/pins/useMinuteNow";
 import { cn } from "@/lib/utils";
 import { formatPickTime } from "@/lib/pins/zoneTime";
@@ -18,7 +19,10 @@ import { formatPickTime } from "@/lib/pins/zoneTime";
  * #6452 (R9): the automatic-pick line at the end of an open decision pin's
  * detail (mockup v6 `deadlineBar`, `.deadline` :308-314), on one row: what it
  * will pick and when, then a button that opens the deadline dialog. Nothing
- * for a pin with no pick, or from a node built before #6452.
+ * for a pin with no pick, or from a node built before #6452. #6539 (R12):
+ * while a dismissal is staged the button is inert, because staging turned the
+ * pick off to hold it and re-arming it here would undo the hold; Undo is the
+ * way back.
  */
 export function PinDeadlineLine(props: { model: PinViewModel }) {
   const state = automaticPickState(props.model);
@@ -27,6 +31,8 @@ export function PinDeadlineLine(props: { model: PinViewModel }) {
 }
 
 const ICON: CSSProperties = { width: "13px", height: "13px" };
+/** Why the button does nothing while a dismissal is staged. */
+export const DEADLINE_HELD_TOOLTIP = "Undo turns the automatic pick back on";
 const ARMED_FILL: CSSProperties = {
   background: "color-mix(in srgb, var(--status-warn) 9%, transparent)",
 };
@@ -43,6 +49,7 @@ function Line(props: {
   const [open, setOpen] = useState(false);
   const armed = state.kind === "armed";
   const Icon = armed ? Timer : TimerOff;
+  const held = useStagedPin(sessionId, model.pin.key)?.dismiss === true;
   return (
     <>
       <div
@@ -82,15 +89,20 @@ function Line(props: {
             "Automatic pick is off · waits for you"
           )}
         </span>
+        {/* Inert, not `disabled`: a disabled button shows no tooltip, and the
+            tooltip is what says why (the `ui/button.tsx` #3462 pattern). */}
         <HoverTooltipButton
           type="button"
           content={
-            armed
-              ? "Move or turn off this pin's automatic pick"
-              : "Set a time for this pin's automatic pick"
+            held
+              ? DEADLINE_HELD_TOOLTIP
+              : armed
+                ? "Move or turn off this pin's automatic pick"
+                : "Set a time for this pin's automatic pick"
           }
-          onClick={() => setOpen(true)}
-          className="inline-flex h-6 flex-none items-center gap-1 whitespace-nowrap rounded-md border border-[var(--app-border)] px-2 text-xs font-semibold text-[var(--app-fg)] transition-colors hover:bg-[var(--app-subtle-bg)]"
+          aria-disabled={held || undefined}
+          onClick={held ? undefined : () => setOpen(true)}
+          className="inline-flex h-6 flex-none items-center gap-1 whitespace-nowrap rounded-md border border-[var(--app-border)] px-2 text-xs font-semibold text-[var(--app-fg)] transition-colors hover:bg-[var(--app-subtle-bg)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
         >
           <CalendarClock
             style={{ width: "12px", height: "12px" }}
@@ -99,7 +111,7 @@ function Line(props: {
           {armed ? "Change…" : "Set…"}
         </HoverTooltipButton>
       </div>
-      {open ? (
+      {open && !held ? (
         <PinDeadlineDialog
           open
           onOpenChange={setOpen}

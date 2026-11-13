@@ -2,14 +2,19 @@
 import {
   memo,
   useCallback,
+  useEffect,
   useLayoutEffect,
+  useRef,
   useState,
+  type ComponentProps,
   type CSSProperties,
   type KeyboardEvent,
+  type RefObject,
 } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { ArrowRight, Pin as PinGlyph } from "lucide-react";
 import type { ApiClient } from "@/api/client";
+import { chipsOverflow } from "@/components/AssistantChat/SessionConfigCluster";
 import { ChevronIcon } from "@/components/icons";
 import { NodeBadge } from "@/components/NodeBadge";
 import { LaneBox, StatusPip } from "@/components/pins/LaneBox";
@@ -26,7 +31,9 @@ import type { ProjectManagerModel } from "@/lib/pins/dashboards";
  * #6454: one Project Manager (mockup v6 `pmBlock()` :756-763, CSS :183-205): a
  * gold header (the `--session-rel-spawn` family), then its lanes in boxes. The
  * one managing the open session is outlined and filled and starts expanded; the
- * others recede until hovered. The header row expands in place; Open goes to
+ * others recede until hovered. #6539 (Matt's NLOOK2): the gold outline is the
+ * block's, so it holds the header AND every lane box (R8-c: an object's outline
+ * contains every object that belongs to it). The header row expands in place; Open goes to
  * the PM's session; 📌 opens every lane with open pins and flashes them.
  */
 
@@ -34,8 +41,16 @@ const HEADER_GRID: CSSProperties = {
   gridTemplateColumns: "20px minmax(0,1fr) auto",
   columnGap: "6px",
   padding: "4px 4px 4px 6px",
-  borderRadius: "4px",
 };
+
+/** The block's outline: solid gold when it manages this session, muted otherwise. */
+function blockBorder(managing: boolean): string {
+  return `1px solid ${
+    managing
+      ? "var(--session-rel-spawn)"
+      : "color-mix(in srgb, var(--session-rel-spawn-parent) 60%, transparent)"
+  }`;
+}
 
 const MINE_BADGE: CSSProperties = {
   fontSize: "9.5px",
@@ -81,6 +96,20 @@ export const ProjectManagerBlock = memo(function ProjectManagerBlock(props: {
   const navigate = useNavigate();
   const accountLabel = useAccountLabel(api, pm.accountEmail ?? undefined);
   const monogram = useAccountMonogram(api, pm.accountEmail ?? undefined);
+  // #6574 (R17): the heading's chip row stays one line; its chips compact in a
+  // fixed order as the room runs out (`ProjectManagerChips`).
+  const { rowRef: chipRowRef, level: chipLevel } = useChipLadder(
+    [
+      pm.self,
+      pm.managing,
+      pm.running,
+      pm.nodeLabel,
+      accountLabel,
+      pm.lanesRunning,
+      pm.lanesTotal,
+      pm.openPinCount,
+    ].join("|")
+  );
   const [expanded, setExpanded] = useState(pm.managing);
   const [openLanes, setOpenLanes] = useState<ReadonlySet<string>>(
     () => new Set()
@@ -126,8 +155,9 @@ export const ProjectManagerBlock = memo(function ProjectManagerBlock(props: {
 
   return (
     <div
-      className={`pins-pm ${pm.managing ? "" : "pins-pm-other"}`}
+      className={`pins-pm overflow-hidden rounded-md ${pm.managing ? "" : "pins-pm-other"}`}
       data-managing={pm.managing || undefined}
+      style={{ border: blockBorder(pm.managing) }}
     >
       <div
         role="button"
@@ -141,11 +171,6 @@ export const ProjectManagerBlock = memo(function ProjectManagerBlock(props: {
           backgroundColor: pm.managing
             ? "color-mix(in srgb, var(--session-rel-spawn) 16%, transparent)"
             : "var(--session-rel-spawn-fill)",
-          border: `1px solid ${
-            pm.managing
-              ? "var(--session-rel-spawn)"
-              : "color-mix(in srgb, var(--session-rel-spawn-parent) 60%, transparent)"
-          }`,
         }}
       >
         <HoverTooltip
@@ -167,66 +192,14 @@ export const ProjectManagerBlock = memo(function ProjectManagerBlock(props: {
               {pm.name}
             </span>
           </HoverTooltip>
-          <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 whitespace-nowrap text-[length:var(--text-caption)] text-[var(--session-rel-spawn-text)]">
-            {pm.self ? (
-              <HoverTooltip content="This Project Manager is the session you are in">
-                <span className="uppercase" style={MINE_BADGE}>
-                  This session
-                </span>
-              </HoverTooltip>
-            ) : pm.managing ? (
-              <HoverTooltip content="This Project Manager manages the session you are in">
-                <span className="uppercase" style={MINE_BADGE}>
-                  Manages this session
-                </span>
-              </HoverTooltip>
-            ) : null}
-            <StatusPip
-              status={pm.running ? "idle" : "stopped"}
-              label={pm.running ? "Running" : "Not running"}
-            />
-            {pm.nodeLabel ? (
-              <NodeBadge
-                nodeId={pm.nodeId ?? undefined}
-                nodeLabel={pm.nodeLabel}
-                interactive={false}
-                resourceHealth={false}
-              />
-            ) : null}
-            {pm.accountEmail ? (
-              <span className="min-w-0 shrink">
-                <AccountChip
-                  email={pm.accountEmail}
-                  label={accountLabel}
-                  monogram={monogram}
-                  maxChars={18}
-                />
-              </span>
-            ) : null}
-            <HoverTooltip
-              content={`${pm.lanesRunning} of ${pm.lanesTotal} lanes have a session running`}
-            >
-              <span>
-                {pm.lanesRunning}/{pm.lanesTotal} lanes
-              </span>
-            </HoverTooltip>
-            {pm.openPinCount > 0 ? (
-              <HoverTooltipButton
-                type="button"
-                content={`${pm.openPinCount} ${pm.openPinCount === 1 ? "pin" : "pins"} from this Project Manager's lanes ${pm.openPinCount === 1 ? "is" : "are"} waiting on you. Click to show them`}
-                aria-label={`Show the ${pm.openPinCount} pins waiting on you`}
-                onClick={event => {
-                  event.stopPropagation();
-                  revealWaiting();
-                }}
-                className="inline-flex items-center gap-0.5"
-                style={PIN_COUNT}
-              >
-                <PinGlyph style={PIN_ICON} aria-hidden />
-                {pm.openPinCount}
-              </HoverTooltipButton>
-            ) : null}
-          </span>
+          <ProjectManagerChips
+            pm={pm}
+            accountLabel={accountLabel}
+            monogram={monogram}
+            onRevealWaiting={revealWaiting}
+            level={chipLevel}
+            rowRef={chipRowRef}
+          />
         </span>
         <span className="flex items-center gap-1.5">
           <HoverTooltipButton
@@ -253,10 +226,11 @@ export const ProjectManagerBlock = memo(function ProjectManagerBlock(props: {
         </span>
       </div>
       {expanded ? (
-        // #6555: the lanes sit 4px in from the header (was 8px). With the lane
-        // body's 4px, a lane's pin has 252px for its action row on a 320px
-        // screen (Pins PM ruling L1, 2026-11-10).
-        <div className="pb-1 pl-1">
+        // #6539 (NLOOK2): the lanes sit inside the block's outline, 4px from it
+        // and 4px apart, as a section spaces its items. Measured on a 320px
+        // screen, a lane's pin then has 246px for its action row; the fullest
+        // row, every label given way, takes 219px.
+        <div className="flex flex-col gap-1 p-1">
           {pm.degraded ? (
             <div className="py-1 text-[length:var(--text-caption)] text-[var(--app-hint)]">
               A lane on this dashboard could not be read, so it is not shown
@@ -285,3 +259,164 @@ export const ProjectManagerBlock = memo(function ProjectManagerBlock(props: {
     </div>
   );
 });
+
+// ── The heading's chip row (#6574, R17) ─────────────────────────────────────
+
+export type ChipLevel = 0 | 1 | 2 | 3 | 4;
+const CHIP_MAX_LEVEL: ChipLevel = 4;
+
+/**
+ * The Project Manager heading's chip row at a given ladder `level`, layout-free so
+ * each level is testable without real layout (jsdom reports zero widths), as the
+ * composer's `SessionConfigChips` is. The row is one line that never wraps; every
+ * chip is `shrink-0`, so `chipsOverflow` sees the overflow instead of a chip
+ * absorbing it. Levels, lowest-value text first, each keeping its tooltip:
+ * - 0: everything;
+ * - 1: the account chip shows its monogram only;
+ * - 2: the lane count reads `2/2` (its tooltip and aria-label keep the sentence);
+ * - 3: "Manages this session" reads "Manages" ("This session" stays);
+ * - 4: the badge goes: the block's solid gold outline and fill and the emoji's
+ *   tooltip still say it (ruling D9, option 1).
+ * The status pip, the node badge and the pin count never give way. At level 4 a
+ * row that still does not fit clips; it never wraps.
+ */
+export function ProjectManagerChips(props: {
+  pm: ProjectManagerModel;
+  accountLabel: ComponentProps<typeof AccountChip>["label"];
+  monogram: ComponentProps<typeof AccountChip>["monogram"];
+  onRevealWaiting: () => void;
+  level: ChipLevel;
+  rowRef?: RefObject<HTMLSpanElement | null>;
+}) {
+  const { pm, level } = props;
+  const lanesSentence = `${pm.lanesRunning} of ${pm.lanesTotal} lanes have a session running`;
+  const badge =
+    level >= 4 ? null : pm.self ? (
+      <HoverTooltip content="This Project Manager is the session you are in">
+        <span className="shrink-0 uppercase" style={MINE_BADGE}>
+          This session
+        </span>
+      </HoverTooltip>
+    ) : pm.managing ? (
+      <HoverTooltip content="This Project Manager manages the session you are in">
+        <span className="shrink-0 uppercase" style={MINE_BADGE}>
+          {level >= 3 ? "Manages" : "Manages this session"}
+        </span>
+      </HoverTooltip>
+    ) : null;
+  return (
+    <span
+      ref={props.rowRef}
+      data-chip-level={level}
+      className="pins-pm-chips mt-0.5 flex min-w-0 flex-nowrap items-center gap-x-1.5 overflow-hidden whitespace-nowrap text-[length:var(--text-caption)] text-[var(--session-rel-spawn-text)]"
+    >
+      {badge}
+      <span className="shrink-0">
+        <StatusPip
+          status={pm.running ? "idle" : "stopped"}
+          label={pm.running ? "Running" : "Not running"}
+        />
+      </span>
+      {pm.nodeLabel ? (
+        <span className="shrink-0">
+          <NodeBadge
+            nodeId={pm.nodeId ?? undefined}
+            nodeLabel={pm.nodeLabel}
+            interactive={false}
+            resourceHealth={false}
+          />
+        </span>
+      ) : null}
+      {pm.accountEmail ? (
+        <span className="shrink-0">
+          <AccountChip
+            email={pm.accountEmail}
+            label={props.accountLabel}
+            monogram={props.monogram}
+            maxChars={18}
+            compact={level >= 1}
+          />
+        </span>
+      ) : null}
+      <HoverTooltip content={lanesSentence}>
+        <span className="shrink-0" aria-label={lanesSentence}>
+          {pm.lanesRunning}/{pm.lanesTotal}
+          {level >= 2 ? null : " lanes"}
+        </span>
+      </HoverTooltip>
+      {pm.openPinCount > 0 ? (
+        <HoverTooltipButton
+          type="button"
+          content={`${pm.openPinCount} ${pm.openPinCount === 1 ? "pin" : "pins"} from this Project Manager's lanes ${pm.openPinCount === 1 ? "is" : "are"} waiting on you. Click to show them`}
+          aria-label={`Show the ${pm.openPinCount} pins waiting on you`}
+          onClick={event => {
+            event.stopPropagation();
+            props.onRevealWaiting();
+          }}
+          className="inline-flex shrink-0 items-center gap-0.5"
+          style={PIN_COUNT}
+        >
+          <PinGlyph style={PIN_ICON} aria-hidden />
+          {pm.openPinCount}
+        </HoverTooltipButton>
+      ) : null}
+    </span>
+  );
+}
+
+/**
+ * The chip row's step-down ladder, the same shape as the composer's
+ * `useOverflowLadder` (`SessionConfigCluster.tsx`): step down while the row
+ * overflows, and start again from 0 on a width change (rAF-guarded) or a change to
+ * what the row shows. A second copy of that shape; extract a shared hook only when
+ * a third appears.
+ *
+ * A width change also bumps `resizes`, because `setLevel(0)` alone does nothing
+ * when the level is already 0 (React skips a same-value update), so a row that
+ * fit at 0 and then narrowed would keep its full chips and clip them.
+ */
+export function useChipLadder(measureKey: string): {
+  rowRef: RefObject<HTMLSpanElement | null>;
+  level: ChipLevel;
+} {
+  const rowRef = useRef<HTMLSpanElement | null>(null);
+  const [level, setLevel] = useState<ChipLevel>(0);
+  const [resizes, setResizes] = useState(0);
+  const rafRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    setLevel(0);
+  }, [measureKey]);
+
+  useLayoutEffect(() => {
+    const el = rowRef.current;
+    if (!el) return;
+    if (chipsOverflow(el)) {
+      setLevel(prev =>
+        prev < CHIP_MAX_LEVEL ? ((prev + 1) as ChipLevel) : prev
+      );
+    }
+  }, [level, measureKey, resizes]);
+
+  useEffect(() => {
+    const el = rowRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let width = el.clientWidth;
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth === width || rafRef.current != null) return;
+      width = el.clientWidth;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        setLevel(0);
+        setResizes(n => n + 1);
+      });
+    });
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  return { rowRef, level };
+}

@@ -35,10 +35,14 @@ import { UserStore } from "./userStore";
 import { MidnightResetStateStore } from "./midnightResetStateStore";
 import { UsageHistoryStore } from "./usageHistoryStore";
 import { UsageAlertStore } from "./usageAlertStore";
+import { applyPinIdMigrations } from "./pinIds";
+import { applyBillableMigrations } from "./billable/schema";
+import { IntervalStore } from "./billable/intervalStore";
 import { applyTurnsMigrations } from "./turns/schema";
 import { seedRateCards } from "./turns/rateCards";
 import { TurnStore } from "./turns/turnStore";
 import { TurnMirrorStore } from "./turns/turnMirrorStore";
+import { IntervalMirrorStore } from "./billable/intervalMirrorStore";
 import { applyThroughputMigrations } from "./throughput/schema";
 import { ThroughputFactsStore } from "./throughput/factsStore";
 import { ThroughputRollupStore } from "./throughput/rollupStore";
@@ -222,7 +226,11 @@ export class Store {
   readonly usageHistory: UsageHistoryStore;
   readonly usageAlertState: UsageAlertStore;
   readonly turns: TurnStore;
+  /** Issue #6586: stored thinking intervals (billable time). */
+  readonly billableIntervals: IntervalStore;
   readonly turnMirror: TurnMirrorStore;
+  /** #6586: the billable interval feed readers and the peer interval mirror. */
+  readonly intervalMirror: IntervalMirrorStore;
   // Issue #6164 (epic #6163 A1): throughput facts, rollups, GitHub facts, digests.
   readonly throughputFacts: ThroughputFactsStore;
   readonly throughputRollups: ThroughputRollupStore;
@@ -331,7 +339,9 @@ export class Store {
     this.usageHistory = new UsageHistoryStore(this.db);
     this.usageAlertState = new UsageAlertStore(this.db);
     this.turns = new TurnStore(this.db);
+    this.billableIntervals = new IntervalStore(this.db);
     this.turnMirror = new TurnMirrorStore(this.db);
+    this.intervalMirror = new IntervalMirrorStore(this.db);
     this.throughputFacts = new ThroughputFactsStore(this.db);
     this.throughputRollups = new ThroughputRollupStore(this.db);
     this.throughputGithub = new ThroughputGithubStore(this.db);
@@ -1215,6 +1225,18 @@ export class Store {
       );
     }
 
+    // Issue #6574 (epic #6446): pin IDs. A server-owned second identity for every
+    // pin, so any session can name a pin it does not own. Nullable and unread by
+    // older code, so SCHEMA_VERSION stays 1 and a reverted binary's inserts leave it
+    // NULL, which the backfill fills at the next start. The registry, the unique
+    // index and the backfill live in pinIds.ts (the mint also runs from PinStore).
+    this.migrateAddColumn("session_pins", "pin_id", "TEXT");
+    try {
+      applyPinIdMigrations(this.db);
+    } catch (error) {
+      console.error(`[Store] Migration failed: pin IDs (#6574):`, error);
+    }
+
     // Epic #1965, Sub G (#1972): prediction-accuracy dataset for the File
     // Conflict Monitor. Persists the predicted-vs-actual file footprint of each
     // closed issue + computed precision/recall — the ground-truth dataset that
@@ -1401,6 +1423,10 @@ export class Store {
     this.migrateAddColumn("sessions", "is_sidebar", "INTEGER DEFAULT 0");
     this.migrateAddColumn("sessions", "parent_hapi_session_id", "TEXT");
     applyTurnsMigrations(this.db);
+    // Issue #6586: billable-time tables, indexes and triggers. DDL only: the rows
+    // written at boot belong to runBillableStartup (store/billable/startup.ts),
+    // which the entry point calls once with the node id and the mode.
+    applyBillableMigrations(this.db);
     // Issue #6164 (A1): node-local throughput tables + two turn_mirror indexes.
     // After applyTurnsMigrations (turn_mirror must exist). Fail-open; SCHEMA_VERSION stays 1.
     applyThroughputMigrations(this.db);

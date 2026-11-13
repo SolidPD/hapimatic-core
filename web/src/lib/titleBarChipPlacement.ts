@@ -5,10 +5,13 @@
  * A pure, DOM-free function so the geometry is a unit table. Every value is in
  * viewport px, as read from `getBoundingClientRect()`.
  *
- * The rule (approved F5/F6 mockup): the chip's center sits at half the distance
- * from the screen's left edge to the wordmark's left edge. The back arrow and
- * the iPad Stage Manager inset are NOT inputs to that position; they only feed
- * the guards, applied in order:
+ * The rule (approved F5/F6 mockup): the chip's center sits halfway between the
+ * left bound and the wordmark's left edge. The left bound is the screen's left
+ * edge while the window is no wider than the content column, and the width of
+ * the brand letterbox once it is wider, so the chip stays inside the column
+ * instead of drifting out into the letterbox (operator ruling 2026-11-12). The
+ * back arrow and the iPad Stage Manager inset are NOT inputs to that position;
+ * they only feed the guards, applied in order:
  *   1. Nudge: while an obstacle (the back arrow's box; the iPad window-control
  *      zone while multitasking, ruling H-1 A) overlaps the chip, move the chip
  *      to `obstacle.right + gap`. Overlap is STRICT: a chip that only touches an
@@ -39,6 +42,11 @@ export interface ChipObstacle {
 export interface ChipPlacementInput {
   /** The wordmark `<Link>`'s left edge. */
   wordmarkLeft: number;
+  /**
+   * Where the chip's region starts: the brand letterbox's width, which is 0
+   * until the window is wider than the content column. Defaults to 0.
+   */
+  leftBound?: number;
   /** The FULL (uncollapsed) badge width, from the hidden measurer. */
   chipWidth: number;
   /** The collapsed tile width. */
@@ -64,12 +72,13 @@ function overlaps(left: number, width: number, o: ChipObstacle): boolean {
 
 export function computeChipPlacement({
   wordmarkLeft,
+  leftBound = 0,
   chipWidth,
   dotWidth = CHIP_DOT_WIDTH,
   obstacles,
   gap = CHIP_GAP,
 }: ChipPlacementInput): ChipPlacement {
-  const naturalCenter = wordmarkLeft / 2;
+  const naturalCenter = (leftBound + wordmarkLeft) / 2;
   let left = naturalCenter - chipWidth / 2;
   let nudged = false;
 
