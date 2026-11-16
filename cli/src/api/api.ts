@@ -23,6 +23,42 @@ import { getAuthToken } from "@/api/auth";
 import { ApiMachineClient } from "./apiMachine";
 import { ApiSessionClient, type ApiSessionClientOptions } from "./apiSession";
 import type { AccountCaptureNotice } from "@/accounts/credentialsWatcher";
+import { RUNNER_REFUSED, type RunnerAttachInfo } from "@hapi/protocol";
+
+/**
+ * Issue #6647 (R3): the hub refused this runner's attach (`409
+ * runner-refused`). `reason` and `message` are the hub's own; the command
+ * entry prints the message and exits non-zero. No socket is opened after it.
+ */
+export class RunnerRefusedError extends Error {
+  readonly reason: string;
+  readonly sessionId: string | null;
+
+  constructor(reason: string, message: string, sessionId: string | null) {
+    super(message);
+    this.name = "RunnerRefusedError";
+    this.reason = reason;
+    this.sessionId = sessionId;
+  }
+}
+
+/** The `RunnerRefusedError` for a 409 `runner-refused` answer, else null. */
+function runnerRefusalOf(error: unknown): RunnerRefusedError | null {
+  if (!axios.isAxiosError(error) || error.response?.status !== 409) {
+    return null;
+  }
+  const data: unknown = error.response.data;
+  if (typeof data !== "object" || data === null) return null;
+  const body = data as Record<string, unknown>;
+  if (body.error !== RUNNER_REFUSED) return null;
+  const reason = typeof body.reason === "string" ? body.reason : "unknown";
+  const message =
+    typeof body.message === "string" && body.message.length > 0
+      ? body.message
+      : `The hub refused this runner (${RUNNER_REFUSED}: ${reason}).`;
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId : null;
+  return new RunnerRefusedError(reason, message, sessionId);
+}
 
 export class ApiClient {
   static async create(): Promise<ApiClient> {
@@ -40,22 +76,30 @@ export class ApiClient {
     tag: string;
     metadata: Metadata;
     state: AgentState | null;
+    /** Issue #6647 (R1): this attach's runner id and process id. */
+    runner?: RunnerAttachInfo;
   }): Promise<{ session: Session; deliveryFloorSeq: number | null }> {
-    const response = await axios.post<CreateSessionResponse>(
-      `${configuration.serverUrl}/cli/sessions`,
-      {
-        tag: opts.tag,
-        metadata: opts.metadata,
-        agentState: opts.state,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/json",
+    let response;
+    try {
+      response = await axios.post<CreateSessionResponse>(
+        `${configuration.serverUrl}/cli/sessions`,
+        {
+          tag: opts.tag,
+          metadata: opts.metadata,
+          agentState: opts.state,
+          ...(opts.runner ? { runner: opts.runner } : {}),
         },
-        timeout: 60_000,
-      }
-    );
+        {
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 60_000,
+        }
+      );
+    } catch (error) {
+      throw runnerRefusalOf(error) ?? error;
+    }
 
     const parsed = CreateSessionResponseSchema.safeParse(response.data);
     if (!parsed.success) {

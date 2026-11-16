@@ -67,7 +67,14 @@ import { BookmarkStore } from "./bookmarkStore";
 import { McpProjectDefaultsStore } from "./mcpProjectDefaultsStore";
 import { McpServerStatsStore } from "./mcpServerStatsStore";
 import { PinStore } from "./pinStore";
+import {
+  BillableSwitchStore,
+  hasBillableSwitchStorage,
+  migrateBillableSwitchTables,
+  setBillableSwitchStorageReady,
+} from "./billableSwitchStore";
 import { getConfiguration } from "../configuration";
+import { migrateRunnerIdentityDailyTable } from "./runnerIdentityDaily";
 
 export type {
   DailySummary,
@@ -113,6 +120,10 @@ export { BookmarkStore } from "./bookmarkStore";
 export { McpProjectDefaultsStore } from "./mcpProjectDefaultsStore";
 export { McpServerStatsStore } from "./mcpServerStatsStore";
 export { PinStore } from "./pinStore";
+export {
+  BillableSwitchStore,
+  hasBillableSwitchStorage,
+} from "./billableSwitchStore";
 export { LeaseStore } from "./leaseStore";
 export { ApiKeyShareAuditStore } from "./apiKeyShareAuditStore";
 export type {
@@ -255,6 +266,15 @@ export class Store {
   readonly mcpProjectDefaults: McpProjectDefaultsStore;
   readonly mcpServerStats: McpServerStatsStore;
   readonly pins: PinStore;
+  /** Issue #6646: the billable switch's storage (headers, reports, events, the copy). */
+  readonly billableSwitch: BillableSwitchStore;
+  /**
+   * Issue #6646: both `sessions` columns and all six `billable_switch_*` tables
+   * exist. When false the gate is `off` for this process and every summary
+   * leaves the switch out ("unknown"), because `migrateAddColumn` swallows a
+   * failed ALTER and a missing table would make every new session's insert throw.
+   */
+  readonly billableSwitchStorageReady: boolean;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
@@ -290,6 +310,16 @@ export class Store {
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.initSchema();
+
+    // Issue #6646: ONE readiness check, after every migration step (the indexes
+    // are left out: a missing index is slow, not wrong).
+    this.billableSwitchStorageReady = hasBillableSwitchStorage(this.db);
+    setBillableSwitchStorageReady(this.db, this.billableSwitchStorageReady);
+    if (!this.billableSwitchStorageReady) {
+      console.error(
+        "[Store] Billable switch storage is NOT ready (a column or a billable_switch_* table is missing): billable sessions stay off on this node and its sessions read as unknown (#6646)"
+      );
+    }
 
     // #2447: long-lived-connection first-open form for SQLite's optimize pragma.
     // 0x10002 = run ANALYZE on tables that might benefit (0x00002) + check all
@@ -357,13 +387,14 @@ export class Store {
     this.mcpProjectDefaults = new McpProjectDefaultsStore(this.db);
     this.mcpServerStats = new McpServerStatsStore(this.db);
     this.pins = new PinStore(this.db);
+    this.billableSwitch = new BillableSwitchStore(this.db);
   }
 
   /**
    * Issue #1670 (Sub H1, PR-2): TS-derived daily time-log read.
    * Encapsulates the private `db` handle so the time-log route can compute the
    * per-namespace, timezone-aware daily buckets without exposing the raw DB.
-   * Dormant until the cutover gate is green (see `cutoverGate.ts`).
+   * The Time Log's read path on every node (#6675 retired the cutover gate).
    */
   deriveDailyTimeLog(
     opts: DeriveTimelogOptions
@@ -374,7 +405,7 @@ export class Store {
   /**
    * Issue #1892 Task 3B: turns-derived per-session breakdown per local-day bucket.
    * Surfaced on `GET /timelogs/derived` to populate the TimeLogModal breakdown
-   * post-cutover (archive fallback for pre-turns days is applied on the client).
+   * (archive fallback for pre-turns days is applied on the client).
    */
   deriveDailyBreakdown(
     opts: DeriveTimelogOptions
@@ -474,6 +505,28 @@ export class Store {
     // `enqueuedAt`. New column avoids changing existing
     // idx_error_logs_timestamp / getEntries(startTime/endTime) semantics.
     this.migrateAddColumn("error_logs", "original_timestamp", "INTEGER");
+
+    // Issue #6646: the billable switch. Two columns on the node's own sessions
+    // row (never in metadata, which can be nulled or replaced whole, K9), NOT in
+    // createSchema: every database takes this path (the #5254 precedent). An
+    // existing row reads non-billable (W1). Then the six tables, each in its own
+    // log-and-continue try, so a failure can never stop the server from starting.
+    this.migrateAddColumn("sessions", "billable", "INTEGER NOT NULL DEFAULT 0");
+    this.migrateAddColumn("sessions", "billable_confirm", "TEXT");
+    migrateBillableSwitchTables(this.db);
+
+    // Issue #6647: the runner record (R2, R15), seven nullable columns read and
+    // written only by getRunnerRecord / setRunnerRecord and never mapped into
+    // the Session record. A NULL runner_attached_at means "no record".
+    this.migrateAddColumn("sessions", "runner_key", "TEXT");
+    this.migrateAddColumn("sessions", "runner_started_by", "TEXT");
+    this.migrateAddColumn("sessions", "runner_pid", "INTEGER");
+    this.migrateAddColumn("sessions", "runner_attached_at", "INTEGER");
+    this.migrateAddColumn("sessions", "runner_superseded_keys", "TEXT");
+    this.migrateAddColumn("sessions", "runner_refused_keys", "TEXT");
+    this.migrateAddColumn("sessions", "runner_cut_at", "INTEGER");
+    // Issue #6647 (Task 9a): the daily snapshot, additive, not REQUIRED_TABLES.
+    migrateRunnerIdentityDailyTable(this.db);
 
     // Create recent_paths table if it doesn't exist
     try {
@@ -1192,6 +1245,10 @@ export class Store {
     this.migrateAddColumn("session_pins", "saved_revision", "INTEGER");
     this.migrateAddColumn("session_pins", "saved_at", "INTEGER");
     this.migrateAddColumn("session_pins", "save_reported_at", "INTEGER");
+    // #6458 (#6540 S-4): how many files the last Save left in the folder and how
+    // many it skipped, so a partial save never reads as a full one.
+    this.migrateAddColumn("session_pins", "saved_files", "INTEGER");
+    this.migrateAddColumn("session_pins", "saved_skipped", "INTEGER");
 
     // Issue #6452 (epic #6446): automatic picks. The deadline is server-owned
     // state beside the pin, never content: an operator's move must not bump the

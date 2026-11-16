@@ -207,7 +207,9 @@ function cleanEntry(entry: PinAnswersEntry): PinAnswersEntry {
     // second layer, for a record written before that rule or by a newer peer.
     pin: neutralizeApprovalTokens(entry.pin),
     rev: entry.rev,
-    kind: entry.kind,
+    // #6458 Task 11l: a record from a newer peer is read loosely, so the kind is
+    // cleaned like every other text.
+    kind: neutralizeApprovalTokens(entry.kind),
     // #6574: the fourth identity field. The server mints it, but a record from a
     // newer peer is read loosely, so it is cleaned like the key.
     ...(entry.pinId !== undefined
@@ -233,7 +235,10 @@ function cleanEntry(entry: PinAnswersEntry): PinAnswersEntry {
     out.automaticPick =
       "off" in entry.automaticPick
         ? { off: true }
-        : { at: entry.automaticPick.at, local: entry.automaticPick.local };
+        : {
+            at: neutralizeApprovalTokens(entry.automaticPick.at),
+            local: neutralizeApprovalTokens(entry.automaticPick.local),
+          };
   }
   if (entry.marks && entry.marks.length > 0) {
     out.marks = entry.marks.map(mark => ({

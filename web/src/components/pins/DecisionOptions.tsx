@@ -10,6 +10,7 @@ import { Star } from "lucide-react";
 import type { PinOption } from "@hapi/protocol";
 import { HoverTooltip } from "@/components/ui/tooltip";
 import { collapseCount } from "@/lib/pins/actionRowFit";
+import { OptionIdCell, optionIdCellStyle, optionIdColumnCh } from "./optionId";
 
 type DecisionOptionsProps = {
   options: readonly PinOption[];
@@ -132,11 +133,16 @@ function RecommendedLabel(props: { label: string }) {
  * #6449: a decision pin's options with their consequences (mockup v6
  * :293-302). Read-only — no radio — unless `onSelect` is passed, which
  * requires a `name` (#6450). The caller orders the options (the recommended
- * one first, `orderedOptions`).
+ * one first, `orderedOptions`). An id longer than two characters widens the
+ * pin's id column, never past the cap, so it never draws over its label (#6458,
+ * `./optionId`).
  */
 export function DecisionOptions(props: DecisionOptionsProps) {
   const { options, recommendedId, selectedId, onSelect, disabled } = props;
   const choosing = onSelect !== undefined;
+  const ids = options.map(option => option.id);
+  const idCh = optionIdColumnCh(ids);
+  const idColumn = idCh === null ? "16px" : "max-content";
   return (
     <div
       className="mt-1.5 border-t border-[var(--app-divider)]"
@@ -160,9 +166,15 @@ export function DecisionOptions(props: DecisionOptionsProps) {
             <span
               className={`pt-px text-[length:var(--text-body-dense)] font-bold ${
                 selected ? "text-[var(--app-accent)]" : "text-[var(--app-hint)]"
-              }`}
+              }${idCh === null ? "" : " truncate"}`}
+              style={idCh === null ? undefined : optionIdCellStyle(idCh)}
+              title={idCh === null ? undefined : option.id}
             >
-              {option.id}
+              {idCh === null ? (
+                option.id
+              ) : (
+                <OptionIdCell id={option.id} ids={ids} idCh={idCh} />
+              )}
             </span>
             <span className="min-w-0">
               {option.id === recommendedId ? (
@@ -184,8 +196,8 @@ export function DecisionOptions(props: DecisionOptionsProps) {
           "grid items-start gap-x-1.5 border-b border-[var(--app-divider)] py-1.5";
         const style = {
           gridTemplateColumns: choosing
-            ? "18px 16px minmax(0, 1fr)"
-            : "16px minmax(0, 1fr)",
+            ? `18px ${idColumn} minmax(0, 1fr)`
+            : `${idColumn} minmax(0, 1fr)`,
         };
         return choosing ? (
           <label key={option.id} className={className} style={style}>

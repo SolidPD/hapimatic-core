@@ -14,8 +14,9 @@ import { nextLink, type GithubClient } from "./client";
  * `If-None-Match` is trusted only for a timeline that fit on one page: a later
  * page can change while page 1's ETag stays the same.
  *
- * This replaces nothing: `workflowReconcileService`'s private fetcher keeps
- * only label events, has no timeout and reads 30 per page.
+ * This replaces nothing: `workflowReconcileService`'s own fetcher keeps only
+ * label events and reads 100 per page (`gh --paginate` sends per_page=100,
+ * measured); since #2503 it is killed after 30 s.
  */
 
 export interface TimelineSource {

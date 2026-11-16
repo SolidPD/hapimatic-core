@@ -29,6 +29,8 @@ import type {
 import type { BillableMode } from "../billable/mode";
 import { requestWaitRef } from "../billable/predicate";
 import { newUuidV7 } from "../store/turns/ids";
+import type { BillableSwitchInitial } from "../store/sessions";
+import type { BillableSwitchStartContext } from "@hapi/protocol";
 import { clampAliveTime } from "./aliveTime";
 import { EventPublisher } from "./eventPublisher";
 import { buildSessionRecord } from "./sessionRecord";
@@ -80,6 +82,18 @@ const NO_ALIVE_EDGES: SessionAliveResult = {
   completedBackgroundAgents: [],
 };
 
+/** Issue #6646: how long a tag-keyed spawn entry (start context or parent link) is kept. */
+export const PENDING_BY_TAG_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** Issue #6646: the start hook's input; it returns the new row's start value, or null. */
+export type BillableSwitchStartHook = (input: {
+  tag: string;
+  metadata: unknown;
+  namespace: string;
+  /** The queued start context, or null when the registration had nothing queued. */
+  context: BillableSwitchStartContext | null;
+}) => BillableSwitchInitial | null;
+
 export class SessionCache {
   private readonly sessions: Map<string, Session> = new Map();
   private readonly lastBroadcastAtBySessionId: Map<string, number> = new Map();
@@ -114,6 +128,22 @@ export class SessionCache {
     string,
     { parentSessionId: string; parentRelationship: "branch" | "spawn" }
   > = new Map();
+  /** Issue #6646: when each tag-keyed parent entry was queued (the 30-minute sweep). */
+  private readonly pendingParentQueuedAt: Map<string, number> = new Map();
+  /**
+   * Issue #6646: the start context of a spawn, queued by TAG before the daemon
+   * RPC (exactly as the parent link above, for the same timeout-after-success
+   * reason) and handed to the start hook when the child registers. Kept across
+   * an uncoded spawn error; dropped on registration, on a coded refusal, and by
+   * the 30-minute sweep.
+   */
+  private readonly pendingBillableSwitchStartByTag: Map<
+    string,
+    { context: BillableSwitchStartContext; queuedAt: number }
+  > = new Map();
+  /** Issue #6646: decides a new row's start value (installed by index.ts while the gate is on). */
+  private billableSwitchStartHook: BillableSwitchStartHook | null = null;
+  private billableSwitchStartFailures = 0;
   /**
    * Sessions recently archived via handleSessionEnd(). Heartbeats arriving
    * within the guard window are ignored to prevent the keepAlive interval
@@ -370,12 +400,55 @@ export class SessionCache {
     agentState: unknown,
     namespace: string
   ): Session {
-    const stored = this.store.sessions.getOrCreateSession(
-      tag,
-      metadata,
-      agentState,
-      namespace
-    );
+    // Issue #6646 (the plan's ordering rule 1): the lookup and the insert with its
+    // start value first, then the parent link and the refresh (#6586's process
+    // tracker goes after the refresh).
+    this.sweepPendingByTag();
+    const queued = this.peekPendingBillableSwitchStart(tag, namespace);
+    const hook = this.billableSwitchStartHook;
+    const initial = hook
+      ? (): BillableSwitchInitial | null => {
+          try {
+            return hook({ tag, metadata, namespace, context: queued });
+          } catch (error) {
+            this.noteBillableSwitchStartFailure(tag, error);
+            return null;
+          }
+        }
+      : undefined;
+    let stored: StoredSession;
+    if (!initial) {
+      // No hook (the gate is not on, or a test): exactly the call made before #6646.
+      stored = this.store.sessions.getOrCreateSession(
+        tag,
+        metadata,
+        agentState,
+        namespace
+      );
+    } else {
+      try {
+        stored = this.store.sessions.getOrCreateSessionWithFlag(
+          tag,
+          metadata,
+          agentState,
+          namespace,
+          initial
+        ).session;
+      } catch (error) {
+        // The billing step failed inside the insert (its event or its header
+        // write); the transaction rolled the row back. A billing feature must
+        // not stop a session from starting: register it non-billable, no event.
+        this.noteBillableSwitchStartFailure(tag, error);
+        stored = this.store.sessions.getOrCreateSession(
+          tag,
+          metadata,
+          agentState,
+          namespace
+        );
+      }
+    }
+    // Created or found, the queued start is spent (a reattach never leaves one).
+    if (queued) this.pendingBillableSwitchStartByTag.delete(tag);
     const session =
       this.refreshSession(stored.id) ??
       (() => {
@@ -384,6 +457,102 @@ export class SessionCache {
     this.applyPendingParentByTag(tag, session);
     this.noteBillableAttach(session);
     return session;
+  }
+
+  /**
+   * Issue #6646: the queued start context for a tag, when it belongs to this
+   * namespace (a registration from another namespace under the same tag does
+   * not consume it). Not removed here: the caller removes it after the insert.
+   */
+  private peekPendingBillableSwitchStart(
+    tag: string,
+    namespace: string
+  ): BillableSwitchStartContext | null {
+    const entry = this.pendingBillableSwitchStartByTag.get(tag);
+    if (!entry) return null;
+    const ns = entry.context.namespace;
+    if (ns !== undefined && ns !== namespace) return null;
+    return entry.context;
+  }
+
+  private noteBillableSwitchStartFailure(tag: string, error: unknown): void {
+    this.billableSwitchStartFailures += 1;
+    console.error(
+      `[SessionCache] Billable switch start failed for ${tag}; the session registers non-billable with no event (#6646):`,
+      error instanceof Error ? error.message : error
+    );
+  }
+
+  /** Issue #6646: install (or remove) the start hook. */
+  setBillableSwitchStartHook(hook: BillableSwitchStartHook | null): void {
+    this.billableSwitchStartHook = hook;
+  }
+
+  /** Issue #6646: how many starts failed and registered non-billable (a counter for operators and tests). */
+  getBillableSwitchStartFailures(): number {
+    return this.billableSwitchStartFailures;
+  }
+
+  /**
+   * Issue #6646: queue a spawn's start context by TAG, before the daemon RPC.
+   * Kept across an uncoded spawn error on purpose (the call can time out after
+   * the daemon started the session); the late registration finds it.
+   */
+  queuePendingBillableSwitchStartByTag(
+    tag: string,
+    context: BillableSwitchStartContext
+  ): void {
+    this.sweepPendingByTag();
+    this.pendingBillableSwitchStartByTag.set(tag, {
+      context,
+      queuedAt: Date.now(),
+    });
+  }
+
+  /** Issue #6646: drop a tag's queued start (a coded refusal proves no child exists). */
+  deletePendingBillableSwitchStartByTag(tag: string): void {
+    this.pendingBillableSwitchStartByTag.delete(tag);
+  }
+
+  /** Issue #6646: drop a tag's queued parent link (a coded refusal proves no child exists). */
+  deletePendingParentByTag(tag: string): void {
+    this.pendingParentInfoByTag.delete(tag);
+    this.pendingParentQueuedAt.delete(tag);
+  }
+
+  /** Issue #6646: true while a tag has a queued start context (tests and diagnostics). */
+  hasPendingBillableSwitchStart(tag: string): boolean {
+    return this.pendingBillableSwitchStartByTag.has(tag);
+  }
+
+  /** Issue #6646: true while a tag has a queued parent link (tests and diagnostics). */
+  hasPendingParentByTag(tag: string): boolean {
+    return this.pendingParentInfoByTag.has(tag);
+  }
+
+  /**
+   * Issue #6646: drop entries of BOTH tag queues older than 30 minutes. A bound
+   * by budget (the longest budgeted start is about five minutes), not a proof
+   * (a clone has no deadline); a registration later than that takes the
+   * `unattended` rule. This is also what ends the parent queue's slow leak (an
+   * entry whose child never registers). Runs whenever either queue is touched
+   * and on a timer (BillableSwitchService). Returns how many were dropped.
+   */
+  sweepPendingByTag(now: number = Date.now()): number {
+    let dropped = 0;
+    for (const [tag, entry] of this.pendingBillableSwitchStartByTag) {
+      if (now - entry.queuedAt > PENDING_BY_TAG_MAX_AGE_MS) {
+        this.pendingBillableSwitchStartByTag.delete(tag);
+        dropped += 1;
+      }
+    }
+    for (const [tag, queuedAt] of this.pendingParentQueuedAt) {
+      if (now - queuedAt > PENDING_BY_TAG_MAX_AGE_MS) {
+        this.pendingParentQueuedAt.delete(tag);
+        if (this.pendingParentInfoByTag.delete(tag)) dropped += 1;
+      }
+    }
+    return dropped;
   }
 
   /**
@@ -399,6 +568,7 @@ export class SessionCache {
     const pending = this.pendingParentInfoByTag.get(tag);
     if (!pending) return;
     this.pendingParentInfoByTag.delete(tag);
+    this.pendingParentQueuedAt.delete(tag);
     if (session.parentSessionId) return;
     const applied = this.store.sessions.updateSessionParentRelationship(
       session.id,
@@ -2008,10 +2178,12 @@ export class SessionCache {
     parentSessionId: string,
     parentRelationship: "branch" | "spawn"
   ): void {
+    this.sweepPendingByTag();
     this.pendingParentInfoByTag.set(tag, {
       parentSessionId,
       parentRelationship,
     });
+    this.pendingParentQueuedAt.set(tag, Date.now());
   }
 
   /**

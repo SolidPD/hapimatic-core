@@ -15,6 +15,7 @@ import {
   type HoverTooltipButtonProps,
 } from "@/components/ui/tooltip";
 import { usePinsContext } from "@/components/pins/pinsShared";
+import { OptionIdText } from "@/components/pins/optionId";
 import {
   ACTION_COLLAPSE_RANK,
   ACTION_ICON_ONLY_PADDING_PX,
@@ -208,7 +209,11 @@ export function PinAnswerButtons(props: {
           className={GO_CLASS}
           icon={<Check style={ICON} aria-hidden />}
           label="Use"
-          keep={<span>{recommended.id}</span>}
+          keep={
+            <span>
+              <OptionIdText id={recommended.id} />
+            </span>
+          }
         />
       ) : null}
       {dismissed ? null : (

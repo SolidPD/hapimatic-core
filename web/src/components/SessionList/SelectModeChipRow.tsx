@@ -31,6 +31,8 @@ import { SendToSelectedDialog } from "./SendToSelectedDialog";
  *   All · None · Connect · Disconnect · Stop turn · Delete · Send
  *   (Stop turn in the warning tone, Delete red)
  *
+ * The number of selected sessions sits at the far left of the row ("3 selected").
+ *
  * The retired global Connect/Disconnect-All + Delete-All-Disconnected toolbar
  * actions fold into these chips (directive Task 3 dispositions 1 & 2). Since
  * #3815 they are also the fleet-wide stop: filter, select All, Stop turn.
@@ -127,7 +129,7 @@ export function SelectModeChipRow({
   onRefresh,
 }: SelectModeChipRowProps) {
   const queryClient = useQueryClient();
-  const { showToast } = useToast();
+  const { showToast, clearToast } = useToast();
   const { runBulkAction } = useBulkSessionAction(api);
   const { sendToSelected } = useSendToSelected(api);
   const [isPending, setIsPending] = useState(false);
@@ -248,6 +250,7 @@ export function SelectModeChipRow({
       api,
       queryClient,
       showToast,
+      clearToast,
       connectedIds: connectedSelected.map(s => s.id),
       disconnectedIds: disconnectedSelected.map(s => s.id),
       snapshot,
@@ -363,6 +366,17 @@ export function SelectModeChipRow({
     // Seven chips overflow a 375 px phone (#3818 Task 1 step 6, measured), so the
     // row wraps onto a second line rather than hiding a chip.
     <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-0.5 px-3.5 py-0.5 bg-[var(--app-bg)] border-b border-[var(--app-divider)]">
+      {/* How many sessions are selected, at the far left of the row (`mr-auto`
+          keeps the chips right-justified). It counts EVERY selected id; the ones
+          the current filter hides are named, because the chips leave them out. */}
+      <span
+        data-testid="select-mode-count"
+        aria-live="polite"
+        className="mr-auto shrink-0 tabular-nums text-[length:var(--text-caption)] text-[var(--app-hint)]"
+      >
+        {selectedIds.size} selected
+        {hiddenCount > 0 ? ` (${hiddenCount} hidden)` : ""}
+      </span>
       <Chip label="All" onClick={() => onSelectAll(sessions.map(s => s.id))} />
       {/* Enabled for ANY selected id, including ones the filter hides — otherwise
           they could not be cleared and would reappear selected (#3815-16). */}

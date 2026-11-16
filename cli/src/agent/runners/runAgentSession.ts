@@ -19,7 +19,11 @@ import {
 import { startHappyServer } from "@/claude/utils/startHappyServer";
 import { configuration } from "@/configuration";
 import { buildDocsPointer } from "@/utils/hapimaticDocsPointer";
-import { renderTier0, capabilityCatalogIndex } from "@hapi/protocol";
+import {
+  renderTier0,
+  renderPinsPrimer,
+  capabilityCatalogIndex,
+} from "@hapi/protocol";
 import { getHappyCliCommand } from "@/utils/spawnHappyCLI";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { bootstrapSession } from "@/agent/sessionFactory";
@@ -49,14 +53,17 @@ function emitReadyIfIdle(props: {
  * have no system-prompt carrier, so Tier-0 rides a leading USER-turn text block;
  * it lands in transcript history and does NOT survive a transcript trim. Gated
  * by the HAPI_CAPABILITY_TIER0 kill-switch (R8). The #6219 docs pointer (built
- * once by the caller) follows on the same first turn, with or without Tier-0.
+ * once by the caller) follows on the same first turn, with or without Tier-0,
+ * then the #6458 Pins block when the session's Pins gate is open (the caller
+ * passes it, or "" for a closed gate).
  * `tier0Sent` means "the first-turn blocks were sent". Pure + exported for unit
  * testing.
  */
 export function buildAgentPromptContent(
   message: string,
   tier0AlreadySent: boolean,
-  docsPointer = ""
+  docsPointer = "",
+  pinsPrimer = ""
 ): { content: PromptContent[]; tier0Sent: boolean } {
   const content: PromptContent[] = [];
   if (!tier0AlreadySent && configuration.capabilityTier0Enabled) {
@@ -64,6 +71,9 @@ export function buildAgentPromptContent(
   }
   if (!tier0AlreadySent && docsPointer) {
     content.push({ type: "text", text: docsPointer });
+  }
+  if (!tier0AlreadySent && pinsPrimer) {
+    content.push({ type: "text", text: pinsPrimer });
   }
   content.push({ type: "text", text: message });
   return { content, tier0Sent: true };
@@ -300,6 +310,12 @@ export async function runAgentSession(opts: {
     // Stop heartbeats immediately so the server doesn't re-activate
     // this session after the archive (issue #678).
     clearInterval(keepAliveInterval);
+    // #6647 (Task 13, R8): a stop the hub sent (runner-superseded) also
+    // cancels a prompt in flight, as the abort handler does; a user's kill
+    // keeps today's behaviour.
+    if (session.superseded) {
+      await backend.cancelPrompt(agentSessionId).catch(() => {});
+    }
     await permissionAdapter.cancelAll("Session killed");
     if (waitAbortController) {
       waitAbortController.abort();
@@ -332,7 +348,12 @@ export async function runAgentSession(opts: {
         buildAgentPromptContent(
           batch.message,
           tier0Sent,
-          tier0Sent ? "" : buildDocsPointer()
+          tier0Sent ? "" : buildDocsPointer(),
+          // #6458: the Pins block on the first turn, from this session's own
+          // probe (the stdio bridge forwards the pin tools when it is open).
+          tier0Sent || happyServer.pinsEnabled !== true
+            ? ""
+            : renderPinsPrimer(capabilityCatalogIndex)
         );
       tier0Sent = nextTier0Sent;
 

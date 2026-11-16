@@ -6,6 +6,8 @@ import type { IntervalMirrorStore } from "../store/billable/intervalMirrorStore"
 import { loadTurnMirrorConfig } from "../config/turnMirrorConfig";
 import * as turnMirrorPullService from "../services/turnMirrorPullService";
 import * as intervalMirrorPullService from "../services/intervalMirrorPullService";
+import * as billableSwitchMirrorPullService from "../services/billableSwitchMirrorPullService";
+import type { BillableSwitchStore } from "../store/billableSwitchStore";
 
 /**
  * Turn-ledger mirror pull-loop wiring (issue #4614), extracted from index.ts so
@@ -32,6 +34,12 @@ export function startTurnMirrorPull(opts: {
   getNodeRegistry: () => NodeRegistry | null;
   turnMirror: TurnMirrorStore;
   intervalMirror: IntervalMirrorStore;
+  /**
+   * Issue #6646 (Task 7b): the billable switch record's copy, pulled by its own
+   * loop with the turn mirror's role gate, cadence and opt-out. Optional so a
+   * caller without it starts the turn mirror alone.
+   */
+  billableSwitch?: BillableSwitchStore;
 }): void {
   const { federationConfig } = opts;
   if (!federationConfig || federationConfig.role === "node") return;
@@ -50,10 +58,20 @@ export function startTurnMirrorPull(opts: {
     intervalMirror: opts.intervalMirror,
     turnMirrorConfig,
   });
+  if (opts.billableSwitch) {
+    billableSwitchMirrorPullService.start({
+      jobNodeId: opts.jobNodeId,
+      jobRegistry: opts.jobRegistry,
+      getNodeRegistry: opts.getNodeRegistry,
+      store: opts.billableSwitch,
+      turnMirrorConfig,
+    });
+  }
 }
 
-/** Stop the turn-mirror and interval-mirror pull loops (reverse-order shutdown). */
+/** Stop the turn-mirror, interval-mirror and billable-switch-mirror pull loops (reverse-order shutdown). */
 export function stopTurnMirrorPull(): void {
+  billableSwitchMirrorPullService.stop();
   intervalMirrorPullService.stop();
   turnMirrorPullService.stop();
 }

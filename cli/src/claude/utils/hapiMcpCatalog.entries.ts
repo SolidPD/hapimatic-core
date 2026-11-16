@@ -232,9 +232,11 @@ export const mcpCatalogEntries = [
   }),
   // Issue #6448: the pin tools, registered only while the server reports the
   // Pins gate open (`HAPY_MCP_PIN_TOOL_NAMES`). `gate: "pins"` keeps them out of
-  // Tier-0 and both self-knowledge docs, which cannot know an instance's gate,
-  // and out of the served catalog while the gate is closed. They stay Tier-1
-  // until #6458 decides how Tier-0 and the self-knowledge doc present Pins.
+  // Tier-0, which cannot know an instance's gate, and out of the served catalog
+  // while the gate is closed. #6458: Tier-0 stays free of gated entries; the
+  // separate Pins block (`renderPinsPrimer`, shared/src/capabilityCatalog/
+  // pinsPrimer.ts) carries their text, rendered only where the gate is open, and
+  // both self-knowledge docs list them in an "Instance-gated: Pins" section.
   defineCapability({
     id: "session-introspection.pin-post",
     domain: "session-introspection",

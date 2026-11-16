@@ -11,6 +11,7 @@ import type {
   LegacyStretchRow,
   OpenIntervalRow,
 } from "../store/billable/intervalStore";
+import { newUuidV7 } from "../store/turns/ids";
 
 /**
  * The interval write service (issue #6586, R21): one FIFO queue between the
@@ -59,6 +60,14 @@ export interface IntervalWriteStore {
   closeInterval(input: CloseIntervalInput): CloseIntervalResult;
   touchLastSeen(id: string, ms: number): void;
   recordLegacyStretch(row: LegacyStretchRow): void;
+  /** Add to the stored lost-write totals (#6670); a direct call, never queued. */
+  addLostWrites(input: {
+    setAside: number;
+    leftAtStop: number;
+    nowMs: number;
+  }): void;
+  /** The interval change counter (#6670 X1); optional so a fake store need not have it. */
+  readChangeSeq?(): number;
 }
 
 export type IntervalWriteLogger = Pick<ErrorLogger, "error" | "warn">;
@@ -88,6 +97,18 @@ export interface IntervalWriteCounters {
   depth: number;
   oldestOpAgeMs: number;
   setAsideCount: number;
+  /** Fixed when this service is built, once per server process (#6670). */
+  bootId: string;
+  /** Fixed when this service is built, once per server process (#6670). */
+  bootStartedAtMs: number;
+  /**
+   * The interval change counter when this process started (#6670 X1): a row
+   * whose `change_seq` is at or below it was closed by an earlier process. Null
+   * when the store cannot read it.
+   */
+  bootChangeSeq: number | null;
+  /** Set-asides counted in memory whose stored-total write has not landed yet (#6670). */
+  pendingSetAside: number;
 }
 
 type QueuedOp =
@@ -147,6 +168,48 @@ function reportNotQueued(method: string, error: unknown): void {
   }
 }
 
+/**
+ * The fields of a set-aside op kept on its persisted log row (#6670 X3, R19), so
+ * the amount behind a counted loss can be read later.
+ */
+function lostOpFields(op: QueuedOp): {
+  namespace: string | null;
+  startedAtMs: number | null;
+  endedAtMs: number | null;
+  endCause: string | null;
+} {
+  switch (op.kind) {
+    case "open":
+      return {
+        namespace: op.row.namespace,
+        startedAtMs: op.row.started_at_ms,
+        endedAtMs: null,
+        endCause: null,
+      };
+    case "close":
+      return {
+        namespace: op.input.namespace,
+        startedAtMs: op.input.started_at_ms,
+        endedAtMs: op.input.endedAtMs,
+        endCause: op.input.endCause,
+      };
+    case "stretch":
+      return {
+        namespace: op.row.namespace,
+        startedAtMs: op.row.stretch_started_at_ms,
+        endedAtMs: op.row.legacy_ended_at_ms,
+        endCause: null,
+      };
+    case "touch":
+      return {
+        namespace: null,
+        startedAtMs: null,
+        endedAtMs: null,
+        endCause: null,
+      };
+  }
+}
+
 export class IntervalWriteService {
   private readonly queue: Queued[] = [];
   /** Queued touches by interval id, so a later touch raises the queued one. */
@@ -165,6 +228,18 @@ export class IntervalWriteService {
   private closesEnqueued = 0;
   private closesLanded = 0;
   private setAsideCount = 0;
+
+  // #6670 (D2-4, D6-1): the stored lost-write totals. A set-aside is counted in
+  // `pendingSetAside` until its direct store write lands; a failed write is
+  // retried by its own timer, never by the drain timer.
+  private pendingSetAside = 0;
+  private lostWriteWarned = false;
+  private lostWriteTimer: ReturnType<typeof setTimeout> | null = null;
+  private lostWriteAttempts = 0;
+  private leftAtStopStored = false;
+  private readonly bootId: string;
+  private readonly bootStartedAtMs: number;
+  private readonly bootChangeSeq: number | null;
 
   private depthAlarmRaised = false;
   private depthAlarmPending = false;
@@ -192,6 +267,15 @@ export class IntervalWriteService {
     this.opMaxAttempts = options?.opMaxAttempts ?? DEFAULT_OP_MAX_ATTEMPTS;
     this.flushBudgetMs = options?.flushBudgetMs ?? DEFAULT_FLUSH_BUDGET_MS;
     this.getNow = options?.getNow ?? Date.now;
+    this.bootId = newUuidV7();
+    this.bootStartedAtMs = this.getNow();
+    let bootChangeSeq: number | null = null;
+    try {
+      bootChangeSeq = this.store.readChangeSeq?.() ?? null;
+    } catch {
+      bootChangeSeq = null;
+    }
+    this.bootChangeSeq = bootChangeSeq;
   }
 
   // ───────────── public enqueue API: synchronous, never throws ─────────────
@@ -278,6 +362,10 @@ export class IntervalWriteService {
       oldestOpAgeMs:
         head === undefined ? 0 : Math.max(0, this.getNow() - head.enqueuedAt),
       setAsideCount: this.setAsideCount,
+      bootId: this.bootId,
+      bootStartedAtMs: this.bootStartedAtMs,
+      bootChangeSeq: this.bootChangeSeq,
+      pendingSetAside: this.pendingSetAside,
     };
   }
 
@@ -294,6 +382,12 @@ export class IntervalWriteService {
    * pass ends when every op has had its attempt or `flushBudgetMs` has passed
    * (tested before each attempt). Every log in the pass is `persist: false`, so no
    * row blocks the exit path. What remains is covered by the next boot's repair.
+   *
+   * #6670 (D6-1): before the pass, one attempt to store a pending set-aside count;
+   * after it, what is left queued (each close and stretch row, and each open whose
+   * close did not land in this pass) is added to `left_at_stop_total`, once per
+   * process, in one attempt. Both calls run while `flushing` is true, so a failure
+   * arms no retry timer on the shutdown path.
    */
   flush(): void {
     if (this.drainTimer) {
@@ -302,9 +396,16 @@ export class IntervalWriteService {
     }
     this.flushing = true;
     try {
+      // The budget covers the first stored-total attempt too (#6670 review F3).
       const startedAt = this.getNow();
+      if (this.lostWriteTimer) {
+        clearTimeout(this.lostWriteTimer);
+        this.lostWriteTimer = null;
+      }
+      this.persistLostWrites();
       const pending = this.queue.splice(0, this.queue.length);
       const remaining: Queued[] = [];
+      const closesLanded = new Set<string>();
       for (let i = 0; i < pending.length; i++) {
         const op = pending[i];
         if (this.getNow() - startedAt >= this.flushBudgetMs) {
@@ -314,6 +415,7 @@ export class IntervalWriteService {
         try {
           const result = this.apply(op);
           this.afterRemoved(op);
+          if (op.kind === "close") closesLanded.add(op.intervalId);
           this.afterLanded(op, result);
         } catch (error) {
           remaining.push(op);
@@ -327,6 +429,14 @@ export class IntervalWriteService {
         }
       }
       this.queue.push(...remaining);
+      let leftAtStop = 0;
+      for (const op of remaining) {
+        if (op.kind === "close" || op.kind === "stretch") leftAtStop++;
+        else if (op.kind === "open" && !closesLanded.has(op.intervalId))
+          leftAtStop++;
+      }
+      this.persistLostWrites(this.leftAtStopStored ? 0 : leftAtStop);
+      this.leftAtStopStored = true;
     } catch {
       // flush runs on the shutdown path and must not throw.
     } finally {
@@ -334,12 +444,16 @@ export class IntervalWriteService {
     }
   }
 
-  /** Cancel the drain timer and refuse further enqueues. */
+  /** Cancel the drain timer and the lost-write retry, and refuse further enqueues. */
   stop(): void {
     this.stopped = true;
     if (this.drainTimer) {
       clearTimeout(this.drainTimer);
       this.drainTimer = null;
+    }
+    if (this.lostWriteTimer) {
+      clearTimeout(this.lostWriteTimer);
+      this.lostWriteTimer = null;
     }
   }
 
@@ -348,9 +462,14 @@ export class IntervalWriteService {
   private push(op: QueuedOp): void {
     try {
       if (this.stopped) return;
+      const now = this.getNow();
       const queued: Queued = {
         ...op,
-        enqueuedAt: this.getNow(),
+        // #6670 (R18): a stretch row is never queued later than its own
+        // `recorded_at_ms`, so a run that ends its period below the oldest queued
+        // op ends it below the row's stamp, and the next run reads the row.
+        enqueuedAt:
+          op.kind === "stretch" ? Math.min(now, op.row.recorded_at_ms) : now,
         ownAttempts: 0,
         busyAttempts: 0,
       } as Queued;
@@ -449,12 +568,20 @@ export class IntervalWriteService {
             this.queue.shift();
             this.afterRemoved(op);
             this.setAsideCount++;
+            // #6670 (D2-4): a touch loses nothing, so it is not counted.
+            if (op.kind !== "touch") {
+              this.pendingSetAside++;
+              this.persistLostWrites();
+            }
+            const lost = lostOpFields(op);
             this.log(
               "error",
               `interval ${op.kind} write set aside after ${op.ownAttempts} attempts`,
               op,
               error,
-              true
+              true,
+              lost,
+              lost.namespace
             );
             continue;
           }
@@ -466,6 +593,49 @@ export class IntervalWriteService {
       // A throw in a setTimeout callback exits the server; contain it.
     } finally {
       if (this.queue.length <= this.queueCap) this.depthAlarmRaised = false;
+    }
+  }
+
+  /**
+   * Add the pending set-aside count (and, from `flush`, the ops left queued) to
+   * the stored totals by a direct store call (#6670, D2-4, D6-1). On a throw the
+   * pending count is kept and retried by this method's own timer (never the drain
+   * timer, so later writes never wait for its backoff), unless the service is
+   * stopping. Never throws: it runs from a timer, and a throw there exits the
+   * server.
+   */
+  private persistLostWrites(leftAtStop = 0): void {
+    try {
+      if (this.pendingSetAside + leftAtStop === 0) return;
+      try {
+        this.store.addLostWrites({
+          setAside: this.pendingSetAside,
+          leftAtStop,
+          nowMs: this.getNow(),
+        });
+        this.pendingSetAside = 0;
+        this.lostWriteAttempts = 0;
+      } catch (error) {
+        if (!this.lostWriteWarned) {
+          this.lostWriteWarned = true;
+          this.log(
+            "error",
+            "lost-write total not stored; retried by its own timer",
+            null,
+            error,
+            false,
+            { pendingSetAside: this.pendingSetAside, leftAtStop }
+          );
+        }
+        if (!this.stopped && !this.flushing && this.lostWriteTimer === null) {
+          this.lostWriteTimer = setTimeout(() => {
+            this.lostWriteTimer = null;
+            this.persistLostWrites();
+          }, this.backoff(++this.lostWriteAttempts));
+        }
+      }
+    } catch {
+      // Never throw from a timer callback or the drainer.
     }
   }
 
@@ -560,13 +730,15 @@ export class IntervalWriteService {
     op: Queued | null,
     error: unknown,
     persist: boolean,
-    extra?: Record<string, unknown>
+    extra?: Record<string, unknown>,
+    namespace?: string | null
   ): void {
     if (this.errorLogger === null) return;
     try {
       const options: ErrorLogOptions = {
         category: CATEGORY,
         sessionId: op?.sessionId ?? null,
+        ...(namespace !== undefined ? { namespace } : {}),
         persist: persist && !this.flushing,
         context: {
           op: op?.kind ?? null,

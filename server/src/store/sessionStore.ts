@@ -10,6 +10,8 @@ import {
   getLastOperatorMessageAt,
   getMessageCountsByNamespace,
   getOrCreateSession,
+  getOrCreateSessionWithFlag,
+  type BillableSwitchInitial,
   getSession,
   getSessionByNamespace,
   getSessions,
@@ -34,6 +36,13 @@ import {
   getChildBranchCount,
   getChildBranchCounts,
   dissolveChildSessions,
+  getRunnerRecord,
+  setRunnerRecord,
+  setRunnerCutAt,
+  addRefusedRunnerKey,
+  findSessionIdByTag,
+  runnerColumnsPresent,
+  type RunnerRecord,
 } from "./sessions";
 
 export class SessionStore {
@@ -50,6 +59,27 @@ export class SessionStore {
     namespace: string
   ): StoredSession {
     return getOrCreateSession(this.db, tag, metadata, agentState, namespace);
+  }
+
+  /**
+   * Issue #6646: create-or-find with the start value applied on the INSERT
+   * branch only, in one transaction (see `getOrCreateSessionWithFlag`).
+   */
+  getOrCreateSessionWithFlag(
+    tag: string,
+    metadata: unknown,
+    agentState: unknown,
+    namespace: string,
+    initial?: () => BillableSwitchInitial | null
+  ): { session: StoredSession; created: boolean } {
+    return getOrCreateSessionWithFlag(
+      this.db,
+      tag,
+      metadata,
+      agentState,
+      namespace,
+      initial
+    );
   }
 
   updateSessionMetadata(
@@ -303,5 +333,43 @@ export class SessionStore {
     excludeIds: string[] = []
   ): string[] {
     return dissolveChildSessions(this.db, parentIds, namespace, excludeIds);
+  }
+
+  /** Issue #6647: the session's runner record, or null when the row is absent. */
+  getRunnerRecord(sessionId: string, namespace: string): RunnerRecord | null {
+    return getRunnerRecord(this.db, sessionId, namespace);
+  }
+
+  /** Issue #6647: writes the `runner_*` columns only (never seq/updated_at). */
+  setRunnerRecord(
+    sessionId: string,
+    namespace: string,
+    record: RunnerRecord
+  ): boolean {
+    return setRunnerRecord(this.db, sessionId, namespace, record);
+  }
+
+  /** Issue #6647 (R15): the cut-off mark, `runner_cut_at` only. */
+  setRunnerCutAt(sessionId: string, cutAt: number | null): boolean {
+    return setRunnerCutAt(this.db, sessionId, cutAt);
+  }
+
+  /** Issue #6647: adds a key to the refused list (capped at 16). */
+  addRefusedRunnerKey(
+    sessionId: string,
+    namespace: string,
+    key: string
+  ): boolean {
+    return addRefusedRunnerKey(this.db, sessionId, namespace, key);
+  }
+
+  /** Issue #6647: the attach's tag lookup (newest row with the tag). */
+  findSessionIdByTag(tag: string, namespace: string): string | null {
+    return findSessionIdByTag(this.db, tag, namespace);
+  }
+
+  /** Issue #6647 (Task 9): whether the seven runner columns exist. */
+  runnerColumnsPresent(): boolean {
+    return runnerColumnsPresent(this.db);
   }
 }

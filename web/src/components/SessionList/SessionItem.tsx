@@ -586,6 +586,11 @@ export function SessionItem(props: {
           // Enter/Space on the focused row navigates (primary button action);
           // in Select Mode it toggles selection instead (#3292).
           if (isEditing) return;
+          // #6660 (R14): a key press on an interactive child — the kebab
+          // trigger, or an entry of its menu, portaled to <body> but still
+          // bubbling here through React — acts on that control only, the same
+          // guard the tap handler above applies.
+          if (isInteractiveTarget(e.target)) return;
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
             if (selectMode) {
@@ -617,7 +622,7 @@ export function SessionItem(props: {
       >
         {/* Select Mode (operator round 11, 2026-09-07): the WHOLE row is ONE tap
             surface — every inner control (status dot, emoji, pencil, account
-            chip, node badge, loop-cron chip, message count, bell, chevron, the
+            chip, node badge, loop-cron chip, message count, pins, chevron, the
             expanded details) is `inert`, so a tap anywhere on the card toggles
             the selection instead of landing on whichever control happened to be
             under the finger. `inert` removes the subtree from hit-testing AND
@@ -821,9 +826,9 @@ export function SessionItem(props: {
                     );
                   })()}
                 </div>
-                {/* #87 feedback (#2745 round): the mute bell moved into the shared
-                  SessionRightMetaRow (between message count and node badge) so
-                  the list and instance views render it identically. */}
+                {/* #6660: the per-session mute is the last kebab entry under
+                  the session details (it was a bell in SessionRightMetaRow);
+                  that slot now shows the pins waiting. */}
               </div>
 
               {/* Row 3 (#2479, X1): "managed by …" breadcrumb for a managed peer.
@@ -883,7 +888,7 @@ export function SessionItem(props: {
                   Configuration modal (the account selector lives in its Account
                   row), NOT a bare account picker; NodeBadge is relocated here from
                   Row 2 (its sole render site per surface). */}
-                {/* Fixed-width block = the Row-2 [loop-cron · count · bell] span, so
+                {/* Fixed-width block = the Row-2 [loop-cron · count · pins] span, so
                   the Account Chip's LEFT edge sits on the Loop-Cron slot's left
                   edge one row below (operator ruling 2026-09-05; rowAnchors.ts).
                   Chip grows/truncates inside; Node Badge pinned right. */}
@@ -900,7 +905,8 @@ export function SessionItem(props: {
                     onOpen={() => setEditParamsOpen(true)}
                   />
                   {/* E8/E9 right block: the Node Badge is a FIXED cell exactly as
-                    wide as [Message Count · Bell] beneath it, label centered.
+                    wide as [Message Count · Pins Waiting] beneath it (#6660),
+                    label centered.
                     Round 10: both grow by the badge's corner radius — the count
                     slot pads left by it so the bubble starts where the badge's
                     straight edge begins (rowAnchors.ts). Tapping the badge opens
@@ -920,13 +926,15 @@ export function SessionItem(props: {
                 </div>
               </div>
               {/* Row 2: shared Status Icon Cluster (loop-cron · message count ·
-                bell) — the same width as the Row-1 cluster above, so the two
-                rows form the E9 two-block layout. NodeBadge moved to Row 1
-                above (D3(a)); the conditional `?`/queued slot is gone (E9). */}
+                pins waiting, #6660) — the same width as the Row-1 cluster above,
+                so the two rows form the E9 two-block layout. NodeBadge moved to
+                Row 1 above (D3(a)); the conditional `?`/queued slot is gone
+                (E9). The pins count is the SUMMARY's (absent = unknown). */}
               <SessionRightMetaRow
                 sessionId={s.id}
                 messageCount={s.messageCount}
                 backgroundAgents={s.backgroundAgents}
+                openPinCount={s.openPinCount}
               />
             </div>
 

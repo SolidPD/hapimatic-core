@@ -192,8 +192,14 @@ export function PinDetail(props: {
   /** Replaces the context for a completed pin's summary line. */
   summary?: ReactNode;
   mode?: "tab" | "chat";
+  /**
+   * #6458 (TITLE-D): shown at the right end of the facts line; the pin row
+   * moves its signals here while its title wraps. A pin with no ID then gets
+   * a facts line with only these.
+   */
+  factsEnd?: ReactNode;
 }) {
-  const { model, actions, summary } = props;
+  const { model, actions, summary, factsEnd } = props;
   const { pin } = model;
   const { sessionId, markSeen } = usePinsContext();
   const [showText, setShowText] = useState(false);
@@ -224,15 +230,25 @@ export function PinDetail(props: {
     >
       {/* #6574 (Matt's pick C): the facts line opens every pin that has an ID, on
           every surface that renders this detail. One line: the revision and key
-          truncate, the ID chip never does. Inside the pin's own box (R18). */}
-      {pin.pinId ? (
+          truncate, the ID chip never does. Inside the pin's own box (R18).
+          #6458 (TITLE-D): `factsEnd` sits at its right end and never shrinks. */}
+      {pin.pinId || factsEnd ? (
         <div className="pins-facts mb-1.5 flex min-w-0 items-center gap-1.5 whitespace-nowrap text-[length:var(--text-caption)] text-[var(--app-hint)]">
-          <PinIdControl pinId={pin.pinId} form="chip" />
-          <HoverTooltip content="The pin's revision and the key its agent gave it">
-            <span className="min-w-0 truncate">
-              Revision {pin.revision} · key {pin.key}
+          {pin.pinId ? (
+            <>
+              <PinIdControl pinId={pin.pinId} form="chip" />
+              <HoverTooltip content="The pin's revision and the key its agent gave it">
+                <span className="min-w-0 truncate">
+                  Revision {pin.revision} · key {pin.key}
+                </span>
+              </HoverTooltip>
+            </>
+          ) : null}
+          {factsEnd ? (
+            <span data-pin-facts-end="" className="ml-auto flex flex-none">
+              {factsEnd}
             </span>
-          </HoverTooltip>
+          ) : null}
         </div>
       ) : null}
       {summary ?? null}

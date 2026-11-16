@@ -414,6 +414,8 @@ export class TaskExecutor {
           yolo: true,
           claimPort: false,
           scheduleId: task.id,
+          // Issue #6646: a schedule's start (AG-1 decides at each run).
+          billableSwitchStart: { kind: "schedule", scheduleId: task.id },
           sessionType: task.sessionType ?? "simple",
           worktreeName:
             task.sessionType === "worktree"

@@ -197,7 +197,6 @@ export const queryKeys = {
   timeLogProjects: ["time-log-projects"] as const,
   // Issue #1670 (PR-2): "time-log" prefix so the timer-reset invalidation
   // predicate (useSSE.ts) + the control mutations both cover these keys.
-  timeLogCutoverStatus: ["time-log-cutover-status"] as const,
   timeLogDerived: (startDate: string, endDate: string) =>
     ["time-log-derived", startDate, endDate] as const,
   timeLogAdjustments: ["time-log-adjustments"] as const,

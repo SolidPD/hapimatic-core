@@ -119,6 +119,8 @@ export function buildSuccessorHandoffDeps(args: {
         ...inheritSpawnPosture(predecessor.metadata?.permissionMode, "claude"),
         name: `${baseName}-successor`,
         parentSessionId: predecessor.id,
+        // Issue #6646 (A4): the successor takes its predecessor's switch.
+        billableSwitchStart: { kind: "inherit", fromSessionId: predecessor.id },
         accountUuid: predecessor.metadata?.accountUuid,
         // Issue #4568 (R6): a successor of an API-key session bills the same key.
         apiKeyId: predecessor.metadata?.apiKeyId,

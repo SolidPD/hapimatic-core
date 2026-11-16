@@ -21,9 +21,14 @@ import type {
 } from "@hapi/protocol/bulkSessionResult";
 import type { SessionSummary } from "@hapi/protocol";
 import type { Session, SyncEngine } from "../../sync/syncEngine";
-import type {
-  NodeRegistry,
-  RemoteSessionActionError,
+import {
+  listFederationForNamespace,
+  listForNamespace,
+} from "../../sync/pendingSpawns";
+import {
+  REMOTE_DELETE_CONCURRENCY,
+  type NodeRegistry,
+  type RemoteSessionActionError,
 } from "../../federation/nodeRegistry";
 
 export type BulkSessionAction = "abort" | "archive";
@@ -37,7 +42,49 @@ export type BulkSessionAction = "abort" | "archive";
  */
 export const BULK_SESSION_DEADLINE_MS = 25_000;
 
-type Target =
+/**
+ * #6681: no DELETE goes to a node once this much of a bulk-delete request has
+ * passed: 25 s answer − the 10 s request timeout − a 6 s confirmation budget,
+ * so a DELETE sent at the cutoff can still time out and be confirmed in time.
+ */
+export const REMOTE_DELETE_SEND_CUTOFF_MS = 9_000;
+/** #6681: how much of the deadline is kept back to build the answer. */
+const DELETE_ANSWER_MARGIN_MS = 250;
+
+/** #6681: a remote id that was never sent; safe to send again. */
+function notSentItem(id: string, label: string): BulkSessionResultItem {
+  return {
+    id,
+    ok: false,
+    retry: true,
+    error: `Not sent: ${label} busy; this session was not deleted`,
+  };
+}
+
+/**
+ * #6681: a remote id that was sent and whose outcome is still unknown. "timed
+ * out" stays in the text because older web builds label a failure by it.
+ * R1-2 (B2, B3): when the peer answered with its own error text, the text
+ * carries it, so a delete never confirmed keeps its reason. R2-4: that form
+ * keeps "(timed out)" too, for the same older web builds.
+ */
+function pendingItem(
+  id: string,
+  label: string,
+  peerText?: string
+): BulkSessionResultItem {
+  return {
+    id,
+    ok: false,
+    pending: true,
+    error:
+      peerText === undefined
+        ? `Still deleting on ${label}: no answer within 10 s (timed out); it may still complete`
+        : `Still deleting on ${label}: the node answered "${peerText}"; not confirmed in time (timed out); it may still complete`,
+  };
+}
+
+export type BulkTarget =
   | { kind: "done"; result: BulkSessionResultItem }
   | { kind: "local"; id: string; session: Session }
   | { kind: "remote"; id: string; nodeId: string; session: SessionSummary };
@@ -57,13 +104,13 @@ function errorMessage(err: unknown): string {
  * anything else is looked up on the federation REGARDLESS of node status, so
  * an offline owner reads `node_offline`, not `not_found`.
  */
-function resolveTarget(
+export function resolveTarget(
   id: string,
   engine: SyncEngine,
   namespace: string,
   registry: NodeRegistry | null,
   requireActive: boolean
-): Target {
+): BulkTarget {
   const session = engine.getSession(id);
   if (session) {
     if (session.namespace !== namespace) {
@@ -92,6 +139,50 @@ function resolveTarget(
   };
 }
 
+/**
+ * #6681 A1: while the hub has not yet polled every static peer since it
+ * started (`isAwaitingInitialPoll`, bounded by HUB_RESTART_GRACE_MS), an id
+ * no node can place may be a live peer session the empty cache cannot see.
+ * Mirrors the single-session routes (`remoteSessionAvailability`, which turns
+ * that 404 into a 503 `node_offline`): such an id is `node_offline`, never
+ * `not_found`, so no caller counts it as deleted or gone.
+ */
+function unplacedDuringInitialPoll(
+  result: BulkSessionResultItem,
+  registry: NodeRegistry | null
+): BulkSessionResultItem {
+  return result.code === "not_found" &&
+    registry?.isAwaitingInitialPoll?.() === true
+    ? { id: result.id, ok: false, code: "node_offline" }
+    : result;
+}
+
+/**
+ * #6681 A2, R2-1: a relaunch evicts its session from the hub's cache while it
+ * keeps running on its node, until a poll of that node that starts after the
+ * eviction puts it back. Until then an id the hub cannot place is not known to
+ * be gone: `retry` (nothing was sent), or `node_offline` while its node reads
+ * offline; never `not_found`, which callers count as gone.
+ */
+function relaunchedNotGone(
+  result: BulkSessionResultItem,
+  registry: NodeRegistry | null
+): BulkSessionResultItem {
+  if (result.code !== "not_found") return result;
+  const answer = registry?.relaunchAnswer?.(result.id);
+  if (answer === "node_offline") {
+    return { id: result.id, ok: false, code: "node_offline" };
+  }
+  return answer === "retry"
+    ? {
+        id: result.id,
+        ok: false,
+        retry: true,
+        error: "Not sent: being relaunched; this session was not changed",
+      }
+    : result;
+}
+
 /** Map a peer failure for an action that needs an ACTIVE session. */
 function remoteFailure(
   id: string,
@@ -108,7 +199,7 @@ function remoteFailure(
 
 /** Stop the running turn of one local session; never throws. */
 async function abortLocal(
-  target: Extract<Target, { kind: "local" }>,
+  target: Extract<BulkTarget, { kind: "local" }>,
   engine: SyncEngine,
   namespace: string
 ): Promise<BulkSessionResultItem> {
@@ -138,7 +229,7 @@ async function abortLocal(
 
 /** Stop the running turn of one remote session; never throws. */
 async function abortRemote(
-  target: Extract<Target, { kind: "remote" }>,
+  target: Extract<BulkTarget, { kind: "remote" }>,
   registry: NodeRegistry,
   namespace: string
 ): Promise<BulkSessionResultItem> {
@@ -163,7 +254,7 @@ async function abortRemote(
 
 /** Disconnect one local session; never throws. */
 async function archiveLocal(
-  target: Extract<Target, { kind: "local" }>,
+  target: Extract<BulkTarget, { kind: "local" }>,
   engine: SyncEngine
 ): Promise<BulkSessionResultItem> {
   try {
@@ -187,7 +278,7 @@ async function archiveLocal(
  * cannot prove the process died — local and remote semantics differ.
  */
 async function archiveRemote(
-  target: Extract<Target, { kind: "remote" }>,
+  target: Extract<BulkTarget, { kind: "remote" }>,
   registry: NodeRegistry,
   namespace: string
 ): Promise<BulkSessionResultItem> {
@@ -202,29 +293,34 @@ async function archiveRemote(
   return { id: target.id, ok: true };
 }
 
+/** Settle `work` or, after `ms`, `late` (#6646: Keep all uses it with its own outcome). */
+export async function settleWithin<T>(
+  work: Promise<T>,
+  ms: number,
+  late: T
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const lateAnswer = new Promise<T>(resolve => {
+    timer = setTimeout(() => resolve(late), ms);
+  });
+  try {
+    return await Promise.race([work, lateAnswer]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Settle `work` or, after `ms`, an "outcome unknown" failure for `id`. */
-async function withDeadline(
+function withDeadline(
   id: string,
   work: Promise<BulkSessionResultItem>,
   ms: number
 ): Promise<BulkSessionResultItem> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<BulkSessionResultItem>(resolve => {
-    timer = setTimeout(
-      () =>
-        resolve({
-          id,
-          ok: false,
-          error: `No answer within ${Math.round(ms / 1000)} s; the action may still complete`,
-        }),
-      ms
-    );
+  return settleWithin(work, ms, {
+    id,
+    ok: false,
+    error: `No answer within ${Math.round(ms / 1000)} s; the action may still complete`,
   });
-  try {
-    return await Promise.race([work, late]);
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
@@ -252,7 +348,12 @@ export async function runBulkSessionAction(params: {
 
   const settled = await Promise.allSettled(
     targets.map(async (target): Promise<BulkSessionResultItem> => {
-      if (target.kind === "done") return target.result;
+      if (target.kind === "done") {
+        return unplacedDuringInitialPoll(
+          relaunchedNotGone(target.result, registry),
+          registry
+        );
+      }
       if (target.kind === "local") {
         return withDeadline(
           target.id,
@@ -286,8 +387,16 @@ export async function runBulkSessionAction(params: {
  * `engine.deleteSessions` (which gathers tmux + worktree cleanup for every id
  * it is handed — a foreign id must never reach it). Remote ids are deleted one
  * SESSION at a time through `registry.deleteOnNode` (the peer's
- * `DELETE /api/federation/sessions/:id`) so each gets its own outcome, with ONE
- * coalesced re-poll per touched node. Throws only if the local delete throws.
+ * `DELETE /api/federation/sessions/:id`) so each gets its own outcome.
+ *
+ * #6681: the local and remote phases run together and are both settled; a
+ * local throw fails the local ids only. The remote phase answers within
+ * BULK_SESSION_DEADLINE_MS whatever the peers do: per node at most
+ * REMOTE_DELETE_CONCURRENCY DELETEs (the registry's shared slots), none sent
+ * after REMOTE_DELETE_SEND_CUTOFF_MS or after that node's first unknown or
+ * offline answer (those ids come back `retry`), and every unknown outcome is
+ * confirmed on its node by positive evidence (`gone` is deleted, anything
+ * else `pending`). One coalesced re-poll per touched node with no unknown id.
  */
 export async function runBulkDelete(params: {
   ids: readonly string[];
@@ -296,15 +405,41 @@ export async function runBulkDelete(params: {
   registry: NodeRegistry | null;
 }): Promise<BulkSessionResult> {
   const { engine, namespace, registry } = params;
+  const started = performance.now();
   const ids = dedupeIds(params.ids);
   const byId = new Map<string, BulkSessionResultItem>();
   const localIds: string[] = [];
-  const remote: { id: string; nodeId: string }[] = [];
+  const remoteByNode = new Map<string, { label: string; ids: string[] }>();
+  // #6681 (R9): an id no node knows may be a spawn placeholder of this
+  // namespace, local (`hapi-…`) or federation (a UUID). Read once, lazily.
+  let placeholders: Map<string, string | undefined> | null = null;
+  const placeholderState = (id: string): string | undefined => {
+    placeholders ??= new Map(
+      [
+        ...listForNamespace(namespace),
+        ...listFederationForNamespace(namespace),
+      ].map(s => [s.id, s.lifecycleState])
+    );
+    return placeholders.get(id);
+  };
 
   for (const id of ids) {
     const target = resolveTarget(id, engine, namespace, registry, false);
     if (target.kind === "done") {
-      byId.set(id, target.result);
+      // A placeholder still spawning is skipped; a failed one stays not_found
+      // (it is dismissable), as does any other unknown id.
+      const spawning =
+        target.result.code === "not_found" &&
+        placeholderState(id) === "spawning";
+      byId.set(
+        id,
+        spawning
+          ? { id, ok: false, skipped: true, code: "session_spawning" }
+          : unplacedDuringInitialPoll(
+              relaunchedNotGone(target.result, registry),
+              registry
+            )
+      );
     } else if (target.kind === "local") {
       // A still-connected session is refused HERE, with the cache's own rule
       // (#1443: an orphaned one — its CWD is gone — may be deleted while
@@ -317,11 +452,17 @@ export async function runBulkDelete(params: {
         localIds.push(id);
       }
     } else {
-      remote.push({ id, nodeId: target.nodeId });
+      const group = remoteByNode.get(target.nodeId) ?? {
+        label: target.session.nodeLabel ?? target.nodeId,
+        ids: [],
+      };
+      group.ids.push(id);
+      remoteByNode.set(target.nodeId, group);
     }
   }
 
-  if (localIds.length > 0) {
+  const localPhase = async (): Promise<void> => {
+    if (localIds.length === 0) return;
     // #6210: answer once the records are gone; the tmux + worktree cleanup
     // RPCs finish in the background instead of holding this response.
     const local = await engine.deleteSessions(localIds, namespace, {
@@ -333,27 +474,95 @@ export async function runBulkDelete(params: {
       // session that reconnected in between.
       byId.set(id, { id, ok: false, skipped: true, code: "session_active" });
     }
-  }
+  };
 
-  if (registry && remote.length > 0) {
-    const settled = await Promise.allSettled(
-      remote.map(({ id, nodeId }) =>
-        registry.deleteOnNode(nodeId, id, namespace, { deferPoll: true })
-      )
+  // Ids handed to `deleteOnNode`: at the deadline one without an answer was
+  // sent (a call still waiting for a slot gives up at the send cutoff).
+  const dispatched = new Set<string>();
+  const remote = new Map<string, BulkSessionResultItem>();
+  // F2: a 5xx the peer answered with its own text, by id (ids are unique).
+  const peerText = new Map<string, string>();
+  const remotePhase = async (): Promise<void> => {
+    if (!registry || remoteByNode.size === 0) return;
+    const deadline = started + BULK_SESSION_DEADLINE_MS;
+    const sendBy = started + REMOTE_DELETE_SEND_CUTOFF_MS;
+    const caller = Symbol("bulk-delete");
+    const quietNodes: string[] = [];
+    await Promise.all(
+      Array.from(remoteByNode, async ([nodeId, { label, ids: nodeIds }]) => {
+        let tripped = false;
+        const queue = [...nodeIds];
+        const unknown = new Map<string, number>();
+        const worker = async (): Promise<void> => {
+          for (let id = queue.shift(); id !== undefined; id = queue.shift()) {
+            if (tripped || performance.now() > sendBy) {
+              remote.set(id, notSentItem(id, label));
+              continue;
+            }
+            dispatched.add(id);
+            const r = await registry.deleteOnNode(nodeId, id, namespace, {
+              deferPoll: true,
+              sendBy,
+              shouldSend: () => !tripped,
+              caller,
+            });
+            if ("ok" in r) {
+              remote.set(id, { id, ok: true });
+            } else if (r.notSent) {
+              // Never reached the peer: a refused connection trips the node too.
+              tripped = true;
+              remote.set(id, notSentItem(id, label));
+            } else if (r.unknown) {
+              tripped = true;
+              unknown.set(id, r.sentAt ?? performance.now());
+              if (r.peerAnswered) peerText.set(id, r.message);
+            } else if (r.offline) {
+              tripped = true;
+              remote.set(id, { id, ok: false, code: "node_offline" });
+            } else {
+              remote.set(id, remoteFailure(id, r, "session_active"));
+            }
+          }
+        };
+        await Promise.all(
+          Array.from(
+            { length: Math.min(REMOTE_DELETE_CONCURRENCY, queue.length) },
+            worker
+          )
+        );
+        if (unknown.size === 0) {
+          quietNodes.push(nodeId);
+          return;
+        }
+        const confirmed = await registry.confirmDeletedOnNode(
+          nodeId,
+          [...unknown.keys()],
+          {
+            sentAt: unknown,
+            timeoutMs: Math.max(
+              0,
+              deadline - DELETE_ANSWER_MARGIN_MS - performance.now()
+            ),
+          }
+        );
+        for (const id of unknown.keys()) {
+          const outcome = confirmed.get(id);
+          const text = peerText.get(id);
+          if (outcome === "gone") {
+            remote.set(id, { id, ok: true });
+          } else if (outcome === "present" && text !== undefined) {
+            // F2: the peer answered the delete with an error and still has
+            // the session, so the delete failed: report the peer's text and
+            // free the slot now instead of holding it for the 60 s hold.
+            registry.releaseOwedDeleteSlot(nodeId, id);
+            remote.set(id, { id, ok: false, error: text });
+          } else {
+            remote.set(id, pendingItem(id, label, text));
+          }
+        }
+      })
     );
-    const touched = new Set<string>();
-    settled.forEach((s, i) => {
-      const { id, nodeId } = remote[i] as { id: string; nodeId: string };
-      touched.add(nodeId);
-      if (s.status === "rejected") {
-        byId.set(id, { id, ok: false, error: errorMessage(s.reason) });
-      } else if ("ok" in s.value) {
-        byId.set(id, { id, ok: true });
-      } else {
-        byId.set(id, remoteFailure(id, s.value, "session_active"));
-      }
-    });
-    for (const nodeId of touched) {
+    for (const nodeId of quietNodes) {
       void registry.pollNodeById(nodeId).catch(err => {
         console.warn(
           `[Federation] Background poll failed after bulk-delete on ${nodeId}:`,
@@ -361,10 +570,57 @@ export async function runBulkDelete(params: {
         );
       });
     }
+  };
+
+  const remoteBudget = Math.max(
+    0,
+    started +
+      BULK_SESSION_DEADLINE_MS -
+      DELETE_ANSWER_MARGIN_MS -
+      performance.now()
+  );
+  const [localOutcome, remoteOutcome] = await Promise.allSettled([
+    localPhase(),
+    settleWithin(remotePhase(), remoteBudget, undefined),
+  ]);
+  if (localOutcome.status === "rejected") {
+    // The whole error (its stack too) goes to the log; each local id carries
+    // its message.
+    console.warn("[bulk-delete] local phase failed:", localOutcome.reason);
+    for (const id of localIds) {
+      if (!byId.has(id)) {
+        byId.set(id, {
+          id,
+          ok: false,
+          error: errorMessage(localOutcome.reason),
+        });
+      }
+    }
+  }
+  // Every remote id has an answer, even at the deadline or after a throw:
+  // one sent is pending (it may still complete), one never sent is retry.
+  for (const [, { label, ids: nodeIds }] of remoteByNode) {
+    for (const id of nodeIds) {
+      const item = remote.get(id);
+      if (item) byId.set(id, item);
+      else if (registry === null) {
+        byId.set(id, { id, ok: false, code: "node_offline" });
+      } else {
+        byId.set(
+          id,
+          dispatched.has(id)
+            ? pendingItem(id, label, peerText.get(id))
+            : notSentItem(id, label)
+        );
+      }
+    }
+  }
+  if (remoteOutcome.status === "rejected") {
+    console.warn("[bulk-delete] remote phase failed:", remoteOutcome.reason);
   }
 
-  // An id the engine neither deleted nor skipped (it vanished mid-request) is
-  // reported, never dropped.
+  // A local id the engine neither deleted nor skipped (it vanished
+  // mid-request) is reported, never dropped.
   return ids.map(
     id =>
       byId.get(id) ?? {
@@ -404,7 +660,14 @@ export function summarizeBulkFailures(
       continue;
     }
     failed += 1;
-    const reason = r.code ?? `error: ${(r.error ?? "unknown").slice(0, 80)}`;
+    // #6681: a sent delete of unknown outcome and a never-sent one are their
+    // own reasons, so the error log tells them from real failures.
+    const reason =
+      r.pending === true
+        ? "pending"
+        : r.retry === true
+          ? "not_sent"
+          : (r.code ?? `error: ${(r.error ?? "unknown").slice(0, 80)}`);
     byReason[reason] = (byReason[reason] ?? 0) + 1;
     if (samples.length < BULK_FAILURE_SAMPLE_LIMIT) {
       samples.push({

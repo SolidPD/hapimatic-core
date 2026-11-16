@@ -28,9 +28,9 @@ import type { TimelogAdjustmentType } from "./types";
  * read-only SELECT over `turns` + `timelog_adjustments`, so it is reproducible and
  * unit-testable.
  *
- * DORMANCY (#1670 PR-1): nothing in the live read path / HTTP routes calls this yet.
- * PR-2 wires the modal + #1039 route to it, gated on the Sub-G parity green-streak
- * (`cutoverGate.ts`). PR-1 ships the derivation + tests only.
+ * READ PATH: `GET /timelogs/derived` serves this to the Time Log, which reads
+ * nothing else on any node since #6675 retired the cutover gate (the parity
+ * green-streak gate #1670 PR-2 originally wired it behind).
  *
  * ── Control-type semantics (R4) ──
  *   - `delta`   : signed `delta_ms` added to the bucket of its `ts_ms` local day.

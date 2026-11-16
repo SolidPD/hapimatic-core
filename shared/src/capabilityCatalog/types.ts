@@ -75,8 +75,11 @@ export interface Availability {
   gate?: CatalogGate;
 }
 
-/** The instance gates an `availability.gate` may name (#6448). */
-export const CATALOG_GATES = ["pins"] as const;
+/**
+ * The instance gates an `availability.gate` may name (#6448). `billable-switch`
+ * (#6646): open where the node's billable sessions are `on` or `closed`.
+ */
+export const CATALOG_GATES = ["pins", "billable-switch"] as const;
 export type CatalogGate = (typeof CATALOG_GATES)[number];
 
 /**

@@ -9,15 +9,15 @@
 // Uniform anatomy, left → right:
 //   [status cluster]  [icon?]  [label]  [(count)?]  ————ml-auto————  [chevron]
 //
-// - The status cluster sits at the FAR LEFT in a FIXED-width box
-//   (--subheading-cluster-w, index.css) so its four `flex-1 text-right` columns
-//   line up under the router.tsx toolbar accumulator cluster
-//   (SessionCountBadge variant="aligned"). The toolbar cluster is pinned to
-//   --status-cluster-w and the subheading box is that width minus the 5px the
-//   card pattern insets a subheading (own 4px rail + 1px card hairline), so the
-//   RIGHTMOST column of every bar sits exactly under the toolbar's rightmost
-//   column. Bars with no session-status cluster (the Schedulers group header)
-//   omit it — the label then starts at the far left.
+// - The status cluster sits at the FAR LEFT. Its four columns each reserve their
+//   own width (SessionCountBadge variant="aligned", STATUS_COUNT_COLUMN_CLASS), and
+//   the router.tsx toolbar accumulator renders the same column classes, so the two
+//   are the same width. The card pattern insets a subheading by 5px (its own 4px
+//   rail + the 1px card hairline, --subheading-rail-inset in index.css), and the
+//   toolbar cluster is padded left by that same inset, so both start at the same x
+//   and every column of every bar sits under the toolbar's column. Bars with no
+//   session-status cluster (the Schedulers group header) omit it — the label then
+//   starts at the far left.
 // - `nestedInRail`: a bar whose card sits INSIDE an outer 4px rail (the managed
 //   clusters' dark-gold rail, the scheduler section's dark-blue rail) is pushed
 //   4px further right than a bar whose card is not (branched conversations).
@@ -49,9 +49,9 @@ export interface SubheadingBarProps {
   count?: ReactNode;
   /**
    * Optional far-left status cluster — pass a
-   * `<SessionCountBadge variant="aligned" />`. Rendered inside a fixed-width box
-   * so its columns align under the toolbar accumulator. Omit for bars that have
-   * no session-status cluster (the Schedulers group header).
+   * `<SessionCountBadge variant="aligned" />`, whose reserved-width columns align
+   * under the toolbar accumulator. Omit for bars that have no session-status
+   * cluster (the Schedulers group header).
    */
   cluster?: ReactNode;
   /** Optional leading glyph between the cluster and the label (e.g. a clock icon). */
@@ -111,10 +111,11 @@ export function SubheadingBar({
           data-subheading-cluster
           // #3285: `mr-1.5` adds 6px beyond the row's gap-1.5, separating the
           // status-count values from the label (e.g. "…· 4  managed peers") which
-          // read as one run when only 6px apart. It's a MARGIN (outside the fixed
-          // --subheading-cluster-w box), so the box's width and its rightmost
-          // column's alignment under the toolbar accumulator are unchanged.
-          className="flex shrink-0 w-[var(--subheading-cluster-w)] mr-1.5"
+          // read as one run when only 6px apart. It's a MARGIN outside the
+          // cluster, so the columns' alignment under the toolbar accumulator is
+          // unchanged. The cluster sizes itself: each column reserves its own
+          // width (see the header comment).
+          className="flex shrink-0 mr-1.5"
         >
           {cluster}
         </span>

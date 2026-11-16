@@ -23,6 +23,10 @@ import {
 } from "@hapi/protocol";
 import { configuration } from "../configuration";
 import { ACCOUNT_LEASE_COORDINATOR_CAPABILITY } from "../services/rotationLeaseService";
+import {
+  billableSwitchCapabilityTags,
+  type BillableSwitchGateState,
+} from "../config/billableSwitchConfig";
 
 let cachedBaseCapabilities: string[] | null = null;
 
@@ -117,6 +121,22 @@ function readToolOverride(): { add: string[]; suppress: string[] } {
 }
 
 /**
+ * Issue #6646: this process's effective billable-sessions gate, set ONCE at boot
+ * by `server/src/index.ts`. A caller that passes `billableSwitch` uses its own
+ * value (tests); every other caller (`/federation/info`, the peer announcement,
+ * the catalog's availability context) advertises the process's tags.
+ */
+let processBillableSwitchGate:
+  | Pick<BillableSwitchGateState, "mode" | "storageReady">
+  | undefined;
+
+export function setProcessBillableSwitchGate(
+  state: Pick<BillableSwitchGateState, "mode" | "storageReady"> | undefined
+): void {
+  processBillableSwitchGate = state;
+}
+
+/**
  * Detect available capabilities for this node.
  * Includes base capabilities plus agent-specific ones.
  * Agent capabilities use the `agent:` prefix (e.g., `agent:claude`).
@@ -129,6 +149,11 @@ function readToolOverride(): { add: string[]; suppress: string[] } {
  */
 export function detectCapabilities(opts?: {
   role?: "hub" | "node" | "peer";
+  /**
+   * Issue #6646: this node's effective billable-sessions gate. Its tags are
+   * appended per call after the role tag, never cached with the base set.
+   */
+  billableSwitch?: Pick<BillableSwitchGateState, "mode" | "storageReady">;
 }): string[] {
   if (!cachedBaseCapabilities) {
     // #4462: ANTHROPIC_LOGIN_CAPABILITY is static (every binary since #4462 ships
@@ -181,6 +206,11 @@ export function detectCapabilities(opts?: {
   if (opts?.role === "hub") {
     result.push(ACCOUNT_LEASE_COORDINATOR_CAPABILITY);
   }
+  result.push(
+    ...billableSwitchCapabilityTags(
+      opts?.billableSwitch ?? processBillableSwitchGate
+    )
+  );
   return result;
 }
 

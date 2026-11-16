@@ -20,6 +20,10 @@ import type { SocketData, SocketServer } from "./socketTypes";
 import type { RemoteTerminalProxy } from "../federation/remoteTerminalProxy";
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { MessageWriteRetryQueue } from "./handlers/cli/messageWriteRetryQueue";
+import {
+  type RunnerIdentity,
+  runnerHandshakeStep,
+} from "../sync/runnerIdentity";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_MAX_TERMINALS = 4;
@@ -35,6 +39,8 @@ function resolveEnvNumber(name: string, fallback: number): number {
 
 export type SocketServerDeps = {
   store: Store;
+  /** Issue #6647: the one runner identity registry (absent: no identity step). */
+  runnerIdentity?: RunnerIdentity | null;
   jwtSecret: Uint8Array;
   getSession?: (
     sessionId: string
@@ -170,8 +176,14 @@ export function createSocketServer(deps: SocketServerDeps): {
       return next(new Error("Invalid token"));
     }
     socket.data.namespace = parsedToken.namespace;
-    next();
+    // Issue #6647 (Tasks 6 and 12, R6, R11): the runner identity at handshake.
+    // `off` adds nothing. The step calls `next` once: with the
+    // `runner-superseded` refusal only in `enforce`, and a plain `next()` on a
+    // throw (a throw here exits the server).
+    runnerHandshakeStep(socket, auth, deps.runnerIdentity, next);
   });
+  // Issue #6647 (Task 12, R5): a cut-off acts on the namespace's own socket.
+  deps.runnerIdentity?.bindSocketLookup(id => cliNs.sockets.get(id));
   cliNs.on("connection", socket =>
     registerCliHandlers(socket, {
       io,
@@ -189,6 +201,7 @@ export function createSocketServer(deps: SocketServerDeps): {
       onArchiveSession: deps.onArchiveSession,
       errorLogger: deps.errorLogger,
       messageWriteRetryQueue: deps.messageWriteRetryQueue,
+      runnerIdentity: deps.runnerIdentity,
     })
   );
 

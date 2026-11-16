@@ -91,6 +91,12 @@ export interface SessionRespawnDeps {
    * so a construction without it raises none; the legacy events still fire.
    */
   notifyUser?: (input: ProducerNotification) => void;
+  /**
+   * Issue #6647 (Task 12a, R15): whether the runner identity layer cut this
+   * session's wrapper off (its stored mark). Optional: absent, Reconnect
+   * behaves as before.
+   */
+  wasCutOffByIdentity?: (sessionId: string) => boolean;
 }
 
 export class SessionRespawn {
@@ -102,6 +108,7 @@ export class SessionRespawn {
   private readonly spawnSession: SpawnSessionFn;
   private readonly getLoopCronCoupler: () => LoopCronLifecycleCoupler | null;
   private readonly notifyUser: (input: ProducerNotification) => void;
+  private readonly wasCutOffByIdentity: (sessionId: string) => boolean;
 
   constructor(deps: SessionRespawnDeps) {
     this.sessionCache = deps.sessionCache;
@@ -112,6 +119,19 @@ export class SessionRespawn {
     this.spawnSession = deps.spawnSession;
     this.getLoopCronCoupler = deps.getLoopCronCoupler ?? (() => null);
     this.notifyUser = deps.notifyUser ?? (() => {});
+    this.wasCutOffByIdentity = deps.wasCutOffByIdentity ?? (() => false);
+  }
+
+  /** #6647 (Task 12a): marked cut off and no CLI socket connected; false on a fault. */
+  private cutOffWithNoSocket(sessionId: string): boolean {
+    try {
+      return (
+        this.wasCutOffByIdentity(sessionId) &&
+        !this.rpcGateway.hasConnectedCli(sessionId)
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -315,7 +335,13 @@ export class SessionRespawn {
       machineId,
       sessionTag
     );
-    if (aliveness === true) {
+    // Issue #6647 (Task 12a, R15): a wrapper the identity layer cut off is
+    // alive but has no socket and never reconnects, so re-marking it active
+    // would flap. With the mark set and no connected CLI socket, fall through
+    // to the respawn below with the dead-wrapper value killLivePane:true. Every
+    // other session keeps this fast path (Fallback Preservation Rule).
+    const cutOff = aliveness === true && this.cutOffWithNoSocket(sessionId);
+    if (aliveness === true && !cutOff) {
       this.sessionCache.reactivate(sessionId);
       this.errorLogger?.debug(
         `Reconnect session ${sessionId}: daemon reports wrapper+pane ALIVE — re-attaching (no respawn) (issue #1661)`,
@@ -329,7 +355,13 @@ export class SessionRespawn {
     // alive===false → killLivePane:true (respawn the dead/bash-occupied pane);
     // alive===null → killLivePane:false (uncertain — the daemon adapter re-checks
     // liveness before any kill, re-attaching if the wrapper is in fact alive).
-    const killLivePane = aliveness === false;
+    const killLivePane = aliveness === false || cutOff;
+    if (cutOff) {
+      this.errorLogger?.warn(
+        `Reconnect session ${sessionId}: the wrapper is alive but was cut off by runner identity and has no socket — respawning it (issue #6647)`,
+        { category: "sync", sessionId }
+      );
+    }
 
     // ⚠️ CRITICAL FALLBACK — DO NOT REMOVE OR REPLACE WITH AN ERROR
     //
@@ -451,6 +483,9 @@ export class SessionRespawn {
           machineId,
           directory: cwd,
           agent,
+          // Issue #6646: a reconnect reuses the tag, so the row and its switch
+          // stay; inherit applies only if a new row appears.
+          billableSwitchStart: { kind: "inherit", fromSessionId: session.id },
           // Round 11 (epic #3285): a SAVED permission posture
           // (metadata.permissionMode — stamped by the CLI at spawn (#6218) and on
           // a live mode change, or staged by the disconnected Session
@@ -723,6 +758,8 @@ export class SessionRespawn {
       name: branchLabel ?? undefined,
       forkSession: true,
       parentSessionId: sessionId,
+      // Issue #6646 (A4): a branch takes its parent's switch and confirm state.
+      billableSwitchStart: { kind: "inherit", fromSessionId: sessionId },
       // #2479: stamp the discriminator so a branched child reads as "branch".
       // (The branch persistence itself is updateSessionBranchInfo below, which
       // also writes parent_relationship='branch'; this makes intent explicit and

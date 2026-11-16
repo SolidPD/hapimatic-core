@@ -2,6 +2,7 @@
 import {
   neutralizeApprovalTokens,
   PinSchema,
+  type FederationConfig,
   type Pin,
   type SessionSummary,
 } from "@hapi/protocol";
@@ -52,7 +53,12 @@ export type PinByIdOutcome =
       timeZone: string | null;
       session: PinByIdSession;
     }
-  | { kind: "not_found"; notAsked: PinByIdNode[] }
+  | {
+      kind: "not_found";
+      notAsked: PinByIdNode[];
+      /** This node is a federated spoke: only its own store was searched. */
+      localOnly?: true;
+    }
   | { kind: "incomplete"; nodes: PinByIdNode[] }
   | { kind: "ambiguous"; matches: PinByIdMatch[] };
 
@@ -75,7 +81,25 @@ export type PinByIdDeps = {
   getTimeZone(): Promise<string | null>;
   localNode: { nodeId: string; nodeLabel?: string } | null;
   registry: PinByIdRegistry | null;
+  /**
+   * This node is a federated spoke (`isPinLookupLocalOnly`): it builds no
+   * registry, so a miss here says nothing about the other nodes (#6458 Task 11i).
+   */
+  localOnly?: boolean;
 };
+
+/**
+ * Whether a by-ID read on this node can search only its own store: a federated
+ * `node`-role spoke builds no `NodeRegistry` (`server/src/index.ts`). A node with
+ * federation off is the only node, so its miss is a real miss. The check lives in
+ * the routes' lookup, never in `findLocalPinById`, which the federation receiver
+ * also uses to answer the hub.
+ */
+export function isPinLookupLocalOnly(
+  config: Pick<FederationConfig, "enabled" | "role"> | null | undefined
+): boolean {
+  return config?.enabled === true && config.role === "node";
+}
 
 /** The lookup's deps over a node's engine and registry, shared by the JWT and CLI routes. */
 export function enginePinByIdDeps(
@@ -84,6 +108,7 @@ export function enginePinByIdDeps(
     registry: PinByIdRegistry | null;
     getTimeZone?: () => Promise<string | null>;
     localNode: { nodeId: string; nodeLabel?: string } | null;
+    localOnly?: boolean;
   }
 ): PinByIdDeps {
   return {
@@ -93,6 +118,7 @@ export function enginePinByIdDeps(
     getTimeZone: async () => (await options.getTimeZone?.()) ?? null,
     localNode: options.localNode,
     registry: options.registry,
+    localOnly: options.localOnly === true,
   };
 }
 
@@ -182,6 +208,11 @@ export async function lookupPinById(
       },
     };
   }
+
+  // A spoke cannot ask the other nodes, so its miss must not read as "no pin
+  // has that ID" (#6458 Task 11i, PM-13): a retry cannot help either.
+  if (deps.localOnly)
+    return { kind: "not_found", notAsked: [], localOnly: true };
 
   const registry = deps.registry;
   const peers = registry ? registry.getNodeSummaries() : [];

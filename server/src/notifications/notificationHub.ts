@@ -5,7 +5,12 @@ import type {
   NotificationHubOptions,
 } from "./notificationTypes";
 import type { ErrorLogger } from "../logging/errorLogger";
-import { isQuestionToolName } from "@hapi/protocol";
+import {
+  cleanElicitationText,
+  ELICITATION_LIMITS,
+  isQuestionToolName,
+  MCP_ELICITATION_TOOL,
+} from "@hapi/protocol";
 import { extractMessageEventType } from "./eventParsing";
 
 export class NotificationHub {
@@ -237,9 +242,15 @@ export class NotificationHub {
     // #6455: the CLI stores a request's input as `arguments` (agentState schema);
     // this read named `args`, so every question notification lost its text.
     const request = requests[newQuestionId] as
-      | { arguments?: { questions?: Array<{ question?: string }> } }
+      | {
+          tool?: string;
+          arguments?: { questions?: Array<{ question?: string }> };
+        }
       | undefined;
-    const questionSummary = request?.arguments?.questions?.[0]?.question || "";
+    const questionSummary =
+      request?.tool === MCP_ELICITATION_TOOL
+        ? elicitationSummary(request.arguments)
+        : request?.arguments?.questions?.[0]?.question || "";
 
     const existingTimer = this.questionDebounce.get(session.id);
     if (existingTimer) {
@@ -332,4 +343,28 @@ export class NotificationHub {
       }
     }
   }
+}
+
+/**
+ * The most characters of the server's message a push summary shows (#6606
+ * R10).
+ */
+const ELICITATION_SUMMARY_MESSAGE_CHARS = 100;
+
+/** The push text for an MCP server's form or link request (#6606 R10). */
+function elicitationSummary(args: unknown): string {
+  const record =
+    args !== null && typeof args === "object"
+      ? (args as Record<string, unknown>)
+      : {};
+  const server =
+    typeof record.server === "string"
+      ? cleanElicitationText(record.server, ELICITATION_LIMITS.noticeName)
+      : "";
+  const message =
+    typeof record.message === "string"
+      ? cleanElicitationText(record.message, ELICITATION_SUMMARY_MESSAGE_CHARS)
+      : "";
+  const head = `${server || "An MCP server"} asks for input`;
+  return message ? `${head}: ${message}` : head;
 }

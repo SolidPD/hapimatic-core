@@ -7,10 +7,8 @@ import {
   isAutoPickEligible,
   isReservedPinKey,
   laneSessionRefs,
-  neutralizeApprovalTokens,
   parseDashboardLanes,
   PIN_ANSWERS_MESSAGE_MAX_CHARS,
-  scrubSecretTokens,
   type Pin,
   type PinAnswersEntry,
   type PinAutomaticPick,
@@ -26,7 +24,10 @@ import {
 } from "../config/timeLogConfig";
 import type { PinBatchAnswer, PinBatchOutcome } from "../store/pinStore";
 import { RecordVetoError } from "./messageService";
+import { isPromptPinLive } from "./pinPromptMirror";
+import { PROMPT_PIN_PREFIX } from "./pinService";
 import { DETECTED_PIN_PREFIX } from "./pinTurnCheck";
+import { cleanPinText } from "./pinText";
 import type { MessageOrigin } from "./sentFrom";
 import type { Session, SyncEngine } from "./syncEngine";
 
@@ -50,7 +51,9 @@ export type PinSubmissionSession = Pick<
   | "metadata"
   | "parentSessionId"
   | "parentRelationship"
->;
+> &
+  /** #6458 Task 11k: what `isPromptPinLive` reads; absent reads as live. */
+  Partial<Pick<Session, "agentState" | "blockedOnTuiPrompt">>;
 
 export type PinSubmissionContext = {
   /** Who sent it, derived from the authenticated request, never the body. */
@@ -100,15 +103,14 @@ type Checked =
   | { kept: Kept }
   | { dropped: { key: string; reason: string; code: string } };
 
-/** Secrets out first, then approval tokens, so the record and the message agree. */
-function clean(text: string): string {
-  return neutralizeApprovalTokens(scrubSecretTokens(text));
-}
+/** The shared pin-text scrub (#6530), so the record and the message agree. */
+const clean = cleanPinText;
 
 function check(
   entry: PinSubmissionEntry,
   pin: Pin | undefined,
-  seen: Set<string>
+  seen: Set<string>,
+  isRequestLive: (key: string) => boolean
 ): Checked {
   const drop = (reason: string, code: string): Checked => ({
     dropped: { key: entry.key, reason, code },
@@ -119,10 +121,12 @@ function check(
   // #6455 mirrors native prompts as `prompt:` pins, which resolve through their
   // own control; `detected:` pins are dismiss-only, so a dismissal is the one
   // entry a Submit takes for them (#6539, ruling Q1).
-  if (
-    isReservedPinKey(pin.key) &&
-    !(entry.dismiss === true && pin.key.startsWith(DETECTED_PIN_PREFIX))
-  ) {
+  // #6458 Task 11k: a `prompt:` pin whose request is gone (a restart left it
+  // open) takes a dismissal too; one still waiting resolves where it was asked.
+  const dismissible =
+    pin.key.startsWith(DETECTED_PIN_PREFIX) ||
+    (pin.key.startsWith(PROMPT_PIN_PREFIX) && !isRequestLive(pin.key));
+  if (isReservedPinKey(pin.key) && !(entry.dismiss === true && dismissible)) {
     return drop("answered through its own prompt", "pin_reserved");
   }
   if (pin.kind === "dashboard") {
@@ -366,18 +370,19 @@ const RELAY_TEXT_MAX_CHARS = 80;
 /**
  * A session's name or tag on one line of the relay: no control characters or
  * backticks (a name set through session metadata could otherwise open a fence
- * ahead of the real answers block), whitespace collapsed, capped, then cleaned.
+ * ahead of the real answers block), whitespace collapsed, cleaned, then
+ * capped: a secret the cap would cut is scrubbed whole first (#6458 round 6).
  */
 function relayText(text: string): string {
-  const flat = text
-    .replace(/[\p{Cc}`]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return clean(
-    flat.length > RELAY_TEXT_MAX_CHARS
-      ? `${flat.slice(0, RELAY_TEXT_MAX_CHARS - 1)}…`
-      : flat
+  const flat = clean(
+    text
+      .replace(/[\p{Cc}`]/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim()
   );
+  return flat.length > RELAY_TEXT_MAX_CHARS
+    ? `${flat.slice(0, RELAY_TEXT_MAX_CHARS - 1)}…`
+    : flat;
 }
 
 /**
@@ -466,7 +471,9 @@ export async function submitPinAnswers(
       savedOnly.push(entry);
       continue;
     }
-    const checked = check(entry, live.get(entry.key), seen);
+    const checked = check(entry, live.get(entry.key), seen, key =>
+      isPromptPinLive(session, key)
+    );
     if ("kept" in checked) kept.push(checked.kept);
     else
       drop(checked.dropped.key, checked.dropped.reason, checked.dropped.code);
@@ -636,6 +643,24 @@ export async function submitPinAnswers(
     deliveredTo = parent.tag ?? parent.id;
   }
 
+  if (alreadyDelivered) {
+    // #6453 (IR-3): this submission's message is already in the recipient's
+    // chat, so this is a replay. Nothing is sent, recorded or marked.
+    // #6458 (ER-D2): answered BEFORE the empty refusal and the dry-run
+    // return, so a retry or a dry run of a delivered id always reads
+    // `delivered: true`. A stored report-only, save-only or trimmed Submit
+    // recomputes to nothing (or to something new) once delivered, and was
+    // answered "Nothing left to send" (400) or "not delivered", which made the
+    // client drop or resend answers the agent already had.
+    return {
+      ok: true,
+      response: {
+        ...replay(engine, session, request, live),
+        ...(deliveredTo !== undefined ? { deliveredTo } : {}),
+      },
+    };
+  }
+
   if (kept.length === 0 && saves.length === 0) {
     // A preview says why: through a federation proxy a refusal keeps only its
     // message, so the dialog would lose each entry's reason.
@@ -714,14 +739,6 @@ export async function submitPinAnswers(
         openPinCount: engine.pins.countOpen(session.id),
         ...relayed,
       },
-    };
-  }
-  if (alreadyDelivered) {
-    // #6453 (IR-3): this submission's message is already in the recipient's
-    // chat, so this is a replay. Nothing is sent, recorded or marked.
-    return {
-      ok: true,
-      response: { ...replay(engine, session, request, live), ...relayed },
     };
   }
   if (recipient.active !== true) {
@@ -1069,7 +1086,16 @@ function replay(
     seen.add(key);
     const pin = live.get(key);
     const savedOnly = isSavedOnly(entry);
+    // #6458 (N): an entry that only reported an automatic pick records no
+    // answer; the message carried it when the pin's deadline report is no
+    // longer pending, the way a saved-only entry reads its save report.
+    const pickOnly =
+      entry.automaticPick !== undefined &&
+      !hasPinAnswer(entry) &&
+      entry.dismiss !== true;
     if (savedOnly && pin?.savedTo && pin.saveReportPending !== true) {
+      entries.push({ key, outcome: "sent", recorded: true, pin });
+    } else if (pickOnly && pin && pin.deadlineReportPending !== true) {
       entries.push({ key, outcome: "sent", recorded: true, pin });
     } else if (pin && wasRecordedBy(pin, request.submissionId)) {
       const mine = pin.answers.filter(

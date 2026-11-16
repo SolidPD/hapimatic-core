@@ -14,6 +14,7 @@ import type { ApiClient } from "@/api/client";
 import { SyntaxHighlighter } from "@/components/assistant-ui/shiki-highlighter";
 import { useOptionalHappyChatContext } from "@/components/AssistantChat/context";
 import type { ChatBlock, ToolCallBlock } from "@/chat/types";
+import { usePins } from "@/hooks/queries/usePins";
 import { useVersion } from "@/hooks/useVersion";
 import { lazyWithLoadError } from "@/lib/lazyWithPreload";
 
@@ -86,11 +87,65 @@ const PIN_TOOLS = new Set([
   "hapi__pin_update",
 ]);
 
-/** The pin a `pin_post` / `pin_update` call names, unless the call failed. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** A tool result's text: a string, or the first `text` part of its content. */
+function resultText(result: unknown): string | null {
+  if (typeof result === "string") return result;
+  const parts = Array.isArray(result) ? result : asRecord(result)?.content;
+  if (!Array.isArray(parts)) return null;
+  for (const part of parts) {
+    const record = asRecord(part);
+    if (record?.type === "text" && typeof record.text === "string") {
+      return record.text;
+    }
+  }
+  return null;
+}
+
+/** The longest result line read as the pin tool's JSON payload. */
+const RESULT_JSON_MAX = 16 * 1024;
+
+/**
+ * Whether a completed pin call's result is the tool's refusal: its first line
+ * is the JSON payload `hapiPinTools.ts` builds, and `ok` is false. Codex and
+ * ACP report a refused call as completed (`normalizeAgent.ts` writes their
+ * results with `is_error: false`), so the state alone does not tell. A payload
+ * that is itself a tool result's content is read one level down.
+ */
+function refusedResult(result: unknown, depth = 0): boolean {
+  const text = resultText(result);
+  if (!text) return false;
+  const first = text.trimStart().split("\n", 1)[0] ?? "";
+  if (!first.startsWith("{") || first.length > RESULT_JSON_MAX) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(first);
+  } catch {
+    return false;
+  }
+  const record = asRecord(parsed);
+  if (!record) return false;
+  if (record.ok === false) return true;
+  return depth === 0 && Array.isArray(record.content)
+    ? refusedResult(record, 1)
+    : false;
+}
+
+/**
+ * The pin a `pin_post` / `pin_update` call names, once the call has completed
+ * and was not refused (#6527, R10). A running call has no pin to read yet: the
+ * server writes it before the result lands, so reading it earlier is a 404.
+ */
 export function pinToolKey(block: ToolCallBlock): string | null {
-  if (!PIN_TOOLS.has(block.tool.name) || block.tool.state === "error") {
+  if (!PIN_TOOLS.has(block.tool.name) || block.tool.state !== "completed") {
     return null;
   }
+  if (refusedResult(block.tool.result)) return null;
   const input = block.tool.input as { key?: unknown } | null | undefined;
   const key = input && typeof input === "object" ? input.key : undefined;
   return typeof key === "string" && key.length > 0 && key.length <= PIN_KEY_MAX
@@ -152,7 +207,29 @@ export function PinFence(props: SyntaxHighlighterProps): ReactElement {
   const key = pinKeyFromFence(props.code);
   const block = <SyntaxHighlighter {...props} />;
   if (!key) return block;
-  return <PinCard pinKey={key} fallback={block} />;
+  return <FencePinCard pinKey={key} fallback={block} />;
+}
+
+/** #6527: a fence's pin is written after its message; read it once the list has it. */
+function FencePinCard(props: { pinKey: string; fallback: ReactNode }) {
+  const ctx = useOptionalHappyChatContext();
+  const pinsEnabled = useVersion().data?.pinsEnabled === true;
+  if (!ctx || !pinsEnabled) return <>{props.fallback}</>;
+  return <ListedPinCard {...props} api={ctx.api} sessionId={ctx.sessionId} />;
+}
+
+function ListedPinCard(props: {
+  pinKey: string;
+  fallback: ReactNode;
+  api: ApiClient | null;
+  sessionId: string;
+}) {
+  const list = usePins(props.api, props.sessionId, true);
+  const pins = list.data?.kind === "ready" ? list.data : null;
+  const listed = pins?.hasMore || pins?.pins.some(p => p.key === props.pinKey);
+  if (pins && !listed) return <>{props.fallback}</>;
+  if (list.isPending) return <Placeholder />;
+  return <PinCard pinKey={props.pinKey} fallback={props.fallback} />;
 }
 
 /** A pin tool call's card, below the tool row. Renders nothing when it cannot. */

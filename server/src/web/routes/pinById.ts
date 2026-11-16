@@ -42,6 +42,8 @@ export type PinByIdRoutesOptions = {
   /** This node's pin time zone, for a local hit. */
   getPreferenceTimeZone?: () => Promise<string | null>;
   errorLogger?: ErrorLogger | null;
+  /** This node is a federated spoke (`isPinLookupLocalOnly`, #6458 Task 11i). */
+  localOnly?: boolean;
 };
 
 export function createPinByIdRoutes(
@@ -93,6 +95,7 @@ export function createPinByIdRoutes(
             registry: options.getNodeRegistry?.() ?? null,
             getTimeZone: options.getPreferenceTimeZone,
             localNode: options.localNode(),
+            localOnly: options.localOnly,
           }),
           c.get("namespace"),
           pinId

@@ -2,7 +2,7 @@
 // Session grouping + pure display helpers.
 // Extracted from SessionList.tsx (issue #2083, epic #2077 F) — verbatim move,
 // re-exported through the SessionList barrel to preserve public import paths.
-import { LOCAL_NODE_ID } from "@hapi/protocol";
+import { LOCAL_NODE_ID, projectBaseKey } from "@hapi/protocol";
 import type { SessionSummary } from "@/types/api";
 
 export type FilterView = "all" | "sessions" | "schedules";
@@ -77,12 +77,8 @@ function getSessionNodeId(session: SessionSummary): string {
  * key, and is used for `displayName` derivation and the expand-state migration read.
  */
 function getSessionBaseKey(session: SessionSummary): string {
-  return (
-    session.metadata?.repoIdentity?.name ??
-    session.metadata?.worktree?.basePath ??
-    session.metadata?.path ??
-    "Other"
-  );
+  // Issue #6646: the same key the server keys a project's billable header by.
+  return projectBaseKey(session.metadata);
 }
 
 /**

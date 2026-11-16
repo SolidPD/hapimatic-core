@@ -20,7 +20,10 @@ import type {
   SessionLike,
 } from "../../capabilities/availabilityContext";
 import { auditInvoke, isEntryInvocable } from "./capabilityPolicy";
-import { CALLER_SESSION_HEADER } from "./agentEscalation";
+import {
+  CALLER_SESSION_HEADER,
+  CAPABILITY_DEPTH_HEADER,
+} from "./agentEscalation";
 import { extendTelemetryRequestTimeout } from "../../telemetry/executor";
 
 /**
@@ -99,7 +102,7 @@ const ALLOWED_METHODS = new Set([
 
 /** Re-entrancy marker: set on every dispatched request; refused on the way IN so a
  *  transitive catalogued route can never loop back into the invoker. */
-const DEPTH_HEADER = "X-Hapi-Capability-Depth";
+const DEPTH_HEADER = CAPABILITY_DEPTH_HEADER; // #6646: one constant, in agentEscalation.ts
 
 /** The caller's own session id, stamped by the injected hapi MCP wrapper and
  *  copied onto the dispatched request (#3842 R5). The SAME constant the route

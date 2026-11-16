@@ -18,6 +18,7 @@
  * `web/src/lib/sessionHelpers.ts` `formatRelativeTimeCompact` (a same-named
  * `formatRelativeTime` already lives there; a duplicate would collide).
  */
+import { PIN_MAX_OPEN_PER_SESSION } from "@hapi/protocol";
 import type { LoopCronState } from "@/types/systemJobs";
 
 /**
@@ -205,4 +206,57 @@ export function formatMcp(a: number, b: number, c: number): string {
 export function formatMessageCount(n: number): string {
   const safe = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
   return safe >= 1000 ? "1k+" : String(safe);
+}
+
+/**
+ * Issue #6660: what the Row-2 Pins Waiting slot shows for a session's open-pin
+ * count (variant D of the Pins session-list mockup, picked by Matt):
+ * - `undefined` (the owning node's Pins gate is closed, or the node is older) →
+ *   unknown: nothing, and the slot keeps its width (Q1, ruled by the Pins PM).
+ * - 0 → none: the grey pin glyph alone, no number.
+ * - 1–99 → waiting: the glyph and the number, in the Pins red.
+ * - 100, the most a session can hold (`PIN_MAX_OPEN_PER_SESSION`) → waiting:
+ *   the number alone, because the glyph and three digits do not fit the 25px
+ *   slot (D2, ruled by the Pins PM).
+ * A negative or fractional count reads as unknown.
+ */
+export type PinCountDisplay = {
+  state: "unknown" | "none" | "waiting";
+  glyph: boolean;
+  text: string | null;
+  title: string | null;
+};
+
+export function pinCountDisplay(count: number | undefined): PinCountDisplay {
+  if (count === undefined || !Number.isInteger(count) || count < 0) {
+    return { state: "unknown", glyph: false, text: null, title: null };
+  }
+  if (count === 0) {
+    return { state: "none", glyph: true, text: null, title: "No pins waiting" };
+  }
+  if (count >= PIN_MAX_OPEN_PER_SESSION) {
+    return {
+      state: "waiting",
+      glyph: false,
+      text: String(count),
+      title:
+        count === PIN_MAX_OPEN_PER_SESSION
+          ? `${count} pins waiting on you, the most a session can hold`
+          : `${count} pins waiting on you`,
+    };
+  }
+  return {
+    state: "waiting",
+    glyph: true,
+    text: String(count),
+    title:
+      count === 1 ? "1 pin waiting on you" : `${count} pins waiting on you`,
+  };
+}
+
+/** Issue #6660: the project bar's total, as its tooltip and accessible name. */
+export function projectPinTotalTitle(total: number): string {
+  return total === 1
+    ? "1 pin waiting in this project"
+    : `${total} pins waiting in this project`;
 }

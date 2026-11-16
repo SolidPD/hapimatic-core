@@ -726,9 +726,11 @@ export class CodexRemoteLauncher extends RemoteLauncherBase {
     };
     attachTransport(client);
 
-    const { server: happyServer, mcpServers } = await buildHapiMcpBridge(
-      session.client
-    );
+    const {
+      server: happyServer,
+      mcpServers,
+      pinsEnabled,
+    } = await buildHapiMcpBridge(session.client);
     this.happyServer = happyServer;
 
     this.setupAbortHandlers(
@@ -962,6 +964,7 @@ export class CodexRemoteLauncher extends RemoteLauncherBase {
             mode: message.mode,
             first,
             mcpServers,
+            pinsEnabled,
             cliOverrides: session.codexCliOverrides,
             developerInstructions,
           });
@@ -987,6 +990,7 @@ export class CodexRemoteLauncher extends RemoteLauncherBase {
                       mode: message.mode,
                       first,
                       mcpServers,
+                      pinsEnabled,
                       cliOverrides: session.codexCliOverrides,
                     }).config?.developer_instructions ?? ""
                   ),

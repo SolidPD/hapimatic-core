@@ -17,6 +17,7 @@ import type {
 import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { readSettings } from "@/persistence";
 import type { AuthBinding } from "@hapi/protocol";
+import { GIT_REMOTE_TIMEOUT_MS, parseGitRemoteUrl } from "@hapi/protocol";
 import { AuthBindingSchema } from "@hapi/protocol/schemas";
 import { configuration } from "@/configuration";
 import { logger } from "@/ui/logger";
@@ -88,43 +89,6 @@ function detectTmuxWindowName(): string | undefined {
 }
 
 /**
- * Parse a git remote URL (SSH or HTTPS) and extract owner/repo identity.
- * Returns null if the URL cannot be parsed.
- */
-function parseGitRemoteUrl(
-  remoteUrl: string
-): { name: string; url?: string } | null {
-  const trimmed = remoteUrl.trim();
-
-  // SSH format: git@github.com:owner/repo.git
-  const sshMatch = trimmed.match(/^git@([^:]+):([^/]+)\/(.+?)(?:\.git)?$/);
-  if (sshMatch) {
-    const [, host, owner, repo] = sshMatch;
-    const name = `${owner}/${repo}`;
-    const isGitHub = host === "github.com";
-    return {
-      name,
-      url: isGitHub ? `https://github.com/${name}` : `https://${host}/${name}`,
-    };
-  }
-
-  // HTTPS format: https://github.com/owner/repo.git
-  const httpsMatch = trimmed.match(
-    /^https?:\/\/([^/]+)\/([^/]+)\/(.+?)(?:\.git)?$/
-  );
-  if (httpsMatch) {
-    const [, host, owner, repo] = httpsMatch;
-    const name = `${owner}/${repo}`;
-    return {
-      name,
-      url: `https://${host}/${name}`,
-    };
-  }
-
-  return null;
-}
-
-/**
  * Resolve git repo identity for the given working directory.
  * Runs `git remote get-url origin` with a short timeout.
  * Returns undefined if not a git repo or no remote configured.
@@ -136,7 +100,7 @@ function resolveRepoIdentity(
     const remoteUrl = execFileSync("git", ["remote", "get-url", "origin"], {
       cwd: workingDirectory,
       encoding: "utf8",
-      timeout: 3000,
+      timeout: GIT_REMOTE_TIMEOUT_MS,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
 
@@ -409,7 +373,10 @@ export async function bootstrapSession(
   // Both daemon spawn paths (tmuxSpawnAdapter and the direct spawn, #5083) inject the
   // spawn's tag; a session started with none generates one above and writes it back here.
   // Safe: the daemon strips any inherited value on startup and before every spawn (#283).
-  if (!process.env.HAPI_SESSION_ID) {
+  // Issue #6647 (Task 8, R13): a caller that passes its own tag gets no
+  // write-back. `hapi acp` holds one tag per session in one process and hands
+  // each to its own child; a process-wide write would leak one into another.
+  if (!options.tag && !process.env.HAPI_SESSION_ID) {
     process.env.HAPI_SESSION_ID = sessionTag;
   }
   if (isSessionReuse) {
@@ -437,17 +404,25 @@ export async function bootstrapSession(
     sessionRole: options.sessionRole,
   });
 
+  // Issue #6647 (R1): this attach's runner id, held in memory only and never
+  // written to process.env, so no child process inherits it. A refused
+  // attach throws RunnerRefusedError before any socket is made.
+  const runnerId = randomUUID();
   const { session: sessionInfo, deliveryFloorSeq } =
     await api.getOrCreateSession({
       tag: sessionTag,
       metadata,
       state: agentState,
+      runner: { id: runnerId, pid: process.pid },
     });
 
   // #4682: the wrapper takes delivery only of user messages above the attach
   // floor, so a reconnect does not replay the session's earlier history
   // (residual KR1: docs/internal/architecture/sync.md).
-  const session = api.sessionSyncClient(sessionInfo, { deliveryFloorSeq });
+  const session = api.sessionSyncClient(sessionInfo, {
+    deliveryFloorSeq,
+    runnerId,
+  });
 
   await reportSessionStarted(sessionInfo.id, metadata);
 

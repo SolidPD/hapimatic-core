@@ -2,7 +2,7 @@
 import type { CodexSessionConfig } from "../types";
 import type { EnhancedMode } from "../loop";
 import type { CodexCliOverrides } from "./codexCliOverrides";
-import { codexSystemPrompt } from "./systemPrompt";
+import { buildCodexSystemPrompt } from "./systemPrompt";
 
 function resolveApprovalPolicy(
   mode: EnhancedMode
@@ -47,6 +47,8 @@ export function buildCodexStartConfig(args: {
   mode: EnhancedMode;
   first: boolean;
   mcpServers: Record<string, { command: string; args: string[] }>;
+  /** Issue #6458 (A6): this session's Pins gate; required on every start path. */
+  pinsEnabled: boolean;
   cliOverrides?: CodexCliOverrides;
   developerInstructions?: string;
 }): CodexSessionConfig {
@@ -58,7 +60,9 @@ export function buildCodexStartConfig(args: {
   const resolvedSandbox = cliOverrides?.sandbox ?? sandbox;
 
   const prompt = args.message;
-  const baseInstructions = codexSystemPrompt;
+  const baseInstructions = buildCodexSystemPrompt({
+    pinsEnabled: args.pinsEnabled,
+  });
   const config: Record<string, unknown> = {
     mcp_servers: args.mcpServers,
     developer_instructions: args.developerInstructions

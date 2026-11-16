@@ -33,6 +33,13 @@ import { sdkStartPermissionMode } from "./spawnPermissionSeed";
 import type { ClaudePermissionMode } from "@hapi/protocol/modes";
 import type { EffortLevel } from "@hapi/protocol/effort";
 import type { McpServerUsage } from "@hapi/protocol";
+import { delay } from "@/utils/time";
+
+/**
+ * Issue #6627: how long the end of claudeRemote() waits for a resolved fetch's
+ * handling (a local image read) before it returns.
+ */
+const FETCH_HANDOFF_WAIT_MS = 5_000;
 
 /**
  * Issue #6166: read back the effort (and model) the Claude process applies, via
@@ -62,6 +69,8 @@ export async function claudeRemote(opts: {
   sessionId: string | null;
   path: string;
   mcpServers?: Record<string, any>;
+  /** Issue #6458: this session's Pins gate; `true` adds the Pins block. Required (A1). */
+  pinsEnabled: boolean;
   claudeEnvVars?: Record<string, string>;
   /** Issue #4568 (F1): the session bills an API key through its `apiKeyHelper`. */
   apiKeyHelperSession?: boolean;
@@ -78,6 +87,12 @@ export async function claudeRemote(opts: {
 
   // Dynamic parameters
   nextMessage: () => Promise<{ message: string; mode: EnhancedMode } | null>;
+  /**
+   * Issue #6627 (R3): hands back a message that a fetch took after this call
+   * began to end its claude child, so it reaches the next child, never the
+   * ended one. The launcher puts it back at the front of the session queue.
+   */
+  requeueMessage?: (message: string, mode: EnhancedMode) => void;
   onReady: () => void;
   isAborted: (toolCallId: string) => boolean;
 
@@ -115,6 +130,13 @@ export async function claudeRemote(opts: {
    * mcp-toggle RPC in issue #1077).
    */
   onQueryCreated?: (query: Query) => void;
+
+  /**
+   * Issue #6627: called once, just before the child is ended, so the caller
+   * stops handing this query to requests (one sent while the child is being
+   * ended fails as claude_exited). Must not throw.
+   */
+  onQueryEnding?: () => void;
 
   /**
    * Issue #1442: invoked with the list of attached-file paths present in the
@@ -185,10 +207,14 @@ export async function claudeRemote(opts: {
   // process.env, where every other wrapper child (a web-terminal shell, a hook)
   // would inherit it. An API-key session carries no key in claudeEnvVars at all:
   // Claude Code reads it from the settings-file `apiKeyHelper` (F1).
+  // Issue #6647 (R13): nor is `HAPI_SESSION_ID`, the session's own tag. One
+  // `hapi acp` process runs several sessions, each with its own tag, so a
+  // process-wide write would hand one session's tag to another. Both still
+  // reach the child through `bindingEnvVars` below.
   const claudeEnvVarsPrior = new Map<string, string | undefined>();
   if (opts.claudeEnvVars) {
     const mirrored = Object.entries(opts.claudeEnvVars).filter(
-      ([key]) => key !== "ANTHROPIC_API_KEY"
+      ([key]) => key !== "ANTHROPIC_API_KEY" && key !== "HAPI_SESSION_ID"
     );
     for (const [key] of mirrored) {
       claudeEnvVarsPrior.set(key, process.env[key]);
@@ -264,7 +290,7 @@ export async function claudeRemote(opts: {
     opts.claudeArgs?.includes("--fork-session") ?? false;
   const resolvedSystemPrompt = spawnTimeSafeMode
     ? undefined
-    : buildSystemPrompt(opts.path);
+    : buildSystemPrompt(opts.path, { pinsEnabled: opts.pinsEnabled });
   // R4b (#3748): resolve the custom/append pair so the base prompt (and its
   // Tier-0 block) is injected EXACTLY ONCE — previously folded into BOTH fields,
   // doubling it whenever a customSystemPrompt was set.
@@ -438,6 +464,32 @@ export async function claudeRemote(opts: {
   let appliedEffortRequested = false;
   let queryEnded = false;
 
+  // Issue #6627 (R3): a message that must not go to the child this call is
+  // ending goes back to the front of the session queue, for the next child.
+  type QueuedMessage = { message: string; mode: EnhancedMode };
+  const handBack = (next: QueuedMessage, why: string): void => {
+    try {
+      if (!opts.requeueMessage) {
+        throw new Error("no requeueMessage was supplied");
+      }
+      opts.requeueMessage(next.message, next.mode);
+      logger.debug(`${debugPrefix} message handed back (${why})`);
+    } catch (error) {
+      logger.warn(
+        `${debugPrefix} a message could not be handed back (${why})`,
+        error
+      );
+    }
+  };
+  // Issue #6627: the handling of a fetch that has resolved (its image read and
+  // its push or hand-back). The finally waits for it, so a message handed back
+  // late never lands behind one the next child has already taken.
+  let fetchedInFlight: Promise<void> | null = null;
+  // Issue #6627: messages pushed while results come back empty with no API
+  // time. If the bounce exit follows, none of them got an answer and no tool
+  // ran for them, so they are handed back to the fresh session.
+  let pushedDuringEmptyStreak: QueuedMessage[] = [];
+
   const scheduleNextMessage = () => {
     if (nextMessageFetchInFlight || inputEnded) {
       logger.debug(
@@ -462,17 +514,38 @@ export async function claudeRemote(opts: {
           );
           return;
         }
-        mode = next.mode;
-        // Hapimatic-specific: convert image attachments to base64 content blocks
-        const nextContent = await buildImageContent(
-          next.message,
-          opts.path,
-          opts.onMissingAttachments
-        );
-        messages.push({
-          type: "user",
-          message: { role: "user", content: nextContent },
+        let handled = (): void => {};
+        fetchedInFlight = new Promise<void>(resolve => {
+          handled = resolve;
         });
+        try {
+          // Issue #6627 (R3): a fetch that resolves after the finally began to
+          // end the child (inputEnded is set there first) hands its message
+          // back, never into the ended child.
+          if (inputEnded) {
+            handBack(next, `fetched after the query ended, fetchId=${fetchId}`);
+            return;
+          }
+          // Hapimatic-specific: convert image attachments to base64 content blocks
+          const nextContent = await buildImageContent(
+            next.message,
+            opts.path,
+            opts.onMissingAttachments
+          );
+          if (inputEnded) {
+            handBack(next, `fetched after the query ended, fetchId=${fetchId}`);
+            return;
+          }
+          mode = next.mode;
+          messages.push({
+            type: "user",
+            message: { role: "user", content: nextContent },
+          });
+          if (consecutiveEmptyResults > 0) pushedDuringEmptyStreak.push(next);
+        } finally {
+          fetchedInFlight = null;
+          handled();
+        }
         logger.debug(
           `${debugPrefix} nextMessage resolved fetchId=${fetchId} elapsedMs=${Date.now() - startedAt} ` +
             `messageLength=${next.message.length} permissionMode=${next.mode.permissionMode}`
@@ -494,6 +567,14 @@ export async function claudeRemote(opts: {
       }
     })();
   };
+
+  // Issue #6627: why the stream loop ended, for the child's end line.
+  let exitReason:
+    | "aborted-tool"
+    | "bounce-reset"
+    | "stream-error"
+    | "aborted"
+    | "stream-ended" = "stream-ended";
 
   updateThinking(true);
   try {
@@ -671,12 +752,15 @@ export async function claudeRemote(opts: {
               opts.onSessionReset();
             }
 
-            // Exit claudeRemote; the launcher's outer loop will restart with a fresh session
+            // Exit claudeRemote; the launcher's outer loop will restart with a
+            // fresh session. The finally ends this child first (#6627).
+            exitReason = "bounce-reset";
             return;
           }
         } else {
           // Successful result — reset bounce counter
           consecutiveEmptyResults = 0;
+          pushedDuringEmptyStreak = [];
         }
 
         // Fallback: Extract session ID from result message if not found from system.init
@@ -735,6 +819,7 @@ export async function claudeRemote(opts: {
               logger.debug(
                 `${debugPrefix} tool aborted via tool_result; exiting stream loop`
               );
+              exitReason = "aborted-tool";
               return;
             }
           }
@@ -742,11 +827,14 @@ export async function claudeRemote(opts: {
       }
     }
     logger.debug(`${debugPrefix} response stream exhausted`);
+    exitReason = "stream-ended";
   } catch (e) {
     if (e instanceof AbortError) {
+      exitReason = "aborted";
       logger.debug(`[claudeRemote] Aborted`);
       // Ignore
     } else {
+      exitReason = "stream-error";
       logger.debug(`${debugPrefix} response stream error`, e);
       throw e;
     }
@@ -755,6 +843,37 @@ export async function claudeRemote(opts: {
       `${debugPrefix} finally ` +
         `(streamMessages=${streamMessageSeq}, results=${resultSeq}, nextFetches=${nextMessageFetchSeq}, inputEnded=${inputEnded})`
     );
+    // Issue #6627 (R1): end this call's claude child, and confirm it gone,
+    // before anything reports the query as over, so the launcher never starts
+    // a second child beside it. Every exit comes here: the aborted tool result
+    // (each plan approval and denied card), the bounce reset (the exit seen on
+    // ms1), a throw from the loop body, an abort, a stream error, the stream's
+    // end. inputEnded is set first, so a fetch still in flight hands its
+    // message back. Never through opts.signal: the launcher reads an abort as a
+    // user stop. end() never throws; the catch only guards against a change.
+    inputEnded = true;
+    messages.end();
+    opts.onQueryEnding?.();
+    try {
+      await response.end(exitReason);
+    } catch (error) {
+      logger.warn(
+        `[claudeRemote] ending the claude child failed (reason=${exitReason})`,
+        error
+      );
+    }
+    // A fetch that resolved before the end began may still be reading images;
+    // its hand-back must land before the next child takes a message.
+    if (fetchedInFlight) {
+      await Promise.race([fetchedInFlight, delay(FETCH_HANDOFF_WAIT_MS)]);
+    }
+    // The bounce exit: messages pushed during the empty streak got no answer
+    // and ran no tool. Unshifted newest first, so they keep their order.
+    if (exitReason === "bounce-reset") {
+      for (const queued of [...pushedDuringEmptyStreak].reverse()) {
+        handBack(queued, "pushed during the empty results of a bounce");
+      }
+    }
     updateThinking(false);
     queryEnded = true;
     opts.onQueryEnd?.();

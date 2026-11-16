@@ -13,7 +13,15 @@
 
 import { randomUUID } from "node:crypto";
 import { logger } from "@/ui/logger";
-import type { CodexPermissionHandler } from "../utils/permissionHandler";
+import {
+  answerElicitation,
+  type ElicitationAskResult,
+  type ElicitationReply,
+} from "../elicitation";
+import type {
+  CodexPermissionHandler,
+  PermissionAnswerValidator,
+} from "../utils/permissionHandler";
 import type { AppServerRequestMethod } from "./appServerTypes";
 
 type PermissionDecision =
@@ -36,6 +44,8 @@ export interface AppServerPermissionAdapterOptions {
   getFileChanges: (itemId: string) => Record<string, unknown> | null;
   /** YOLO: approval policy `never` with `danger-full-access`. */
   isYolo: () => boolean;
+  /** Post a chat notice (the transport's `hapi_notice`), #6606. */
+  notice: (message: string) => void;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -82,36 +92,24 @@ function mapPermissionGrant(
   return { permissions: { network: null, fileSystem: null }, scope: "turn" };
 }
 
-/** Defaults for an elicitation schema's required properties (accept). */
-function defaultElicitationContent(
-  request: Record<string, unknown>
-): Record<string, unknown> {
-  const schema = asRecord(request.requestedSchema);
-  const properties = asRecord(schema.properties);
-  const required = Array.isArray(schema.required)
-    ? schema.required.filter((key): key is string => typeof key === "string")
-    : Object.keys(properties);
-  const content: Record<string, unknown> = {};
-  for (const key of required) {
-    const property = asRecord(properties[key]);
-    if ("default" in property) content[key] = property.default;
-    else if (property.type === "boolean") content[key] = true;
-    else if (property.type === "number" || property.type === "integer") {
-      content[key] = 0;
-    } else if (Array.isArray(property.enum) && property.enum.length > 0) {
-      content[key] = property.enum[0];
-    } else content[key] = "";
-  }
-  return content;
-}
-
 /** The reply each method gets for a finished or aborted turn. */
 export const STALE_TURN_REPLIES: Readonly<Record<string, unknown>> = {
   "item/commandExecution/requestApproval": { decision: "cancel" },
   "item/fileChange/requestApproval": { decision: "cancel" },
   "item/permissions/requestApproval": { permissions: {} },
   "item/tool/requestUserInput": { answers: {} },
-  "mcpServer/elicitation/request": { action: "cancel" },
+  // Every elicitation reply has the three members (#6606 R2).
+  "mcpServer/elicitation/request": {
+    action: "cancel",
+    content: null,
+    _meta: null,
+  },
+};
+
+const ELICITATION_FAILURE_DECLINE: Readonly<ElicitationReply> = {
+  action: "decline",
+  content: null,
+  _meta: null,
 };
 
 export class AppServerPermissionAdapter {
@@ -159,30 +157,45 @@ export class AppServerPermissionAdapter {
   }
 
   /**
-   * Ask the permission handler; a rejection (the launcher's reset() on abort,
-   * mode change and turn end rejects pending requests with "Session reset")
-   * becomes `abort`, so Codex is never left without a reply.
+   * Ask the permission handler and return its whole result (the decision,
+   * and for an elicitation the checked answers and who answered). A
+   * rejection (the launcher's reset() on abort, mode change and turn end
+   * rejects pending requests with "Session reset") becomes `abort`, so Codex
+   * is never left without a reply.
    */
   private async ask(
     toolCallId: string,
     toolName: string,
-    input: unknown
-  ): Promise<PermissionDecision> {
+    input: unknown,
+    validate?: PermissionAnswerValidator
+  ): Promise<ElicitationAskResult> {
     const handler = this.options.getPermissionHandler();
     if (!handler) {
       logger.debug("[CodexAppServer] No permission handler; declining");
-      return "denied";
+      return { decision: "denied" };
     }
     try {
-      const result = await handler.handleToolCall(toolCallId, toolName, input);
-      return result.decision;
+      return await handler.handleToolCall(
+        toolCallId,
+        toolName,
+        input,
+        validate
+      );
     } catch (error) {
       logger.debug(
         `[CodexAppServer] Permission request ${toolCallId} ended without a decision`,
         error
       );
-      return "abort";
+      return { decision: "abort" };
     }
+  }
+
+  private async decide(
+    toolCallId: string,
+    toolName: string,
+    input: unknown
+  ): Promise<PermissionDecision> {
+    return (await this.ask(toolCallId, toolName, input)).decision;
   }
 
   private async commandApproval(params: unknown): Promise<unknown> {
@@ -199,7 +212,9 @@ export class AppServerPermissionAdapter {
     };
     const reason = asString(record.reason);
     if (reason) input.reason = reason;
-    return mapApprovalDecision(await this.ask(toolCallId, "CodexBash", input));
+    return mapApprovalDecision(
+      await this.decide(toolCallId, "CodexBash", input)
+    );
   }
 
   private async fileChangeApproval(params: unknown): Promise<unknown> {
@@ -215,7 +230,9 @@ export class AppServerPermissionAdapter {
     if (reason) input.reason = reason;
     const grantRoot = asString(record.grantRoot);
     if (grantRoot) input.grant_root = grantRoot;
-    return mapApprovalDecision(await this.ask(toolCallId, "CodexPatch", input));
+    return mapApprovalDecision(
+      await this.decide(toolCallId, "CodexPatch", input)
+    );
   }
 
   private async permissionsApproval(params: unknown): Promise<unknown> {
@@ -223,7 +240,7 @@ export class AppServerPermissionAdapter {
     if (stale) return stale;
     const record = asRecord(params);
     const permissions = record.permissions ?? {};
-    const decision = await this.ask(
+    const decision = await this.decide(
       asString(record.itemId) ?? randomUUID(),
       "CodexPermission",
       {
@@ -246,45 +263,42 @@ export class AppServerPermissionAdapter {
   }
 
   /**
-   * Hapimatic attaches its own `hapi` MCP server to every Codex session; a
-   * stalled elicitation would stall `change_title` and the other `hapi`
-   * tools. YOLO accepts; otherwise the permission handler decides.
+   * An MCP server's request for input, which also carries Codex's own
+   * approval of an MCP tool call (a field-less form whose `_meta` names
+   * `mcp_tool_call`; the `hapi` server itself never elicits). A stalled reply
+   * would stall that tool call, so every path answers. The routing module
+   * (`../elicitation.ts`, #6606) decides: YOLO declines with a notice, a
+   * field-less request keeps today's `mcp__<server>` card, a form or a link
+   * gets its own card and is answered only from an answer set the handler
+   * checked, and anything else is declined with a notice. Each request is
+   * registered under a fresh UUID, never the server's `elicitationId`, so a
+   * server cannot choose the key or make two requests share one (R11). A
+   * throw anywhere becomes a decline with a notice, never a JSON-RPC error.
    */
-  private async elicitation(params: unknown): Promise<unknown> {
-    const stale = this.staleReply("mcpServer/elicitation/request", params);
-    if (stale) return stale;
-    const record = asRecord(params);
-    const request = Object.keys(asRecord(record.request)).length
-      ? asRecord(record.request)
-      : record;
-    if (this.options.isYolo()) {
-      return {
-        action: "accept",
-        content: defaultElicitationContent(request),
-        _meta: null,
-      };
-    }
-    const serverName = asString(record.serverName);
-    const decision = await this.ask(
-      asString(request.elicitationId) ?? randomUUID(),
-      serverName ? `mcp__${serverName}` : "CodexElicitation",
-      {
-        message: asString(request.message),
-        server: serverName,
-        requestedSchema: request.requestedSchema,
+  private async elicitation(params: unknown): Promise<ElicitationReply> {
+    try {
+      const stale = this.staleReply("mcpServer/elicitation/request", params);
+      if (stale) return { ...(stale as ElicitationReply) };
+      return await answerElicitation({
+        params,
+        yolo: this.options.isYolo(),
+        ask: (toolName, input, validate) =>
+          this.ask(randomUUID(), toolName, input, validate),
+        notice: message => this.options.notice(message),
+      });
+    } catch (error) {
+      logger.debug(
+        "[CodexAppServer] mcpServer/elicitation/request could not be read; declining",
+        error
+      );
+      try {
+        this.options.notice(
+          "MCP server (unnamed) asked for input and Hapimatic could not process it. Declined."
+        );
+      } catch {
+        // The reply stands without the notice.
       }
-    );
-    if (decision === "approved" || decision === "approved_for_session") {
-      return {
-        action: "accept",
-        content: defaultElicitationContent(request),
-        _meta: null,
-      };
+      return { ...ELICITATION_FAILURE_DECLINE };
     }
-    return {
-      action: decision === "denied" ? "decline" : "cancel",
-      content: null,
-      _meta: null,
-    };
   }
 }

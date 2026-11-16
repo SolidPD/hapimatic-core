@@ -122,7 +122,19 @@ function extractCwd(params: Record<string, unknown>): string | null {
   return typeof cwd === "string" && cwd.length > 0 ? cwd : null;
 }
 
-function buildElicitationResult(
+/** Why a form with none of the known decision keys is declined (#6606). */
+export const UNKNOWN_ELICITATION_FORM_REASON =
+  "Hapimatic answers only a form whose fields it knows, so this one was declined.";
+
+/**
+ * The reply to Codex's approval elicitation on the MCP transport. An approval
+ * of a schema with properties fills the known keys the schema has
+ * (`decision`, `approved`, `allow`, and `reason` when a reason is given);
+ * when none of them is filled the request is declined (#6606, board-26 PM
+ * ruling P1-a): writing the decision into the first property would invent a
+ * value for a third-party form.
+ */
+export function buildElicitationResult(
   decision: "approved" | "approved_for_session" | "denied" | "abort",
   requestedSchema: ElicitRequestedSchema | null,
   reason?: string
@@ -171,10 +183,11 @@ function buildElicitationResult(
     }
 
     if (Object.keys(content).length === 0) {
-      const [fallbackKey] = Object.keys(properties);
-      if (fallbackKey) {
-        content[fallbackKey] = decision;
-      }
+      return {
+        action: "decline",
+        decision: "denied",
+        reason: UNKNOWN_ELICITATION_FORM_REASON,
+      };
     }
   } else {
     content.decision = decision;

@@ -39,6 +39,12 @@ interface LoopOptions {
   startedBy?: "daemon" | "terminal";
   onModeChange: (mode: "local" | "remote") => void;
   mcpServers: Record<string, any>;
+  /**
+   * Issue #6458: this session's Pins gate, from its own probe
+   * (`startHappyServer().pinsEnabled`). Required so a dropped hop fails
+   * typecheck; every launcher renders the Pins block from it.
+   */
+  pinsEnabled: boolean;
   session: ApiSessionClient;
   api: ApiClient;
   claudeEnvVars?: Record<string, string>;
@@ -75,6 +81,7 @@ export async function loop(opts: LoopOptions) {
     claudeArgs: opts.claudeArgs,
     claudeTrailingArgs: opts.claudeTrailingArgs,
     mcpServers: opts.mcpServers,
+    pinsEnabled: opts.pinsEnabled,
     logPath: logPath,
     messageQueue: opts.messageQueue,
     allowedTools: opts.allowedTools,

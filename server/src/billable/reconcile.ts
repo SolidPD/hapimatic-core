@@ -1,8 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Database } from "bun:sqlite";
 import type { ErrorLogger } from "../logging/errorLogger";
+import { CARRIED_FORWARD_ID_RULE } from "../store/billable/startup";
 import { newUuidV7 } from "../store/turns/ids";
 import type { IntervalWriteCounters } from "./intervalWriteService";
+import {
+  type BalanceFigures,
+  compareBalance,
+  compareLostWrites,
+  countRunsOf6670InWindow,
+  isRunOf6670,
+  type LostWritesTotals,
+} from "./reconcileStoredFigures";
+
+export { isRunOf6670 } from "./reconcileStoredFigures";
 
 /**
  * The billable-time daily check (issue #6586, R10, R18, R19).
@@ -19,34 +30,65 @@ import type { IntervalWriteCounters } from "./intervalWriteService";
  * row neither the tracker nor a queued write owns), `shadow` (`shadow`: the old
  * clock against the tracker's measurements, stretch by stretch), `silence` (`on`
  * and `shadow`, ruling D2-A: an interval of 30 minutes or more holding more than
- * 30 minutes without a message, flagged for a person, never shortened).
+ * 30 minutes without a message, flagged for a person, never shortened), `writes`
+ * (`on` and `shadow`: a write queue more than 60 s behind, and interval writes
+ * set aside or left queued at a graceful stop since the last check, from totals
+ * stored in `billable_lost_writes`, so a loss is listed even when the process
+ * that made it stopped before its next check; totals it cannot read are listed as
+ * `lost_writes_unreadable`, and a run that lists it is not clean), `balance` (`on`
+ * and `shadow`: the count and the sum of the balance rows, which can only grow,
+ * against the last check's).
  *
- * Switching a node from `shadow` to `on` has THREE conditions:
+ * Switching a node from `shadow` to `on` has FOUR conditions:
  * 1. Ruling D1-A / F1-a — the daily-check criterion `evaluateBillableFlip` tests:
  *    the latest run is in `shadow` and less than 25 hours old; every run of the
  *    last 7 days is in `shadow` with no `unexplained` and no `orphan_open` row;
  *    and those runs compared at least one stretch.
- * 2. Ruling TP-1 (Matt Starfield, 2026-11-12) — the process-identity issue #6647
- *    has landed, because until the hub can tell which process sent a heartbeat or
- *    a state write, a second live process on a session can make the waiting rule
- *    bill a wait.
+ * 2. Ruling TP-1 (Matt Starfield, 2026-11-12), as rulings COND-1 and COND-WIDE
+ *    (2026-11-13) word it: three parts, all for that node. The process-identity
+ *    issue #6647 has landed (both of its pull requests merged); the node runs
+ *    `HAPI_RUNNER_IDENTITY=enforce`; and its `GET /cli/runner-identity` route,
+ *    read at least two minutes after a server start, lists no unidentified live
+ *    runner node-wide (`nodeWide.unidentifiedLive` is 0). Until then a second
+ *    live process on a session can make the waiting rule bill a wait.
  * 3. The ruling on review finding F3 (2026-11-12) — the `carried_forward` id rule
- *    has landed: a `carried_forward` row made again after a restore of the same
- *    database gets the same `id` as the first one, as the `opening_balance` row
- *    does from this build on (store/billable/startup.ts). Until then such a row
- *    reaches a puller under a new random id and its amount is counted twice.
- *    Only a boot in `on` writes `carried_forward` rows.
- * `evaluateBillableFlip` reads `billable_reconcile` only and cannot test
- * conditions 2 and 3, so its `met` speaks for condition 1 alone.
+ *    (#6651) is in the release the node runs, and the latest daily check came
+ *    from that release: a `carried_forward` row made again after a restore of the
+ *    same database, when it follows the same balance row, gets the same `id` as
+ *    the first one, as the `opening_balance` row does (store/billable/startup.ts).
+ *    A build without the rule gives such a row a new random id, and a peer then
+ *    counts its amount twice. Only a boot in `on` writes `carried_forward` rows.
+ * 4. Ruling M9 (the Business Admin Project Manager, 2026-11-13) — issue #6670,
+ *    the daily check's open items, runs on the node: a stretch that ends on a wait
+ *    or a rollover is compared at its 24-hour mark; an interval write set aside
+ *    after three attempts, or left queued at a graceful stop, is listed in both
+ *    modes even after the process that lost it has stopped; and a balance row that
+ *    disappears is listed. A run row written by a build with #6670 holds the write
+ *    service's boot id (`writeService.bootId`) and the stored lost-write totals
+ *    (`lostWrites`). `evaluateBillableFlip` asks for seven such runs in its 7-day
+ *    window (the Project Manager's working ruling X5-2).
+ * `evaluateBillableFlip` reads `billable_reconcile` only. It tests condition 1,
+ * and conditions 3 and 4 through the latest run row; it cannot test condition 2,
+ * so its `met` speaks for conditions 1, 3 and 4.
  * The switch is a setting change plus a restart, and when to make it is the
  * operator's decision; nothing here switches a node.
  */
 
 export const FLIP_WINDOW_MS = 604_800_000;
 export const FLIP_MIN_STRETCHES = 1;
+/**
+ * The daily checks of the 7-day window that must be written by a build with
+ * #6670 (working ruling X5-2). At 0, `evaluateBillableFlip` only prints the
+ * count (X5-1); the reason never fires.
+ */
+export const FLIP_MIN_RUNS_OF_6670 = 7;
 
 const PERIOD_MARGIN_MS = 60_000;
 const LATEST_RUN_MAX_AGE_MS = 25 * 60 * 60 * 1000;
+/**
+ * 90 days in milliseconds (90 × 86,400,000). Each daily run deletes stretch rows
+ * and check detail rows older than this; run rows and interval rows are kept.
+ */
 const RETENTION_MS = 7_776_000_000;
 const SILENCE_MS = 1_800_000;
 const RESIDUAL_TOLERANCE_MS = 1_000;
@@ -67,6 +109,11 @@ const EXPLAINED_GROUP_CAUSES = [
   "session_deleted",
 ];
 const RUNNING_GROUP_CAUSES = ["waiting_on_person", "rollover"];
+/**
+ * A group whose latest row ended on a wait or a rollover is compared once, when
+ * it is this old (24 h): before it, the stretch can still be running (#6670).
+ */
+const RUNNING_GROUP_AGE_MS = 86_400_000;
 
 /**
  * Closed interval groups recorded in `shadow` with no old-clock row and no open
@@ -75,7 +122,7 @@ const RUNNING_GROUP_CAUSES = ["waiting_on_person", "rollover"];
  */
 const NO_LEGACY_GROUPS_SQL =
   "SELECT t.hapi_session_id, t.namespace, t.stretch_started_at_ms, t.launcher_kind, " +
-  "SUM(t.duration_ms) AS intervals_ms, MAX(t.ended_at_ms) AS last_end " +
+  "SUM(t.duration_ms) AS intervals_ms, MAX(t.ended_at_ms) AS last_end, MAX(t.change_seq) AS last_seq " +
   "FROM thinking_intervals t WHERE t.recorded_mode = 'shadow' AND t.ended_at_ms IS NOT NULL " +
   `AND t.end_cause NOT IN (${BALANCE_IN}) ` +
   "AND NOT EXISTS (SELECT 1 FROM billable_shadow_stretches b WHERE " +
@@ -90,7 +137,9 @@ export type ReconcileSection =
   | "memory"
   | "orphan_open"
   | "shadow"
-  | "silence";
+  | "silence"
+  | "writes"
+  | "balance";
 
 export type ReconcileDetailKind =
   | "timer"
@@ -112,6 +161,8 @@ export interface ReconcileLive {
   }>;
   counters(): IntervalWriteCounters;
   liveAttachCount(): number;
+  /** The old clock's running stretch start (the cached `thinkingStartedAt`), or null (#6670 R5). */
+  oldClockStretchStartMs(sessionId: string): number | null;
 }
 
 export interface ReconcileDetail {
@@ -141,6 +192,30 @@ export interface ReconcileRunDetail {
     clamped: number;
   };
   writeService: IntervalWriteCounters | null;
+  /**
+   * The lost-write totals stored in `billable_lost_writes` when this run read
+   * them (#6670); null when the `writes` section did not run or the read failed.
+   */
+  lostWrites: LostWritesTotals | null;
+  /** The balance rows' counts and sums (#6670 X6); null when `balance` did not run. */
+  balanceRows: BalanceFigures | null;
+  /**
+   * The `carried_forward` id rule of the build that wrote this run (#6651,
+   * condition 3): `evaluateBillableFlip` reads it from the latest run row.
+   */
+  carriedForwardIdRule: string;
+  /**
+   * Groups that ended on a wait or a rollover, compared at their 24-hour mark
+   * (#6670); five zeros and "none" when the `shadow` section did not run.
+   */
+  runningGroupsAtLimit: {
+    explainedRestart: number;
+    explainedDeleted: number;
+    unexplained: number;
+    stillRunning: number;
+    unverified: number;
+    evidence: "change_seq" | "clock" | "none";
+  };
   periodFromMs: number;
   periodToMs: number;
   intervalSeqFrom: number;
@@ -150,12 +225,40 @@ export interface ReconcileRunDetail {
 export interface ReconcileResult {
   run: ReconcileRunDetail;
   details: ReconcileDetail[];
+  /**
+   * Without the running server: wait-ended groups whose 24-hour mark only an
+   * older build's run passed (#6670 R21), neither explained nor listed. Always
+   * empty with `live`, and never stored.
+   */
+  unverifiedGroups: UnverifiedGroup[];
+}
+
+export interface UnverifiedGroup {
+  namespace: string;
+  hapiSessionId: string;
+  stretchStartedAtMs: number;
+  intervalsMs: number;
+  lastEndMs: number;
+  lastEndCause: string;
+}
+
+/** A row of {@link NO_LEGACY_GROUPS_SQL}. */
+interface GroupRow {
+  hapi_session_id: string;
+  namespace: string;
+  stretch_started_at_ms: number;
+  launcher_kind: string;
+  intervals_ms: number;
+  last_end: number;
+  last_seq: number | null;
 }
 
 interface PreviousRun {
   periodToMs: number;
   intervalSeqThrough: number;
   setAsideCount: number | null;
+  /** The write service's boot id in the latest run row (#6670); null before it. */
+  bootId: string | null;
 }
 
 function emptyCounts(): Record<ReconcileDetailKind, number> {
@@ -175,9 +278,13 @@ function readPreviousRun(db: Database): PreviousRun {
       "SELECT detail_json FROM billable_reconcile WHERE row_type = 'run' ORDER BY run_at_ms DESC LIMIT 1"
     )
     .get() as { detail_json: string | null } | null;
-  if (!row?.detail_json) {
-    return { periodToMs: 0, intervalSeqThrough: 0, setAsideCount: null };
-  }
+  const none: PreviousRun = {
+    periodToMs: 0,
+    intervalSeqThrough: 0,
+    setAsideCount: null,
+    bootId: null,
+  };
+  if (!row?.detail_json) return none;
   try {
     const d = JSON.parse(row.detail_json) as Partial<ReconcileRunDetail>;
     return {
@@ -188,9 +295,13 @@ function readPreviousRun(db: Database): PreviousRun {
         typeof d.writeService?.setAsideCount === "number"
           ? d.writeService.setAsideCount
           : null,
+      bootId:
+        typeof d.writeService?.bootId === "string"
+          ? d.writeService.bootId
+          : null,
     };
   } catch {
-    return { periodToMs: 0, intervalSeqThrough: 0, setAsideCount: null };
+    return none;
   }
 }
 
@@ -236,9 +347,10 @@ const yieldToEventLoop = (): Promise<void> =>
  * Read and return what a run would write, without writing. With `sinceMs`, both
  * period cursors are replaced: stretch rows recorded after it and closed rows
  * ended after it are examined, whatever earlier runs compared; a group with no
- * old-clock row is reported only when it ended inside the retention. Everything that
- * reads `live` runs before the first `await`, so live and stored values come from
- * one synchronous slice.
+ * old-clock row is reported only when it ended inside the retention; and a group
+ * whose latest row ended on a wait or a rollover is read from 24 h before
+ * `sinceMs`, at its 24-hour mark. Everything that reads `live` runs before the
+ * first `await`, so live and stored values come from one synchronous slice.
  */
 export async function computeBillableReconcile(input: {
   db: Database;
@@ -272,6 +384,19 @@ export async function computeBillableReconcile(input: {
   // interval rows are kept.
   const groupsFrom =
     since === undefined ? stretchFrom : Math.max(since, nowMs - RETENTION_MS);
+  const lastCause = db.prepare(
+    "SELECT end_cause FROM thinking_intervals WHERE hapi_session_id = ? AND stretch_started_at_ms = ? " +
+      `AND ended_at_ms IS NOT NULL AND end_cause NOT IN (${BALANCE_IN}) ` +
+      "ORDER BY ended_at_ms DESC, started_at_ms DESC LIMIT 1"
+  );
+  const causeOf = (sid: string, key: number): string =>
+    (lastCause.get(sid, key) as { end_cause: string } | null)?.end_cause ?? "";
+  // A group that ends on a wait or a rollover is compared at its 24-hour mark:
+  // read the window of ends one day behind the period (#6670 R1).
+  const agedFrom =
+    since === undefined
+      ? prev.periodToMs - RUNNING_GROUP_AGE_MS
+      : Math.max(since - RUNNING_GROUP_AGE_MS, nowMs - RETENTION_MS);
 
   // A group the comparison skips for a queued op of its session must fall in the
   // next run's window, because the queued op can be another stretch's and nothing
@@ -290,6 +415,28 @@ export async function computeBillableReconcile(input: {
       const held = Math.max(g.last_end - 1, prev.periodToMs);
       if (held < periodToMs) periodToMs = held;
     }
+  }
+
+  // The groups at their 24-hour mark, read once (M10). A running-cause group
+  // whose session has a queued write at its mark holds the period below the
+  // mark, never below the previous run's (R7).
+  let agedRows: GroupRow[] = [];
+  let agedTo = agedFrom;
+  if (sections.has("shadow")) {
+    agedRows = db
+      .prepare(NO_LEGACY_GROUPS_SQL)
+      .all(agedFrom, periodToMs - RUNNING_GROUP_AGE_MS) as GroupRow[];
+    for (const g of agedRows) {
+      if (!live?.hasQueuedOp(g.hapi_session_id)) continue;
+      const cause = causeOf(g.hapi_session_id, g.stretch_started_at_ms);
+      if (!RUNNING_GROUP_CAUSES.includes(cause)) continue;
+      const held = Math.max(
+        g.last_end + RUNNING_GROUP_AGE_MS - 1,
+        prev.periodToMs
+      );
+      if (held < periodToMs) periodToMs = held;
+    }
+    agedTo = Math.max(agedFrom, periodToMs - RUNNING_GROUP_AGE_MS);
   }
 
   // Closed rows "since the last run": by change_seq (assigned when a close is
@@ -401,6 +548,15 @@ export async function computeBillableReconcile(input: {
 
   // ── shadow (shadow) ──
   let stretchesCompared = 0;
+  const runningGroupsAtLimit: ReconcileRunDetail["runningGroupsAtLimit"] = {
+    explainedRestart: 0,
+    explainedDeleted: 0,
+    unexplained: 0,
+    stillRunning: 0,
+    unverified: 0,
+    evidence: "none",
+  };
+  const unverifiedGroups: UnverifiedGroup[] = [];
   let stallTrims = 0;
   let waitUnchecked = 0;
   if (sections.has("shadow")) {
@@ -505,31 +661,14 @@ export async function computeBillableReconcile(input: {
       }
     }
 
-    // Interval groups recorded in `shadow` with no old-clock row.
-    const groups = db
-      .prepare(NO_LEGACY_GROUPS_SQL)
-      .all(groupsFrom, periodToMs) as Array<{
-      hapi_session_id: string;
-      namespace: string;
-      stretch_started_at_ms: number;
-      launcher_kind: string;
-      intervals_ms: number;
-      last_end: number;
-    }>;
-    const lastCause = db.prepare(
-      "SELECT end_cause FROM thinking_intervals WHERE hapi_session_id = ? AND stretch_started_at_ms = ? " +
-        `AND ended_at_ms IS NOT NULL AND end_cause NOT IN (${BALANCE_IN}) ` +
-        "ORDER BY ended_at_ms DESC, started_at_ms DESC LIMIT 1"
-    );
-    for (const g of groups) {
-      if (live?.hasQueuedOp(g.hapi_session_id)) continue;
-      const cause =
-        (
-          lastCause.get(g.hapi_session_id, g.stretch_started_at_ms) as {
-            end_cause: string;
-          } | null
-        )?.end_cause ?? "";
-      if (RUNNING_GROUP_CAUSES.includes(cause)) continue;
+    // Interval groups recorded in `shadow` with no old-clock row: each one
+    // counted is compared against nothing, so its whole sum is the difference.
+    const compareGroup = (
+      g: GroupRow,
+      cause: string,
+      explained: boolean,
+      ageLimitMs?: number
+    ): void => {
       stretchesCompared++;
       const acc = sum(g.hapi_session_id, g.namespace);
       const diffMs = -g.intervals_ms;
@@ -537,9 +676,9 @@ export async function computeBillableReconcile(input: {
       acc.diffMs += diffMs;
       acc.stretches++;
       if (diffMs !== 0) acc.anyDiff = true;
-      if (EXPLAINED_GROUP_CAUSES.includes(cause)) {
+      if (explained) {
         acc.restartMs += g.intervals_ms;
-        continue;
+        return;
       }
       acc.residualMs += diffMs;
       details.push({
@@ -563,8 +702,121 @@ export async function computeBillableReconcile(input: {
           legacyEndedAtMs: null,
           site: null,
           lastEndCause: cause,
+          ...(ageLimitMs !== undefined ? { ageLimitMs } : {}),
         },
       });
+    };
+    const groups = db
+      .prepare(NO_LEGACY_GROUPS_SQL)
+      .all(groupsFrom, periodToMs) as GroupRow[];
+    for (const g of groups) {
+      if (live?.hasQueuedOp(g.hapi_session_id)) continue;
+      const cause = causeOf(g.hapi_session_id, g.stretch_started_at_ms);
+      if (RUNNING_GROUP_CAUSES.includes(cause)) continue;
+      compareGroup(g, cause, EXPLAINED_GROUP_CAUSES.includes(cause));
+    }
+
+    // Groups that ended on a wait or a rollover, at their 24-hour mark (R1-R8).
+    // The restart evidence (X1) is the interval change counter read at boot: with
+    // the running server, this process's reading; without it, per group, the
+    // reading of the first stored run whose period reached the group's mark,
+    // never one reading for all groups (F-1). `json_valid` keeps a malformed run
+    // row from throwing in `json_extract`.
+    const at = runningGroupsAtLimit;
+    let bootSeq: number | null = null;
+    let bootMs: number | null = null;
+    if (live) {
+      const c = live.counters();
+      bootSeq = typeof c.bootChangeSeq === "number" ? c.bootChangeSeq : null;
+      bootMs = typeof c.bootStartedAtMs === "number" ? c.bootStartedAtMs : null;
+    } else {
+      try {
+        const r = db
+          .prepare(
+            "SELECT MAX(json_extract(detail_json, '$.writeService.bootChangeSeq')) AS s, " +
+              "MAX(json_extract(detail_json, '$.writeService.bootStartedAtMs')) AS b " +
+              "FROM billable_reconcile WHERE row_type = 'run' AND json_valid(detail_json)"
+          )
+          .get() as { s: unknown; b: unknown } | null;
+        bootSeq = typeof r?.s === "number" ? r.s : null;
+        bootMs = typeof r?.b === "number" ? r.b : null;
+      } catch {
+        bootSeq = null;
+        bootMs = null;
+      }
+    }
+    at.evidence =
+      bootSeq !== null ? "change_seq" : bootMs !== null ? "clock" : "none";
+    const markRun = db.prepare(
+      "SELECT detail_json FROM billable_reconcile WHERE row_type = 'run' AND json_valid(detail_json) " +
+        "AND json_extract(detail_json, '$.periodToMs') >= ? " +
+        "ORDER BY json_extract(detail_json, '$.periodToMs'), run_at_ms LIMIT 1"
+    );
+    const sessionRow = db.prepare("SELECT 1 AS one FROM sessions WHERE id = ?");
+    for (const g of agedRows) {
+      if (g.last_end > agedTo) continue;
+      const sid = g.hapi_session_id;
+      if (live?.hasQueuedOp(sid)) continue; // held (R7)
+      const cause = causeOf(sid, g.stretch_started_at_ms);
+      if (!RUNNING_GROUP_CAUSES.includes(cause)) continue;
+      if (
+        live &&
+        live.oldClockStretchStartMs(sid) === g.stretch_started_at_ms
+      ) {
+        at.stillRunning++; // R5
+        continue;
+      }
+      let seq = bootSeq;
+      let ms = bootMs;
+      let noEvidence = false;
+      if (!live) {
+        const mark = markRun.get(g.last_end + RUNNING_GROUP_AGE_MS) as {
+          detail_json: string;
+        } | null;
+        if (mark) {
+          const ws = parseJson(mark.detail_json)?.writeService as {
+            bootChangeSeq?: unknown;
+            bootStartedAtMs?: unknown;
+          } | null;
+          seq = typeof ws?.bootChangeSeq === "number" ? ws.bootChangeSeq : null;
+          ms =
+            typeof ws?.bootStartedAtMs === "number" ? ws.bootStartedAtMs : null;
+          noEvidence = seq === null && ms === null; // an older build's run
+        }
+      }
+      const closedByEarlierProcess =
+        seq !== null && g.last_seq !== null
+          ? g.last_seq <= seq
+          : ms !== null
+            ? g.last_end < ms
+            : false;
+      if (cause === "rollover") {
+        // X2: only a lost reopen leaves a rollover-ended group with no open row.
+        at.unexplained++;
+        compareGroup(g, cause, false, RUNNING_GROUP_AGE_MS);
+      } else if (closedByEarlierProcess) {
+        at.explainedRestart++;
+        compareGroup(g, cause, true);
+      } else if (noEvidence) {
+        // R21: before the session-row test, which without the server reads the
+        // row as it is now, not at the group's mark. Neither explained nor
+        // listed, and not a compared stretch.
+        at.unverified++;
+        unverifiedGroups.push({
+          namespace: g.namespace,
+          hapiSessionId: sid,
+          stretchStartedAtMs: g.stretch_started_at_ms,
+          intervalsMs: g.intervals_ms,
+          lastEndMs: g.last_end,
+          lastEndCause: cause,
+        });
+      } else if (sessionRow.get(sid) == null) {
+        at.explainedDeleted++;
+        compareGroup(g, cause, true);
+      } else {
+        at.unexplained++;
+        compareGroup(g, cause, false, RUNNING_GROUP_AGE_MS);
+      }
     }
 
     for (const [sid, s] of perSession) {
@@ -587,36 +839,49 @@ export async function computeBillableReconcile(input: {
         },
       });
     }
+  }
 
+  // A row for the whole node: no session, no namespace, no per-session value,
+  // because the route returns a run's run-level rows to no caller and its run
+  // row to every namespace of the node.
+  const runLevel = (reason: string, extra: Record<string, unknown>): void => {
+    details.push({
+      kind: "unexplained",
+      namespace: null,
+      hapiSessionId: null,
+      intervalId: null,
+      stretchStartedAtMs: null,
+      aMs: null,
+      bMs: null,
+      diffMs: null,
+      detail: { reason, ...extra },
+    });
+  };
+
+  // ── writes (on and shadow) ──
+  // In both modes (#6670 item 4): the totals are stored, so a write lost by a
+  // process that stopped before its next check is listed; a lower total means
+  // the table was edited or re-created. Writes lost between a backup and its
+  // restore are not listed. Nothing here writes a timer or an interval.
+  let lostWrites: LostWritesTotals | null = null;
+  if (sections.has("writes")) {
+    lostWrites = compareLostWrites({
+      db,
+      counters: live ? live.counters() : null,
+      prev,
+      runLevel,
+    });
     if (live) {
-      const runLevel = (
-        reason: string,
-        extra: Record<string, unknown>
-      ): void => {
-        details.push({
-          kind: "unexplained",
-          namespace: null,
-          hapiSessionId: null,
-          intervalId: null,
-          stretchStartedAtMs: null,
-          aMs: null,
-          bMs: null,
-          diffMs: null,
-          detail: { reason, ...extra },
-        });
-      };
       const oldest = live.oldestQueuedOpAgeMs();
       if (oldest > WRITE_LAG_MS)
         runLevel("write_lag", { oldestQueuedOpAgeMs: oldest });
-      const setAside = live.counters().setAsideCount;
-      if (setAside > 0 && setAside !== prev.setAsideCount) {
-        runLevel("set_aside", {
-          setAsideCount: setAside,
-          previous: prev.setAsideCount,
-        });
-      }
     }
   }
+
+  // ── balance (on and shadow; #6670 X6) ──
+  const balanceRows = sections.has("balance")
+    ? compareBalance({ db, runLevel })
+    : null;
 
   // Values read from `live` before the first await.
   const liveAttaches = live ? live.liveAttachCount() : null;
@@ -738,12 +1003,17 @@ export async function computeBillableReconcile(input: {
       liveAttaches,
       closedSinceLastRun,
       writeService,
-      periodFromMs: prev.periodToMs,
+      lostWrites,
+      balanceRows,
+      carriedForwardIdRule: CARRIED_FORWARD_ID_RULE,
+      runningGroupsAtLimit,
+      periodFromMs: since ?? prev.periodToMs,
       periodToMs,
       intervalSeqFrom: prev.intervalSeqThrough,
       intervalSeqThrough,
     },
     details,
+    unverifiedGroups,
   };
 }
 
@@ -771,8 +1041,8 @@ export async function runBillableReconcile(input: {
   try {
     const sections: ReconcileSection[] =
       mode === "on"
-        ? ["timer", "memory", "orphan_open", "silence"]
-        : ["shadow", "orphan_open", "silence"];
+        ? ["timer", "memory", "orphan_open", "silence", "writes", "balance"]
+        : ["shadow", "orphan_open", "silence", "writes", "balance"];
     const { run, details } = await computeBillableReconcile({
       db,
       nowMs,
@@ -949,11 +1219,27 @@ export function readLatestReconcile(
   };
 }
 
+/** The run rows of the last 7 days written by a build with #6670 (X5). */
+export function countRunsOf6670(
+  db: Database,
+  nowMs: number
+): { inWindow: number; runsInWindow: number; firstAtMs: number | null } {
+  return countRunsOf6670InWindow(db, nowMs, FLIP_WINDOW_MS);
+}
+
 /**
- * The daily-check part of the flip criterion (ruling D1-A / F1-a). It reads
- * `billable_reconcile` only. Two more conditions apply that this function cannot
- * test: the process-identity issue #6647 has landed (ruling TP-1), and the
- * `carried_forward` id rule has landed (the ruling on review finding F3).
+ * The daily-check part of the flip criterion (ruling D1-A / F1-a). It also tests
+ * condition 4 (ruling M9): the latest run was written by a build with #6670,
+ * which stores the write service's boot id and the lost-write totals, and seven
+ * runs of the 7-day window were (working ruling X5-2). It reads
+ * `billable_reconcile` only. It also tests condition 3: the latest run row states
+ * the `carried_forward` id rule of #6651 (`carriedForwardIdRule`). One more
+ * condition applies that this function cannot test: condition 2 (ruling TP-1 as
+ * COND-1 and COND-WIDE word it), whose three parts are that #6647 has landed
+ * (both of its pull requests merged), that the node runs
+ * `HAPI_RUNNER_IDENTITY=enforce`, and that its `GET /cli/runner-identity`
+ * route, read at least two minutes after a server start, lists no unidentified
+ * live runner node-wide.
  */
 export function evaluateBillableFlip(
   db: Database,
@@ -962,16 +1248,37 @@ export function evaluateBillableFlip(
   const reasons: string[] = [];
   const latest = db
     .prepare(
-      "SELECT run_at_ms, mode FROM billable_reconcile WHERE row_type = 'run' ORDER BY run_at_ms DESC LIMIT 1"
+      "SELECT run_at_ms, mode, detail_json FROM billable_reconcile WHERE row_type = 'run' ORDER BY run_at_ms DESC, rowid DESC LIMIT 1"
     )
-    .get() as { run_at_ms: number; mode: string } | null;
+    .get() as {
+    run_at_ms: number;
+    mode: string;
+    detail_json: string | null;
+  } | null;
   if (!latest) {
     return { met: false, reasons: ["no daily check has run"] };
+  }
+  // Condition 3 (#6651): the latest daily check was written by a build with
+  // the carried_forward id rule. It says nothing of the build that runs at the
+  // switch; the switch procedure reads the boot line for that.
+  if (
+    parseJson(latest.detail_json)?.carriedForwardIdRule !==
+    CARRIED_FORWARD_ID_RULE
+  ) {
+    reasons.push(
+      "the latest daily check ran on a build without the carried_forward id rule (#6651)"
+    );
   }
   if (latest.mode !== "shadow")
     reasons.push(`the latest daily check ran in ${latest.mode}, not shadow`);
   if (nowMs - latest.run_at_ms >= LATEST_RUN_MAX_AGE_MS) {
     reasons.push("the latest daily check is 25 hours old or older");
+  }
+  // Condition 4 (ruling M9): issue #6670 runs on the node.
+  if (!isRunOf6670(parseJson(latest.detail_json))) {
+    reasons.push(
+      "the latest daily check was not written by a build with #6670 (no write-service boot id or no stored lost-write totals)"
+    );
   }
   const windowStart = nowMs - FLIP_WINDOW_MS;
   const runs = db
@@ -1004,6 +1311,12 @@ export function evaluateBillableFlip(
   if (compared < FLIP_MIN_STRETCHES) {
     reasons.push(
       `the last 7 days compared ${compared} stretch(es), fewer than ${FLIP_MIN_STRETCHES}`
+    );
+  }
+  const { inWindow } = countRunsOf6670(db, nowMs);
+  if (inWindow < FLIP_MIN_RUNS_OF_6670) {
+    reasons.push(
+      `the last 7 days hold ${inWindow} daily check(s) written by a build with #6670, fewer than ${FLIP_MIN_RUNS_OF_6670}`
     );
   }
   return { met: reasons.length === 0, reasons };

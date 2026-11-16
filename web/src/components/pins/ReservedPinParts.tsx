@@ -9,6 +9,7 @@ import {
 } from "@/components/pins/PinAnswerControls";
 import {
   DISMISS_LABEL,
+  isStalePromptPin,
   PinDismissAction,
   useDismissStaging,
   WILL_DISMISS,
@@ -36,6 +37,8 @@ import { pinChatAt } from "@/lib/pins/chatTarget";
  * #6539 (ruling Q1): a Detected pin's Dismiss, in its body and its row pill,
  * confirms and is staged like an ordinary pin's (`useDismissStaging`), and goes
  * with the next Submit. Nothing here calls the dismiss route.
+ * #6458 (D-b): a prompt pin whose request is gone (`isStalePromptPin`) takes the
+ * same Dismiss, in its detail's action row and its row pill.
  */
 
 const PROMPT_PREFIX = "prompt:";
@@ -89,7 +92,9 @@ function GoToViewButton(props: { pin: Pin; view: SessionView }) {
     <PinActionButton
       rank={ACTION_COLLAPSE_RANK.inChat}
       content={
-        props.pin.status === "open" && isPromptPinKey(props.pin.key)
+        props.pin.status === "open" &&
+        isPromptPinKey(props.pin.key) &&
+        !isStalePromptPin(props.pin)
           ? `Open the ${name}, where the prompt is waiting for your answer`
           : `Open the ${name}`
       }
@@ -118,9 +123,11 @@ export function PromptPinBody(props: {
   return (
     <div className="flex items-center gap-2">
       <span className="min-w-0 flex-1 truncate text-[length:var(--text-body-dense)] text-[var(--app-hint)]">
-        {pin.status === "open"
-          ? `Waiting for your answer in the ${VIEW_NAME[view]}`
-          : `Asked in the ${VIEW_NAME[view]}`}
+        {isStalePromptPin(pin)
+          ? `No longer waiting in the ${VIEW_NAME[view]}`
+          : pin.status === "open"
+            ? `Waiting for your answer in the ${VIEW_NAME[view]}`
+            : `Asked in the ${VIEW_NAME[view]}`}
       </span>
       {target ? <GoToViewButton pin={pin} view={target} /> : null}
     </div>
@@ -171,7 +178,7 @@ export function ReservedPinPill(props: {
   const selectView = useSelectSessionView(api, sessionId);
   const dismissal = useDismissStaging(pin);
   if (pin.status !== "open") return null;
-  if (isDetectedPinKey(pin.key)) {
+  if (isDetectedPinKey(pin.key) || isStalePromptPin(pin)) {
     if (dismissal.staged) {
       return (
         <PinIndicator

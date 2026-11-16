@@ -216,19 +216,28 @@ export class PinService {
 
   /**
    * The operator's dismissal, from the web route and the federation receiver
-   * (#6455): as `dismiss`, except an open mirrored prompt is refused. A closed one,
-   * and any detected pin, dismiss normally.
+   * (#6455): as `dismiss`, except an open mirrored prompt whose request is still
+   * waiting is refused. A closed one, one whose request is gone (#6458 Task 11k:
+   * after a restart the mirror never closes it), and any detected pin, dismiss
+   * normally. `isRequestLive` is the caller's `isPromptPinLive` over the session
+   * record; without it every open prompt reads as live, the #6455 refusal.
    */
   dismissForOperator(
     session: PinSessionRef,
     key: string,
-    now?: number
+    options: { now?: number; isRequestLive?: (key: string) => boolean } = {}
   ): PinWriteResult | PinDismissRefusal | null {
     const pin = this.store.get(session.id, key);
+    const isRequestLive = options.isRequestLive ?? (() => true);
     if (pin?.status === "open" && key.startsWith(PROMPT_PIN_PREFIX)) {
-      return { refused: "pin_reserved_key" };
+      if (isRequestLive(key)) return { refused: "pin_reserved_key" };
+      // #6458 review D3: closed the way the mirror closes a prompt it no longer
+      // sees, withdrawn, because "not live" may be a session that is only
+      // disconnected: a request that is still waiting re-posts the pin open,
+      // which a sticky dismissal would refuse.
+      return this.withdraw(session, key, options.now);
     }
-    return this.dismiss(session, key, now);
+    return this.dismiss(session, key, options.now);
   }
 
   /** Keys starting `prefix` (#6455). Reads no JSON. */
@@ -243,6 +252,13 @@ export class PinService {
   /** Every open pin the agent owns, with its timestamps (#6455). */
   listTurnCandidates(sessionId: string): PinTurnCandidate[] {
     return this.store.listTurnCandidates(sessionId);
+  }
+
+  /** Every open pin's key and pin ID, reserved keys included (#6527). */
+  listOpenPinRefs(
+    sessionId: string
+  ): Array<{ key: string; pinId: string | null }> {
+    return this.store.listOpenPinRefs(sessionId);
   }
 
   /**
@@ -479,7 +495,12 @@ export class PinService {
   markSaved(
     session: PinSessionRef,
     key: string,
-    save: { savedTo: string; revision: number },
+    save: {
+      savedTo: string;
+      revision: number;
+      files?: number;
+      skipped?: number;
+    },
     now?: number
   ): PinWriteResult | null {
     return this.settle(

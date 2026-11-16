@@ -30,6 +30,11 @@ import {
   sessionCreateResponse,
 } from "./cliMessageDelivery";
 import { logAndJson } from "./routeErrorHelper";
+import {
+  attachOrRefuse,
+  registerCliRunnerIdentityRoute,
+  runnerAttachSchema,
+} from "./cliRunnerIdentity";
 import { cataloged } from "../../capabilities/cataloged";
 import {
   apiErrorNotification,
@@ -39,15 +44,14 @@ import {
 
 const bearerSchema = z.string().regex(/^Bearer\s+(.+)$/i);
 
-// Issue #1098: tighten metadata validation at the boundary so attacker-
-// supplied paths can't reach the engine. MetadataSchema enforces shape
-// (absolute, no traversal, no NUL); the content blacklist runs later in
-// applyDisabledServerToggle (UnsafePathError). Two-layer defense: shape
-// here, content there.
+// Issue #1098: shape checks at the boundary (MetadataSchema: absolute, no
+// traversal, no NUL) so attacker-supplied paths can't reach the engine; the
+// content blacklist runs later in applyDisabledServerToggle (UnsafePathError).
 const createOrLoadSessionSchema = z.object({
   tag: z.string().min(1),
   metadata: MetadataSchema,
   agentState: z.unknown().nullable().optional(),
+  runner: runnerAttachSchema,
 });
 
 const renameSessionSchema = z.object({
@@ -92,10 +96,9 @@ const cliErrorReportSchema = z.object({
   context: z.string().max(2000).nullish(),
 });
 
-// Issue #1449: manual-login account auto-capture broadcast. .strict() REJECTS
-// any unknown key (e.g. accessToken/refreshToken) — defense ensuring the daemon
-// never sends a token here (redacted identity fields only). No sessionId:
-// account capture is machine/account-scoped, not session-scoped.
+// Issue #1449: manual-login account auto-capture broadcast; .strict() REJECTS
+// any unknown key (accessToken, refreshToken), keeping tokens out (redacted
+// identity fields only). No sessionId: capture is machine/account-scoped.
 const cliAccountCapturedSchema = z
   .object({
     accountUuid: z.string().min(1).max(200),
@@ -111,15 +114,12 @@ const createOrLoadMachineSchema = z.object({
   daemonState: z.unknown().nullable().optional(),
 });
 
-// Issue #4914 (epic #4912): the CLI report categories that raise a user
-// notification (and, for one release, their legacy toast SyncEvent) in addition
-// to landing in error_logs, each mapped to its notification kind. Every other
-// category is error-log only (Lane 3). Lineage: "tool-error" (#1078), the MCP
-// toggle config failures (#1107) so a reverted toggle is visible instead of
-// buried in /admin/error-logs, UserPromptSubmit hook blocks (#1348), the
-// in-session cron usage warning (#1460), a PTY submit-Enter cancelled on
-// teardown with an unsubmitted body (#1488 Gap 3), and Anthropic API error
-// phases (#1233). The non-"tool-error" tool-style categories render as
+// Issue #4914 (epic #4912): CLI report categories that raise a user
+// notification (and, for one release, their legacy toast SyncEvent) besides
+// error_logs; all others are error-log only (Lane 3). Lineage: tool-error
+// (#1078), MCP toggle config failures so a reverted toggle shows (#1107),
+// prompt blocks (#1348), cron usage (#1460), a PTY submit-Enter cancelled on
+// teardown (#1488 Gap 3), API errors (#1233). Tool-style ones render as
 // `tool-error` rows; the original category rides `context.category`.
 const ERROR_REPORT_NOTIFICATION_KINDS: Readonly<
   Record<string, NotificationKind>
@@ -143,21 +143,12 @@ export type CliEnv = {
 };
 
 /**
- * Resolve a session by ID (UUID) or tag within a namespace.
- *
- * The sessionIdOrTag parameter can be:
- * - A UUID (e.g., "ec6d2f7e-7318-40e3-8148-02b3acc99113") - tried first
- * - A tag (e.g., "hapi-1234567890-abc123") - tried as fallback
- * - A Claude SDK session id (claudeSessionId) - tried as a final
- *   namespace-scoped fallback (#1460). CLI detectors report session.sessionId,
- *   which is the claudeSessionId, so the toast-broadcast path lands here.
- *
- * This flexibility allows CLI hooks to use HAPI_SESSION_ID (which contains the tag)
- * when calling the API, without needing to look up the UUID first.
+ * Resolve a session within a namespace by UUID, then tag ("hapi-…", what
+ * HAPI_SESSION_ID holds, so CLI hooks need no UUID lookup), then Claude SDK
+ * session id (#1460: CLI detectors report session.sessionId, which is it).
+ * Issue #1772: exported so the impact-artifact submit route reuses this one
+ * resolution to confirm the posting session is in the CLI token's namespace.
  */
-// Issue #1772: exported so the impact-artifact submit route can confirm the
-// posting session belongs to the CLI token's namespace, reusing the identical
-// UUID → tag → claudeSessionId resolution (no second copy of this logic).
 export function resolveSessionForNamespace(
   engine: SyncEngine,
   sessionIdOrTag: string,
@@ -180,13 +171,11 @@ export function resolveSessionForNamespace(
     return { ok: true, session: sessionByTag };
   }
 
-  // Issue #1460: try by claudeSessionId (the Claude SDK session id) as a final
-  // fallback. CLI detectors (toolErrorDetector / userPromptBlockDetector /
-  // cronUsageDetector) report session.sessionId, which is the claudeSessionId —
-  // neither the Hapimatic UUID nor the tag. Without this, the #1107 namespace
-  // check 404s on every detector report, silently skipping the tool-error /
-  // prompt-blocked / cron-usage toast broadcast. Scoped to `namespace` so the
-  // anti-spoofing property holds (a CLI token resolves only its own namespace).
+  // Issue #1460: final fallback by claudeSessionId, which the CLI detectors
+  // (toolErrorDetector, userPromptBlockDetector, cronUsageDetector) report as
+  // session.sessionId; without it the #1107 namespace check 404s each detector
+  // report and silently skips its toast. Scoped to `namespace` (anti-spoofing:
+  // a CLI token resolves only its own namespace).
   const sessionByClaudeId = engine
     .getSessionsByNamespace(namespace)
     .find(s => s.metadata?.claudeSessionId === sessionIdOrTag);
@@ -321,13 +310,18 @@ export function createCliRoutes(
       }
 
       const namespace = c.get("namespace");
-      const session = engine.getOrCreateSession(
-        parsed.data.tag,
-        parsed.data.metadata,
-        parsed.data.agentState ?? null,
-        namespace
+      // #6647 (R3): an attach `enforce` refuses answers 409 before the row changes.
+      const attached = attachOrRefuse(() =>
+        engine.getOrCreateSession(
+          parsed.data.tag,
+          parsed.data.metadata,
+          parsed.data.agentState ?? null,
+          namespace,
+          { ...parsed.data.runner, startedBy: parsed.data.metadata.startedBy } // #6647
+        )
       );
-      return c.json(sessionCreateResponse(engine, session)); // #4682
+      if ("refused" in attached) return c.json(attached.refused, 409);
+      return c.json(sessionCreateResponse(engine, attached.session)); // #4682
     }
   );
 
@@ -484,11 +478,9 @@ export function createCliRoutes(
     }
   );
 
-  // Issue #1507: daemon-triggered same-account token-refresh restart. Called by
-  // the daemon's TokenRefreshService.onSuccessfulRefresh callback after a refresh
-  // succeeds, to push the fresh token into the already-running bound process. The
-  // /cli namespace uses CLI API token auth (no JWT), so the daemon calls it
-  // without user credentials.
+  // Issue #1507: same-account token-refresh restart, called by the daemon's
+  // TokenRefreshService.onSuccessfulRefresh to push the fresh token into the
+  // running bound process (/cli uses CLI API token auth, no user credentials).
   app.post(
     "/sessions/:id/token-refresh",
     cataloged(
@@ -621,11 +613,10 @@ export function createCliRoutes(
   );
 
   // Issue #2862 (Fix 1 / Task 4′): retroactively stamp a session's managed-peer
-  // parent over the CLI-token surface. This is the route the CROSS-REPO orphan-
-  // adoption caller (rp1-home spawn-with-link.sh — authenticates with CLI_API_TOKEN
-  // and passes a TAG) will use to heal an orphan whose spawn timed out after the
-  // daemon succeeded. Local-only (no federation proxy); resolves BOTH the target
-  // and the parent tag→uuid so grouping.ts matches. Mirrors the linked-issue route.
+  // parent over the CLI-token surface, for the CROSS-REPO orphan adoption
+  // (rp1-home spawn-with-link.sh, with CLI_API_TOKEN and a TAG) when a spawn
+  // timed out after the daemon succeeded. Local-only (no federation proxy);
+  // resolves BOTH tags to uuids so grouping.ts matches; mirrors linked-issue.
   app.put(
     "/sessions/:id/parent",
     cataloged(
@@ -891,6 +882,7 @@ export function createCliRoutes(
 
   // Issue #6171: MCP cost reports for the New Session picker.
   registerCliMcpCostsRoute(app, store);
+  registerCliRunnerIdentityRoute(app, getSyncEngine, store); // #6647
 
   if (store) {
     const errorReportsLimiter = createRateLimiter({
@@ -940,12 +932,11 @@ export function createCliRoutes(
           context: data.context ?? null,
         });
 
-        // Issue #1078 (extended in #1107, #4914): for a notification category
-        // tied to a session, raise a user notification (#4914) and broadcast the
-        // legacy toast SyncEvent. Persistence is unchanged (the entry above goes
-        // to error_logs, so every notify() below passes mirror:false to avoid a
-        // second row). See ERROR_REPORT_NOTIFICATION_KINDS above for the set.
-        // Object.hasOwn: a category such as "toString" must never match.
+        // Issue #1078 (extended in #1107, #4914): a notification category
+        // (ERROR_REPORT_NOTIFICATION_KINDS) tied to a session raises a user
+        // notification (#4914) and the legacy toast SyncEvent. The entry above
+        // is in error_logs, so each notify() below passes mirror:false (no
+        // second row). Object.hasOwn: "toString" must never match a category.
         if (
           Object.hasOwn(ERROR_REPORT_NOTIFICATION_KINDS, data.category) &&
           data.sessionId
@@ -957,11 +948,10 @@ export function createCliRoutes(
               { sessionId: data.sessionId, namespace }
             );
           } else {
-            // Hardening: validate that the supplied sessionId actually belongs to
-            // the caller's namespace before broadcasting a tool-error toast that
-            // claims to come from that session. Without this check, a CLI token
-            // can spoof tool-error toasts referencing arbitrary sessions in its
-            // namespace (UI-spoofing surface).
+            // Hardening: check the supplied sessionId is in the caller's
+            // namespace before broadcasting a tool-error toast that claims to
+            // come from it; otherwise a CLI token could spoof such toasts for
+            // arbitrary sessions in its namespace (UI-spoofing surface).
             const resolved = resolveSessionForNamespace(
               engine,
               data.sessionId,
@@ -1158,13 +1148,12 @@ export function createCliRoutes(
                 resumesAt = upgraded.resumesAt ?? undefined;
               }
 
-              // TODO(#4912): legacy api-error SyncEvent, kept for one release
-              // so a pre-#4915 web client still toasts. Remove its SSE/web
-              // delivery once Sub C (#4915) has shipped for a release. Server
-              // consumers: AutoRecoveryService + OrphanGrantObserver +
-              // SpendLimitNoticeObserver + ApiKeyCreditObserver +
-              // sessionStateWaiter — keep the internal event or migrate them
-              // first.
+              // TODO(#4912): legacy api-error SyncEvent, kept one release so a
+              // pre-#4915 web client still toasts; drop its SSE/web delivery
+              // once Sub C (#4915) has shipped a release. Server consumers:
+              // AutoRecoveryService, OrphanGrantObserver, sessionStateWaiter,
+              // SpendLimitNoticeObserver, ApiKeyCreditObserver — keep the
+              // internal event or migrate them first.
               engine.handleRealtimeEvent({
                 type: "api-error",
                 sessionId: resolved.session.id,
@@ -1210,10 +1199,9 @@ export function createCliRoutes(
                   if (typeof ctx.errorContent === "string") {
                     errorContent = ctx.errorContent;
                   }
-                  // Issue #1107: mcp-toggle-config-* reports use a different
-                  // context schema ({projectDir, serverName, enabled, ...}) and
-                  // have no toolName/toolUseId. Synthesize a meaningful label
-                  // from serverName so the toast doesn't read "unknown: ...".
+                  // Issue #1107: mcp-toggle-config-* reports carry {projectDir,
+                  // serverName, enabled, ...} and no toolName/toolUseId, so
+                  // label the toast from serverName, never "unknown: ...".
                   if (
                     toolName === "unknown" &&
                     typeof ctx.serverName === "string"
@@ -1246,11 +1234,10 @@ export function createCliRoutes(
                 }
               }
 
-              // TODO(#4912): legacy tool-error SyncEvent, kept for one release
-              // so a pre-#4915 web client still toasts. Remove its SSE/web
-              // delivery once Sub C (#4915) has shipped for a release. Server
-              // consumers: InitiativeEventObserver — keep the internal event or
-              // migrate it first.
+              // TODO(#4912): legacy tool-error SyncEvent, kept one release so a
+              // pre-#4915 web client still toasts; drop its SSE/web delivery
+              // once Sub C (#4915) has shipped a release. Server consumer
+              // InitiativeEventObserver: keep the internal event or migrate it.
               engine.handleRealtimeEvent({
                 type: "tool-error",
                 sessionId: resolved.session.id,
@@ -1283,11 +1270,10 @@ export function createCliRoutes(
     );
   }
 
-  // Issue #1449: manual-login account auto-capture -> live dropdown SSE.
-  // Non-session-scoped (machine/account level), so this sits OUTSIDE the
-  // `if (store)` block (no error_logs persistence) and needs no
-  // resolveSessionForNamespace. Mirrors the /cli/error-reports broadcast shape
-  // (#1078): validate -> getSyncEngine() guard -> handleRealtimeEvent.
+  // Issue #1449: manual-login account auto-capture -> live dropdown SSE. Not
+  // session-scoped, so it sits OUTSIDE `if (store)` (no error_logs row) with no
+  // resolveSessionForNamespace. Mirrors /cli/error-reports' broadcast (#1078):
+  // validate -> getSyncEngine() guard -> handleRealtimeEvent.
   const accountCapturedLimiter = createRateLimiter({
     name: "cli-account-captured",
   });
@@ -1347,17 +1333,15 @@ export function createCliRoutes(
   );
 
   // ─── Issue #1644: daemon-facing cross-machine rotation-lease endpoints ──
-  //
-  // The daemon's rotationLeaseClient POSTs here before any proactive
+  // The daemon's rotationLeaseClient POSTs here before a proactive
   // (TokenRefreshService.tick) or recovery tier-b (isolatedSnapshotRecovery)
-  // rotation. The `app.use("*")` middleware above already gates these by
-  // cliApiToken. The body carries only `accountUuid`; the server stamps the
-  // holder (federationConfig.nodeId) inside RotationLeaseService, so the CLI
-  // stays node-agnostic. When the service is not wired (e.g. a minimal test
-  // harness), fail open — granting machine-local rotation preserves #1635.
+  // rotation; the `app.use("*")` cliApiToken middleware above gates them. The
+  // body carries only `accountUuid`; RotationLeaseService stamps the holder
+  // (federationConfig.nodeId), so the CLI stays node-agnostic. Not wired (a
+  // minimal test harness): fail open, granting machine-local rotation (#1635).
   // #5127: shared API keys across federation nodes — the identity and secret
-  // routes a session's daemon, launcher and apiKeyHelper call (./cliApiKeys.ts).
-  // Mounted here so the CLI-token middleware above runs first.
+  // routes a session's daemon, launcher and apiKeyHelper call
+  // (./cliApiKeys.ts), mounted here so the CLI-token middleware runs first.
   app.route(
     "/",
     createCliApiKeyRoutes(getSyncEngine, {

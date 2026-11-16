@@ -639,7 +639,7 @@ export type TimeLogProjectsResponse = {
   projects: string[];
 };
 
-// Issue #1670 (Sub H1, PR-2): six-control ledger + derived read + cutover gate.
+// Issue #1670 (Sub H1, PR-2): six-control ledger + derived read.
 export type TimelogControlType =
   | "adjust"
   | "set"
@@ -726,15 +726,6 @@ export type DerivedDailyBucket = {
 };
 
 export type DerivedTimeLogResponse = { buckets: DerivedDailyBucket[] };
-export type TimelogCutoverStatus = {
-  ready: boolean;
-  /**
-   * #2247: present (true) only when the operator override forces the gate open
-   * (settings.json `timelogCutover.force`). Optional — an older server never
-   * sends it (deploy-skew safe).
-   */
-  forced?: boolean;
-};
 
 export type TimeLogProjectGroupedSummary = {
   startDate: string;

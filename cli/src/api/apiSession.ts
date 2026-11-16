@@ -50,7 +50,11 @@ import type {
   BackgroundAgentsSnapshot,
   ProviderUsageSnapshotWindow,
 } from "@hapi/protocol/schemas";
-import type { PromptCacheState } from "@hapi/protocol";
+import {
+  RUNNER_SUPERSEDED,
+  RUNNER_SUPERSEDED_EVENT,
+  type PromptCacheState,
+} from "@hapi/protocol";
 import { applyVersionedAck } from "./versionedUpdate";
 
 /**
@@ -108,6 +112,11 @@ export type ApiSessionClientOptions = {
    * backfill start.
    */
   deliveryFloorSeq?: number | null;
+  /**
+   * Issue #6647 (R1): this attach's runner id. It rides the socket's fixed
+   * `auth`, so every reconnect carries it.
+   */
+  runnerId?: string;
   /** Backfill retry bounds; tests shorten them. */
   backfillRetryMs?: { min: number; max: number };
 };
@@ -162,6 +171,17 @@ export class ApiSessionClient extends EventEmitter {
   private readonly token: string;
   readonly sessionId: string;
   private metadata: Metadata | null;
+  /**
+   * Issue #6647 (Task 13, R8): set by `hapi acp`, which ends only this
+   * session when the hub replaces its runner; unset, the runner stops.
+   */
+  onSuperseded: (() => void) | null = null;
+  private supersededSignal = false;
+
+  /** Whether the hub told this runner it was replaced (`runner-superseded`). */
+  get superseded(): boolean {
+    return this.supersededSignal;
+  }
 
   /**
    * Round 11 (epic #3285): read-only view of the server record's metadata as
@@ -253,6 +273,10 @@ export class ApiSessionClient extends EventEmitter {
         token: this.token,
         clientType: "session-scoped" as const,
         sessionId: this.sessionId,
+        ...(options.runnerId ? { runnerId: options.runnerId } : {}),
+        // #6647 F1: this client reads `runner-superseded`, so the hub may count
+        // a cut of it as a stop; a PR1 binary sends a runner id without this.
+        readsStop: true,
       },
       path: "/socket.io/",
       reconnection: true,
@@ -313,7 +337,15 @@ export class ApiSessionClient extends EventEmitter {
     this.socket.on("connect_error", error => {
       logger.debug("[API] Socket connection error:", error);
       this.rpcHandlerManager.onSocketDisconnect();
+      // Issue #6647 (Task 13, R6, R8): a refused handshake carries the code in
+      // `data`; a transport-level error has none.
+      const data = (error as { data?: { code?: unknown } } | null)?.data;
+      if (data?.code === RUNNER_SUPERSEDED) this.handleSuperseded();
     });
+
+    // Issue #6647 (Task 13, R8): the hub sends this before it disconnects a
+    // replaced runner's socket.
+    this.socket.on(RUNNER_SUPERSEDED_EVENT, () => this.handleSuperseded());
 
     this.socket.on("error", payload => {
       logger.debug("[API] Socket error:", payload);
@@ -1166,11 +1198,61 @@ export class ApiSessionClient extends EventEmitter {
     }
   }
 
+  /**
+   * Issue #6647 (Task 13, R8, ruling RUN-1): the first signal stops this
+   * runner, once. `hapi acp` ends only this session (`onSuperseded`); any other
+   * runner stops through its own `killSession` handler, or exits directly
+   * when it has none yet (it is registered late) or the handler fails.
+   */
+  private handleSuperseded(): void {
+    if (this.supersededSignal) return;
+    this.supersededSignal = true;
+    logger.debug(`runner-superseded received for ${this.sessionId}`);
+    if (this.onSuperseded) {
+      try {
+        this.onSuperseded();
+      } catch (error) {
+        logger.debug("[API] onSuperseded failed:", error);
+      }
+      return;
+    }
+    void this.stopSuperseded();
+  }
+
+  private async stopSuperseded(): Promise<void> {
+    // #6647 F5: the person sees why the runner stops, on both paths, once.
+    process.stderr.write(
+      `hapi: session ${this.sessionId}: this runner was replaced; stopping\n`
+    );
+    try {
+      if (this.rpcHandlerManager.hasHandler("killSession")) {
+        const reply = await this.rpcHandlerManager.handleRequest({
+          method: `${this.sessionId}:killSession`,
+          params: "{}",
+        });
+        if (!isRpcErrorReply(reply)) return;
+      }
+    } catch (error) {
+      logger.debug("[API] the superseded runner's kill path failed:", error);
+    }
+    process.exit(0);
+  }
+
   close(): void {
     this.closed = true;
     this.clearBackfillRetry();
     this.rpcHandlerManager.onSocketDisconnect();
     this.terminalManager.closeAll();
     this.socket.disconnect();
+  }
+}
+
+/** A local RPC reply that failed: `{ type: "error" }` or `{ success: false }`. */
+function isRpcErrorReply(reply: string): boolean {
+  try {
+    const parsed = JSON.parse(reply) as { type?: unknown; success?: unknown };
+    return parsed?.type === "error" || parsed?.success === false;
+  } catch {
+    return true;
   }
 }

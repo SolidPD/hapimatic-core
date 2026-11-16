@@ -34,6 +34,12 @@ export interface HapiMcpBridge {
   };
   /** MCP server config to pass to Codex (works for both CLI and SDK) */
   mcpServers: McpServersConfig;
+  /**
+   * Issue #6458: whether this session's server has the Pins gate open (the
+   * bridge's own `startHappyServer` probe). The stdio bridge forwards the pin
+   * tools when it is, so the prompt carries the Pins block from it.
+   */
+  pinsEnabled: boolean;
 }
 
 /**
@@ -60,5 +66,6 @@ export async function buildHapiMcpBridge(
         args: bridgeCommand.args,
       },
     },
+    pinsEnabled: happyServer.pinsEnabled === true,
   };
 }

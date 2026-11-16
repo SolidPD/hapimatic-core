@@ -106,6 +106,10 @@ import {
   getSearchFilterEngagement,
 } from "@/components/SearchFilterBar";
 import { SelectModeChipRow } from "@/components/SessionList/SelectModeChipRow";
+import {
+  STATUS_COUNT_COLUMN_CLASS,
+  STATUS_COUNT_SEPARATOR_CLASS,
+} from "@/components/SessionList/SessionCountBadge";
 import { useSelectMode } from "@/components/SessionList/useSelectMode";
 import {
   applyScheduleSearchFilter,
@@ -275,6 +279,19 @@ function SessionsPage() {
     },
     [exitManualSort, setSort]
   );
+  // "Manual" chosen under "Sort by": the mounted session list stores the order on
+  // screen as the custom order (it registers how on this ref), then Manual governs,
+  // as after a first drag, without the user dragging anything. With no list
+  // mounted there is no order to store, so nothing changes: Manual never turns on
+  // over an older stored order.
+  const manualSeedRef = useRef<(() => void) | null>(null);
+  const handleSelectManualSort = useCallback(() => {
+    const seed = manualSeedRef.current;
+    if (manualActive || !seed) return;
+    seed();
+    setManualActive(true);
+    persistManualActive(true);
+  }, [manualActive]);
   const handleClearSort = useCallback(() => {
     exitManualSort();
     clearSort();
@@ -543,45 +560,38 @@ function SessionsPage() {
           <CumulativeTimer sessions={sessions} />
         </div>
         <div
-          // #3484: pinned to --status-cluster-w (index.css) so the four flex-1
-          // columns stop following the timer text's width above — every
-          // SubheadingBar's status cluster is sized from the same token, which
-          // is what lets the subheading columns align under these by construction.
-          className="flex items-center mt-px text-[10px] tabular-nums w-[var(--status-cluster-w)]"
+          // #3484: the four columns and the dots use the SAME classes as every
+          // SubheadingBar's status cluster (SessionCountBadge variant="aligned"),
+          // and the left padding starts this cluster at the x where a subheading's
+          // cluster starts (its card sits --subheading-rail-inset further in), so
+          // the subheading columns line up under these by construction. Each
+          // column reserves its own width ("99 · 99 · 99 · 999" fits); the search
+          // field next to it gives up the difference.
+          className="flex items-center mt-px text-[10px] tabular-nums pl-[var(--subheading-rail-inset)]"
           title="Session status across ALL sessions, including sessions in collapsed groups"
           aria-label={`Session status across all sessions, including collapsed groups: ${statusCounts.orange} need attention, ${statusCounts.blue} working, ${statusCounts.green} active, ${statusCounts.gray} inactive`}
         >
-          <span className="flex-1 text-right text-[var(--status-cat-attention)]">
+          <span
+            className={`${STATUS_COUNT_COLUMN_CLASS.orange} text-[var(--status-cat-attention)]`}
+          >
             {statusCounts.orange}
           </span>
-          {/* design-system PERMANENT exception (#3336, from #3038 pilot): decorative
-              6px separator dot, far below the type-scale floor — a glyph size, not
-              "type". Registered in docs/design/design-system/decision-typography.md
-              § Sub-floor type-size exceptions. */}
-          <span className="shrink-0 text-[var(--app-hint)] text-[6px] leading-none px-1">
-            •
-          </span>
-          <span className="flex-1 text-right text-[var(--status-cat-working)]">
+          <span className={STATUS_COUNT_SEPARATOR_CLASS}>•</span>
+          <span
+            className={`${STATUS_COUNT_COLUMN_CLASS.blue} text-[var(--status-cat-working)]`}
+          >
             {statusCounts.blue}
           </span>
-          {/* design-system PERMANENT exception (#3336, from #3038 pilot): decorative
-              6px separator dot, far below the type-scale floor — a glyph size, not
-              "type". Registered in docs/design/design-system/decision-typography.md
-              § Sub-floor type-size exceptions. */}
-          <span className="shrink-0 text-[var(--app-hint)] text-[6px] leading-none px-1">
-            •
-          </span>
-          <span className="flex-1 text-right text-[var(--status-cat-active)]">
+          <span className={STATUS_COUNT_SEPARATOR_CLASS}>•</span>
+          <span
+            className={`${STATUS_COUNT_COLUMN_CLASS.green} text-[var(--status-cat-active)]`}
+          >
             {statusCounts.green}
           </span>
-          {/* design-system PERMANENT exception (#3336, from #3038 pilot): decorative
-              6px separator dot, far below the type-scale floor — a glyph size, not
-              "type". Registered in docs/design/design-system/decision-typography.md
-              § Sub-floor type-size exceptions. */}
-          <span className="shrink-0 text-[var(--app-hint)] text-[6px] leading-none px-1">
-            •
-          </span>
-          <span className="flex-1 text-right text-[var(--status-cat-inactive)]">
+          <span className={STATUS_COUNT_SEPARATOR_CLASS}>•</span>
+          <span
+            className={`${STATUS_COUNT_COLUMN_CLASS.gray} text-[var(--status-cat-inactive)]`}
+          >
             {statusCounts.gray}
           </span>
         </div>
@@ -615,6 +625,7 @@ function SessionsPage() {
         onClearFilters={clearFilters}
         onClearSort={handleClearSort}
         manualSortActive={manualActive}
+        onSelectManualSort={handleSelectManualSort}
       />
       {/* Right: action icons — icon-col system for vertical alignment.
           #3292: Delete-All-Disconnected + Connect/Disconnect-All RETIRED into Select
@@ -823,6 +834,7 @@ function SessionsPage() {
                   liftedToggleSessionExpanded={toggleSessionExpanded}
                   liftedManualActive={manualActive}
                   liftedSetManualActive={setManualActive}
+                  liftedManualSeedRef={manualSeedRef}
                   selectMode={selectMode}
                   selectedIds={selectedIds}
                   onToggleSelect={toggleSelect}
@@ -891,6 +903,7 @@ function SessionsPage() {
                     liftedToggleSessionExpanded={togglePaneBSessionExpanded}
                     liftedManualActive={manualActive}
                     liftedSetManualActive={setManualActive}
+                    liftedManualSeedRef={manualSeedRef}
                     selectMode={selectMode}
                     selectedIds={selectedIds}
                     onToggleSelect={toggleSelect}

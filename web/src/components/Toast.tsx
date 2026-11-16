@@ -24,6 +24,10 @@ interface ToastOptions {
   // Issue #4921: an optional first line in a stronger weight — the session a
   // notification is about. No title renders exactly as before.
   title?: string;
+  // Issue #6681: a keyed toast replaces the live toast with the same key in
+  // place (its text and type, and restarts its timer), never stacking or
+  // deduped: one progress note.
+  key?: string;
 }
 
 interface ToastItem {
@@ -36,10 +40,13 @@ interface ToastItem {
   swiping: boolean;
   action?: { label: string; onClick: () => void };
   title?: string;
+  key?: string;
 }
 
 interface ToastContextValue {
   showToast: (message: string, options?: ToastOptions) => void;
+  /** Issue #6681: take down the live toast shown with this key, if any. */
+  clearToast: (key: string) => void;
 }
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -70,7 +77,7 @@ const ToastContext = createContext<ToastContextValue | null>(null);
 export function useToast() {
   const ctx = useContext(ToastContext);
   if (!ctx) {
-    return { showToast: () => {} };
+    return { showToast: () => {}, clearToast: () => {} };
   }
   return ctx;
 }
@@ -265,6 +272,24 @@ export function ToastProvider({ children }: ToastProviderProps) {
     (message: string, options?: ToastOptions) => {
       const type = options?.type ?? "info";
       const duration = options?.duration ?? DEFAULT_DURATIONS[type];
+      const key = options?.key;
+      const live =
+        key === undefined
+          ? undefined
+          : toastsRef.current.find(t => t.key === key && !t.exiting);
+      if (live) {
+        const next = toastsRef.current.map(t =>
+          t.id === live.id ? { ...t, message, type } : t
+        );
+        toastsRef.current = next;
+        setToasts(next);
+        clearTimeout(timersRef.current.get(live.id));
+        timersRef.current.set(
+          live.id,
+          setTimeout(() => dismissToast(live.id), duration)
+        );
+        return;
+      }
 
       // Deduplication: suppress same message within window. Issue #4921: two
       // toasts with different titles (two sessions, same text) both show, but
@@ -274,13 +299,16 @@ export function ToastProvider({ children }: ToastProviderProps) {
       const title = options?.title || undefined;
       const last = lastMessage.current;
       if (
+        key === undefined &&
         last.text === message &&
         now - last.time < DEDUP_WINDOW_MS &&
         (last.title === title || !last.title || !title)
       ) {
         return;
       }
-      lastMessage.current = { text: message, title, time: now };
+      if (key === undefined) {
+        lastMessage.current = { text: message, title, time: now };
+      }
 
       const id = nextId.current++;
       const newToast: ToastItem = {
@@ -293,6 +321,7 @@ export function ToastProvider({ children }: ToastProviderProps) {
         swiping: false,
         action: options?.action,
         title,
+        key,
       };
 
       // Compute the next visible set synchronously from the ref mirror (NOT
@@ -327,6 +356,14 @@ export function ToastProvider({ children }: ToastProviderProps) {
     [dismissToast]
   );
 
+  const clearToast = useCallback(
+    (key: string) => {
+      const live = toastsRef.current.find(t => t.key === key && !t.exiting);
+      if (live) dismissToast(live.id);
+    },
+    [dismissToast]
+  );
+
   // Cleanup timers on unmount
   useEffect(() => {
     return () => {
@@ -335,7 +372,7 @@ export function ToastProvider({ children }: ToastProviderProps) {
   }, []);
 
   return (
-    <ToastContext.Provider value={{ showToast }}>
+    <ToastContext.Provider value={{ showToast, clearToast }}>
       {children}
       {toasts.length > 0 &&
         createPortal(

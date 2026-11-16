@@ -10,6 +10,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { AddressInfo } from "node:net";
 import { z } from "zod";
 import { logger } from "@/ui/logger";
+import { delay } from "@/utils/time";
 import { ApiSessionClient } from "@/api/apiSession";
 import { configuration } from "@/configuration";
 import { API_KEY_PROVIDERS } from "@hapi/protocol/schemas";
@@ -38,12 +39,28 @@ const IMAGE_FETCH_TIMEOUT_MS = 10000; // 10 seconds
 const IMAGE_MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
 
 /**
- * Budget for each gate probe run before `mcp.connect` (#6448): the operator
- * catalog probe and the Pins gate read. `/api/version` answers in a few
- * milliseconds locally, so this only covers a stalled server, which would
+ * Budget for each gate probe attempt run before `mcp.connect` (#6448): the
+ * operator catalog probe and the Pins gate read. `/api/version` answers in a
+ * few milliseconds locally, so this only covers a stalled server, which would
  * otherwise stall session start.
  */
 const GATE_PROBE_TIMEOUT_MS = 2000;
+
+/**
+ * Pause before the Pins gate probe's one retry (#6458 R6). The probe retries
+ * only after a FAST failure (a refused connection, a 5xx: a server restarting
+ * under the session), never after a timeout, because a stalled server stays
+ * stalled and a second timeout would double session start. Worst case is a
+ * fast failure, this pause, then one full GATE_PROBE_TIMEOUT_MS.
+ */
+const GATE_PROBE_RETRY_DELAY_MS = 250;
+
+/** One Pins gate probe attempt, classified for the retry rule (#6458 R6). */
+type PinsGateAttempt =
+  | { kind: "open" }
+  | { kind: "closed"; reason?: string }
+  | { kind: "fast-failure"; reason: string }
+  | { kind: "timeout"; reason: string };
 
 /**
  * Check if a URL points to a private/internal IP address
@@ -609,27 +626,78 @@ export function createCapabilityTools(deps: CapabilityToolDeps) {
   }
 
   /**
+   * One read of `/api/version` for the Pins gate, classified (#6458 R6): a
+   * request that threw before its own budget ran out, or a 5xx, is a fast
+   * failure; a request whose budget ran out is a timeout; a 4xx, a body that
+   * is not JSON, or a 2xx without `pinsEnabled: true` is a closed gate.
+   */
+  async function probePinsGateOnce(): Promise<PinsGateAttempt> {
+    const signal = AbortSignal.timeout(GATE_PROBE_TIMEOUT_MS);
+    let resp: Awaited<ReturnType<FetchLike>>;
+    try {
+      resp = await doFetch(`${base}/api/version`, { signal });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return signal.aborted
+        ? {
+            kind: "timeout",
+            reason: `no answer in ${GATE_PROBE_TIMEOUT_MS} ms`,
+          }
+        : { kind: "fast-failure", reason };
+    }
+    if (resp.status >= 500) {
+      return { kind: "fast-failure", reason: `HTTP ${resp.status}` };
+    }
+    if (!resp.ok) return { kind: "closed", reason: `HTTP ${resp.status}` };
+    try {
+      const body = (await resp.json()) as { pinsEnabled?: unknown };
+      return body?.pinsEnabled === true ? { kind: "open" } : { kind: "closed" };
+    } catch {
+      return signal.aborted
+        ? {
+            kind: "timeout",
+            reason: `no answer in ${GATE_PROBE_TIMEOUT_MS} ms`,
+          }
+        : { kind: "closed", reason: "a body that is not JSON" };
+    }
+  }
+
+  /**
    * Whether this session's server has the Pins gate open (#6448): its
    * unauthenticated `/api/version` answers `pinsEnabled: true` only then. The
    * session process cannot read the server's environment, and this is the read
-   * Sub-Issue A's contract names. Fails closed: any error, non-2xx status, odd
-   * body or timeout answers `false`. A failed request or a non-2xx status writes
-   * one debug line; a body without `pinsEnabled: true` is a closed gate.
+   * Sub-Issue A's contract names. Fails closed. #6458 R6: one retry after a
+   * fast failure (a refused connection, a 5xx), never after a timeout or a
+   * closed answer, and a final failure is logged at warn with its reason,
+   * because it leaves this session without pin tools until it restarts.
    */
   async function pinsGateOpen(): Promise<boolean> {
-    try {
-      const resp = await doFetch(`${base}/api/version`, {
-        signal: AbortSignal.timeout(GATE_PROBE_TIMEOUT_MS),
-      });
-      if (!resp.ok) {
-        logger.debug(`[hapiMCP] Pins gate probe: HTTP ${resp.status}`);
+    let attempt = await probePinsGateOnce();
+    let retried = false;
+    if (attempt.kind === "fast-failure") {
+      logger.debug(
+        `[hapiMCP] Pins gate probe: ${attempt.reason}; retrying once`
+      );
+      await delay(GATE_PROBE_RETRY_DELAY_MS);
+      attempt = await probePinsGateOnce();
+      retried = true;
+    }
+    switch (attempt.kind) {
+      case "open":
+        return true;
+      case "closed":
+        if (attempt.reason) {
+          logger.debug(`[hapiMCP] Pins gate probe: ${attempt.reason}`);
+        }
         return false;
-      }
-      const body = (await resp.json()) as { pinsEnabled?: unknown };
-      return body?.pinsEnabled === true;
-    } catch (err) {
-      logger.debug("[hapiMCP] Pins gate probe failed:", err);
-      return false;
+      case "fast-failure":
+      case "timeout":
+        logger.warn(
+          `[hapiMCP] Pins gate probe failed (${attempt.reason}${
+            retried ? ", after one retry" : ""
+          }); this session starts without the pin tools`
+        );
+        return false;
     }
   }
 
@@ -768,7 +836,8 @@ export const HAPY_MCP_OPERATOR_TOOL_NAMES = ["remove_worktree"] as const;
  * reports the Pins gate open. Kept out of {@link HAPY_MCP_TOOL_NAMES}, the
  * always-on surface the stdio bridge declares; at runtime the bridge proxies
  * whatever is registered, these included. Their catalog entries carry
- * `gate: "pins"`, so Tier-0 and the self-knowledge docs never list them.
+ * `gate: "pins"`, so Tier-0 never lists them and the self-knowledge docs list
+ * them only in their "Instance-gated: Pins" section (#6458).
  */
 export const HAPY_MCP_PIN_TOOL_NAMES = [
   "pin_post",
@@ -1264,8 +1333,9 @@ export async function startHappyServer(
   //
   // Gated tools, registered BEFORE `mcp.connect` (no reliance on
   // `tools/list_changed`), so they are in the first `tools/list`. Both probes
-  // start together and neither rejects; each has GATE_PROBE_TIMEOUT_MS, so a
-  // stalled server delays session start by at most that.
+  // start together and neither rejects; each attempt has GATE_PROBE_TIMEOUT_MS,
+  // so a stalled server delays session start by at most that (#6458: the Pins
+  // probe retries once only after a fast failure, never after a timeout).
   //
   const [operatorListed, pinsEnabled] = await Promise.all([
     options.operatorTools === true

@@ -136,3 +136,51 @@ export function generatePinId(
   }
   return PIN_ID_PREFIX + out;
 }
+
+/** The most pin IDs one text is scanned for (#6527). */
+export const PIN_ID_SCAN_MAX = 16;
+/** A pin ID's body anywhere in a text: fixed length, so the scan is linear. */
+const PIN_ID_IN_TEXT = /pin-[2-9a-hjkmnp-z]{10}/g;
+const TOKEN_CHAR = /[a-z0-9_]/;
+const JOIN_BEFORE = /[a-z0-9_.:-]/;
+
+/**
+ * Whether `text.slice(at, at + length)` stands as a whole token in lower-cased
+ * text: nothing key-like touches it before, and after it comes neither a key
+ * character nor a `-`, `:` or `.` that joins one, so `plan` is not found in
+ * "planning", "plan-b", "pm26:plan" or "notes/plan.md". The turn check's
+ * `namesPinKey` and `findPinIds` share this rule.
+ */
+export function standsAsToken(
+  text: string,
+  at: number,
+  length: number
+): boolean {
+  const before = at === 0 ? "" : text[at - 1]!;
+  const after = text[at + length] ?? "";
+  const next = text[at + length + 1] ?? "";
+  const openBefore = before === "" || !JOIN_BEFORE.test(before);
+  const openAfter =
+    after === "" ||
+    (!TOKEN_CHAR.test(after) &&
+      !(
+        (after === "-" || after === ":" || after === ".") &&
+        TOKEN_CHAR.test(next)
+      ));
+  return openBefore && openAfter;
+}
+
+/**
+ * The pin IDs a lower-cased (normalized) text names as whole tokens, in order,
+ * each once, at most {@link PIN_ID_SCAN_MAX}. "x-pin-…", "pin-…-notes" and
+ * "notes/pin-….md" name none.
+ */
+export function findPinIds(text: string): string[] {
+  const found: string[] = [];
+  for (const match of text.matchAll(PIN_ID_IN_TEXT)) {
+    if (found.length >= PIN_ID_SCAN_MAX) break;
+    if (!standsAsToken(text, match.index, match[0].length)) continue;
+    if (!found.includes(match[0])) found.push(match[0]);
+  }
+  return found;
+}

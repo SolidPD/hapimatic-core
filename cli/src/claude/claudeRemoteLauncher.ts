@@ -141,6 +141,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
    * requests to Claude Code's headless handler without restarting the process.
    */
   private currentQuery: Query | null = null;
+  // Issue #6627: the last query started, kept past its iteration (unlike
+  // `currentQuery`), so the next iteration and teardown can check its child.
+  private lastQuery: Query | null = null;
   /**
    * Issue #6169: the prompt-cache keep-alive state of the live query — the last
    * cache touch, the TTL of the last write, and whether a turn is in flight.
@@ -171,6 +174,37 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
       this.abortController.abort();
     }
     await this.abortFuture?.promise;
+  }
+
+  /**
+   * Issue #6627 (R2): never start a claude child beside a live one. A live child
+   * of the last query is ended, with one `claude-child-leftover` warning to
+   * error_logs (/admin/error-logs): the guard, and the signal an operator reads;
+   * claudeRemote() ends its child on every exit, so it should never fire. A
+   * failed check is logged and the launcher goes on (R6): it never ends the session.
+   */
+  private async endLeftoverChild(reason: string): Promise<void> {
+    const leftover = this.lastQuery;
+    try {
+      if (!leftover?.isChildAlive()) return;
+      const pid = leftover.childPid;
+      logger.warn(
+        `[remote]: a claude child (pid ${pid ?? "unknown"}) was still alive (${reason}); ending it`
+      );
+      // end() is memoized: an unkillable child gets "unkillable" again, as reported.
+      const result = await leftover.end(reason);
+      const message = `A claude child (pid ${pid ?? "unknown"}) was still alive (${reason}); end result: ${result}`;
+      logger.warn(`[remote]: ${message}`);
+      logger.reportError({
+        category: "claude-child-leftover",
+        severity: "warn",
+        sessionId: this.session.client.sessionId,
+        message,
+        context: JSON.stringify({ pid, reason, result }),
+      });
+    } catch (error) {
+      logger.warn(`[remote]: the claude child check failed (${reason})`, error);
+    }
   }
 
   /**
@@ -431,7 +465,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
         }
         void this.requestExit("exit", () => {
           try {
-            this.currentQuery?.interrupt();
+            // The interrupt rejects (claude_exited) when the child dies first.
+            void this.currentQuery?.interrupt().catch(() => {});
           } catch {
             // interrupt may reject if the query already exited — best-effort
           }
@@ -785,6 +820,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
       let previousSessionId: string | null = null;
       while (!this.exitReason) {
+        await this.endLeftoverChild("leftover-before-relaunch");
         logger.debug("[remote]: launch");
         messageBuffer.addMessage("═".repeat(40), "status");
 
@@ -805,6 +841,10 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
         previousSessionId = session.sessionId;
         const controller = new AbortController();
+        // Issue #6627 (R3): this iteration's message fetches, aborted in its
+        // finally so a fetch left in flight (the bounce exit leaves one) cannot
+        // take the next message from the queue. Never `controller` (R4).
+        const fetchController = new AbortController();
         this.abortController = controller;
         this.requestedStop = null;
         this.abortFuture = new Future<void>();
@@ -862,6 +902,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             path: session.path,
             allowedTools: session.allowedTools ?? [],
             mcpServers: session.mcpServers,
+            pinsEnabled: session.pinsEnabled,
             hookSettingsPath: session.hookSettingsPath,
             canCallTool: permissionHandler.handleToolCall,
             // Issue #6617 (R1, R7 ii): with the switch on, every query start
@@ -920,7 +961,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
               }
 
               let msg = await session.queue.waitForSingleMessage(
-                controller.signal,
+                AbortSignal.any([controller.signal, fetchController.signal]),
                 () => {
                   // Queue is empty and we're about to block — safe to signal ready
                   if (!pending) {
@@ -975,6 +1016,18 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
               this.keepalive.onInputEnded();
               return null;
+            },
+            // Issue #6627 (R3): a message a fetch took after the end began goes
+            // to the front of the queue; one parked in `pending` for a new mode
+            // arrived after every handed-back message, so it goes behind them.
+            requeueMessage: (message, messageMode) => {
+              if (pending) {
+                session.queue.unshift(pending.message, pending.mode, {
+                  isolate: pending.isolate,
+                });
+                pending = null;
+              }
+              session.queue.unshift(message, messageMode);
             },
             onSessionFound: sessionId => {
               session.onSessionFound(sessionId);
@@ -1045,8 +1098,10 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
               // non-empty), ready is intentionally NOT sent — the next result
               // cycle will trigger it.
             },
+            onQueryEnding: () => (this.currentQuery = null),
             onQueryCreated: (q: Query) => {
               this.currentQuery = q;
+              this.lastQuery = q;
               // Issue #6617 round 4: the child starts in the mode read just
               // before query(); a card answer's recorded mode is compared with it.
               if (startedPermissionMode) {
@@ -1061,9 +1116,10 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
           // claudeRemote() returned normally.  If it ran for a healthy
           // duration (user interaction occurred), reset the failure counter.
-          // A very fast return (< MIN_HEALTHY_DURATION_MS) means Claude's
-          // process died immediately — count it as a launch failure just
-          // like the throw path.
+          // A very fast return (< MIN_HEALTHY_DURATION_MS) counts as a launch
+          // failure just like the throw path: Claude's process died at once,
+          // or claudeRemote() left early (an aborted tool, the bounce reset)
+          // and ended the child itself before returning (#6627).
           const launchDurationMs = Date.now() - launchStartTime;
           // Issue #6617 (Matt 81a): who asked this iteration to stop, if anyone.
           const stoppedBy = controller.signal.aborted
@@ -1333,6 +1389,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
           messageQueue.destroy();
           logger.debug("[remote]: message queue flushed");
 
+          // Issue #6627 (R3): a fetch left in flight stops waiting, so the next
+          // message waits for the next iteration; never `controller` (R4).
+          fetchController.abort();
           this.abortController = null;
           this.abortFuture?.resolve(undefined);
           this.abortFuture = null;
@@ -1378,6 +1437,8 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
   }
 
   protected async cleanup(): Promise<void> {
+    // Issue #6627: no child outlives the launcher (switch and exit abort it).
+    await this.endLeftoverChild("leftover-at-teardown");
     this.clearAbortHandlers(this.session.client.rpcHandlerManager);
 
     // Replace the mcp-toggle handler with a config-write stub so RPCs

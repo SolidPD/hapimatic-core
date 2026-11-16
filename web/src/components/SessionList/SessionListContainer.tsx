@@ -16,7 +16,13 @@ import { usePendingSpawns } from "@/hooks/usePendingSpawns";
 import { pruneOrphanedSessions } from "@/lib/localStorageCleanup";
 import { getSessionTitle, getStatusBreakdown } from "@/lib/sessionHelpers";
 import type { PendingSpawn } from "@/lib/pending-spawns";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type MutableRefObject,
+} from "react";
 import type {
   HeartbeatConfig,
   HeartbeatStatus,
@@ -169,6 +175,12 @@ export function SessionList(props: {
    */
   liftedManualActive?: boolean;
   liftedSetManualActive?: (active: boolean) => void;
+  /**
+   * The Sort menu's "Manual" row has no list data of its own, so the container
+   * registers on this ref the function that stores the arrangement on screen as
+   * the custom order. router.tsx calls it right before it turns Manual on.
+   */
+  liftedManualSeedRef?: MutableRefObject<(() => void) | null>;
   /** Schedule integration for unified list view (issue #392) */
   schedules?: ScheduledTask[];
   heartbeatConfig?: HeartbeatConfig | null;
@@ -754,6 +766,34 @@ export function SessionList(props: {
 
   const onDragCancel = useCallback(() => setFrozen(null), []);
 
+  // Store the arrangement on screen as the custom order: every project in its
+  // place, and every group's root sessions in theirs. Used by the first completed
+  // drag and by the Sort menu's "Manual" row (through `liftedManualSeedRef`), so
+  // neither can turn Manual on over an older stored order.
+  const seedManualOrder = useCallback(() => {
+    persistProjectOrder(allGroups.map(g => g.groupKey));
+    const seed: Record<string, string[]> = {};
+    for (const g of allGroups) {
+      seed[g.groupKey] = buildClusters(
+        g.sessions,
+        knownScheduleIds,
+        crossRepoPeerIds(g)
+      ).clusters.map(c => c[0].id);
+    }
+    persistSessionOrder(seed);
+  }, [allGroups, knownScheduleIds]);
+
+  const manualSeedRef = props.liftedManualSeedRef;
+  useEffect(() => {
+    if (!manualSeedRef) return;
+    manualSeedRef.current = seedManualOrder;
+    return () => {
+      // Split view mounts two lists on one ref: clear only our own registration.
+      if (manualSeedRef.current === seedManualOrder)
+        manualSeedRef.current = null;
+    };
+  }, [manualSeedRef, seedManualOrder]);
+
   const onDragEnd = useCallback(
     (e: DragEndEvent) => {
       const snap = frozen;
@@ -768,18 +808,7 @@ export function SessionList(props: {
       // refetch can't shift un-dragged rows, then flips the effective sort to Manual.
       // The reorder branch below then overrides the ONE dragged dimension on top.
       const firstDrag = !manualActive;
-      if (firstDrag) {
-        persistProjectOrder(allGroups.map(g => g.groupKey));
-        const seed: Record<string, string[]> = {};
-        for (const g of allGroups) {
-          seed[g.groupKey] = buildClusters(
-            g.sessions,
-            knownScheduleIds,
-            crossRepoPeerIds(g)
-          ).clusters.map(c => c[0].id);
-        }
-        persistSessionOrder(seed);
-      }
+      if (firstDrag) seedManualOrder();
 
       let didReorder = false;
       if (activeId.startsWith("proj:") && overId.startsWith("proj:")) {
@@ -827,7 +856,7 @@ export function SessionList(props: {
         setOrderVersion(v => v + 1);
       }
     },
-    [frozen, manualActive, allGroups, knownScheduleIds]
+    [frozen, manualActive, seedManualOrder]
   );
 
   // ── Bulk expand / collapse: the chevron menus ────────────────────────────
@@ -969,6 +998,7 @@ export function SessionList(props: {
                       group={group}
                       isCollapsed={isCollapsed}
                       showNode={multiNode}
+                      localNodeId={localNodeId}
                       onToggle={() => toggleGroup(group.groupKey, isCollapsed)}
                       api={api}
                       onRefresh={props.onRefresh}

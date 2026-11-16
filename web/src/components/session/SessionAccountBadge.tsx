@@ -26,7 +26,8 @@
  * by email. Renders nothing only when there is no account to name: non-Claude
  * sessions (Codex/Gemini) or a node with no active account.
  *
- * The full pointer-event isolation set mirrors the mute bell / queued indicator:
+ * The full pointer-event isolation set mirrors the former mute bell (now a kebab
+ * entry, #6660) / queued indicator:
  * the list card's row navigation fires from useLongPress's up-handlers, so every
  * pointer phase must stop here or a tap on the badge would ALSO open the session
  * (a latent sibling of the round-2 #87 bell bug).

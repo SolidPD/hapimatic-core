@@ -20,18 +20,31 @@ const STAKES_DOT: CSSProperties = {
 };
 const RISK_BARS: CSSProperties = { height: "9px", gap: "1px" };
 const RISK_BAR_HEIGHTS = ["4px", "6.5px", "9px"];
+const SIGNALS_STYLE: CSSProperties = { fontSize: "10.5px" };
+// #6458 (TITLE-D): the row's copy while the title wraps. It keeps its grid
+// column at no width, so the chevron stays in its own column, and is hidden
+// from sight and from screen readers; the facts line shows the signals.
+const STOWED_STYLE: CSSProperties = {
+  ...SIGNALS_STYLE,
+  width: 0,
+  overflow: "hidden",
+  visibility: "hidden",
+};
 
 /**
  * #6449: a pin row's signals (mockup v6 :154-162, :672-682) — blocking,
  * stakes, risk, the automatic-pick marker, and age — each an indicator with
  * its tooltip. One click-stopping wrapper keeps a tap on any of them (or on
- * its touch bubble) from toggling the row.
+ * its touch bubble) from toggling the row. #6458 (TITLE-D): `stowed` is the
+ * row's copy while an expanded pin's title wraps; the pin's facts line then
+ * shows the signals.
  */
 export function PinSignals(props: {
   model: PinViewModel;
   ageLabel: string;
   ageTooltip: string;
   armed: boolean;
+  stowed?: boolean;
 }) {
   const { model, ageLabel, ageTooltip, armed } = props;
   const { pin } = model;
@@ -43,8 +56,10 @@ export function PinSignals(props: {
   return (
     <span
       onClick={stopRowToggle}
+      data-pin-signals=""
+      aria-hidden={props.stowed ? true : undefined}
       className="inline-flex items-center gap-1.5 whitespace-nowrap text-[var(--app-hint)]"
-      style={{ fontSize: "10.5px" }}
+      style={props.stowed ? STOWED_STYLE : SIGNALS_STYLE}
     >
       {pin.blocking ? (
         <PinIndicator

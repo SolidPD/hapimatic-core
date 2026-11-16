@@ -23,6 +23,7 @@ import {
   browserOrHostTimeZone,
   submitPinAnswers,
 } from "../../sync/pinSubmission";
+import { isPromptPinLive, withRequestLive } from "../../sync/pinPromptMirror";
 import type { Session, SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
 import { pinsGate } from "../middleware/pinsGate";
@@ -246,7 +247,10 @@ export function createPinsRoutes(
         if (target.kind === "response") return target.response;
         if (target.kind === "local") {
           return c.json({
-            ...target.pins.list(target.session.id, query.data),
+            ...withRequestLive(
+              target.record,
+              target.pins.list(target.session.id, query.data)
+            ),
             timeZone: await getPreferenceTimeZone(),
           });
         }
@@ -303,7 +307,10 @@ export function createPinsRoutes(
         if (target.kind === "local") {
           const found = target.pins.get(target.session.id, key);
           return found
-            ? c.json({ ...found, timeZone: await getPreferenceTimeZone() })
+            ? c.json({
+                ...withRequestLive(target.record, found),
+                timeZone: await getPreferenceTimeZone(),
+              })
             : c.json({ error: "Pin not found" }, 404);
         }
         const result = await target.service.proxyPinRequest(
@@ -514,9 +521,12 @@ export function createPinsRoutes(
         if (target.kind === "response") return target.response;
         const key = c.req.param("key");
         if (target.kind === "local") {
+          const record = target.record;
           return pinWriteResponse(
             c,
-            target.pins.dismissForOperator(target.session, key)
+            target.pins.dismissForOperator(target.session, key, {
+              isRequestLive: k => isPromptPinLive(record, k),
+            })
           );
         }
         return proxyWrite(c, target.service, pinPath(key, "/dismiss"), "POST");

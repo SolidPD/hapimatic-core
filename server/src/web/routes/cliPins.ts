@@ -93,6 +93,8 @@ export function createCliPinRoutes(
     localNode?: () => { nodeId: string; nodeLabel: string } | null;
     /** #6574: this node's pin time zone, for a local by-ID hit. */
     getPreferenceTimeZone?: () => Promise<string | null>;
+    /** This node is a federated spoke (`isPinLookupLocalOnly`, #6458 Task 11i). */
+    localOnly?: boolean;
     errorLogger?: ErrorLogger | null;
   }
 ): Hono<CliEnv> {
@@ -652,6 +654,7 @@ export function createCliPinRoutes(
             registry: options.getNodeRegistry(),
             getTimeZone: options.getPreferenceTimeZone,
             localNode: options.localNode?.() ?? null,
+            localOnly: options.localOnly,
           }),
           c.get("namespace"),
           pinId

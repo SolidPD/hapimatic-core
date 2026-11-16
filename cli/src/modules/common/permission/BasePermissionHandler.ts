@@ -37,7 +37,18 @@ export type PermissionCompletion = {
   decision?: "approved" | "approved_for_session" | "denied" | "abort";
   allowTools?: string[];
   answers?: Record<string, string[]>;
+  /** The hub knew a session approved (`X-Hapi-Session-Id`, #6606 R18). */
+  answeredBy?: "session";
+  /**
+   * Set when an approval is declined because its answer set failed the check
+   * (#6606 R13): the reason, which the "permission" RPC returns to the hub so
+   * that the caller is told (#6606 round 9, F4).
+   */
+  answersDeclined?: string;
 };
+
+/** What the "permission" RPC returns: a declined answer set, or nothing. */
+export type PermissionRpcReply = { declined: true; reason: string } | undefined;
 
 export type CancelPendingRequestOptions = {
   completedReason: string;
@@ -123,6 +134,9 @@ export abstract class BasePermissionHandler<
             decision: completion.decision,
             allowTools: completion.allowTools,
             answers: completion.answers,
+            ...(completion.answeredBy
+              ? { answeredBy: completion.answeredBy }
+              : {}),
           },
         },
       };
@@ -157,7 +171,10 @@ export abstract class BasePermissionHandler<
   }
 
   private setupRpcHandler(): void {
-    this.client.rpcHandlerManager.registerHandler<TResponse, void>(
+    this.client.rpcHandlerManager.registerHandler<
+      TResponse,
+      PermissionRpcReply
+    >(
       "permission",
       async response => {
         const pending = this.pendingRequests.get(response.id);
@@ -172,6 +189,9 @@ export abstract class BasePermissionHandler<
 
         const completion = this.handlePermissionResponse(response, pending);
         this.finalizeRequest(response.id, completion);
+        return completion.answersDeclined === undefined
+          ? undefined
+          : { declined: true, reason: completion.answersDeclined };
       },
       PERMISSION_META
     );

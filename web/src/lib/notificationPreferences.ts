@@ -122,7 +122,12 @@ export function readMutedSessions(): Set<string> {
   }
 }
 
-/** Persist the muted-session id set to localStorage (try/catch-guarded). */
+/**
+ * Persist the muted-session id set to localStorage (try/catch-guarded), then
+ * tell every mute reader (issue #6660). The notice also goes out when the write
+ * threw, so a reader re-reads the stored truth rather than trusting the set it
+ * was handed.
+ */
 export function writeMutedSessions(ids: Set<string>): void {
   if (typeof window === "undefined") return;
   try {
@@ -130,6 +135,68 @@ export function writeMutedSessions(ids: Set<string>): void {
   } catch {
     // Ignore localStorage errors (quota / disabled store).
   }
+  notifyMutedSessions();
+}
+
+// Issue #6660: one shared muted-set store for every reader in the tab. Before
+// it, each `useMutedSessions` caller kept its own copy and built each toggle
+// from that copy, so muting a second session from another row (or the session
+// header) silently unmuted the first. The store stays React-free: the hook
+// binds it with `useSyncExternalStore`. Every writer already goes through
+// `writeMutedSessions` (the hook, the Settings Enable/Disable clear, the orphan
+// prune), so notifying there reaches them all; another tab's write arrives as
+// a `storage` event.
+const mutedListeners = new Set<() => void>();
+let mutedSnapshot: { raw: string | null; ids: ReadonlySet<string> } | null =
+  null;
+
+function readMutedRaw(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return localStorage.getItem(MUTED_SESSIONS_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function notifyMutedSessions(): void {
+  for (const listener of [...mutedListeners]) listener();
+}
+
+function onMutedStorage(event: StorageEvent): void {
+  // `key === null` is a `localStorage.clear()` in another tab.
+  if (event.key === MUTED_SESSIONS_KEY || event.key === null) {
+    notifyMutedSessions();
+  }
+}
+
+/**
+ * The muted-session set as stored now. It reads storage on every call and
+ * parses only when the stored string changed, so the same set object comes
+ * back until a write (the stable snapshot `useSyncExternalStore` needs), and a
+ * clear, a direct `setItem`, a failed write or another tab can never leave it
+ * stale.
+ */
+export function getMutedSessionsSnapshot(): ReadonlySet<string> {
+  const raw = readMutedRaw();
+  if (mutedSnapshot === null || mutedSnapshot.raw !== raw) {
+    mutedSnapshot = { raw, ids: readMutedSessions() };
+  }
+  return mutedSnapshot.ids;
+}
+
+/** Subscribe to muted-set changes; returns the unsubscribe function. */
+export function subscribeMutedSessions(listener: () => void): () => void {
+  mutedListeners.add(listener);
+  if (mutedListeners.size === 1 && typeof window !== "undefined") {
+    window.addEventListener("storage", onMutedStorage);
+  }
+  return () => {
+    mutedListeners.delete(listener);
+    if (mutedListeners.size === 0 && typeof window !== "undefined") {
+      window.removeEventListener("storage", onMutedStorage);
+    }
+  };
 }
 
 /**

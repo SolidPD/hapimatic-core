@@ -498,6 +498,9 @@ export class ApiMachineClient {
           // from the wire payload (the #1262 trap — an un-listed field is
           // silently dropped here, leaving the daemon to OMIT the marker).
           messageHooksEnabled,
+          // Issue #6458: destructure the server-stamped Pins gate (#1262 trap —
+          // un-listed here, a tmux-persisted session never gets the Pins block).
+          pinsEnabled,
           // Issue #3611: destructure the resolved optimal-account opt-in from the
           // wire payload (#1262 trap — un-listed here, the daemon reads undefined
           // and never runs the un-pinned optimal-pick, so R1 fails silently).
@@ -607,6 +610,9 @@ export class ApiMachineClient {
           // dormant). `undefined` is preserved as OMIT. Guarded by
           // apiMachine.spawnMessageHooks.test.ts.
           messageHooksEnabled,
+          // Issue #6458: forward the server-stamped Pins gate to the daemon
+          // spawnSession (#1262 trap). Guarded by apiMachine.spawnPins.test.ts.
+          pinsEnabled,
           // Issue #3611: forward the resolved optimal-account opt-in to the daemon
           // spawnSession (#1262 trap — omit it and the daemon never runs the
           // un-pinned optimal-pick). `undefined`/`false` ⇒ NO pick (#3023 unchanged).

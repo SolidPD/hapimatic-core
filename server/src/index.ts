@@ -16,7 +16,15 @@
  */
 
 import { join } from "node:path";
-import { createConfiguration, type ConfigSource } from "./configuration";
+import {
+  createConfiguration,
+  resolveDataPaths,
+  type ConfigSource,
+} from "./configuration";
+import {
+  acquireServerInstanceLock,
+  instanceLockLine,
+} from "./serverInstanceLock";
 import { Store } from "./store";
 import { TelemetryStore } from "./store/telemetryStore";
 import { createTelemetryExecutorFromEnv } from "./telemetry/executor";
@@ -43,7 +51,20 @@ import {
 } from "./sync/turnEnrichment";
 import { SyncEngine, type SyncEvent } from "./sync/syncEngine";
 import { type BillableMode, resolveBillableMode } from "./billable/mode";
-import { runBillableStartup } from "./store/billable/startup";
+import {
+  RUNNER_IDENTITY_ENFORCE_AVAILABLE,
+  describeRunnerIdentityMode,
+  pairWarning,
+  resolveRunnerIdentityMode,
+} from "./sync/runnerIdentityMode";
+import { liveSessionInput, RunnerIdentity } from "./sync/runnerIdentity";
+import { RunnerIdentityDaily } from "./store/runnerIdentityDaily";
+import {
+  CARRIED_FORWARD_ID_RULE,
+  runBillableStartup,
+} from "./store/billable/startup";
+import { readClockSynced } from "./billable/clockSync";
+import { MIRROR_BALANCE_RULE } from "./store/billable/intervalMirrorStore";
 import { QueueDrainObserver } from "./sync/queueDrainObserver";
 import { OrphanGrantObserver } from "./sync/orphanGrantObserver";
 import { SpendLimitNoticeObserver } from "./sync/spendLimitNoticeObserver";
@@ -74,7 +95,10 @@ import { scanFilesystemExtensions } from "./ext/fsLoader";
 import { extensions as builtinServerExtensions } from "./extensions.generated";
 import type { HeartbeatService } from "./extensions/heartbeat/heartbeatService";
 import { SystemEventQueue } from "./heartbeat/systemEvents";
-import { WorkflowReconcileService } from "./workflow/workflowReconcileService";
+import {
+  WorkflowReconcileService,
+  createLinkReconcileTrigger,
+} from "./workflow/workflowReconcileService";
 import { loadWorkflowReconcileConfig } from "./config/workflowReconcileConfig";
 import { InitiativeEventObserver } from "./sync/initiativeEventObserver";
 import { createPinDeadlineLoop } from "./sync/pinDeadlines";
@@ -172,6 +196,12 @@ import { startSinkReconciler } from "./feedback/sinkForward";
 import { resolveFeedbackSinkConfig } from "./config/serverSettings";
 import { initSentry } from "./sentry";
 import { VERSION } from "./version.generated"; // eslint-disable-line -- generated file
+import {
+  describeBillableSwitchGate,
+  resolveBillableSwitchGate,
+} from "./config/billableSwitchConfig";
+import { setProcessBillableSwitchGate } from "./federation/capabilityDetector";
+import { BillableSwitchService } from "./billableSwitch/billableSwitchService";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyBunServer = BunServer<any>;
@@ -263,6 +293,19 @@ let notificationService: NotificationService | null = null;
 async function main() {
   console.log("HAPI Server starting...");
 
+  // The server instance lock (issue #6651, Task G), before anything opens the
+  // database or writes settings: a second server process on the same database
+  // waits up to 90 s for the holder, then exits with code 75, having opened no
+  // database and written no settings (at most the lock file, when it did not
+  // exist). Never delete `<database>.server.lock` while a server runs.
+  const instanceLock = await acquireServerInstanceLock({
+    dbPath: resolveDataPaths().dbPath,
+    version: VERSION,
+    onWaiting: line => console.log(line),
+  });
+  console.log(instanceLockLine(instanceLock));
+  if (instanceLock.kind === "refused") process.exit(75);
+
   // Load configuration (async - loads from env/file with persistence)
   const config = await createConfiguration();
 
@@ -301,6 +344,16 @@ async function main() {
   }
 
   const store = new Store(config.dbPath);
+  // Issue #6646: the billable-sessions gate, resolved ONCE for this process
+  // (the store's readiness check has run by now). A node whose event table
+  // holds any row never runs dark: with the variable unset or not on it runs
+  // `closed`. Every reader takes this one value.
+  const billableSwitchGateState = resolveBillableSwitchGate({
+    storageReady: store.billableSwitchStorageReady,
+    hasEvents: () => store.billableSwitch.hasAnyEvent(),
+  });
+  console.log(describeBillableSwitchGate(billableSwitchGateState));
+  setProcessBillableSwitchGate(billableSwitchGateState);
   const telemetryStore = new TelemetryStore(
     join(config.dataDir, "telemetry.db")
   );
@@ -437,8 +490,27 @@ async function main() {
   // with a browser attached. Returns null (no-op) on prod/dev.
   sseManager.setPresenceHook(createWorktreePresenceTouch(config));
 
+  // Issue #6647 (Task 3, R9): the runner identity mode, read once here; no
+  // other module reads HAPI_RUNNER_IDENTITY. Logged beside the billable line.
+  const runnerIdentityResolved = resolveRunnerIdentityMode(
+    process.env.HAPI_RUNNER_IDENTITY,
+    { enforceAvailable: RUNNER_IDENTITY_ENFORCE_AVAILABLE }
+  );
+  // Issue #6647 (Task 4): the one runner identity registry, built before the
+  // socket server and handed to it and to the engine. Its build and hand-over
+  // time is the start-up timing line's `runnerIdentity` figure.
+  const runnerIdentityStartedAt = performance.now();
+  const runnerIdentity = new RunnerIdentity({
+    store: store.sessions,
+    mode: runnerIdentityResolved.mode,
+    logger: errorLogger,
+    resolution: runnerIdentityResolved,
+  });
+  let runnerIdentityMs = performance.now() - runnerIdentityStartedAt;
+
   const socketServer = createSocketServer({
     store,
+    runnerIdentity,
     jwtSecret,
     errorLogger,
     messageWriteRetryQueue,
@@ -482,6 +554,38 @@ async function main() {
     findNodeForSession: sessionId =>
       nodeRegistry?.findNodeForSession(sessionId) ?? null,
   });
+  // Issue #6647 (Task 4): the registry reads a session's sockets from the /cli
+  // room each time; it keeps no socket map of its own.
+  const runnerIdentityBindStartedAt = performance.now();
+  const cliNamespace = socketServer.io.of("/cli");
+  runnerIdentity.bindLiveSockets(sessionId => {
+    const room = cliNamespace.adapter.rooms.get(`session:${sessionId}`);
+    const sockets = [];
+    for (const id of room ?? []) {
+      const socket = cliNamespace.sockets.get(id);
+      if (socket) sockets.push({ id: socket.id, data: socket.data });
+    }
+    return sockets;
+  });
+  runnerIdentityMs += performance.now() - runnerIdentityBindStartedAt;
+
+  // Issue #6647 (Task 9a, ruling GATE): the daily snapshot, written now (part
+  // of the runnerIdentity figure), every five minutes on an unref'd timer, and
+  // at a graceful shutdown; nothing in off. No socket is connected yet, so this
+  // first write's node-wide count is 0; later writes read the engine.
+  const runnerIdentityDailyStartedAt = performance.now();
+  runnerIdentity.setDaily(new RunnerIdentityDaily(store.getRawDb(), jobNodeId));
+  const writeRunnerIdentityDaily = (boot: boolean): boolean =>
+    runnerIdentity.writeDailySnapshot({
+      boot,
+      unidentifiedLive: () =>
+        runnerIdentity.listUnidentifiedLive(
+          (syncEngine?.getSessions() ?? []).map(liveSessionInput)
+        ).length,
+    });
+  writeRunnerIdentityDaily(true);
+  runnerIdentity.startSnapshotTimer(() => writeRunnerIdentityDaily(false));
+  runnerIdentityMs += performance.now() - runnerIdentityDailyStartedAt;
 
   // Issue #5819 (D5 = B): stamp the cross-node placement marker on sessions
   // another node placed here before the fix. Runs once per database, after this
@@ -500,17 +604,33 @@ async function main() {
   const billableResolved = resolveBillableMode();
   let billableEffectiveMode: BillableMode = billableResolved.mode;
   let billableStartupCounts = "";
+  let legacyCarriedForwardRows = 0;
+  // Issue #6651 (the cap's record): read once per boot, bounded to one second,
+  // outside the step's transaction; a record, never a gate.
+  const clockSynced = readClockSynced();
   try {
+    const startupStartedAt = performance.now();
     const result = runBillableStartup(store.getRawDb(), {
       nodeId: jobNodeId,
       mode: billableResolved.mode,
       nowMs: Date.now(),
+      clockSynced,
     });
+    const startupMs = Math.round(performance.now() - startupStartedAt);
+    legacyCarriedForwardRows = result.legacyCarriedForwardRows;
+    // Issue #6651: the excess the step found, the rows written before the id
+    // rule, the step's time and the two rule constants.
     billableStartupCounts =
       ` openingBalanceRows=${result.openingBalanceRows}` +
       ` carriedForwardRows=${result.carriedForwardRows}` +
       ` repairedRows=${result.repairedRows}` +
-      ` timersChanged=${result.timersChanged}`;
+      ` timersChanged=${result.timersChanged}` +
+      ` excessSessions=${result.excessSessions}` +
+      ` excessMs=${result.excessMs}` +
+      ` legacyCarriedForwardRows=${result.legacyCarriedForwardRows}` +
+      ` startupMs=${startupMs}` +
+      ` carriedForwardIdRule="${CARRIED_FORWARD_ID_RULE}"` +
+      ` mirrorBalanceRule="${MIRROR_BALANCE_RULE}"`;
   } catch (error) {
     billableEffectiveMode = "off";
     errorLogger.error(
@@ -534,15 +654,57 @@ async function main() {
         : "") +
       billableStartupCounts
   );
+  console.log(describeRunnerIdentityMode(runnerIdentityResolved));
+  // Issue #6647 (Task 9): the status route reports the billable mode in force.
+  runnerIdentity.setBillableMode(billableEffectiveMode);
+  // Issue #6647 (Task 3, M4): billable time `on` without identity `enforce` is
+  // a persisted warning at every start, so a typo or a removed drop-in shows.
+  const runnerIdentityPairWarning = pairWarning(
+    billableEffectiveMode,
+    runnerIdentityResolved.mode
+  );
+  if (runnerIdentityPairWarning !== null) {
+    errorLogger.warn(runnerIdentityPairWarning, {
+      category: "runner-identity-mode",
+      context: {
+        billableMode: billableEffectiveMode,
+        runnerIdentityMode: runnerIdentityResolved.mode,
+      },
+    });
+  }
+  // Issue #6651: outside the try above, whose catch turns the boot `off`.
+  if (legacyCarriedForwardRows > 0) {
+    errorLogger.warn(
+      `${legacyCarriedForwardRows} carried_forward row(s) were written before the id rule of #6651: a restore from a backup taken before them makes them again under a new id, and a peer then counts them twice`,
+      {
+        category: "billable-intervals",
+        context: { legacyCarriedForwardRows },
+      }
+    );
+  }
+  // Issue #6647 (Task 0, R16): the silent step runs from the
+  // `[Server] billable intervals` line to the `[ext:loader] Loaded` line, and
+  // includes extension scanning and loading. `syncEngine` times only the
+  // constructor's synchronous work; async work it starts lands in silentStep.
+  const silentStepStartedAt = performance.now();
 
+  const syncEngineStartedAt = performance.now();
   syncEngine = new SyncEngine(
     store,
     socketServer.io,
     socketServer.rpcRegistry,
     sseManager,
     errorLogger,
-    { node: jobNodeId, jobRegistry, billableMode: billableEffectiveMode }
+    {
+      node: jobNodeId,
+      jobRegistry,
+      billableMode: billableEffectiveMode,
+      runnerIdentity,
+    }
   );
+  const syncEngineMs = performance.now() - syncEngineStartedAt;
+  // Issue #6646: never inside the constructor call (#6586 extends it).
+  syncEngine.setBillableSwitchGate(billableSwitchGateState);
 
   // Issue #1883: out-of-band session-fatal escalation (G3). The notifier shells
   // out to notify-pm.sh and no-ops (fail-open) if the script is absent. Wired via
@@ -686,6 +848,16 @@ async function main() {
       getCoreConfig: () => config,
     },
     [...builtinServerExtensions, ...fsServerEntries]
+  );
+
+  // Issue #6647 (Task 0, R16): one line per start that splits the silent step's
+  // time. runnerIdentity is the runner identity registry's build and hand-over
+  // (Task 4), outside the silent step; syncEngine lies inside it.
+  const silentStepMs = performance.now() - silentStepStartedAt;
+  console.log(
+    `[Server] start-up timing: syncEngine=${Math.round(syncEngineMs)}ms` +
+      ` runnerIdentity=${Math.round(runnerIdentityMs)}ms` +
+      ` silentStep=${Math.round(silentStepMs)}ms`
   );
 
   // #1271: boot-time observability for the extension system. Without this the
@@ -1041,6 +1213,17 @@ async function main() {
       jobRegistry,
     });
     workflowReconcileService.start();
+    // #2503 (B2, design B): the link trigger. Every local link write reaches
+    // SyncEngine.updateSessionLinkedIssue, which calls this listener; the
+    // trigger defers its work, stays silent while reconcile is disabled, and
+    // republishes only the linked session (createLinkReconcileTrigger).
+    reconcileEngine.setLinkedIssueListener(
+      createLinkReconcileTrigger({
+        service: workflowReconcileService,
+        getBadge: id => reconcileEngine.getSessionWorkflowBadge(id),
+        republish: id => reconcileEngine.refreshBillableSwitchSession(id),
+      })
+    );
   }
 
   // Skill-revamp 3.2 (#2157): the webhook gap detector — arbitrates push vs
@@ -1192,6 +1375,63 @@ async function main() {
     });
     healthAggregator.start();
   }
+
+  // Issue #6646 (Task 5): the billable switch's service, constructed after the
+  // engine exists (never inside the `new SyncEngine(` call) and after the
+  // federation block, so its late-bound registry is the one the hub polls with.
+  // Attached to the engine so every route and receiver reaches this instance.
+  const billableLocalIdentity = resolveLocalNodeIdentity(federationConfig);
+  const billableSwitchService = new BillableSwitchService({
+    store,
+    getRegistry: () => nodeRegistry,
+    getLocalNodeId: () => billableLocalIdentity.nodeId,
+    getLocalNodeLabel: () => billableLocalIdentity.nodeLabel,
+    getMode: () => billableSwitchGateState.mode,
+    getSession: id => syncEngine?.getSession(id),
+    refreshSession: id => syncEngine?.refreshBillableSwitchSession(id),
+    getRole: () => (federationConfig ? federationConfig.role : "node"),
+    sweepPendingByTag: () => syncEngine?.sweepPendingSpawnQueues(),
+  });
+  syncEngine.setBillableSwitchService(billableSwitchService);
+  if (billableSwitchGateState.mode === "on") {
+    // The start rule runs only while the gate is on; without a hook the insert
+    // writes the same row as before (not billable, no event), now inside one
+    // IMMEDIATE transaction (getOrCreateSessionWithFlag) on every node.
+    syncEngine.setBillableSwitchStartHook(input =>
+      billableSwitchService.resolveStartForInsert(input)
+    );
+  }
+  nodeRegistry?.setBillableSwitchHooks({
+    getMode: () => billableSwitchGateState.mode,
+    // Returns whether the stored report changed: the store is the service's.
+    onBillableSwitchHeaders: (nodeId, nodeLabel, headers, reportedAt) =>
+      billableSwitchService.recordPeerReport(
+        nodeId,
+        nodeLabel,
+        headers,
+        reportedAt
+      ),
+    onNodeRemoved: nodeId => billableSwitchService.onNodeRemoved(nodeId),
+    // Raised once per poll round in which a report changed; the 5-minute
+    // repeat is the service's own timer.
+    onBillableSwitchReportsChanged: () =>
+      billableSwitchService.onReportsChanged(),
+  });
+  // The other nodes never run evictNode: a received tombstone is where they
+  // drop the evicted node's report.
+  peerAnnouncer?.setOnNodeRemoved(nodeId => {
+    if (nodeRegistry) nodeRegistry.notifyBillableSwitchNodeRemoved(nodeId);
+    else billableSwitchService.onNodeRemoved(nodeId);
+  });
+  if (store.billableSwitchStorageReady) {
+    const pruned = billableSwitchService.pruneOnStart();
+    if (pruned.length > 0) {
+      console.log(
+        `[Server] Billable sessions: dropped the stored header reports of ${pruned.length} node(s) no longer in the mesh`
+      );
+    }
+  }
+  billableSwitchService.start();
 
   // Auto-recovery service (#1234, Epic #1231 Sub-Issue C). Constructed AFTER
   // both SyncEngine AND the federation NodeRegistry so the owning-node check
@@ -1582,6 +1822,8 @@ async function main() {
     getNodeRegistry: () => nodeRegistry,
     turnMirror: store.turnMirror,
     intervalMirror: store.intervalMirror, // issue #6586
+    // Issue #6646 (Task 7b): the copy of the other nodes' billable switch records.
+    billableSwitch: store.billableSwitch,
   });
 
   // Invoke extension startup callbacks (issue #1270, locked §3b) — AFTER all
@@ -1725,6 +1967,9 @@ async function main() {
     messageWriteRetryQueue?.stop();
     turnWriteService?.flush();
     turnWriteService?.stop();
+    // Issue #6647 (Task 9a, F8): retry pending record writes, then the last
+    // daily snapshot, before the engine stops.
+    runnerIdentity.shutdown(() => writeRunnerIdentityDaily(false));
     queueDrainObserver?.stop();
     orphanGrantObserver?.stop();
     spendNoticeObserver?.stop();

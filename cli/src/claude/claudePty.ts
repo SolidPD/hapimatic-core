@@ -20,6 +20,8 @@ export interface ClaudePtyOptions {
   claudeEnvVars?: Record<string, string>;
   claudeArgs?: string[];
   mcpServers?: Record<string, unknown>;
+  /** Issue #6458: this session's Pins gate; `true` adds the Pins block. Required (A1). */
+  pinsEnabled: boolean;
   allowedTools?: string[];
   hookSettingsPath: string;
   initialCols?: number;
@@ -101,7 +103,10 @@ export async function claudePty(
   // degradations: no change_title/image_fetch, no hook-driven thinking-state.
   const safeMode = opts.claudeArgs?.includes("--safe-mode") ?? false;
   if (!safeMode) {
-    args.push("--append-system-prompt", buildSystemPrompt(opts.path));
+    args.push(
+      "--append-system-prompt",
+      buildSystemPrompt(opts.path, { pinsEnabled: opts.pinsEnabled })
+    );
   }
 
   const cleanupMcpConfig = safeMode

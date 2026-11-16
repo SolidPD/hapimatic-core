@@ -7,6 +7,8 @@ import type { WebAppEnv } from "../middleware/auth";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { resolvePinsEnabled } from "../../config/pinsConfig";
+import { isBillableSwitchRoutePath } from "../../config/billableSwitchConfig";
+import type { BillableSwitchMode } from "@hapi/protocol";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { AvailabilityContext, CatalogEntry } from "@hapi/protocol";
 import {
@@ -105,6 +107,26 @@ function withoutClosedPinRoutes<
 }
 
 /**
+ * #6646: a hub whose billable-sessions gate is `off` answers 404 for the billable
+ * switch routes, so it must not advertise a peer's on that peer's behalf. Matches
+ * whole path segments only, so #6586's `/api/billable-time/...` is left alone.
+ */
+function withoutClosedBillableSwitchRoutes<C extends { rest: CatalogEntry[] }>(
+  peer: C,
+  mode: BillableSwitchMode
+): C {
+  if (mode === "on" || mode === "closed") return peer;
+  return {
+    ...peer,
+    rest: peer.rest.filter(
+      e =>
+        e.invocation.kind !== "rest" ||
+        !isBillableSwitchRoutePath(e.invocation.path)
+    ),
+  };
+}
+
+/**
  * Narrow a live catalog by `?domain=` / `?surface=`. `?surface=X` keeps only the
  * X section; `?domain=Y` keeps only entries whose `domain === Y` (dropping the
  * domain-less `rpc` and `uncatalogedRest` sections, which cannot match a domain).
@@ -171,8 +193,11 @@ export function createCapabilityCatalogRoutes(options: {
     caller: Caller;
     nodeVersion?: string;
   }) => AvailabilityContext;
+  /** #6646: this hub's effective billable-sessions gate (hides a peer's billable routes while `off`). */
+  billableSwitchMode?: BillableSwitchMode;
 }): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
+  const billableSwitchMode = options.billableSwitchMode ?? "off";
 
   app.get(
     "/capabilities/catalog",
@@ -247,7 +272,14 @@ export function createCapabilityCatalogRoutes(options: {
             // local domain/surface narrowing.
             const peer = (await resp.json()) as AnnotatedLiveCatalog;
             return c.json(
-              filterCatalog(withoutClosedPinRoutes(peer), domain, surface)
+              filterCatalog(
+                withoutClosedBillableSwitchRoutes(
+                  withoutClosedPinRoutes(peer),
+                  billableSwitchMode
+                ),
+                domain,
+                surface
+              )
             );
           }
           if (resp.status === 404) {
@@ -332,7 +364,14 @@ export function createCapabilityCatalogRoutes(options: {
             if (resp.ok) {
               const peer = (await resp.json()) as AnnotatedLiveCatalog;
               return c.json(
-                filterCatalog(withoutClosedPinRoutes(peer), domain, surface)
+                filterCatalog(
+                  withoutClosedBillableSwitchRoutes(
+                    withoutClosedPinRoutes(peer),
+                    billableSwitchMode
+                  ),
+                  domain,
+                  surface
+                )
               );
             }
             // Non-2xx from the owning node → fall through to the 404 below.

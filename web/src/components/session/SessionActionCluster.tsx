@@ -25,8 +25,16 @@
  * stays in the container and is reached via a callback prop — their tested
  * semantics are preserved verbatim through the reflow. The kebab's Copy Session
  * Info entry (#4480) is a callback too; the container owns the copy hook.
+ *
+ * Issue #6660: the per-session notifications mute moved here from the bell in
+ * the session row. The cluster builds that entry itself
+ * (`useSessionMuteEntry`) and appends it LAST, after Peers, so both surfaces
+ * get it from one place. The cluster is mounted on every list row (the details
+ * panel collapses by CSS), so the entry's device push check runs only while
+ * this cluster's menu is open.
  */
 import { useState } from "react";
+import { useSessionMuteEntry } from "@/hooks/useSessionMuteEntry";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Spinner } from "@/components/Spinner";
@@ -44,6 +52,8 @@ import { SessionKebabMenu, type SessionKebabEntry } from "./SessionKebabMenu";
 
 export type SessionActionClusterProps = {
   surface: "list" | "instance";
+  /** #6660: the session the kebab's notifications entry mutes. */
+  sessionId: string;
   /** session.active (instance) / online (list). Drives chain direction + R5. */
   isActive: boolean;
 
@@ -58,7 +68,8 @@ export type SessionActionClusterProps = {
   onDelete: () => void;
   onDisconnectAndDelete: () => Promise<void>;
 
-  // Kebab entries (D2(a)) — thin pointers into the container's handlers.
+  // Kebab entries (D2(a)) — thin pointers into the container's handlers. The
+  // last entry, notifications (#6660), is built by the cluster itself.
   onBranch: () => void;
   isBranching: boolean;
   isBranchDisabled: boolean;
@@ -88,6 +99,7 @@ export type SessionActionClusterProps = {
 
 export function SessionActionCluster({
   surface,
+  sessionId,
   isActive,
   onDisconnect,
   onReconnect,
@@ -111,6 +123,14 @@ export function SessionActionCluster({
 }: SessionActionClusterProps) {
   const [disconnectAndDeleteOpen, setDisconnectAndDeleteOpen] = useState(false);
   const isList = surface === "list";
+  // #6660: the menu's open state drives the mute entry's device push check; the
+  // container's own handler (#4480 prefetch) still hears every change.
+  const [kebabOpen, setKebabOpen] = useState(false);
+  const handleKebabOpenChange = (open: boolean) => {
+    setKebabOpen(open);
+    onKebabOpenChange?.(open);
+  };
+  const muteEntry = useSessionMuteEntry(sessionId, kebabOpen);
 
   // List card row-navigation fires from up-handlers, so a tap on any control
   // must stop here or it would ALSO open the session. Instance surface has no
@@ -174,6 +194,9 @@ export function SessionActionCluster({
           },
         ]
       : []),
+    // #6660: mute / unmute this session's notifications — always last (P3,
+    // confirmed by the Pins PM, 2026-11-13).
+    muteEntry,
   ];
 
   return (
@@ -236,11 +259,12 @@ export function SessionActionCluster({
         <TrashIcon className="h-5 w-5" />
       </Button>
 
-      {/* Kebab — Branch + Copy Session Info (extensible); list-hover Notes Preview. */}
+      {/* Kebab — Branch, Copy Session Info, Fan out?, Peers?, then the
+          notifications mute (#6660); list-hover Notes Preview. */}
       <SessionKebabMenu
         surface={surface}
         entries={kebabEntries}
-        onOpenChange={onKebabOpenChange}
+        onOpenChange={handleKebabOpenChange}
         notesValue={notesValue}
         sessionTitle={sessionTitle}
         isolatePointerEvents={isList}

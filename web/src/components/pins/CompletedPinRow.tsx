@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { memo, useCallback, type CSSProperties } from "react";
 import { Bot, Timer, User } from "lucide-react";
+import { FadeTruncate } from "@/components/session/FadeTruncate";
 import { PinDetail } from "@/components/pins/PinDetail";
 import {
   PIN_BOX_CLASS,
@@ -29,6 +30,7 @@ const RECEIPT_ICON: CSSProperties = { width: "11px", height: "11px" };
 // collapsed completed pin is still 30px tall.
 const ROW_STYLE: CSSProperties = { minHeight: "28px" };
 const CELL = "min-w-0 truncate";
+const TITLE_STYLE: CSSProperties = { fontSize: "12px" };
 
 function Receipt(props: { model: PinViewModel; armed: boolean }) {
   const receipt = completedReceipt(props.model.pin);
@@ -119,11 +121,12 @@ export const CompletedPinRow = memo(function CompletedPinRow(
         style={ROW_STYLE}
       >
         <PinKindBadge kind={pin.kind} armed={armed} />
-        <span
-          className={`${CELL} font-medium text-[var(--app-fg)]`}
-          style={{ fontSize: "12px" }}
-        >
-          {pin.title}
+        {/* #6458 (TITLE-D): the title fades at its edge, never an ellipsis. Its
+            12 px size sits on the cell, because FadeTruncate sets its own style. */}
+        <span className="flex min-w-0" style={TITLE_STYLE}>
+          <FadeTruncate className="font-medium text-[var(--app-fg)]">
+            {pin.title}
+          </FadeTruncate>
         </span>
         <span onClick={stopRowToggle} className={CELL}>
           <PinIndicator

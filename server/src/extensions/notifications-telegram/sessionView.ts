@@ -7,11 +7,26 @@
  */
 
 import { InlineKeyboard } from "grammy";
+import { isQuestionToolName } from "@hapi/protocol";
 import type { Session } from "../../sync/syncEngine";
-import { ACTIONS } from "./callbacks";
+import { ACTIONS, SHORT_REQUEST_ID } from "./callbacks";
 import { createCallbackData, truncate, getSessionName } from "./renderer";
 
 const MAX_TOOL_ARGS_LENGTH = 150;
+
+/**
+ * The id of the first pending request that is not a question tool, or null.
+ * A question (AskUserQuestion, an MCP server's form or link request) is
+ * answered on its own card, so no Allow button is ever bound to it (#6606, PM
+ * ruling P2-a).
+ */
+export function firstPermissionRequestId(session: Session): string | null {
+  const requests = session.agentState?.requests ?? {};
+  for (const [id, request] of Object.entries(requests)) {
+    if (request && !isQuestionToolName(request.tool)) return id;
+  }
+  return null;
+}
 
 /**
  * Format a compact session notification for permission requests
@@ -21,8 +36,8 @@ export function formatSessionNotification(session: Session): string {
   const lines: string[] = ["Permission Request", "", `Session: ${name}`];
 
   const requests = session.agentState?.requests;
-  if (requests) {
-    const reqId = Object.keys(requests)[0];
+  const reqId = firstPermissionRequestId(session);
+  if (requests && reqId !== null) {
     const req = requests[reqId];
     if (req) {
       lines.push(`Tool: ${req.tool}`);
@@ -39,6 +54,36 @@ export function formatSessionNotification(session: Session): string {
   return lines.join("\n");
 }
 
+/** Telegram's limit on a button's data, in bytes (not characters). */
+const CALLBACK_DATA_MAX_BYTES = 64;
+
+/**
+ * A button's data, naming the request by its whole id, which a tap matches
+ * exactly (#6606 round 9, F3: every Claude request id starts "toolu_01", so
+ * a cut id named several). An id the data cannot carry whole is named by its
+ * first `SHORT_REQUEST_ID` characters, as before (D1): one that does not fit
+ * the 64 bytes, counted in bytes, or that holds a ":", which
+ * `parseCallbackData` splits on.
+ */
+function requestButtonData(
+  action: string,
+  sessionId: string,
+  requestId: string
+): string {
+  const data = createCallbackData(action, sessionId, requestId);
+  const whole =
+    !requestId.includes(":") &&
+    data.endsWith(`:${requestId}`) &&
+    new TextEncoder().encode(data).length <= CALLBACK_DATA_MAX_BYTES;
+  return whole
+    ? data
+    : createCallbackData(
+        action,
+        sessionId,
+        requestId.slice(0, SHORT_REQUEST_ID)
+      );
+}
+
 /**
  * Create notification keyboard for quick actions
  */
@@ -47,17 +92,13 @@ export function createNotificationKeyboard(
   miniAppUrl: string
 ): InlineKeyboard {
   const keyboard = new InlineKeyboard();
-  const requests = session.agentState?.requests ?? null;
-  const hasRequests = Boolean(requests && Object.keys(requests).length > 0);
+  const requestId = firstPermissionRequestId(session);
   const canControl = session.active;
 
-  if (canControl && hasRequests) {
-    const requestId = Object.keys(requests!)[0];
-    const reqPrefix = requestId.slice(0, 8);
-
+  if (canControl && requestId !== null) {
     keyboard
-      .text("Allow", createCallbackData(ACTIONS.APPROVE, session.id, reqPrefix))
-      .text("Deny", createCallbackData(ACTIONS.DENY, session.id, reqPrefix));
+      .text("Allow", requestButtonData(ACTIONS.APPROVE, session.id, requestId))
+      .text("Deny", requestButtonData(ACTIONS.DENY, session.id, requestId));
     keyboard.row();
 
     keyboard.webApp(

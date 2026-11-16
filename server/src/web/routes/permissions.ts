@@ -9,7 +9,10 @@ import { z } from "zod";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
-import { refusePermissionResponse } from "./agentEscalation";
+import {
+  CALLER_SESSION_HEADER,
+  refusePermissionResponse,
+} from "./agentEscalation";
 import { cataloged } from "../../capabilities/cataloged";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
@@ -83,6 +86,14 @@ export function createPermissionsRoutes(
       // so a proxied (remote-node) request is refused on this hub too.
       const refusal = refusePermissionResponse(c, engine);
       if (refusal) return refusal;
+      // #6606 R18 (69-Q1-b): a caller that names its session approved as an
+      // agent. Read from the header only, after the floors pass; the body
+      // cannot set or clear it (approveBodySchema has no such key). The header
+      // is not authenticated, so its absence proves nothing.
+      const answeredBy =
+        (c.req.header(CALLER_SESSION_HEADER) ?? "").trim() !== ""
+          ? ("session" as const)
+          : undefined;
 
       const sessionResult = requireSessionFromParam(c, engine, {
         requireActive: true,
@@ -108,14 +119,22 @@ export function createPermissionsRoutes(
         const allowTools = parsed.data.allowTools;
         const decision = parsed.data.decision;
         const answers = parsed.data.answers;
-        await engine.approvePermission(
+        const declined = await engine.approvePermission(
           sessionId,
           requestId,
           mode,
           allowTools,
           decision,
-          answers
+          answers,
+          answeredBy
         );
+        // #6606 round 9 (F4): the CLI declined the answer set; say so.
+        if (declined) {
+          return c.json(
+            { error: "Answers declined", reason: declined.reason },
+            422
+          );
+        }
         return c.json({ ok: true });
       }
 
@@ -139,7 +158,14 @@ export function createPermissionsRoutes(
           try {
             resp = await fetch(
               `${node.url}/api/federation/sessions/${encodeURIComponent(sessionId)}/permissions/${encodeURIComponent(requestId)}/approve`,
-              { method: "POST", headers, body: JSON.stringify(parsed.data) }
+              {
+                method: "POST",
+                headers,
+                body: JSON.stringify({
+                  ...parsed.data,
+                  ...(answeredBy ? { answeredBy } : {}),
+                }),
+              }
             );
           } catch (error) {
             return proxyTransportFailure(c, error, {
@@ -156,7 +182,10 @@ export function createPermissionsRoutes(
             nodeId: node.nodeId,
           });
           if (read.failure) return read.failure;
-          return c.json(read.body, resp.status as 400 | 404 | 409 | 500 | 503);
+          return c.json(
+            read.body,
+            resp.status as 400 | 404 | 409 | 422 | 500 | 503
+          );
         }
       }
 

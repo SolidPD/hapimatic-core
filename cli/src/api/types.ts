@@ -297,6 +297,8 @@ export interface ServerToClientEvents {
   "terminal:close": (data: TerminalClosePayload) => void;
   "claude:pty-write": (data: ClaudePtyWritePayload) => void;
   "claude:pty-resize": (data: ClaudePtyResizePayload) => void;
+  /** Issue #6647 (R8): this runner was replaced; PR2 (Task 13) listens. */
+  "runner-superseded": (data: { code: "runner-superseded" }) => void;
   error: (data: {
     message: string;
     code?: SocketErrorReason;

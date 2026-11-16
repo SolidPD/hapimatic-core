@@ -3,7 +3,11 @@ import { execFileSync } from "node:child_process";
 import { trimIdent } from "@/utils/trimIdent";
 import { shouldIncludeCoAuthoredBy } from "./claudeSettings";
 import { configuration } from "@/configuration";
-import { renderTier0, capabilityCatalogIndex } from "@hapi/protocol";
+import {
+  renderTier0,
+  renderPinsPrimer,
+  capabilityCatalogIndex,
+} from "@hapi/protocol";
 import { buildDocsPointer } from "@/utils/hapimaticDocsPointer";
 
 /**
@@ -96,12 +100,25 @@ function detectDefaultBranch(cwd: string): string | null {
   }
 }
 
+/** Per-session inputs to the system prompt (#6458). */
+export interface SystemPromptOptions {
+  /**
+   * Whether this session's Pins gate is open. `true` appends the Pins block
+   * (`renderPinsPrimer`) after the docs pointer; `false` or absent renders no
+   * block, so a caller that does not know the gate never claims Pins.
+   */
+  pinsEnabled?: boolean;
+}
+
 /**
  * Build the system prompt, optionally including repo-specific context.
  * When cwd is provided, detects the actual default branch and injects it
  * to override Claude Code's built-in heuristic (which defaults to "main").
  */
-export function buildSystemPrompt(cwd?: string): string {
+export function buildSystemPrompt(
+  cwd?: string,
+  options: SystemPromptOptions = {}
+): string {
   const includeCoAuthored = shouldIncludeCoAuthoredBy();
 
   // Issue #3748 (Sub H, R4/R8): with Tier-0 injection ON (default) the folded
@@ -125,6 +142,14 @@ export function buildSystemPrompt(cwd?: string): string {
   const docsPointer = buildDocsPointer();
   if (docsPointer) {
     prompt += "\n\n" + docsPointer;
+  }
+
+  // Issue #6458 (PM-1): the Pins block, only where this session's Pins gate is
+  // open, independent of HAPI_CAPABILITY_TIER0 like the docs pointer. Outside
+  // Tier-0 (which cannot know a gate) with its own bound
+  // (PINS_PRIMER_BUDGET_CHARS).
+  if (options.pinsEnabled === true) {
+    prompt += "\n\n" + renderPinsPrimer(capabilityCatalogIndex);
   }
 
   if (includeCoAuthored) {

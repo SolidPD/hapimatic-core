@@ -23,6 +23,33 @@ import type { CommandDefinition } from "./types";
 
 const SELFTEST_TIMEOUT_MS = 20_000;
 
+/**
+ * Remove the scratch folder, retrying while Windows still holds it (#6458
+ * round 7). `stop()` terminates the worker without waiting, so its
+ * `telemetry.db` handle can outlive the call for a moment and the delete
+ * fails with EBUSY or EPERM. Bun parses rmSync's `maxRetries` but never
+ * retries, so the retry is here: up to `attempts` tries, `delayMs` apart.
+ */
+export async function removeScratchDir(
+  dir: string,
+  rm: typeof rmSync = rmSync,
+  attempts = 10,
+  delayMs = 100
+): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      rm(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (attempt >= attempts || (code !== "EBUSY" && code !== "EPERM")) {
+        throw err;
+      }
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function telemetryWorkerSelftest(): Promise<number> {
   const dir = mkdtempSync(join(tmpdir(), "hapi-selftest-"));
   let ok = false;
@@ -46,7 +73,7 @@ async function telemetryWorkerSelftest(): Promise<number> {
   } catch (err) {
     cause = err instanceof Error ? err.message : String(err);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await removeScratchDir(dir);
   }
   if (ok) {
     console.log("telemetry-worker selftest: ok");

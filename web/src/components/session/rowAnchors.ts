@@ -7,17 +7,24 @@
  *
  *   LEFT BLOCK  — Account Chip (Row 1) over Loop-Cron Chip (Row 2): one width
  *                 (`LOOP_CRON_SLOT_PX`), one shared left edge.
- *   RIGHT BLOCK — Node Badge (Row 1) over [Message Count · Bell] (Row 2): one
- *                 shared right edge (both rows are right-aligned in the same
- *                 `items-end` column).
+ *   RIGHT BLOCK — Node Badge (Row 1) over [Message Count · Pins Waiting] (Row
+ *                 2): one shared right edge (both rows are right-aligned in the
+ *                 same `items-end` column).
  *
- * Row 2 (right → left): [Bell 16] gap [Message Count 31 + r] gap [Loop-Cron 76],
+ * Row 2 (right → left): [Pins Waiting 25] gap [Message Count 31 + r] gap
+ * [Loop-Cron 76],
  * where `r` is the Node Badge's corner radius (`NODE_BADGE_RADIUS_CSS`): the
  * count slot is padded left by `r` so the bubble starts where the badge's
  * straight edge begins (round 10). E9 removed the reserved conditional-icon
  * slot that used to lead the row (the waiting `?` was dropped; the queued
  * signal is now the count bubble turning yellow), so Row 2 is exactly
- * (76 + 4 + 31 + 4 + 16) px + r = the Row-1 cluster.
+ * (76 + 4 + 31 + 4 + 25) px + r = 140px + r = the Row-1 cluster.
+ *
+ * Issue #6660: the notification bell (16px) left the row for the kebab menu,
+ * and its slot became the Pins Waiting slot (25px: an 11px pin glyph, a 1px
+ * gap and two tabular caption digits on the iPhone, variant D of the Pins
+ * mockup). Both blocks widened by the same 9px: the Row-1 cluster 131 → 140px
+ * and the Node Badge cell 51 → 60px, each plus the badge radius.
  *
  * The left block is 76px — the E9 mockup's `--chip-w` — not the E7 68px: the
  * Account Chip's fixed chrome (monogram + gaps + padding + border) measures
@@ -26,23 +33,24 @@
  * nickname with ≥2px to spare (measured on the deployed 393px card, 2026-09-06).
  *
  * The Tailwind classes on the slots stay literal (`w-[76px]`, `w-[31px]`,
- * `gap-1`, bell `p-0.5` + `h-3`) because Tailwind's JIT needs literal strings;
+ * `w-[25px]`, `gap-1`) because Tailwind's JIT needs literal strings;
  * `rowAnchors.test.ts` pins these constants to those literals so they cannot
  * drift apart silently.
  */
 export const LOOP_CRON_SLOT_PX = 76;
 export const MESSAGE_COUNT_SLOT_PX = 31;
-/** Bell button: `p-0.5` (2px) × 2 + `h-3 w-3` (12px) glyph. */
-export const BELL_PX = 16;
+/** Pins Waiting slot (#6660): an 11px pin glyph + 1px gap + two tabular
+ *  caption digits on the iPhone (variant D of the Pins session-list mockup). */
+export const PIN_COUNT_SLOT_PX = 25;
 /** `gap-1` between cluster members. */
 export const CLUSTER_GAP_PX = 4;
 
 /** The RIGHT block: the Node Badge is a fixed cell exactly as wide as the Row-2
- *  [Message Count · gap · Bell] span beneath it, label centered (E8: "node badge
+ *  [Message Count · gap · Pins Waiting] span beneath it, label centered (E8: "node badge
  *  … centered"; E9: "one width, one right edge"). Integer part only — see
  *  `plusNodeBadgeRadius` for the rendered width. */
 export const NODE_BADGE_CELL_PX =
-  MESSAGE_COUNT_SLOT_PX + CLUSTER_GAP_PX + BELL_PX;
+  MESSAGE_COUNT_SLOT_PX + CLUSTER_GAP_PX + PIN_COUNT_SLOT_PX;
 
 /** Width of the Row-1 right cluster [Account Chip … Node Badge] — equal to the
  *  Row-2 cluster, so the two rows share BOTH edges (the E9 two-block layout).
@@ -52,7 +60,7 @@ export const ROW1_RIGHT_CLUSTER_PX =
   CLUSTER_GAP_PX +
   MESSAGE_COUNT_SLOT_PX +
   CLUSTER_GAP_PX +
-  BELL_PX;
+  PIN_COUNT_SLOT_PX;
 
 /**
  * The Node Badge's corner radius — Tailwind `rounded-md` = `--radius-md`, which
@@ -84,9 +92,10 @@ export function plusNodeBadgeRadius(px: number): string {
 export const ROW1_GAP_PX = 7;
 /** Gap inside the Row-1 right cluster (Account Chip ↔ Node Badge). MUST equal
  *  the Row-2 `CLUSTER_GAP_PX`: the cluster is `ROW1_RIGHT_CLUSTER_PX` wide
- *  (76 + 4 + 51), so a 5px gap (the E6 `.cluster` seating) overflowed it by 1px
- *  and pushed the Node Badge cell 1px right of the [count · bell] span beneath
- *  it — both block edges must coincide (measured 2026-09-07: 299 vs 298). */
+ *  (76 + 4 + 60 since #6660; 76 + 4 + 51 when measured), so a 5px gap (the E6
+ *  `.cluster` seating) overflowed it by 1px and pushed the Node Badge cell 1px
+ *  right of the Row-2 span beneath it — both block edges must coincide
+ *  (measured 2026-09-07: 299 vs 298). */
 export const ROW1_CLUSTER_GAP_PX = CLUSTER_GAP_PX;
 /** Vertical gap between Row 1 and Row 2 — list card. */
 export const ROW_GAP_LIST_PX = 5;

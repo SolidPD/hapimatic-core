@@ -682,6 +682,28 @@ export function createPinTools(deps: CapabilityToolDeps) {
     if (!outcome.ok) {
       const body = asRecord(outcome.body);
       const code = typeof body?.code === "string" ? body.code : null;
+      if (
+        outcome.status === 404 &&
+        code === "pin_not_found" &&
+        body?.localOnly === true
+      ) {
+        // #6458 Task 11i: this session's node is a federation spoke, which
+        // cannot ask the other nodes, so the miss is not "no such pin" and a
+        // retry here cannot help.
+        return result(
+          {
+            ok: false,
+            status: 404,
+            code,
+            id: pinId,
+            localOnly: true,
+            error:
+              "No pin has that ID on this node, and this node cannot search the other nodes.",
+          },
+          true,
+          "If the pin is on another node, ask the operator to look it up from the hub's Pins search; the ID may also be mistyped."
+        );
+      }
       if (outcome.status === 404 && code === "pin_not_found") {
         const notAsked = NodeLabelsSchema.safeParse(body?.notAsked);
         const offline = notAsked.success

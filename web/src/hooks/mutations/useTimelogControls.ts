@@ -13,11 +13,11 @@ import type {
  * `timelog_adjustments` row via `POST /api/timelogs/adjustments`. On success it
  * invalidates every query whose key starts with `"time-log"` — that covers the
  * legacy summaries, the derived read, and the adjustments ledger, so the modal
- * + clock display refresh once the cutover gate is green.
+ * and the clock display refresh.
  *
- * DORMANT until the gate opens: the `SessionTimer` clock menu only renders these
- * controls when `useTimelogCutoverStatus().ready` is true, so this hook has no
- * user-visible effect on the legacy path.
+ * The `SessionTimer` clock menu has rendered these controls unconditionally
+ * since #1892 (`SessionTimer.test.tsx`); the derived read they feed is the Time
+ * Log's only read path since #6675.
  */
 export function useTimelogControls(api: ApiClient | null): {
   submit: (req: TimelogAdjustmentRequest) => Promise<TimelogAdjustmentRow>;

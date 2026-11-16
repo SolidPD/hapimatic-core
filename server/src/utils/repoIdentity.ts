@@ -6,6 +6,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { GIT_REMOTE_TIMEOUT_MS, parseGitRemoteUrl } from "@hapi/protocol";
 
 export type RepoIdentity = {
   name: string;
@@ -77,36 +78,6 @@ export function isGitRepo(directory: string): boolean {
   }
 }
 
-function parseGitRemoteUrl(
-  remoteUrl: string
-): { name: string; url?: string } | null {
-  const trimmed = remoteUrl.trim();
-
-  // SSH format: git@github.com:owner/repo.git
-  const sshMatch = trimmed.match(/^git@([^:]+):([^/]+)\/(.+?)(?:\.git)?$/);
-  if (sshMatch) {
-    const [, host, owner, repo] = sshMatch;
-    const name = `${owner}/${repo}`;
-    const isGitHub = host === "github.com";
-    return {
-      name,
-      url: isGitHub ? `https://github.com/${name}` : `https://${host}/${name}`,
-    };
-  }
-
-  // HTTPS format: https://github.com/owner/repo.git
-  const httpsMatch = trimmed.match(
-    /^https?:\/\/([^/]+)\/([^/]+)\/(.+?)(?:\.git)?$/
-  );
-  if (httpsMatch) {
-    const [, host, owner, repo] = httpsMatch;
-    const name = `${owner}/${repo}`;
-    return { name, url: `https://${host}/${name}` };
-  }
-
-  return null;
-}
-
 export function resolveRepoIdentity(
   directory: string
 ): RepoIdentity | undefined {
@@ -126,7 +97,8 @@ export function resolveRepoIdentity(
       // Bumped from 3000ms: `git` on a CIFS mount (e.g. /mnt/netshare,
       // cache=none) can take 6+ seconds for a cold round-trip to the NAS,
       // which exceeded the old 3s timeout under load and poisoned the cache.
-      timeout: 10000,
+      // Issue #6646: one budget shared with the CLI's resolver.
+      timeout: GIT_REMOTE_TIMEOUT_MS,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
 

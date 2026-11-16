@@ -96,6 +96,26 @@ const THINKING_INTERVAL_CHANGE_SEQ_DDL = `
 `;
 
 /**
+ * `billable_lost_writes`: the totals of interval writes lost since this table was
+ * created, kept across restarts so a daily check lists a loss made by a process
+ * that stopped before its next check (#6670); nothing billed reads it. One row:
+ * `set_aside_total` counts opens, closes and stretch rows set aside after three
+ * attempts; `left_at_stop_total` counts those still queued when a graceful stop's
+ * flush ended. The seed is `INSERT OR IGNORE`, never `OR REPLACE`, because this
+ * block runs at every boot and a replace would zero the totals.
+ */
+const BILLABLE_LOST_WRITES_DDL = `
+  CREATE TABLE IF NOT EXISTS billable_lost_writes (
+    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    set_aside_total    INTEGER NOT NULL,
+    left_at_stop_total INTEGER NOT NULL,
+    updated_at_ms      INTEGER NOT NULL
+  );
+  INSERT OR IGNORE INTO billable_lost_writes (id, set_aside_total, left_at_stop_total, updated_at_ms)
+    VALUES (1, 0, 0, 0);
+`;
+
+/**
  * `billable_shadow_stretches`: the old clock's stretches, written in `shadow`
  * only, beside the tracker's three measurements of each and the wait the
  * session's own request records give for it.
@@ -204,6 +224,7 @@ export function applyBillableMigrations(db: Database): void {
     "thinking_interval_change_seq",
     THINKING_INTERVAL_CHANGE_SEQ_DDL
   );
+  applyBlock(db, "billable_lost_writes", BILLABLE_LOST_WRITES_DDL);
   applyBlock(db, "billable_shadow_stretches", BILLABLE_SHADOW_STRETCHES_DDL);
   applyBlock(db, "billable_reconcile", BILLABLE_RECONCILE_DDL);
   applyBlock(db, "thinking_intervals_mirror", THINKING_INTERVALS_MIRROR_DDL);

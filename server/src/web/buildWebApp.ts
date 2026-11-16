@@ -30,6 +30,7 @@ import { Database } from "bun:sqlite";
 import { serveStatic } from "hono/bun";
 import { configuration } from "../configuration";
 import { VERSION } from "../version.generated"; // eslint-disable-line -- generated file
+import { isPinLookupLocalOnly } from "../sync/pinById";
 import type { SyncEngine } from "../sync/syncEngine";
 import { createAuthMiddleware, type WebAppEnv } from "./middleware/auth";
 import {
@@ -51,6 +52,7 @@ import { createExtensionAdminRoutes } from "./routes/extensionAdmin";
 import { createBookmarksRoutes } from "./routes/bookmarks";
 import { createCliPinRoutes } from "./routes/cliPins";
 import { createPinsRoutes } from "./routes/pins";
+import { createBillableSwitchRoutes } from "./routes/billableSwitch";
 import { createPinByIdRoutes } from "./routes/pinById";
 import { createPinDashboardsRoutes } from "./routes/pinDashboards";
 import { resolvePinsEnabled } from "../config/pinsConfig";
@@ -65,7 +67,7 @@ import {
 import { AuditLog, initProvisioner, SYSTEM_ACTOR } from "../provisioner";
 import { createExtWebRoutes } from "./routes/extWeb";
 import type { HonoRouteFactory } from "@hapi/protocol/ext";
-import type { CatalogEntry } from "@hapi/protocol";
+import type { BillableSwitchMode, CatalogEntry } from "@hapi/protocol";
 import { createEventsRoutes } from "./routes/events";
 import { createSessionsRoutes } from "./routes/sessions";
 import { createCapabilitiesRoutes } from "./routes/capabilities";
@@ -404,6 +406,11 @@ export function buildWebApp(options: {
    * staleness against.
    */
   const capabilitiesDetectedAt = new Date().toISOString();
+  // Issue #6646: the billable-sessions gate, read ONCE at mount from the engine
+  // (index.ts sets it right after constructing the engine, before the web app is
+  // built). `off` when there is no engine (a bare test app).
+  const billableSwitchMode: BillableSwitchMode =
+    options.getSyncEngine()?.getBillableSwitchMode?.() ?? "off";
   const availabilityContextFactory = (args: {
     session?: SessionLike;
     caller: Caller;
@@ -553,6 +560,8 @@ export function buildWebApp(options: {
       getPreferenceTimeZone: () =>
         resolvePinPreferenceTimeZone(configuration.dataDir),
       errorLogger: options.errorLogger,
+      // #6458 Task 11i: a spoke's by-ID miss says it searched only this node.
+      localOnly: isPinLookupLocalOnly(options.federationConfig),
     })
   );
 
@@ -575,7 +584,7 @@ export function buildWebApp(options: {
   // Auth for this route IS the handoff token — it is on the middleware skip list.
   app.route("/api", createGoogleOAuthRoutes(options.errorLogger));
   app.route("/api", createBindRoutes(options.jwtSecret, options.store));
-  app.route("/api", createVersionRoutes());
+  app.route("/api", createVersionRoutes({ billableSwitchMode }));
   app.route("/api", createLauncherRoutes());
   // #5444: /api/system-health also accepts the monitoring sweep's read-only
   // health token, read live from settings.json (delete = revoke, replace = rotate).
@@ -1104,6 +1113,17 @@ export function buildWebApp(options: {
     })
   );
 
+  // Issue #6646: the billable switch routes. Like the pins above, the MOUNT
+  // POSITION (after the JWT middleware) is the auth; each route carries the gate.
+  app.route(
+    "/api",
+    createBillableSwitchRoutes(options.getSyncEngine, {
+      billableSwitchMode,
+      getSessionService: getPinSessionService,
+      getNodeRegistry: options.getNodeRegistry,
+    })
+  );
+
   // Issue #6454: the Project Manager dashboards across the federation. The MOUNT
   // POSITION is the auth, as for the pin routes above.
   app.route(
@@ -1127,6 +1147,7 @@ export function buildWebApp(options: {
       getPreferenceTimeZone: () =>
         resolvePinPreferenceTimeZone(configuration.dataDir),
       errorLogger: options.errorLogger,
+      localOnly: isPinLookupLocalOnly(options.federationConfig),
     })
   );
 
@@ -1279,6 +1300,8 @@ export function buildWebApp(options: {
       getLocalNode: localNode,
       // Issue #5879: the rebind account-headroom check reads this node's usage.
       getUsageService: () => usageService,
+      // Issue #6646: the Keep all route's gate.
+      billableSwitchMode,
     })
   );
   // Issue #2418 (epic #2416 B): capability enumeration read path. Same federation
@@ -1300,6 +1323,7 @@ export function buildWebApp(options: {
   app.route(
     "/api",
     createCapabilityCatalogRoutes({
+      billableSwitchMode,
       getCatalog: () => liveCatalogProvider?.() ?? null,
       getNodeRegistry: options.getNodeRegistry,
       federationApiToken: options.federationApiToken,
@@ -2004,8 +2028,14 @@ export function buildWebApp(options: {
     getRpcRegistry: options.getRpcRegistry,
     errorLogger: options.errorLogger,
     extensionEntries: options.extensionCatalogEntries,
-    // #6448: the pin tools are listed only where Pins is on.
-    openGates: resolvePinsEnabled() ? ["pins"] : [],
+    // #6448: the pin tools are listed only where Pins is on. #6646: the agents'
+    // billable verb only where billable sessions are `on` or `closed`.
+    openGates: [
+      ...(resolvePinsEnabled() ? (["pins"] as const) : []),
+      ...(billableSwitchMode === "on" || billableSwitchMode === "closed"
+        ? (["billable-switch"] as const)
+        : []),
+    ],
   });
   // #3744 (Sub-Issue D): build the audit provider on the SAME fully-mounted `app`
   // (walks the identical route table `buildCatalogProvider` sees), for the same

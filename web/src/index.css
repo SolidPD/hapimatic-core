@@ -49,21 +49,16 @@
   /* Density tokens — driven by useDensity hook; default matches 'normal' */
   --row-padding-y: 6px;
 
-  /* Status-cluster alignment (#3484). The router.tsx toolbar accumulator
-     cluster is pinned to --status-cluster-w so its four flex-1 columns no longer
-     follow the timer text's width (a "1h 23m" timer made it 57.9px, "12h 34m"
-     wider — so nothing below could align with it by construction). Every
-     SubheadingBar's far-left cluster box is the SAME width minus the structural
-     inset the card pattern imposes on a subheading (its own 4px rail + the 1px
-     card hairline = 5px), so the RIGHTMOST column of every subheading bar lands
-     exactly under the toolbar's rightmost column, and all bars agree with each
-     other. 60px fits a two-digit count in every column ("9•9•9•99" measures
-     57.6px at 10px tabular). */
-  --status-cluster-w: 60px;
+  /* Status-cluster alignment (#3484). The router.tsx toolbar accumulator and
+     every SubheadingBar's far-left cluster render the same four columns, each
+     reserving its own width (STATUS_COUNT_COLUMN_CLASS in SessionCountBadge.tsx:
+     two digits for the first three counts, three for inactive), so the two
+     clusters are the same width whatever the font. The card pattern insets a
+     subheading by its own 4px rail + the 1px card hairline = 5px; the toolbar
+     cluster is padded left by this token so both start at the same x and every
+     column of every bar lands under the toolbar's column. This replaced a fixed
+     60px box sized for "9•9•9•99", which a three-digit inactive count overflowed. */
   --subheading-rail-inset: 5px;
-  --subheading-cluster-w: calc(
-    var(--status-cluster-w) - var(--subheading-rail-inset)
-  );
 }
 
 @layer base {

@@ -17,6 +17,7 @@ import type {
 } from "./schemas";
 import type { ClaudeRemoteLauncherKind } from "./launcherResolver";
 import type { McpSet } from "./mcpSet";
+import { isQuestionToolName } from "./questionTools";
 
 /**
  * Recovery status for sessions that persist across restarts
@@ -24,16 +25,15 @@ import type { McpSet } from "./mcpSet";
 export type RecoveryStatus = "none" | "recovering" | "recovered" | "failed";
 
 /**
- * Check if any pending request is an AskUserQuestion tool.
- * This indicates Claude is waiting for user input and timers should pause.
+ * Check if any pending request is a question tool (AskUserQuestion, its
+ * Codex/ACP name, or an MCP server's form or link request, #6606). This
+ * indicates the agent is waiting for user input and timers should pause.
  */
 export function checkIsWaitingForUserQuestion(
   agentState: AgentState | null | undefined
 ): boolean {
   const requests = agentState?.requests ?? {};
-  return Object.values(requests).some(
-    r => r.tool === "AskUserQuestion" || r.tool === "ask_user_question"
-  );
+  return Object.values(requests).some(r => isQuestionToolName(r.tool));
 }
 
 /**
@@ -279,6 +279,14 @@ export type SessionSummary = {
   needsReviewOverride?: "read" | "unread" | null;
   /** Per-session auto-recover override: null=follow global, true=force on, false=force off */
   autoRecoverFromApiError?: boolean | null;
+  /**
+   * Issue #6646: the billable switch. Absent means the switch cannot be read
+   * (an older owning node, switch storage not ready, a session still
+   * starting): unknown, never "non-billable".
+   */
+  billable?: boolean;
+  /** Issue #6646: `"pending"` while the session waits under "To confirm". */
+  billableConfirm?: "pending" | null;
   /** UI collapse state for prompt/notes sections (cross-device sync) */
   uiCollapseState?: UiCollapseState | null;
   /** Federation: originating node ID (only present for remote sessions) */
@@ -421,5 +429,11 @@ export function toSessionSummary(
     workflowBadge: workflowBadge ?? null,
     // Spread only when defined, so a closed Pins gate produces no key at all.
     ...(openPinCount !== undefined ? { openPinCount } : {}),
+    // Issue #6646: spread only when the session carries them, so an absent
+    // switch (unknown) stays absent and never reads as non-billable.
+    ...(session.billable !== undefined ? { billable: session.billable } : {}),
+    ...(session.billableConfirm !== undefined
+      ? { billableConfirm: session.billableConfirm }
+      : {}),
   };
 }

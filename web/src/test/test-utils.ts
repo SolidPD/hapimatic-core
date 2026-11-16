@@ -201,8 +201,7 @@ export function createMockApiClient(): Record<string, Mock> {
     getTimeLogDailySummary: vi.fn(),
     getTimeLogProjects: vi.fn(),
     getTimeLogProjectGrouped: vi.fn(),
-    // Issue #1670 (PR-2): six-control ledger + derived read + cutover gate.
-    getTimelogCutoverStatus: vi.fn(),
+    // Issue #1670 (PR-2): six-control ledger + derived read.
     getDerivedTimeLog: vi.fn(),
     getTimelogAdjustments: vi.fn(),
     postTimelogAdjustment: vi.fn(),

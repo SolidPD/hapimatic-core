@@ -34,6 +34,12 @@ import {
   snapshotSessionLists,
   type SessionListSnapshots,
 } from "@/lib/sessionListOptimistic";
+import { summarizeBulkDelete } from "@/lib/bulkSessionToast";
+import {
+  bulkDeleteProgressNote,
+  runBulkDeleteRounds,
+  snapshotNodeOf,
+} from "./useBulkSessionAction";
 
 /**
  * Collect all descendant session IDs (children, grandchildren, etc.)
@@ -152,7 +158,7 @@ export function useSessionActions(
   isDeleting: boolean;
 } {
   const queryClient = useQueryClient();
-  const { showToast } = useToast();
+  const { showToast, clearToast } = useToast();
 
   // Issue #3516: `isDeleting` is driven by the delete wrappers (below), NOT a
   // useMutation observer. Navigate-first unmounts SessionHeader the instant
@@ -915,10 +921,11 @@ export function useSessionActions(
     removeSessionRows(queryClient, ids);
 
     try {
-      // Archive active descendants (raw api — survives the unmount), then chunk
-      // the bulk-delete by the 100-id server cap. Per-descendant archive failures
-      // are swallowed (a still-active descendant comes back as `skipped` below).
-      const skipped: string[] = [];
+      // Archive active descendants (raw api — survives the unmount), then run
+      // Select mode's round loop (#6681 R13: chunked by the 100-id server cap,
+      // ids the hub did not send go again in later rounds). Per-descendant
+      // archive failures are swallowed (a still-active descendant comes back
+      // as `session_active` below).
       for (const id of activeDescendantIds) {
         try {
           await api.archiveSession(id);
@@ -929,29 +936,31 @@ export function useSessionActions(
           );
         }
       }
-      for (let i = 0; i < ids.length; i += 100) {
-        const res = await api.bulkDeleteSessions(ids.slice(i, i + 100));
-        // #3815: `skipped` is a COUNT on the wire — spreading it threw after the
-        // server had already deleted the rows, so every cascade toasted a false
-        // failure. The per-session `results` name the ids that were kept.
-        skipped.push(...res.results.filter(r => !r.ok).map(r => r.id));
-      }
-      const skippedSet = new Set(skipped);
-      // Drop the per-session caches only for the ids the server actually deleted.
-      dropSessionDetailCaches(
-        queryClient,
-        ids.filter(id => !skippedSet.has(id))
-      );
-      // Partial failure: the server kept some rows (still-active / unknown). The
-      // call RESOLVED, so without this those rows would only reappear on the
-      // finally's refetch — restore EXACTLY the skipped rows now and toast (R3).
-      if (skipped.length > 0) {
-        restoreSessionRowsById(queryClient, snap, skipped);
-        const n = skipped.length;
-        showToast(`${n} session${n === 1 ? "" : "s"} could not be deleted`, {
-          type: "error",
-          ...viewSessionToastAction(),
-        });
+      const note = bulkDeleteProgressNote(showToast, clearToast);
+      const run = await runBulkDeleteRounds({
+        api,
+        ids,
+        nodeOf: snapshotNodeOf(snap),
+        mark: true,
+        onProgress: note.onProgress,
+      }).finally(note.end);
+      // Drop the per-session caches only for the ids the server deleted.
+      dropSessionDetailCaches(queryClient, run.deleted);
+      // Partial outcome: the server kept some rows, or is still deleting them
+      // (D1 = 1). The call RESOLVED, so without this those rows would only
+      // reappear on the finally's refetch — restore EXACTLY them now and toast.
+      const kept = [
+        ...run.failures.map(f => f.id),
+        ...run.stillDeleting.map(s => s.id),
+      ];
+      if (kept.length > 0) {
+        restoreSessionRowsById(queryClient, snap, kept);
+        const { message, type } = summarizeBulkDelete(
+          run.deleted.length,
+          run.failures,
+          run.stillDeleting
+        );
+        showToast(message, { type, ...viewSessionToastAction() });
       }
     } catch (err) {
       // Full failure: roll the whole optimistic removal back + toast (R3/R4).

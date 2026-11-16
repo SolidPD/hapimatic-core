@@ -36,6 +36,12 @@ export type StoredSession = {
   contextPercentage: number | null;
   needsReviewOverride: "read" | "unread" | null;
   autoRecoverFromApiError: boolean | null;
+  /**
+   * Issue #6646: the billable switch. Undefined when the node's switch storage
+   * is not ready (the switch cannot be read: "unknown", never non-billable).
+   */
+  billable?: boolean;
+  billableConfirm?: "pending" | null;
   uiCollapseState: UiCollapseState | null;
   messageCount?: number;
   /** Branching: parent session ID (this session was forked from) */

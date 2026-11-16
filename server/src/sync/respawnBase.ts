@@ -74,6 +74,9 @@ export function buildRespawnBase(
     claimPort: true,
     resumeSessionId: args.claudeSessionId ?? undefined,
     hapiSessionId: args.sessionTag,
+    // Issue #6646: a respawn keeps its row (same tag), so the switch stays; this
+    // matters only if a respawn ever creates a new row, which then inherits.
+    billableSwitchStart: { kind: "inherit", fromSessionId: session.id },
     name: session.metadata?.name,
     sessionType: "simple",
     accountUuid: session.metadata?.accountUuid,

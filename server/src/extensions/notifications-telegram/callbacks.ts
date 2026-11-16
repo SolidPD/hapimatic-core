@@ -18,6 +18,13 @@ export const ACTIONS = {
 } as const;
 
 /**
+ * How many characters of a request id a button carried before #6606 round 9,
+ * and still carries for an id it cannot carry whole: one over the 64 bytes
+ * of a button's data, or one that holds a ":" (round 9, D1).
+ */
+export const SHORT_REQUEST_ID = 8;
+
+/**
  * Callback handler context
  */
 export interface CallbackContext {
@@ -129,22 +136,28 @@ export async function handleCallback(
 }
 
 /**
- * Find request ID by prefix
+ * The pending request a button names. A button carries the whole request id
+ * (#6606 round 9, F3); a pending id it equals is that request. A button sent
+ * before that, or for an id it cannot carry whole (D1), carries the id's
+ * first `SHORT_REQUEST_ID` characters, which name the one pending id that
+ * starts with them, or none when several do. A carried id that is not
+ * pending is read by the same prefix rule when it has `SHORT_REQUEST_ID`
+ * characters or fewer, so a stale whole id that short can still name another
+ * pending id that starts with it, as before this round (D2); a longer one
+ * names nothing. There is no fallback to another request, so a stale tap
+ * otherwise answers "not found" and resolves nothing (#6606, PM ruling
+ * P2-a).
  */
 function findRequestByPrefix(
   session: Session,
   prefix: string
 ): string | undefined {
   const requests = session.agentState?.requests;
-  if (!requests) return undefined;
-
-  for (const reqId of Object.keys(requests)) {
-    if (reqId.startsWith(prefix)) {
-      return reqId;
-    }
-  }
-
-  // If no prefix match, return the first request
-  const keys = Object.keys(requests);
-  return keys.length > 0 ? keys[0] : undefined;
+  if (!requests || prefix.length === 0) return undefined;
+  if (Object.hasOwn(requests, prefix)) return prefix;
+  if (prefix.length > SHORT_REQUEST_ID) return undefined;
+  const matches = Object.keys(requests).filter(reqId =>
+    reqId.startsWith(prefix)
+  );
+  return matches.length === 1 ? matches[0] : undefined;
 }

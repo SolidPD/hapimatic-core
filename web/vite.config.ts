@@ -40,8 +40,8 @@ const appName = isDev ? "Hapimatic DEV" : "Hapimatic";
 /**
  * The version the bundle embeds as `__APP_VERSION__` (#3491) — the `VERSION` in
  * `server/src/version.generated.ts`, which is what `/api/version` serves.
- * Never `web/package.json` (`0.1.0`): the client and server must share the
- * `1.0.xxxx` scheme or every client reads as out of date. The release build
+ * Never `web/package.json` (`0.1.0`): the client and server must carry the
+ * same version or every client reads as out of date. The release build
  * (`build:single-exe:all`) never regenerates that file, so it is the one
  * version both sides share at build time.
  */

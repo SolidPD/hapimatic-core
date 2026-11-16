@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Database } from "bun:sqlite";
+import type { ClockSynced } from "../../billable/clockSync";
 import type { BillableMode } from "../../billable/mode";
 import { safeJsonParse } from "../json";
-import { newUuidV7 } from "../turns/ids";
 
 /**
  * The billable-time start-up step (issue #6586, R17). The entry point calls it
@@ -23,7 +23,8 @@ import { newUuidV7 } from "../turns/ids";
  *    `hub_restart`. No timer write: in `shadow` the old clock owned the timer and
  *    lost that stretch at the restart.
  * 3. Carry-forward (`on` only): one undated `carried_forward` row for the amount
- *    by which a session's timer exceeds the sum of its closed rows.
+ *    by which a session's timer exceeds the sum of its closed rows, under the id
+ *    `carried_forward:<session id>:<n>:<anchor>` (issue #6651, `carriedForwardId`).
  * 4. Repair of rows recorded in `on` (every mode): as part 2; a boot in `shadow` or
  *    `off` also credits the session's timer with the time each row gained,
  *    because that time accrued while intervals drove the timer and today's code,
@@ -47,11 +48,54 @@ import { newUuidV7 } from "../turns/ids";
 
 export const OPENING_BALANCE_MARKER = "billable_opening_balance_v1";
 
+/**
+ * The id of a `carried_forward` row (issue #6651, rule C):
+ * `carried_forward:<session id>:<n>:<anchor>`.
+ *
+ * - `n` is one more than the session's count of `carried_forward` rows (under
+ *   any id). No row is ever deleted, so it only grows, and two rows of one
+ *   database never share an id, even when a clock set back repeats an anchor.
+ * - `anchor` is the `started_at_ms` of the session's latest balance row
+ *   (`opening_balance` or `carried_forward`), or 0 when it has none. Two copies of
+ *   a database that both carry the excess held at the backup follow the same
+ *   balance row with the same count, so a carry made again after a restore gets
+ *   the same id as the first and a puller counts it once.
+ * - The last two fields are integers, so the parts are recoverable even when a
+ *   session id contains a colon; the prefix differs from `opening_balance:` and
+ *   from a UUID.
+ *
+ * The rule does not rename rows written before it: a row under a random id keeps
+ * that id, and counts in the next row's `n`.
+ */
+export function carriedForwardId(
+  sessionId: string,
+  ordinal: number,
+  anchorMs: number
+): string {
+  return `carried_forward:${sessionId}:${ordinal}:${anchorMs}`;
+}
+
+/**
+ * The name of what part 3 writes for a carried row. The daily check stores it in
+ * every run row (`carriedForwardIdRule`, issue #6651, condition 3) and the boot
+ * line prints it. A change to what part 3 writes for a carried row (the id, or
+ * a key in its flags) changes this value, so that `evaluateBillableFlip` waits
+ * for a daily check from the new release.
+ */
+export const CARRIED_FORWARD_ID_RULE =
+  "carried_forward:<session id>:<n>:<anchor>; flags.cap v1; flags.clockSynced v1";
+
 export interface BillableStartupOptions {
   /** The node id `server/src/index.ts` resolves; never `sessions.node_id`, which is NULL. */
   nodeId: string;
   mode: BillableMode;
   nowMs: number;
+  /**
+   * Whether the system clock was synchronized at this boot, as the entry point
+   * read it (issue #6651); written into every carried row's flags. Default
+   * `unknown`.
+   */
+  clockSynced?: ClockSynced;
 }
 
 export interface BillableStartupResult {
@@ -59,6 +103,20 @@ export interface BillableStartupResult {
   carriedForwardRows: number;
   repairedRows: number;
   timersChanged: number;
+  /**
+   * `carried_forward` rows whose id does not start with `carried_forward:` (or is
+   * NULL): rows written before the id rule of #6651, which a restore from an
+   * older backup would make again under a new id. Counted in every mode.
+   */
+  legacyCarriedForwardRows: number;
+  /**
+   * Sessions whose timer is above the sum of their closed rows after part 2 and
+   * before part 3, and the sum of that excess, in every mode (#6651). After a
+   * restore it says whether the restored backup held excess; in `on`,
+   * `excessSessions` equals `carriedForwardRows`.
+   */
+  excessSessions: number;
+  excessMs: number;
 }
 
 interface SessionTimerRow {
@@ -92,31 +150,43 @@ export function runBillableStartup(
   options: BillableStartupOptions
 ): BillableStartupResult {
   const { nodeId, mode, nowMs } = options;
+  const clockSynced: ClockSynced = options.clockSynced ?? "unknown";
 
   const insertBalance = db.prepare(
     "INSERT INTO thinking_intervals (" +
       "id, hapi_session_id, namespace, node_id, launcher_kind, recorded_mode, " +
       "stretch_started_at_ms, started_at_ms, last_seen_at_ms, ended_at_ms, " +
       "duration_ms, start_cause, end_cause, session_name, linked_issue, cwd, flags" +
-      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'balance', ?, NULL, NULL, NULL, " +
-      `'{"noIntervalHistory":true}')`
+      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'balance', ?, NULL, NULL, NULL, ?)"
+  );
+  // The two reads of the carried_forward id rule (issue #6651), inside this
+  // step's transaction, just before each insert.
+  const countCarried = db.prepare(
+    "SELECT COUNT(*) AS n FROM thinking_intervals " +
+      "WHERE hapi_session_id = ? AND end_cause = 'carried_forward'"
+  );
+  // Under `ORDER BY change_seq DESC`, NULLs sort last, so a numbered balance row
+  // is picked before an un-numbered one; un-numbered rows (a failed trigger DDL)
+  // never reach a puller, because the feed serves `change_seq > cursor`.
+  const latestBalanceStart = db.prepare(
+    "SELECT started_at_ms FROM thinking_intervals WHERE hapi_session_id = ? " +
+      "AND end_cause IN ('opening_balance', 'carried_forward') " +
+      "ORDER BY change_seq DESC, started_at_ms DESC, id DESC LIMIT 1"
   );
   const addBalance = (
     session: SessionTimerRow,
     amountMs: number,
-    endCause: "opening_balance" | "carried_forward"
+    endCause: "opening_balance" | "carried_forward",
+    id: string,
+    flags: string
   ): void => {
     insertBalance.run(
-      // Review finding F3 (ruling 2026-11-12): an opening balance's id is
-      // derived from its session id and nothing else, so a row made again after
-      // a restore from an older backup reaches a puller under the same
-      // interval_id and is counted once. Part 1 writes at most one per session
-      // (the marker and its NOT EXISTS test), so the id cannot collide. A
-      // carried_forward row keeps a random id in this build: a rule for it is
-      // the third condition for switching a node to `on` (reconcile.ts).
-      endCause === "opening_balance"
-        ? `opening_balance:${session.id}`
-        : newUuidV7(),
+      // Both balance ids repeat when a row is made again after a restore, so a
+      // puller counts it once. Review finding F3 (ruling 2026-11-12): an opening
+      // balance's id is `opening_balance:<session id>`; part 1 writes at most one
+      // per session (the marker and its NOT EXISTS test), so it cannot collide.
+      // Issue #6651: a carried_forward row's id is `carriedForwardId` (part 3).
+      id,
       session.id,
       session.namespace,
       nodeId,
@@ -127,9 +197,28 @@ export function runBillableStartup(
       nowMs,
       nowMs,
       amountMs,
-      endCause
+      endCause,
+      flags
     );
   };
+  // An opening balance's flags: its copy holds no dated row below it, so it
+  // needs no cap key (plan of #6651, section 12 (i)).
+  const OPENING_FLAGS = JSON.stringify({ noIntervalHistory: true });
+  // The cap's key (issue #6651, Task C1): the copy's previous carried row, and
+  // the closed dated `shadow` rows of this copy that started since it and before
+  // this boot. Part 2 has just closed every open `shadow` row.
+  const previousCarryStart = db.prepare(
+    "SELECT started_at_ms FROM thinking_intervals WHERE hapi_session_id = ? " +
+      "AND end_cause = 'carried_forward' " +
+      "ORDER BY change_seq DESC, started_at_ms DESC, id DESC LIMIT 1"
+  );
+  const shadowSince = db.prepare(
+    "SELECT COALESCE(SUM(duration_ms), 0) AS ms FROM thinking_intervals " +
+      "WHERE hapi_session_id = ? AND ended_at_ms IS NOT NULL " +
+      "AND recorded_mode = 'shadow' " +
+      "AND (end_cause IS NULL OR end_cause NOT IN ('opening_balance', 'carried_forward')) " +
+      "AND started_at_ms >= ? AND started_at_ms < ?"
+  );
 
   const repair = (recordedMode: "shadow" | "on"): RepairCandidate[] => {
     const rows = db
@@ -184,7 +273,13 @@ export function runBillableStartup(
         )
         .all() as SessionTimerRow[];
       for (const session of sessions) {
-        addBalance(session, session.timer, "opening_balance");
+        addBalance(
+          session,
+          session.timer,
+          "opening_balance",
+          `opening_balance:${session.id}`,
+          OPENING_FLAGS
+        );
         openingBalanceRows++;
       }
       db.prepare(
@@ -203,6 +298,17 @@ export function runBillableStartup(
     // Part 2 — repair of rows recorded in `shadow`; no timer write in any mode.
     const shadowRepaired = repair("shadow");
 
+    // The excess part 3 reads, counted in every mode for the boot line (#6651).
+    const excess = db
+      .prepare(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(excess), 0) AS ms FROM (" +
+          "SELECT COALESCE(s.server_accumulated_ms, 0) - (" +
+          "SELECT COALESCE(SUM(t.duration_ms), 0) FROM thinking_intervals t " +
+          "WHERE t.hapi_session_id = s.id AND t.ended_at_ms IS NOT NULL" +
+          ") AS excess FROM sessions s) WHERE excess > 0"
+      )
+      .get() as { n: number; ms: number };
+
     // Part 3 — carry-forward (`on` only), before the `on` rows are repaired.
     if (mode === "on") {
       const sessions = db
@@ -216,15 +322,43 @@ export function runBillableStartup(
         .all() as Array<Omit<SessionTimerRow, "timer"> & { excess: number }>;
       for (const session of sessions) {
         if (session.excess > 0) {
+          const n = 1 + (countCarried.get(session.id) as { n: number }).n;
+          const anchor = latestBalanceStart.get(session.id) as {
+            started_at_ms: number;
+          } | null;
+          const fromStartedAt =
+            (
+              previousCarryStart.get(session.id) as {
+                started_at_ms: number;
+              } | null
+            )?.started_at_ms ?? 0;
+          const shadowMs = (
+            shadowSince.get(session.id, fromStartedAt, nowMs) as { ms: number }
+          ).ms;
           addBalance(
             { ...session, timer: session.excess },
             session.excess,
-            "carried_forward"
+            "carried_forward",
+            carriedForwardId(session.id, n, anchor?.started_at_ms ?? 0),
+            JSON.stringify({
+              noIntervalHistory: true,
+              cap: { v: 1, fromStartedAt, shadowMs },
+              clockSynced,
+            })
           );
           carriedForwardRows++;
         }
       }
     }
+
+    // Rows written before the id rule (#6651). `substr`, not `LIKE`: `_` is a
+    // LIKE wildcard; 16 is the length of `carried_forward:`.
+    const legacy = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM thinking_intervals WHERE end_cause = 'carried_forward' " +
+          "AND (id IS NULL OR substr(id, 1, 16) != 'carried_forward:')"
+      )
+      .get() as { n: number };
 
     // Part 4 — repair of rows recorded in `on`; outside `on`, credit the timer
     // with what each row gained (its whole duration for a row that was open; the
@@ -277,6 +411,9 @@ export function runBillableStartup(
       carriedForwardRows,
       repairedRows: shadowRepaired.length + onRepaired.length,
       timersChanged,
+      legacyCarriedForwardRows: legacy.n,
+      excessSessions: excess.n,
+      excessMs: excess.ms,
     };
   });
 

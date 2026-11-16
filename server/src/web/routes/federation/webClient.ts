@@ -6,12 +6,19 @@ import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
 import type { FederationDeps } from "./shared";
 import {
+  BILLABLE_SWITCH_CAPABILITY,
+  BillableSwitchStartChoiceSchema,
   FederationSpawnBodySchema,
   LOCAL_NODE_ID,
   MCP_SET_CAPABILITY,
   defineCapability,
+  type BillableSwitchStartChoice,
 } from "@hapi/protocol";
-import { floorAgentMcpEnable } from "../agentEscalation";
+import {
+  buildBillableSwitchStart,
+  floorAgentMcpEnable,
+} from "../agentEscalation";
+import { z } from "zod";
 import { cataloged } from "../../../capabilities/cataloged";
 import { createRateLimiter } from "../../middleware/rateLimit";
 import {
@@ -22,6 +29,11 @@ import {
 
 /** #5127: the statuses a key-bound remote spawn's refusal keeps. */
 const PASSED_REFUSAL_STATUSES = new Set([400, 403, 404, 409, 503]);
+
+/** Issue #6646: what a client may send as `billableSwitchStart` (its answer only). */
+const ClientBillableSwitchStartSchema = z
+  .object({ choice: BillableSwitchStartChoiceSchema })
+  .strict();
 
 export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
@@ -262,6 +274,31 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       }
 
       const body = await c.req.json().catch(() => null);
+      // Issue #6646 (review P2): the browser sends `billableSwitchStart` as
+      // `{ choice }` only. Read it with the client-only strict schema and take it
+      // out of the raw body BEFORE the shared federation schema parses it (that
+      // schema's wire form would read the client's shape differently); the hub
+      // adds only the context it builds itself. A client value that carries a
+      // kind, an actor or any other key is refused, and nothing it sent goes on.
+      let clientChoice: BillableSwitchStartChoice | undefined;
+      if (body && typeof body === "object" && "billableSwitchStart" in body) {
+        const raw = (body as Record<string, unknown>).billableSwitchStart;
+        delete (body as Record<string, unknown>).billableSwitchStart;
+        if (raw !== undefined) {
+          const client = ClientBillableSwitchStartSchema.safeParse(raw);
+          if (!client.success) {
+            return c.json(
+              {
+                type: "error",
+                message:
+                  "billableSwitchStart accepts only { choice } from a client",
+              },
+              400
+            );
+          }
+          clientChoice = client.data.choice;
+        }
+      }
       // Issue #4568 (R8): a BARE API-key id names a key in THIS node's vault, so
       // it cannot bind a session on another node. Refused loudly here — before
       // the peer schema below silently strips the field and the remote session
@@ -337,6 +374,8 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       const {
         parentSessionId: requestedParentId,
         parentRelationship: requestedRelationship,
+        // Issue #6646: never forwarded as received; the hub's own context goes on.
+        billableSwitchStart: _droppedBillableSwitchStart,
         ...forwardable
       } = parsed.data;
       let parentAttribution:
@@ -365,13 +404,73 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
 
       // Inject this peer's nodeId so the remote node can tag the session's origin
       const fedConfig = deps.federationConfig;
+      const nodeId = c.req.param("nodeId");
+
+      // Issue #6646: the start context, built HERE by the entry hub (Task 6's
+      // signal order). An explicit answer to the question at Create would be
+      // dropped silently by an older or gate-off peer, so refuse it unless the
+      // target advertises billable:switch (the MCP-set precedent above); while
+      // the target has not been polled yet, say so instead of "unsupported".
+      const routeStart = buildBillableSwitchStart(
+        c,
+        deps.getSyncEngine(),
+        {
+          choice: clientChoice,
+          parentSessionId: parentAttribution?.parentSessionId,
+          parentRelationship: parentAttribution?.parentRelationship,
+        },
+        deps.getSyncEngine()?.getBillableSwitchService?.()?.localNodeId() ??
+          fedConfig?.nodeId
+      );
+      if (
+        routeStart.kind === "person" &&
+        routeStart.choice !== undefined &&
+        routeStart.choice !== "follow-header"
+      ) {
+        const view = registry
+          .getBillableSwitchNodeViews()
+          .find(v => v.nodeId === nodeId);
+        const nodeLabel =
+          view?.nodeLabel ??
+          registry.getNodeIdentity(nodeId)?.nodeLabel ??
+          nodeId;
+        if (view?.awaitingInitialPoll || view?.status === "offline") {
+          return c.json(
+            {
+              type: "error",
+              message: `${nodeLabel} has not answered yet, so its billable sessions cannot be checked. Try again in a moment.`,
+              code: "node_not_reachable_yet",
+              nodeLabel,
+            },
+            503
+          );
+        }
+        if (!registry.nodeSupports(nodeId, BILLABLE_SWITCH_CAPABILITY)) {
+          return c.json(
+            {
+              type: "error",
+              message: `${nodeLabel} cannot take a billable answer: billable sessions are not on there, or it runs an older version.`,
+              code: "billable_feature_unsupported",
+              nodeLabel,
+            },
+            409
+          );
+        }
+      }
       const spawnBody = {
         ...forwardable,
         ...parentAttribution,
         originatingNodeId: fedConfig?.nodeId,
+        billableSwitchStart: {
+          kind: routeStart.kind,
+          ...(routeStart.choice ? { choice: routeStart.choice } : {}),
+          actor: routeStart.actor,
+          via: routeStart.via,
+          ...(routeStart.entryNodeId
+            ? { entryNodeId: routeStart.entryNodeId }
+            : {}),
+        },
       };
-
-      const nodeId = c.req.param("nodeId");
 
       // Issue #2150 (R1, ruling D2-A): register the hub-side placeholder BEFORE
       // forwarding — a fast peer refusal callback can race the accept response —

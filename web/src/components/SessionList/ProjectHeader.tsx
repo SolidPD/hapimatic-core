@@ -14,11 +14,16 @@ import { ClockIcon, ProjectTimer } from "@/components/SessionTimer";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useToast } from "@/components/Toast";
-import { summarizeBulkSessionResult } from "@/lib/bulkSessionToast";
-import { executeBulkSessionAction } from "@/hooks/mutations/useBulkSessionAction";
+import { summarizeBulkDelete } from "@/lib/bulkSessionToast";
+import {
+  bulkDeleteProgressNote,
+  runBulkDeleteRounds,
+} from "@/hooks/mutations/useBulkSessionAction";
 import { SESSION_NAME_MAX_LENGTH, validateSessionName } from "@hapi/protocol";
 import { useEffect, useRef, useState } from "react";
+import { Pin } from "lucide-react";
 import { NodeBadge, useNodeTone } from "@/components/NodeBadge";
+import { projectPinTotalTitle } from "@/components/session/badgeFormat";
 import { getShortPath } from "./grouping";
 import type { SessionGroup } from "./grouping";
 import type { ExpandCollapseAllScope } from "./bulkExpand";
@@ -33,6 +38,10 @@ import {
   sumOpenPins,
   withOpenPinsNote,
 } from "@/lib/pins/archiveWarning";
+
+/** #6660: the project bar's pin glyph, the row slot's 11px (variant D). */
+const PROJECT_PIN_GLYPH_CLASS =
+  "h-[11px] w-[11px] shrink-0"; /* design-tokens-allow: 11px pin glyph, the row slot's size (variant D, #6660); no icon-size token at 11px */
 
 // ── #4538: row-2 node band + icon discs ──────────────────────────────────
 // Row-2 node band: a `::before` layer on line 2, painted BEHIND its content
@@ -73,6 +82,11 @@ export function ProjectHeader(props: {
    * is present, so a single-node setup shows no badge (no behavioral change).
    */
   showNode?: boolean;
+  /**
+   * #6681 S1: the hub's own node id, which the router also gives every local
+   * row. "Delete disconnected" keys only rows on OTHER nodes by node.
+   */
+  localNodeId?: string;
   onToggle: () => void;
   api: ApiClient | null;
   onRefresh: () => void;
@@ -94,6 +108,7 @@ export function ProjectHeader(props: {
     group,
     isCollapsed,
     showNode,
+    localNodeId,
     onToggle,
     api,
     onRefresh,
@@ -113,7 +128,7 @@ export function ProjectHeader(props: {
   const [disconnectAllOpen, setDisconnectAllOpen] = useState(false);
   const [deleteDisconnectedOpen, setDeleteDisconnectedOpen] = useState(false);
   const [isPending, setIsPending] = useState(false);
-  const { showToast } = useToast();
+  const { showToast, clearToast } = useToast();
 
   // Inline project name editing
   const [isEditingName, setIsEditingName] = useState(false);
@@ -212,6 +227,12 @@ export function ProjectHeader(props: {
   // schedulesByGroupKey — they never appear in group.sessions.
   const connectedSessions = group.sessions.filter(s => s.active);
   const disconnectedSessions = group.sessions.filter(s => !s.active);
+  // #6660 (Matt's ROW-D pick): the pins waiting across the project's sessions.
+  // Shown only above zero — "when there are no pins underneath the project
+  // header, the pin icon and number just disappear" — and not while no session
+  // knows its count (the node's Pins gate is closed: unknown, not zero).
+  const pinTotal = sumOpenPins(group.sessions);
+  const showPinTotal = typeof pinTotal === "number" && pinTotal > 0;
 
   const handleDisconnectAll = async () => {
     if (!api || connectedSessions.length === 0) return;
@@ -232,14 +253,29 @@ export function ProjectHeader(props: {
     setIsPending(true);
     try {
       // #3815: chunked by the 100-id server cap, and reported per session — a
-      // skipped session is no longer silent.
-      const results = await executeBulkSessionAction(
-        api,
-        "delete",
-        disconnectedSessions.map(s => s.id)
+      // skipped session is no longer silent. #6681 (R13): Select mode's round
+      // loop, so ids the hub did not send go again in later rounds. S1: a
+      // local row carries the hub's own id and stays unkeyed (local).
+      const nodes = new Map(
+        disconnectedSessions.flatMap(s =>
+          s.nodeId && s.nodeId !== localNodeId
+            ? [[s.id, { nodeId: s.nodeId, nodeLabel: s.nodeLabel }] as const]
+            : []
+        )
       );
+      const note = bulkDeleteProgressNote(showToast, clearToast);
+      const run = await runBulkDeleteRounds({
+        api,
+        ids: disconnectedSessions.map(s => s.id),
+        nodeOf: id => nodes.get(id),
+        onProgress: note.onProgress,
+      }).finally(note.end);
       onRefresh();
-      const { message, type } = summarizeBulkSessionResult("delete", results);
+      const { message, type } = summarizeBulkDelete(
+        run.deleted.length,
+        run.failures,
+        run.stillDeleting
+      );
       showToast(message, { type });
     } finally {
       setIsPending(false);
@@ -369,6 +405,25 @@ export function ProjectHeader(props: {
               >
                 <PencilIcon className="h-2.5 w-2.5" />
               </Button>
+            )}
+            {!isEditingName && showPinTotal && (
+              /* #6660: the project's pins waiting, after the name and pencil, in
+                 the Pins red. design-system exception (D1, ruled by the Pins PM,
+                 2026-11-13): a native `title` and an accessible name on a
+                 non-interactive span, not the `ui/tooltip.tsx` surface (a
+                 portaled bubble's taps reach this bar's fold through React).
+                 A tap here folds the project like a tap on its name. The name
+                 truncates first, so the total never wraps the bar. */
+              <span
+                className="ml-0.5 flex shrink-0 items-center gap-px tabular-nums leading-none font-bold text-[length:var(--text-caption)] text-[var(--view-accent-pins)]"
+                data-testid="project-pin-total"
+                role="img"
+                title={projectPinTotalTitle(pinTotal)}
+                aria-label={projectPinTotalTitle(pinTotal)}
+              >
+                <Pin aria-hidden="true" className={PROJECT_PIN_GLYPH_CLASS} />
+                {pinTotal}
+              </span>
             )}
           </div>
           {/* Line 2: Clock + timer + node badge + directory path (secondary).

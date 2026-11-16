@@ -41,8 +41,12 @@ type SessionExpandedDetailsProps = {
     "session"
   >;
   /** Props for the shared Session Action Cluster (Row 1 + R5), rendered here so
-   *  the list card and instance header compose the SAME cluster (#3288 R7). */
-  actionClusterProps: React.ComponentProps<typeof SessionActionCluster>;
+   *  the list card and instance header compose the SAME cluster (#3288 R7).
+   *  #6660: the session id comes from `session`, passed once here. */
+  actionClusterProps: Omit<
+    React.ComponentProps<typeof SessionActionCluster>,
+    "sessionId"
+  >;
 };
 
 export function SessionExpandedDetails({
@@ -88,7 +92,10 @@ export function SessionExpandedDetails({
             cannot widen it. Keep `gap-2`: the ID
             row's hit band extends exactly 8px up to the cluster's bottom edge. */}
         <div className="flex flex-col items-start gap-2 shrink-0">
-          <SessionActionCluster {...actionClusterProps} />
+          <SessionActionCluster
+            {...actionClusterProps}
+            sessionId={session.id}
+          />
           <SessionIdDisplay
             hapiShortId={hapiShortId}
             nativeId={nativeId}

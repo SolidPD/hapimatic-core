@@ -17,6 +17,7 @@ import type {
 } from "../../../sync/turnLifecycle";
 import { extractTodoWriteTodosFromMessageContent } from "../../../sync/todos";
 import type { SocketWithData } from "../../socketTypes";
+import type { GatedReportKind } from "../../../sync/runnerIdentity";
 import type { MessageWriteRetryQueue } from "./messageWriteRetryQueue";
 import {
   MESSAGE_WRITE_CATEGORY,
@@ -182,6 +183,17 @@ export type SessionHandlersDeps = {
   errorLogger?: ErrorLogger | null;
   /** #3631: deferred re-attempt queue for a SQLITE_BUSY message write (ruling D1). */
   messageWriteRetryQueue?: MessageWriteRetryQueue | null;
+  /**
+   * Issue #6647 (Tasks 6 and 12, R7): the runner identity backstop on four
+   * reports. `false` is a drop, in `enforce` only.
+   */
+  gateReport?: (
+    socket: SocketWithData,
+    sid: string,
+    kind: GatedReportKind
+  ) => boolean;
+  /** Issue #6647 (Task 12, R5): after a drop was answered, cut its socket off. */
+  afterDroppedReport?: (socket: SocketWithData) => void;
 };
 
 /**
@@ -267,6 +279,26 @@ export function registerSessionHandlers(
     errorLogger,
     messageWriteRetryQueue,
   } = deps;
+
+  // Issue #6647 (Tasks 6 and 12, R7, R11): the runner identity backstop, after
+  // a handler's access check. True when the report goes ahead; a drop answers
+  // the report first and then calls `dropped`, which cuts the socket off (R5).
+  // A throw here must never reach a listener (an uncaught throw on a listener
+  // exits the server), so both fail open.
+  const gate = (sid: string, kind: GatedReportKind): boolean => {
+    try {
+      return deps.gateReport?.(socket, sid, kind) ?? true;
+    } catch {
+      return true;
+    }
+  };
+  const dropped = (): void => {
+    try {
+      deps.afterDroppedReport?.(socket);
+    } catch {
+      // Fail open: the socket stays connected; its next report is dropped too.
+    }
+  };
 
   // Issue #1664 (epic #1662, Sub B): per-turn telemetry boundaries. Both
   // handlers are FAIL-OPEN (R8) — a malformed/unknown payload is dropped
@@ -576,6 +608,18 @@ export function registerSessionHandlers(
         cb({ result: "error", reason: sessionAccess.reason });
         return;
       }
+      if (!gate(sid, "update-metadata")) {
+        // R7, K6: success-shaped with the stored value, so an older CLI's
+        // retry ends; a newer CLI reads `superseded`.
+        cb({
+          result: "success",
+          version: sessionAccess.value.metadataVersion,
+          metadata: sessionAccess.value.metadata,
+          superseded: true,
+        });
+        dropped();
+        return;
+      }
 
       const result = store.sessions.updateSessionMetadata(
         sid,
@@ -632,6 +676,17 @@ export function registerSessionHandlers(
     const sessionAccess = resolveSessionAccess(sid);
     if (!sessionAccess.ok) {
       cb({ result: "error", reason: sessionAccess.reason });
+      return;
+    }
+    if (!gate(sid, "update-state")) {
+      // R7, K6: as for update-metadata above.
+      cb({
+        result: "success",
+        version: sessionAccess.value.agentStateVersion,
+        agentState: sessionAccess.value.agentState,
+        superseded: true,
+      });
+      dropped();
       return;
     }
 
@@ -704,6 +759,10 @@ export function registerSessionHandlers(
         emitAccessError("session", data.sid, sessionAccess.reason);
         return;
       }
+      if (!gate(data.sid, "session-alive")) {
+        dropped();
+        return;
+      }
       let payload = data;
       const agents = sanitizeBackgroundAgents(data.backgroundAgents);
       if (!agents.ok) {
@@ -747,6 +806,10 @@ export function registerSessionHandlers(
     const sessionAccess = resolveSessionAccess(data.sid);
     if (!sessionAccess.ok) {
       emitAccessError("session", data.sid, sessionAccess.reason);
+      return;
+    }
+    if (!gate(data.sid, "session-end")) {
+      dropped();
       return;
     }
     // #3478: forward only the typed fields. `respawn` / `archived` are

@@ -26,6 +26,7 @@ import { AccountMonogramSchema } from "./accountMonogram";
 import { StoredNotificationSchema } from "./notifications";
 import { ProviderIdSchema } from "./providerAuthState";
 import { PromptCacheStateSchema } from "./cacheKeepalive";
+import { BillableConfirmSchema } from "./billableSwitch";
 import {
   PIN_CHANGES,
   PIN_KINDS,
@@ -605,6 +606,8 @@ export const AgentStateCompletedRequestSchema = z
       .optional(),
     allowTools: z.array(z.string()).optional(),
     answers: z.record(z.string(), z.array(z.string())).optional(),
+    // #6606 R18: the hub knew a session approved (`X-Hapi-Session-Id`).
+    answeredBy: z.enum(["session"]).optional(),
   })
   .passthrough();
 
@@ -867,6 +870,14 @@ export const SessionSchema = z
     /** Per-session override for auto-recovery from Anthropic API errors.
      *  null = follow global preference; true = force on; false = force off. */
     autoRecoverFromApiError: z.boolean().nullable().optional(),
+    /**
+     * Issue #6646: the billable switch, stored in two columns of the owning
+     * node's `sessions` row. Absent means the switch cannot be read (an older
+     * node, a node whose switch storage is not ready, a session still starting):
+     * read it as unknown, never as non-billable.
+     */
+    billable: z.boolean().optional(),
+    billableConfirm: BillableConfirmSchema.optional(),
     uiCollapseState: UiCollapseStateSchema.nullable().optional(),
     /**
      * Issue #3286 (View Picker): the server-persisted selected view for this

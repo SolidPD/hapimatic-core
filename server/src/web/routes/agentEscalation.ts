@@ -13,9 +13,10 @@
  * Every floor keys on `X-Hapi-Session-Id`, the caller's own session id. The
  * injected hapi MCP wrapper stamps it on every `POST /api/capabilities/call` and
  * the invoker copies it onto the dispatched request (Task 2). The `hapi api` CLI
- * stamps its `HAPI_SESSION_ID` tag only on `sessions send`, so that verb run from
- * inside a session meets the send floor below (#5616 D5); its spawn, archive and
- * `call` verbs carry no header. A request without the header (the web UI, the
+ * stamps its `HAPI_SESSION_ID` tag on `sessions send` and `sessions billable`
+ * (#6646), so those verbs run from inside a session meet the send floor below
+ * (#5616 D5) and the billable agent rule; its spawn, archive and `call` verbs
+ * carry no header. A request without the header (the web UI, the
  * `hapi api` CLI outside a session, a shell or cron caller) keeps today's
  * behaviour: web and CLI mint identical JWTs, so the header is the only
  * discriminator, and an unsandboxed agent holding `CLI_API_TOKEN` can still call
@@ -64,6 +65,23 @@
  *   own text (PM ruling OD-1 = 1). The R8 floors resolve callers locally only:
  *   their header comes only from the injected MCP wrapper, which posts to the
  *   session's own hub.
+ * - Pins operator-only actions (#6458 Task 12, M-1 option 1 "FLOOR", ruled by
+ *   Matt 2026-11-12 03:07Z): a Submit, moving or stopping an automatic pick,
+ *   and dismissing or saving a pin of the caller's own session, and P's
+ *   `pin_not_owned` on the CLI pin writes, refuse only a caller that sends this
+ *   header (`pinRouteHelpers.ts`). The web client never sends it, so a caller
+ *   with `CLI_API_TOKEN` and a shell can act as the operator: the same residual
+ *   as above. Invariant: no gate, hook or automation treats a pin answer's
+ *   `by: "operator"` as authorization. Everything inside a Pins answers
+ *   message, notes and review-mark comments included, is machine text to the
+ *   hooks: a note is the operator's answer, never a sign-off, and starts no
+ *   workflow by itself (Matt, NOTE1, 04:08Z). rp1-home's
+ *   `deploy-approval-detector.py` broke it by reading a Pins answers message as
+ *   a deploy approval; rp1-home Part 1 (R11a, rp1-home#3226) marks that message
+ *   machine-originated. Closing the floor needs per-session credentials (#6633)
+ *   and an agent kept out of `HAPI_HOME`; #6632 marks an answer recorded
+ *   outside the app (a hint). Detail: `docs/internal/architecture/sync.md` "Who
+ *   counts as the operator".
  */
 import type { Context } from "hono";
 import {
@@ -506,5 +524,234 @@ export function refuseAgentArchive(
   return escalationRefused(
     c,
     "A session that is not in a bypass permission mode can archive only itself or a session it spawned"
+  );
+}
+
+// ─── Issue #6646: the billable switch's agent rule ──────────────────────────
+
+/**
+ * The capability invoker's re-entrancy header: set on every request it
+ * dispatches (the agents' tool channel and `hapi api call`), and refused on the
+ * way in, so a caller cannot strip it from a dispatched request. Moved here from
+ * `capabilityCall.ts` (which imports it) so the billable agent rule reads it.
+ */
+export const CAPABILITY_DEPTH_HEADER = "X-Hapi-Capability-Depth";
+
+/**
+ * A billable write (or a spawn) is an agent's when it names a session (the
+ * header is present, resolved or not) or arrived through the tool channel. A
+ * floor on the paths agents normally use, not a guarantee: a caller holding the
+ * node's access token that names no session reads as `client` (R14).
+ */
+export function isAgentRequest(c: Context<WebAppEnv>): boolean {
+  return Boolean(
+    c.req.header(CALLER_SESSION_HEADER) || c.req.header(CAPABILITY_DEPTH_HEADER)
+  );
+}
+
+/** The channel a billable write came in on: `tool` through the invoker, else `direct`. */
+export function billableSwitchVia(c: Context<WebAppEnv>): "tool" | "direct" {
+  return c.req.header(CAPABILITY_DEPTH_HEADER) ? "tool" : "direct";
+}
+
+/**
+ * The actor a billable write records, set by the hub from the request and never
+ * from a client body: a request that names a session is that session (the
+ * resolved id, else the raw header value); any other is `client`, with its user
+ * agent. Claims, not identities (the plan's section 6 item 3).
+ */
+export function billableSwitchActor(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null
+): { kind: "session" | "client"; sessionId?: string; userAgent?: string } {
+  const raw = c.req.header(CALLER_SESSION_HEADER);
+  if (raw) {
+    const resolved = resolveCallerSession(c, engine);
+    return { kind: "session", sessionId: (resolved?.id ?? raw).slice(0, 200) };
+  }
+  const userAgent = c.req.header("user-agent")?.slice(0, 200);
+  return { kind: "client", ...(userAgent ? { userAgent } : {}) };
+}
+
+/** What a billable write asks for, for the agent rule. */
+export type BillableSwitchWriteIntent =
+  | "on"
+  | "off"
+  | "keep"
+  | "reverse"
+  | "keep-all"
+  | "header";
+
+/**
+ * The agent rule (review P3), the same on every billable write: an agent may
+ * switch off and Reverse; it is refused the on direction, Keep, Keep all and
+ * every header change; and a request whose named session does not resolve is
+ * refused on every write (the product's other floors fail closed the same way).
+ * Returns null when the request may proceed.
+ */
+export function refuseAgentBillableWrite(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null,
+  wants: BillableSwitchWriteIntent
+): Response | null {
+  if (!isAgentRequest(c)) return null;
+  if (c.req.header(CALLER_SESSION_HEADER) && !resolveCallerSession(c, engine)) {
+    return escalationRefused(c, UNKNOWN_CALLER_ERROR);
+  }
+  switch (wants) {
+    case "off":
+    case "reverse":
+      return null;
+    case "on":
+      return c.json(
+        {
+          ok: false,
+          error:
+            "An agent cannot switch a session on. Switch it on in the app.",
+          code: "agent_cannot_switch_on",
+        },
+        403
+      );
+    case "keep":
+      return c.json(
+        {
+          ok: false,
+          error: "An agent cannot keep a session billable. Keep it in the app.",
+          code: "agent_cannot_keep",
+        },
+        403
+      );
+    case "keep-all":
+    case "header":
+      return c.json(
+        {
+          ok: false,
+          error:
+            wants === "header"
+              ? "An agent cannot change a project's billable header. Change it in the app."
+              : "An agent cannot keep sessions billable. Keep them in the app.",
+          code: "agent_billable_refused",
+        },
+        403
+      );
+  }
+}
+
+/** The start context a route builds; the server-only form of the wire context. */
+export type RouteBillableSwitchStart = {
+  kind: "agent" | "person" | "unattended";
+  choice?:
+    | "follow-header"
+    | "header-and-session"
+    | "session-only"
+    | "not-billable";
+  actor: { kind: "session" | "client"; sessionId?: string; userAgent?: string };
+  via: "tool" | "direct";
+  entryNodeId?: string;
+  namespace?: string;
+};
+
+/**
+ * Issue #6646 (Task 6): the start context of a spawn request, by this signal
+ * order, built by the ENTRY hub and never taken from a client body:
+ *  1. an agent's request (names a session, resolved or not, or came through the
+ *     tool channel) → `agent`; a body choice is ignored. A person's spawn sent
+ *     through `hapi api call` comes through the tool channel and is `agent` on
+ *     purpose: that channel is the agents' own, and no screen uses it;
+ *  2. a body choice → `person` with that choice (with or without a parent link:
+ *     the web's Fan-out sends one and is a person's start);
+ *  3. a parent link with relationship `spawn` (what `hapi api sessions spawn`
+ *     sends from inside a session) → `agent`, with the parent as the actor;
+ *  4. anything else → `unattended` (a script, a Create from a cached old app).
+ */
+export function buildBillableSwitchStart(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null,
+  body: {
+    choice?: RouteBillableSwitchStart["choice"];
+    parentSessionId?: string;
+    parentRelationship?: "branch" | "spawn";
+  },
+  entryNodeId?: string
+): RouteBillableSwitchStart {
+  const via = billableSwitchVia(c);
+  const namespace = c.get("namespace");
+  const common = {
+    via,
+    ...(entryNodeId ? { entryNodeId } : {}),
+    ...(namespace ? { namespace } : {}),
+  };
+  if (isAgentRequest(c)) {
+    return { kind: "agent", actor: billableSwitchActor(c, engine), ...common };
+  }
+  if (body.choice) {
+    return {
+      kind: "person",
+      choice: body.choice,
+      actor: billableSwitchActor(c, engine),
+      ...common,
+    };
+  }
+  if (body.parentRelationship === "spawn" && body.parentSessionId) {
+    return {
+      kind: "agent",
+      actor: { kind: "session", sessionId: body.parentSessionId.slice(0, 200) },
+      ...common,
+    };
+  }
+  return {
+    kind: "unattended",
+    actor: billableSwitchActor(c, engine),
+    ...common,
+  };
+}
+
+/**
+ * Issue #6646 (closer review round 1; the Project Manager's ruling of
+ * 2026-11-13, a clarification of R5 and Task 6): the local Create refuses a
+ * person's explicit billable answer (`session-only`, `header-and-session`)
+ * while this node's gate is not `on`, with the codes the remote path and the
+ * closed state use (`billable_feature_unsupported` when off,
+ * `billable_feature_closed` when closed), because the start rule runs only
+ * when the gate is on and the answer would otherwise be dropped without a word.
+ * Every other start (no answer, `follow-header`, `not-billable`, an agent's or
+ * an unattended start) passes in every gate state. Returns null to pass.
+ */
+export function refuseUnhonourableBillableAnswer(
+  c: Context<WebAppEnv>,
+  engine: Pick<
+    SyncEngine,
+    "getBillableSwitchMode" | "getBillableSwitchService"
+  >,
+  start: RouteBillableSwitchStart
+): Response | null {
+  if (
+    start.kind !== "person" ||
+    (start.choice !== "session-only" && start.choice !== "header-and-session")
+  ) {
+    return null;
+  }
+  const mode = engine.getBillableSwitchMode?.() ?? "off";
+  if (mode === "on") {
+    return null;
+  }
+  const nodeLabel =
+    engine.getBillableSwitchService?.()?.localNodeLabel?.() ?? "this node";
+  const message =
+    mode === "closed"
+      ? `Billable sessions are closed on ${nodeLabel}: a new session there cannot start billable.`
+      : `${nodeLabel} cannot take a billable answer: billable sessions are not on there.`;
+  return c.json(
+    {
+      type: "error",
+      error: message,
+      message,
+      code:
+        mode === "closed"
+          ? "billable_feature_closed"
+          : "billable_feature_unsupported",
+      nodeLabel,
+    },
+    409
   );
 }

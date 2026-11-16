@@ -8,7 +8,8 @@
  * every reader, and the bounded primitives for large files — a backward line scan
  * from EOF in fixed chunks (`scanLinesBackward`) and a forward read of a window
  * (`readEntriesFrom`). All reads are synchronous: they run inside the finalize
- * seam, on the server's only event loop.
+ * seam, on the server's only event loop. `forEachTranscriptEntry` streams a
+ * whole file in bounded memory for offline callers (#6678).
  */
 
 import {
@@ -139,22 +140,37 @@ interface CollectedEntries {
 }
 
 /**
+ * Apply the file-order line rules to one decoded line: `"blank"` for a blank
+ * line (not counted), `"skipped"` for a malformed, non-object, skipped-type or
+ * duplicate-uuid line, else the admitted entry. `readTranscript`,
+ * `readEntriesFrom` and `forEachTranscriptEntry` all go through this, so a
+ * window read, a whole-file read and a streamed read over the same lines
+ * cannot drift apart (#6264, #6678).
+ */
+function admitLine(
+  line: string,
+  seenUuids: Set<string>
+): TranscriptEntry | "blank" | "skipped" {
+  const parsed = parseTranscriptLine(line);
+  if (parsed === "blank") return "blank";
+  const entry =
+    parsed === "bad" ? null : acceptTranscriptRecord(parsed, seenUuids);
+  return entry === null ? "skipped" : entry;
+}
+
+/**
  * Add one line to a file-order read: blank lines are ignored, malformed or
  * skipped lines count in `skipped`, uuid copies after the first are dropped.
- * `readTranscript` and `readEntriesFrom` both use this, so a window read and a
- * full read over the same lines cannot drift apart (#6264).
  */
 function collectLine(
   line: string,
   seenUuids: Set<string>,
   acc: CollectedEntries
 ): void {
-  const parsed = parseTranscriptLine(line);
-  if (parsed === "blank") return;
-  const entry =
-    parsed === "bad" ? null : acceptTranscriptRecord(parsed, seenUuids);
-  if (entry === null) acc.skipped += 1;
-  else acc.entries.push(entry);
+  const admitted = admitLine(line, seenUuids);
+  if (admitted === "blank") return;
+  if (admitted === "skipped") acc.skipped += 1;
+  else acc.entries.push(admitted);
 }
 
 /**
@@ -368,6 +384,109 @@ export function readEntriesFrom(
     lineStart = nl + 1;
   }
   return acc;
+}
+
+/**
+ * Cap on one line for `forEachTranscriptEntry` (#6678). The longest line on
+ * ms1's affected transcripts on 2026-11-13 was 1.80 MB across 537,272 lines;
+ * this only stops one unterminated, multi-gigabyte line from defeating the
+ * bounded-memory read. A line over the cap is a read error.
+ */
+export const TRANSCRIPT_STREAM_MAX_LINE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Visit every entry of the transcript at `path` in file order, with exactly
+ * `readTranscript`'s rules (blank lines ignored; malformed, non-object,
+ * skipped-type and duplicate-uuid lines counted in `skipped`; first copy of
+ * each uuid wins), without ever holding the whole file (#6678). It reads
+ * forward in `chunkBytes` chunks up to the size the file had when it was
+ * opened (a live session may still be appending), splits on byte 0x0a (UTF-8
+ * safe) and decodes complete lines only, so a multibyte character across a
+ * chunk boundary is handled. The final line counts even without a trailing
+ * newline, as in a whole-file read. Memory does not grow with line content:
+ * one chunk, the line being assembled, and the set of uuids seen, which grows
+ * by about 100 bytes per distinct uuid (about 12 MB for 122,456 uuids). A long line keeps the chunks it spans alive until it is
+ * joined, so a line near `maxLineBytes` peaks at a few times the cap (the
+ * chunks, the joined copy, the decoded string): bounded, not one line's size.
+ *
+ * It throws on any I/O error (entries already passed to `visit` stay passed):
+ * ENOENT from the open (test it with `isMissingFileError`), EACCES, EISDIR, a
+ * short read, or a line over `maxLineBytes`. It reads the whole file synchronously, so it is for offline
+ * callers (the orphan-duration backfill), never the server's event loop.
+ */
+export function forEachTranscriptEntry(
+  path: string,
+  visit: (entry: TranscriptEntry) => void,
+  opts?: { chunkBytes?: number; maxLineBytes?: number }
+): { skipped: number; sizeBytes: number } {
+  const chunkBytes = Math.max(
+    1,
+    Math.floor(opts?.chunkBytes ?? TRANSCRIPT_TAIL_CHUNK_BYTES)
+  );
+  const maxLineBytes = opts?.maxLineBytes ?? TRANSCRIPT_STREAM_MAX_LINE_BYTES;
+  const seenUuids = new Set<string>();
+  let skipped = 0;
+  const take = (line: string): void => {
+    const admitted = admitLine(line, seenUuids);
+    if (admitted === "blank") return;
+    if (admitted === "skipped") skipped += 1;
+    else visit(admitted);
+  };
+
+  const fd = openSync(path, "r");
+  try {
+    const sizeBytes = fstatSync(fd).size;
+    let pos = 0;
+    // The line being assembled across chunks: its pieces in file order, their
+    // total length, and where it starts (for the over-cap error).
+    let partial: Buffer[] = [];
+    let partialBytes = 0;
+    let lineStart = 0;
+    const checkCap = (lineBytes: number): void => {
+      if (lineBytes > maxLineBytes) {
+        throw new Error(
+          `transcript line at byte ${lineStart} is longer than ${maxLineBytes} bytes: ${path}`
+        );
+      }
+    };
+    while (pos < sizeBytes) {
+      const len = Math.min(chunkBytes, sizeBytes - pos);
+      // A fresh buffer per chunk, so the pieces kept in `partial` stay valid.
+      const buf = Buffer.allocUnsafe(len);
+      readExactly(fd, buf, pos);
+      const chunkStart = pos;
+      pos += len;
+      let start = 0;
+      for (;;) {
+        const nl = buf.indexOf(0x0a, start);
+        if (nl === -1) break;
+        checkCap(partialBytes + (nl - start));
+        if (partial.length === 0) {
+          take(buf.toString("utf8", start, nl));
+        } else {
+          take(
+            Buffer.concat([...partial, buf.subarray(start, nl)]).toString(
+              "utf8"
+            )
+          );
+          partial = [];
+          partialBytes = 0;
+        }
+        start = nl + 1;
+        lineStart = chunkStart + start;
+      }
+      if (start < len) {
+        checkCap(partialBytes + (len - start));
+        partial.push(buf.subarray(start));
+        partialBytes += len - start;
+      }
+    }
+    // The last line of the file has no newline after it.
+    if (partial.length > 0) take(Buffer.concat(partial).toString("utf8"));
+    return { skipped, sizeBytes };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**

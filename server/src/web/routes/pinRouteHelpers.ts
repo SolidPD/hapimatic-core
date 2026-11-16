@@ -135,6 +135,53 @@ export const PIN_FILES_MISSING_ROUTE = {
   code: "peer_without_pin_files",
 } as const;
 
+/** One peer-bad-response line at most this often (#6458 Task 11h). */
+export const PEER_BAD_RESPONSE_LOG_EVERY_MS = 60_000;
+
+/** When each kind last logged: reads and writes apart (#6458 review). */
+const peerBadResponseLoggedAt = {
+  read: Number.NEGATIVE_INFINITY,
+  write: Number.NEGATIVE_INFINITY,
+};
+
+/**
+ * #6458 Task 11h (#6487 SF-1): a peer's pin response that fails this hub's
+ * schema is answered 502, but on a write the peer may already have applied it,
+ * so the operator's retry can double it. Say so in the log, at most once a
+ * minute for reads and once a minute for writes, because a version-skewed peer
+ * fails every read poll and would otherwise hide the write line. Only the issue
+ * paths and codes are logged, never the issue messages or the body, which can
+ * quote pin text.
+ */
+function logPeerBadResponse(
+  method: string,
+  path: string,
+  issues: ReadonlyArray<{ path: PropertyKey[]; code: string }>,
+  now: number = Date.now()
+): void {
+  const write = method !== "GET" && method !== "HEAD";
+  const kind = write ? "write" : "read";
+  if (now - peerBadResponseLoggedAt[kind] < PEER_BAD_RESPONSE_LOG_EVERY_MS) {
+    return;
+  }
+  peerBadResponseLoggedAt[kind] = now;
+  const shape = issues
+    .slice(0, 3)
+    .map(
+      issue => `${issue.path.map(String).join(".") || "(root)"}:${issue.code}`
+    )
+    .join(", ");
+  console.warn(
+    `[pins] ${method} ${path}: the session's node answered a pin response this hub cannot read (${shape}); answered 502 peer_bad_response${write ? ", but the write may already be applied on that node" : ""}. Is that node on an older or newer version?`
+  );
+}
+
+/** Tests: forget when the last peer-bad-response lines were written. */
+export function __resetPeerBadResponseLog(): void {
+  peerBadResponseLoggedAt.read = Number.NEGATIVE_INFINITY;
+  peerBadResponseLoggedAt.write = Number.NEGATIVE_INFINITY;
+}
+
 /**
  * Map a proxy result to the caller's response, never relaying a 401, because the
  * web client treats any 401 as an expired login and shows "Session expired". A
@@ -186,6 +233,7 @@ export function proxiedPinResponse<T>(
   }
   const parsed = schema.safeParse(result.data);
   if (!parsed.success) {
+    logPeerBadResponse(c.req.method, c.req.path, parsed.error.issues);
     return c.json(
       {
         error: "The session's node returned an unexpected pin response",
@@ -387,7 +435,13 @@ export async function pinSaveResponse(
   const written = pins.markSaved(
     { id: session.id, namespace: session.namespace },
     pin.key,
-    { savedTo: saved.savedTo, revision: pin.revision }
+    {
+      savedTo: saved.savedTo,
+      revision: pin.revision,
+      // #6458 (#6540 S-4): so the Save button can say a save was partial.
+      files: saved.copied.length + saved.kept.length,
+      skipped: saved.skipped.length + (saved.skippedMore ?? 0),
+    }
   );
   if (!written) return pinNotFound(c);
   return c.json({
@@ -690,6 +744,21 @@ export function pinByIdResponse(c: Context, outcome: PinByIdOutcome): Response {
         session: outcome.session,
       });
     case "not_found":
+      // A spoke's miss (#6458 Task 11i): still `pin_not_found`, so an older
+      // client reads a miss, with `localOnly` for the ones that can say more. No
+      // `Retry-After`: a retry on a spoke cannot search more.
+      if (outcome.localOnly) {
+        return c.json(
+          {
+            error:
+              "No pin has that ID on this node, which cannot search the other nodes",
+            code: "pin_not_found",
+            notAsked: [],
+            localOnly: true,
+          },
+          404
+        );
+      }
       return c.json(
         {
           error:

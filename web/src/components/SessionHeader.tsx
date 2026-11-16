@@ -149,6 +149,8 @@ export function SessionHeader(props: {
   // Repo URL from metadata (no lazy API call needed)
   const repoUrl = session.metadata?.repoIdentity?.url ?? null;
   // #6454: the open pins a Disconnect confirm warns about (unknown until read).
+  // #6660: the same count feeds the Row-2 Pins Waiting slot — the Pins tab
+  // badge's own reader, so the header and the tab can never disagree.
   const { openPinCount } = useSessionOpenPinCount(session.id);
 
   // Get branch name — check isDetached before falling back to worktree metadata
@@ -685,7 +687,7 @@ export function SessionHeader(props: {
                     Session Configuration modal — the account selector lives in
                     its Account row — NOT a bare account picker; the NodeBadge is
                     relocated here from Row 2 (its sole render site). */}
-                {/* Fixed-width block = the Row-2 [loop-cron · count · bell] span,
+                {/* Fixed-width block = the Row-2 [loop-cron · count · pins] span,
                     so the Account Chip's LEFT edge sits on the Loop-Cron slot's
                     left edge one row below (operator ruling 2026-09-05; see
                     rowAnchors.ts). Chip grows/truncates inside; Node Badge is
@@ -708,7 +710,8 @@ export function SessionHeader(props: {
                       OpenCode (mutually exclusive with it by flavor). */}
                   <SessionAuthBindingBadge session={session} />
                   {/* E8/E9 right block: the Node Badge is a FIXED cell exactly as
-                      wide as [Message Count · Bell] beneath it, label centered.
+                      wide as [Message Count · Pins Waiting] beneath it
+                      (#6660), label centered.
                       Round 10: both grow by the badge's corner radius — the
                       count slot pads left by it so the bubble starts where the
                       badge's straight edge begins (rowAnchors.ts). Tapping the
@@ -728,13 +731,15 @@ export function SessionHeader(props: {
                 </div>
               </div>
               {/* Row 2: shared Status Icon Cluster (loop-cron · message count ·
-                  bell) — the same width as the Row-1 cluster above, so the two
-                  rows form the E9 two-block layout. NodeBadge moved to Row 1
-                  above (D3(a)); the conditional `?`/queued slot is gone (E9). */}
+                  pins waiting, #6660) — the same width as the Row-1 cluster
+                  above, so the two rows form the E9 two-block layout. NodeBadge
+                  moved to Row 1 above (D3(a)); the conditional `?`/queued slot
+                  is gone (E9). The pins count is the detail query's. */}
               <SessionRightMetaRow
                 sessionId={session.id}
                 messageCount={props.messageCount}
                 backgroundAgents={session.backgroundAgents}
+                openPinCount={openPinCount}
               />
             </div>
 

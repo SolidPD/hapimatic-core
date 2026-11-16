@@ -33,6 +33,13 @@ const MIRROR_SKIP_CATEGORIES = new Set([
   "turns-write",
   "turns-lifecycle",
   "api-error",
+  // Issue #6647: runner identity warnings carry a session id but are not the
+  // session's errors; mirrored, `observe` would show on a person's turns.
+  "runner-identity-attach",
+  "runner-identity-handshake",
+  "runner-identity-report",
+  "runner-identity-refusal",
+  "runner-identity-shutdown",
 ]);
 
 /**

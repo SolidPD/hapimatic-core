@@ -85,6 +85,70 @@ export const WORKFLOW_BADGE_SQL = `SELECT
          GROUP BY 1`;
 
 /**
+ * The exact DELETE {@link TurnStore.replaceReconcileLabels} runs, hoisted (like
+ * {@link WORKFLOW_BADGE_SQL}) so the #2503 write-path plan guard
+ * (`turnStore.readers.test.ts`) EXPLAINs the shipping statement, never a copy.
+ */
+export const WORKFLOW_RECONCILE_DELETE_SQL =
+  "DELETE FROM workflow_reconcile WHERE hapi_session_id = ? AND issue_number = ?";
+
+/** #2503 (R10): the busy wait of one reconcile write transaction. */
+export const RECONCILE_WRITE_BUSY_TIMEOUT_MS = 250;
+
+/** One label event of a reconcile snapshot (GitHub's timeline, label events only). */
+export interface ReconcileLabelEvent {
+  label: string;
+  kind: "label_added" | "label_removed";
+  tsMs: number;
+  /** The GitHub timeline event id: the tie-break for same-second events. */
+  id?: number;
+}
+
+/**
+ * #2503 (R10): keep the newest event per label, by `(tsMs, GitHub event id)`;
+ * where either event of a same-second pair has no id, the later one in timeline
+ * (input) order wins. GitHub does not document the order of same-second events,
+ * and before this the UNIQUE(session, issue, label, ts_ms) key with
+ * INSERT OR IGNORE kept the FIRST of them, so a same-second add then remove
+ * left a removed label on the badge.
+ */
+export function collapseReconcileEvents(
+  events: readonly ReconcileLabelEvent[]
+): ReconcileLabelEvent[] {
+  const newest = new Map<string, ReconcileLabelEvent>();
+  for (const ev of events) {
+    const current = newest.get(ev.label);
+    if (!current || isLaterReconcileEvent(ev, current)) {
+      newest.set(ev.label, ev);
+    }
+  }
+  return [...newest.values()];
+}
+
+/** `candidate` (later in input order) supersedes `current` for its label. */
+function isLaterReconcileEvent(
+  candidate: ReconcileLabelEvent,
+  current: ReconcileLabelEvent
+): boolean {
+  if (candidate.tsMs !== current.tsMs) return candidate.tsMs > current.tsMs;
+  if (
+    typeof candidate.id === "number" &&
+    typeof current.id === "number" &&
+    candidate.id !== current.id
+  ) {
+    return candidate.id > current.id;
+  }
+  return true; // same second, no id to order by: timeline order
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /database is locked|SQLITE_BUSY/i.test(message);
+}
+
+/**
  * Raw synchronous CRUD for the per-turn telemetry tables (issue #1663).
  *
  * `TurnStore` is the low-level DB surface — its methods are SYNCHRONOUS and MAY
@@ -750,44 +814,147 @@ export class TurnStore {
    * issue #1672 (Sub J, R6). "Replace" semantics keep `workflow_reconcile` a
    * faithful mirror of GitHub's current timeline snapshot, so the call is
    * idempotent per reconcile cycle. One transaction: DELETE the pair's rows, then
-   * batch-INSERT. `node_id` stamps the federation origin (R5). INSERT OR IGNORE
-   * tolerates a (label, ts_ms) collision within the same snapshot. MAY throw —
-   * the reconcile service wraps it fail-open.
+   * batch-INSERT. `node_id` stamps the federation origin (R5). MAY throw. (The
+   * reconcile service writes through `replaceReconcileLabelsForSessions`.)
+   *
+   * #2503 (R10): the snapshot is collapsed to the newest event per label
+   * ({@link collapseReconcileEvents}) before it is written, so a same-second
+   * add and remove ends as the later one. Badge-equivalent: the badge SQL and
+   * `v_workflow_state` keep only the latest event per label anyway.
    */
   replaceReconcileLabels(
     hapiSessionId: string,
     issueNumber: number,
     nodeId: string,
-    events: Array<{
-      label: string;
-      kind: "label_added" | "label_removed";
-      tsMs: number;
-    }>
+    events: ReconcileLabelEvent[]
   ): void {
     const apply = this.db.transaction(() => {
-      this.db
-        .prepare(
-          "DELETE FROM workflow_reconcile WHERE hapi_session_id = ? AND issue_number = ?"
-        )
-        .run(hapiSessionId, issueNumber);
-      const stmt = this.db.prepare(
-        `INSERT OR IGNORE INTO workflow_reconcile
-           (id, hapi_session_id, issue_number, label, kind, ts_ms, node_id)
-         VALUES (@id, @hapi_session_id, @issue_number, @label, @kind, @ts_ms, @node_id)`
+      this.writeReconcilePair(
+        hapiSessionId,
+        issueNumber,
+        nodeId,
+        collapseReconcileEvents(events)
       );
-      for (const ev of events) {
-        stmt.run({
-          id: newUuidV7(),
-          hapi_session_id: hapiSessionId,
-          issue_number: issueNumber,
-          label: ev.label,
-          kind: ev.kind,
-          ts_ms: ev.tsMs,
-          node_id: nodeId,
-        });
-      }
     });
     apply();
+  }
+
+  /**
+   * #2503 (R10): write one issue's snapshot to several sessions in ONE
+   * `BEGIN IMMEDIATE` transaction, with `busy_timeout` lowered to
+   * `busyTimeoutMs` (250 ms by default) for the duration and restored after.
+   * bun:sqlite is synchronous, so a busy wait freezes the whole event loop:
+   * a per-session transaction at the connection's 5 s could stall it for 5 s
+   * per session. A busy error returns `{ busy: true }` with nothing written (the
+   * transaction rolls back); every other error throws. The `writeFactsBatch`
+   * pattern (`store/throughput/factsStore.ts`).
+   */
+  replaceReconcileLabelsForSessions(
+    hapiSessionIds: readonly string[],
+    issueNumber: number,
+    nodeId: string,
+    events: ReconcileLabelEvent[],
+    opts: { busyTimeoutMs?: number } = {}
+  ): { busy: boolean } {
+    if (hapiSessionIds.length === 0) return { busy: false };
+    const collapsed = collapseReconcileEvents(events);
+    const txn = this.db.transaction(() => {
+      for (const hapiSessionId of hapiSessionIds) {
+        this.writeReconcilePair(hapiSessionId, issueNumber, nodeId, collapsed);
+      }
+    });
+    const previousTimeout = this.readBusyTimeout();
+    try {
+      this.setBusyTimeout(
+        opts.busyTimeoutMs ?? RECONCILE_WRITE_BUSY_TIMEOUT_MS
+      );
+      txn.immediate();
+      return { busy: false };
+    } catch (error) {
+      if (!isSqliteBusy(error)) throw error;
+      return { busy: true };
+    } finally {
+      this.setBusyTimeout(previousTimeout);
+    }
+  }
+
+  /** DELETE one pair's reconcile rows, then INSERT `events` (already collapsed). */
+  private writeReconcilePair(
+    hapiSessionId: string,
+    issueNumber: number,
+    nodeId: string,
+    events: ReconcileLabelEvent[]
+  ): void {
+    this.db
+      .prepare(WORKFLOW_RECONCILE_DELETE_SQL)
+      .run(hapiSessionId, issueNumber);
+    const stmt = this.db.prepare(
+      `INSERT OR IGNORE INTO workflow_reconcile
+         (id, hapi_session_id, issue_number, label, kind, ts_ms, node_id)
+       VALUES (@id, @hapi_session_id, @issue_number, @label, @kind, @ts_ms, @node_id)`
+    );
+    for (const ev of events) {
+      stmt.run({
+        id: newUuidV7(),
+        hapi_session_id: hapiSessionId,
+        issue_number: issueNumber,
+        label: ev.label,
+        kind: ev.kind,
+        ts_ms: ev.tsMs,
+        node_id: nodeId,
+      });
+    }
+  }
+
+  /** #2503 fix round 2 (R2-2): `fn` at a lowered busy_timeout, restored after. */
+  withBusyTimeout<T>(busyTimeoutMs: number, fn: () => T): T {
+    const previousTimeout = this.readBusyTimeout();
+    this.setBusyTimeout(busyTimeoutMs);
+    try {
+      return fn();
+    } finally {
+      this.setBusyTimeout(previousTimeout);
+    }
+  }
+
+  /**
+   * #2503 fix round 2 (R2-2): BEGIN IMMEDIATE under a `busyTimeoutMs` wait,
+   * then ROLLBACK: true when free; false on busy or a thrown ROLLBACK (F6: it
+   * is retried while a transaction is open). Other errors throw.
+   */
+  tryWriteLock(busyTimeoutMs: number): boolean {
+    return this.withBusyTimeout(busyTimeoutMs, () => {
+      try {
+        this.db.run("BEGIN IMMEDIATE");
+      } catch (error) {
+        if (isSqliteBusy(error)) return false;
+        throw error;
+      }
+      try {
+        this.db.run("ROLLBACK");
+        return true;
+      } catch {
+        try {
+          if (this.db.inTransaction) this.db.run("ROLLBACK");
+        } catch {
+          // Still not free: never a write into an open transaction.
+        }
+        return false;
+      }
+    });
+  }
+
+  private readBusyTimeout(): number {
+    const row = this.db.prepare("PRAGMA busy_timeout").get() as
+      | Record<string, unknown>
+      | undefined;
+    const value = row ? Object.values(row)[0] : undefined;
+    return typeof value === "number" ? value : 5000;
+  }
+
+  private setBusyTimeout(ms: number): void {
+    const safe = Math.max(0, Math.floor(ms));
+    this.db.prepare(`PRAGMA busy_timeout = ${safe}`).get();
   }
 
   /**

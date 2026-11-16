@@ -359,6 +359,11 @@ function startSync(
   // Past PIN_CHANGE_FETCH_MAX observed cards (the chat is not virtualized), one
   // list read seeds them all instead of a request per card on every reconnect.
   const onConnect = () => {
+    // #6527: a fence card waits for the list, so a watched list refetches too.
+    void queryClient.invalidateQueries(
+      { queryKey: listKey, exact: true },
+      { cancelRefetch: false }
+    );
     const observed = cache
       .findAll({ queryKey: queryKeys.pins(sessionId) })
       .filter(q => q.queryKey[2] === "pin" && q.getObserversCount() > 0);
@@ -497,7 +502,12 @@ export type PinByIdLookup =
       timeZone: string | null;
       session: PinByIdSession;
     }
-  | { kind: "not_found"; notAsked: PinByIdNode[] }
+  | {
+      kind: "not_found";
+      notAsked: PinByIdNode[];
+      /** The server is a federation spoke and searched only itself (#6458 Task 11i). */
+      localOnly?: boolean;
+    }
   | { kind: "ambiguous"; matches: PinByIdMatch[] }
   | { kind: "rate_limited" }
   | { kind: "incomplete"; nodes: PinByIdNode[] }
@@ -552,7 +562,11 @@ async function fetchPinById(
     const body = pinByIdErrorBody(error.body);
     if (error.status === 404) {
       return body?.code === "pin_not_found"
-        ? { kind: "not_found", notAsked: nodeLabels(body.notAsked) }
+        ? {
+            kind: "not_found",
+            notAsked: nodeLabels(body.notAsked),
+            ...(body.localOnly === true ? { localOnly: true } : {}),
+          }
         : { kind: "unavailable" };
     }
     if (error.status === 409) {
@@ -701,6 +715,38 @@ export function writePinsToCaches(
   );
 }
 
+/**
+ * #6511 S2: write a star or mark-seen response without rolling a newer cached
+ * pin back. A response with a lower `revision` than the cached pin never
+ * replaces it; one with the same `revision` copies only the fields that write
+ * changed, because answering a pin moves `updated_at` but not `revision`
+ * (`server/src/store/pinStore.ts`), so an equal-revision response can still
+ * carry older answers; a higher revision is newer and replaces the pin.
+ */
+function writeFlagResponse(
+  queryClient: QueryClient,
+  sessionId: string,
+  res: Pin,
+  fields: readonly ("starred" | "seenAt" | "seenRevision")[],
+  openPinCount?: number
+): void {
+  updateCachedPins(
+    queryClient,
+    sessionId,
+    cached => {
+      if (res.revision > cached.revision) return res;
+      if (res.revision < cached.revision) return cached;
+      const next = { ...cached };
+      for (const field of fields) {
+        (next as Record<string, unknown>)[field] = res[field];
+      }
+      return next;
+    },
+    [res.key],
+    openPinCount
+  );
+}
+
 /** A pin as cached, from its own cache first, then the list. */
 function cachedPin(
   queryClient: QueryClient,
@@ -785,7 +831,13 @@ export function useStarPin(api: ApiClient | null, sessionId: string) {
       }
     },
     onSuccess: res =>
-      writePinsToCaches(queryClient, sessionId, [res.pin], res.openPinCount),
+      writeFlagResponse(
+        queryClient,
+        sessionId,
+        res.pin,
+        ["starred"],
+        res.openPinCount
+      ),
     onSettled: (_res, _error, _vars, context) => {
       for (const queryKey of context?.cancelled ?? []) {
         void queryClient.invalidateQueries({ queryKey, exact: true });
@@ -891,7 +943,13 @@ export function useMarkPinSeen(api: ApiClient | null, sessionId: string) {
       );
     },
     onSuccess: res =>
-      writePinsToCaches(queryClient, sessionId, [res.pin], res.openPinCount),
+      writeFlagResponse(
+        queryClient,
+        sessionId,
+        res.pin,
+        ["seenAt", "seenRevision"],
+        res.openPinCount
+      ),
     // Mutation-level, not per-call: TanStack fires a `mutate(…, { onError })`
     // callback only for the latest call, so a second pin marked right after a
     // failing one would leave the failed id stuck in the set.

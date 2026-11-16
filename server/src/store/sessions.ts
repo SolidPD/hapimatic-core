@@ -2,10 +2,18 @@
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 import type { SessionView, UiCollapseState } from "@hapi/protocol";
+import { MAX_RUNNER_KEYS_PER_LIST } from "@hapi/protocol";
 
 import type { StoredSession, VersionedUpdateResult } from "./types";
 import { safeJsonParse } from "./json";
 import { updateVersionedField } from "./versionedUpdates";
+import {
+  insertBillableSwitchEvent,
+  isBillableSwitchStorageReady,
+  readProjectDefaultRow,
+  upsertProjectDefaultRow,
+  type BillableSwitchEventInsert,
+} from "./billableSwitchStore";
 
 type DbSessionRow = {
   id: string;
@@ -42,10 +50,35 @@ type DbSessionRow = {
   parent_relationship: string | null;
   branch_label: string | null;
   branch_created_at: number | null;
+  // Issue #6646: absent on a database whose billable migration failed.
+  billable?: number | null;
+  billable_confirm?: string | null;
 };
 
-function toStoredSession(row: DbSessionRow): StoredSession {
+/**
+ * Issue #6646: the switch is read only when the node's switch storage is ready;
+ * otherwise both fields stay undefined, so the record and the summary leave
+ * them out and the session reads "unknown" (A5), never "non-billable".
+ */
+function billableFields(
+  row: DbSessionRow,
+  switchReady: boolean
+): Pick<StoredSession, "billable" | "billableConfirm"> {
+  if (!switchReady || row.billable === undefined || row.billable === null) {
+    return {};
+  }
   return {
+    billable: row.billable === 1,
+    billableConfirm: row.billable_confirm === "pending" ? "pending" : null,
+  };
+}
+
+function toStoredSession(
+  row: DbSessionRow,
+  switchReady: boolean
+): StoredSession {
+  return {
+    ...billableFields(row, switchReady),
     id: row.id,
     tag: row.tag,
     namespace: row.namespace,
@@ -96,34 +129,69 @@ function toStoredSession(row: DbSessionRow): StoredSession {
   };
 }
 
-export function getOrCreateSession(
+/**
+ * Issue #6646: the start value of a new session row (the plan's Task 3), applied
+ * on the INSERT branch only, in the same transaction as the row: the switch, its
+ * `start` event, and for row 2 of the truth table this node's header for the
+ * project with its `header-on` event. The caller computes it only when the gate
+ * is `on`; the store fills in the new row's id.
+ */
+export type BillableSwitchInitial = {
+  billable: boolean;
+  confirm: "pending" | null;
+  event: Omit<BillableSwitchEventInsert, "sessionId">;
+  header?: {
+    projectKey: string;
+    keyKind: "repo" | "path";
+    event: Omit<BillableSwitchEventInsert, "sessionId">;
+  };
+};
+
+/**
+ * The one place a session row is created (every registration reaches it through
+ * `sessionCache.getOrCreateSession` from `POST /cli/sessions`). The existence
+ * SELECT, the base INSERT (unchanged, so registration never names a column a
+ * failed migration could lack), the switch UPDATE, the `start` event and the
+ * header write all run in ONE `.immediate()` transaction: the check and the
+ * insert are atomic across processes (the CLI and operator scripts can hold the
+ * same file), and a busy writer waits for `busy_timeout` instead of failing on
+ * a lock upgrade (#3631). `initial` is called only when a row is inserted;
+ * anything it or the event write throws rolls the whole insert back.
+ */
+export function getOrCreateSessionWithFlag(
   db: Database,
   tag: string,
   metadata: unknown,
   agentState: unknown,
-  namespace: string
-): StoredSession {
-  const existing = db
-    .prepare(
-      "SELECT * FROM sessions WHERE tag = ? AND namespace = ? ORDER BY created_at DESC LIMIT 1"
-    )
-    .get(tag, namespace) as DbSessionRow | undefined;
+  namespace: string,
+  initial?: () => BillableSwitchInitial | null
+): { session: StoredSession; created: boolean } {
+  const run = db.transaction(
+    (): { session: StoredSession; created: boolean } => {
+      const existing = db
+        .prepare(
+          "SELECT * FROM sessions WHERE tag = ? AND namespace = ? ORDER BY created_at DESC LIMIT 1"
+        )
+        .get(tag, namespace) as DbSessionRow | undefined | null;
 
-  if (existing) {
-    return toStoredSession(existing);
-  }
+      if (existing != null) {
+        return {
+          session: toStoredSession(existing, isBillableSwitchStorageReady(db)),
+          created: false,
+        };
+      }
 
-  const now = Date.now();
-  const id = randomUUID();
+      const now = Date.now();
+      const id = randomUUID();
 
-  const metadataJson = JSON.stringify(metadata);
-  const agentStateJson =
-    agentState === null || agentState === undefined
-      ? null
-      : JSON.stringify(agentState);
+      const metadataJson = JSON.stringify(metadata);
+      const agentStateJson =
+        agentState === null || agentState === undefined
+          ? null
+          : JSON.stringify(agentState);
 
-  db.prepare(
-    `
+      db.prepare(
+        `
         INSERT INTO sessions (
             id, tag, namespace, machine_id, created_at, updated_at,
             metadata, metadata_version,
@@ -138,21 +206,75 @@ export function getOrCreateSession(
             0, NULL, 0
         )
     `
-  ).run({
-    id,
-    tag,
-    namespace,
-    created_at: now,
-    updated_at: now,
-    metadata: metadataJson,
-    agent_state: agentStateJson,
-  });
+      ).run({
+        id,
+        tag,
+        namespace,
+        created_at: now,
+        updated_at: now,
+        metadata: metadataJson,
+        agent_state: agentStateJson,
+      });
 
-  const row = getSession(db, id);
-  if (!row) {
-    throw new Error("Failed to create session");
-  }
-  return row;
+      const start = initial?.() ?? null;
+      if (start) {
+        db.prepare(
+          "UPDATE sessions SET billable = ?, billable_confirm = ? WHERE id = ?"
+        ).run(
+          start.billable ? 1 : 0,
+          start.billable ? start.confirm : null,
+          id
+        );
+        if (start.header) {
+          const prior = readProjectDefaultRow(
+            db,
+            namespace,
+            start.header.projectKey
+          );
+          if (prior === null || !prior.billable) {
+            upsertProjectDefaultRow(
+              db,
+              namespace,
+              start.header.projectKey,
+              start.header.keyKind,
+              true,
+              now
+            );
+            insertBillableSwitchEvent(db, {
+              ...start.header.event,
+              namespace,
+              sessionId: null,
+              billableBefore: prior === null ? null : prior.billable,
+              billableAfter: true,
+            });
+          }
+        }
+        insertBillableSwitchEvent(db, {
+          ...start.event,
+          namespace,
+          sessionId: id,
+        });
+      }
+
+      const row = getSession(db, id);
+      if (!row) {
+        throw new Error("Failed to create session");
+      }
+      return { session: row, created: true };
+    }
+  );
+  return run.immediate();
+}
+
+export function getOrCreateSession(
+  db: Database,
+  tag: string,
+  metadata: unknown,
+  agentState: unknown,
+  namespace: string
+): StoredSession {
+  return getOrCreateSessionWithFlag(db, tag, metadata, agentState, namespace)
+    .session;
 }
 
 export function updateSessionMetadata(
@@ -258,7 +380,7 @@ export function getSession(db: Database, id: string): StoredSession | null {
   const row = db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as
     | DbSessionRow
     | undefined;
-  return row ? toStoredSession(row) : null;
+  return row ? toStoredSession(row, isBillableSwitchStorageReady(db)) : null;
 }
 
 export function getSessionByNamespace(
@@ -269,7 +391,7 @@ export function getSessionByNamespace(
   const row = db
     .prepare("SELECT * FROM sessions WHERE id = ? AND namespace = ?")
     .get(id, namespace) as DbSessionRow | undefined;
-  return row ? toStoredSession(row) : null;
+  return row ? toStoredSession(row, isBillableSwitchStorageReady(db)) : null;
 }
 
 export function getSessions(db: Database): StoredSession[] {
@@ -284,7 +406,8 @@ export function getSessions(db: Database): StoredSession[] {
     `
     )
     .all() as DbSessionRow[];
-  return rows.map(toStoredSession);
+  const ready = isBillableSwitchStorageReady(db);
+  return rows.map(row => toStoredSession(row, ready));
 }
 
 export function getSessionsByNamespace(
@@ -303,7 +426,8 @@ export function getSessionsByNamespace(
     `
     )
     .all(namespace) as DbSessionRow[];
-  return rows.map(toStoredSession);
+  const ready = isBillableSwitchStorageReady(db);
+  return rows.map(row => toStoredSession(row, ready));
 }
 
 export function deleteSession(
@@ -862,4 +986,181 @@ export function getMessageCountsByNamespace(
     counts.set(row.id, row.message_count);
   }
   return counts;
+}
+
+/**
+ * Issue #6647 (R2, R15): a session's runner record, kept in seven nullable
+ * `sessions` columns and never mapped into the Session record (plan §7). A
+ * NULL `attachedAt` is "no record"; the two key lists and `cutAt` are read in
+ * every state. Keys only, never a runner id.
+ */
+export type RunnerRecord = {
+  runnerKey: string | null;
+  startedBy: string | null;
+  pid: number | null;
+  attachedAt: number | null;
+  supersededKeys: string[];
+  refusedKeys: string[];
+  cutAt: number | null;
+};
+
+type DbRunnerRow = {
+  runner_key: string | null;
+  runner_started_by: string | null;
+  runner_pid: number | null;
+  runner_attached_at: number | null;
+  runner_superseded_keys: string | null;
+  runner_refused_keys: string | null;
+  runner_cut_at: number | null;
+};
+
+/** A malformed or missing list column reads as `[]`. */
+function readRunnerKeys(raw: string | null): string[] {
+  const parsed = safeJsonParse(raw);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.filter((k): k is string => typeof k === "string");
+}
+
+/** Keep the newest keys: the list is oldest first, so the oldest go first. */
+function capRunnerKeys(keys: readonly string[]): string[] {
+  return keys.slice(-MAX_RUNNER_KEYS_PER_LIST);
+}
+
+export function getRunnerRecord(
+  db: Database,
+  sessionId: string,
+  namespace: string
+): RunnerRecord | null {
+  const row = db
+    .prepare(
+      `SELECT runner_key, runner_started_by, runner_pid, runner_attached_at,
+              runner_superseded_keys, runner_refused_keys, runner_cut_at
+       FROM sessions WHERE id = ? AND namespace = ?`
+    )
+    .get(sessionId, namespace) as DbRunnerRow | undefined | null;
+  if (row == null) return null;
+  return {
+    runnerKey: row.runner_key,
+    startedBy: row.runner_started_by,
+    pid: row.runner_pid,
+    attachedAt: row.runner_attached_at,
+    supersededKeys: readRunnerKeys(row.runner_superseded_keys),
+    refusedKeys: readRunnerKeys(row.runner_refused_keys),
+    cutAt: row.runner_cut_at,
+  };
+}
+
+/**
+ * Writes the `runner_*` columns only, never `seq` or `updated_at`: the session
+ * lists are ordered by `updated_at`, so a record write must not reorder them.
+ */
+export function setRunnerRecord(
+  db: Database,
+  sessionId: string,
+  namespace: string,
+  record: RunnerRecord
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE sessions
+       SET runner_key = @runner_key,
+           runner_started_by = @runner_started_by,
+           runner_pid = @runner_pid,
+           runner_attached_at = @runner_attached_at,
+           runner_superseded_keys = @runner_superseded_keys,
+           runner_refused_keys = @runner_refused_keys,
+           runner_cut_at = @runner_cut_at
+       WHERE id = @id AND namespace = @namespace`
+    )
+    .run({
+      id: sessionId,
+      namespace,
+      runner_key: record.runnerKey,
+      runner_started_by: record.startedBy,
+      runner_pid: record.pid,
+      runner_attached_at: record.attachedAt,
+      runner_superseded_keys: JSON.stringify(
+        capRunnerKeys(record.supersededKeys)
+      ),
+      runner_refused_keys: JSON.stringify(capRunnerKeys(record.refusedKeys)),
+      runner_cut_at: record.cutAt,
+    });
+  return result.changes === 1;
+}
+
+/** R15's cut-off mark: sets `runner_cut_at` only. */
+export function setRunnerCutAt(
+  db: Database,
+  sessionId: string,
+  cutAt: number | null
+): boolean {
+  const result = db
+    .prepare("UPDATE sessions SET runner_cut_at = ? WHERE id = ?")
+    .run(cutAt, sessionId);
+  return result.changes === 1;
+}
+
+/**
+ * Adds a refused (or would-be-refused) newcomer's key, newest last, capped
+ * at 16. A key already on the list moves to the end rather than taking a
+ * second slot. Two plain statements, no deferred transaction (the store's
+ * busy rule, server/CLAUDE.md); sets `runner_refused_keys` only.
+ */
+export function addRefusedRunnerKey(
+  db: Database,
+  sessionId: string,
+  namespace: string,
+  key: string
+): boolean {
+  const row = db
+    .prepare(
+      "SELECT runner_refused_keys FROM sessions WHERE id = ? AND namespace = ?"
+    )
+    .get(sessionId, namespace) as
+    | { runner_refused_keys: string | null }
+    | undefined
+    | null;
+  if (row == null) return false;
+  const keys = readRunnerKeys(row.runner_refused_keys).filter(k => k !== key);
+  keys.push(key);
+  const result = db
+    .prepare(
+      "UPDATE sessions SET runner_refused_keys = ? WHERE id = ? AND namespace = ?"
+    )
+    .run(JSON.stringify(capRunnerKeys(keys)), sessionId, namespace);
+  return result.changes === 1;
+}
+
+/** Issue #6647: the seven runner columns of `sessions` (Task 2). */
+export const RUNNER_COLUMNS = [
+  "runner_key",
+  "runner_started_by",
+  "runner_pid",
+  "runner_attached_at",
+  "runner_superseded_keys",
+  "runner_refused_keys",
+  "runner_cut_at",
+] as const;
+
+/** Task 9: whether every runner column exists (the route's `columnsPresent`). */
+export function runnerColumnsPresent(db: Database): boolean {
+  const rows = db.prepare("PRAGMA table_info(sessions)").all() as Array<{
+    name: string;
+  }>;
+  const names = new Set(rows.map(r => r.name));
+  return RUNNER_COLUMNS.every(column => names.has(column));
+}
+
+/** The attach's own tag lookup (the newest row with this tag), id only. */
+export function findSessionIdByTag(
+  db: Database,
+  tag: string,
+  namespace: string
+): string | null {
+  const row = db
+    .prepare(
+      "SELECT id FROM sessions WHERE tag = ? AND namespace = ? ORDER BY created_at DESC LIMIT 1"
+    )
+    .get(tag, namespace) as { id: string } | undefined | null;
+  return row?.id ?? null;
 }

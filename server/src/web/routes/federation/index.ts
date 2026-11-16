@@ -14,6 +14,8 @@ import { createSettingsSyncReceiverRoutes } from "./settingsSync";
 import { createWebClientRoutes } from "./webClient";
 import { createQueueMutationRoutes } from "./queueMutations";
 import { createPinMutationRoutes } from "./pinMutations";
+import { createBillableSwitchReceiverRoutes } from "./billableSwitchReceivers";
+import { createBillableSwitchEventFeedRoutes } from "./billableSwitchEventFeed";
 import { createFederationAccountRoutes } from "./accounts";
 import { createFederationAccountHealthRoutes } from "./accountHealth";
 import { createFederationAnthropicLoginRoutes } from "./anthropicLogin";
@@ -59,6 +61,11 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   app.route("/", createQueueMutationRoutes(deps));
   // Issue #6447: pin receivers, the owning node's half of a proxied pin request.
   app.route("/", createPinMutationRoutes(deps));
+  // Issue #6646: billable switch receivers, the owning node's half of a proxied
+  // switch, confirm, history or header write, the list read and the report push.
+  app.route("/", createBillableSwitchReceiverRoutes(deps));
+  // Issue #6646 (Task 7b): the record's replication feed for other nodes' pullers.
+  app.route("/", createBillableSwitchEventFeedRoutes(deps));
   // Issue #1452 (Sub-Issue F): node-to-node active-account receivers.
   app.route("/", createFederationAccountRoutes(deps));
   // Issue #4461 (epic #4460 A): per-node account health — hub aggregator (JWT

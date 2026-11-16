@@ -8,7 +8,11 @@
 
 import { trimIdent } from "@/utils/trimIdent";
 import { configuration } from "@/configuration";
-import { renderTier0, capabilityCatalogIndex } from "@hapi/protocol";
+import {
+  renderTier0,
+  renderPinsPrimer,
+  capabilityCatalogIndex,
+} from "@hapi/protocol";
 import { buildDocsPointer } from "@/utils/hapimaticDocsPointer";
 
 /**
@@ -23,7 +27,7 @@ export const TITLE_INSTRUCTION = trimIdent(`
 /**
  * The system prompt to inject via developer_instructions — used by BOTH the
  * local `-c developer_instructions=` path (codexLocal.ts) and the remote
- * JSON-config path (codexStartConfig.ts), which both import this const.
+ * JSON-config path (codexStartConfig.ts), through `buildCodexSystemPrompt`.
  *
  * Issue #3748 (Sub H, R5): with Tier-0 injection ON (default) the title
  * instruction + the rendered capability catalog; with HAPI_CAPABILITY_TIER0=0
@@ -41,6 +45,19 @@ const codexBasePrompt = configuration.capabilityTier0Enabled
 
 const codexDocsPointer = buildDocsPointer();
 
-export const codexSystemPrompt = codexDocsPointer
+const codexPromptWithDocs = codexDocsPointer
   ? codexBasePrompt + "\n\n" + codexDocsPointer
   : codexBasePrompt;
+
+/**
+ * The Codex system prompt for one session. Issue #6458: a session whose Pins
+ * gate is open (its own `startHappyServer` probe; the stdio bridge forwards the
+ * pin tools verbatim) gets the shared Pins block after the docs pointer, the
+ * same text as every Claude launcher. `pinsEnabled` is required, so a start
+ * path (the resume one included, A6) cannot drop it silently.
+ */
+export function buildCodexSystemPrompt(opts: { pinsEnabled: boolean }): string {
+  return opts.pinsEnabled
+    ? codexPromptWithDocs + "\n\n" + renderPinsPrimer(capabilityCatalogIndex)
+    : codexPromptWithDocs;
+}

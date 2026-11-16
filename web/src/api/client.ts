@@ -198,7 +198,6 @@ import type {
   TimelogAdjustmentResponse,
   TimelogAdjustmentsResponse,
   DerivedTimeLogResponse,
-  TimelogCutoverStatus,
   TelemetryAnomaly,
   TelemetryDurationStats,
   TelemetryFilesResponse,
@@ -2415,8 +2414,9 @@ export class ApiClient {
 
   /**
    * #6455: dismiss a pin for the operator (publishes `pin-changed`). The server
-   * refuses an open prompt pin with 409 `pin_reserved_key`: the prompt itself is
-   * still waiting, so the caller treats that as an expected outcome.
+   * refuses an open prompt pin whose request is still waiting with 409
+   * `pin_reserved_key` (one whose request is gone closes withdrawn, #6458 Task
+   * 11k), so the caller treats that as an expected outcome.
    */
   async dismissSessionPin(
     sessionId: string,
@@ -3384,13 +3384,6 @@ export class ApiClient {
     const qs = params.toString();
     return await this.request<DerivedTimeLogResponse>(
       `/api/timelogs/derived${qs ? `?${qs}` : ""}`
-    );
-  }
-
-  /** Is the time-log derived read-path cutover gate open? */
-  async getTimelogCutoverStatus(): Promise<TimelogCutoverStatus> {
-    return await this.request<TimelogCutoverStatus>(
-      "/api/timelogs/cutover-status"
     );
   }
 

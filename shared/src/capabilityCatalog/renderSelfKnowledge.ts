@@ -38,7 +38,12 @@
  * R3 exists to prevent). REST is excluded (F1-T0): the ~409 REST routes stay
  * discoverable on demand via `GET /api/capabilities/catalog`, never inline.
  */
-import type { CatalogEntry, Invocation } from "./types";
+import {
+  CATALOG_GATES,
+  type CatalogEntry,
+  type CatalogGate,
+  type Invocation,
+} from "./types";
 import { DOMAIN_SLUGS, DOMAIN_LABELS, type DomainSlug } from "./domains";
 import { isVisibleToScope } from "./availability";
 import { trimTrailingChars } from "../trimChars";
@@ -92,7 +97,15 @@ export const SELF_KNOWLEDGE_CEILING: Record<SelfKnowledgeScope, number> = {
   // raises again: #6224 (the Files-tab capability line, 75 B) and #6559
   // (`request_context_reset`, at most 100 B), leaving about 148 B spare.
   // A lane that needs more than its budget raises again, in review.
-  user: 13000,
+  // RAISED to 15,000 B by #6458 (Pins release 1; PM-10, ruled with the expert
+  // review, A3 and S-2): the preamble gains a Pins section (what a pin is, its
+  // ID, the answers message, its files, the count line, and what a session
+  // without Pins sees), and the six gated pin tools render in their own
+  // "Instance-gated: Pins" section (740 B). Measured render 14,620 B, from
+  // 12,289 B; re-measured on top of #6570's bullet at 14,878 B, so this keeps
+  // the larger ceiling. The 122 B margin holds #6224's 75 B but not #6559's
+  // 100 B as well: whichever of those lands second raises again, in review.
+  user: 15000,
   // Greenfield: no replaced-doc anchor. Fits the current full user∪operator
   // render (~16 KB) with headroom for the catalog to fill as #3745 lands more
   // RPC entries, and catches the ~64–80 KB REST-inclusion runaway (R3). A
@@ -122,12 +135,23 @@ const SURFACE_LABEL: Record<string, string> = {
 function isRenderCandidate(entry: CatalogEntry): boolean {
   if (entry.trusted === false) return false;
   if (entry.surface === "ui" || entry.surface === "rest") return false;
-  // #6448: a gated entry is never rendered. The doc is a committed artifact the
-  // boot writer copies to the machine-global ~/.claude/agent-self-knowledge.md,
-  // which every instance on a host shares, gate open or not.
-  if (entry.availability?.gate !== undefined) return false;
   return true;
 }
+
+/**
+ * #6458 Task 9 (A7): a gated entry renders in its own section, never among the
+ * domain lists. The doc is a committed artifact the boot writer copies to the
+ * machine-global ~/.claude/agent-self-knowledge.md, which every instance on a
+ * host shares, gate open or not, so the section names the gate instead of
+ * claiming it is open. A `Record` over the gates, so a new gate cannot render
+ * without its label.
+ */
+/**
+ * The gates whose entries a self-knowledge doc shows, with their names. A gate
+ * with no label stays out of every doc, as #6448 built gated entries (#6646's
+ * billable-switch among them); add one here only when its entries should show.
+ */
+const GATE_LABELS: Partial<Record<CatalogGate, string>> = { pins: "Pins" };
 
 /** The compact invocation coordinate for an entry (never rendered for destructive). */
 function invocationAction(inv: Invocation): string {
@@ -186,6 +210,19 @@ function selectByScope(
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
+/** Entry lines grouped by surface, in the domain lists' surface order. */
+function surfaceLines(entries: readonly CatalogEntry[]): string[] {
+  const lines: string[] = [];
+  for (const surface of SURFACE_ORDER) {
+    const inSurface = entries.filter(e => e.surface === surface);
+    if (inSurface.length === 0) continue;
+    lines.push(`**${SURFACE_LABEL[surface]}**`, "");
+    for (const e of inSurface) lines.push(renderEntryLine(e));
+    lines.push("");
+  }
+  return lines;
+}
+
 /**
  * Render the full `agent-self-knowledge.md` document for one scope (R1). The
  * output is: frontmatter (with the LITERAL `__HAPIMATIC_VERSION__` stamp, R1b) →
@@ -199,7 +236,8 @@ export function renderSelfKnowledge(
   scope: SelfKnowledgeScope,
   preambleText: string
 ): string {
-  const eligible = selectByScope(entries, scope);
+  const selected = selectByScope(entries, scope);
+  const eligible = selected.filter(e => e.availability?.gate === undefined);
   const scopeLabel =
     scope === "user"
       ? "this single-tenant user VM"
@@ -247,13 +285,20 @@ export function renderSelfKnowledge(
     const inDomain = eligible.filter(e => e.domain === (domain as DomainSlug));
     if (inDomain.length === 0) continue;
     lines.push(`### ${DOMAIN_LABELS[domain]}`, "");
-    for (const surface of SURFACE_ORDER) {
-      const inSurface = inDomain.filter(e => e.surface === surface);
-      if (inSurface.length === 0) continue;
-      lines.push(`**${SURFACE_LABEL[surface]}**`, "");
-      for (const e of inSurface) lines.push(renderEntryLine(e));
-      lines.push("");
-    }
+    lines.push(...surfaceLines(inDomain));
+  }
+
+  // #6458 Task 9: each gate's entries, after every domain, named as gated.
+  for (const gate of CATALOG_GATES) {
+    const label = GATE_LABELS[gate];
+    if (label === undefined) continue;
+    const gated = selected.filter(e => e.availability?.gate === gate);
+    if (gated.length === 0) continue;
+    lines.push(
+      `## Instance-gated: ${label} — present only where this instance's ${label} gate is open`,
+      ""
+    );
+    lines.push(...surfaceLines(gated));
   }
 
   const out = trimTrailingChars(lines.join("\n"), "\n") + "\n";

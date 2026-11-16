@@ -44,6 +44,22 @@ export interface ConfigSources {
   cliApiToken: "env" | "file" | "generated";
 }
 
+/**
+ * The data directory (`HAPI_HOME`, default `~/.hapi`) and the database
+ * (`DB_PATH`, default `<data directory>/hapi.db`), from the environment only.
+ * `Configuration.create` and the server instance lock (issue #6651) both call it,
+ * so the lock and the store cannot name different databases.
+ */
+export function resolveDataPaths(): { dataDir: string; dbPath: string } {
+  const dataDir = process.env.HAPI_HOME
+    ? process.env.HAPI_HOME.replace(/^~/, homedir())
+    : join(homedir(), ".hapi");
+  const dbPath = process.env.DB_PATH
+    ? process.env.DB_PATH.replace(/^~/, homedir())
+    : join(dataDir, "hapi.db");
+  return { dataDir, dbPath };
+}
+
 class Configuration {
   /** Telegram Bot API token */
   public readonly telegramBotToken: string | null;
@@ -179,20 +195,14 @@ class Configuration {
 
   /** Create configuration asynchronously */
   static async create(): Promise<Configuration> {
-    // 1. Determine data directory (env only - not persisted)
-    const dataDir = process.env.HAPI_HOME
-      ? process.env.HAPI_HOME.replace(/^~/, homedir())
-      : join(homedir(), ".hapi");
+    // 1-2. Determine the data directory and the DB path (env only - not
+    // persisted), by the one function the instance lock also uses (#6651).
+    const { dataDir, dbPath } = resolveDataPaths();
 
     // Ensure data directory exists before loading settings
     if (!existsSync(dataDir)) {
       mkdirSync(dataDir, { recursive: true });
     }
-
-    // 2. Determine DB path (env only - not persisted)
-    const dbPath = process.env.DB_PATH
-      ? process.env.DB_PATH.replace(/^~/, homedir())
-      : join(dataDir, "hapi.db");
 
     // 3. Load server settings (with persistence)
     const settingsResult = await loadServerSettings(dataDir);

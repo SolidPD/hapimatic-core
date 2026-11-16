@@ -11,7 +11,6 @@ import { logAndJson } from "./routeErrorHelper";
 import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
 import { createRateLimiter } from "../middleware/rateLimit";
-import { getTimelogSoakStatus } from "../../store/turns/cutoverGate";
 import type { TimelogAdjustmentRow } from "../../store/turns/types";
 
 // #2188 Task 7: shared date-only pattern for the derived-route epoch pre-filter
@@ -332,9 +331,9 @@ export function createTimeLogRoutes(
   // ───────────────────────────────────────────────────────────────────
   // Issue #1670 (Sub H1, PR-2): six-control ledger writes + derived read.
   // Namespace-local (no federation proxy — mirrors the existing /timelogs
-  // routes). DORMANT: the client gates ALL user-visible switching on
-  // GET /timelogs/cutover-status, so these endpoints are inert until the
-  // Sub-G parity green streak opens the gate.
+  // routes). GET /timelogs/derived is the Time Log's only read path on every
+  // node (#6675 retired the cutover gate that used to keep it dormant), and
+  // the adjustments ledger feeds it.
   // ───────────────────────────────────────────────────────────────────
 
   // POST /timelogs/adjustments — append one of the six clock controls (R3, R4).
@@ -568,11 +567,15 @@ export function createTimeLogRoutes(
     }
   );
 
-  // GET /timelogs/cutover-status — single source of truth for the client's
-  // dormancy gate (R1, R6). `ready` is unchanged (false until Sub-G's parity
-  // green streak); #2188 V4 enriches the payload with per-metric streak /
-  // lastGreen / daysToGate and the latest run's red buckets (sourced from the
-  // recorded artifact via parity_runs.artifact_path — no per-request dir scan).
+  // GET /timelogs/cutover-status — the cutover gate was retired by #6675: the
+  // turns-derived read path is the Time Log's only read path, and the
+  // `timelogCutover` settings key is no longer read. The route stays as a
+  // constant `{ ready: true }` because the PWA service worker updates in prompt
+  // mode (web/vite.config.ts `registerType: "prompt"`), so an installed app can
+  // keep running a pre-#6675 bundle for days; that bundle polls this route and
+  // falls back to the empty legacy view on `ready: false`, a 404 or a 503 — so
+  // the answer reads no store and no settings. It can be removed once no
+  // pre-#6675 bundle can still be in use; leaving it is harmless (no state).
   app.get(
     "/timelogs/cutover-status",
     cataloged(
@@ -581,9 +584,9 @@ export function createTimeLogRoutes(
         domain: "telemetry",
         surface: "rest",
         description:
-          "Report whether the turn-derived time source has completed its soak-based cutover from the legacy clock.",
+          "Report that the turns-derived time source is always in use (retired cutover gate, kept for older clients).",
         whenToUse:
-          "When the client decides which time-tracking source to display.",
+          "Only older web clients call this; current clients read the derived time log directly.",
         invocation: {
           kind: "rest",
           method: "GET",
@@ -594,14 +597,7 @@ export function createTimeLogRoutes(
         availability: { scope: "user" },
       })
     ),
-    async c => {
-      const store = requireStore(c);
-      if (store instanceof Response) {
-        return store;
-      }
-      const status = await getTimelogSoakStatus(store, resolveDataDir());
-      return c.json(status);
-    }
+    c => c.json({ ready: true })
   );
 
   return app;

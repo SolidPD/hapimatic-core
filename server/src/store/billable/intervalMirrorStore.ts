@@ -24,10 +24,20 @@ import {
  * mirrored closed interval is never shortened (a restore can re-close an interval
  * shorter at the origin; the re-pull must not replace the real, longer close).
  * Readers count each `interval_id` once: when one id is stored under more than one
- * key (two incarnations, or a node whose id changed), the row with the largest
- * `duration_ms`, then the latest `mirrored_at_ms`, is used. Balance rows are
- * excluded from interval lists and days and returned as `carriedForwardMs`.
+ * key (two incarnations, or a node whose id changed), a dated row is counted at
+ * the largest `duration_ms`, then the latest `mirrored_at_ms`, and a balance row
+ * (`opening_balance`, `carried_forward`) at the first received (keep-held, issue
+ * #6651: a balance row made again after a restore can hold a different amount,
+ * and the node keeps the one it received first). Balance rows are excluded from
+ * interval lists and days and returned as `carriedForwardMs`, a `carried_forward`
+ * row with the cap's key at its capped amount (`balanceAmounts`, issue #6651).
  */
+
+/**
+ * The mirror's rule for balance rows, printed on the boot line. A change to how
+ * the mirror stores or counts a balance row changes this value (issue #6651).
+ */
+export const MIRROR_BALANCE_RULE = "keep-first-v1; cap-started-window-v1";
 
 export type MirrorFeedState = "ok" | "unsupported";
 
@@ -74,12 +84,23 @@ interface MirrorRow {
 }
 
 /**
- * One row per `interval_id` for a session in a namespace: the count-once rule
- * (largest duration, then the latest mirror time).
+ * One row per `interval_id` for a session in a namespace: the count-once rule.
+ * A balance id is counted at the first received (keep-held, #6651), and on an
+ * exact tie of `mirrored_at_ms` at the SMALLER duration, so a tie never counts a
+ * figure above the one-node figure (#6651, the Project Manager's ruling of
+ * 2026-11-14); a dated id at the largest duration, then the latest mirror time.
+ * One id is either a balance id or a dated id, so one partition is of one kind; the
+ * last two keys make a full tie deterministic. For a balance row stored before
+ * keep-held, the older upsert had moved `mirrored_at_ms` at every arrival, so
+ * "first received" there means its latest arrival before the upgrade.
  */
 const COUNT_ONCE_SQL =
   "SELECT * FROM (SELECT m.*, ROW_NUMBER() OVER (PARTITION BY m.interval_id " +
-  "ORDER BY m.duration_ms DESC, m.mirrored_at_ms DESC) AS rn " +
+  "ORDER BY CASE WHEN m.end_cause IN ('opening_balance', 'carried_forward') " +
+  "THEN m.mirrored_at_ms ELSE 0 END ASC, " +
+  "CASE WHEN m.end_cause IN ('opening_balance', 'carried_forward') " +
+  "THEN m.duration_ms ELSE -m.duration_ms END ASC, " +
+  "m.mirrored_at_ms DESC, m.origin_node_id, m.origin_incarnation) AS rn " +
   "FROM thinking_intervals_mirror m WHERE m.hapi_session_id = ? AND m.namespace = ?) " +
   "WHERE rn = 1";
 
@@ -134,6 +155,38 @@ function toRecord(row: MirrorRow): IntervalRecord {
 
 function isBalance(endCause: string): boolean {
   return (BALANCE_END_CAUSES as readonly string[]).includes(endCause);
+}
+
+interface CapKey {
+  fromStartedAt: number;
+  shadowMs: number;
+}
+
+/**
+ * The cap's key in a carried row's `flags` (issue #6651, Task C1), or null: no
+ * flags, flags that are not JSON, no `cap.v === 1`, or a `fromStartedAt` or
+ * `shadowMs` that is not an integer of 0 or more. A null key counts the carried
+ * amount uncapped.
+ */
+function capKeyOf(rowJson: string): CapKey | null {
+  const flags = rowField<unknown>(rowJson, "flags", null);
+  if (typeof flags !== "string") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(flags);
+  } catch {
+    return null;
+  }
+  const cap =
+    parsed !== null && typeof parsed === "object"
+      ? (parsed as { cap?: unknown }).cap
+      : undefined;
+  if (cap === null || typeof cap !== "object") return null;
+  const { v, fromStartedAt, shadowMs } = cap as Record<string, unknown>;
+  const count = (x: unknown): x is number =>
+    typeof x === "number" && Number.isInteger(x) && x >= 0;
+  if (v !== 1 || !count(fromStartedAt) || !count(shadowMs)) return null;
+  return { fromStartedAt, shadowMs };
 }
 
 export class IntervalMirrorStore {
@@ -194,9 +247,11 @@ export class IntervalMirrorStore {
   // ───────────── mirror writes ─────────────
 
   /**
-   * Upsert mirrored intervals. A row whose incoming `duration_ms` is smaller than
-   * the stored one keeps its stored values and updates only `origin_change_seq`
-   * and `mirrored_at_ms`.
+   * Upsert mirrored intervals. A dated row whose incoming `duration_ms` is smaller
+   * than the stored one keeps its stored values and updates only
+   * `origin_change_seq` and `mirrored_at_ms`. A stored balance row
+   * (`opening_balance`, `carried_forward`) is kept whole when it arrives again,
+   * every column included (keep-held, issue #6651).
    */
   upsertMirrorIntervals(
     originNodeId: string,
@@ -218,17 +273,28 @@ export class IntervalMirrorStore {
     rows: MirrorIntervalRow[],
     nowMs: number
   ): void {
+    // Keep-held (#6651): a stored balance row keeps every column. SET reads the
+    // stored row's values as they were before this update, so `end_cause` below
+    // is the stored cause in every clause.
+    const storedBalance =
+      "thinking_intervals_mirror.end_cause IN ('opening_balance', 'carried_forward')";
     const keep = (col: string) =>
-      `${col} = CASE WHEN excluded.duration_ms < thinking_intervals_mirror.duration_ms ` +
+      `${col} = CASE WHEN ${storedBalance} THEN thinking_intervals_mirror.${col} ` +
+      `WHEN excluded.duration_ms < thinking_intervals_mirror.duration_ms ` +
       `THEN thinking_intervals_mirror.${col} ELSE excluded.${col} END`;
+    const latest = (col: string) =>
+      `${col} = CASE WHEN ${storedBalance} THEN thinking_intervals_mirror.${col} ` +
+      `ELSE excluded.${col} END`;
     const stmt = this.db.prepare(
       "INSERT INTO thinking_intervals_mirror (origin_node_id, origin_incarnation, " +
         "interval_id, origin_change_seq, hapi_session_id, namespace, launcher_kind, " +
         "started_at_ms, ended_at_ms, duration_ms, end_cause, row_json, mirrored_at_ms) " +
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
         "ON CONFLICT (origin_node_id, origin_incarnation, interval_id) DO UPDATE SET " +
-        "origin_change_seq = excluded.origin_change_seq, " +
-        "mirrored_at_ms = excluded.mirrored_at_ms, " +
+        latest("origin_change_seq") +
+        ", " +
+        latest("mirrored_at_ms") +
+        ", " +
         [
           "hapi_session_id",
           "namespace",
@@ -240,7 +306,8 @@ export class IntervalMirrorStore {
         ]
           .map(keep)
           .join(", ") +
-        ", duration_ms = MAX(excluded.duration_ms, thinking_intervals_mirror.duration_ms)"
+        `, duration_ms = CASE WHEN ${storedBalance} THEN thinking_intervals_mirror.duration_ms ` +
+        "ELSE MAX(excluded.duration_ms, thinking_intervals_mirror.duration_ms) END"
     );
     for (const r of rows) {
       stmt.run(
@@ -390,17 +457,65 @@ export class IntervalMirrorStore {
       .map(toRecord);
   }
 
+  /**
+   * The counted amount of each counted balance row (the cap, issue #6651; plan
+   * section 12 (i)). A `carried_forward` row whose flags hold the cap's key is
+   * counted at its amount less the `shadow` time this node holds in its window
+   * beyond what the carrying copy held there (`shadowMs`), never below zero. The
+   * window is the session's counted dated rows recorded in `shadow` that started
+   * at or after the key's `fromStartedAt` and before the carried row's own start
+   * (its copy's boot time); `started_at_ms` never changes for a row, so a row
+   * closed again later stays in its window. Every other balance row, an
+   * `opening_balance` included, is counted at its stored amount. The rows are
+   * those `countedRows` returns, so a dated row stored under two keys is in the
+   * window once.
+   */
+  private balanceAmounts(rows: MirrorRow[]): number[] {
+    const keyed = rows
+      .filter(r => r.end_cause === "carried_forward")
+      .map(r => ({ r, key: capKeyOf(r.row_json) }));
+    const shadowRows = keyed.some(k => k.key !== null)
+      ? rows.filter(
+          r =>
+            !isBalance(r.end_cause) &&
+            rowField<string>(r.row_json, "recorded_mode", "") === "shadow"
+        )
+      : [];
+    const amounts: number[] = [];
+    for (const r of rows) {
+      if (!isBalance(r.end_cause)) continue;
+      const key = keyed.find(k => k.r === r)?.key ?? null;
+      if (key === null) {
+        amounts.push(r.duration_ms);
+        continue;
+      }
+      let windowMs = 0;
+      for (const d of shadowRows) {
+        if (
+          d.started_at_ms >= key.fromStartedAt &&
+          d.started_at_ms < r.started_at_ms
+        )
+          windowMs += d.duration_ms;
+      }
+      const extra = Math.max(0, windowMs - key.shadowMs);
+      amounts.push(Math.max(0, r.duration_ms - extra));
+    }
+    return amounts;
+  }
+
   sessionTotals(sessionId: string, namespace: string): MirrorSessionTotals {
     let intervalsMs = 0;
-    let carriedForwardMs = 0;
     const intervalsMsByLauncher: Record<string, number> = {};
     let latest: MirrorRow | null = null;
-    for (const r of this.countedRows(sessionId, namespace)) {
+    const rows = this.countedRows(sessionId, namespace);
+    const carriedForwardMs = this.balanceAmounts(rows).reduce(
+      (a, b) => a + b,
+      0
+    );
+    for (const r of rows) {
       if (latest === null || r.mirrored_at_ms > latest.mirrored_at_ms)
         latest = r;
-      if (isBalance(r.end_cause)) {
-        carriedForwardMs += r.duration_ms;
-      } else {
+      if (!isBalance(r.end_cause)) {
         intervalsMs += r.duration_ms;
         intervalsMsByLauncher[r.launcher_kind] =
           (intervalsMsByLauncher[r.launcher_kind] ?? 0) + r.duration_ms;
@@ -424,12 +539,13 @@ export class IntervalMirrorStore {
     timezone: string;
   }): BillableDays {
     const byDay = new Map<string, number>();
-    let carriedForwardMs = 0;
-    for (const r of this.countedRows(query.sessionId, query.namespace)) {
-      if (isBalance(r.end_cause)) {
-        carriedForwardMs += r.duration_ms;
-        continue;
-      }
+    const rows = this.countedRows(query.sessionId, query.namespace);
+    const carriedForwardMs = this.balanceAmounts(rows).reduce(
+      (a, b) => a + b,
+      0
+    );
+    for (const r of rows) {
+      if (isBalance(r.end_cause)) continue;
       if (!(r.started_at_ms < query.toMs && r.ended_at_ms > query.fromMs))
         continue;
       const portions = splitIntervalByLocalDay(

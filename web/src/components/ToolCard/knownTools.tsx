@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { ReactNode } from "react";
 import type { SessionMetadataSummary } from "@/types/api";
+import { MCP_ELICITATION_TOOL } from "@hapi/protocol";
 import {
   BulbIcon,
   ClipboardIcon,
@@ -354,6 +355,22 @@ export const knownTools: Record<
     icon: () => <ClipboardIcon className={DEFAULT_ICON_CLASS} />,
     title: () => "Plan proposal",
     minimal: false,
+  },
+  // #6606: an MCP server's form or link request (its own card). Server text
+  // is shown as plain text only.
+  [MCP_ELICITATION_TOOL]: {
+    icon: () => <QuestionIcon className={DEFAULT_ICON_CLASS} />,
+    title: opts => {
+      const server =
+        isObject(opts.input) && typeof opts.input.server === "string"
+          ? opts.input.server.trim()
+          : "";
+      return `${server.length > 0 ? truncate(server, 64) : "An MCP server"} asks for input`;
+    },
+    // No subtitle: the card below shows the message and the address, and a
+    // second copy in the header costs rows on a phone (R10-b).
+    subtitle: () => null,
+    minimal: opts => opts.result === undefined || opts.result === null,
   },
   AskUserQuestion: {
     icon: () => <QuestionIcon className={DEFAULT_ICON_CLASS} />,

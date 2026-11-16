@@ -27,10 +27,11 @@ export interface DayPortion {
 const SEARCH_WINDOW_MS = 26 * 60 * 60 * 1000;
 
 /**
- * One formatter per zone, built once. `localDateForTimestamp` builds a new
- * `Intl.DateTimeFormat` on every call, measured on ms2 at 51 to 81 µs a call
- * against 1 to 3 µs cached; a boundary search makes about 29 date computations and
- * the hub runs on one thread.
+ * One formatter per zone, built once. Building an `Intl.DateTimeFormat` costs 51
+ * to 81 µs a call against 1 to 3 µs cached (measured on ms2); a boundary search
+ * makes about 29 date computations and the hub runs on one thread.
+ * `localDateForTimestamp` keeps its own cache (#6675); this one stays separate
+ * because it carries the cost counters below.
  */
 const formatters = new Map<string, Intl.DateTimeFormat>();
 

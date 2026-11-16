@@ -19,6 +19,7 @@
  * - `session/request_permission` → surfaced by the permission bridge (R4)
  * - `session/cancel` → interrupt the in-flight turn, resolve with `cancelled` (R5)
  */
+import { randomUUID } from "node:crypto";
 import type { Readable, Writable } from "node:stream";
 import type { SDKMessage, SDKResultMessage, Query } from "@/claude/sdk";
 import type { EnhancedMode } from "@/claude/loop";
@@ -66,12 +67,16 @@ type PromptQueueItem = { message: string; mode: EnhancedMode };
 interface IngressSession {
   /** ACP-facing sessionId — the Hapimatic session id (PWA-visible). */
   readonly sessionId: string;
+  /** Issue #6647 (R13): this session's own tag, handed to its `claude` child. */
+  readonly tag: string;
   readonly apiSession: ApiSessionClient;
   readonly happyServer: { stop: () => void };
   readonly hookServer: { stop: () => void };
   readonly hookSettingsPath: string;
   readonly path: string;
   readonly mcpServers: Record<string, unknown>;
+  /** Issue #6458 (A1): the gate this session's own probe read; renders the Pins block. */
+  readonly pinsEnabled: boolean;
   readonly allowedTools: string[];
   readonly promptQueue: PushableAsyncIterable<PromptQueueItem>;
   readonly permissionBridge: AcpIngressPermissionBridge;
@@ -210,10 +215,15 @@ export class AcpIngressServer {
       (isObject(params) ? asString(params.cwd) : null) ?? process.cwd();
 
     // DECISION-2: a first-class, PWA-visible, governed Hapimatic session.
+    // Issue #6647 (Task 8, R13): each session/new gets its own tag, so a second
+    // session/new is a second session, and `hapi acp` run inside a hosted
+    // session never attaches to the host session.
+    const tag = randomUUID();
     const boot = await bootstrapSession({
       flavor: "claude",
       startedBy: this.startedBy,
       workingDirectory: cwd,
+      tag,
     });
     const sessionId = boot.sessionInfo.id;
     const apiSession = boot.session;
@@ -240,12 +250,14 @@ export class AcpIngressServer {
 
     const session: IngressSession = {
       sessionId,
+      tag,
       apiSession,
       happyServer,
       hookServer,
       hookSettingsPath,
       path: cwd,
       mcpServers,
+      pinsEnabled: happyServer.pinsEnabled === true,
       allowedTools,
       promptQueue: new PushableAsyncIterable<PromptQueueItem>(),
       permissionBridge: new AcpIngressPermissionBridge(
@@ -259,6 +271,9 @@ export class AcpIngressServer {
       torndown: false,
     };
     this.sessions.set(sessionId, session);
+    // Issue #6647 (Task 13, R8): the hub replaced this session's runner; end
+    // this session only. The process and its other sessions go on.
+    apiSession.onSuperseded = () => this.supersedeSession(session);
 
     // Start the persistent claudeRemote turn driver. It blocks on the empty
     // prompt queue until the first session/prompt, then runs each turn. Tracked
@@ -278,8 +293,13 @@ export class AcpIngressServer {
       await this.driverRunner({
         sessionId: null,
         path: session.path,
+        // Issue #6647 (R13): the child's own tag, child-only. claudeRemote
+        // keeps HAPI_SESSION_ID out of process.env (one ACP process holds
+        // several sessions) and lays it over the child's environment.
+        claudeEnvVars: { HAPI_SESSION_ID: session.tag },
         allowedTools: session.allowedTools,
         mcpServers: session.mcpServers,
+        pinsEnabled: session.pinsEnabled,
         hookSettingsPath: session.hookSettingsPath,
         signal: session.abort.signal,
         // R4: the ACP permission surface (default-deny-on-timeout).
@@ -407,6 +427,18 @@ export class AcpIngressServer {
   }
 
   // ---- teardown ---------------------------------------------------------
+
+  /**
+   * Issue #6647 (Task 13, R8): ends one superseded session as `shutdown` ends
+   * each (abort, end its prompt queue, so its driver settles) and tears it
+   * down at once. `teardownSession` is idempotent.
+   */
+  private supersedeSession(session: IngressSession): void {
+    logger.debug(`[ACP] session ${session.sessionId} superseded — ending it`);
+    session.abort.abort();
+    if (!session.promptQueue.done) session.promptQueue.end();
+    this.teardownSession(session);
+  }
 
   private teardownSession(
     session: IngressSession,

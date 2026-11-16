@@ -5,11 +5,18 @@
  * Instance header (issue #1050 extraction; #3287 S2 redesign — the shared
  * foundation the epic #3285 set builds on).
  *
- * Fixed-slot order (R2, E9): [Loop-Cron Badge 76px] → [Message Count 31px] →
- * [Notification Bell 16px], `gap-1` between — exactly the width of the Row-1
+ * Fixed-slot order (R2, E9; #6660): [Loop-Cron Badge 76px] → [Message Count
+ * 31px] → [Pins Waiting 25px], `gap-1` between — exactly the width of the Row-1
  * right cluster ([Account Chip] · [Node Badge], `ROW1_RIGHT_CLUSTER_PX`), so the
  * two rows form two aligned BLOCKS: Account Chip over Loop-Cron Chip (one left
- * edge) and Node Badge over [Count · Bell] (one right edge).
+ * edge) and Node Badge over [Count · Pins] (one right edge).
+ *
+ * Issue #6660 (Matt's request and his pick ROW-D, 2026-11-13): the notification
+ * bell left this row. Its slot shows the session's pins waiting — the Pins
+ * tab's pushpin and the count in the Pins red while pins wait, the grey pushpin
+ * alone at zero, nothing (but the reserved width) while the count is unknown.
+ * The per-session mute moved to the kebab menu under the session details
+ * (`useSessionMuteEntry`, appended by `SessionActionCluster`).
  *
  * E9 (operator round 11, 2026-09-06): the reserved conditional-icon slot that
  * used to lead this row is GONE. The waiting-for-input `?` was dropped outright
@@ -26,12 +33,14 @@
  * queued signal reads the per-session queue query, so the row is not a pure
  * prop-passthrough.
  */
-import { BellIcon, BellOffIcon, MessageSquareIcon } from "@/components/icons";
+import { Pin } from "lucide-react";
+import { MessageSquareIcon } from "@/components/icons";
 import { SessionLoopCronBadge } from "@/components/session/SessionLoopCronBadge";
 import { SessionAgentsBadge } from "@/components/session/SessionAgentsBadge";
 import {
   agentCompactForm,
   formatMessageCount,
+  pinCountDisplay,
   shellBadgeForm,
 } from "@/components/session/badgeFormat";
 import { NODE_BADGE_RADIUS_CSS } from "@/components/session/rowAnchors";
@@ -39,10 +48,6 @@ import { useAppContext } from "@/lib/app-context";
 import { useSessionLoopSummaries } from "@/hooks/queries/useSessionLoopSummaries";
 import type { BackgroundAgentsSummary } from "@hapi/protocol";
 import { useQueuedMessages } from "@/hooks/queries/useQueuedMessages";
-import { useMutedSessions } from "@/hooks/useMutedSessions";
-import { useGlobalNotificationsEnabled } from "@/hooks/useGlobalNotificationsEnabled";
-import { useToast } from "@/components/Toast";
-import { Button } from "@/components/ui/button";
 
 type SessionRightMetaRowProps = {
   sessionId: string;
@@ -53,6 +58,13 @@ type SessionRightMetaRowProps = {
    * record (both expose the same counts). `null`/absent = no background agents.
    */
   backgroundAgents?: BackgroundAgentsSummary | null;
+  /**
+   * #6660: the session's open-pin count. SessionItem passes the list SUMMARY's
+   * `openPinCount`, SessionHeader the detail query's (the Pins tab badge's own
+   * reader). Absent = unknown (the owning node's Pins gate is closed, or the
+   * node is older), never zero.
+   */
+  openPinCount?: number;
 };
 
 /** E9 queued signal: the bubble turns yellow (warning token, tinted fill). Kept
@@ -61,19 +73,25 @@ type SessionRightMetaRowProps = {
 const QUEUED_BUBBLE_CLASS =
   "text-[var(--app-badge-warning-text)] fill-[var(--app-badge-warning-bg)]";
 
+/** #6660 Pins Waiting slot: one constant per fixed-px class string, so each
+ *  `design-tokens-allow` marker sits on the same line as the px it excuses. */
+const PIN_SLOT_CLASS =
+  "flex w-[25px] shrink-0 items-center justify-start gap-px whitespace-nowrap tabular-nums leading-none text-[length:var(--text-caption)]"; /* design-tokens-allow: 25px fixed anchor slot (PIN_COUNT_SLOT_PX, #6660); no --space token is 25px */
+const PIN_GLYPH_CLASS =
+  "h-[11px] w-[11px] shrink-0"; /* design-tokens-allow: 11px pin glyph, the message bubble's size (variant D, #6660); no icon-size token at 11px */
+const PIN_WAITING_CLASS = "font-semibold text-[var(--view-accent-pins)]";
+
 export function SessionRightMetaRow({
   sessionId,
   messageCount,
   backgroundAgents,
+  openPinCount,
 }: SessionRightMetaRowProps) {
   const { api } = useAppContext();
-  const { isMuted, toggleMuted } = useMutedSessions();
-  const globalEnabled = useGlobalNotificationsEnabled();
-  const { showToast } = useToast();
   // E9: the queued signal. Server-backed queue (#1325); non-empty ⇒ yellow bubble.
   const { length: queuedCount } = useQueuedMessages(api, sessionId);
   const queued = queuedCount > 0;
-  const muted = isMuted(sessionId);
+  const pins = pinCountDisplay(openPinCount);
 
   // Issue #4383: the slot composes the loop badge and/or the agents badge. Read
   // the loop summary (cached — the badge reads the same query) only to decide
@@ -163,65 +181,34 @@ export function SessionRightMetaRow({
           {formatMessageCount(messageCount ?? 0)}
         </span>
       </span>
-      {/* #87 feedback (#2745 round): per-session mute bell — ONE shared site
-          rendered identically by the session list AND the session-instance
-          header (this placement also delivers #3076's dedupe). Tri-state
-          (#3150): global-off (push not subscribed on this device) dominates as
-          a gray inert bell whose tap only hints; enabled + unmuted = muted-mint
-          accent; enabled + muted = red + strike. Pointer events stop here so
-          the row's select/long-press never fires from a bell tap. */}
-      <Button
-        type="button"
-        variant="ghost"
-        onClick={e => {
-          e.stopPropagation();
-          e.preventDefault();
-          if (!globalEnabled) {
-            // #3150 Q3 ruling: inert under global-off — hint, never toggle.
-            showToast("Notifications globally disabled", { type: "info" });
-            return;
-          }
-          toggleMuted(sessionId);
-        }}
-        onPointerDown={e => e.stopPropagation()}
-        onMouseDown={e => e.stopPropagation()}
-        onTouchStart={e => e.stopPropagation()}
-        // 🔴 The UP events too: SessionItem's row navigation runs on
-        // useLongPress's onMouseUp/onTouchEnd, and its click detection fires on
-        // a bare up-event even when the down was stopped here — a bell tap
-        // navigated into the session until these were stopped (round-2 #87).
-        onMouseUp={e => e.stopPropagation()}
-        onTouchEnd={e => e.stopPropagation()}
-        onPointerUp={e => e.stopPropagation()}
-        aria-pressed={globalEnabled ? muted : undefined}
-        aria-label={
-          !globalEnabled
-            ? "Notifications globally disabled"
-            : muted
-              ? "Unmute notifications"
-              : "Mute notifications"
-        }
-        title={
-          !globalEnabled
-            ? "Notifications globally disabled"
-            : muted
-              ? "Notifications muted — tap to unmute"
-              : "Mute notifications for this session"
-        }
-        className={`shrink-0 h-auto rounded-md p-0.5 font-normal hover:bg-[var(--app-hover)] ${
-          !globalEnabled
-            ? "text-[var(--app-hint)] hover:text-[var(--app-hint)]"
-            : muted
-              ? "text-red-400/80 hover:text-red-400"
-              : "text-[var(--app-accent)]/70 hover:text-[var(--app-accent)]"
+      {/* #6660: Pins Waiting — where the bell was (Matt's ROW-D). A plain
+          pushpin and number in the Pins red while pins wait; the grey pushpin
+          alone at zero; an empty slot of the same width while the count is
+          unknown, so the cluster never reflows. At 100 (the most a session can
+          hold) the number shows without the glyph (D2, ruled by the Pins PM).
+          design-system exception (D1, ruled by the Pins PM, 2026-11-13): a
+          native `title` and an accessible name on a non-interactive span, like
+          the message count beside it, instead of the `ui/tooltip.tsx` surface —
+          `HoverTooltipButton` measured 6.8–9.5 ms per 60-row re-render against
+          0.5–0.7 ms for a plain element, and taps on its portaled bubble reach
+          the row through React. Not a tap target, no pointer cursor of its own:
+          a tap here opens the session like the rest of the row (P1 dropped). */}
+      <span
+        className={`${PIN_SLOT_CLASS} ${
+          pins.state === "waiting"
+            ? PIN_WAITING_CLASS
+            : "text-[var(--app-hint)]"
         }`}
+        data-testid={`pin-count-${sessionId}`}
+        data-state={pins.state}
+        data-empty={pins.state === "unknown" ? "true" : undefined}
+        title={pins.title ?? undefined}
+        aria-label={pins.title ?? undefined}
+        role={pins.title ? "img" : undefined}
       >
-        {globalEnabled && muted ? (
-          <BellOffIcon className="h-3 w-3" />
-        ) : (
-          <BellIcon className="h-3 w-3" />
-        )}
-      </Button>
+        {pins.glyph && <Pin aria-hidden="true" className={PIN_GLYPH_CLASS} />}
+        {pins.text}
+      </span>
     </div>
   );
 }

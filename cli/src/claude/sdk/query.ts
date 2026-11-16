@@ -242,6 +242,42 @@ export const CONTEXT_USAGE_DETAIL_TIMEOUT_MS = 25_000;
 export const MCP_STATUS_TIMEOUT_MS = 10_000;
 
 /**
+ * Issue #6627: `Query.end()` ends a claude child by its input (Claude Code exits
+ * when stdin ends, as on a mode change), then SIGTERM, then SIGKILL, waiting
+ * this long for its `exit` after each. Worst case 8 s: ending never hangs.
+ */
+export const CHILD_END_INPUT_MS = 1_000;
+export const CHILD_END_GRACE_MS = 5_000;
+export const CHILD_KILL_WAIT_MS = 2_000;
+
+export type ChildEndResult =
+  | "already-closed"
+  | "exited"
+  | "killed"
+  | "unkillable";
+
+/** Issue #6627: the claude child a `Query` can end; `query()` builds it. */
+export interface QueryChild {
+  readonly pid: number | undefined;
+  /** Settles on the child's `exit` (or a failed spawn); never rejects. */
+  readonly exited: Promise<void>;
+  hasExited(): boolean;
+  endInput(): void;
+  kill(force: boolean): Promise<boolean>;
+}
+
+/** True when `exited` settles within `ms`; the timer is cleared either way. */
+function waitForChildExit(exited: Promise<void>, ms: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(false), ms);
+    void exited.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+/**
  * Read the get_context_usage payload, which sits at
  * control_response.response.response (the same double-nest the can_use_tool
  * response uses). Throws on a malformed shape so a per-turn caller's catch
@@ -333,16 +369,76 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
   private sdkMessages: AsyncIterableIterator<SDKMessage>;
   private inputStream = new Stream<SDKMessage>();
   private canCallTool?: CanCallToolCallback;
+  /** Issue #6627: the one `end()` run; every later call gets the same promise. */
+  private endPromise: Promise<ChildEndResult> | null = null;
 
   constructor(
     private childStdin: Writable | null,
     private childStdout: NodeJS.ReadableStream,
     private processExitPromise: Promise<void>,
-    canCallTool?: CanCallToolCallback
+    canCallTool?: CanCallToolCallback,
+    private child: QueryChild | null = null
   ) {
     this.canCallTool = canCallTool;
     this.readMessages();
     this.sdkMessages = this.readSdkMessages();
+  }
+
+  /** Issue #6627: the claude child this query started, and whether it runs. */
+  get childPid(): number | undefined {
+    return this.child?.pid;
+  }
+
+  isChildAlive(): boolean {
+    return this.child !== null && !this.child.hasExited();
+  }
+
+  /**
+   * Issue #6627 (R1, R6): end the claude child and confirm it gone. Never
+   * aborts the caller's signal (the launcher reads an abort as a user stop).
+   * Memoized; never throws (a failure resolves "unkillable"); one log line.
+   */
+  end(
+    reason: string,
+    opts: { graceMs?: number; killWaitMs?: number } = {}
+  ): Promise<ChildEndResult> {
+    this.endPromise ??= this.endChild(reason, opts);
+    return this.endPromise;
+  }
+
+  private async endChild(
+    reason: string,
+    opts: { graceMs?: number; killWaitMs?: number }
+  ): Promise<ChildEndResult> {
+    const startedAt = Date.now();
+    let result: ChildEndResult = "unkillable";
+    const child = this.child;
+    if (!child || child.hasExited()) {
+      result = "already-closed";
+    } else {
+      // The kills go out directly (query()'s `cleanup` skips a child an earlier
+      // signal marked `killed`); a step that throws is logged, the next runs.
+      const grace = opts.graceMs ?? CHILD_END_GRACE_MS;
+      const killWait = opts.killWaitMs ?? CHILD_KILL_WAIT_MS;
+      const steps: Array<[() => unknown, number, ChildEndResult]> = [
+        [() => child.endInput(), CHILD_END_INPUT_MS, "exited"],
+        [() => child.kill(false), grace, "exited"],
+        [() => child.kill(true), killWait, "killed"],
+      ];
+      for (const [step, waitMs, outcome] of steps) {
+        await Promise.resolve()
+          .then(step)
+          .catch(e => logger.warn(`[Query] end step failed (${reason})`, e));
+        if (await waitForChildExit(child.exited, waitMs)) {
+          result = outcome;
+          break;
+        }
+      }
+    }
+    const line = `[Query] ended claude child pid=${this.child?.pid ?? "none"} reason=${reason} result=${result} ms=${Date.now() - startedAt}`;
+    if (result === "unkillable") logger.warn(line);
+    else logger.debug(line);
+    return result;
   }
 
   /**
@@ -445,6 +541,9 @@ export class Query implements AsyncIterableIterator<SDKMessage> {
           }
         }
       }
+      // Issue #6627: stdout has ended, so no answer can come; fail what still
+      // waits now (processExitPromise never settles on a signal exit).
+      this.cleanupControllers();
       await this.processExitPromise;
     } catch (error) {
       this.inputStream.error(error as Error);
@@ -1222,6 +1321,32 @@ export function query(config: {
     childStdin = child.stdin;
   }
 
+  // Issue #6627: the child's own exit, apart from processExitPromise (which
+  // settles only on a clean `close`, for the stream). `exit`, not `close`: a
+  // grandchild holding the pipes can delay `close`. A failed spawn has no pid.
+  let childExited = false;
+  const exited = new Promise<void>(resolve => {
+    child.once("exit", () => resolve());
+    child.once("error", () => {
+      if (child.pid === undefined) resolve();
+    });
+  }).then(() => {
+    childExited = true;
+  });
+  const queryChild: QueryChild = {
+    pid: child.pid,
+    exited,
+    hasExited: () => childExited,
+    // streamToStdin drops its error listener when it finishes; an EPIPE from a
+    // child that has already left is worth a debug line, not a crash.
+    endInput: () => {
+      if (!childStdin || childStdin.writableEnded) return;
+      childStdin.on("error", e => logger.debug(`[Query] stdin: ${e.message}`));
+      childStdin.end();
+    },
+    kill: force => killProcessByChildProcess(child, force),
+  };
+
   // Parse stderr for API error/retry messages and emit as synthetic events.
   // Claude Code prints retry status (e.g. "Retrying in 21 seconds... (attempt 7/10)")
   // to stderr during API errors. We capture these and inject them into the message
@@ -1266,9 +1391,9 @@ export function query(config: {
   };
 
   config.options?.abort?.addEventListener("abort", cleanup);
-  // Saved reference so the listener is removed in processExitPromise.finally()
-  // below; otherwise repeated query() invocations accumulate exit listeners on
-  // the long-lived process object.
+  // Saved reference so the listener is removed on the child's exit (below);
+  // otherwise repeated query() invocations accumulate exit listeners on the
+  // long-lived process object.
   const onProcessExit = cleanup;
   process.on("exit", onProcessExit);
 
@@ -1329,7 +1454,8 @@ export function query(config: {
     childStdin,
     child.stdout,
     processExitPromise,
-    canCallTool
+    canCallTool,
+    queryChild
   );
 
   // Handle process errors
@@ -1348,9 +1474,11 @@ export function query(config: {
     }
   });
 
-  // Cleanup on exit
-  processExitPromise.finally(() => {
-    cleanup();
+  // Cleanup on exit. Issue #6627 (R5): on the child's own exit, by every route;
+  // processExitPromise never settles on a non-zero, signal or abort exit, so
+  // clean-up hung on it leaked all of this once per such child. No kill: the
+  // child has exited (the former `cleanup()` here reached a closed handle).
+  void exited.then(() => {
     config.options?.abort?.removeEventListener("abort", cleanup);
     process.off("exit", onProcessExit);
     if (process.env.CLAUDE_SDK_MCP_SERVERS) {

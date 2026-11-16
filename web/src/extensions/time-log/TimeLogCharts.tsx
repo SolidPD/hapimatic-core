@@ -426,6 +426,38 @@ function WeekPicker({
   );
 }
 
+/**
+ * Issue #6675 (R6): the error state a Week/Month view shows when its data
+ * request failed and there is nothing to show, so a failed fetch never reads as
+ * "no hours". Same message + Retry styling as the Day tab's error block in
+ * `TimeLogModal.tsx`.
+ */
+function ViewErrorState({
+  error,
+  onRetry,
+}: {
+  error: string;
+  onRetry?: () => void;
+}) {
+  return (
+    <div className="text-center py-4">
+      <div className="text-sm text-[var(--app-badge-error-text)] mb-2">
+        {error}
+      </div>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          title="Load this period again"
+          className="px-4 py-2 text-sm bg-[var(--app-subtle-bg)] border border-[var(--app-border)] rounded-lg text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] transition-colors"
+        >
+          Retry
+        </button>
+      )}
+    </div>
+  );
+}
+
 interface WeekViewProps {
   weeklySummary: TimeLogWeeklySummary | null;
   weekEntries: TimeLogEntry[];
@@ -435,6 +467,10 @@ interface WeekViewProps {
   weekStart: string;
   onWeekChange: (newWeekStart: string) => void;
   onDayClick?: (date: string) => void;
+  /** Issue #6675 (R6): the week's data request failed. Shown only when there
+   *  is no data to show; existing data stays on screen. */
+  error?: string | null;
+  onRetry?: () => void;
 }
 
 export function WeekView({
@@ -446,6 +482,8 @@ export function WeekView({
   weekStart,
   onWeekChange,
   onDayClick,
+  error,
+  onRetry,
 }: WeekViewProps) {
   const [isWeekPickerOpen, setIsWeekPickerOpen] = useState(false);
 
@@ -545,6 +583,11 @@ export function WeekView({
       ? Math.max(...weeklySummary.dailyTotals.map(d => d.totalMs), 1)
       : 1;
 
+  // Issue #6675 (R6): the derived week summary is a full Mon→Sun skeleton even
+  // when the request failed, so "no data" means no logged time, not no rows.
+  const showError =
+    Boolean(error) && (!weeklySummary || weeklySummary.totalMs === 0);
+
   return (
     <div className="space-y-3">
       {/* Week header */}
@@ -556,9 +599,11 @@ export function WeekView({
           isOpen={isWeekPickerOpen}
           onToggle={() => setIsWeekPickerOpen(!isWeekPickerOpen)}
         />
-        <span className="text-sm font-semibold text-[var(--app-fg)] tabular-nums">
-          {weeklySummary ? formatDurationShort(weeklySummary.totalMs) : "0m"}
-        </span>
+        {!showError && (
+          <span className="text-sm font-semibold text-[var(--app-fg)] tabular-nums">
+            {weeklySummary ? formatDurationShort(weeklySummary.totalMs) : "0m"}
+          </span>
+        )}
       </div>
 
       {/* Week navigation arrows */}
@@ -590,7 +635,9 @@ export function WeekView({
       </div>
 
       {/* Daily stacked bar chart */}
-      {weeklySummary && weeklySummary.dailyTotals.length > 0 ? (
+      {showError && error ? (
+        <ViewErrorState error={error} onRetry={onRetry} />
+      ) : weeklySummary && weeklySummary.dailyTotals.length > 0 ? (
         <div className="space-y-1.5">
           {weeklySummary.dailyTotals.map(day => {
             const dayBreakdown = dailyProjectBreakdown.get(day.date);
@@ -734,6 +781,10 @@ interface MonthViewProps {
   year: number;
   month: number;
   onMonthChange: (year: number, month: number) => void;
+  /** Issue #6675 (R6): the month's data request failed. Shown only when there
+   *  is no data to show; existing data stays on screen. */
+  error?: string | null;
+  onRetry?: () => void;
 }
 
 export function MonthView({
@@ -742,6 +793,8 @@ export function MonthView({
   year,
   month,
   onMonthChange,
+  error,
+  onRetry,
 }: MonthViewProps) {
   const prevMonth = () => {
     if (month === 1) {
@@ -816,9 +869,13 @@ export function MonthView({
           Loading...
         </div>
       ) : !summary || summary.projects.length === 0 ? (
-        <div className="py-6 text-center text-[var(--app-hint)] text-sm">
-          No time logged for {MONTH_NAMES[month - 1]} {year}
-        </div>
+        error ? (
+          <ViewErrorState error={error} onRetry={onRetry} />
+        ) : (
+          <div className="py-6 text-center text-[var(--app-hint)] text-sm">
+            No time logged for {MONTH_NAMES[month - 1]} {year}
+          </div>
+        )
       ) : (
         <div>
           <div className="text-xs font-medium text-[var(--app-hint)] uppercase tracking-wide mb-2">

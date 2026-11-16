@@ -10704,6 +10704,66 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Set this node's billable header for a project and switch the picked sessions on with it, in one transaction. Peer-incoming.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-billable-switch-headers",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/billable-switch/headers"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub forwards a person's header change for a project on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Receive every node's billable header reports on a node that has no view of the mesh; a node with a registry answers that its own polls are the truth.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-billable-switch-peer-reports",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/billable-switch/peer-reports"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub pushes the other nodes' billable headers to a node that does not poll the mesh itself."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "List this node's sessions whose billable switch is on, for the caller's namespace: the authoritative read a billing reader makes of every node.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-billable-switch-sessions",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/billable-switch/sessions"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a billing reader on the hub asks each node which of its sessions are billable now."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Set or clear a session's auto-recover-from-API-error override on the node that owns it. Peer-incoming PUT field receiver for a remote-owned session.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.api-federation-sessions-auto-recover",
@@ -10718,6 +10778,66 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When updating the auto-recover override of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Switch a session billable or not on the node that owns it. Peer-incoming; the hub proxies here with the actor it recorded.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-sessions-billable",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/federation/sessions/:id/billable"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub forwards a billable switch for a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Keep or reverse a session waiting for a billable confirmation on the node that owns it. Peer-incoming; Keep all calls it once per remote session.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-sessions-billable-confirm",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/billable/confirm"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub forwards Keep, Reverse or Keep all for a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Read a session's billable switch history on the node that owns it, the record of a deleted session included. Peer-incoming.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-sessions-billable-history",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/federation/sessions/:id/billable/history"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub reads the authoritative billable history of a session that lives, or lived, on a remote federation node."
   },
   {
     "auth": "federation-token",
@@ -10980,6 +11100,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
   {
     "auth": "cli-token",
     "availability": {
+      "gate": "billable-switch",
+      "scope": "operator"
+    },
+    "description": "Switch a session not billable (off only), recorded under the calling session. A session is switched on in the app, never by this command.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-sessions-billable",
+    "invocation": {
+      "command": "api sessions billable",
+      "kind": "cli"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "cli",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To switch a session's time off for billing: `hapi api sessions billable` with the session's id or tag and the word off, your own session included."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
       "scope": "operator"
     },
     "description": "Branch (fork) a session's conversation context.",
@@ -11170,6 +11310,146 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When showing or checking whether sessions automatically recover after API errors."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Switch a session billable or not billable, on whichever node owns it; the change is recorded with who made it.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billable",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/sessions/:id/billable"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person switches a session's time on or off for billing, or switches it off before deleting it."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Decide a session that started billable without a person's answer: keep it billable, or reverse it to not billable.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billable-confirm",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/sessions/:id/billable/confirm"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person keeps or reverses a session that is waiting for a billable confirmation."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read a session's billable switch history, oldest first, from this node, the owning node, or this node's copy.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billable-history",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/sessions/:id/billable/history"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When showing who switched a session billable or not, and when, including after the session was deleted."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Keep billable every listed session that is waiting for a billable confirmation, up to 200, each on its owning federation node; returns one outcome per session.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billable-keep-all",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/sessions/bulk-billable-keep"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person keeps all the sessions waiting for a billable confirmation at once."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List the caller's namespace's billable switch events from this node and from its copy of the other nodes' records, after two cursors, optionally by kind.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billable-switch-events",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/billable-switch/events"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a billing reader looks for every switch-off and reversal since its last read, without knowing session ids."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Switch a project's billable header on or off on one node, and switch the picked sessions of that project on with it, in one step.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billable-switch-header",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/billable-switch/headers"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person makes a project billable (or not) on a node and picks which of its running sessions to bill."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "List every node's billable project headers for the caller's namespace, with each node's state and report time; ?history=1 adds the header changes.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billable-switch-headers",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/billable-switch/headers"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When showing which projects are billable on this node and on the other nodes."
   },
   {
     "auth": "jwt",
@@ -11612,6 +11892,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Return this node's billable switch events after the caller's cursor, whole, with the database's incarnation and highest event id (the record's replication feed).",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.federation-billable-switch-event-feed",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/billable-switch/event-feed"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "When another node's pull loop copies this node's billable switch record."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Fork one session's conversation history into a new session on this node.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.federation-branch",
@@ -11945,6 +12245,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the user renames a session."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read the runner identity layer's mode, counts since the server start, and the namespace's live processes the hub cannot name as a session's current runner.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.runner-identity-status",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/cli/runner-identity"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When watching a node in observe before switching it to enforce, or when checking which live sessions have an unidentified runner."
   },
   {
     "auth": "jwt",
@@ -12990,7 +13310,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Report whether the turn-derived time source has completed its soak-based cutover from the legacy clock.",
+    "description": "Report that the turns-derived time source is always in use (retired cutover gate, kept for older clients).",
     "domain": "telemetry",
     "id": "telemetry.timelogs-cutover-status",
     "invocation": {
@@ -13003,7 +13323,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "When the client decides which time-tracking source to display."
+    "whenToUse": "Only older web clients call this; current clients read the derived time log directly."
   },
   {
     "auth": "jwt",

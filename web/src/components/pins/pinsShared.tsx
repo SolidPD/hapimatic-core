@@ -177,11 +177,19 @@ const KIND_BOX: CSSProperties = {
 const KIND_ICON: CSSProperties = { width: "11px", height: "11px" };
 
 /** A row's kind glyph in its tinted box, in a click-stopping grid cell. */
-export function PinKindBadge(props: { kind: string; armed: boolean }) {
+export function PinKindBadge(props: {
+  kind: string;
+  armed: boolean;
+  /** Added to the badge's box, e.g. a pin row's first-line height (#6458). */
+  className?: string;
+}) {
   const kind = pinKindMeta(props.kind);
   const KindIcon = kind.icon;
   return (
-    <span onClick={stopRowToggle} className="flex">
+    <span
+      onClick={stopRowToggle}
+      className={props.className ? `flex ${props.className}` : "flex"}
+    >
       <PinIndicator
         armed={props.armed}
         label={`Kind: ${kind.label}`}
@@ -204,6 +212,11 @@ export function PinDetailsToggle(props: {
   expanded: boolean;
   armed: boolean;
   onToggle: () => void;
+  /**
+   * #6458 (TITLE-D): the row's title wraps onto more lines, so the chevron
+   * keeps its one-line height at the top of the row instead of stretching.
+   */
+  firstLine?: boolean;
 }) {
   const { expanded } = props;
   return (
@@ -215,7 +228,9 @@ export function PinDetailsToggle(props: {
       aria-expanded={expanded}
       aria-controls={expanded ? `pin-detail-${props.pinKey}` : undefined}
       onClick={props.onToggle}
-      className="flex w-[var(--icon-btn-size)] shrink-0 items-center justify-center self-stretch rounded-md bg-[var(--app-secondary-bg)] text-[var(--app-hint)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-fg)]"
+      className={`flex w-[var(--icon-btn-size)] shrink-0 items-center justify-center ${
+        props.firstLine ? "h-7 self-start" : "self-stretch"
+      } rounded-md bg-[var(--app-secondary-bg)] text-[var(--app-hint)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-fg)]`}
     >
       <ChevronIcon className="h-3.5 w-3.5" collapsed={!expanded} />
     </PinTipButton>

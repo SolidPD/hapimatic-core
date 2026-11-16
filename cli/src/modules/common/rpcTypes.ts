@@ -174,6 +174,15 @@ export interface SpawnSessionOptions {
    *  trap); any un-enumerated hop silently drops it (guarded by
    *  apiMachine.spawnMessageHooks.test.ts). */
   messageHooksEnabled?: boolean;
+  /** Issue #6458: the OWNING SERVER's Pins gate (`resolvePinsEnabled()`) at
+   *  spawn, stamped like `messageHooksEnabled`, because the daemon is a separate
+   *  unit whose env does not carry `HAPI_PINS_ENABLED`. The daemon's tmux render
+   *  appends the Pins block only on `true`, and Claude Code keeps only the LAST
+   *  `--append-system-prompt`, so this render is the one a tmux-persisted
+   *  session sees. `undefined` (an old server, a daemon-local spawn) renders no
+   *  block. Threaded field-by-field through every spawn hop (the #1262 trap);
+   *  guarded by apiMachine.spawnPins.test.ts and syncEngine.spawnPins.test.ts. */
+  pinsEnabled?: boolean;
   /** Issue #3611: the resolved `autoSelectOptimalAccount` opt-in (the server's
    *  preference-mirror snapshot at spawn time), threaded to the daemon so the
    *  un-pinned spawn resolver (`selectHealthyAccount.ts`) may bind the lowest

@@ -15,6 +15,10 @@ import {
 
 import { cataloged } from "../../../capabilities/cataloged";
 import {
+  isPromptPinLive,
+  withRequestLive,
+} from "../../../sync/pinPromptMirror";
+import {
   browserOrHostTimeZone,
   submitPinAnswers,
 } from "../../../sync/pinSubmission";
@@ -119,7 +123,10 @@ export function createPinMutationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
           return c.json({ error: describePinIssues(query.error) }, 400);
         }
         return c.json({
-          ...local.engine.pins.list(local.session.id, query.data),
+          ...withRequestLive(
+            local.session,
+            local.engine.pins.list(local.session.id, query.data)
+          ),
           timeZone: await preferenceZone(),
         });
       })
@@ -156,7 +163,10 @@ export function createPinMutationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
           c.req.param("key")
         );
         return found
-          ? c.json({ ...found, timeZone: await preferenceZone() })
+          ? c.json({
+              ...withRequestLive(local.session, found),
+              timeZone: await preferenceZone(),
+            })
           : c.json({ error: "Pin not found" }, 404);
       })
   );
@@ -311,7 +321,8 @@ export function createPinMutationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
           c,
           local.engine.pins.dismissForOperator(
             local.session,
-            c.req.param("key")
+            c.req.param("key"),
+            { isRequestLive: key => isPromptPinLive(local.session, key) }
           )
         );
       })

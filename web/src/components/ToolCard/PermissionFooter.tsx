@@ -6,6 +6,7 @@ import type { ChatToolCall, ToolPermission } from "@/chat/types";
 import { usePlatform } from "@/hooks/usePlatform";
 import { Spinner } from "@/components/Spinner";
 import { Button } from "@/components/ui/button";
+import { heldPressProps } from "@/components/ToolCard/elicitationPressHold";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
@@ -299,8 +300,10 @@ export function PermissionFooter(props: {
     return <div className="mt-2 text-xs text-red-600">{permission.reason}</div>;
   }
 
+  // A press on this card is ignored while another card holds it (an MCP
+  // elicitation card just answered or gone: the chat slides; #6606 round 9).
   return (
-    <div className="mt-2">
+    <div className="mt-2" {...heldPressProps(permission.id)}>
       <div className="text-xs text-[var(--app-hint)]">{summary}</div>
 
       {error ? <div className="mt-2 text-xs text-red-600">{error}</div> : null}

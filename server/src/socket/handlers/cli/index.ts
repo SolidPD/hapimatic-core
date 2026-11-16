@@ -28,6 +28,7 @@ import {
   cleanupClaudePtyCliHandlers,
   registerClaudePtyCliHandlers,
 } from "./claudePtyHandlers";
+import type { RunnerIdentity } from "../../../sync/runnerIdentity";
 
 type SessionAlivePayload = {
   sid: string;
@@ -81,6 +82,8 @@ export type CliHandlersDeps = {
   errorLogger?: ErrorLogger | null;
   /** #3631: deferred re-attempt queue for a SQLITE_BUSY message write (ruling D1). */
   messageWriteRetryQueue?: MessageWriteRetryQueue | null;
+  /** Issue #6647: the runner identity registry (absent: no identity step). */
+  runnerIdentity?: RunnerIdentity | null;
 };
 
 /**
@@ -165,6 +168,14 @@ export function registerCliHandlers(
       clearTimeout(pendingTimer);
       disconnectGraceTimers.delete(sessionId);
     }
+
+    // Issue #6647 (Task 6, R5, R15): an accepted socket joined the room. Clears
+    // the cut-off mark in every mode; in PR1 it counts what a cut would hit.
+    try {
+      deps.runnerIdentity?.socketConnected(socket, sessionId);
+    } catch {
+      // Fail open (R11): nothing on the connection path may throw.
+    }
   }
 
   const machineId = typeof auth?.machineId === "string" ? auth.machineId : null;
@@ -199,6 +210,12 @@ export function registerCliHandlers(
     onProviderUsageSnapshot: deps.onProviderUsageSnapshot,
     errorLogger: deps.errorLogger,
     messageWriteRetryQueue: deps.messageWriteRetryQueue,
+    gateReport: deps.runnerIdentity
+      ? (s, sid, kind) => deps.runnerIdentity?.gateReport(s, sid, kind) ?? true
+      : undefined,
+    afterDroppedReport: deps.runnerIdentity
+      ? s => deps.runnerIdentity?.afterDroppedReport(s)
+      : undefined,
   });
   registerMachineHandlers(socket, {
     store,
@@ -236,7 +253,9 @@ export function registerCliHandlers(
     // DISCONNECT_GRACE_MS, archive the session to trigger process cleanup.
     // This catches tab closes, network drops, and browser crashes that
     // previously left MCP server processes orphaned. (Issue #849)
-    if (sessionId && deps.onArchiveSession) {
+    // Issue #6647 (Task 12, R5): a socket the identity layer cut off arms no
+    // timer; its session has a new runner, or is recovered by Reconnect (R15).
+    if (sessionId && deps.onArchiveSession && !socket.data.evicted) {
       const archiveCallback = deps.onArchiveSession;
       // #6264: replace, never orphan, a pending timer. An overwritten handle can
       // no longer be cancelled by a reconnect and would archive a live session.

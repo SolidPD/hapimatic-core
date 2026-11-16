@@ -28,6 +28,13 @@ export const NUDGE_REQUEST_TIMEOUT_MS = 3500;
 /** Time for the flagged message to reach the server's store before a detect. */
 export const DETECT_DELAY_MS = 1500;
 const DETECT_REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * #6527 CR2-SF2: the one detect retry waits at least this long, so it outlasts
+ * a server restart (the usual cause of a refused or 503 detect); a longer
+ * `Retry-After` (the 429 rate limiter, a 503) wins, up to DETECT_RETRY_MAX_MS.
+ */
+export const DETECT_RETRY_DELAY_MS = 30_000;
+export const DETECT_RETRY_MAX_MS = 120_000;
 
 export type PinStopNudgeDeps = {
   selfSessionId: string;
@@ -61,7 +68,16 @@ type TurnState = {
 type TurnEndReply =
   | { kind: "answer"; body: unknown }
   | { kind: "skip" }
-  | { kind: "failed"; detail: unknown };
+  | { kind: "failed"; detail: unknown; retryAfterMs?: number };
+
+/** A `Retry-After` value (seconds, or an HTTP date) in ms; undefined if unreadable. */
+function parseRetryAfterMs(raw: string | null | undefined): number | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const at = Date.parse(trimmed);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
+}
 
 export function createPinStopNudge(deps: PinStopNudgeDeps): PinStopNudge {
   const doFetch: FetchLike = deps.fetchFn ?? ((url, init) => fetch(url, init));
@@ -93,7 +109,13 @@ export function createPinStopNudge(deps: PinStopNudgeDeps): PinStopNudge {
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (resp.status === 404) return { kind: "skip" };
-      if (!resp.ok) return { kind: "failed", detail: resp.status };
+      if (!resp.ok) {
+        return {
+          kind: "failed",
+          detail: resp.status,
+          retryAfterMs: parseRetryAfterMs(resp.headers?.get("Retry-After")),
+        };
+      }
       return { kind: "answer", body: await resp.json() };
     } catch (error) {
       return { kind: "failed", detail: error };
@@ -135,16 +157,54 @@ export function createPinStopNudge(deps: PinStopNudgeDeps): PinStopNudge {
     return { decision: "block", reason: answer.reason };
   }
 
-  /** Ask the server to pin the ask itself once the message is stored. */
+  /**
+   * Ask the server to pin the ask itself once the message is stored. #6527
+   * CR2-SF2: any failed detect (a timeout, a refused connection during a
+   * restart, a 429, a 503) is sent once more after DETECT_RETRY_DELAY_MS or the
+   * server's `Retry-After`, whichever is longer (capped). The retry is safe:
+   * the server keys the Detected pin `detected:<messageId>`, so a detect that
+   * did land the first time changes nothing. A `skip` (404: the gate closed,
+   * or no token) is never retried. A failed nudge keeps the turn's one detect
+   * (the sink's F2 note): it is what pins the ask when the nudge never got an
+   * answer.
+   */
   function detectLater(state: TurnState): void {
     state.detectSent = true;
-    const turnStartedAt = state.turnStartedAt;
-    delay(() => {
-      void post(
-        withStart({ mode: "detect" }, turnStartedAt),
-        DETECT_REQUEST_TIMEOUT_MS
-      ).then(reply => logger.debug("[pinStopNudge] detect answered", reply));
-    }, DETECT_DELAY_MS);
+    const body = withStart({ mode: "detect" }, state.turnStartedAt);
+    const attempt = (retried: boolean): void => {
+      // #6458 review D4: the server takes the newest matching message since
+      // this turn's start, so once the next turn has opened a retry could pin
+      // that turn's message, or one the operator already answered.
+      if (retried && turn !== state) {
+        logger.warn(
+          "[pinStopNudge] detect not retried: a new turn started, so the earlier ask may be unpinned"
+        );
+        return;
+      }
+      void post(body, DETECT_REQUEST_TIMEOUT_MS).then(reply => {
+        if (reply.kind === "failed" && retried) {
+          logger.warn(
+            "[pinStopNudge] detect failed twice; the ask is not pinned",
+            reply.detail
+          );
+          return;
+        }
+        if (reply.kind === "failed") {
+          const wait = Math.min(
+            DETECT_RETRY_MAX_MS,
+            Math.max(DETECT_RETRY_DELAY_MS, reply.retryAfterMs ?? 0)
+          );
+          logger.debug(
+            `[pinStopNudge] detect failed; retrying once in ${wait} ms`,
+            reply.detail
+          );
+          delay(() => attempt(true), wait);
+          return;
+        }
+        logger.debug("[pinStopNudge] detect answered", reply);
+      });
+    };
+    delay(() => attempt(false), DETECT_DELAY_MS);
   }
 
   return {

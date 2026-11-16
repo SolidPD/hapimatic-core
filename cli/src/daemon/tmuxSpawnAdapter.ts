@@ -122,6 +122,10 @@ export interface TmuxSpawnOptions {
   /** Issue #6171: the encoded `--hapi-mcp-set` JSON (`encodeMcpSetLaunchArg`). */
   mcpSetArg?: string;
 
+  /** Issue #6458: the owning server's Pins gate (see SpawnSessionOptions).
+   *  `true` adds the Pins block to the daemon's `--append-system-prompt`. */
+  pinsEnabled?: boolean;
+
   /** OAuth token for authentication */
   token?: string;
 
@@ -1007,6 +1011,7 @@ export async function spawnSessionInTmux(
     sessionRole,
     outputStyle,
     mcpSetArg,
+    pinsEnabled,
     token,
     model,
     codexHome,
@@ -1206,6 +1211,7 @@ export async function spawnSessionInTmux(
           sessionRole,
           outputStyle,
           mcpSetArg,
+          pinsEnabled,
           projectDir,
           directory,
           resumeSessionId,
@@ -3311,6 +3317,8 @@ export interface BuildCommandOptions {
   outputStyle?: string;
   /** Issue #6171: see TmuxSpawnOptions.mcpSetArg. */
   mcpSetArg?: string;
+  /** Issue #6458: see TmuxSpawnOptions.pinsEnabled. */
+  pinsEnabled?: boolean;
   projectDir: string;
   directory: string;
   resumeSessionId?: string;
@@ -3420,7 +3428,12 @@ export function buildClaudeCommand(options: BuildCommandOptions): string[] {
   // through commands/claude.ts into the child argv VERBATIM (the launcher
   // suppression only gates the launcher's own buildSystemPrompt addition).
   if (!options.safeMode) {
-    const systemPrompt = buildSystemPrompt(options.directory);
+    // Issue #6458: the Pins block only on the server's stamped `true`; this
+    // flag comes after the launcher's own (claudeCommandArgs), so it is the one
+    // the model sees (Claude Code keeps the LAST --append-system-prompt).
+    const systemPrompt = buildSystemPrompt(options.directory, {
+      pinsEnabled: options.pinsEnabled === true,
+    });
     args.push(
       "--append-system-prompt",
       escapeShellArg(

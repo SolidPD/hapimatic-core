@@ -53,6 +53,8 @@ export class Session extends AgentSessionBase<EnhancedMode> {
   // overload that syncSessionModes applies, which getModelMode() does not.
   model?: string;
   readonly mcpServers: Record<string, any>;
+  /** Issue #6458: this session's Pins gate (its own probe); see LoopOptions. */
+  readonly pinsEnabled: boolean;
   readonly allowedTools?: string[];
   readonly hookSettingsPath: string;
   readonly startedBy: "daemon" | "terminal";
@@ -83,6 +85,7 @@ export class Session extends AgentSessionBase<EnhancedMode> {
     claudeArgs?: string[];
     claudeTrailingArgs?: string[];
     mcpServers: Record<string, any>;
+    pinsEnabled: boolean;
     messageQueue: MessageQueue2<EnhancedMode>;
     onModeChange: (mode: "local" | "remote") => void;
     allowedTools?: string[];
@@ -124,6 +127,7 @@ export class Session extends AgentSessionBase<EnhancedMode> {
     this.claudeTrailingArgs = opts.claudeTrailingArgs;
     this.model = opts.model;
     this.mcpServers = opts.mcpServers;
+    this.pinsEnabled = opts.pinsEnabled;
     this.allowedTools = opts.allowedTools;
     this.hookSettingsPath = opts.hookSettingsPath;
     this.startedBy = opts.startedBy;

@@ -1312,6 +1312,8 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
           url: happyServer.url,
         },
       },
+      // #6458: the gate this session's own probe read; renders the Pins block.
+      pinsEnabled: happyServer.pinsEnabled === true,
       session,
       claudeEnvVars: options.claudeEnvVars,
       claudeArgs: options.claudeArgs,

@@ -15,6 +15,14 @@
  *   skipped = skipped === true            (always ok: false)
  *   failed  = !ok && !skipped
  *
+ * Inside `failed`, Delete (#6681) marks two kinds of not-done item with a flag,
+ * never a code (an older CLI rejects an unknown code; an older client reads a
+ * flagged item as today's code-less failure):
+ *   pending = pending === true  (sent; the outcome is unknown and the delete
+ *                                may still complete; the web decides it from
+ *                                a direct read)
+ *   retry   = retry === true    (never sent; safe to send again)
+ *
  * Any failure outside the code vocabulary is `{ id, ok: false, error }` with
  * no `code`. Imports only `zod` on purpose: `schemas.ts` is a shared hotspot.
  */
@@ -55,6 +63,12 @@ export const BULK_SESSION_SKIP_CODES = [
 /** Server cap on ids per bulk request; clients chunk by it. */
 export const BULK_SESSION_MAX_IDS = 100;
 
+/**
+ * #6681 (D3 = 1): how long one bulk delete keeps resending `retry` ids, from
+ * its first request. The web's round loop and the CLI's resend both use it.
+ */
+export const BULK_DELETE_BUDGET_MS = 300_000;
+
 export const BulkSessionResultItemSchema = z
   .object({
     id: z.string(),
@@ -64,8 +78,51 @@ export const BulkSessionResultItemSchema = z
     error: z.string().optional(),
     /** Stop turn only (ruling D2): prompts still queued on a stopped session. */
     queued: z.number().int().nonnegative().optional(),
+    /** #6681 (Delete): outcome unknown, the action may still complete. */
+    pending: z.literal(true).optional(),
+    /** #6681 (Delete): not sent, safe to send again. */
+    retry: z.literal(true).optional(),
   })
   .superRefine((item, ctx) => {
+    const flagged = item.pending === true || item.retry === true;
+    if (item.pending === true && item.retry === true) {
+      ctx.addIssue({
+        code: "custom",
+        message: "an item is pending or retry, never both",
+        path: ["retry"],
+      });
+    }
+    if (flagged) {
+      const flag = item.pending === true ? "pending" : "retry";
+      if (item.ok) {
+        ctx.addIssue({
+          code: "custom",
+          message: `${flag} implies ok: false`,
+          path: [flag],
+        });
+      }
+      if (item.skipped !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: `${flag} never carries skipped`,
+          path: ["skipped"],
+        });
+      }
+      if (item.code !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: `${flag} never carries a code`,
+          path: ["code"],
+        });
+      }
+      if (!item.error) {
+        ctx.addIssue({
+          code: "custom",
+          message: `${flag} needs a non-empty error`,
+          path: ["error"],
+        });
+      }
+    }
     if (item.skipped === true && item.ok) {
       ctx.addIssue({
         code: "custom",

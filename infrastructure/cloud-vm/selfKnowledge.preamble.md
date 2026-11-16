@@ -78,6 +78,28 @@ Judgment when you use them:
 - Prefer a peer session (not a one-shot subagent) for non-trivial work that should outlive the
   current turn or that the user should be able to watch.
 
+## Pins
+
+Pins is per instance, so this doc cannot say whether it is on here. Your session has it when the
+`pin_*` tools are in your tool list or your instructions carry a Pins block; `GET /api/version`
+answering `pinsEnabled: true` says the instance has it now.
+
+With Pins, a pin is a card in the session's Pins tab holding a decision, review or step list for
+the operator, which stays put while the chat scrolls away. Its tools are listed under
+"Instance-gated: Pins" below. "Pin" means a Pins-tab pin unless the context clearly means another
+kind. Every pin has an ID (`pin-` and ten characters) that `pin_get({id})` reads from any session,
+so a lane names a pin by its ID when it reports to its project manager. Use a `hapi_pin` fenced
+block only when the pin tools are absent. The operator's answers arrive as one `hapi_pin_answers/1`
+message whose entries each carry a `pinId`; a `dismissed` entry means the operator dismissed that
+pin, so treat it as closed and do not ask it again. Put a pin's files in the folders `pin_folder`
+returns (the saved one under `GeneratedFiles/pins/` for a file you keep building on), never loose
+in `GeneratedFiles/`. End a status report that has open pins with one count line,
+`📌 N open (M new: <titles>)`.
+
+Without Pins there is no tab and no pin tools, and a `hapi_pin` block is dropped with no notice, so
+ask in the chat. A pin tool answering `pins_unavailable` means Pins was turned off after the
+session started.
+
 ## Where things live
 
 - **Documentation**: the `docs/` folder of the Hapimatic data directory, `~/.hapimatic-private/docs/`

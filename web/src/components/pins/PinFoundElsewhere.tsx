@@ -5,6 +5,7 @@ import { ArrowRight } from "lucide-react";
 import { PIN_LIST_MAX_LIMIT } from "@hapi/protocol";
 import { PinActionButton } from "@/components/pins/PinAnswerControls";
 import { PinKindBadge } from "@/components/pins/pinsShared";
+import { FadeTruncate } from "@/components/session/FadeTruncate";
 import { HoverTooltip } from "@/components/ui/tooltip";
 import type { PinByIdLookup } from "@/hooks/queries/usePins";
 import { ACTION_COLLAPSE_RANK } from "@/lib/pins/actionRowFit";
@@ -66,6 +67,15 @@ export function PinFoundElsewhere(props: {
         </Line>
       );
     case "not_found": {
+      // #6458 Task 11i: a spoke searched only itself, so this is not a miss.
+      if (lookup.localOnly) {
+        return (
+          <Line>
+            {props.pinId} is not on this node, which cannot search the others;
+            look it up on the hub.
+          </Line>
+        );
+      }
       const offline = lookup.notAsked.map(node => node.nodeLabel);
       return (
         <Line>
@@ -111,9 +121,12 @@ export function PinFoundElsewhere(props: {
       style={BOX}
     >
       <PinKindBadge kind={pin.kind} armed />
+      {/* #6458 (TITLE-D): the title fades at its edge, never an ellipsis. The
+          tooltip's trigger is the wrapper, because FadeTruncate keeps its own
+          ref to measure the overflow. */}
       <HoverTooltip content={pin.title}>
-        <span className="min-w-0 flex-1 truncate font-semibold text-[var(--app-fg)]">
-          {pin.title}
+        <span className="flex min-w-0 flex-1 font-semibold text-[var(--app-fg)]">
+          <FadeTruncate>{pin.title}</FadeTruncate>
         </span>
       </HoverTooltip>
       {note ? (

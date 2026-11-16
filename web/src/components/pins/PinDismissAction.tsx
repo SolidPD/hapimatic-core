@@ -68,12 +68,26 @@ const UNDO_CLASS =
   "inline-flex items-center gap-1 rounded-md border border-[var(--app-border)] px-2 font-semibold text-[var(--app-fg)] hover:bg-[var(--app-hover)] disabled:opacity-50";
 
 /**
- * A pin the operator may dismiss from its action row: exactly the pins they may
- * answer (KD1). A dashboard, a closed pin and a `prompt:` pin are not; a
- * Detected pin has its own Dismiss, which uses the same flow.
+ * #6458 (D-b, Task 11k): an open `prompt:` pin whose request is gone, which the
+ * server marks `requestLive: false`. Nothing waits on it any more, so the
+ * operator may dismiss it; absent reads as live.
+ */
+export function isStalePromptPin(pin: Pin): boolean {
+  return (
+    pin.status === "open" &&
+    pin.key.startsWith("prompt:") &&
+    pin.requestLive === false
+  );
+}
+
+/**
+ * A pin the operator may dismiss from its action row: the pins they may answer
+ * (KD1), and a prompt pin whose request is gone (#6458 D-b). A dashboard, a
+ * closed pin and a waiting `prompt:` pin are not; a Detected pin has its own
+ * Dismiss, which uses the same flow.
  */
 export function isDismissablePin(pin: Pin): boolean {
-  return isAnswerablePin(pin);
+  return isAnswerablePin(pin) || isStalePromptPin(pin);
 }
 
 export type DismissStaging = {

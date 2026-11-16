@@ -15,11 +15,11 @@ import {
   type CacheKeepaliveResponse,
 } from "@hapi/protocol";
 import { cacheKeepaliveRpc } from "./cacheKeepaliveRpc";
-import type { SpawnSessionOptions } from "./syncEngine";
+import type { GatewaySpawnOptions } from "./syncEngine";
 import type { ErrorLogger } from "../logging/errorLogger";
-// Issue #3632: value import (not `import type`) — this predicate is CALLED at
-// spawn time to stamp the owning server's message-hook stage into the RPC.
+// #3632, #6458: value imports, CALLED at spawn to stamp this server's gates.
 import { messageHooksEnabled } from "./messageHooks";
+import { resolvePinsEnabled } from "../config/pinsConfig";
 import { spawnSuccessFromRpc, type SpawnSuccess } from "./spawnSuccess";
 import {
   isRetriableSpawnFailure,
@@ -137,7 +137,6 @@ export type CreateDirectoryResponse = {
  * use `errorKind` to log the failure mode loudly enough that orphan
  * accumulation is detectable in production logs. `originalError` preserves the
  * raw exception message for diagnostic context.
- *
  * Backward-compatible: every new field is optional and additive. Tests that
  * mock `cleanupTmuxSession` returning `{message: "spy"}` continue to pass.
  */
@@ -175,15 +174,17 @@ export class RpcGateway {
     mode?: PermissionMode,
     allowTools?: string[],
     decision?: "approved" | "approved_for_session" | "denied" | "abort",
-    answers?: Record<string, string[]>
-  ): Promise<void> {
-    await this.sessionRpc(sessionId, "permission", {
+    answers?: Record<string, string[]>,
+    answeredBy?: "session"
+  ): Promise<unknown> {
+    return await this.sessionRpc(sessionId, "permission", {
       id: requestId,
       approved: true,
       mode,
       allowTools,
       decision,
       answers,
+      ...(answeredBy ? { answeredBy } : {}),
     });
   }
 
@@ -276,7 +277,7 @@ export class RpcGateway {
     );
   }
 
-  async spawnSession(opts: SpawnSessionOptions): Promise<
+  async spawnSession(opts: GatewaySpawnOptions): Promise<
     | SpawnSuccess
     // Issue #1772: carry the daemon's error `code` (e.g. "at_capacity") back to
     // syncEngine.spawnSession, whose return type already declares `code?`.
@@ -373,6 +374,7 @@ export class RpcGateway {
           // OMITS the marker → the rp1-home client DEFERS (fail-closed, safe).
           // Guarded by syncEngine.spawnMessageHooks.test.ts (the #1262 trap).
           messageHooksEnabled: messageHooksEnabled(),
+          pinsEnabled: resolvePinsEnabled(), // #6458; spawnPins.test.ts
           // Issue #1555: forward the await-webhook gate through this first
           // field-by-field RPC hop (the #1262 trap — un-enumerated fields are
           // silently dropped on the wire). false → daemon returns once the

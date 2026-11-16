@@ -776,6 +776,7 @@ export async function claudeTmuxRemoteLauncher(
         ),
         claudeArgs: attemptArgs,
         mcpServers: session.mcpServers,
+        pinsEnabled: session.pinsEnabled,
         allowedTools: session.allowedTools,
         hookSettingsPath: session.hookSettingsPath,
         initialCols: TMUX_INITIAL_COLS,

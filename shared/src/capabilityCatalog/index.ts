@@ -22,6 +22,7 @@ export * from "./domains";
 export * from "./schema";
 export * from "./index.generated"; // Sub-Issue C (#3743): committed Tier-0 index.
 export * from "./renderTier0"; // Sub-Issue H (#3748): Tier-0 renderer + eligibility.
+export * from "./pinsPrimer"; // #6458: the gated Pins block (outside Tier-0).
 export * from "./tier0.generated"; // Sub-Issue H (#3748): committed Tier-0 snapshot.
 export * from "./availability"; // Sub-Issue I (#3749): session-aware evaluator.
 export * from "./infraExclusion"; // Sub-Issue F.1 (#3746): audit infra-exclusion class.

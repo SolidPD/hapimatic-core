@@ -37,6 +37,24 @@ export class PeerAnnouncer {
   private readonly loop: SupervisedLoop;
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Issue #6646: called when a received tombstone removes a node (index.ts wires it). */
+  private onNodeRemoved: ((nodeId: string) => void) | null = null;
+
+  setOnNodeRemoved(callback: ((nodeId: string) => void) | null): void {
+    this.onNodeRemoved = callback;
+  }
+
+  private notifyNodeRemoved(nodeId: string): void {
+    try {
+      this.onNodeRemoved?.(nodeId);
+    } catch (err) {
+      console.warn(
+        `[PeerAnnouncer] Node-removed callback failed for ${nodeId}:`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+
   constructor(options: PeerAnnouncerOptions) {
     this.config = options.config;
     this.apiToken = options.apiToken;
@@ -255,7 +273,11 @@ export class PeerAnnouncer {
       // over a stale "online" entry for the same id.
       for (const t of parsed.data.tombstones) {
         if (t.id === this.config.nodeId) continue; // never tombstone self
-        this.peerStore.applyReceivedTombstone(t.id, t.evictedAt);
+        if (this.peerStore.applyReceivedTombstone(t.id, t.evictedAt)) {
+          // Issue #6646: the other nodes never run evictNode, so a received death
+          // certificate is where they drop the node's billable header report.
+          this.notifyNodeRemoved(t.id);
+        }
       }
 
       // Store all validated peers from the exchange response. This is GOSSIP —

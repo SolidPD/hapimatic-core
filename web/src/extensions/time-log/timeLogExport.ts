@@ -23,7 +23,10 @@ function downloadBlob(blob: Blob, filename: string): void {
 }
 
 /**
- * Export time log entries to CSV format
+ * Export legacy time log entries (the read-only `timelog_entries` archive) to
+ * CSV format. No caller since #6675, which made the Time Log's CSV export the
+ * derived one ({@link exportDerivedToCSV}). Kept because W5 (#4431) owns the
+ * export rework and routes this function through its shared `toCsv` helper.
  */
 export function exportToCSV(entries: TimeLogEntry[], filename: string): void {
   // CSV header
@@ -55,8 +58,9 @@ export function exportToCSV(entries: TimeLogEntry[], filename: string): void {
 
 /**
  * Issue #1670 (Sub H1, PR-2): export the TS-derived daily buckets to CSV.
- * Used when the cutover gate is green (R5) — the columns intentionally differ
- * from the legacy per-entry export (per-day auto/adjustment/net totals).
+ * The Time Log's CSV export since #6675 retired the cutover gate. The columns
+ * intentionally differ from the legacy per-entry export (per-day
+ * auto/adjustment/net totals).
  */
 export function exportDerivedToCSV(
   buckets: DerivedDailyBucket[],

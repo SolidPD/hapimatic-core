@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import {
+  openPinCountField,
+  readOpenPinCounts,
+} from "../../../sync/openPinCountReads";
 import { Hono } from "hono";
 import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
@@ -12,12 +16,42 @@ import {
   parseFileSearchOutput,
   parseHiddenParam,
 } from "../../../extensions/git-rpc/fileSearchArgs";
-import { defineCapability, toSessionSummary } from "@hapi/protocol";
+import {
+  defineCapability,
+  toSessionSummary,
+  type BillableSwitchHeader,
+} from "@hapi/protocol";
 import { cataloged } from "../../../capabilities/cataloged";
 import type { MessageOrigin } from "../../../sync/sentFrom";
 import { computeApprovalState } from "../../../services/approvalTokens";
 import { loadApprovalHygieneConfig } from "../../../config/approvalHygieneConfig";
 import { loadApprovalTokensConfig } from "../../../config/approvalTokensConfig";
+
+// Issue #6646: one log line per failing streak, so a broken table does not log
+// at every 15 s poll.
+let billableSwitchReportFailing = false;
+
+function readBillableSwitchReport(engine: {
+  getBillableSwitchMode?: () => "off" | "on" | "closed";
+  listBillableSwitchHeaders?: () => BillableSwitchHeader[];
+}): BillableSwitchHeader[] | undefined {
+  const mode = engine.getBillableSwitchMode?.() ?? "off";
+  if (mode !== "on" && mode !== "closed") return undefined;
+  try {
+    const headers = engine.listBillableSwitchHeaders?.();
+    billableSwitchReportFailing = false;
+    return headers;
+  } catch (err) {
+    if (!billableSwitchReportFailing) {
+      billableSwitchReportFailing = true;
+      console.error(
+        "[Federation] Billable switch header report left out of the poll:",
+        err instanceof Error ? err.message : err
+      );
+    }
+    return undefined;
+  }
+}
 
 export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
@@ -86,7 +120,7 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       const allSessions = engine.getSessions();
       // #6447: one grouped query, because this route runs on every federation poll.
       const pinCounts =
-        deps.pinsEnabled === true ? engine.getOpenPinCounts() : null;
+        deps.pinsEnabled === true ? readOpenPinCounts(engine) : null;
       const sessions = allSessions.map(s =>
         toSessionSummary(
           s,
@@ -99,11 +133,20 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         )
       );
 
+      // Issue #6646: this node's header defaults beside its sessions, while its
+      // gate is on or closed. Fail-soft at the reporting end: a throw leaves the
+      // key out and is logged once, never a 500 (three failed polls mark a node
+      // offline). Absent means "nothing new": the receiver keeps the last report.
+      const billableSwitchHeaders = readBillableSwitchReport(engine);
+
       return c.json({
         nodeId: config.nodeId,
         nodeLabel: config.nodeLabel,
         sessions,
         fetchedAt: Date.now(),
+        ...(billableSwitchHeaders !== undefined
+          ? { billableSwitchHeaders }
+          : {}),
       });
     }
   );
@@ -154,7 +197,7 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         session,
         messageCount,
         ...(deps.pinsEnabled === true
-          ? { openPinCount: engine.getOpenPinCount(sessionId) }
+          ? openPinCountField(engine, sessionId)
           : {}),
       });
     }

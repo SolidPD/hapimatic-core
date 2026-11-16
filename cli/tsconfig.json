@@ -19,6 +19,8 @@
     "src/**/*.tsx",
     "src/**/*.d.ts",
     "../server/src/**/*.ts",
-    "../server/src/**/*.d.ts"
+    "../server/src/**/*.d.ts",
+    "../scripts/version-bump.ts",
+    "../scripts/lib/version-policy-v1.ts"
   ]
 }

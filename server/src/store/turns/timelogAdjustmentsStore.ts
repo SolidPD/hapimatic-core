@@ -19,9 +19,9 @@ import type { TimelogAdjustmentRow, TimelogAdjustmentType } from "./types";
  * The table itself is created by `applyTurnsMigrations` (Sub A) — this store adds
  * NO schema.
  *
- * DORMANCY (#1670 PR-1): nothing in the live read path or any HTTP route calls
- * this store yet. PR-2 wires the six clock controls to it; the actual display
- * switch stays gated on the Sub-G parity green-streak (see `cutoverGate.ts`).
+ * The six clock controls write here (`POST /timelogs/adjustments`), and the
+ * turns-derived read (`timelogDerivation.ts`) applies these rows to the Time
+ * Log's figures — its only read path since #6675 retired the cutover gate.
  */
 
 /** Generic append input — one `timelog_adjustments` row. */

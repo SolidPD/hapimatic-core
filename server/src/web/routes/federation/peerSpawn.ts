@@ -21,7 +21,12 @@ import { isSafeMachinePath } from "../../../utils/pathSecurity";
 import { expandTilde } from "../../../utils/expandTilde";
 import { validateApiKeySpawn } from "../machines";
 import { resolveSpawnMcpSet } from "../../../services/mcpSetResolver";
-import { resolveModelFamily, type SpawnWarning } from "@hapi/protocol";
+import {
+  resolveModelFamily,
+  type BillableSwitchStartContext,
+  type BillableSwitchStartWire,
+  type SpawnWarning,
+} from "@hapi/protocol";
 import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
 import {
   ACCOUNT_EXHAUSTED_CODE,
@@ -30,6 +35,36 @@ import {
 } from "../../../accounts/accountHeadroom";
 import type { FederationDeps } from "./shared";
 import { checkFederationToken, notifyOriginatingHub } from "./shared";
+
+/**
+ * Issue #6646: the start context a peer receiver passes to its engine. Only the
+ * kinds that can cross a hop (`person`, `agent`, `unattended`) are kept; any
+ * other or unknown kind, and a missing context (an older hub), read as
+ * `unattended`. The actor, channel and entry node are the forwarding node's
+ * claims (one shared mesh token); `fromSessionId` never crosses (the wire
+ * schema strips it). The caller's namespace is kept, so a registration from
+ * another namespace under the same tag does not consume it.
+ */
+export function receivedBillableSwitchStart(
+  wire: BillableSwitchStartWire | undefined,
+  namespace: string | undefined
+): BillableSwitchStartContext {
+  const kind =
+    wire &&
+    (wire.kind === "person" ||
+      wire.kind === "agent" ||
+      wire.kind === "unattended")
+      ? wire.kind
+      : "unattended";
+  return {
+    kind,
+    ...(kind === "person" && wire?.choice ? { choice: wire.choice } : {}),
+    ...(wire?.actor ? { actor: wire.actor } : {}),
+    ...(wire?.entryNodeId ? { entryNodeId: wire.entryNodeId } : {}),
+    ...(wire?.via ? { via: wire.via } : {}),
+    ...(namespace ? { namespace } : {}),
+  };
+}
 
 export async function spawnForPeer(
   c: Context<WebAppEnv>,
@@ -96,7 +131,17 @@ export async function spawnForPeer(
     nativeModelSelection,
     mcpSet: requestedMcpSet,
     spawnCorrelationId,
+    billableSwitchStart: wireBillableSwitchStart,
   } = parsed.data;
+
+  // Issue #6646: only the kinds that can cross a hop (person, agent, unattended);
+  // any other or unknown kind reads as `unattended`, and a missing context (an
+  // older hub) too. The actor, the channel and the entry node are taken as
+  // claimed by the federation-token caller; `fromSessionId` is never accepted.
+  const billableSwitchStart = receivedBillableSwitchStart(
+    wireBillableSwitchStart,
+    c.req.header("x-hapi-caller-namespace") ?? undefined
+  );
 
   // H-4: validate the directory against the path-security blacklist BEFORE
   // spawning a session in it. Without this, any federation-authorized caller
@@ -262,6 +307,7 @@ export async function spawnForPeer(
       machineId,
       directory,
       agent,
+      billableSwitchStart,
       yolo,
       // Issue #6218: forward the starting permission mode on the peer-incoming
       // hop (#1262 trap). With `yolo` also omitted, this node's own default

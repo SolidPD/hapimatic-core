@@ -41,6 +41,7 @@ import type { ResolveTranscriptPathsInput } from "./transcriptPath";
 import {
   TRANSCRIPT_CLASSIFY_SCAN_MAX_BYTES,
   admitScannedLine,
+  forEachTranscriptEntry,
   isMissingFileError,
   readEntriesFrom,
   readTranscript,
@@ -232,6 +233,44 @@ function readLastTurnWindow(
   return readEntriesFrom(path, boundary);
 }
 
+/** The watermark bound (#2248): a positive timestamp (0 marks an absent one) at
+ *  or below the next-turn start, when there is one. One copy for both readers. */
+function inWatermarkBound(
+  ts: number,
+  upperBoundMs: number | undefined
+): boolean {
+  return ts > 0 && (typeof upperBoundMs !== "number" || ts <= upperBoundMs);
+}
+
+/**
+ * The exact whole-file watermark for several turns of one transcript in one
+ * pass (#6678): per bound, the largest in-bound timestamp over the entries a
+ * whole-file `readTranscript` admits (#6264 R10), or `null`. Streamed in bounded
+ * memory by `forEachTranscriptEntry`, for the offline backfill. It throws on any
+ * I/O error (a missing file included): "no watermark" is a floor, "could not
+ * read" must stay unresolved, and only the caller can tell them apart.
+ */
+export function lastMessageTsMsForBounds(
+  path: string,
+  upperBounds: ReadonlyArray<number | undefined>,
+  opts?: { chunkBytes?: number; maxLineBytes?: number }
+): Array<number | null> {
+  const max: Array<number | null> = upperBounds.map(() => null);
+  forEachTranscriptEntry(
+    path,
+    entry => {
+      const ts = tsMsOf(entry, 0);
+      for (let i = 0; i < upperBounds.length; i++) {
+        if (!inWatermarkBound(ts, upperBounds[i])) continue;
+        const current = max[i];
+        if (current === null || ts > current) max[i] = ts;
+      }
+    },
+    opts
+  );
+  return max;
+}
+
 /**
  * Last-observed-activity watermark for a turn: `MAX(entry.timestamp)` over the
  * session transcript (issue #2248). Used by the orphan sweep to close an orphaned
@@ -256,9 +295,9 @@ function readLastTurnWindow(
  * cap, because nearly every line carries a timestamp and each one parsed counts.
  * Known trade-off: an OLDER orphaned turn whose bound lies beyond that reach
  * returns `null` and reports `onCapHit`, so the sweep can leave its duration
- * unresolved for the exact backfill instead of flooring it. `exact: true` keeps
- * the whole-file read; the offline orphan backfill uses it. A failed read of an
- * existing file also returns `null`, and reports `onReadError`.
+ * unresolved for the exact backfill instead of flooring it. The exact backfill
+ * reads the whole file with `lastMessageTsMsForBounds` (#6678). A failed read
+ * of an existing file also returns `null`, and reports `onReadError`.
  */
 export function lastMessageTsMs(
   ctx: {
@@ -267,8 +306,6 @@ export function lastMessageTsMs(
     workingDirectory?: string | null;
     configDir?: string;
     upperBoundMs?: number;
-    /** Always read the whole file (offline backfill — #6264 R10). */
-    exact?: boolean;
   } & BoundedReadOptions
 ): number | null {
   // Set once the path resolves: an error before that is an unresolvable path
@@ -286,14 +323,10 @@ export function lastMessageTsMs(
       }).main;
     }
     const inBound = (ts: number): boolean =>
-      ts > 0 &&
-      (typeof ctx.upperBoundMs !== "number" || ts <= ctx.upperBoundMs);
+      inWatermarkBound(ts, ctx.upperBoundMs);
 
     const bounds = resolveBounds(ctx);
-    if (
-      ctx.exact === true ||
-      !useBoundedRead(mainPath, bounds.fullReadMaxBytes)
-    ) {
+    if (!useBoundedRead(mainPath, bounds.fullReadMaxBytes)) {
       const { entries } = readTranscript(mainPath);
       let max: number | null = null;
       for (const e of entries) {

@@ -55,6 +55,15 @@ import type {
 import { isEffortLevel, type EffortLevel } from "@hapi/protocol/effort";
 import type { SSEManager } from "../sse/sseManager";
 import { resolvePinsEnabled } from "../config/pinsConfig";
+import {
+  BILLABLE_SWITCH_CAPABILITY,
+  BILLABLE_SWITCH_CLOSED_CAPABILITY,
+  BILLABLE_SWITCH_STORE_CAPABILITY,
+  BillableSwitchHeaderSchema,
+  type BillableSwitchHeader,
+  type BillableSwitchMode,
+} from "@hapi/protocol";
+import { z } from "zod";
 import type { PeerStore } from "../store/peerStore";
 import type { CachedRemoteSessions, NodeRegistryOptions } from "./types";
 import { createHomeUrlGuard } from "./secretTransport";
@@ -107,6 +116,28 @@ const UNREACHABLE_CODES = new Set([
   "ENETUNREACH",
   "ETIMEDOUT",
 ]);
+/**
+ * #6681: at most this many DELETEs outstanding to one node at a time, across
+ * every bulk request and round. A slow peer serves its deletes one after
+ * another anyway; two keeps one request ready behind the one it is serving.
+ */
+export const REMOTE_DELETE_CONCURRENCY = 2;
+/**
+ * #6681: a DELETE whose outcome is unknown (a timeout, an after-send reset, a
+ * 5xx) keeps its slot until positive evidence that the peer finished it
+ * (`releaseOwedDeleteSlot`), or until this long has passed, so a slow peer's
+ * backlog stays at REMOTE_DELETE_CONCURRENCY, not just the hub's count.
+ */
+export const REMOTE_DELETE_OWED_SLOT_MS = 60_000;
+/**
+ * #6681 (revision 3): while a slot is owed, its id is re-read on its node this
+ * often. The read queues behind the peer's synchronous delete work (about 6 s
+ * per delete on ms1, 2026-11-10), so one read per owed id per 5 s frees a
+ * finished delete's slot within about 5 s instead of the 60 s hold, adds at
+ * most 2 reads per 5 s to the node, and (one in flight per id) leaves a
+ * blocked node at most 2 outstanding reads.
+ */
+export const REMOTE_DELETE_CONFIRM_INTERVAL_MS = 5_000;
 /** Per-peer timeout for the notification fan-out (issue #4913): the badge polls. */
 const NOTIFICATION_PROXY_TIMEOUT_MS = 3_000;
 
@@ -137,6 +168,98 @@ export type RemoteSessionActionError = {
   message: string;
   status?: number;
   offline?: true;
+  /**
+   * #6681 (deleteOnNode only): the request was sent and its outcome is unknown
+   * (a timeout, an after-send reset or a 5xx); the peer may still complete it.
+   * `sentAt` is the `performance.now()` of the send.
+   */
+  unknown?: true;
+  sentAt?: number;
+  /** #6681 (deleteOnNode only): the request never reached the peer. */
+  notSent?: true;
+  /**
+   * #6681 F2 (deleteOnNode only): an `unknown` 5xx whose body carried the
+   * peer's own error text (`message`), so the peer itself answered; a 502/504
+   * with no peer body leaves this unset.
+   */
+  peerAnswered?: true;
+};
+
+/** #6681: fetch error codes that mean the request never reached the peer. */
+const NOT_SENT_CODES = new Set(
+  [...UNREACHABLE_CODES].filter(
+    code => code !== "ECONNRESET" && code !== "ConnectionClosed"
+  )
+);
+/** #6681: fetch error codes of a connection reset after the request was sent. */
+const AFTER_SEND_CODES = new Set(["ECONNRESET", "ConnectionClosed"]);
+
+/** #6681: what positive evidence says about a delete whose outcome was unknown. */
+export type DeleteConfirmation = "gone" | "present" | "unknown";
+
+/** #6681: one queued `deleteOnNode` call waiting for a slot. */
+type DeleteSlotWaiter = { grant: () => void };
+
+/** #6681: one node's delete slots (REMOTE_DELETE_CONCURRENCY of them). */
+type NodeDeleteSlots = {
+  /** Slots taken: DELETEs in flight plus owed ones. */
+  taken: number;
+  /**
+   * Owed slots by session id: the send time, the hold's expiry timer and the
+   * next re-read (revision 3).
+   */
+  owed: Map<
+    string,
+    {
+      sentAt: number;
+      timer: ReturnType<typeof setTimeout>;
+      reread: ReturnType<typeof setTimeout> | null;
+    }
+  >;
+  /** Waiters per caller, in arrival order. */
+  waiters: Map<symbol, DeleteSlotWaiter[]>;
+  /** Callers with waiters, in round-robin order. */
+  turns: symbol[];
+  /** The caller granted last, so the next grant goes to another one first. */
+  lastGranted: symbol | null;
+};
+
+/**
+ * Issue #6646: the billable switch's hooks into the registry, installed once by
+ * `server/src/index.ts` (`setBillableSwitchHooks`). Every hook runs inside its own
+ * `try`, never inside a poll's, so a failure in the hub's handling of a report
+ * can never fail the poll that carried it.
+ */
+export type BillableSwitchRegistryHooks = {
+  /** This node's effective gate; reports are applied only while `on` or `closed`. */
+  getMode: () => BillableSwitchMode;
+  /** A node's header report (whole snapshot). Returns whether the stored report changed. */
+  onBillableSwitchHeaders?: (
+    nodeId: string,
+    nodeLabel: string,
+    headers: BillableSwitchHeader[],
+    reportedAt: number
+  ) => boolean;
+  /** A node left the mesh: an explicit eviction or a received tombstone. */
+  onNodeRemoved?: (nodeId: string) => void;
+  /** Raised once per poll round in which a stored report changed. */
+  onBillableSwitchReportsChanged?: () => void;
+};
+
+/** Issue #6646: one tracked node as the billable switch sees it. */
+export type BillableSwitchNodeRegistryView = {
+  nodeId: string;
+  nodeLabel: string;
+  status: FederationNodeState["status"];
+  role: string | null;
+  /** Advertises `billable:switch` (its gate is on). */
+  on: boolean;
+  /** Advertises `billable:switch-closed`. */
+  closed: boolean;
+  /** Advertises `billable:switch-store` (its summaries carry the switch). */
+  store: boolean;
+  /** This node itself has not been polled yet, inside the first-poll window. */
+  awaitingInitialPoll: boolean;
 };
 
 /**
@@ -155,7 +278,21 @@ export type PeerReadOutcome =
       kind: "unreachable";
       reason: NodeAccountHealthReason;
       message: string;
+      /** Issue #6646: set only for a caller that asks (`withStatus`). */
+      status?: number;
+      /** Issue #6646: the peer's JSON `code`, only with `withStatus`. */
+      code?: string;
     };
+
+/** Issue #6646: the string `code` of a peer's JSON error body, else nothing. */
+function peerErrorCode(text: string): { code?: string } {
+  try {
+    const code = (JSON.parse(text) as { code?: unknown } | null)?.code;
+    return typeof code === "string" ? { code: code.slice(0, 100) } : {};
+  } catch {
+    return {};
+  }
+}
 
 /**
  * #5487: read a non-OK peer reply's error body. An empty or unparseable body
@@ -469,6 +606,54 @@ export class NodeRegistry {
     string,
     { nodeId: string | null; seq: number; at: number }
   >();
+  /**
+   * #6681 A2, R2-1: sessions a relaunch evicted, which keep running on their
+   * node. A mark holds until a successful poll of that node that started after
+   * the eviction (its snapshot puts the session back, or shows it gone),
+   * however long the node's polls fail; a delete's eviction drops it. `nodeId`
+   * is the node whose cached list held the session (null when none did: such a
+   * mark keeps the tombstone's TTL, since no poll can clear it).
+   */
+  private relaunchMarks = new Map<
+    string,
+    { nodeId: string | null; seq: number; at: number }
+  >();
+  /**
+   * #6681: per-node delete slots, shared by every bulk request and round so
+   * no more than REMOTE_DELETE_CONCURRENCY DELETEs are outstanding to a node.
+   */
+  private deleteSlots = new Map<string, NodeDeleteSlots>();
+  /**
+   * #6681: when a bridged `session-removed` arrived, per node and id
+   * (`performance.now()`). Not the tombstone map `evictedSessions`, which also
+   * holds relaunch evictions with no node id.
+   */
+  private deleteReceipts = new Map<string, number>();
+  /** #6681: the confirmation read in flight per node and id (one at a time). */
+  private confirmReads = new Map<string, Promise<DeleteConfirmation>>();
+  /** #6681: confirmation reads in flight and waiting, per node. */
+  private confirmReadSlots = new Map<
+    string,
+    { inFlight: number; queue: Array<() => void> }
+  >();
+  /** Issue #6646: the billable switch's hooks (null until index.ts installs them). */
+  private billableSwitchHooks: BillableSwitchRegistryHooks | null = null;
+  /**
+   * Issue #6646: reports are ordered without clocks, by one counter per node
+   * (the `evictionSeq` pattern): read when a poll starts, advanced by every
+   * applied report and every proxied header write; a poll's header payload
+   * applies only if the counter has not moved since that poll started.
+   */
+  private billableReportSeq = new Map<string, number>();
+  /**
+   * Issue #6646: a proxied switch write or a bridged change stamps the session
+   * here; a poll that started before the stamp keeps the cached switch instead
+   * of overwriting it with its older snapshot.
+   */
+  private billableWriteSeq = 0;
+  private billableWrites = new Map<string, number>();
+  private billableReportsChangedThisRound = false;
+  private billableReportWarned = new Set<string>();
   private readonly loop: SupervisedLoop;
 
   /** SSE event bridge: one persistent connection per remote node. */
@@ -637,6 +822,15 @@ export class NodeRegistry {
     }
     this.eventBridgeReconnectTimers.clear();
 
+    // #6681: the owed delete slots' hold timers.
+    for (const slots of this.deleteSlots.values()) {
+      for (const { timer, reread } of slots.owed.values()) {
+        clearTimeout(timer);
+        if (reread) clearTimeout(reread);
+      }
+      slots.owed.clear();
+    }
+
     this.eventBridgeSseManager = null;
 
     console.log("[Federation] NodeRegistry stopped");
@@ -735,6 +929,8 @@ export class NodeRegistry {
     console.warn(
       `[Federation] Explicitly evicted peer ${nodeId} — tombstone written (propagates mesh-wide)`
     );
+    // Issue #6646: a node that left the mesh stops counting as "billable elsewhere".
+    this.notifyBillableSwitchNodeRemoved(nodeId);
     return {
       inMemoryRemoved,
       storeUpdated: this.peerStore !== null,
@@ -871,7 +1067,7 @@ export class NodeRegistry {
               // or not the event is forwarded, and scoped to the channel's node
               // so one peer cannot evict another node's session.
               if (event.type === "session-removed" && "sessionId" in event) {
-                this.evictSessionFromCache(event.sessionId, nodeConfig.id);
+                this.onBridgedSessionRemoved(nodeConfig.id, event.sessionId);
               }
               if (this.shouldForwardEvent(event)) {
                 // Issue #4461 (R7): name the node whose store refused. The hub's
@@ -1179,17 +1375,24 @@ export class NodeRegistry {
    * that started before this eviction cannot re-insert the session; a poll
    * that starts after it is trusted. With `nodeId`, only that node's cached
    * list is touched; without it, the tombstone matches every node.
+   * #6681 A2, R2-1: `reason` "relaunch" marks a session that still runs (see
+   * `relaunchMarks`); any other eviction of the id drops its mark.
    */
-  evictSessionFromCache(sessionId: string, nodeId?: string): void {
+  evictSessionFromCache(
+    sessionId: string,
+    nodeId?: string,
+    reason?: "relaunch"
+  ): void {
     const now = performance.now();
     for (const [id, tomb] of this.evictedSessions) {
       if (now - tomb.at > EVICTION_TOMBSTONE_TTL_MS) {
         this.evictedSessions.delete(id);
       }
     }
+    const seq = ++this.evictionSeq;
     this.evictedSessions.set(sessionId, {
       nodeId: nodeId ?? null,
-      seq: ++this.evictionSeq,
+      seq,
       at: now,
     });
     const entries =
@@ -1198,13 +1401,42 @@ export class NodeRegistry {
         : [this.sessionCache.get(nodeId)].filter(
             (c): c is CachedRemoteSessions => c !== undefined
           );
+    let heldOn: string | null = null;
     for (const cached of entries) {
       const idx = cached.sessions.findIndex(s => s.id === sessionId);
       if (idx !== -1) {
         cached.sessions.splice(idx, 1);
-        return;
+        heldOn = cached.nodeId;
+        break;
       }
     }
+    if (reason === "relaunch") {
+      this.relaunchMarks.set(sessionId, {
+        nodeId: heldOn ?? this.relaunchMarks.get(sessionId)?.nodeId ?? null,
+        seq,
+        at: now,
+      });
+    } else {
+      this.relaunchMarks.delete(sessionId);
+    }
+  }
+
+  /**
+   * #6681 A2, R2-1: how a bulk action answers `sessionId` while a relaunch's
+   * mark holds (a cache miss for it is then not evidence that it is gone):
+   * "retry" while its node is live, "node_offline" while its node reads
+   * offline (the session may still run there); undefined with no mark.
+   */
+  relaunchAnswer(sessionId: string): "retry" | "node_offline" | undefined {
+    const mark = this.relaunchMarks.get(sessionId);
+    if (!mark) return undefined;
+    if (mark.nodeId === null) {
+      return performance.now() - mark.at <= EVICTION_TOMBSTONE_TTL_MS
+        ? "retry"
+        : undefined;
+    }
+    const state = this.nodeStates.get(mark.nodeId);
+    return !state || state.status === "offline" ? "node_offline" : "retry";
   }
 
   /**
@@ -1304,6 +1536,26 @@ export class NodeRegistry {
       const session = cached.sessions.find(s => s.id === sessionId);
       if (session) {
         session.autoRecoverFromApiError = autoRecover;
+        return;
+      }
+    }
+  }
+
+  /**
+   * Issue #6646: update a cached session's switch after a successful proxied
+   * write, and stamp it so a poll that started earlier keeps this value.
+   */
+  updateCachedSessionBillable(
+    sessionId: string,
+    billable: boolean,
+    confirm: "pending" | null
+  ): void {
+    this.billableWrites.set(sessionId, ++this.billableWriteSeq);
+    for (const cached of this.sessionCache.values()) {
+      const session = cached.sessions.find(s => s.id === sessionId);
+      if (session) {
+        session.billable = billable;
+        session.billableConfirm = confirm;
         return;
       }
     }
@@ -1595,6 +1847,31 @@ export class NodeRegistry {
     if ("needsReviewOverride" in data) {
       session.needsReviewOverride =
         (data.needsReviewOverride as "read" | "unread" | null) ?? null;
+    }
+    // Issue #6646: the billable switch, by the same `in` guard. A malformed value
+    // drops the field to "unknown", never to "off"; a change stamps the session so
+    // an older poll in flight cannot undo it.
+    if ("billable" in data || "billableConfirm" in data) {
+      const before = `${String(session.billable)}|${String(session.billableConfirm)}`;
+      if ("billable" in data) {
+        if (typeof data.billable === "boolean")
+          session.billable = data.billable;
+        else delete session.billable;
+      }
+      if ("billableConfirm" in data) {
+        if (
+          data.billableConfirm === "pending" ||
+          data.billableConfirm === null
+        ) {
+          session.billableConfirm = data.billableConfirm;
+        } else delete session.billableConfirm;
+      }
+      if (
+        `${String(session.billable)}|${String(session.billableConfirm)}` !==
+        before
+      ) {
+        this.billableWrites.set(session.id, ++this.billableWriteSeq);
+      }
     }
     // Issue #4387 (mirrors #1647 rateLimited / #1700 blockedOnTuiPrompt / #2026
     // needsReviewOverride): carry the background-agents delta through the
@@ -1944,6 +2221,7 @@ export class NodeRegistry {
   async pollNodeById(nodeId: string, trigger = "force"): Promise<void> {
     const node = this.remoteNodes.find(n => n.id === nodeId);
     if (node) await this.pollNode(node, trigger);
+    this.raiseBillableSwitchReportsChanged();
   }
 
   /**
@@ -2723,6 +3001,168 @@ export class NodeRegistry {
     );
   }
 
+  // ─── Issue #6646: the billable switch ─────────────────────────────────────
+
+  /** Install the billable switch's hooks (once, from index.ts). */
+  setBillableSwitchHooks(hooks: BillableSwitchRegistryHooks | null): void {
+    this.billableSwitchHooks = hooks;
+  }
+
+  /**
+   * One entry per tracked node, with the three capability flags. The join with
+   * the stored reports is BillableSwitchService.crossNodeView(); this supplies
+   * its inputs only.
+   */
+  getBillableSwitchNodeViews(): BillableSwitchNodeRegistryView[] {
+    const inFirstWindow =
+      Date.now() - this.constructedAt < HUB_RESTART_GRACE_MS;
+    return [...this.nodeStates.values()].map(state => {
+      const id = state.config.id;
+      return {
+        nodeId: id,
+        nodeLabel: state.config.label,
+        status: state.status,
+        role: state.info?.role ?? null,
+        on: this.nodeSupports(id, BILLABLE_SWITCH_CAPABILITY),
+        closed: this.nodeSupports(id, BILLABLE_SWITCH_CLOSED_CAPABILITY),
+        store: this.nodeSupports(id, BILLABLE_SWITCH_STORE_CAPABILITY),
+        awaitingInitialPoll: inFirstWindow && state.lastSuccessfulPoll === null,
+      };
+    });
+  }
+
+  /** The node ids a start prune keeps: configured static nodes and peer-store rows. */
+  getBillableSwitchKeepNodeIds(): string[] {
+    const ids = new Set<string>(this.staticNodeIds);
+    for (const peer of this.peerStore?.getAll() ?? []) ids.add(peer.id);
+    return [...ids];
+  }
+
+  /** A proxied header write advances that node's report counter (an older poll then skips). */
+  advanceBillableSwitchReportCounter(nodeId: string): void {
+    this.billableReportSeq.set(
+      nodeId,
+      (this.billableReportSeq.get(nodeId) ?? 0) + 1
+    );
+  }
+
+  /**
+   * A billable switch call to one node, POST with a body, through `readPeerRoute`
+   * (the outcome tells offline, unsupported and unreachable apart).
+   */
+  callBillableSwitchPeerRoute(
+    nodeId: string,
+    endpoint: string,
+    body: unknown,
+    options: { namespace?: string; timeoutMs?: number } = {}
+  ): Promise<PeerReadOutcome> {
+    return this.readPeerRoute(nodeId, endpoint, "billable switch", {
+      ...options,
+      body,
+      // A refusal keeps its status and code, so a peer's 409
+      // `billable_feature_closed` reaches the hub's answer (Task 7).
+      withStatus: true,
+    });
+  }
+
+  /** Send a registry-less node every usable report (Task 4's push). */
+  pushBillableSwitchPeerReports(
+    nodeId: string,
+    body: unknown
+  ): Promise<PeerReadOutcome> {
+    return this.callBillableSwitchPeerRoute(
+      nodeId,
+      "/api/federation/billable-switch/peer-reports",
+      body
+    );
+  }
+
+  private keepNewerBillableSwitch(
+    nodeId: string,
+    sessions: SessionSummary[],
+    pollStart: number
+  ): void {
+    if (this.billableWrites.size === 0) return;
+    const prior = new Map(
+      (this.sessionCache.get(nodeId)?.sessions ?? []).map(s => [s.id, s])
+    );
+    for (const s of sessions) {
+      const stamp = this.billableWrites.get(s.id);
+      if (stamp === undefined) continue;
+      if (stamp > pollStart) {
+        const cached = prior.get(s.id);
+        if (cached) {
+          if (cached.billable === undefined) delete s.billable;
+          else s.billable = cached.billable;
+          if (cached.billableConfirm === undefined) delete s.billableConfirm;
+          else s.billableConfirm = cached.billableConfirm;
+        }
+      } else {
+        // A poll that started after the stamp is authoritative again.
+        this.billableWrites.delete(s.id);
+      }
+    }
+  }
+
+  private applyBillableSwitchReport(
+    nodeConfig: FederationNodeConfig,
+    headers: BillableSwitchHeader[] | undefined,
+    pollStart: number
+  ): void {
+    // A poll without the key changes nothing: the last report stands.
+    if (headers === undefined) return;
+    const hooks = this.billableSwitchHooks;
+    if (!hooks?.onBillableSwitchHeaders) return;
+    try {
+      const mode = hooks.getMode();
+      if (mode !== "on" && mode !== "closed") return;
+      // The counter moved since this poll started: a proxied header write or a
+      // newer report landed first; skip, the next poll is authoritative.
+      if ((this.billableReportSeq.get(nodeConfig.id) ?? 0) !== pollStart) {
+        return;
+      }
+      this.billableReportSeq.set(nodeConfig.id, pollStart + 1);
+      const changed = hooks.onBillableSwitchHeaders(
+        nodeConfig.id,
+        nodeConfig.label,
+        headers,
+        Date.now()
+      );
+      if (changed) this.billableReportsChangedThisRound = true;
+    } catch (err) {
+      console.warn(
+        `[Federation] Billable switch report from ${nodeConfig.id} not applied:`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+
+  private raiseBillableSwitchReportsChanged(): void {
+    if (!this.billableReportsChangedThisRound) return;
+    this.billableReportsChangedThisRound = false;
+    try {
+      this.billableSwitchHooks?.onBillableSwitchReportsChanged?.();
+    } catch (err) {
+      console.warn(
+        "[Federation] Billable switch reports-changed hook failed:",
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+
+  /** Issue #6646: an explicit eviction or a received tombstone removed a node. */
+  notifyBillableSwitchNodeRemoved(nodeId: string): void {
+    this.billableReportSeq.delete(nodeId);
+    try {
+      this.billableSwitchHooks?.onNodeRemoved?.(nodeId);
+    } catch (err) {
+      console.warn(
+        `[Federation] Billable switch removal of ${nodeId} failed:`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+
   /** #4462: the gate inputs for a node-targeted login; `null` for an unknown id. */
   getNodeLoginGate(nodeId: string): NodeLoginGate | null {
     const state = this.nodeStates.get(nodeId);
@@ -2852,6 +3292,23 @@ export class NodeRegistry {
       nodeId,
       "/api/federation/interval-feed",
       "Interval-feed",
+      { body: { cursor: opts.cursor, limit: opts.limit } }
+    );
+  }
+
+  /**
+   * Issue #6646 (Task 7b): one page of a remote origin's billable switch record,
+   * through `readPeerRoute` (offline, unsupported and unreachable told apart; the
+   * puller validates the body).
+   */
+  getBillableSwitchEventFeedOnNode(
+    nodeId: string,
+    opts: { cursor: number; limit: number }
+  ): Promise<PeerReadOutcome> {
+    return this.readPeerRoute(
+      nodeId,
+      "/api/federation/billable-switch/event-feed",
+      "billable switch event feed",
       { body: { cursor: opts.cursor, limit: opts.limit } }
     );
   }
@@ -3092,7 +3549,13 @@ export class NodeRegistry {
     nodeId: string,
     endpoint: string,
     label: string,
-    options: { namespace?: string; timeoutMs?: number; body?: unknown } = {}
+    options: {
+      namespace?: string;
+      timeoutMs?: number;
+      body?: unknown;
+      /** #6646: add the status and the JSON `code` to an `unreachable` outcome. */
+      withStatus?: boolean;
+    } = {}
   ): Promise<PeerReadOutcome> {
     const state = this.nodeStates.get(nodeId);
     if (!state || state.status === "offline") {
@@ -3135,6 +3598,9 @@ export class NodeRegistry {
               ? "http_5xx"
               : "http_4xx",
         message: `Node returned ${res.status}`,
+        ...(options.withStatus
+          ? { status: res.status, ...peerErrorCode(text) }
+          : {}),
       };
     }
     try {
@@ -3417,6 +3883,7 @@ export class NodeRegistry {
 
     // Rebuild the interesting sessions Set after all polls complete
     this.rebuildInterestingSessions();
+    this.raiseBillableSwitchReportsChanged();
   }
 
   /** Poll a single remote node for info and sessions.
@@ -3433,6 +3900,9 @@ export class NodeRegistry {
     // #6210: read before any fetch — a session evicted after this point may
     // still be in the snapshot this poll is about to receive.
     const startSeq = this.evictionSeq;
+    // Issue #6646: the same idea for the header report and the session switch.
+    const billableReportStart = this.billableReportSeq.get(nodeConfig.id) ?? 0;
+    const billableWriteStart = this.billableWriteSeq;
 
     try {
       // Fetch node info, sessions, and (R4) the claim snapshot concurrently.
@@ -3462,6 +3932,14 @@ export class NodeRegistry {
           nodeId: nodeConfig.id,
           nodeLabel: nodeConfig.label,
         }));
+
+      // #6681 R2-1: this poll started after these relaunches: its snapshot is
+      // their sessions' truth (put back above, or gone).
+      for (const [id, mark] of this.relaunchMarks) {
+        if (mark.nodeId === nodeConfig.id && mark.seq <= startSeq) {
+          this.relaunchMarks.delete(id);
+        }
+      }
 
       // Update state — success
       state.info = info;
@@ -3502,6 +3980,10 @@ export class NodeRegistry {
         (this.sessionCache.get(nodeConfig.id)?.sessions ?? []).map(s => s.id)
       );
 
+      // Issue #6646: a proxied switch write or a bridged change that landed after
+      // this poll started is newer than the snapshot: keep the cached switch.
+      this.keepNewerBillableSwitch(nodeConfig.id, sessions, billableWriteStart);
+
       // Update session cache
       this.sessionCache.set(nodeConfig.id, {
         nodeId: nodeConfig.id,
@@ -3509,6 +3991,13 @@ export class NodeRegistry {
         sessions,
         fetchedAt: Date.now(),
       });
+
+      // Issue #6646: the node's header report, in its own try (never the poll's).
+      this.applyBillableSwitchReport(
+        nodeConfig,
+        sessionsResponse.billableSwitchHeaders,
+        billableReportStart
+      );
 
       // [perf] issue #2147 stage (f): log any session id newly appearing for this
       // node — the moment the hub first sees a spawned session, tagged with the
@@ -3596,15 +4085,35 @@ export class NodeRegistry {
   }
 
   /** Fetch /api/federation/sessions from a remote node. */
-  private async fetchNodeSessions(
-    nodeConfig: FederationNodeConfig
-  ): Promise<{ sessions: unknown[] }> {
+  private async fetchNodeSessions(nodeConfig: FederationNodeConfig): Promise<{
+    sessions: unknown[];
+    billableSwitchHeaders?: BillableSwitchHeader[];
+  }> {
     const url = `${nodeConfig.url}/api/federation/sessions`;
     const res = await this.fetchWithAuth(url);
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} from ${url}`);
     }
-    return (await res.json()) as { sessions: unknown[] };
+    const body = (await res.json()) as {
+      sessions: unknown[];
+      billableSwitchHeaders?: unknown;
+    };
+    // Issue #6646: the node's header report. A malformed list is dropped with one
+    // warning, and the sessions still update (fail-soft, like fetchNodeClaims).
+    if (!("billableSwitchHeaders" in body)) return { sessions: body.sessions };
+    const parsed = z
+      .array(BillableSwitchHeaderSchema)
+      .safeParse(body.billableSwitchHeaders);
+    if (!parsed.success) {
+      if (!this.billableReportWarned.has(nodeConfig.id)) {
+        this.billableReportWarned.add(nodeConfig.id);
+        console.warn(
+          `[Federation] Dropped a malformed billable switch header report from ${nodeConfig.id}`
+        );
+      }
+      return { sessions: body.sessions };
+    }
+    return { sessions: body.sessions, billableSwitchHeaders: parsed.data };
   }
 
   /**
@@ -3642,14 +4151,40 @@ export class NodeRegistry {
     nodeId: string,
     sessionId: string,
     namespace: string,
-    options?: { deferPoll?: boolean }
+    options?: {
+      deferPoll?: boolean;
+      /** #6681: a `performance.now()` after which the DELETE is not sent. */
+      sendBy?: number;
+      /** #6681: asked when the slot is granted; false → not sent. */
+      shouldSend?: () => boolean;
+      /** #6681: the bulk request this call belongs to (round-robin key). */
+      caller?: symbol;
+    }
   ): Promise<{ ok: true } | RemoteSessionActionError> {
-    const state = this.nodeStates.get(nodeId);
-    if (!state || state.status === "offline") {
+    if (!this.isNodeReachable(nodeId)) {
       return { type: "error", message: "Node is offline", offline: true };
+    }
+    // #6681: wait for one of the node's slots, so the request's own 10 s
+    // timeout starts when it is sent, not while it queues behind the others.
+    const caller = options?.caller ?? Symbol("deleteOnNode");
+    if (!(await this.acquireDeleteSlot(nodeId, caller, options?.sendBy))) {
+      return { type: "error", message: "Not sent", notSent: true };
+    }
+    // The node's state and URL as they are now, not as they were on entry.
+    const state = this.nodeStates.get(nodeId);
+    if (
+      !state ||
+      state.status === "offline" ||
+      (options?.sendBy !== undefined && performance.now() > options.sendBy) ||
+      (options?.shouldSend !== undefined && !options.shouldSend())
+    ) {
+      this.releaseDeleteSlot(nodeId);
+      return { type: "error", message: "Not sent", notSent: true };
     }
 
     const url = `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}`;
+    const sentAt = performance.now();
+    let owed = false;
     try {
       const res = await this.fetchWithAuth(
         url,
@@ -3665,13 +4200,26 @@ export class NodeRegistry {
           res,
           `delete on ${state.config.id}`
         );
-        return {
+        const failure: RemoteSessionActionError = {
           type: "error",
           message:
             (body as Record<string, string>).error ??
             `Node returned ${res.status}`,
           status: res.status,
         };
+        // A 5xx leaves the outcome unknown; a 4xx (404, 409…) is an answer.
+        if (res.status >= 500) {
+          owed = true;
+          const peerAnswered =
+            typeof (body as Record<string, unknown>).error === "string";
+          return {
+            ...failure,
+            unknown: true,
+            sentAt,
+            ...(peerAnswered ? { peerAnswered: true as const } : {}),
+          };
+        }
+        return failure;
       }
       // Immediately remove from cache so client queries reflect the deletion
       this.evictSessionFromCache(sessionId, nodeId);
@@ -3687,11 +4235,308 @@ export class NodeRegistry {
       });
       return { ok: true };
     } catch (err) {
-      return {
-        type: "error",
-        message: err instanceof Error ? err.message : "Delete request failed",
-      };
+      const message =
+        err instanceof Error ? err.message : "Delete request failed";
+      const name = err instanceof Error ? err.name : "";
+      const code = (err as { code?: unknown } | null)?.code;
+      if (typeof code === "string" && NOT_SENT_CODES.has(code)) {
+        return {
+          type: "error",
+          message: `Not sent: ${message}`,
+          notSent: true,
+        };
+      }
+      if (
+        name === "TimeoutError" ||
+        (typeof code === "string" && AFTER_SEND_CODES.has(code))
+      ) {
+        owed = true;
+        return { type: "error", message, unknown: true, sentAt };
+      }
+      return { type: "error", message };
+    } finally {
+      if (owed) this.oweDeleteSlot(nodeId, sessionId, sentAt);
+      else this.releaseDeleteSlot(nodeId);
     }
+  }
+
+  /**
+   * #6681: a bridged `session-removed` from `nodeId`: evict the session (the
+   * #6210 rule) and keep the receipt time as positive evidence of a delete.
+   */
+  private onBridgedSessionRemoved(nodeId: string, sessionId: string): void {
+    this.evictSessionFromCache(sessionId, nodeId);
+    const now = performance.now();
+    for (const [key, at] of this.deleteReceipts) {
+      if (now - at > 2 * REMOTE_DELETE_OWED_SLOT_MS) {
+        this.deleteReceipts.delete(key);
+      }
+    }
+    this.deleteReceipts.set(`${nodeId}\u0000${sessionId}`, now);
+  }
+
+  /**
+   * #6681 Task 3: confirm deletes whose outcome was unknown, by positive
+   * evidence only. A bridged `session-removed` for the id received after its
+   * `sentAt`, or a `404 {"error":"Session not found"}` from the node's
+   * `GET /api/federation/sessions/:id`, is `gone`: the id is evicted (so the
+   * #6210 tombstone stops an older poll from re-adding it) and its owed slot
+   * released. A 200 is `present`; anything else, a timeout or a network error
+   * is `unknown`. Absence from this hub's cache is never evidence. Bounded by
+   * `timeoutMs`; at most REMOTE_DELETE_CONCURRENCY reads in flight per node.
+   * Never touches `consecutiveFailures` and never polls.
+   */
+  async confirmDeletedOnNode(
+    nodeId: string,
+    ids: readonly string[],
+    opts: { sentAt: ReadonlyMap<string, number>; timeoutMs: number }
+  ): Promise<Map<string, DeleteConfirmation>> {
+    const out = new Map<string, DeleteConfirmation>(
+      ids.map(id => [id, "unknown" as DeleteConfirmation])
+    );
+    const markGone = (id: string): void => {
+      out.set(id, "gone");
+      this.evictSessionFromCache(id, nodeId);
+      this.releaseOwedDeleteSlot(nodeId, id);
+    };
+    const toRead: string[] = [];
+    for (const id of ids) {
+      const receipt = this.deleteReceipts.get(`${nodeId}\u0000${id}`);
+      const sentAt = opts.sentAt.get(id);
+      if (receipt !== undefined && sentAt !== undefined && receipt > sentAt) {
+        markGone(id);
+      } else {
+        toRead.push(id);
+      }
+    }
+    if (toRead.length === 0) return out;
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const deadline = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, opts.timeoutMs);
+    });
+    const reads = Promise.all(
+      toRead.map(async id => {
+        const answer = await this.readDeleteConfirmation(nodeId, id);
+        // A late answer after the deadline changes nothing in `out`, which
+        // the caller already has; its slot is still released below.
+        if (answer === "gone") markGone(id);
+        else if (out.get(id) === "unknown") out.set(id, answer);
+      })
+    );
+    try {
+      await Promise.race([reads, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    // Snapshot: what was decided by the deadline.
+    return new Map(out);
+  }
+
+  /** #6681: one per-id confirmation read, joined while one is in flight. */
+  private readDeleteConfirmation(
+    nodeId: string,
+    sessionId: string
+  ): Promise<DeleteConfirmation> {
+    const key = `${nodeId}\u0000${sessionId}`;
+    const inFlight = this.confirmReads.get(key);
+    if (inFlight) return inFlight;
+    const read = this.runDeleteConfirmationRead(nodeId, sessionId).finally(
+      () => {
+        this.confirmReads.delete(key);
+      }
+    );
+    this.confirmReads.set(key, read);
+    return read;
+  }
+
+  private async runDeleteConfirmationRead(
+    nodeId: string,
+    sessionId: string
+  ): Promise<DeleteConfirmation> {
+    let slots = this.confirmReadSlots.get(nodeId);
+    if (!slots) {
+      slots = { inFlight: 0, queue: [] };
+      this.confirmReadSlots.set(nodeId, slots);
+    }
+    const node = slots;
+    if (node.inFlight >= REMOTE_DELETE_CONCURRENCY) {
+      await new Promise<void>(resolve => node.queue.push(resolve));
+    }
+    node.inFlight += 1;
+    try {
+      const state = this.nodeStates.get(nodeId);
+      if (!state || state.status === "offline") return "unknown";
+      const res = await this.fetchWithAuth(
+        `${state.config.url}/api/federation/sessions/${encodeURIComponent(sessionId)}`
+      );
+      if (res.status === 200) return "present";
+      if (res.status === 404) {
+        const body = (await res.json().catch(() => null)) as {
+          error?: unknown;
+        } | null;
+        return body?.error === "Session not found" ? "gone" : "unknown";
+      }
+      return "unknown";
+    } catch {
+      return "unknown";
+    } finally {
+      node.inFlight -= 1;
+      node.queue.shift()?.();
+    }
+  }
+
+  /** #6681: the node is known and not offline (no request needed to say so). */
+  private isNodeReachable(nodeId: string): boolean {
+    const state = this.nodeStates.get(nodeId);
+    return state !== undefined && state.status !== "offline";
+  }
+
+  private deleteSlotsFor(nodeId: string): NodeDeleteSlots {
+    let slots = this.deleteSlots.get(nodeId);
+    if (!slots) {
+      slots = {
+        taken: 0,
+        owed: new Map(),
+        waiters: new Map(),
+        turns: [],
+        lastGranted: null,
+      };
+      this.deleteSlots.set(nodeId, slots);
+    }
+    return slots;
+  }
+
+  /**
+   * #6681: take one of the node's delete slots. Resolves true when granted,
+   * false when `sendBy` passed first (the waiter leaves the queue unserved).
+   */
+  private acquireDeleteSlot(
+    nodeId: string,
+    caller: symbol,
+    sendBy: number | undefined
+  ): Promise<boolean> {
+    const slots = this.deleteSlotsFor(nodeId);
+    if (slots.taken < REMOTE_DELETE_CONCURRENCY && slots.turns.length === 0) {
+      slots.taken += 1;
+      slots.lastGranted = caller;
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const waiter: DeleteSlotWaiter = {
+        grant: () => {
+          if (timer) clearTimeout(timer);
+          resolve(true);
+        },
+      };
+      let queue = slots.waiters.get(caller);
+      if (!queue) {
+        queue = [];
+        slots.waiters.set(caller, queue);
+        slots.turns.push(caller);
+      }
+      queue.push(waiter);
+      if (sendBy !== undefined) {
+        timer = setTimeout(
+          () => {
+            const q = slots.waiters.get(caller);
+            const at = q ? q.indexOf(waiter) : -1;
+            if (!q || at < 0) return; // granted meanwhile
+            q.splice(at, 1);
+            if (q.length === 0) {
+              slots.waiters.delete(caller);
+              slots.turns = slots.turns.filter(c => c !== caller);
+            }
+            resolve(false);
+          },
+          Math.max(0, sendBy - performance.now())
+        );
+      }
+    });
+  }
+
+  /** #6681: give back one slot and hand it to the next waiter, round-robin. */
+  private releaseDeleteSlot(nodeId: string): void {
+    const slots = this.deleteSlots.get(nodeId);
+    if (!slots) return;
+    slots.taken = Math.max(0, slots.taken - 1);
+    while (slots.taken < REMOTE_DELETE_CONCURRENCY && slots.turns.length > 0) {
+      // The next caller in turn, skipping the one served last when another waits.
+      let at = slots.turns.findIndex(c => c !== slots.lastGranted);
+      if (at < 0) at = 0;
+      const caller = slots.turns.splice(at, 1)[0] as symbol;
+      const queue = slots.waiters.get(caller) as DeleteSlotWaiter[];
+      const waiter = queue.shift() as DeleteSlotWaiter;
+      if (queue.length > 0) slots.turns.push(caller);
+      else slots.waiters.delete(caller);
+      slots.taken += 1;
+      slots.lastGranted = caller;
+      waiter.grant();
+    }
+  }
+
+  /** #6681: keep the slot of an unknown outcome until evidence or the hold expires. */
+  private oweDeleteSlot(
+    nodeId: string,
+    sessionId: string,
+    sentAt: number
+  ): void {
+    const slots = this.deleteSlotsFor(nodeId);
+    const prior = slots.owed.get(sessionId);
+    if (prior) {
+      // The same id owed twice: the newer hold replaces the older one.
+      clearTimeout(prior.timer);
+      if (prior.reread) clearTimeout(prior.reread);
+      slots.owed.delete(sessionId);
+      this.releaseDeleteSlot(nodeId);
+    }
+    const timer = setTimeout(() => {
+      this.releaseOwedDeleteSlot(nodeId, sessionId);
+    }, REMOTE_DELETE_OWED_SLOT_MS);
+    const entry = { sentAt, timer, reread: null };
+    slots.owed.set(sessionId, entry);
+    this.scheduleOwedReread(nodeId, sessionId, entry);
+  }
+
+  /**
+   * #6681 (revision 3): while the slot stays owed, re-read its id every
+   * REMOTE_DELETE_CONFIRM_INTERVAL_MS. A `gone` releases the slot (inside
+   * `confirmDeletedOnNode`); the re-read stops once the slot is released any
+   * way. A read still in flight is joined, never repeated.
+   */
+  private scheduleOwedReread(
+    nodeId: string,
+    sessionId: string,
+    entry: { sentAt: number; reread: ReturnType<typeof setTimeout> | null }
+  ): void {
+    entry.reread = setTimeout(() => {
+      entry.reread = null;
+      if (this.deleteSlots.get(nodeId)?.owed.get(sessionId) !== entry) return;
+      void this.confirmDeletedOnNode(nodeId, [sessionId], {
+        sentAt: new Map([[sessionId, entry.sentAt]]),
+        timeoutMs: FETCH_TIMEOUT_MS,
+      }).then(() => {
+        if (this.deleteSlots.get(nodeId)?.owed.get(sessionId) === entry) {
+          this.scheduleOwedReread(nodeId, sessionId, entry);
+        }
+      });
+    }, REMOTE_DELETE_CONFIRM_INTERVAL_MS);
+  }
+
+  /**
+   * #6681: release the slot an unknown delete of `sessionId` still holds, on
+   * positive evidence that the peer finished it. False when none is owed.
+   */
+  releaseOwedDeleteSlot(nodeId: string, sessionId: string): boolean {
+    const slots = this.deleteSlots.get(nodeId);
+    const owed = slots?.owed.get(sessionId);
+    if (!slots || !owed) return false;
+    clearTimeout(owed.timer);
+    if (owed.reread) clearTimeout(owed.reread);
+    slots.owed.delete(sessionId);
+    this.releaseDeleteSlot(nodeId);
+    return true;
   }
 
   /**

@@ -8,7 +8,13 @@ import {
 } from "react";
 import { Link } from "@tanstack/react-router";
 import type { Components, Options } from "react-markdown";
-import { Check, Folder, MessageSquareText, Save } from "lucide-react";
+import {
+  Check,
+  Folder,
+  MessageSquareText,
+  Save,
+  TriangleAlert,
+} from "lucide-react";
 import {
   effectiveSavedTo,
   pinFolderName,
@@ -293,7 +299,10 @@ const SAVE_DOT: CSSProperties = {
  * `GeneratedFiles/pins/<folder>/`. It reads "Save" in every state, and its
  * icon says which (Pins PM ruling Q2): plain when never saved, a check badge
  * when saved and current, an amber dot when the pin changed since its files
- * were saved. The tooltip and the `aria-label` carry the state, and the label
+ * were saved. #6458 (#6540 S-4): an amber warning badge when the last Save
+ * skipped files, so a partial save never shows the full-save check; its
+ * tooltip and `aria-label` give the counts. The tooltip and the `aria-label`
+ * carry the state, and the label
  * gives way to the icon when the action row runs out of room (R13). A success
  * stages D's `saved` marker so this device's Submit is enabled; the server
  * reports the save on whichever device submits next.
@@ -307,19 +316,25 @@ export function PinSaveButton(props: { pin: Pin }) {
   if (sources.folders.length === 0 && sources.files.length === 0) return null;
   const folder = `GeneratedFiles/pins/${pinFolderName(pin.key)}/`;
   const savedRevision = pin.savedTo ? (pin.savedRevision ?? null) : null;
-  const state: "never" | "current" | "changed" =
+  const skippedCount = pin.savedSkipped ?? 0;
+  const state: "never" | "current" | "partial" | "changed" =
     savedRevision === null
       ? "never"
       : pin.revision > savedRevision
         ? "changed"
-        : "current";
+        : skippedCount > 0
+          ? "partial"
+          : "current";
+  const partialCounts = `${plural(pin.savedFiles ?? 0, "file")} saved, ${skippedCount} skipped`;
   const tooltip = save.isPending
     ? "Saving…"
     : state === "changed"
       ? `This pin changed since its files were saved. Save copies the new files into ${folder} in this session's folder.`
-      : state === "current"
-        ? `Saved to ${folder} in this session's folder. Save copies them again.`
-        : `Copy this pin's files into ${folder} in this session's folder. Your next Submit tells the agent, which commits them.`;
+      : state === "partial"
+        ? `Partly saved to ${folder} in this session's folder: ${partialCounts}. Save copies them again.`
+        : state === "current"
+          ? `Saved to ${folder} in this session's folder. Save copies them again.`
+          : `Copy this pin's files into ${folder} in this session's folder. Your next Submit tells the agent, which commits them.`;
   return (
     <PinActionButton
       rank={ACTION_COLLAPSE_RANK.save}
@@ -346,7 +361,13 @@ export function PinSaveButton(props: { pin: Pin }) {
             showToast(`Not saved: ${saveError(error)}`, { type: "error" }),
         })
       }
-      aria-label={state === "changed" ? "Save again" : "Save"}
+      aria-label={
+        state === "changed"
+          ? "Save again"
+          : state === "partial"
+            ? `Save, partial: ${partialCounts}`
+            : "Save"
+      }
       className={`${PIN_ACTION_CLASS} disabled:opacity-50`}
       icon={
         <span className="relative inline-flex" data-save-state={state}>
@@ -356,6 +377,13 @@ export function PinSaveButton(props: { pin: Pin }) {
               style={{ ...SAVE_BADGE, ...SAVE_CHECK }}
               strokeWidth={4}
               className="absolute text-[var(--app-accent)]"
+              aria-hidden
+            />
+          ) : state === "partial" ? (
+            <TriangleAlert
+              style={{ ...SAVE_BADGE, ...SAVE_CHECK }}
+              strokeWidth={3}
+              className="absolute text-[var(--status-warn)]"
               aria-hidden
             />
           ) : state === "changed" ? (

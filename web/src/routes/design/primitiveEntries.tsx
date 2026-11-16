@@ -70,6 +70,7 @@ import { DenseRow } from "@/components/ui/DenseRow";
 import { KVGrid } from "@/components/ui/KVGrid";
 import { FilterChip } from "@/components/ui/FilterChip";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
+import { RadioRow } from "@/components/ui/RadioRow";
 import { StatusDot } from "@/components/ui/StatusDot";
 import { TouchButton } from "@/components/ui/TouchButton";
 import { SearchInput } from "@/components/ui/SearchInput";
@@ -828,6 +829,38 @@ function SegmentedToggleEntry() {
   );
 }
 
+function RadioRowEntry() {
+  const [answer, setAnswer] = useState<"true" | "false" | null>(null);
+  const [optional, setOptional] = useState<"true" | "false" | null>("true");
+  return (
+    <CatalogEntry id="radio-row" title="RadioRow" kind="primitive">
+      <SpecimenRow label="nothing selected yet (a yes/no question, #6606)">
+        <RadioRow
+          ariaLabel="Agree?"
+          value={answer}
+          onChange={setAnswer}
+          options={[
+            { value: "true", label: "Yes" },
+            { value: "false", label: "No" },
+          ]}
+        />
+      </SpecimenRow>
+      <SpecimenRow label="clearable (an optional field; Clear sets it back to unset)">
+        <RadioRow
+          ariaLabel="Subscribe?"
+          value={optional}
+          onChange={setOptional}
+          clearable
+          options={[
+            { value: "true", label: "Yes" },
+            { value: "false", label: "No" },
+          ]}
+        />
+      </SpecimenRow>
+    </CatalogEntry>
+  );
+}
+
 function StatusDotEntry() {
   return (
     <CatalogEntry id="status-dot" title="StatusDot" kind="primitive">
@@ -1018,6 +1051,7 @@ export function PrimitiveEntries() {
       <KVGridEntry />
       <FilterChipEntry />
       <SegmentedToggleEntry />
+      <RadioRowEntry />
       <StatusDotEntry />
       <TouchButtonEntry />
       <SearchInputEntry />

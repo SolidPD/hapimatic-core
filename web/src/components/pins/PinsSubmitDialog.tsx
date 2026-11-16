@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/dialog";
 import { useToast } from "@/components/Toast";
 import { PinKindBadge } from "@/components/pins/pinsShared";
+import { FadeTruncate } from "@/components/session/FadeTruncate";
 import {
   usePins,
   useSetPinDeadline,
@@ -44,13 +45,18 @@ import {
   pendingStillStaged,
   savePendingSubmission,
   type StagedPin,
+  type StagedPins,
 } from "@/lib/pins/staging";
-
-type Refusal = {
-  code?: string;
-  error: string;
-  entries?: PinSubmissionResult[];
-};
+import {
+  NOT_IN_SUBMISSION,
+  provesUndelivered,
+  refusalOf,
+  stampedSubmitted,
+  subsetOf,
+  UNCERTAIN_TEXT,
+  uncertainOf,
+  withoutDelivered,
+} from "./pinsSubmitRecovery";
 
 type Phase =
   | { kind: "checking" }
@@ -71,7 +77,13 @@ type Phase =
   | { kind: "unsupported" }
   /** #6539: the session's node predates dismissals; nothing was sent. */
   | { kind: "dismissUnsupported" }
-  | { kind: "error"; message: string; preview?: PinSubmissionResponse };
+  | {
+      kind: "error";
+      message: string;
+      preview?: PinSubmissionResponse;
+      /** #6521 S2: a lost response or a 5xx: the answers may have been delivered. */
+      uncertain?: boolean;
+    };
 
 /** #6454: how often, and how long, Resume and send waits for the session. */
 export const RESUME_POLL_MS = 1_500;
@@ -120,16 +132,6 @@ function isRelayRefusal(code: string | undefined): boolean {
     code === "parent_unavailable" ||
     code === "parent_mismatch"
   );
-}
-
-function refusalOf(error: unknown): Refusal | null {
-  if (!(error instanceof ApiError)) return null;
-  try {
-    const body = JSON.parse(error.body ?? "") as Refusal;
-    return { ...body, code: body.code ?? error.code };
-  } catch {
-    return { code: error.code, error: error.message };
-  }
 }
 
 /**
@@ -263,6 +265,9 @@ export function PinsSubmitDialog(props: {
   const { showToast } = useToast();
   const [phase, setPhase] = useState<Phase>({ kind: "checking" });
   const [built, setBuilt] = useState<BuiltSubmission | null>(null);
+  // Bumped by Check again, so the opening's check runs again even when `built`
+  // was already null (a failed reopen dry run never sets it; #6458 round 6).
+  const [recheck, setRecheck] = useState(0);
   const busy = useRef(false);
   // #6454: mirrors `busy` for rendering, so Cancel is disabled whenever a
   // request or the Resume wait is out.
@@ -295,6 +300,14 @@ export function PinsSubmitDialog(props: {
   // the session record this dialog was opened with said.
   const [stopped, setStopped] = useState(false);
   const [relayNotice, setRelayNotice] = useState<string | null>(null);
+  // #6521 S2/S3 (ER-D2): said when an earlier Submit turned out delivered and
+  // the edits made since go as a new Submit.
+  const [carryNotice, setCarryNotice] = useState<string | null>(null);
+  // #6521 S2: the pending Submit may have been delivered (a lost response or a
+  // 5xx), so a later 4xx proves nothing about the first send.
+  const uncertainRef = useRef(false);
+  // An opening whose frozen pending Submit is being dry-run (ER-D2).
+  const reopening = useRef(false);
   // False once this dialog closes or unmounts: an async step that resumes after
   // that (the Resume wait, a dry run) does nothing (#6454 review).
   const alive = useRef(open);
@@ -332,14 +345,100 @@ export function PinsSubmitDialog(props: {
       setResumed(false);
       setStopped(false);
       setRelayNotice(null);
+      setCarryNotice(null);
+      uncertainRef.current = false;
+      reopening.current = false;
       return;
     }
-    if (built || !pinsSettled) return;
+    if (built || !pinsSettled || reopening.current) return;
     const staged = getStagedPins(sessionId);
     const pending = loadPendingSubmission(sessionId);
+    uncertainRef.current = pending?.uncertain === true;
+    // A staged set that is not a pending Submit's frozen request goes under a
+    // new id (#6521 S2/S3): one id belongs to one request.
+    const asNewSubmit = (set: StagedPins): BuiltSubmission =>
+      buildSubmissionRequest({
+        staged: set,
+        pins,
+        submissionId: makeSubmissionId(),
+      });
+    if (pending && !pendingStillStaged(pending, staged)) {
+      // #6521 S2/S3 (ER-D2): one id belongs to one frozen request. The staged
+      // entries changed since this Submit went out, so first ask the server
+      // about the ORIGINAL request under its own id: reusing the id for the
+      // edited set would replay the old message and lose the edit, and a new
+      // id alone could deliver its notes and questions twice.
+      reopening.current = true;
+      const token = opening.current;
+      void submit({ ...pending.request, dryRun: true }).then(
+        frozen => {
+          if (token !== opening.current || !alive.current) return;
+          reopening.current = false;
+          const current = getStagedPins(sessionId);
+          const sentAs = stampedSubmitted(pending);
+          if (frozen.delivered && !allRecorded(frozen)) {
+            // Delivered, not all on record: Retry records it under its own id.
+            const firstTarget = pending.request.deliverTo ?? null;
+            setPinnedTarget(firstTarget);
+            setTarget(firstTarget);
+            settleStaging(sessionId, frozen, sentAs, pending.stamps);
+            setBuilt({
+              ...buildSubmissionRequest({
+                staged: subsetOf(current, pending),
+                pins,
+                submissionId: pending.submissionId,
+              }),
+              request: pending.request,
+            });
+            setPhase({ kind: "result", result: frozen });
+            return;
+          }
+          clearPendingSubmission(sessionId);
+          uncertainRef.current = false;
+          if (frozen.delivered) {
+            // Delivered: settle what it carried, then the edits go as a new
+            // Submit, without the questions and notes the agent already has.
+            settleStaging(sessionId, frozen, sentAs, pending.stamps);
+            setCarryNotice(
+              "Your earlier Submit was delivered. The changes you made since go as a new Submit"
+            );
+            previewFresh(
+              withoutDelivered(
+                asNewSubmit(getStagedPins(sessionId)),
+                pending.request,
+                frozen,
+                sessionId
+              )
+            );
+            return;
+          }
+          // Not delivered: the edited set is a new request under a new id.
+          previewFresh(asNewSubmit(current));
+        },
+        (error: unknown) => {
+          if (token !== opening.current || !alive.current) return;
+          reopening.current = false;
+          if (provesUndelivered(error)) {
+            // The server refuses this way only after it found the id in
+            // neither the session's chat nor the named PM's, so the frozen
+            // request never arrived: the edited set goes as a new request
+            // under a new id, and the dialog's own refusal handling takes it
+            // from there (a relay that no longer works falls back to the
+            // session).
+            clearPendingSubmission(sessionId);
+            uncertainRef.current = false;
+            previewFresh(asNewSubmit(getStagedPins(sessionId)));
+            return;
+          }
+          // The pending Submit stays: nothing here says it was not delivered.
+          setPhase({ ...phaseForError(error), ...uncertainOf(error) });
+        }
+      );
+      return;
+    }
     let next: BuiltSubmission;
     let firstTarget: string | null = null;
-    if (pending && pendingStillStaged(pending, staged)) {
+    if (pending) {
       // #6454: a pending id goes only where it went before.
       firstTarget = pending.request.deliverTo ?? null;
       setPinnedTarget(firstTarget);
@@ -358,13 +457,19 @@ export function PinsSubmitDialog(props: {
         request: pending.request,
       };
     } else {
-      if (pending) clearPendingSubmission(sessionId);
-      next = buildSubmissionRequest({
-        staged,
-        pins,
-        submissionId: makeSubmissionId(),
-      });
+      next = asNewSubmit(staged);
     }
+    previewFresh(next, firstTarget);
+    // previewFresh is recreated each render and reads only state setters and
+    // the deps listed here; listing it would re-run this effect every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, built, pinsSettled, pins, sessionId, submit, recheck]);
+
+  /** Show `next` and dry-run it for its first target. */
+  function previewFresh(
+    next: BuiltSubmission,
+    firstTarget: string | null = null
+  ) {
     setBuilt(next);
     const request = requestFor(next.request, firstTarget);
     if (!request) {
@@ -398,10 +503,15 @@ export function PinsSubmitDialog(props: {
           void refusedRef.current(error, undefined, next.request);
           return;
         }
-        setPhase(phaseForError(error));
+        // A pending Submit whose response was lost may have arrived: its
+        // outcome stays unknown, as on the changed-staging path (#6458 round 6).
+        setPhase({
+          ...phaseForError(error),
+          ...(uncertainRef.current ? { uncertain: true } : {}),
+        });
       }
     );
-  }, [open, built, pinsSettled, pins, sessionId, submit]);
+  }
 
   const preview =
     "preview" in phase && phase.preview ? phase.preview : undefined;
@@ -501,6 +611,9 @@ export function PinsSubmitDialog(props: {
     const next = withoutDismissals(built);
     const request = requestFor(next.request, target);
     if (!request) return;
+    // A new id (#6458 review): the node refused the dismissals outright, so
+    // the earlier attempt's unknown outcome does not carry over to this one.
+    uncertainRef.current = false;
     setBuilt(next);
     setBusy(true);
     setPhase({ kind: "checking" });
@@ -542,7 +655,7 @@ export function PinsSubmitDialog(props: {
     // go where it went, so the relay stops being offered for it, and Resume too
     // once it went to the PM.
     setPinnedTarget(to);
-    savePendingSubmission(sessionId, {
+    const pendingRecord = {
       submissionId: request.submissionId,
       request,
       stamps: Object.fromEntries(
@@ -552,7 +665,9 @@ export function PinsSubmitDialog(props: {
         ])
       ),
       at: Date.now(),
-    });
+      ...(uncertainRef.current ? { uncertain: true } : {}),
+    };
+    savePendingSubmission(sessionId, pendingRecord);
     try {
       const result = await submit({ ...request, dryRun: false });
       if (!result.delivered) {
@@ -609,14 +724,38 @@ export function PinsSubmitDialog(props: {
       });
       onOpenChange(false);
     } catch (error) {
-      // A refusal (4xx) delivered nothing; a lost response may have.
-      if (error instanceof ApiError && error.status < 500) {
+      // #6521 S2/S3: a lost response or a 5xx may have delivered; the pending
+      // Submit is marked uncertain and the next send replays its id. A 4xx
+      // proves nothing was delivered only on a first attempt that was not
+      // uncertain, and a 429 (the Submit rate limiter) never does. The client
+      // gives up after 30 s (`api/client.ts`) while a proxied owner node may
+      // still be sending, which is why an unknown outcome keeps the id.
+      const lost = uncertainOf(error).uncertain === true;
+      if (lost) {
+        uncertainRef.current = true;
+        savePendingSubmission(sessionId, { ...pendingRecord, uncertain: true });
+      } else if (
+        error instanceof ApiError &&
+        error.status !== 429 &&
+        !uncertainRef.current
+      ) {
         clearPendingSubmission(sessionId);
         setPinnedTarget(undefined);
       }
       setBusy(false);
       // The request that was sent: its target names the PM a refusal is about.
       await refused(error, preview, request);
+      if (lost) {
+        setPhase(prev =>
+          prev.kind === "error"
+            ? {
+                ...prev,
+                uncertain: true,
+                message: `${UNCERTAIN_TEXT} (${prev.message})`,
+              }
+            : prev
+        );
+      }
     } finally {
       setBusy(false);
     }
@@ -775,6 +914,7 @@ export function PinsSubmitDialog(props: {
             />
           ) : null}
           {relayNotice ? <Notice title={relayNotice} text="" /> : null}
+          {carryNotice ? <Notice title={carryNotice} text="" /> : null}
           {target !== null && preview ? (
             <Line
               text={`${sessionName ?? "This session"} is not running, so ${pm ? `${pm.name}, its Project Manager,` : "its Project Manager"} receives these answers. They are recorded on ${sessionName ? `${sessionName}'s` : "this session's"} pins`}
@@ -795,9 +935,10 @@ export function PinsSubmitDialog(props: {
                     className="flex min-h-8 items-center gap-1.5 border-b border-[var(--app-divider)] py-1"
                   >
                     <PinKindBadge kind={kindOf(entry.key)} armed={false} />
-                    <span className="min-w-0 flex-1 truncate font-semibold">
+                    {/* #6458 (TITLE-D): a pin title fades, never an ellipsis. */}
+                    <FadeTruncate className="flex-1 font-semibold">
                       {titleOf(entry.key)}
-                    </span>
+                    </FadeTruncate>
                     {entry.stale ? (
                       <span
                         className="shrink-0 rounded-full border px-1.5 text-[length:var(--text-caption)] text-[var(--status-warn)]"
@@ -886,7 +1027,10 @@ export function PinsSubmitDialog(props: {
             />
           ) : null}
           {phase.kind === "error" ? (
-            <Notice title="Not sent" text={phase.message} />
+            <Notice
+              title={phase.uncertain ? "Outcome unknown" : "Not sent"}
+              text={phase.message}
+            />
           ) : null}
         </div>
 
@@ -961,6 +1105,7 @@ export function PinsSubmitDialog(props: {
                 setTarget(null);
                 setBuilt(null);
                 setPhase({ kind: "checking" });
+                setRecheck(n => n + 1);
               }}
             >
               Check again
@@ -1048,12 +1193,23 @@ function allRecorded(result: PinSubmissionResponse): boolean {
 function settleStaging(
   sessionId: string,
   result: PinSubmissionResponse,
-  submitted: Readonly<Record<string, Readonly<StagedPin>>>
+  submitted: Readonly<Record<string, Readonly<StagedPin>>>,
+  stamps?: Readonly<Record<string, number>>
 ): void {
   // #6539 R1: a stale dismissal stays staged, even when the pin's save went.
+  // #6521 S2/N: on a replay, an entry "not in the message already sent" was
+  // never delivered, so it is still staged (a stale dismissal N keeps among
+  // them), never forgotten.
   const keep = new Set(
-    result.entries.filter(e => e.code === STALE_DISMISS).map(e => e.key)
+    result.entries
+      .filter(e => e.code === STALE_DISMISS || e.code === NOT_IN_SUBMISSION)
+      .map(e => e.key)
   );
+  // #6521 S2: with the stamps a frozen Submit was built from, an entry edited
+  // since then is the operator's newer answer and is never dropped.
+  const current = stamps ? getStagedPins(sessionId) : undefined;
+  const unchanged = (key: string): boolean =>
+    !stamps || !current || current[key]?.updatedAt === stamps[key];
   const done: Record<string, Readonly<StagedPin>> = {};
   for (const entry of result.entries) {
     const staged = submitted[entry.key];
@@ -1070,7 +1226,9 @@ function settleStaging(
   dropPins(
     sessionId,
     result.entries
-      .filter(e => e.outcome === "dropped" && !keep.has(e.key))
+      .filter(
+        e => e.outcome === "dropped" && !keep.has(e.key) && unchanged(e.key)
+      )
       .map(e => e.key)
   );
 }
@@ -1146,9 +1304,9 @@ function DroppedRows(props: {
             key={`${row.key}:${index}`}
             className="flex min-h-7 items-center gap-1.5 border-b border-[var(--app-divider)]"
           >
-            <span className="min-w-0 flex-1 truncate">
+            <FadeTruncate className="flex-1">
               {props.titleOf(row.key)}
-            </span>
+            </FadeTruncate>
             <span className="shrink-0 text-[var(--app-hint)]">
               {row.reason ?? "dropped"}
             </span>
@@ -1196,7 +1354,9 @@ function ResultRows(props: {
               className="border-b border-[var(--app-divider)] py-1"
             >
               {/* The status on its own line, so a long one never hides the title. */}
-              <span className="block truncate">{props.titleOf(entry.key)}</span>
+              <FadeTruncate className="block">
+                {props.titleOf(entry.key)}
+              </FadeTruncate>
               <span
                 className={`block text-[length:var(--text-caption)] ${entry.moot || entry.recorded === false ? "text-[var(--status-warn)]" : "text-[var(--app-hint)]"}`}
               >
@@ -1223,7 +1383,9 @@ function ResultRows(props: {
               key={`${entry.key}:${index}`}
               className="border-b border-[var(--app-divider)] py-1"
             >
-              <span className="block truncate">{props.titleOf(entry.key)}</span>
+              <FadeTruncate className="block">
+                {props.titleOf(entry.key)}
+              </FadeTruncate>
               <span className="block text-[length:var(--text-caption)] text-[var(--status-warn)]">
                 {droppedText(entry)}
               </span>

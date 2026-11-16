@@ -43,6 +43,9 @@ export function createSessionLifecycleRoutes(
     allowTools: z.array(z.string()).optional(),
     decision: federationDecisionSchema.optional(),
     answers: z.record(z.string(), z.array(z.string())).optional(),
+    // #6606 R18: the entry hub read `X-Hapi-Session-Id` and adds this; any
+    // other value is an invalid body. A peer on an older build drops the key.
+    answeredBy: z.enum(["session"]).optional(),
   });
 
   const federationDenyBodySchema = z.object({
@@ -253,16 +256,25 @@ export function createSessionLifecycleRoutes(
       const allowTools = parsed.data.allowTools;
       const decision = parsed.data.decision;
       const answers = parsed.data.answers;
+      const answeredBy = parsed.data.answeredBy;
 
       try {
-        await engine.approvePermission(
+        const declined = await engine.approvePermission(
           sessionId,
           requestId,
           mode,
           allowTools,
           decision,
-          answers
+          answers,
+          answeredBy
         );
+        // #6606 round 9 (F4): the CLI declined the answer set; say so.
+        if (declined) {
+          return c.json(
+            { error: "Answers declined", reason: declined.reason },
+            422
+          );
+        }
         return c.json({ ok: true });
       } catch (error) {
         return logAndJson(c, error, 500, {

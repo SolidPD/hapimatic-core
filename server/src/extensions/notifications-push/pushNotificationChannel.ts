@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { Session } from "../../sync/syncEngine";
 import type { NotificationChannel } from "@hapi/protocol/ext";
+import { isQuestionToolName } from "@hapi/protocol";
 import { getAgentName } from "../../notifications/sessionInfo";
 import type { PushService } from "../../push/pushService";
 import { buildSessionPushPayloadFromSession } from "../../push/sessionPushPayload";
@@ -20,9 +21,12 @@ export class PushNotificationChannel implements NotificationChannel {
       return;
     }
 
-    const request = session.agentState?.requests
-      ? Object.values(session.agentState.requests)[0]
-      : null;
+    // The first pending request that is not a question tool: a question (an
+    // MCP server's form or link request included) is answered on its own
+    // card, so the permission title never names one (#6606, PM ruling P2-a).
+    const request = Object.values(session.agentState?.requests ?? {}).find(
+      candidate => candidate && !isQuestionToolName(candidate.tool)
+    );
     const toolName = request?.tool ?? "Tool";
 
     await this.pushService.sendToNamespace(

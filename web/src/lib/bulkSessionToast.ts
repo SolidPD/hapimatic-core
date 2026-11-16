@@ -120,6 +120,17 @@ export function bulkFailureLabel(
 ): string {
   if (item.code) return REASON_LABEL[item.code];
   const text = (item.error ?? "").trim();
+  // #6681: a delete the hub never sent, "Not sent: <node> busy; …".
+  if (item.retry === true) {
+    const node = text.match(/^Not sent: (.+) busy;/)?.[1];
+    // #6681 A2: else the hub's own short reason ("being relaunched").
+    const reason = text.match(/^Not sent: ([^;]{1,40});/)?.[1];
+    if (!node) return reason ? `not sent (${reason})` : "not sent";
+    const label = `not sent (${node} busy)`;
+    return label.length > ERROR_LABEL_MAX
+      ? `not sent (${node.slice(0, ERROR_LABEL_MAX - "not sent ( busy)…".length)}… busy)`
+      : label;
+  }
   if (TIMEOUT_TEXT.test(text)) {
     return phase === "disconnect" ? "disconnect timed out" : "timed out";
   }
@@ -133,20 +144,51 @@ export function bulkFailureLabel(
 }
 
 /**
+ * #6681 N1, R1-2: a delete its node never confirmed, with the peer's own text
+ * (shortened) when the peer answered the delete with one.
+ */
+export function notConfirmedLabel(node: string, peerText?: string): string {
+  const label = `delete not confirmed on ${node.slice(0, 36)}`;
+  const text = (peerText ?? "").trim();
+  if (text.length === 0) return label;
+  return `${label}: ${text.length > 40 ? `${text.slice(0, 39)}…` : text}`;
+}
+
+/**
  * #6210: the ONE toast a background bulk delete ends with. All deleted →
  * "Deleted 50 sessions". Any failure → "2 sessions could not be deleted: node
  * offline", with counted labels when the reasons differ ("3 sessions could not
  * be deleted: 2 node offline, 1 timed out"), most frequent first.
+ *
+ * #6681 (D1 = 1): sessions whose delete was sent but not yet confirmed are
+ * never failures. They are counted as "M still being deleted on <node>" ("on
+ * <node>" only when they share one node label): after the deleted count
+ * (warning), alone when none was deleted (warning), or after the failures
+ * (error). Their rows leave the list once the node confirms.
  */
 export function summarizeBulkDelete(
   deletedCount: number,
-  failures: ReadonlyArray<{ id: string; label: string }>
+  failures: ReadonlyArray<{ id: string; label: string }>,
+  stillDeleting: ReadonlyArray<{ id: string; node?: string }> = []
 ): { message: string; type: BulkToastType } {
   const noun = (n: number) => (n === 1 ? "session" : "sessions");
+  const m = stillDeleting.length;
+  const nodes = new Set(stillDeleting.map(s => s.node));
+  const shared = nodes.size === 1 ? stillDeleting[0]?.node : undefined;
+  const still = `still being deleted${shared ? ` on ${shared}` : ""}`;
   if (failures.length === 0) {
+    if (m === 0) {
+      return {
+        message: `Deleted ${deletedCount} ${noun(deletedCount)}`,
+        type: "success",
+      };
+    }
     return {
-      message: `Deleted ${deletedCount} ${noun(deletedCount)}`,
-      type: "success",
+      message:
+        deletedCount === 0
+          ? `${m} ${noun(m)} ${still}`
+          : `Deleted ${deletedCount} ${noun(deletedCount)} · ${m} ${still}`,
+      type: "warning",
     };
   }
   const counts = new Map<string, number>();
@@ -160,7 +202,7 @@ export function summarizeBulkDelete(
           .join(", ");
   const n = failures.length;
   return {
-    message: `${n} ${noun(n)} could not be deleted: ${reasonText}`,
+    message: `${n} ${noun(n)} could not be deleted: ${reasonText}${m > 0 ? ` · ${m} ${still}` : ""}`,
     type: "error",
   };
 }

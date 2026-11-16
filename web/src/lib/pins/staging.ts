@@ -256,7 +256,14 @@ export function flushStaging(): void {
       }
     } catch {
       // Full or disabled storage: staging keeps working in memory for this
-      // page, and the bars say so once.
+      // page, and the bars say so once. #6521 S4: remove the session's older
+      // snapshot too (best effort), so a reload never brings back answers the
+      // operator has since changed or sent.
+      try {
+        store?.removeItem(STAGING_KEY_PREFIX + sessionId);
+      } catch {
+        // Disabled storage: nothing stored to remove.
+      }
       setFailed();
     }
   }
@@ -647,15 +654,20 @@ export function removeSessionStaging(sessionId: string): void {
 
 /**
  * A Submit sent without a definitive answer yet (a lost response, a closed app).
- * Kept in storage so the next opening reuses its `submissionId` while the staged
- * entries it was built from are unchanged: the server then replays instead of
- * delivering a second message. `stamps` is each entry's `updatedAt` when sent.
+ * Kept in storage so the next opening finishes it under its own `submissionId`:
+ * the server then replays instead of delivering a second message. `stamps` is
+ * each entry's `updatedAt` when sent. #6521 S2/S3 (ER-D2): one id belongs to one
+ * frozen request, so `request` and `stamps` never change after the send; edits
+ * made since go under a new id (`PinsSubmitDialog`). `uncertain` is set only
+ * after a lost response or a 5xx, the cases where the first send may have been
+ * delivered.
  */
 export type PendingSubmission = {
   submissionId: string;
   request: PinSubmissionRequest;
   stamps: Record<string, number>;
   at: number;
+  uncertain?: boolean;
 };
 
 export function savePendingSubmission(
@@ -681,7 +693,8 @@ export function loadPendingSubmission(
       !parsed.request ||
       !Array.isArray(parsed.request.entries) ||
       !parsed.stamps ||
-      typeof parsed.stamps !== "object"
+      typeof parsed.stamps !== "object" ||
+      (parsed.uncertain !== undefined && typeof parsed.uncertain !== "boolean")
     ) {
       return null;
     }

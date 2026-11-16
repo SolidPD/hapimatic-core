@@ -3,6 +3,7 @@ import type { ToolCallBlock } from "@/chat/types";
 import type { ApiClient } from "@/api/client";
 import type { SessionMetadataSummary } from "@/types/api";
 import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
+import { MCP_ELICITATION_TOOL } from "@hapi/protocol";
 import {
   Card,
   CardContent,
@@ -23,6 +24,7 @@ import {
 } from "@/components/ui/dialog";
 import { PermissionFooter } from "@/components/ToolCard/PermissionFooter";
 import { AskUserQuestionFooter } from "@/components/ToolCard/AskUserQuestionFooter";
+import { ElicitationFooter } from "@/components/ToolCard/ElicitationFooter";
 import { isAskUserQuestionToolName } from "@/components/ToolCard/askUserQuestion";
 import { showsPermissionFooter as showsPermissionFooterFor } from "@/components/ToolCard/showsPermissionFooter";
 import { getToolPresentation } from "@/components/ToolCard/knownTools";
@@ -449,9 +451,21 @@ function ToolCardInner(props: ToolCardProps) {
           <div className="shrink-0 flex h-3.5 w-3.5 items-center justify-center text-[var(--app-hint)] leading-none">
             {presentation.icon}
           </div>
-          <CardTitle className="min-w-0 text-sm font-medium leading-tight break-words">
-            {toolTitle}
-          </CardTitle>
+          {toolName === MCP_ELICITATION_TOOL ? (
+            // An elicitation's title holds the server's name: one line, cut
+            // before it can wrap, the whole title on hover and in the details
+            // dialog (#6606 round 1, D1). Every other tool keeps its title.
+            <CardTitle
+              className="min-w-0 truncate text-sm font-medium leading-tight"
+              title={typeof toolTitle === "string" ? toolTitle : undefined}
+            >
+              {toolTitle}
+            </CardTitle>
+          ) : (
+            <CardTitle className="min-w-0 text-sm font-medium leading-tight break-words">
+              {toolTitle}
+            </CardTitle>
+          )}
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
@@ -564,7 +578,18 @@ function ToolCardInner(props: ToolCardProps) {
             )
           ) : null}
 
-          {isAskUserQuestion && permission?.status === "pending" ? (
+          {toolName === MCP_ELICITATION_TOOL &&
+          permission?.status === "pending" ? (
+            // #6606: an MCP server's form or link request has its own card,
+            // mounted before the PermissionFooter fallback.
+            <ElicitationFooter
+              api={props.api}
+              sessionId={props.sessionId}
+              tool={props.block.tool}
+              disabled={props.disabled}
+              onDone={props.onDone}
+            />
+          ) : isAskUserQuestion && permission?.status === "pending" ? (
             <AskUserQuestionFooter
               api={props.api}
               sessionId={props.sessionId}

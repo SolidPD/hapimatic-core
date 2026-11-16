@@ -59,6 +59,9 @@ type PinRow = {
   saved_revision: number | null;
   saved_at: number | null;
   save_reported_at: number | null;
+  // #6458 (#6540 S-4), added by `migrateAddColumn`; null on a save made before it.
+  saved_files?: number | null;
+  saved_skipped?: number | null;
   // #6574, added by `migrateAddColumn` (store/index.ts); null only on a row an
   // older binary inserted, until the next start's backfill.
   pin_id?: string | null;
@@ -337,6 +340,8 @@ export class PinStore {
       savedTo: row.saved_to ?? null,
       savedRevision: row.saved_revision ?? null,
       saveReportPending: isSaveReportPending(row),
+      savedFiles: row.saved_files ?? null,
+      savedSkipped: row.saved_skipped ?? null,
       // #6574: after the content spread, so content can never shadow the ID.
       pinId: row.pin_id ?? null,
       createdAt: iso(row.created_at),
@@ -819,7 +824,11 @@ export class PinStore {
     // statement the dismiss route runs. A moot dismissal, or one on a dashboard
     // (never dismissed by a Submit), leaves the pin as it is.
     if (input.dismisses === true && !moot && row.status === "open") {
-      this.closeRow(sessionId, key, "dismissed", now);
+      // #6458 review D3: a `prompt:` pin (PROMPT_PIN_PREFIX) Submit may dismiss
+      // only once its request looks gone, and closes withdrawn, so a request
+      // still waiting re-posts it open; a sticky dismissal would hide it.
+      const closed = key.startsWith("prompt:") ? "withdrawn" : "dismissed";
+      this.closeRow(sessionId, key, closed, now);
     }
     return {
       pin: this.rowToPin(this.getRow(sessionId, key) as PinRow),
@@ -854,19 +863,34 @@ export class PinStore {
    * Record "Save to session folder" (#6453): where the files went, the revision
    * saved, and a new unreported save. Leaves `updated_at` and `revision` alone,
    * like the star, and is never a no-op, because each Save is new news for the
-   * agent.
+   * agent. #6458 (#6540 S-4): with how many files it left and skipped.
    */
   setSaved(
     sessionId: string,
     key: string,
-    save: { savedTo: string; revision: number; now?: number }
+    save: {
+      savedTo: string;
+      revision: number;
+      files?: number;
+      skipped?: number;
+      now?: number;
+    }
   ): { pin: Pin; changed: boolean } | null {
     const result = this.db
       .prepare(
-        `UPDATE session_pins SET saved_to = ?, saved_revision = ?, saved_at = ?
+        `UPDATE session_pins SET saved_to = ?, saved_revision = ?, saved_at = ?,
+           saved_files = ?, saved_skipped = ?
          WHERE session_id = ? AND key = ?`
       )
-      .run(save.savedTo, save.revision, save.now ?? Date.now(), sessionId, key);
+      .run(
+        save.savedTo,
+        save.revision,
+        save.now ?? Date.now(),
+        save.files ?? null,
+        save.skipped ?? null,
+        sessionId,
+        key
+      );
     if (result.changes === 0) return null;
     return {
       pin: this.rowToPin(this.getRow(sessionId, key) as PinRow),
@@ -1314,6 +1338,25 @@ export class PinStore {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     }));
+  }
+
+  /**
+   * The key and pin ID of every open pin in a session, reserved keys included
+   * (#6527): the turn check covers an ask that names one. Open, so a dashboard
+   * (always `live`) is never listed. `pin_id` was added after the JSON columns
+   * (store/index.ts), so this read walks each open row's overflow pages: at most
+   * `PIN_MAX_OPEN_PER_SESSION` (100) rows a session, which is acceptable.
+   */
+  listOpenPinRefs(
+    sessionId: string
+  ): Array<{ key: string; pinId: string | null }> {
+    const rows = this.db
+      .prepare(
+        `SELECT key, pin_id FROM session_pins
+         WHERE session_id = ? AND status = 'open'`
+      )
+      .all(sessionId) as Array<{ key: string; pin_id: string | null }>;
+    return rows.map(row => ({ key: row.key, pinId: row.pin_id }));
   }
 
   /**

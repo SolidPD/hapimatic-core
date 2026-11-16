@@ -24,6 +24,7 @@ import {
 import { useSessionAccountEmail } from "@/hooks/queries/useSessionAccountEmail";
 import { EditSessionParamsModal } from "@/components/session";
 import { reduceChatBlocks } from "@/chat/reducer";
+import { elicitationHidesJumpRow } from "@/chat/elicitationPending";
 import { reconcileChatBlocks } from "@/chat/reconcile";
 import { useThinkingPlaceholder } from "@/hooks/useThinkingPlaceholder";
 import {
@@ -46,6 +47,7 @@ import type { UiCollapseState } from "@hapi/protocol/schemas";
 import { type Attachment } from "@/lib/attachment-store";
 import { TokenUsageSection } from "@/components/TokenUsageWidget";
 import { computeMergeGroups } from "@/components/SessionChat.mergeGroups";
+import { jumpRowHasTarget } from "@/components/SessionChat.jumpRow";
 import { useExtensionHost } from "@/ext/host";
 import { SessionDetailInfoFields, SessionDetailTabs } from "@/ext/slots";
 import { SessionDetailProvider } from "@/ext/sessionDetailContext";
@@ -1081,10 +1083,8 @@ export function SessionChat(props: {
           {/* Jump navigation buttons - pinned above the bottom dock */}
           {/* 36px circles: `--nav-circle` (2026-10-05), split from the composer's 44px `--control-touch` */}
           {/* Buttons stay horizontally centered in all section-collapse states (#1297) */}
-          {scrollState?.showJumpButton ||
-          (scrollState?.newMessageCount ?? 0) > 0 ||
-          userNav.totalCount > 1 ||
-          bookmarkNav.totalCount > 0 ? (
+          {!elicitationHidesJumpRow(props.session) &&
+          jumpRowHasTarget(scrollState, userNav, bookmarkNav) ? (
             <div
               className="absolute pointer-events-none z-10 animate-bounce-in transition-[bottom] duration-200 left-0 right-0 flex justify-center"
               style={{

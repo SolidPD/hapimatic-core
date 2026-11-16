@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { memo, useCallback, type CSSProperties, type ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import { Check, Star, X } from "lucide-react";
 import { isReservedPinKey } from "@hapi/protocol";
 import { tokens } from "@/design/tokens";
+import { FadeTruncate } from "@/components/session/FadeTruncate";
 import { PinDetail } from "@/components/pins/PinDetail";
 import {
   DISMISS_LABEL,
@@ -10,6 +20,7 @@ import {
 } from "@/components/pins/PinDismissAction";
 import { PinSignals } from "@/components/pins/PinSignals";
 import { ReservedPinPill } from "@/components/pins/ReservedPinParts";
+import { OptionIdText } from "@/components/pins/optionId";
 import {
   PIN_BOX_CLASS,
   PIN_PILL_CLASS as PILL_CLASS,
@@ -131,7 +142,7 @@ function AnswerPill(props: { model: PinViewModel; armed: boolean }) {
         className={`${PILL_CLASS} ${FILLED}`}
         style={stale ? STALE_STYLE : PILL_STYLE}
       >
-        {staged.choice}
+        <OptionIdText id={staged.choice} />
         <Check style={CHECK_ICON} aria-hidden />
       </PinIndicator>
     );
@@ -161,9 +172,65 @@ function AnswerPill(props: { model: PinViewModel; armed: boolean }) {
         borderColor: "color-mix(in srgb, var(--app-accent) 45%, transparent)",
       }}
     >
-      {recommended.id}★
+      <OptionIdText id={recommended.id} />★
     </PinIndicator>
   );
+}
+
+/**
+ * #6458 (TITLE-D, Matt 2026-11-12): whether an expanded pin's title needs more
+ * than one line. It is always measured in the one-line layout, the title on one
+ * line beside the signals in their cell, so moving the signals to the facts
+ * line cannot change the answer and flip it back. While the title wraps, the
+ * read lifts the title's wrap and the row copy's stowed styles and puts them
+ * back before paint (as `RecommendedLabel` in `DecisionOptions.tsx` does). It
+ * measures again when the title cell's width changes (the screen, or a pill
+ * that grows) and when the age label changes.
+ */
+function useTitleWraps(expanded: boolean, title: string, ageLabel: string) {
+  const cellRef = useRef<HTMLDivElement>(null);
+  const [wraps, setWraps] = useState(false);
+  const [pass, setPass] = useState(0);
+
+  useLayoutEffect(() => {
+    if (!expanded) {
+      setWraps(false);
+      return;
+    }
+    const cell = cellRef.current;
+    const text = cell?.querySelector<HTMLElement>("[data-pin-title-text]");
+    if (!cell || !text) return;
+    const signals =
+      cell.parentElement?.querySelector<HTMLElement>("[data-pin-signals]");
+    const textStyle = text.style.cssText;
+    const signalsStyle = signals?.style.cssText ?? "";
+    text.style.whiteSpace = "nowrap";
+    text.style.overflow = "hidden";
+    if (signals) {
+      signals.style.width = "";
+      signals.style.overflow = "";
+      signals.style.visibility = "";
+    }
+    const overflows = text.scrollWidth > text.clientWidth + 1;
+    text.style.cssText = textStyle;
+    if (signals) signals.style.cssText = signalsStyle;
+    setWraps(overflows);
+  }, [expanded, title, ageLabel, pass]);
+
+  useEffect(() => {
+    const cell = cellRef.current;
+    if (!expanded || !cell || typeof ResizeObserver === "undefined") return;
+    let width = cell.clientWidth;
+    const resize = new ResizeObserver(() => {
+      if (cell.clientWidth === width) return;
+      width = cell.clientWidth;
+      setPass(n => n + 1);
+    });
+    resize.observe(cell);
+    return () => resize.disconnect();
+  }, [expanded]);
+
+  return { cellRef, wraps };
 }
 
 export type PinRowProps = {
@@ -203,6 +270,10 @@ export type PinRowProps = {
  * ref, because a reveal scrolls the row, not the whole box, to the centre.
  * Memoized: the list passes the pin's cached view model and primitives with
  * stable handlers.
+ * #6458 (TITLE-D, Matt 2026-11-12): the title is one line that fades at its
+ * edge (`FadeTruncate`), never an ellipsis. An expanded pin whose title does
+ * not fit shows it whole: the title wraps, the star, kind, pill and chevron
+ * keep the first line, and the signals move to the end of the facts line.
  */
 export const PinRow = memo(function PinRow(props: PinRowProps) {
   const { model, expanded, armed, onToggle, onStar, observe } = props;
@@ -213,12 +284,22 @@ export const PinRow = memo(function PinRow(props: PinRowProps) {
     (element: HTMLDivElement | null) => observe(pin.key, element),
     [observe, pin.key]
   );
+  const { cellRef, wraps } = useTitleWraps(expanded, pin.title, props.ageLabel);
+  // One set of props for the row's signals and their facts-line copy: the row's
+  // (stowed) copy is the one the title measurement reads, so the two must match.
+  const signals = {
+    model,
+    ageLabel: props.ageLabel,
+    ageTooltip: props.ageTooltip,
+    armed,
+  };
   return (
     <div data-pin-box className={PIN_BOX_CLASS}>
       <div
         id={props.rowId ?? `pin-row-${pin.key}`}
         ref={armed ? undefined : register}
-        className={`grid items-center gap-x-1.5 px-0.5 py-0.5 ${
+        data-title-wraps={wraps ? "" : undefined}
+        className={`grid ${wraps ? "items-start" : "items-center"} gap-x-1.5 px-0.5 py-0.5 ${
           expanded ? "bg-[var(--app-subtle-bg)]" : "hover:bg-[var(--app-hover)]"
         }`}
         style={ROW_STYLE}
@@ -251,13 +332,20 @@ export const PinRow = memo(function PinRow(props: PinRowProps) {
             />
           </PinTipButton>
         </span>
-        <PinKindBadge kind={pin.kind} armed={armed} />
+        <PinKindBadge
+          kind={pin.kind}
+          armed={armed}
+          className={wraps ? "h-7 items-center" : undefined}
+        />
         <div
+          ref={cellRef}
           onClick={toggle}
-          className="min-w-0 cursor-pointer truncate text-[length:var(--text-body)] font-semibold text-[var(--app-fg)]"
+          className={`flex min-w-0 cursor-pointer ${
+            wraps ? "items-start py-1.25 leading-4.5" : "items-center"
+          } text-[length:var(--text-body)] font-semibold text-[var(--app-fg)]`}
         >
           {isNew ? (
-            <span onClick={stopRowToggle}>
+            <span onClick={stopRowToggle} className="flex-none">
               <PinIndicator
                 armed={armed}
                 label="New: not opened since it last changed"
@@ -268,15 +356,22 @@ export const PinRow = memo(function PinRow(props: PinRowProps) {
               </PinIndicator>
             </span>
           ) : null}
-          {pin.title}
+          {wraps ? (
+            <span
+              data-pin-title-text=""
+              className="min-w-0 whitespace-normal [overflow-wrap:anywhere]"
+            >
+              {pin.title}
+            </span>
+          ) : (
+            <FadeTruncate data-pin-title-text="">{pin.title}</FadeTruncate>
+          )}
         </div>
-        <PinSignals
-          model={model}
-          ageLabel={props.ageLabel}
-          ageTooltip={props.ageTooltip}
-          armed={armed}
-        />
-        <span onClick={stopRowToggle} className="flex justify-end">
+        <PinSignals {...signals} stowed={wraps} />
+        <span
+          onClick={stopRowToggle}
+          className={`flex justify-end${wraps ? " h-7 items-center" : ""}`}
+        >
           {isReservedPinKey(pin.key) ? (
             <ReservedPinPill
               pin={pin}
@@ -292,10 +387,16 @@ export const PinRow = memo(function PinRow(props: PinRowProps) {
           expanded={expanded}
           armed={armed}
           onToggle={toggle}
+          firstLine={wraps}
         />
       </div>
       {expanded ? (
-        <PinDetail model={model} actions={props.actions} mode={props.mode} />
+        <PinDetail
+          model={model}
+          actions={props.actions}
+          mode={props.mode}
+          factsEnd={wraps ? <PinSignals {...signals} /> : undefined}
+        />
       ) : null}
     </div>
   );

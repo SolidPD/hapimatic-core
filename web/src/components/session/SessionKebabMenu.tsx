@@ -160,7 +160,8 @@ export function SessionKebabMenu({
 
   // Pointer isolation for the list card: a tap that opens the menu must not also
   // navigate the row (the row navigates from up-handlers). Mirrors the account
-  // badge / mute bell isolation set.
+  // badge's isolation set (the mute bell that shared it moved into this menu,
+  // #6660).
   const stopProp = isolatePointerEvents
     ? {
         onPointerDown: (e: React.PointerEvent) => e.stopPropagation(),

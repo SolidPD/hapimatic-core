@@ -84,6 +84,12 @@ export class MessageStore {
    * (#6455: the turn a Detected pin is read from). A row longer than `maxChars` is
    * returned with `content: null` and never parsed, because one stored message
    * can be hundreds of kilobytes.
+   *
+   * #6458 Task 11b (#6527 CR-2): bounded by `seq` first, through
+   * idx_messages_session(session_id, seq), then filtered by `created_at`, the
+   * way `findRecentMessageIdContaining` does. Filtering by `created_at` inside
+   * the ordered scan walked back through the whole session when few rows were
+   * recent, on the main thread, on every nudged turn.
    */
   getRecentMessagesBounded(
     sessionId: string,
@@ -93,14 +99,18 @@ export class MessageStore {
       .prepare(
         `SELECT id, created_at,
                 CASE WHEN length(content) <= ? THEN content END AS content
-         FROM messages WHERE session_id = ? AND created_at >= ?
-         ORDER BY seq DESC LIMIT ?`
+         FROM (
+           SELECT id, seq, created_at, content FROM messages
+           WHERE session_id = ? ORDER BY seq DESC LIMIT ?
+         )
+         WHERE created_at >= ?
+         ORDER BY seq DESC`
       )
       .all(
         options.maxChars,
         sessionId,
-        options.sinceMs,
-        options.limit
+        options.limit,
+        options.sinceMs
       ) as Array<{ id: string; created_at: number; content: string | null }>;
     return rows.map(row => {
       let content: unknown = null;

@@ -37,7 +37,13 @@ import {
   type SpawnWarning,
 } from "@hapi/protocol";
 import { requireMachine } from "./guards";
-import { floorAgentMcpEnable, floorAgentSpawnPosture } from "./agentEscalation";
+import {
+  buildBillableSwitchStart,
+  floorAgentMcpEnable,
+  floorAgentSpawnPosture,
+  refuseUnhonourableBillableAnswer,
+} from "./agentEscalation";
+import { BillableSwitchStartChoiceSchema } from "@hapi/protocol";
 import { resolveSpawnMcpSet } from "../../services/mcpSetResolver";
 import type { McpCatalogService } from "../../services/mcpCatalogService";
 import { logAndJson } from "./routeErrorHelper";
@@ -192,6 +198,13 @@ export const spawnBodySchema = z.object({
   /** Issue #2479: "branch" | "spawn". Defaulted to "spawn" by the route when a
    *  parent is present and this is omitted (a PM-originated managed peer). */
   parentRelationship: z.enum(["branch", "spawn"]).optional(),
+  /** Issue #6646: a person's answer to the question at Create. The client sends
+   *  ONLY a choice (strict: a client cannot send a kind, an actor or a node); the
+   *  route builds the start context from the request (buildBillableSwitchStart). */
+  billableSwitchStart: z
+    .object({ choice: BillableSwitchStartChoiceSchema })
+    .strict()
+    .optional(),
 });
 
 /** Issue #4568 (R8): the stable 400 codes for an invalid API-key spawn body. */
@@ -572,10 +585,39 @@ export function createMachinesRoutes(
         }
       }
 
+      // Issue #6646: the start context, built from the request by the signal
+      // order of Task 6 (never taken from the client body beyond its choice).
+      const billableSwitchStart = buildBillableSwitchStart(
+        c,
+        engine,
+        {
+          choice: parsed.data.billableSwitchStart?.choice,
+          parentSessionId: resolvedParentSessionId,
+          parentRelationship:
+            parsed.data.parentRelationship ??
+            (resolvedParentSessionId ? "spawn" : undefined),
+        },
+        engine.getBillableSwitchService?.()?.localNodeId()
+      );
+      // Issue #6646 (closer review round 1, the Project Manager's ruling of
+      // 2026-11-13, clarifying R5 and Task 6): a person's explicit billable
+      // answer that this node cannot honour is refused, as the remote path
+      // refuses it (federation/webClient.ts), never dropped. No answer,
+      // `follow-header` and `not-billable` pass in every gate state.
+      const billableRefusal = refuseUnhonourableBillableAnswer(
+        c,
+        engine,
+        billableSwitchStart
+      );
+      if (billableRefusal) {
+        return billableRefusal;
+      }
+
       const spawnOptions = {
         machineId,
         directory: parsed.data.directory,
         agent: parsed.data.agent,
+        billableSwitchStart,
         // Issue #6218: the EFFECTIVE posture resolved above (the floor judged it),
         // sent explicitly so `spawnSession` does not resolve it a second time.
         yolo: posture.yolo,

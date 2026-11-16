@@ -389,6 +389,41 @@ export class IntervalStore {
     txn.immediate();
   }
 
+  /**
+   * Add to the lost-write totals in `billable_lost_writes` (#6670): one
+   * autocommit upsert, so a missing row is created with the counts rather than
+   * an `UPDATE … WHERE id = 1` that changes nothing and throws nothing. Called
+   * directly by the write service, never queued.
+   */
+  addLostWrites(input: {
+    setAside: number;
+    leftAtStop: number;
+    nowMs: number;
+  }): void {
+    this.db
+      .prepare(
+        "INSERT INTO billable_lost_writes (id, set_aside_total, left_at_stop_total, updated_at_ms) " +
+          "VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET " +
+          "set_aside_total = set_aside_total + excluded.set_aside_total, " +
+          "left_at_stop_total = left_at_stop_total + excluded.left_at_stop_total, " +
+          "updated_at_ms = excluded.updated_at_ms"
+      )
+      .run(input.setAside, input.leftAtStop, input.nowMs);
+  }
+
+  /**
+   * The interval change counter (`thinking_interval_change_seq`, #6670 X1). The
+   * start-up step raises it at every boot, so a value read after that step is
+   * at or above every `change_seq` an earlier process issued.
+   */
+  readChangeSeq(): number {
+    return (
+      this.db
+        .prepare("SELECT value FROM thinking_interval_change_seq WHERE id = 1")
+        .get() as { value: number }
+    ).value;
+  }
+
   /** Record one old-clock stretch (`shadow` only); once per `id`. */
   recordLegacyStretch(row: LegacyStretchRow): void {
     const txn = this.db.transaction(() => {

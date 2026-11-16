@@ -7,7 +7,7 @@ import {
   buildMcpServerConfigArgs,
   buildDeveloperInstructionsArg,
 } from "./utils/codexMcpConfig";
-import { codexSystemPrompt } from "./utils/systemPrompt";
+import { buildCodexSystemPrompt } from "./utils/systemPrompt";
 
 /**
  * Filter out 'resume' subcommand which is managed internally by hapi.
@@ -39,6 +39,8 @@ export async function codexLocal(opts: {
   onSessionFound: (id: string) => void;
   codexArgs?: string[];
   mcpServers?: Record<string, { command: string; args: string[] }>;
+  /** Issue #6458: this session's Pins gate; `true` adds the Pins block. */
+  pinsEnabled: boolean;
 }): Promise<void> {
   const args: string[] = [];
 
@@ -61,7 +63,11 @@ export async function codexLocal(opts: {
   }
 
   // Add developer instructions (system prompt)
-  args.push(...buildDeveloperInstructionsArg(codexSystemPrompt));
+  args.push(
+    ...buildDeveloperInstructionsArg(
+      buildCodexSystemPrompt({ pinsEnabled: opts.pinsEnabled })
+    )
+  );
 
   if (opts.codexArgs) {
     const safeArgs = filterResumeSubcommand(opts.codexArgs);

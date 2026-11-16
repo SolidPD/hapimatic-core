@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { Hono } from "hono";
-import { defineCapability } from "@hapi/protocol";
+import { defineCapability, type BillableSwitchMode } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
 import { homedir } from "node:os";
 import { configuration } from "../../configuration";
@@ -42,9 +42,18 @@ export interface VersionInfo {
    * read it as `=== true`.
    */
   pinsEnabled?: true;
+  /**
+   * Issue #6646: this node's billable-sessions state, `"on"` or `"closed"`;
+   * absent while `off`, so nothing billable appears on a dark node.
+   */
+  billableSwitch?: "on" | "closed";
 }
 
-export function createVersionRoutes(): Hono {
+export function createVersionRoutes(options?: {
+  /** Issue #6646: the effective gate, resolved once per process at boot. */
+  billableSwitchMode?: BillableSwitchMode;
+}): Hono {
+  const billableSwitchMode = options?.billableSwitchMode ?? "off";
   const app = new Hono();
 
   // No auth required for version endpoint
@@ -75,6 +84,9 @@ export function createVersionRoutes(): Hono {
         ssoEnabled: configuration.googleOAuthEnabled,
         desktopEligible: desktopTierAllowed(readVmTier()),
         ...(resolvePinsEnabled() ? { pinsEnabled: true as const } : {}),
+        ...(billableSwitchMode === "on" || billableSwitchMode === "closed"
+          ? { billableSwitch: billableSwitchMode }
+          : {}),
       });
     }
   );

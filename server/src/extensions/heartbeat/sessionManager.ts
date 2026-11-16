@@ -247,6 +247,9 @@ export class HeartbeatSessionManager {
       claimPort: false,
       sessionType,
       worktreeName,
+      // Issue #6646 (ruling SYS-1): the heartbeat is one of Hapimatic's own
+      // sessions, never billable at its start.
+      billableSwitchStart: { kind: "system" },
     });
 
     if (result.type === "error") {

@@ -727,6 +727,11 @@ export class SessionLifecycleOps {
       machineId,
       directory: cwd,
       agent,
+      // Issue #6646: the same tag keeps the row and its switch (inherit only if a new row appears).
+      billableSwitchStart: {
+        kind: "inherit" as const,
+        fromSessionId: session.id,
+      },
       // Issue #6218 (absorbs #5353 R2): respawn in the saved posture, exactly as
       // buildRespawnBase does (absent → the legacy bypass respawn).
       yolo: respawnYoloFromPosture(session.metadata?.permissionMode),

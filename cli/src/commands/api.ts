@@ -5,10 +5,11 @@ import { PmSpawnReconciliationStatusSchema, type McpSet } from "@hapi/protocol";
 import { mcpSetFromScan } from "./apiSpawnMcpFlags";
 import { SPAWN_USAGE, scanSpawnFlags } from "./apiSpawnFlags";
 import {
-  BULK_SESSION_MAX_IDS,
-  BulkSessionResultSchema,
-  type BulkSessionResult,
-} from "@hapi/protocol/bulkSessionResult";
+  BULK_SESSIONS_TIMEOUT_MS,
+  bulkResultsHaveFailure,
+  isBulkSessionSubcommand,
+  runBulkSessionsRequest,
+} from "./apiBulkSessions";
 import {
   EffortLevelSchema,
   ModelModeSchema,
@@ -28,6 +29,7 @@ import { readSettings } from "@/persistence";
 import { writeStdout } from "@/utils/stdout";
 import { handleErrorLogs } from "./apiErrorLogs";
 import { handleApiCall } from "./apiCall";
+import { handleSessionsBillable } from "./apiSessionsBillable";
 import { authenticateCli, cliApiTokenSourcesNote } from "./cliAuth";
 import {
   SPAWN_CLIENT_TIMEOUT_MS,
@@ -733,6 +735,7 @@ async function handleSessions(args: string[]): Promise<void> {
     return;
   }
 
+  if (action === "billable") return handleSessionsBillable(args.slice(1));
   if (action === "messages") {
     const sessionId = args[1];
     if (!sessionId) {
@@ -884,88 +887,15 @@ async function handleSessions(args: string[]): Promise<void> {
   printSessionsHelp();
 }
 
-/**
- * #3815 (operator ruling D1, 2026-10-01): three bulk subcommands, one route and
- * one risk tier each — Stop turn, Disconnect, Delete. There is deliberately no
- * compound disconnect-and-delete: a script runs `bulk-archive` and then
- * `bulk-delete`, two deliberate commands (the CLI analogue of the UI's two
- * dialogs; the delete route refuses sessions that are still connected).
- */
-export const BULK_SESSION_SUBCOMMANDS = {
-  "bulk-abort": "/api/sessions/bulk-abort",
-  "bulk-archive": "/api/sessions/bulk-archive",
-  "bulk-delete": "/api/sessions/bulk-delete",
-} as const;
-
-export type BulkSessionSubcommand = keyof typeof BULK_SESSION_SUBCOMMANDS;
-
-/**
- * A session RPC may take 30 s (server `rpcGateway`) and each bulk route waits
- * for its whole fan-out, so this is wider than the single `abort`'s 10 s.
- */
-const BULK_SESSIONS_TIMEOUT_MS = 60_000;
-
-export function isBulkSessionSubcommand(
-  action: string | undefined
-): action is BulkSessionSubcommand {
-  return (
-    action !== undefined && Object.hasOwn(BULK_SESSION_SUBCOMMANDS, action)
-  );
-}
-
-/** True when any session failed outright (skips are not failures). */
-export function bulkResultsHaveFailure(results: BulkSessionResult): boolean {
-  return results.some(r => !r.ok && r.skipped !== true);
-}
-
-function describeRequestError(error: unknown): string {
-  if (axios.isAxiosError(error)) {
-    const status = error.response?.status;
-    const body = error.response?.data as { error?: string } | undefined;
-    return `${status ?? "network error"} — ${body?.error ?? error.message}`;
-  }
-  return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * POST `ids` to the subcommand's bulk route in chunks of the server's 100-id
- * cap and merge each chunk's per-session `results` in request order — the
- * same `BulkSessionResult` the web UI reports. A chunk whose request fails as a
- * whole yields one `{ id, ok: false, error }` per id and later chunks still
- * run. `post` is injected (cli/CLAUDE.md no-module-mock convention).
- */
-export async function runBulkSessionsRequest(
-  action: BulkSessionSubcommand,
-  ids: readonly string[],
-  post: (path: string, body: { ids: string[] }) => Promise<unknown>
-): Promise<BulkSessionResult> {
-  const path = BULK_SESSION_SUBCOMMANDS[action];
-  const unique = Array.from(new Set(ids));
-  const results: BulkSessionResult = [];
-  for (let i = 0; i < unique.length; i += BULK_SESSION_MAX_IDS) {
-    const chunk = unique.slice(i, i + BULK_SESSION_MAX_IDS);
-    let data: unknown;
-    try {
-      data = await post(path, { ids: chunk });
-    } catch (error) {
-      const message = describeRequestError(error);
-      results.push(...chunk.map(id => ({ id, ok: false, error: message })));
-      continue;
-    }
-    const parsed = BulkSessionResultSchema.safeParse(
-      (data as { results?: unknown } | null)?.results
-    );
-    if (!parsed.success) {
-      // An older server answers bulk-delete with counts only: the request may
-      // well have run, so say "unknown" rather than imply nothing happened.
-      const message = `Outcome unknown: ${path} answered without per-session results (older server?)`;
-      results.push(...chunk.map(id => ({ id, ok: false, error: message })));
-      continue;
-    }
-    results.push(...parsed.data);
-  }
-  return results;
-}
+// #6681: the bulk runner lives in ./apiBulkSessions (this file is at the
+// lint cap); re-exported so its importers are unchanged.
+export {
+  BULK_SESSION_SUBCOMMANDS,
+  bulkResultsHaveFailure,
+  isBulkSessionSubcommand,
+  runBulkSessionsRequest,
+  type BulkSessionSubcommand,
+} from "./apiBulkSessions";
 
 function printSessionsHelp(): void {
   console.log(`
@@ -985,6 +915,7 @@ ${chalk.bold("Usage:")}
                           --mcp-all                    Start with every MCP server, ignoring the project's default
                           --mcp-enable-for-project     Turn a named server that is off for the project on for the whole project
   hapi api sessions send <id> "<message>"              Send a message to a session
+  hapi api sessions billable <id> off                  Switch a session not billable (on is the app's)
   hapi api sessions messages <id>                      Get message history
   hapi api sessions capabilities <id>                  List a session's live RPC capabilities (name + meta)
   hapi api sessions wait-until <id> --state <state>    Block until the session reaches a state, or the timeout
@@ -1006,10 +937,14 @@ ${chalk.bold("Notes:")}
     sending work, wait busy then idle. Same-node only: a session on another
     node answers 409 federation_unsupported, so poll it instead
   - 'bulk-*' run on each session's owning node and print one result per session
-    ({ id, ok, skipped?, code?, error?, queued? }); a session that is not mid-turn
-    is skipped by bulk-abort, and bulk-delete refuses a session that is still
-    connected — run bulk-archive first. Delete is permanent. Exit status 1 when
-    any session failed (skipped sessions do not count).
+    ({ id, ok, skipped?, code?, error?, queued?, pending?, retry? }); a session
+    that is not mid-turn is skipped by bulk-abort, and bulk-delete refuses a
+    session that is still connected — run bulk-archive first. Delete is
+    permanent. bulk-delete marks a delete it sent but could not confirm
+    'pending' (it may still complete) and one its node was too busy to take
+    'retry' (not sent, safe to send again); it resends 'retry' ids while a
+    request deleted at least one, for up to 5 minutes. Older CLIs drop both
+    flags. Exit status 1 when any session failed (skipped sessions do not count).
   - All commands output JSON to stdout
   - ${cliApiTokenSourcesNote()}
 `);
@@ -1300,6 +1235,7 @@ export const API_RESOURCE_ACTIONS: Record<string, readonly string[]> = {
     "list",
     "spawn",
     "send",
+    "billable",
     "messages",
     "capabilities",
     "wait-until",

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useId, type ReactNode } from "react";
+import { useId, type ReactNode, type Ref } from "react";
 import { cn } from "@/lib/utils";
 
 /**
@@ -33,7 +33,10 @@ export interface FormFieldControlProps {
  *   aria-describedby, aria-invalid }`), `hint?`, `error?` (replaces the hint +
  *   marks the field invalid), `required?`, `layout?` (`stacked` default | `inline`
  *   — label left, control right), `htmlFor?` (explicit id; else `useId()`),
- *   `className?`.
+ *   `truncateLabel?` (cut a long label to one line with an ellipsis, keeping the
+ *   "*" on its row; opt-in, so every other form is unchanged — #6606),
+ *   `labelRef?` (with `truncateLabel`, a ref to the cut label's element, for a
+ *   caller that measures whether it is cut — #6606 round 2), `className?`.
  * - **Composes**: C's control primitives via the render-prop.
  * - **A11y**: `<label htmlFor>` names the control; `aria-describedby` points at the
  *   hint or error; `aria-invalid` is set while an error shows. WAI-ARIA:
@@ -56,6 +59,18 @@ export interface FormFieldProps {
   layout?: "stacked" | "inline";
   /** Explicit control id (defaults to a generated `useId()`). */
   htmlFor?: string;
+  /**
+   * Cut a long label to one line with an ellipsis instead of wrapping it; the
+   * "*" stays on the row, and in the inline layout the label takes the width
+   * the control leaves (R10-b, #6606). Off by default.
+   */
+  truncateLabel?: boolean;
+  /**
+   * With `truncateLabel`: a ref to the element that holds the cut label, for a
+   * caller that measures whether it is cut (#6606 round 2). The markup is the
+   * same with or without it. Ignored without `truncateLabel`.
+   */
+  labelRef?: Ref<HTMLSpanElement>;
   className?: string;
 }
 
@@ -67,6 +82,8 @@ export function FormField({
   required = false,
   layout = "stacked",
   htmlFor,
+  truncateLabel = false,
+  labelRef,
   className,
 }: FormFieldProps) {
   const autoId = useId();
@@ -84,11 +101,33 @@ export function FormField({
   const labelEl = (
     <label
       htmlFor={id}
-      className="text-[length:var(--text-label-strong)] font-medium text-[var(--app-fg)]"
+      className={cn(
+        "text-[length:var(--text-label-strong)] font-medium text-[var(--app-fg)]",
+        truncateLabel && "flex min-w-0",
+        truncateLabel && layout === "inline" && "flex-1"
+      )}
     >
-      {label}
+      {truncateLabel ? (
+        // A cut string label keeps its whole text on hover; a node label
+        // brings its own title, or none.
+        <span
+          ref={labelRef}
+          className="min-w-0 truncate"
+          title={typeof label === "string" ? label : undefined}
+        >
+          {label}
+        </span>
+      ) : (
+        label
+      )}
       {required && (
-        <span aria-hidden="true" className="text-[var(--app-badge-error-text)]">
+        <span
+          aria-hidden="true"
+          className={cn(
+            "text-[var(--app-badge-error-text)]",
+            truncateLabel && "shrink-0 whitespace-pre"
+          )}
+        >
           {" *"}
         </span>
       )}

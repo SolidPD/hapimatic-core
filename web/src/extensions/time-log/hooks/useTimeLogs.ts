@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, type FetchStatus } from "@tanstack/react-query";
 import type { ApiClient } from "@/api/client";
 import type {
   TimeLogEntry,
@@ -10,6 +10,20 @@ import type {
   DerivedDailyBucket,
 } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
+
+/**
+ * Issue #6675 (closer review): `query.isLoading` is `isPending && isFetching`,
+ * so a first fetch that TanStack's onlineManager paused (the device is offline)
+ * read as "not loading" with no data and no error, and the views showed 0m and
+ * "No time logged". A query that has never answered counts as loading while it
+ * is fetching or paused; a disabled query (fetchStatus "idle") does not.
+ */
+function isAwaitingFirstAnswer(query: {
+  isPending: boolean;
+  fetchStatus: FetchStatus;
+}): boolean {
+  return query.isPending && query.fetchStatus !== "idle";
+}
 
 /**
  * Hook for fetching time log entries with optional filters
@@ -42,7 +56,7 @@ export function useTimeLogs(
   return {
     entries: query.data?.entries ?? [],
     total: query.data?.total ?? 0,
-    isLoading: query.isLoading,
+    isLoading: isAwaitingFirstAnswer(query),
     error:
       query.error instanceof Error
         ? query.error.message
@@ -185,7 +199,7 @@ export function useTimeLogProjectGrouped(
 
   return {
     summary: query.data ?? null,
-    isLoading: query.isLoading,
+    isLoading: isAwaitingFirstAnswer(query),
     error:
       query.error instanceof Error
         ? query.error.message
@@ -196,46 +210,12 @@ export function useTimeLogProjectGrouped(
 }
 
 /**
- * Issue #1670 (Sub H1, PR-2): the cutover-status dormancy gate.
+ * Issue #1670 (Sub H1, PR-2): turns-derived daily buckets for a date range.
  *
- * Single source of truth for the read-switch, the CSV source, and which
- * clock-control set renders. Polls every 60s — the gate flips when Sub-G's
- * parity green streak is reached OR when the operator cutover override is set
- * (#2247: server-side `timelogCutover.force`; `forced` is passed through for
- * consumers that want to label the forced state). Defaults to `false` (legacy
- * path) while loading or on error, so the dormant state is fail-safe.
- */
-export function useTimelogCutoverStatus(api: ApiClient | null): {
-  ready: boolean;
-  forced: boolean;
-  isLoading: boolean;
-} {
-  const query = useQuery({
-    queryKey: queryKeys.timeLogCutoverStatus,
-    queryFn: async () => {
-      if (!api) {
-        throw new Error("API unavailable");
-      }
-      return await api.getTimelogCutoverStatus();
-    },
-    enabled: Boolean(api),
-    refetchInterval: 60_000,
-    staleTime: 60_000,
-  });
-
-  return {
-    ready: query.data?.ready ?? false,
-    forced: query.data?.forced ?? false,
-    isLoading: query.isLoading,
-  };
-}
-
-/**
- * Issue #1670 (Sub H1, PR-2): TS-derived daily buckets for a date range.
- *
- * The gated read path — the modal sources its headline totals from this when
- * the cutover gate is green (else the legacy summaries). Bucketed server-side by
- * per-namespace IANA-TZ local day.
+ * The Time Log's read path: every view's totals come from this (issue #6675
+ * retired the cutover gate that used to switch between this and the legacy
+ * summaries). Bucketed server-side by per-namespace IANA-TZ local day.
+ * `refetch` backs the views' Retry buttons.
  */
 export function useDerivedTimeLog(
   api: ApiClient | null,
@@ -246,6 +226,7 @@ export function useDerivedTimeLog(
   buckets: DerivedDailyBucket[];
   isLoading: boolean;
   error: string | null;
+  refetch: () => Promise<unknown>;
 } {
   const query = useQuery({
     queryKey: queryKeys.timeLogDerived(startDate, endDate),
@@ -260,12 +241,13 @@ export function useDerivedTimeLog(
 
   return {
     buckets: query.data?.buckets ?? [],
-    isLoading: query.isLoading,
+    isLoading: isAwaitingFirstAnswer(query),
     error:
       query.error instanceof Error
         ? query.error.message
         : query.error
           ? "Failed to load derived time log"
           : null,
+    refetch: query.refetch,
   };
 }

@@ -27,8 +27,12 @@ import { canonicalJson, utf8ByteLength } from "./throughput";
 // case-insensitive disk), so a pin's files go in `pinFolderName(key)`
 // (`shared/src/pinFiles.ts`, #6453).
 
-/** The one line #6458 flips to turn Pins on. */
-export const PINS_DEFAULT_ENABLED = false;
+/**
+ * Pins is on by default (#6458). `HAPI_PINS_ENABLED` set to anything but `1` /
+ * `true` / `yes` turns it off on one instance; `server/src/config/pinsConfig.ts`
+ * (`resolvePinsEnabled`) is the one reader.
+ */
+export const PINS_DEFAULT_ENABLED = true;
 
 export const PIN_KINDS = [
   "decision",
@@ -285,6 +289,20 @@ export const PinContentObjectSchema = z.strictObject({
    * The contract and its producer are in `./pinDashboard`.
    */
   lanes: PinLanesSchema.optional(),
+  /**
+   * A mirrored prompt's request was first seen pending under this host pid
+   * (#6527, CR2-CM2): the prompt mirror writes it and reads it back after a
+   * server restart, so a resumed process that still lists a dead process's
+   * request neither reopens its pin nor keeps it live. Top-level and optional
+   * with no default (above); the server sets it, and an agent's write that
+   * carries it is refused.
+   */
+  requestHostPid: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Set by the server on a mirrored prompt; leave it out."),
   /** Required on every pin, for any surface that cannot render it. */
   plainText: z
     .string()
@@ -428,6 +446,13 @@ const AgentPinContentSchema = PinContentSchema.superRefine((pin, ctx) => {
       code: "custom",
       path: ["key"],
       message: `keys starting ${PIN_RESERVED_KEY_PREFIXES.join(" or ")} are reserved for the server`,
+    });
+  }
+  if (pin.requestHostPid !== undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["requestHostPid"],
+      message: "only the server sets requestHostPid, on a mirrored prompt",
     });
   }
 });
@@ -583,6 +608,20 @@ export type Pin = PinContent & {
   savedRevision?: number | null;
   saveReportPending?: boolean;
   /**
+   * #6458 (#6540 S-4): how many of the pin's files the last Save left in the
+   * folder and how many it skipped. Optional for the same reason; null on a save
+   * made before them, which reads as complete.
+   */
+  savedFiles?: number | null;
+  savedSkipped?: number | null;
+  /**
+   * #6458 (D-b): on an open `prompt:` pin only, whether the request it mirrors
+   * still waits. False when it is gone (a restart left the pin open), so the
+   * operator may dismiss it. Set when the pin is read, never stored; absent
+   * reads as live, so a node older than L offers no Dismiss.
+   */
+  requestLive?: boolean;
+  /**
    * #6574: the pin's server-owned ID (`pin-` and ten characters,
    * `shared/src/pinId.ts`), minted when the pin is first posted and never changed or
    * reused. Server-owned like `savedTo`: an agent never sends it. Optional because a
@@ -630,6 +669,10 @@ export const PinSchema = z
     savedTo: z.string().nullable().optional(),
     savedRevision: z.number().int().nullable().optional(),
     saveReportPending: z.boolean().optional(),
+    // #6458 (#6540 S-4): optional, because a peer older than L omits them.
+    savedFiles: z.number().int().nullable().optional(),
+    savedSkipped: z.number().int().nullable().optional(),
+    requestLive: z.boolean().optional(),
     // #6574: optional, because a peer older than P omits it.
     pinId: z.string().nullable().optional(),
     createdAt: z.string(),
@@ -744,6 +787,8 @@ export const PinByIdErrorBodySchema = z
     error: z.string().optional(),
     code: z.string().optional(),
     notAsked: z.array(PinByIdNodeSchema).optional(),
+    /** A federated spoke's miss: only its own store was searched (#6458 Task 11i). */
+    localOnly: z.boolean().optional(),
     nodes: z.array(PinByIdNodeSchema).optional(),
     matches: z
       .array(

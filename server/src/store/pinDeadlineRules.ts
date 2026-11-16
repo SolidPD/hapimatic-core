@@ -132,7 +132,10 @@ export function reconcileDeadline(input: {
     return { ...prev, revision };
   }
   if (prev.at === null) {
-    return armed(next, revision, now, newId, prev.changedAt);
+    // The agent arms this time, so it starts with no pending report: an
+    // operator's spent move kept here would tell the agent its own time as one
+    // the operator chose (#6532 S8).
+    return armed(next, revision, now, newId, null);
   }
   if (!pickChanged(prevContent, next)) return { ...prev, revision };
   const pushed = Math.max(

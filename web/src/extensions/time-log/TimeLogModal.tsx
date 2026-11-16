@@ -11,13 +11,11 @@ import type {
 import {
   useTimeLogs,
   useTimeLogProjectGrouped,
-  useTimeLogWeeklySummary,
-  useTimelogCutoverStatus,
   useDerivedTimeLog,
 } from "./hooks/useTimeLogs";
 import { queryKeys } from "@/lib/query-keys";
 import { getEasternTimeDate, formatDurationShort } from "@/utils/easternTime";
-import { exportToCSV, exportDerivedToCSV, exportToJSON } from "./timeLogExport";
+import { exportDerivedToCSV, exportToJSON } from "./timeLogExport";
 import { generateExportFilename } from "@/utils/timeLogExport";
 import {
   ProjectAccordion,
@@ -172,13 +170,21 @@ function ChevronRightIcon({ className }: { className?: string }) {
 
 // ─── Export Menu ──────────────────────────────────────────────────
 
+/**
+ * Issue #6675 (R8): each format is offered when its own source has data. CSV
+ * exports the turns-derived buckets, JSON the read-only archive rows, so a day
+ * with turns and no archive rows (every day since 2026-08-01) still exports CSV.
+ */
 function ExportMenu({
-  entries,
+  canExportCsv,
+  canExportJson,
   onExport,
 }: {
-  entries: TimeLogEntry[];
+  canExportCsv: boolean;
+  canExportJson: boolean;
   onExport: (format: "csv" | "json") => void;
 }) {
+  const nothingToExport = !canExportCsv && !canExportJson;
   const [isOpen, setIsOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -203,13 +209,13 @@ function ExportMenu({
       <BareButton
         type="button"
         onClick={() => setIsOpen(!isOpen)}
-        disabled={entries.length === 0}
+        disabled={nothingToExport}
         className={`px-2 py-1.5 text-xs border rounded-lg flex items-center gap-1 transition-colors ${
-          entries.length === 0
+          nothingToExport
             ? "bg-[var(--app-bg)] border-[var(--app-border)] text-[var(--app-hint)] opacity-50 cursor-not-allowed"
             : "bg-[var(--app-bg)] border-[var(--app-border)] text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)]"
         }`}
-        title={entries.length === 0 ? "No data to export" : "Export time log"}
+        title={nothingToExport ? "No data to export" : "Export time log"}
       >
         <DownloadIcon className="w-3.5 h-3.5" />
       </BareButton>
@@ -218,14 +224,34 @@ function ExportMenu({
           <button
             type="button"
             onClick={() => handleExport("csv")}
-            className="w-full px-3 py-2 text-sm text-left text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] transition-colors"
+            disabled={!canExportCsv}
+            title={
+              canExportCsv
+                ? "Export this day's totals as CSV"
+                : "No logged time to export for this day"
+            }
+            className={`w-full px-3 py-2 text-sm text-left transition-colors ${
+              canExportCsv
+                ? "text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)]"
+                : "text-[var(--app-hint)] opacity-50 cursor-not-allowed"
+            }`}
           >
             CSV
           </button>
           <button
             type="button"
             onClick={() => handleExport("json")}
-            className="w-full px-3 py-2 text-sm text-left text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] transition-colors border-t border-[var(--app-border)]"
+            disabled={!canExportJson}
+            title={
+              canExportJson
+                ? "Export this day's archived entries as JSON"
+                : "No archived entries to export for this day"
+            }
+            className={`w-full px-3 py-2 text-sm text-left transition-colors border-t border-[var(--app-border)] ${
+              canExportJson
+                ? "text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)]"
+                : "text-[var(--app-hint)] opacity-50 cursor-not-allowed"
+            }`}
           >
             JSON
           </button>
@@ -344,9 +370,6 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
   const queryClient = useQueryClient();
   const { showToast } = useToast();
 
-  // Issue #1670 (PR-2): dormancy gate. RED (default) → byte-for-byte legacy.
-  const { ready: cutoverReady } = useTimelogCutoverStatus(api);
-
   // View state
   const [activeTab, setActiveTab] = useState<ViewTab>("day");
 
@@ -396,65 +419,39 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
     refetch: refetchDayEntries,
   } = useTimeLogs(api, dayFilters, activeTab === "day");
 
-  // Week: weekly summary for stacked bars
-  const { summary: weeklySummary, isLoading: weeklyLoading } =
-    useTimeLogWeeklySummary(api, weekStart, activeTab === "week");
+  // Issue #6675: the turns-derived buckets are the Time Log's only read path on
+  // every node. The cutover gate that used to switch the views back to the
+  // legacy `timelog_entries` summaries is retired: its parity opener stopped
+  // running and the legacy table has had no writer since #1892, so a node
+  // without the operator override showed zero hours. The archive survives only
+  // as the Day breakdown's fallback for days with no turns (below).
+  const {
+    buckets: derivedDayBuckets,
+    isLoading: derivedDayLoading,
+    error: derivedDayError,
+    refetch: refetchDerivedDay,
+  } = useDerivedTimeLog(api, selectedDate, selectedDate, activeTab === "day");
 
-  // Week: raw entries for stacked color breakdown
-  const weekFilters = useMemo(
-    () => ({ startDate: weekStart, endDate: weekEndDate }),
-    [weekStart, weekEndDate]
-  );
-  const { entries: weekEntries } = useTimeLogs(
+  // Issue #2577: derived daily buckets for the week/month ranges (no 100-entry
+  // truncation, repo-collapsed project identity). `error` + `refetch` feed the
+  // views' error state with Retry (#6675 R6).
+  const {
+    buckets: derivedWeekBuckets,
+    isLoading: derivedWeekLoading,
+    error: derivedWeekError,
+    refetch: refetchDerivedWeek,
+  } = useDerivedTimeLog(api, weekStart, weekEndDate, activeTab === "week");
+  const {
+    buckets: derivedMonthBuckets,
+    isLoading: derivedMonthLoading,
+    error: derivedMonthError,
+    refetch: refetchDerivedMonth,
+  } = useDerivedTimeLog(
     api,
-    weekFilters,
-    activeTab === "week"
+    monthBounds.startDate,
+    monthBounds.endDate,
+    activeTab === "month"
   );
-
-  // Week: project-grouped summary for drill-down
-  const { summary: weekProjectSummary } = useTimeLogProjectGrouped(
-    api,
-    weekStart,
-    weekEndDate,
-    activeTab === "week"
-  );
-
-  // Month: project-grouped summary
-  const { summary: monthProjectSummary, isLoading: monthLoading } =
-    useTimeLogProjectGrouped(
-      api,
-      monthBounds.startDate,
-      monthBounds.endDate,
-      activeTab === "month"
-    );
-
-  // Issue #1670 (PR-2): derived daily buckets for the selected day — fetched
-  // ONLY when the cutover gate is green; otherwise the legacy merged totals win.
-  const { buckets: derivedDayBuckets } = useDerivedTimeLog(
-    api,
-    selectedDate,
-    selectedDate,
-    activeTab === "day" && cutoverReady
-  );
-
-  // Issue #2577: derived daily buckets for the week/month ranges — fetched ONLY
-  // when the cutover gate is green. When the gate is red the legacy hooks below
-  // still feed WeekView/MonthView unchanged (Fallback Preservation Rule; the
-  // gate-red render path is byte-identical to before this issue).
-  const { buckets: derivedWeekBuckets, isLoading: derivedWeekLoading } =
-    useDerivedTimeLog(
-      api,
-      weekStart,
-      weekEndDate,
-      activeTab === "week" && cutoverReady
-    );
-  const { buckets: derivedMonthBuckets, isLoading: derivedMonthLoading } =
-    useDerivedTimeLog(
-      api,
-      monthBounds.startDate,
-      monthBounds.endDate,
-      activeTab === "month" && cutoverReady
-    );
 
   // Issue #2577: reshape the week's derived buckets into the exact prop shapes
   // WeekView already consumes, so no WeekView change is needed. The stacked-bar
@@ -593,8 +590,8 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
       };
     }, [derivedDayBuckets, selectedDate]);
 
-  // Prefer the turns-derived breakdown; fall back to the read-only archive for
-  // pre-turns days (breakdown empty) or when the cutover gate is not green.
+  // Prefer the turns-derived breakdown; fall back to the read-only archive only
+  // for days with no turns (breakdown empty) — the archive's last use (#6675).
   const mergedDayProjectSummary =
     derivedBreakdownSummary ?? dayProjectSummary ?? null;
 
@@ -602,13 +599,29 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
   // (R2 / netMs). The breakdown above is the turns-derived per-session split (Task
   // 3B); on days carrying a day-level manual adjustment a small breakdown-sum vs
   // netMs gap is accepted (DD-B).
-  const derivedDayTotalMs = useMemo(
+  const dayTotalMs = useMemo(
     () => derivedDayBuckets.reduce((sum, b) => sum + b.netMs, 0),
     [derivedDayBuckets]
   );
-  const dayTotalMs = cutoverReady
-    ? derivedDayTotalMs
-    : (mergedDayProjectSummary?.totalMs ?? 0);
+
+  // Issue #6675 (R6): a failed derived request shows the error block, but only
+  // when it left nothing to show — a failed background refetch keeps the cached
+  // figures on screen instead of replacing them with an error.
+  const derivedDayFailed =
+    Boolean(derivedDayError) && derivedDayBuckets.length === 0;
+  // The archive list feeds only the JSON export and the entry ids, so its error
+  // replaces the Day body only when the day has nothing else to show.
+  const dayEntriesFailed =
+    Boolean(dayEntriesError) &&
+    dayEntries.length === 0 &&
+    mergedDayProjectSummary === null;
+  const dayError =
+    (derivedDayFailed ? derivedDayError : null) ??
+    (dayEntriesFailed ? dayEntriesError : null);
+  const retryDay = useCallback(() => {
+    void refetchDayEntries();
+    void refetchDerivedDay();
+  }, [refetchDayEntries, refetchDerivedDay]);
 
   const sessionCount = useMemo(
     () =>
@@ -640,17 +653,14 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
     (format: "csv" | "json") => {
       const filename = generateExportFilename("timelog", format, selectedDate);
       if (format === "csv") {
-        // R5: when the gate is green, CSV serializes the derived buckets.
-        if (cutoverReady) {
-          exportDerivedToCSV(derivedDayBuckets, filename);
-        } else {
-          exportToCSV(mergedDayEntries, filename);
-        }
+        // CSV serializes the turns-derived buckets (#1670 R5; the only CSV
+        // source since #6675). JSON still exports the read-only archive rows.
+        exportDerivedToCSV(derivedDayBuckets, filename);
       } else {
         exportToJSON(mergedDayEntries, filename);
       }
     },
-    [mergedDayEntries, selectedDate, cutoverReady, derivedDayBuckets]
+    [mergedDayEntries, selectedDate, derivedDayBuckets]
   );
 
   // Navigate from week bar click to day view
@@ -744,7 +754,11 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
               >
                 <ChevronRightIcon />
               </button>
-              <ExportMenu entries={mergedDayEntries} onExport={handleExport} />
+              <ExportMenu
+                canExportCsv={derivedDayBuckets.length > 0}
+                canExportJson={mergedDayEntries.length > 0}
+                onExport={handleExport}
+              />
             </div>
           </div>
         )}
@@ -757,7 +771,11 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
                 Daily Total
               </span>
               <span className="text-lg font-semibold text-[var(--app-fg)] tabular-nums">
-                {dayProjectLoading ? "..." : formatDurationShort(dayTotalMs)}
+                {dayProjectLoading || derivedDayLoading
+                  ? "..."
+                  : derivedDayFailed
+                    ? "—"
+                    : formatDurationShort(dayTotalMs)}
               </span>
             </div>
             {sessionCount > 0 && (
@@ -774,19 +792,19 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
         <div className="flex-1 overflow-y-auto mt-3 -mx-6 px-6">
           {activeTab === "day" && (
             <div className="space-y-4">
-              {dayProjectLoading || dayEntriesLoading ? (
+              {dayProjectLoading || dayEntriesLoading || derivedDayLoading ? (
                 <div className="text-center py-4 text-[var(--app-hint)]">
                   <div className="animate-spin w-5 h-5 border-2 border-[var(--brand-accent)] border-t-transparent rounded-full mx-auto mb-2" />
                   Loading entries...
                 </div>
-              ) : dayEntriesError ? (
+              ) : dayError ? (
                 <div className="text-center py-4">
                   <div className="text-sm text-[var(--app-badge-error-text)] mb-2">
-                    {dayEntriesError}
+                    {dayError}
                   </div>
                   <button
                     type="button"
-                    onClick={() => void refetchDayEntries()}
+                    onClick={retryDay}
                     className="px-4 py-2 text-sm bg-[var(--app-subtle-bg)] border border-[var(--app-border)] rounded-lg text-[var(--app-fg)] hover:bg-[var(--app-secondary-bg)] transition-colors"
                   >
                     Retry
@@ -817,18 +835,16 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
           {activeTab === "week" && (
             <div className="p-3 bg-[var(--app-subtle-bg)] rounded-lg">
               <WeekView
-                weeklySummary={
-                  cutoverReady ? derivedWeeklySummary : weeklySummary
-                }
-                weekEntries={cutoverReady ? derivedWeekEntries : weekEntries}
-                projectSummary={
-                  cutoverReady ? derivedWeekProjectSummary : weekProjectSummary
-                }
-                isLoading={cutoverReady ? derivedWeekLoading : weeklyLoading}
+                weeklySummary={derivedWeeklySummary}
+                weekEntries={derivedWeekEntries}
+                projectSummary={derivedWeekProjectSummary}
+                isLoading={derivedWeekLoading}
                 weekNumber={weekNumber}
                 weekStart={weekStart}
                 onWeekChange={setWeekStart}
                 onDayClick={handleDayClick}
+                error={derivedWeekError}
+                onRetry={() => void refetchDerivedWeek()}
               />
             </div>
           )}
@@ -836,18 +852,16 @@ export function TimeLogModalBody({ api }: TimeLogModalBodyProps) {
           {activeTab === "month" && (
             <div className="p-3 bg-[var(--app-subtle-bg)] rounded-lg">
               <MonthView
-                summary={
-                  cutoverReady
-                    ? derivedMonthProjectSummary
-                    : monthProjectSummary
-                }
-                isLoading={cutoverReady ? derivedMonthLoading : monthLoading}
+                summary={derivedMonthProjectSummary}
+                isLoading={derivedMonthLoading}
                 year={monthYear}
                 month={monthMonth}
                 onMonthChange={(y, m) => {
                   setMonthYear(y);
                   setMonthMonth(m);
                 }}
+                error={derivedMonthError}
+                onRetry={() => void refetchDerivedMonth()}
               />
             </div>
           )}

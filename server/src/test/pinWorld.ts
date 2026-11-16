@@ -11,7 +11,7 @@ import {
   type SendMessageResult,
 } from "../sync/messageService";
 import { PinService } from "../sync/pinService";
-import { PinTurnCheck } from "../sync/pinTurnCheck";
+import { openPinInNamespace, PinTurnCheck } from "../sync/pinTurnCheck";
 import type { MessageOrigin } from "../sync/sentFrom";
 import type { Session, SyncEngine } from "../sync/syncEngine";
 
@@ -78,6 +78,11 @@ export function makePinWorld(dbPath = ":memory:") {
       pins,
       getRecentMessages: (sid, options) =>
         store.messages.getRecentMessagesBounded(sid, options),
+      resolveOpenPinNamespace: openPinInNamespace({
+        getByPinId: pinId => pins.getByPinId(pinId),
+        getSessionByNamespace: (id, namespace) =>
+          sessions.find(s => s.id === id && s.namespace === namespace),
+      }),
     }),
     getSession: (id: string) => sessions.find(s => s.id === id),
     getSessionByNamespace: (id: string, namespace: string) =>

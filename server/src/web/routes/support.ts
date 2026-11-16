@@ -298,6 +298,9 @@ export function createSupportRoutes(
         // permission mode, which may be YOLO (#6218).
         yolo: false,
         sessionType: "simple",
+        // Issue #6646 (ruling SYS-1): the support session is one of Hapimatic's
+        // own, never billable at its start.
+        billableSwitchStart: { kind: "system" },
         name: SUPPORT_SESSION_NAME,
       });
       if (result.type === "error") {

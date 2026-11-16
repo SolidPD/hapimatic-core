@@ -68,6 +68,11 @@ import { buildSessionPushPayload } from "../push/sessionPushPayload";
 import { getSessionName } from "../notifications/sessionInfo";
 import { getCeilingGuardDefaults } from "../config/ceilingGuardConfig";
 import {
+  BILLABLE_SWITCH_GATE_DARK,
+  type BillableSwitchGateState,
+} from "../config/billableSwitchConfig";
+import type { BillableSwitchService } from "../billableSwitch/billableSwitchService";
+import {
   CEILING_RATE_WINDOW_MS,
   evaluateCeilings,
   resolveEffectiveCeilings,
@@ -97,7 +102,7 @@ import { isNewUserFacingAssistantContent } from "./needsReviewContent";
 import { PinService } from "./pinService";
 import { PinFenceIngest } from "./pinFenceIngest";
 import { PinPromptMirror } from "./pinPromptMirror";
-import { PinTurnCheck } from "./pinTurnCheck";
+import { openPinInNamespace, PinTurnCheck } from "./pinTurnCheck";
 import { resolvePinsEnabled } from "../config/pinsConfig";
 import type { MessageOrigin, SentFrom } from "./sentFrom";
 import {
@@ -147,6 +152,10 @@ import {
   type RecoverWorktreeRpcResult,
 } from "./rpcGateway";
 import type { SpawnSuccess } from "./spawnSuccess";
+import {
+  readPermissionDecline,
+  type PermissionDeclined,
+} from "./permissionDecline";
 import { notifySessionEnded as notifyTranscriptSessionEnded } from "../services/transcriptIndexer";
 import { resolveTranscriptPaths } from "./transcript/transcriptPath";
 import {
@@ -165,15 +174,19 @@ import {
 } from "./backgroundAgentSeed";
 import type { TurnBillingBinding } from "../store/turns/types";
 import { isValidAgentId } from "./agentId";
-import { SessionCache } from "./sessionCache";
 import { BillableIntervalTracker } from "../billable/intervalTracker";
 import { IntervalWriteService } from "../billable/intervalWriteService";
 import type { BillableMode } from "../billable/mode";
+import {
+  RunnerAttachRefusedError,
+  type RunnerIdentity,
+} from "./runnerIdentity";
 import {
   nextReconcileDelayMs,
   runBillableReconcile,
   type ReconcileLive,
 } from "../billable/reconcile";
+import { SessionCache, type BillableSwitchStartHook } from "./sessionCache";
 import {
   filterClaimsToLiveSessions,
   liveSessionIdSet,
@@ -186,6 +199,10 @@ import {
 } from "@hapi/protocol";
 import type {
   IntervalFeedPage,
+  BillableSwitchEventFeedPage,
+  BillableSwitchHeader,
+  BillableSwitchMode,
+  BillableSwitchStartContext,
   TurnFeedDigest,
   TurnFeedPage,
   TurnMirrorOriginStatus,
@@ -404,7 +421,26 @@ export interface SpawnSessionOptions {
    *  Absent ⇒ the daemon uses its static fallback lookup (or no clamp). Forwarded
    *  field-by-field on the spawn RPC (the #1262 trap). */
   modelEffortLevels?: EffortLevel[];
+  /**
+   * Issue #6646: how this start came about, for the billable switch's start
+   * value (the truth table of the plan's Task 1). REQUIRED, so the type checker
+   * names every caller: the routes build it from the request (never from a
+   * client body), the scheduler passes `schedule`, Hapimatic's own sessions
+   * `system`, a branch, a successor and a respawn `inherit`. Server-only: never
+   * forwarded to the daemon (rpcGateway's payload does not list it). Queued by
+   * tag before the RPC, and applied when the child registers.
+   */
+  billableSwitchStart: BillableSwitchStartContext;
 }
+
+/**
+ * #6646: what `RpcGateway.spawnSession` takes. The server-only `billableSwitchStart`
+ * is left out by type, so it cannot reach the daemon payload.
+ */
+export type GatewaySpawnOptions = Omit<
+  SpawnSessionOptions,
+  "billableSwitchStart"
+>;
 
 /** Issue #6028: maps a spawn's model pin to the effort levels that model supports. */
 /** Issue #6070: async so the spawn path can wait on an in-flight catalog fetch
@@ -517,6 +553,13 @@ const MODEL_DOWNGRADE_NOTICE = [
  * the pager-spam guard.
  */
 const SESSION_FATAL_ESCALATION_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
+/** #2503 (B1): told after a successful non-null link write; see `setLinkedIssueListener`. */
+export type LinkedIssueListener = (
+  issue: { repo: string; number: number },
+  sessionId: string,
+  previous: { repo: string; number: number } | null
+) => void;
 
 export class SyncEngine {
   private readonly store: Store;
@@ -711,6 +754,8 @@ export class SyncEngine {
    * page, the daily check and the read API all read this one effective mode.
    */
   private readonly billableEffectiveMode: BillableMode;
+  /** Issue #6647: the runner identity registry (null: no identity step). */
+  private readonly runnerIdentity: RunnerIdentity | null;
   private readonly billableWrites: IntervalWriteService;
   private readonly billableTracker: BillableIntervalTracker;
 
@@ -739,12 +784,15 @@ export class SyncEngine {
       jobRegistry?: JobRegistry | null;
       /** #6586: absent means `off` (no start-up step ran for this engine). */
       billableMode?: BillableMode;
+      /** #6647: the one runner identity registry; absent means no identity step. */
+      runnerIdentity?: RunnerIdentity | null;
     }
   ) {
     this.store = store;
     this.jobRegistry = jobOpts?.jobRegistry ?? null;
     this.jobNode = jobOpts?.node ?? "standalone";
     this.billableEffectiveMode = jobOpts?.billableMode ?? "off";
+    this.runnerIdentity = jobOpts?.runnerIdentity ?? null;
     // The landing closure reads `this.sessionCache` when it runs, on a later
     // setTimeout tick of the write service, after the cache below is built.
     this.billableWrites = new IntervalWriteService(
@@ -798,7 +846,21 @@ export class SyncEngine {
                 machineId,
                 tag
               );
-              if (alive === true) {
+              // #6647 (Task 12a, R15): a wrapper the identity layer cut off is
+              // alive with no socket and never comes back; it falls through to
+              // the re-check and the terminal archive below, and Reconnect then
+              // respawns it. Every other alive session is re-marked as before.
+              const cutOff =
+                alive === true &&
+                this.wasCutOffByIdentity(sessionId) &&
+                !this.rpcGateway.hasConnectedCli(sessionId);
+              if (cutOff) {
+                this.errorLogger?.warn(
+                  `Force-kill watchdog: session ${sessionId} is alive but was cut off by runner identity and has no socket — not re-marking it active (issue #6647)`,
+                  { category: "sync", sessionId }
+                );
+              }
+              if (alive === true && !cutOff) {
                 this.errorLogger?.warn(
                   `Force-kill watchdog: session ${sessionId} flagged inactive >5min but the daemon reports it ALIVE — skipping archive, refreshing activeAt (issue #1661)`,
                   { category: "sync", sessionId }
@@ -911,6 +973,13 @@ export class SyncEngine {
       pins: this.pins,
       getRecentMessages: (sid, options) =>
         store.messages.getRecentMessagesBounded(sid, options),
+      // #6527 (ruling Q3-A): another session's open pin, named by ID, covers an
+      // ask when that session is in the caller's namespace on this node.
+      resolveOpenPinNamespace: openPinInNamespace({
+        getByPinId: pinId => this.pins.getByPinId(pinId),
+        getSessionByNamespace: (sid, namespace) =>
+          this.getSessionByNamespace(sid, namespace),
+      }),
     });
     this.eventPublisher.subscribe(event => {
       try {
@@ -1042,6 +1111,8 @@ export class SyncEngine {
       getLoopCronCoupler: () => this.loopCronCoupler,
       // #4914: waiting-for-slot / account-unrefreshable notifications.
       notifyUser: input => this.notifyUser(input),
+      // #6647 (Task 12a, R15): Reconnect respawns a cut-off live wrapper.
+      wasCutOffByIdentity: sessionId => this.wasCutOffByIdentity(sessionId),
     });
     // Issue #2080: account-keyed restart delegate (switchAccount +
     // tokenRefreshRestart). archiveSession + spawnSession stay facade methods
@@ -1089,6 +1160,9 @@ export class SyncEngine {
       onSessionDeleted: sid => {
         this.roleOverrideSeeded.delete(sid);
         this.downgradeNotified.delete(sid);
+        // Issue #6647 (F2, N2): right after the row delete, before any awaited
+        // cleanup, so no timer tick retries a write for a row that is gone.
+        this.forgetRunner(sid);
         try {
           this.store.turns.deleteCeilingBreaches(sid);
         } catch (err) {
@@ -1254,6 +1328,16 @@ export class SyncEngine {
   private buildBillableReconcileLive(): ReconcileLive {
     const tracker = this.billableTracker;
     const writes = this.billableWrites;
+    // #6670 (R5): one snapshot of the old clock's running stretch per session,
+    // taken in the same synchronous slice as the comparison. `getSessions()`, not
+    // `getSession()`: the latter falls back to `refreshSession`, which emits events
+    // and can tell the tracker a session was removed. In `shadow` the cached
+    // `thinkingStartedAt` is the old clock's start, which is the stretch key.
+    const oldClockStart = new Map(
+      this.sessionCache
+        .getSessions()
+        .map(session => [session.id, session.thinkingStartedAt ?? null])
+    );
     return {
       trackedOpenStartMs: sessionId => tracker.openStartMs(sessionId),
       hasQueuedOp: sessionId => writes.hasQueuedOp(sessionId),
@@ -1266,6 +1350,7 @@ export class SyncEngine {
         })),
       counters: () => writes.getCounters(),
       liveAttachCount: () => tracker.liveAttachCount(),
+      oldClockStretchStartMs: sessionId => oldClockStart.get(sessionId) ?? null,
     };
   }
 
@@ -1485,6 +1570,32 @@ export class SyncEngine {
     return this.sessionCache.getActiveSessions();
   }
 
+  /** Issue #6647 (Task 9): the runner identity registry, for its status route. */
+  getRunnerIdentity(): RunnerIdentity | null {
+    return this.runnerIdentity;
+  }
+
+  /**
+   * #6647 (Task 12a, R15): the runner identity cut-off mark, read with the
+   * session's namespace so a mark stored before a server restart is found.
+   * False with no identity layer or on any fault.
+   */
+  private wasCutOffByIdentity(sessionId: string): boolean {
+    try {
+      const identity = this.runnerIdentity;
+      if (identity === null) return false;
+      const namespace = this.sessionCache.getSession(sessionId)?.namespace;
+      return identity.wasCutOff(sessionId, namespace);
+    } catch {
+      return false;
+    }
+  }
+
+  /** #6586's count of live attaches, for the identity route's V9 read (#6647). */
+  billableLiveAttachCount(): number {
+    return this.billableTracker.liveAttachCount();
+  }
+
   /**
    * Issue #2627 (Sub-Issue E, R5): scrub a deleted custom output-style name from
    * every persisted session so a respawn never carries a now-missing style.
@@ -1610,6 +1721,63 @@ export class SyncEngine {
   /** Issue #6171: the MCP picker's data source for this node. */
   getMcpCatalog(): McpCatalogService {
     return this.mcpCatalog;
+  }
+
+  /**
+   * Issue #6646: this node's effective billable-sessions gate, resolved ONCE per
+   * process in `server/src/index.ts` right after `new Store` and set here right
+   * after construction (never through the constructor, which #6586 extends).
+   * Dark until set, so a test or a bare build reads `off`.
+   */
+  private billableSwitchGate: BillableSwitchGateState =
+    BILLABLE_SWITCH_GATE_DARK;
+
+  setBillableSwitchGate(state: BillableSwitchGateState): void {
+    this.billableSwitchGate = state;
+  }
+
+  getBillableSwitchGateState(): BillableSwitchGateState {
+    return this.billableSwitchGate;
+  }
+
+  /** The in-process reader for #6484, #6204 and the routes: `off`, `on` or `closed`. */
+  getBillableSwitchMode(): BillableSwitchMode {
+    return this.billableSwitchGate.mode;
+  }
+
+  /**
+   * Issue #6646: the billable switch's service, constructed in index.ts after
+   * this engine exists (never inside the constructor call) and attached here so
+   * every route and receiver reaches the same instance. Null until attached.
+   */
+  private billableSwitchService: BillableSwitchService | null = null;
+
+  setBillableSwitchService(service: BillableSwitchService | null): void {
+    this.billableSwitchService = service;
+  }
+
+  getBillableSwitchService(): BillableSwitchService | null {
+    return this.billableSwitchService;
+  }
+
+  /** Issue #6646: re-read one session after a switch write (emits session-updated). */
+  refreshBillableSwitchSession(sessionId: string): void {
+    this.sessionCache.refreshSession(sessionId);
+  }
+
+  /** Issue #6646: install the start hook (index.ts, only while the gate is on). */
+  setBillableSwitchStartHook(hook: BillableSwitchStartHook | null): void {
+    this.sessionCache.setBillableSwitchStartHook(hook);
+  }
+
+  /** Issue #6646: the 30-minute sweep of both tag-keyed spawn queues (a timer calls it). */
+  sweepPendingSpawnQueues(): void {
+    this.sessionCache.sweepPendingByTag();
+  }
+
+  /** Issue #6646: this node's header defaults, all namespaces (the poll report). */
+  listBillableSwitchHeaders(): BillableSwitchHeader[] {
+    return this.store.billableSwitch.listHeaders();
   }
 
   updateMcpStatus(status: McpStatusUpdate): void {
@@ -2395,6 +2563,20 @@ export class SyncEngine {
   }
 
   /**
+   * #2503 (design B, B1): called after every successful non-null link write,
+   * with the new `{repo, number}`, the session id and the previous link (read
+   * before the write). Every local link write converges on
+   * {@link updateSessionLinkedIssue} (the `/api` local branch, the owning
+   * node's federation receiver, the `/cli` PUT), so this one seam covers them
+   * all. Wired in index.ts to the workflow reconcile trigger. Null removes it.
+   */
+  private linkedIssueListener: LinkedIssueListener | null = null;
+
+  setLinkedIssueListener(listener: LinkedIssueListener | null): void {
+    this.linkedIssueListener = listener;
+  }
+
+  /**
    * Issue #1905 / #5254: the runaway-session ceiling guard — the direct sibling
    * of {@link checkModelDowngrade}. Fired at the turn-finalize seam via the
    * `ceilingGuardStep` FinalizeStep (PUBLIC because the step invokes it from
@@ -2874,18 +3056,62 @@ export class SyncEngine {
     this.machineCache.reloadAll(true);
   }
 
+  /**
+   * Issue #6647 (Tasks 5 and 12): a runner's attach. With `runner` given and
+   * identity not `off`, the attach is decided before the cache attaches and
+   * recorded only after it succeeded, with no `await` between the steps (plan
+   * §7). An `enforce` refusal throws `RunnerAttachRefusedError` here, before
+   * the cache attach and the #6586 attach hook (R3); without `runner` nothing
+   * changes.
+   */
   getOrCreateSession(
     tag: string,
     metadata: unknown,
     agentState: unknown,
-    namespace: string
+    namespace: string,
+    runner?: { id?: string; pid?: number; startedBy?: string | null }
   ): Session {
-    return this.sessionCache.getOrCreateSession(
+    const identity = this.runnerIdentity;
+    if (runner === undefined || identity === null || identity.mode === "off") {
+      return this.sessionCache.getOrCreateSession(
+        tag,
+        metadata,
+        agentState,
+        namespace
+      );
+    }
+    const plan = identity.attach({
+      tag,
+      namespace,
+      runnerId: runner.id ?? null,
+      pid: runner.pid ?? null,
+      startedBy: runner.startedBy ?? null,
+    });
+    if (!plan.proceed && plan.existingSessionId !== null) {
+      // The name comes from the stored row (a cache read could refresh it);
+      // a failed read keeps the refusal and names the session by its id.
+      let name: string | null = null;
+      try {
+        const meta = this.store.sessions.getSession(plan.existingSessionId)
+          ?.metadata as { name?: unknown } | null | undefined;
+        name = typeof meta?.name === "string" ? meta.name : null;
+      } catch {
+        name = null;
+      }
+      throw new RunnerAttachRefusedError(
+        plan.refusal ?? "session-exists",
+        plan.existingSessionId,
+        name
+      );
+    }
+    const session = this.sessionCache.getOrCreateSession(
       tag,
       metadata,
       agentState,
       namespace
     );
+    identity.commitAttach(plan, session.id);
+    return session;
   }
 
   getOrCreateMachine(
@@ -3138,15 +3364,25 @@ export class SyncEngine {
     mode?: PermissionMode,
     allowTools?: string[],
     decision?: "approved" | "approved_for_session" | "denied" | "abort",
-    answers?: Record<string, string[]>
-  ): Promise<void> {
-    await this.rpcGateway.approvePermission(
-      sessionId,
-      requestId,
-      mode,
-      allowTools,
-      decision,
-      answers
+    answers?: Record<string, string[]>,
+    /**
+     * "session" when a session answered: the entry hub's route sets it from
+     * `X-Hapi-Session-Id`, never from the caller's body; a peer takes it from
+     * the entry hub's federation forward (#6606 R18).
+     */
+    answeredBy?: "session"
+  ): Promise<PermissionDeclined | null> {
+    // #6606 round 9 (F4): the CLI's decline of the answer set, or null.
+    return readPermissionDecline(
+      await this.rpcGateway.approvePermission(
+        sessionId,
+        requestId,
+        mode,
+        allowTools,
+        decision,
+        answers,
+        answeredBy
+      )
     );
   }
 
@@ -3534,6 +3770,26 @@ export class SyncEngine {
     return this.billableEffectiveMode;
   }
 
+  /**
+   * Issue #6646 (Task 7b): one page of this node's billable switch record for a
+   * puller, the rows after `cursor`, whole. `limit` is clamped to 1..1000 (500
+   * by default). The incarnation is the turn ledger's (one per database).
+   */
+  getBillableSwitchEventFeedPage(opts: {
+    cursor?: number;
+    limit?: number;
+  }): BillableSwitchEventFeedPage {
+    const cursor = Math.max(0, Math.floor(opts.cursor ?? 0));
+    const limit = Math.min(Math.max(Math.floor(opts.limit ?? 500), 1), 1000);
+    const page = this.store.billableSwitch.getEventFeedPage(cursor, limit);
+    return {
+      incarnation: this.store.turns.getLedgerIncarnation(),
+      maxEventId: this.store.billableSwitch.getMaxEventId(),
+      events: page.events,
+      nextCursor: page.nextCursor,
+    };
+  }
+
   /** Per-day digest of this node's finalized turns for the #4614 drift check (R10). */
   getTurnFeedDigest(): TurnFeedDigest {
     return {
@@ -3691,6 +3947,20 @@ export class SyncEngine {
     return result;
   }
 
+  /**
+   * Issue #6647 (F2, N2, plan section 7): a deleted session leaves the runner
+   * identity registry, so a pending record write for it is no longer retried.
+   * Called from the `onSessionDeleted` hook, which SessionDeletion runs right
+   * after the row delete on the single and the bulk path.
+   */
+  private forgetRunner(sessionId: string): void {
+    try {
+      this.runnerIdentity?.forget(sessionId);
+    } catch {
+      // Fail open (R11): a delete never fails because of the registry.
+    }
+  }
+
   async updateSessionNotes(
     sessionId: string,
     notes: string | null
@@ -3742,7 +4012,26 @@ export class SyncEngine {
       state?: "open" | "closed";
     } | null
   ): Promise<void> {
+    const before = this.sessionCache.getSession(sessionId)?.linkedIssue;
+    const previous =
+      before &&
+      typeof before.repo === "string" &&
+      typeof before.number === "number"
+        ? { repo: before.repo, number: before.number }
+        : null;
+    // An unknown session or a failed write throws here, before the listener.
     await this.sessionCache.updateSessionLinkedIssue(sessionId, linkedIssue);
+    if (linkedIssue && this.linkedIssueListener) {
+      try {
+        this.linkedIssueListener(
+          { repo: linkedIssue.repo, number: linkedIssue.number },
+          sessionId,
+          previous
+        );
+      } catch {
+        // fail-open (#2503): a listener never fails the link write
+      }
+    }
   }
 
   /**
@@ -4134,8 +4423,45 @@ export class SyncEngine {
     // (create, reconnect start-fresh, branch, scheduler, federation peer-incoming)
     // funnels through here, so this one stamp gives the local baseline for free
     // and the remote raw-RPC total. Additive log only; grep `[perf][spawn]`.
+    // Issue #6646: queue the start context by TAG before the daemon RPC, only
+    // while the gate is on (the start rule runs only then). A tag is generated
+    // when the caller gave none, widening #2862's tag generation from managed
+    // peers to every spawn that can create a row (the daemon uses a provided
+    // tag on every path). Kept across an uncoded error: the RPC can time out
+    // after the daemon started the session, and the late registration finds it.
+    if (this.billableSwitchGate.mode === "on") {
+      if (!opts.hapiSessionId) {
+        opts.hapiSessionId = generateSessionId();
+      }
+      this.sessionCache.queuePendingBillableSwitchStartByTag(
+        opts.hapiSessionId,
+        opts.billableSwitchStart
+      );
+    }
+
+    // Issue #6647 (Task 5, §4.2): note the spawn this hub asked for, by tag, once,
+    // after every tag mint above (#2862, #6646); a later takeover then reads as
+    // requested. A label only: it never fails or changes a spawn.
+    if (opts.hapiSessionId) {
+      try {
+        this.runnerIdentity?.noteSpawnRequested(opts.hapiSessionId);
+      } catch {
+        // The registry fails open itself; this guards the spawn path regardless.
+      }
+    }
+
     const perfSpawnT0 = Date.now();
     const result = await this.rpcGateway.spawnSession(opts);
+    // Issue #6646: a CODED refusal (for example `at_capacity`) proves no child
+    // exists, so both tag-keyed entries go at once. An uncoded error (the 75 s
+    // timeout among them) keeps them for a late registration; the 30-minute
+    // sweep ends any that never register.
+    if (result.type === "error" && result.code && opts.hapiSessionId) {
+      this.sessionCache.deletePendingBillableSwitchStartByTag(
+        opts.hapiSessionId
+      );
+      this.sessionCache.deletePendingParentByTag(opts.hapiSessionId);
+    }
     this.errorLogger?.info(
       `[perf][spawn] stage=syncEngine-spawnSession key=${opts.hapiSessionId ?? (result.type === "success" ? result.sessionId : "")} dir=${opts.directory} node=${opts.originatingNodeId ?? "local"} result=${result.type} ms=${Date.now() - perfSpawnT0}`,
       { category: "perf" }

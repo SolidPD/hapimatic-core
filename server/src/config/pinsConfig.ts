@@ -5,12 +5,14 @@ import { isEnvFlagTruthy } from "../provisioner/capability";
 /**
  * The one Pins gate (issue #6447, epic #6446). Every pin route on every surface,
  * the `/api/version` flag, the session count, and the hub's bridge read this one
- * value. Sub-Issue L (#6458) turns Pins on by flipping `PINS_DEFAULT_ENABLED` in
- * `shared/src/pins.ts`, and this variable stays as the per-instance override.
+ * value. Pins is on by default since Sub-Issue L (#6458, `PINS_DEFAULT_ENABLED`
+ * in `shared/src/pins.ts`), and this variable is the per-instance override.
  *
  * Env-only, in the house `isEnvFlagTruthy` parse (`1` / `true` / `yes`). The
- * variable set to anything else closes the gate, so `HAPI_PINS_ENABLED=0` is the
- * kill switch once the default is on. Server-side only: the web client and the
+ * variable set to anything else (`0`, empty, a padded value: it is not trimmed)
+ * closes the gate, so `HAPI_PINS_ENABLED=0` is the per-node kill switch
+ * (`docs/internal/architecture/sync.md`, "Turning Pins off on one node").
+ * Server-side only: the web client and the
  * session process read the answer from `GET /api/version`, because the daemon
  * and the server are separate units with separate environments.
  */

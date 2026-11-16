@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /* eslint-disable max-lines -- Grandfathered god-file (Epic 0, #2077); decomposition verdict tracked in claudedocs/architecture-hotspot-review.md. */
 import {
+  openPinCountField,
+  readOpenPinCounts,
+} from "../../sync/openPinCountReads";
+import {
   defineCapability,
   getPermissionModesForFlavor,
   isModelModeAllowedForFlavor,
@@ -56,6 +60,19 @@ import {
   summarizeBulkFailures,
   type BulkSessionAction,
 } from "./bulkSessionActions";
+import type { BillableSwitchMode } from "@hapi/protocol";
+import { billableSwitchGate } from "../middleware/billableSwitchGate";
+import {
+  billableSwitchActor,
+  billableSwitchVia,
+  refuseAgentBillableWrite,
+} from "./agentEscalation";
+import {
+  BillableSwitchKeepAllRequestSchema,
+  closedRefusal,
+  describeIssue,
+  runBillableKeepAll,
+} from "./billableSwitch";
 import type { PaymentMethodTarget } from "../../sync/accountRestart";
 import {
   EMOJI_MUTATION,
@@ -190,7 +207,7 @@ function computeSessions(
   const messageCounts = engine.getMessageCountsByNamespace(namespace);
   const branchCounts = engine.getChildBranchCounts(namespace);
   // #6447: absent, not zero, while the Pins gate is closed.
-  const pinCounts = resolvePinsEnabled() ? engine.getOpenPinCounts() : null;
+  const pinCounts = resolvePinsEnabled() ? readOpenPinCounts(engine) : null;
 
   const real = allSessions
     .sort((a, b) => {
@@ -249,10 +266,13 @@ export function createSessionsRoutes(
     getLocalNode?: () => { nodeId: string; nodeLabel: string };
     // Issue #5879: this node's usage cache for the rebind headroom check.
     getUsageService?: () => UsageService | null;
+    // Issue #6646: the billable-sessions gate, read once at mount (default off).
+    billableSwitchMode?: BillableSwitchMode;
   }
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   const errorLogger = options?.errorLogger ?? null;
+  const billableSwitchMode = options?.billableSwitchMode ?? "off";
   const getLocalNode =
     options?.getLocalNode ?? (() => resolveLocalNodeIdentity(null));
 
@@ -507,7 +527,7 @@ export function createSessionsRoutes(
         session: sessionResult.session,
         messageCount,
         ...(resolvePinsEnabled()
-          ? { openPinCount: engine.getOpenPinCount(sessionResult.sessionId) }
+          ? openPinCountField(engine, sessionResult.sessionId)
           : {}),
       });
     }
@@ -2291,8 +2311,10 @@ export function createSessionsRoutes(
       }
 
       const body = await c.req.json().catch(() => null);
+      // #6681 (R9): any id of 1-256 characters is answered per id, so one
+      // spawn placeholder (`hapi-…`) never fails the whole selection.
       const parsed = z
-        .object({ ids: z.array(z.string().uuid()).min(1).max(100) })
+        .object({ ids: z.array(z.string().min(1).max(256)).min(1).max(100) })
         .safeParse(body);
 
       if (!parsed.success) {
@@ -2325,13 +2347,29 @@ export function createSessionsRoutes(
       }
 
       // #6210: record why sessions were left behind (one entry per request).
-      const failures = summarizeBulkFailures(results);
+      // #6681: `not_found` is not a failure (the web counts it as deleted), so
+      // it is left out of the count and logged as a count of its own; the
+      // `pending` and `not_sent` reasons are named by summarizeBulkFailures.
+      const failures = summarizeBulkFailures(results, ["not_found"]);
+      const notFound = results.filter(r => r.code === "not_found").length;
+      if (!failures && notFound > 0) {
+        // F1: the hub's not_found is a cache miss; keep the count on record
+        // even when nothing else was left behind (N3: say only what is known).
+        errorLogger?.info(
+          `Bulk delete: every session answered ok or not_found; ${notFound} of ${results.length} not_found`,
+          { category: "sessions-bulk-delete", context: { notFound } }
+        );
+      }
       if (failures) {
         errorLogger?.warn(
           `Bulk delete: ${failures.failed} of ${results.length} session(s) not deleted`,
           {
             category: "sessions-bulk-delete",
-            context: { byReason: failures.byReason, samples: failures.samples },
+            context: {
+              byReason: failures.byReason,
+              samples: failures.samples,
+              ...(notFound > 0 ? { notFound } : {}),
+            },
           }
         );
       }
@@ -2460,6 +2498,63 @@ export function createSessionsRoutes(
       })
     ),
     handleBulkAction("archive")
+  );
+
+  // Issue #6646: Keep all, over sessions on any nodes. A person's action: an
+  // agent request is refused. A remote session goes to its node's per-session
+  // confirm receiver with the reason `confirm-all`; there is no bulk switch-on or
+  // switch-off route (each switch-off shows its own minutes first).
+  app.post(
+    "/sessions/bulk-billable-keep",
+    cataloged(
+      defineCapability({
+        id: "session-lifecycle.billable-keep-all",
+        domain: "session-lifecycle",
+        surface: "rest",
+        description:
+          "Keep billable every listed session that is waiting for a billable confirmation, up to 200, each on its owning federation node; returns one outcome per session.",
+        whenToUse:
+          "When a person keeps all the sessions waiting for a billable confirmation at once.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/sessions/bulk-billable-keep",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    billableSwitchGate(billableSwitchMode),
+    async c => {
+      const engine = requireSyncEngine(c, getSyncEngine);
+      if (engine instanceof Response) {
+        return engine;
+      }
+      const service = engine.getBillableSwitchService?.() ?? null;
+      if (!service) return c.json({ error: "Not connected" }, 503);
+      const body = await c.req.json().catch(() => undefined);
+      const parsed = BillableSwitchKeepAllRequestSchema.safeParse(body);
+      if (!parsed.success) {
+        return c.json({ error: describeIssue(parsed.error) }, 400);
+      }
+      const refused = refuseAgentBillableWrite(c, engine, "keep-all");
+      if (refused) return refused;
+      if (billableSwitchMode === "closed") {
+        return closedRefusal(c, service.localNodeLabel());
+      }
+      const results = await runBillableKeepAll({
+        ids: parsed.data.ids,
+        engine,
+        service,
+        namespace: c.get("namespace"),
+        registry: options?.getNodeRegistry?.() ?? null,
+        sessionService: options?.getSessionService?.() ?? null,
+        actor: billableSwitchActor(c, engine),
+        via: billableSwitchVia(c),
+      });
+      return c.json({ ok: true, results });
+    }
   );
 
   app.delete(

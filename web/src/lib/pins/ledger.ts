@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
   answerOnRecord,
+  isReservedPinKey,
   PIN_KINDS,
   PinEvidenceSchema,
   PinIfUnansweredSchema,
@@ -444,16 +445,51 @@ export function pinDecidedBy(
   return by === "operator" || by === "agent" ? by : undefined;
 }
 
+/**
+ * #6458 round 6: the operator's dismissal of a stale prompt pin closes it
+ * withdrawn (ruling D3, so a request still waiting re-posts it open), and the
+ * Submit that dismissed it records an operator entry with `dismissed: true` at
+ * the close's own time. Such a pin reads as the operator's dismissal; a later
+ * re-post and close moves `updatedAt` past that entry.
+ */
+function dismissedByOperator(pin: Pin): boolean {
+  if (pin.status !== "withdrawn") return false;
+  const closedAt = epochMs(pin.updatedAt);
+  return pin.answers.some(
+    answer =>
+      answer.dismissed === true &&
+      answer.by === "operator" &&
+      !answer.moot &&
+      epochMs(answer.at) >= closedAt
+  );
+}
+
+/**
+ * #6527 (CR2-T1): a withdrawn pin with a reserved key (a mirrored prompt or a
+ * Detected pin) was withdrawn by Hapimatic, not by the agent, unless round 6
+ * reads it as the operator's dismissal.
+ */
+function withdrawnByServer(pin: Pin): boolean {
+  return (
+    pin.status === "withdrawn" &&
+    isReservedPinKey(pin.key) &&
+    !dismissedByOperator(pin)
+  );
+}
+
 /** Who completed a pin, for the Completed row's receipt pill. */
 export function completedReceipt(pin: Pin): CompletedReceipt {
-  if (pin.status === "withdrawn") {
+  if (withdrawnByServer(pin)) {
+    return { label: "Withdrawn", tone: "neutral", tooltip: "Withdrawn" };
+  }
+  if (pin.status === "withdrawn" && !dismissedByOperator(pin)) {
     return {
       label: "Withdrawn",
       tone: "neutral",
       tooltip: "Withdrawn by the agent",
     };
   }
-  if (pin.status === "dismissed") {
+  if (pin.status === "dismissed" || dismissedByOperator(pin)) {
     return {
       label: "Dismissed",
       tone: "neutral",
@@ -481,14 +517,22 @@ export function completedReceipt(pin: Pin): CompletedReceipt {
   return { label: "—", tone: "neutral", tooltip: "No answer on record" };
 }
 
+/**
+ * The channel column's words. `via` stays a plain string on the wire, so a
+ * node's new value never fails another's validation; this map is where a value
+ * gets its words. A permission prompt is answered in the chat card (`prompt`,
+ * #6527); the list has no word for the terminal, so it gets the no-channel mark.
+ */
 const CHANNELS: Record<string, string> = {
   pins: "via pins",
   chat: "via chat",
+  prompt: "via chat",
   deadline: "deadline",
   inbox: "via inbox",
+  terminal: "—",
 };
 
-/** Where a pin was settled: "via pins", "via chat", "deadline", "via inbox". */
+/** Where a pin was settled: "via pins", "via chat", "deadline", "via inbox", or "—". */
 export function completedChannel(pin: Pin): string {
   const via = answerOnRecord(pin)?.via;
   if (!via) return "—";
@@ -503,15 +547,20 @@ export function completedSummary(pin: Pin, zone: string): string {
   if (receipt.tone === "auto") {
     return `Decided automatically when its deadline passed, ${at}.`;
   }
+  if (pin.status === "dismissed" || dismissedByOperator(pin)) {
+    return `Dismissed, ${at}.`;
+  }
+  if (withdrawnByServer(pin)) return `Withdrawn, ${at}.`;
   if (pin.status === "withdrawn") return `Withdrawn by the agent, ${at}.`;
-  if (pin.status === "dismissed") return `Dismissed, ${at}.`;
+  const who = receipt.label === "Agent" ? "the agent" : "you";
+  // The list has no word for the terminal: who, then when.
+  if (answer?.via === "terminal") return `Completed by ${who}, ${at}.`;
   const where =
-    answer?.via === "chat"
+    answer?.via === "chat" || answer?.via === "prompt"
       ? "in the chat"
       : answer?.via === "inbox"
         ? "from the inbox"
         : "on the Pins tab";
-  const who = receipt.label === "Agent" ? "the agent" : "you";
   return `Completed by ${who} ${where}, ${at}.`;
 }
 

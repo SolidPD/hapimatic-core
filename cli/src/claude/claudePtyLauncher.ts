@@ -506,6 +506,7 @@ export async function claudePtyLauncher(
       ),
       claudeArgs,
       mcpServers: session.mcpServers,
+      pinsEnabled: session.pinsEnabled,
       allowedTools: session.allowedTools,
       hookSettingsPath: session.hookSettingsPath,
       initialCols: PTY_INITIAL_COLS,

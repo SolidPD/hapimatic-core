@@ -187,6 +187,9 @@ export class ImpactOrchestrator implements ImpactAnalysisCoordinator {
       claimPort: false,
       sessionType: "simple",
       name: `impact ${versionRangeKey(span.from_version, span.to_version)}`,
+      // Issue #6646 (ruling SYS-1): the self-update session is one of
+      // Hapimatic's own, never billable at its start.
+      billableSwitchStart: { kind: "system" },
     });
     if (spawn.type === "error") {
       // Authoritative capacity classifier (Task 6). A generic error → failed.

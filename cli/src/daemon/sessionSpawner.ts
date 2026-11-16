@@ -319,6 +319,9 @@ export function createSessionSpawner(
       // did not stamp a value, and the marker is OMITTED (never "0") at the env
       // sites below via buildMessageHooksEnv(), so the rp1-home client DEFERS.
       messageHooksEnabled,
+      // Issue #6458: the OWNING SERVER's Pins gate, threaded through the spawn
+      // RPC to the tmux render below (undefined renders no block).
+      pinsEnabled,
       // Issue #3611: the un-pinned optimal-account-selection opt-in, resolved
       // server-side from the `autoSelectOptimalAccount` preference mirror and
       // threaded through the spawn RPC (the #1262 enumeration). undefined/false ⇒
@@ -1919,6 +1922,11 @@ export function createSessionSpawner(
         outputStyle,
         // Issue #6171: the encoded MCP set on the tmux path too (#1262 trap).
         mcpSetArg,
+        // Issue #6458 (A2): the server's Pins gate into the tmux render, the
+        // hop TypeScript cannot catch (an optional field): dropping it loses the
+        // Pins block on every tmux-persisted session while other tests pass.
+        // Guarded by sessionSpawner.test.ts.
+        pinsEnabled,
         // #3731 (R0b): an explicit RPC token still wins; otherwise a strictly
         // unbound claude spawn receives the node's instance credential. The adapter
         // writes it into the 0600 env file (never a command line), where it is

@@ -398,7 +398,10 @@ export function PinsView(props: {
   if (query.isPending) {
     return <EmptyLine>Loading pins…</EmptyLine>;
   }
-  if (query.isError) {
+  // #6511 S1: only a first load that failed replaces the list. A background
+  // refetch that fails keeps its last data (TanStack Query keeps `data` and sets
+  // `isError`), so the list stays and one line says it is not current.
+  if (query.isError && query.data === undefined) {
     return (
       <EmptyLine>
         {query.error instanceof Error
@@ -412,6 +415,16 @@ export function PinsView(props: {
   }
   return (
     <PinsContext.Provider value={context}>
+      {query.isError ? (
+        <div
+          role="status"
+          className="truncate px-2.5 pt-2 text-[length:var(--text-body-dense)] text-[var(--app-hint)]"
+        >
+          {query.error instanceof Error
+            ? `Pins could not refresh (${query.error.message}); showing the last list.`
+            : "Pins could not refresh; showing the last list."}
+        </div>
+      ) : null}
       <PinsToolbar
         view={view}
         actions={actions}

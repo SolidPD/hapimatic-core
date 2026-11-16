@@ -196,9 +196,13 @@ export class CodexAppServerTransport implements CodexTransport {
       getPermissionHandler: () => this.permissionHandler,
       isTurnLive: turnId => this.isTurnLive(turnId),
       getFileChanges: itemId => this.converter.getFileChanges(itemId),
+      // The posture of the latest startSession, the one every turn/start
+      // sends: `params` is assigned only by cacheThreadParams, from
+      // startSession (#6606 R4).
       isYolo: () =>
         this.params?.approvalPolicy === "never" &&
         this.params?.sandbox === "danger-full-access",
+      notice: message => this.notice(message),
     }).register();
   }
 

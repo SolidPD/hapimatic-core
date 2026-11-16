@@ -350,6 +350,7 @@ export async function claudeLocalLauncher(
             started = true;
           },
           mcpServers: session.mcpServers,
+          pinsEnabled: session.pinsEnabled,
           allowedTools: session.allowedTools,
           hookSettingsPath: session.hookSettingsPath,
         });

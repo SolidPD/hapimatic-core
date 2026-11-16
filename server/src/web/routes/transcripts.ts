@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { buildBillableSwitchStart } from "./agentEscalation";
+import type { BillableSwitchStartContext } from "@hapi/protocol";
 import { Hono, type Context } from "hono";
 import {
   closeSync,
@@ -656,7 +658,15 @@ export function createTranscriptRoutes(
         engine,
         namespace,
         row,
-        body.data.directory
+        body.data.directory,
+        // Issue #6646: a person resuming from the Transcripts page is asked
+        // nothing and sends no choice, so the start is `unattended` (CLI-1).
+        buildBillableSwitchStart(
+          c,
+          engine,
+          {},
+          engine.getBillableSwitchService?.()?.localNodeId()
+        )
       );
       if ("status" in result) {
         return c.json(
@@ -681,7 +691,8 @@ async function resumeTranscript(
   engine: SyncEngine,
   namespace: string,
   row: TranscriptSummary & { path: string },
-  chosenDirectory: string | undefined
+  chosenDirectory: string | undefined,
+  billableSwitchStart: BillableSwitchStartContext
 ): Promise<TranscriptResumeResponse | ResumeFailure> {
   // (a) The transcript IS its session's current conversation → reconnect it.
   const session = row.hapiSessionId
@@ -789,6 +800,7 @@ async function resumeTranscript(
     // resume path pins "simple" (respawnBase.ts, sessionRespawn.ts).
     sessionType: "simple",
     resumeSessionId: row.ccSessionId,
+    billableSwitchStart,
     // Resume spawns skip the daemon's un-pinned account pick (#3023), so bind
     // the node default explicitly — as the create-session form does.
     ...accountOpt(engine),

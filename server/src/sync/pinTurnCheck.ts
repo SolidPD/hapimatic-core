@@ -16,20 +16,28 @@
  * ## A matching pin
  * Any of: a `hapi_pin` fence in the text (the fence reader writes it after the
  * message's event, so it may not be stored yet); an open pin the agent owns that
- * was created or revised since the turn started; or an open pin whose key the
- * text names (a loop tick that refers to a pin by key). Dashboards are `live`,
- * never `open`, so a dashboard update never hides an ask.
+ * was created or revised since the turn started; or (#6527, rulings Q2-A and
+ * Q3-A) asks that each name an open pin in their own text, by key or pin ID: a
+ * loop tick that points at a pin instead of re-asking. A named pin is an open pin
+ * of this session (reserved Detected and prompt pins included) or, by pin ID, an
+ * open pin of another session in the same namespace on this node; no other node
+ * is asked, because the nudge has a 3.5 s budget. Every strong ask must name one,
+ * so a message that points at a pin and asks something new is still nudged; a
+ * weak ask is read as its whole ask tail. Dashboards are `live`, never `open`, so
+ * a dashboard update never hides an ask.
  *
  * The Pins gate is the route's (cliPins.ts), which is the only caller today.
  */
 import { createHash } from "node:crypto";
 import {
   classifyDecisionSignals,
-  normalizeForMatch,
+  findPinIds,
   PinContentSchema,
   PinKeySchema,
   scanPinFences,
+  standsAsToken,
   type DecisionSignal,
+  type DecisionSignals,
   type Pin,
   type PinContent,
 } from "@hapi/protocol";
@@ -83,41 +91,102 @@ export type DetectResult =
 export type PinTurnCheckOptions = {
   pins: Pick<
     PinService,
-    "listTurnCandidates" | "upsert" | "withdraw" | "listKeysByPrefix"
+    | "listTurnCandidates"
+    | "listOpenPinRefs"
+    | "upsert"
+    | "withdraw"
+    | "listKeysByPrefix"
   >;
   getRecentMessages: (
     sessionId: string,
     options: { limit: number; sinceMs: number; maxChars: number }
   ) => Array<{ id: string; createdAt: number; content: unknown }>;
+  /**
+   * True only for a pin on this node whose status is `open` and whose session is
+   * in `namespace` (ruling Q3-A). Build it with {@link openPinInNamespace}.
+   */
+  resolveOpenPinNamespace: (pinId: string, namespace: string) => boolean;
 };
 
 /**
- * The ask as a title: a lone line's question sentence, else the first line.
+ * `resolveOpenPinNamespace` over a by-ID pin read and a namespace-scoped session
+ * read, the way `findLocalPinById` (pinById.ts) checks a pin's namespace.
+ */
+export function openPinInNamespace(deps: {
+  getByPinId: (pinId: string) => { pin: Pin } | null;
+  getSessionByNamespace: (sessionId: string, namespace: string) => unknown;
+}): (pinId: string, namespace: string) => boolean {
+  return (pinId, namespace) => {
+    const hit = deps.getByPinId(pinId);
+    if (!hit || hit.pin.status !== "open") return false;
+    return Boolean(deps.getSessionByNamespace(hit.pin.sessionId, namespace));
+  };
+}
+
+/** A leading list marker: `- `, `* `, `+ `, `1. `, `1) `, `A. `. */
+const LIST_MARKER = /^(?:[-*+]|\d{1,2}[.)]|[A-Z]\d?[.)])[ \t]+/;
+/** A sentence ends at `.`, `?` or `!`, even before a closing quote, bracket or `*`. */
+const SENTENCE_SPLIT = /(?<=[.?!]["'\u201d\u2019)*]{0,3})\s+/;
+
+/** One line of an excerpt without its heading marks, bold marks or list marker. */
+function titleLine(line: string): string {
+  return line
+    .replace(/^\s{0,3}#{1,6}\s+|\*\*/g, "")
+    .trim()
+    .replace(LIST_MARKER, "")
+    .trim();
+}
+
+/**
+ * Whether a title is the classifier's question: any ask but an answer key or a
+ * needs list, when the classifier found one. The nudge then calls the ask "a
+ * question" (#6527), so its label and its quote agree.
+ */
+function titledByQuestion(
+  signal?: DecisionSignal,
+  question?: string | null
+): boolean {
+  const block = signal === "answer_key" || signal === "needs_from_you";
+  return (
+    !block && !!question && titleLine(question.replace(/\s+/g, " ")) !== ""
+  );
+}
+
+/**
+ * The ask as a title. An answer key or a needs list keeps its first line. Any
+ * other ask takes the classifier's `question` (the last question of the ask's
+ * own text, read past quotes, code spans and URLs) when there is one; else a
+ * lone line's question sentence, else the first line.
  * Scrubbed BEFORE it is capped: the approval-token marker is longer than a
  * token, so scrubbing a capped title could push it past the 200-character limit
  * and the pin would fail validation.
  */
-function titleFrom(excerpt: string): string {
-  const lines = excerpt
-    .split("\n")
-    .map(line => line.replace(/^\s{0,3}#{1,6}\s+|\*\*/g, "").trim())
-    .filter(Boolean);
-  let title = lines[0] ?? "Unpinned ask";
-  if (lines.length === 1) {
-    const sentences = title.split(/(?<=[.?!])\s+/);
-    title =
-      sentences.filter(s => s.includes("?")).at(-1) ??
-      sentences.at(-1) ??
-      title;
+function titleFrom(
+  excerpt: string,
+  signal?: DecisionSignal,
+  question?: string | null
+): string {
+  let title = titledByQuestion(signal, question)
+    ? titleLine(question!.replace(/\s+/g, " "))
+    : "";
+  if (!title) {
+    const lines = excerpt.split("\n").map(titleLine).filter(Boolean);
+    title = lines[0] ?? "Unpinned ask";
+    if (lines.length === 1) {
+      const sentences = title.split(SENTENCE_SPLIT);
+      title =
+        sentences.filter(s => s.includes("?")).at(-1) ??
+        sentences.at(-1) ??
+        title;
+    }
   }
   return capPinText(cleanPinText(title), TITLE_MAX_CHARS);
 }
 
-const KEY_CHAR = /[a-z0-9_]/;
-
 /**
  * Whether `text` (normalized, lower case) names `key` as a whole token, so a
- * short key such as `plan` is not found inside "planning" or "plan-b".
+ * short key such as `plan` is not found inside "planning" or "plan-b". The rule
+ * is `standsAsToken`, which `findPinIds` shares.
  */
 export function namesPinKey(text: string, key: string): boolean {
   const needle = key.toLowerCase();
@@ -126,18 +195,7 @@ export function namesPinKey(text: string, key: string): boolean {
     at !== -1;
     at = text.indexOf(needle, at + 1)
   ) {
-    const before = at === 0 ? "" : text[at - 1]!;
-    const after = text[at + needle.length] ?? "";
-    const next = text[at + needle.length + 1] ?? "";
-    const openBefore = before === "" || !/[a-z0-9_.:-]/.test(before);
-    const openAfter =
-      after === "" ||
-      (!KEY_CHAR.test(after) &&
-        !(
-          (after === "-" || after === ":" || after === ".") &&
-          KEY_CHAR.test(next)
-        ));
-    if (openBefore && openAfter) return true;
+    if (standsAsToken(text, at, needle.length)) return true;
   }
   return false;
 }
@@ -152,22 +210,39 @@ function detectedKey(messageId: string): string {
 export class PinTurnCheck {
   constructor(private readonly options: PinTurnCheckOptions) {}
 
-  /** True when a pin already covers the ask in `text`. */
+  /** True when a pin already covers the asks `signals` found in `text`. */
   private matched(
-    sessionId: string,
+    session: PinSessionRef,
     text: string,
+    signals: DecisionSignals,
     turnStartedAt?: number
   ): boolean {
     if (scanPinFences(text, { maxBlocks: 1 }).blocks.length > 0) return true;
-    const candidates = this.options.pins.listTurnCandidates(sessionId);
+    // Posted or revised this turn: the agent's own pins only, so a Detected pin
+    // written earlier in the turn or a mirrored prompt never hides the last ask.
+    const candidates = this.options.pins.listTurnCandidates(session.id);
     if (turnStartedAt !== undefined) {
       const since = turnStartedAt - TURN_SKEW_MS;
       if (candidates.some(p => p.createdAt >= since || p.updatedAt >= since)) {
         return true;
       }
     }
-    const normalized = normalizeForMatch(text);
-    return candidates.some(p => namesPinKey(normalized, p.key));
+    // An ask cut from askTexts was never checked, so the message is not covered.
+    if (signals.verdict === "decision" && signals.askTextsCut) return false;
+    const asks =
+      signals.verdict === "decision" ? signals.askTexts : [signals.matchText];
+    if (asks.length === 0) return false;
+    const refs = this.options.pins.listOpenPinRefs(session.id);
+    const namesOpenPin = (ask: string): boolean =>
+      refs.some(
+        ref =>
+          namesPinKey(ask, ref.key) ||
+          (ref.pinId !== null && namesPinKey(ask, ref.pinId))
+      ) ||
+      findPinIds(ask).some(id =>
+        this.options.resolveOpenPinNamespace(id, session.namespace)
+      );
+    return asks.every(namesOpenPin);
   }
 
   /** The Stop hook's question: block the turn end once, or let it end. */
@@ -175,16 +250,22 @@ export class PinTurnCheck {
     const signals = classifyDecisionSignals(input.text);
     if (signals.verdict === "none")
       return { action: "none", why: "no_signals" };
-    if (this.matched(session.id, input.text, input.turnStartedAt)) {
+    if (this.matched(session, input.text, signals, input.turnStartedAt)) {
       return { action: "none", why: "matched" };
     }
     const first = signals.signals[0] ?? "ask_question";
+    const label = titledByQuestion(first, signals.question)
+      ? SIGNAL_LABELS.ask_question
+      : SIGNAL_LABELS[first];
     const rest = NUDGE_REASON_TAIL.join(" ");
     const head = (quote: string) =>
-      `📌 Pins: your last message ends with ${SIGNAL_LABELS[first]} ("${quote}"), and no open pin covers it.`;
-    // The quote gives way, so the whole instruction always fits.
+      `📌 Pins: your last message ends with ${label} ("${quote}"), and no open pin covers it.`;
+    // The quote gives way, so the whole instruction always fits. Its double
+    // quotes become single ones: the reason wraps it in ("…"), and an agent that
+    // echoes a title holding its own double quotes would nest them.
     const room = REASON_MAX_CHARS - rest.length - 1 - head("").length;
-    const quote = capPinText(titleFrom(signals.excerpt), Math.max(20, room));
+    const title = titleFrom(signals.excerpt, first, signals.question);
+    const quote = capPinText(title.replaceAll('"', "'"), Math.max(20, room));
     return {
       action: "block",
       reason: capPinText(`${head(quote)} ${rest}`, REASON_MAX_CHARS),
@@ -216,10 +297,15 @@ export class PinTurnCheck {
       if (!text.trim()) continue;
       const signals = classifyDecisionSignals(text);
       if (signals.verdict === "none") continue;
-      if (this.matched(session.id, text, input.turnStartedAt)) {
+      if (this.matched(session, text, signals, input.turnStartedAt)) {
         return { action: "none", why: "matched" };
       }
-      return this.writeDetected(session, message.id, signals.excerpt);
+      return this.writeDetected(
+        session,
+        message.id,
+        signals.excerpt,
+        titleFrom(signals.excerpt, signals.signals[0], signals.question)
+      );
     }
     return { action: "none", why: "no_unpinned_ask" };
   }
@@ -227,10 +313,10 @@ export class PinTurnCheck {
   private writeDetected(
     session: PinSessionRef,
     messageId: string,
-    excerpt: string
+    excerpt: string,
+    title: string
   ): DetectResult {
     const key = detectedKey(messageId);
-    const title = titleFrom(excerpt);
     const quoted = capPinText(cleanPinText(excerpt), CONTEXT_EXCERPT_MAX_CHARS)
       .split("\n")
       .map(line => `> ${line}`)

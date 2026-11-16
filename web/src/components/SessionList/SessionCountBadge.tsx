@@ -45,6 +45,47 @@ const BADGE_CATEGORIES: ReadonlyArray<{
   },
 ];
 
+// The layout of one count column in the ALIGNED cluster, shared by the router.tsx
+// toolbar and every SubheadingBar so their columns cannot drift apart.
+//
+// Each column reserves the width of its widest expected value through an
+// invisible, zero-height `::before` sizer: "00" for the first three counts and
+// "000" for inactive, so "99 · 99 · 99 · 999" fits. The width comes from the
+// rendered digits themselves (tabular figures, the device's own font), so no pixel
+// constant has to be kept in step with the font. A count with more digits than its
+// sizer widens its own column instead of overflowing. The old layout gave all four
+// columns an equal share of a fixed 60px box sized for "9 · 9 · 9 · 99"; a
+// three-digit inactive count pushed the row out of that box and under the search
+// field.
+const COUNT_COLUMN_SIZER =
+  "shrink-0 text-right before:block before:h-0 before:overflow-hidden before:invisible";
+
+/** Column classes for the aligned cluster, keyed by status category. */
+export const STATUS_COUNT_COLUMN_CLASS: Record<keyof StatusBreakdown, string> =
+  {
+    orange: COUNT_COLUMN_SIZER + " before:content-['00']",
+    blue: COUNT_COLUMN_SIZER + " before:content-['00']",
+    green: COUNT_COLUMN_SIZER + " before:content-['00']",
+    gray: COUNT_COLUMN_SIZER + " before:content-['000']",
+  };
+
+// design-system PERMANENT exception (#3336, from #3038 pilot): the 6px separator
+// dot sits far below the type-scale floor (--text-caption-xs = 10px), a decorative
+// glyph size, not "type". Registered in
+// docs/design/design-system/decision-typography.md § Sub-floor type-size
+// exceptions. This is its one definition: the toolbar, the aligned cluster and the
+// compact cluster all build on it.
+const SEPARATOR_DOT = "shrink-0 text-[var(--app-hint)] text-[6px] leading-none";
+
+/**
+ * The separator dot of the aligned cluster. 1px each side, against the compact
+ * cluster's 4px: at 393px the search field beside the toolbar cluster has room for
+ * its "Search" placeholder only if the dots give the width back (measured: 2px
+ * each side clips the placeholder by 3px).
+ */
+export const STATUS_COUNT_SEPARATOR_CLASS = SEPARATOR_DOT + " px-px";
+const COMPACT_SEPARATOR_CLASS = SEPARATOR_DOT + " px-1";
+
 /**
  * Render the four-count session-status breakdown as colored numbers separated by
  * neutral dots, matching the toolbar cluster. All four counts always render,
@@ -54,12 +95,10 @@ const BADGE_CATEGORIES: ReadonlyArray<{
  * - `"compact"` (default) — a COMPACT `inline-flex` cluster for a header corner:
  *   each count is natural-width. Used wherever the badge is pinned beside a label
  *   or far-right (the historical placement).
- * - `"aligned"` — reproduces the router.tsx toolbar cluster geometry EXACTLY: a
- *   `flex w-full` row whose four columns are `flex-1 text-right`, so the columns
- *   distribute a FIXED parent width into an even grid that lines up column-for-column
- *   under the toolbar's own `flex-1 text-right` cluster (issue #3484 — subheading
- *   bars align their status cluster under the title-bar accumulator). The caller
- *   supplies the fixed width via a wrapping box (see `SubheadingBar`).
+ * - `"aligned"` — the router.tsx toolbar cluster's geometry: each count sits in a
+ *   column of a reserved width (`STATUS_COUNT_COLUMN_CLASS`), so the four columns
+ *   of every subheading bar line up under the toolbar's four (issue #3484). The
+ *   toolbar renders the same classes, and both clusters start at the same x.
  */
 export function SessionCountBadge(props: {
   breakdown: StatusBreakdown;
@@ -78,33 +117,33 @@ export function SessionCountBadge(props: {
     <span
       data-testid="session-count-badge"
       data-variant={variant}
-      className={`${aligned ? "flex w-full" : "inline-flex"} items-center leading-none tabular-nums text-[length:var(--text-caption-xs)] ${props.className ?? ""}`}
+      className={`inline-flex items-center leading-none tabular-nums text-[length:var(--text-caption-xs)] ${props.className ?? ""}`}
       title={ariaLabel}
       aria-label={ariaLabel}
     >
       {/* Flat structure — numbers and separator dots are DIRECT siblings, exactly
-          like the router.tsx toolbar cluster, so `aligned` mode's four `flex-1
-          text-right` number columns are all equal width (a per-category wrapper
-          would make column 0 wider by the separator width, breaking column-for-column
-          alignment under the toolbar). */}
+          like the router.tsx toolbar cluster, so in `aligned` mode each column's
+          width is its own reserved width and nothing else (a per-category wrapper
+          would add the separator's width to a column and break the
+          column-for-column alignment under the toolbar). */}
       {BADGE_CATEGORIES.map((c, i) => (
         <Fragment key={c.key}>
           {i > 0 && (
-            /* design-system PERMANENT exception (#3336, from #3038 pilot): the 6px
-               separator dot sits far below the type-scale floor (--text-caption-xs =
-               10px) — a decorative glyph size, not "type". Registered in
-               docs/design/design-system/decision-typography.md
-               § Sub-floor type-size exceptions. */
             <span
               aria-hidden="true"
-              className="shrink-0 text-[var(--app-hint)] text-[6px] leading-none px-1"
+              className={
+                aligned ? STATUS_COUNT_SEPARATOR_CLASS : COMPACT_SEPARATOR_CLASS
+              }
             >
               •
             </span>
           )}
           <span
+            data-status-count={c.key}
             className={
-              aligned ? `flex-1 text-right ${c.colorClass}` : c.colorClass
+              aligned
+                ? `${STATUS_COUNT_COLUMN_CLASS[c.key]} ${c.colorClass}`
+                : c.colorClass
             }
           >
             {breakdown[c.key]}

@@ -44,6 +44,7 @@ const home = process.env.HOME ?? "/tmp";
 await claudeTmuxRemote({
   path: home,
   sessionId: null,
+  pinsEnabled: false,
   abort: new AbortController().signal,
   hapiSessionId,
   claudeEnvVars: { CLAUDE_CODE_OAUTH_TOKEN: fakeToken },

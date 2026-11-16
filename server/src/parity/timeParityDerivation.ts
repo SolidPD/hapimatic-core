@@ -36,17 +36,32 @@ export function bucketKey(namespace: string, localDate: string): BucketKey {
 }
 
 /**
+ * One `Intl.DateTimeFormat` per zone, built on first use. Building one costs
+ * 51 to 81 µs against 1 to 3 µs for a cached format (measured on ms2 for
+ * `billable/daySplit.ts`, #6675 R9), and the derived read calls this once per
+ * turn and adjustment in the range, on the hub's one thread. A zone is added
+ * only after its formatter is built, so an unknown zone still throws
+ * `RangeError` on every call instead of being cached as a failure.
+ */
+const localDateFormatters = new Map<string, Intl.DateTimeFormat>();
+
+/**
  * Format an epoch-ms timestamp as a YYYY-MM-DD local date in an IANA timezone.
  * Mirrors `getTodayInTimezone` (`store/timeLog.ts:48`) but for an arbitrary
  * timestamp. `en-CA` yields the ISO `YYYY-MM-DD` shape.
  */
 export function localDateForTimestamp(tsMs: number, timezone: string): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(new Date(tsMs));
+  let formatter = localDateFormatters.get(timezone);
+  if (formatter === undefined) {
+    formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    localDateFormatters.set(timezone, formatter);
+  }
+  return formatter.format(new Date(tsMs));
 }
 
 /**

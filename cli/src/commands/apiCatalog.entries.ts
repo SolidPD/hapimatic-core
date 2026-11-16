@@ -328,6 +328,22 @@ export const cliCatalogEntries = [
     riskTier: "mutating",
     availability: { scope: "operator" },
   }),
+  // #6646 (Task 7c, ruling AGS-2): the agents' only way to switch a session off for
+  // billing. Gated, so no Tier-0 or self-knowledge doc advertises it on a node whose
+  // billable sessions are `off`.
+  defineCapability({
+    id: "session-lifecycle.api-sessions-billable",
+    domain: "session-lifecycle",
+    surface: "cli",
+    description:
+      "Switch a session not billable (off only), recorded under the calling session. A session is switched on in the app, never by this command.",
+    whenToUse:
+      "To switch a session's time off for billing: `hapi api sessions billable` with the session's id or tag and the word off, your own session included.",
+    invocation: { kind: "cli", command: "api sessions billable" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "operator", gate: "billable-switch" },
+  }),
   defineCapability({
     id: "session-introspection.api-sessions-messages",
     domain: "session-introspection",

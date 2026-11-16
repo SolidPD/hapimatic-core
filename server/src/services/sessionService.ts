@@ -330,9 +330,9 @@ export class SessionService {
   }
 
   /**
-   * Issue #6447: forward a pin request to the node that owns the session. One
-   * generic method, because `localOrProxyMutation` drops the peer's body and a pin
-   * route must return the record, and because this file is near its `max-lines`.
+   * Issue #6447: forward a request to the node that owns the session, generic (the
+   * pin routes and #6646's billable routes use it), because `localOrProxyMutation`
+   * drops the peer's body these routes return, and this file is at `max-lines`.
    */
   proxyPinRequest(
     sessionId: string,
@@ -871,7 +871,7 @@ export class SessionService {
       overrides
     );
     if (result.type === "success") {
-      this.registry?.evictSessionFromCache(sessionId);
+      this.registry?.evictSessionFromCache(sessionId, undefined, "relaunch");
       return { type: "success" };
     }
     if (result.type === "not-found") return { type: "not-found" };

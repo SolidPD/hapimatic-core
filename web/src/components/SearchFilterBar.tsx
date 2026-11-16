@@ -5,7 +5,6 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuSeparator,
-  DropdownMenuLabel,
 } from "@/components/ui/dropdown-menu";
 import {
   MenuHeader,
@@ -58,6 +57,13 @@ type SearchFilterBarProps = {
    * `onClearSort`, which the container wires to clear the flag.
    */
   manualSortActive?: boolean;
+  /**
+   * The "Manual" row under "Sort by" was chosen. The caller freezes the
+   * arrangement on screen as the custom order and sets `manualSortActive`, exactly
+   * as a first drag does, so the list stops reordering itself without the user
+   * having to drag anything.
+   */
+  onSelectManualSort: () => void;
 };
 
 const STATUS_OPTIONS: { value: Filters["status"]; label: string }[] = [
@@ -95,6 +101,13 @@ const SORT_OPTIONS: {
   { value: "created", label: "Created", abbr: "Cr" },
   { value: "name", label: "Name", abbr: "Nm" },
   { value: "timeLogged", label: "Time Logged", abbr: "TL" },
+];
+/** The Sort menu's value while a custom order governs; never a server sort. */
+const MANUAL_SORT_VALUE = "__manual__";
+type SortMenuValue = SearchFilterPreferences["sort"] | typeof MANUAL_SORT_VALUE;
+const SORT_MENU_OPTIONS: { value: SortMenuValue; label: string }[] = [
+  ...SORT_OPTIONS,
+  { value: MANUAL_SORT_VALUE, label: "Manual" },
 ];
 const DIRECTION_OPTIONS: {
   value: SearchFilterPreferences["sortDirection"];
@@ -167,6 +180,7 @@ export function SearchFilterBar({
   onClearFilters,
   onClearSort,
   manualSortActive = false,
+  onSelectManualSort,
 }: SearchFilterBarProps) {
   const { filtersActive, sortActive } = getSearchFilterEngagement({
     filters,
@@ -305,22 +319,19 @@ export function SearchFilterBar({
               onClear={onClearSort}
             />
             <DropdownMenuSeparator className="my-0.5" />
-            {/* #3114: while a drag order is active, "Manual" is the effective sort —
-                surface it in mint and highlight no server-sort option; picking one
-                (below) exits Manual via onSortChange. */}
-            {manualSortActive && (
-              <>
-                <DropdownMenuLabel className="py-0.5 text-[var(--app-accent)]">
-                  Manual (drag order)
-                </DropdownMenuLabel>
-                <DropdownMenuSeparator className="my-0.5" />
-              </>
-            )}
-            <MenuRadioSection
+            {/* "Manual" is a row of its own under "Sort by": choosing it freezes the
+                order on screen without a drag (onSelectManualSort), and it is the
+                highlighted row while a custom order governs (#3114), whether that
+                came from this row or from a drag. Picking a server sort exits
+                Manual via onSortChange. */}
+            <MenuRadioSection<SortMenuValue>
               label="Sort by"
-              value={manualSortActive ? "__manual__" : sort}
-              options={SORT_OPTIONS}
-              onChange={onSortChange}
+              value={manualSortActive ? MANUAL_SORT_VALUE : sort}
+              options={SORT_MENU_OPTIONS}
+              onChange={value => {
+                if (value === MANUAL_SORT_VALUE) onSelectManualSort();
+                else onSortChange(value);
+              }}
             />
             <DropdownMenuSeparator className="my-0.5" />
             <MenuRadioSection
