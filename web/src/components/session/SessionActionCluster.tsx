@@ -69,7 +69,7 @@ export type SessionActionClusterProps = {
   onDisconnectAndDelete: () => Promise<void>;
 
   // Kebab entries (D2(a)) — thin pointers into the container's handlers. The
-  // last entry, notifications (#6660), is built by the cluster itself.
+  // notifications entry (#6660) is built by the cluster itself.
   onBranch: () => void;
   isBranching: boolean;
   isBranchDisabled: boolean;
@@ -154,14 +154,10 @@ export function SessionActionCluster({
 
   const chainSpinning = showReconnectSpinner || showArchiveSpinner;
 
+  // Order ruled by Matt, 2026-11-16: Copy Session Info, the notifications
+  // toggle, Branch, then Fan out and Peers. It replaces the earlier "mute
+  // always last" order (#6660 P3).
   const kebabEntries: SessionKebabEntry[] = [
-    {
-      key: "branch",
-      label: "Branch",
-      icon: <BranchIcon className="h-4 w-4" />,
-      onSelect: onBranch,
-      disabled: isBranchDisabled,
-    },
     {
       // #4480: replaces the "Session Configuration" entry — that modal still
       // opens from the Account Badge and the composer config cluster.
@@ -169,6 +165,15 @@ export function SessionActionCluster({
       label: "Copy Session Info",
       icon: <CopyIcon className="h-4 w-4" />,
       onSelect: onCopySessionInfo,
+    },
+    // #6660: mute / unmute this session's notifications.
+    muteEntry,
+    {
+      key: "branch",
+      label: "Branch",
+      icon: <BranchIcon className="h-4 w-4" />,
+      onSelect: onBranch,
+      disabled: isBranchDisabled,
     },
     // #3818: fan out N peers from this session (it becomes their parent).
     // Gated on the prop only, so the card and the header offer the same
@@ -194,9 +199,6 @@ export function SessionActionCluster({
           },
         ]
       : []),
-    // #6660: mute / unmute this session's notifications — always last (P3,
-    // confirmed by the Pins PM, 2026-11-13).
-    muteEntry,
   ];
 
   return (
@@ -259,8 +261,8 @@ export function SessionActionCluster({
         <TrashIcon className="h-5 w-5" />
       </Button>
 
-      {/* Kebab — Branch, Copy Session Info, Fan out?, Peers?, then the
-          notifications mute (#6660); list-hover Notes Preview. */}
+      {/* Kebab — Copy Session Info, the notifications mute (#6660), Branch,
+          Fan out?, Peers?; list-hover Notes Preview. */}
       <SessionKebabMenu
         surface={surface}
         entries={kebabEntries}

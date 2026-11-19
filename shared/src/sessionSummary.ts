@@ -94,7 +94,7 @@ export type SessionSummaryMetadata = {
   scheduleId?: string;
   /** Git repo identity for project grouping and header display */
   repoIdentity?: RepoIdentity;
-  /** Federation: nodeId of the peer that spawned this session (dual-node visibility) */
+  /** Federation: nodeId of the peer that spawned this session (attribution, spawn-status callbacks and API-key placement; it no longer limits which hubs list the session, #6759) */
   originatingNodeId?: string;
   /** Multi-account (epic #1446): the Anthropic account this session is bound to
    *  (set by the spawn-wiring sub-issue #1455 via HAPI_ACCOUNT_UUID; stamped onto
@@ -297,7 +297,7 @@ export type SessionSummary = {
   nodeUrl?: string;
   /** Federation: current status of the originating node */
   nodeStatus?: "online" | "degraded" | "offline";
-  /** Federation: hub nodeId that spawned this session (for instance isolation filtering) */
+  /** Federation: hub nodeId that spawned this session (attribution; it no longer limits which hubs list the session, #6759) */
   originatingNodeId?: string;
   /** Branching: parent session ID (this session was forked from) */
   parentSessionId?: string | null;

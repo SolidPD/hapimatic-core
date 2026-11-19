@@ -188,6 +188,18 @@ export const BillableSwitchHistoryResponseSchema = z.object({
         timerMs: z.number().nullable(),
         unloggedMs: z.number().nullable(),
         loggedKnown: z.boolean(),
+        // #6646 (Task 14): a start's cause nodes, label and report time only.
+        // Optional: an older peer's answer, and a start with no cause, lack it.
+        causeNodes: z
+          .array(
+            z
+              .object({
+                nodeLabel: z.string(),
+                reportedAt: z.number().nullable(),
+              })
+              .strip()
+          )
+          .optional(),
       })
       // A newer peer's added field never reaches the browser: built field by field.
       .strip()
@@ -199,13 +211,19 @@ export const BillableSwitchHistoryResponseSchema = z.object({
 /**
  * A project key as a header write may name it: a `repo` key has two or more
  * non-empty segments and no leading slash (GitLab subgroups give three or more);
- * its case is never changed. Null when it is acceptable.
+ * its case is never changed. A `path` key must not have that shape (PR-2 item
+ * Y1): other nodes count only `repo` headers, so a repository stored as `path`
+ * would never read as billable there. Null when it is acceptable.
  */
 export function projectKeyProblem(
   projectKey: string,
   keyKind: "repo" | "path"
 ): string | null {
-  if (keyKind !== "repo") return null;
+  if (keyKind !== "repo") {
+    return hasRepoKeyShape(projectKey)
+      ? "A key shaped like owner/name is a repository key: send keyKind repo"
+      : null;
+  }
   if (projectKey.startsWith("/")) {
     return "A repository key has no leading slash";
   }
@@ -214,6 +232,18 @@ export function projectKeyProblem(
     return "A repository key names an owner and a repository (owner/name)";
   }
   return null;
+}
+
+/**
+ * The shape of a repository key (`owner/name`, or deeper): two or more
+ * non-empty segments, not led by "/", "~" or ".", with no backslash or drive
+ * colon, so no path a session can carry (absolute, home-relative, Windows)
+ * has it.
+ */
+function hasRepoKeyShape(projectKey: string): boolean {
+  if (/^[/~.]/.test(projectKey) || /[\\:]/.test(projectKey)) return false;
+  const segments = projectKey.split("/");
+  return segments.length >= 2 && segments.every(seg => seg.trim() !== "");
 }
 
 /** The first issue of a failed parse, as one line. */
@@ -1129,6 +1159,7 @@ export type BillableKeepAllOutcome =
   | "forbidden"
   | "node_offline"
   | "unsupported"
+  | "timeout"
   | "failed";
 
 /**
@@ -1136,6 +1167,11 @@ export type BillableKeepAllOutcome =
  * unique id in request order. A session on another node goes to that node's
  * per-session confirm receiver with the reason `confirm-all`, so the owning node
  * records it as Keep all. A failure on one session never stops the batch.
+ *
+ * PR-2 item E1: a session that does not answer within the deadline is
+ * `timeout`, not `failed`, because a slow remote Keep may still apply (a retry
+ * then answers `not_pending`); a rejection stays `failed`. Each of the two, and
+ * every other `failed`, logs its reason.
  */
 export async function runBillableKeepAll(params: {
   ids: readonly string[];
@@ -1184,7 +1220,10 @@ export async function runBillableKeepAll(params: {
       return "node_offline";
     }
     if (!view.on) return "unsupported";
-    if (!params.sessionService) return "failed";
+    if (!params.sessionService) {
+      logKeepAllFailure(id, "no session service to reach its node");
+      return "failed";
+    }
     const result = await proxyBillableSwitchRequest(
       params.sessionService,
       id,
@@ -1206,10 +1245,17 @@ export async function runBillableKeepAll(params: {
       if (result.code === "billable_feature_closed") return "unsupported";
       if (result.code === "not_pending") return "not_pending";
       if (result.status === 404) return "not_found";
+      logKeepAllFailure(
+        id,
+        `its node answered ${result.status ?? "an error"}${result.code ? ` ${result.code}` : ""}`
+      );
       return "failed";
     }
     const parsed = BillableSwitchSetResponseSchema.safeParse(result.data);
-    if (!parsed.success) return "failed";
+    if (!parsed.success) {
+      logKeepAllFailure(id, "its node's answer did not parse");
+      return "failed";
+    }
     registry?.updateCachedSessionBillable?.(
       id,
       parsed.data.billable,
@@ -1220,11 +1266,28 @@ export async function runBillableKeepAll(params: {
 
   const settled = await Promise.allSettled(
     ids.map(id =>
-      settleWithin<BillableKeepAllOutcome>(one(id), deadlineMs, "failed")
+      settleWithin<BillableKeepAllOutcome>(one(id), deadlineMs, "timeout")
     )
   );
-  return settled.map((s, i) => ({
-    id: ids[i] as string,
-    outcome: s.status === "fulfilled" ? s.value : "failed",
-  }));
+  return settled.map((s, i) => {
+    const id = ids[i] as string;
+    if (s.status === "rejected") {
+      logKeepAllFailure(id, describeRejection(s.reason));
+      return { id, outcome: "failed" };
+    }
+    if (s.value === "timeout") {
+      console.warn(
+        `[billable-switch] Keep all: ${id} did not answer within ${deadlineMs} ms; its Keep may still apply, and a retry then answers not_pending`
+      );
+    }
+    return { id, outcome: s.value };
+  });
+}
+
+function logKeepAllFailure(id: string, reason: string): void {
+  console.warn(`[billable-switch] Keep all: ${id} failed: ${reason}`);
+}
+
+function describeRejection(reason: unknown): string {
+  return reason instanceof Error ? reason.message : String(reason);
 }

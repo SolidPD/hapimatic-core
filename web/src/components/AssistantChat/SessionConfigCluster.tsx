@@ -65,17 +65,21 @@ const COMPACT_EFFORT_LABELS: Record<EffortLevel, string> = {
  * the MCP section into the config modal, drop `onOpenMcpDetail` and the MCP chip
  * becomes display-only like the rest.
  *
- * Overflow ladder (R3): the `.chips` track is `flex-1 min-w-0 overflow-hidden`; a
- * ResizeObserver-driven `useOverflowLadder` measures overflow and steps down:
- * - **L1**: Account chip → monogram-only AND the Model chip's effort suffix drops
- *   (together).
- * - **L2**: MCP chip → the cumulative total colored by the worst-present state.
- * - **L3**: Account chip → removed entirely. The account is duplicated in the
+ * Overflow ladder (R3; order ruled by Matt, 2026-11-16): the `.chips` track is
+ * `flex-1 min-w-0 overflow-hidden`; a ResizeObserver-driven `useOverflowLadder`
+ * measures overflow and steps down. Labels go before values, and the effort
+ * word outlasts everything that is shown somewhere else:
+ * - **L1**: MCP chip → its "MCP" label drops; the three counts stay.
+ * - **L2**: Account chip → monogram-only.
+ * - **L3**: MCP chip → the cumulative total colored by the worst-present state.
+ * - **L4**: Account chip → removed entirely. The account is duplicated in the
  *   Session Basic Info Bar's Account Badge, and the cluster tap still opens the
  *   config modal's account switcher, so nothing becomes unreachable.
- * - **L4**: MCP chip → removed entirely (iPhone SE-class widths, where L3 still
- *   overflows and the strip clipped the chip). The config modal's MCP Servers
- *   row carries the same counts and the per-server list.
+ * - **L5**: the Model chip's effort suffix drops.
+ * - **L6**: MCP chip → removed entirely (iPhone SE-class widths). The config
+ *   modal's MCP Servers row carries the same counts and the per-server list.
+ * Before 2026-11-16 the effort suffix dropped first, together with the account
+ * name, so a phone rarely showed the effort at all.
  * A disconnected session renders the chips with dashed borders (staged state).
  *
  * LAYOUT ONLY — no draft/attachment sync here (owned by #3254).
@@ -153,7 +157,7 @@ const MODEL_BOX_NORMAL =
   "text-[var(--app-link)] bg-[var(--app-link)]/10 border-[var(--app-link)]/30";
 const MODEL_BOX_DOWNGRADED = "text-red-400 bg-red-500/10 border-red-500/30";
 /** Issue #6166: Claude runs a different effort than the session requested. A
- *  chip tone (not only the effort suffix, which drops at L1 on a phone). */
+ *  chip tone (not only the effort suffix, which can drop on a narrow phone). */
 const MODEL_BOX_EFFORT_MISMATCH = TONE_BOX.warning;
 
 // Account monogram color + short-name helpers live in the shared
@@ -195,8 +199,20 @@ export interface SessionConfigClusterProps {
   onOpenMcpDetail?: () => void;
 }
 
-type Level = 0 | 1 | 2 | 3 | 4;
-const MAX_LEVEL: Level = 4;
+type Level = 0 | 1 | 2 | 3 | 4 | 5 | 6;
+const MAX_LEVEL: Level = 6;
+
+/** What each ladder level shows. One table, so the order reads in one place. */
+function ladderState(level: Level) {
+  return {
+    mcpLabel: level < 1,
+    accountCompact: level >= 2,
+    mcpCollapsed: level >= 3,
+    account: level < 4,
+    effort: level < 5,
+    mcp: level < 6,
+  };
+}
 
 /**
  * Pure, layout-free renderer for the chips at a given ladder `level` — exported so
@@ -210,7 +226,9 @@ export function SessionConfigChips(props: {
   modelLabel: string;
   effortLabel?: string;
   /** Issue #3769 (R5): the effort suffix is the model DEFAULT (nothing pinned) —
-   *  render it muted as "High (default)" rather than a fabricated pinned "· High". */
+   *  render it muted, with an aria hint, so it does not read as a pinned level.
+   *  It is the one word alone: the " (default)" text went on 2026-11-16 (Matt:
+   *  the chip names the level, never the word "default"). */
   effortIsDefault?: boolean;
   /** Issue #6166: set when Claude applies a different effort than the session
    *  requested — the chip takes the warning tone and this text as its title. */
@@ -249,6 +267,12 @@ export function SessionConfigChips(props: {
 
   const dashed = disconnected ? "border-dashed" : "";
   const fmt = formatMcp(mcp);
+  const show = ladderState(level);
+  // The chip's name for assistive tech and the hover title: once the "MCP"
+  // label has dropped, the numbers alone do not say what they count.
+  const mcpName = show.mcpCollapsed
+    ? `MCP servers: ${fmt.total}`
+    : `MCP servers: ${fmt.connected} connected, ${fmt.attention} need attention, ${fmt.failed} failed`;
 
   return (
     <div
@@ -260,7 +284,7 @@ export function SessionConfigChips(props: {
         {permissionLabel}
       </span>
 
-      {/* Model (+ Effort suffix, dropped at L1). Issue #6166: an effort Claude
+      {/* Model (+ Effort suffix, dropped at L5). Issue #6166: an effort Claude
           applies differently from the request takes the warning tone (a
           downgraded model's red wins). */}
       <span
@@ -276,10 +300,10 @@ export function SessionConfigChips(props: {
           : {})}
       >
         {modelLabel}
-        {effortLabel && level < 1 ? (
+        {effortLabel && show.effort ? (
           // Issue #3769 (R5): a pinned effort renders "· High"; the model default
-          // renders a muted "· High (default)" with an aria hint — never blank
-          // (#2506 D1a), never a fabricated pinned level.
+          // renders the same one word, muted, with an aria hint — never blank
+          // (#2506 D1a), never the word "default" (Matt, 2026-11-16).
           <span
             className={effortIsDefault ? "opacity-60" : "opacity-80"}
             {...(effortIsDefault
@@ -287,15 +311,14 @@ export function SessionConfigChips(props: {
               : {})}
           >
             · {effortLabel}
-            {effortIsDefault ? " (default)" : ""}
           </span>
         ) : null}
       </span>
 
-      {/* Account (monogram + name; monogram-only at L1; gone at L3) — the SHARED
+      {/* Account (monogram + name; monogram-only at L2; gone at L4) — the SHARED
           entity chip (epic #3285 correction pass 1), byte-identical to the Row-1
           Account Badge in the Session Basic Info Bar. */}
-      {accountEmail && level < 3 ? (
+      {accountEmail && show.account ? (
         // shrink-0: AccountChip is `min-w-0` (so its nickname can ellipsize in
         // the Row-1 badge's fixed cell). Here that made it the one chip that
         // could shrink, so it absorbed the overflow and squeezed its monogram
@@ -306,16 +329,16 @@ export function SessionConfigChips(props: {
           email={accountEmail}
           label={accountLabel}
           monogram={accountMonogram}
-          compact={level >= 1}
+          compact={show.accountCompact}
           dashed={Boolean(disconnected)}
           className="shrink-0"
         />
       ) : null}
 
-      {/* MCP chip — `MCP a·b·c` (L2 → worst-color total; gone at L4). Optional
-          per-server detail tap (stopPropagation so the cluster tap doesn't also
-          fire). */}
-      {level < 4 ? (
+      {/* MCP chip — `MCP a·b·c` (L1 → `a·b·c`, the label gone; L3 → the
+          worst-color total; gone at L6). Optional per-server detail tap
+          (stopPropagation so the cluster tap doesn't also fire). */}
+      {show.mcp ? (
         <BareButton
           type="button"
           disabled={disabled}
@@ -326,10 +349,12 @@ export function SessionConfigChips(props: {
             onOpenMcpDetail();
           }}
           title="MCP servers"
+          aria-label={mcpName}
+          data-testid="mcp-chip"
           className={`inline-flex items-center justify-center whitespace-nowrap rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] px-1.5 py-0.5 text-[length:var(--text-caption-xs)] font-semibold tabular-nums text-[var(--app-hint)] ${dashed}`}
         >
-          <span className="mr-1">MCP</span>
-          {level < 2 ? (
+          {show.mcpLabel ? <span className="mr-1">MCP</span> : null}
+          {!show.mcpCollapsed ? (
             <>
               <b className={`font-bold ${countTone(fmt.connected, "ok")}`}>
                 {fmt.connected}
@@ -374,7 +399,7 @@ export function chipsOverflow(track: HTMLElement): boolean {
 
 /**
  * ResizeObserver-driven overflow ladder (R3, OR-4). Measures the `.chips` track
- * (see `chipsOverflow`) and steps DOWN (0 → 1 → 2 → 3) until the chips fit; a
+ * (see `chipsOverflow`) and steps DOWN (0 → 1 → … → `MAX_LEVEL`) until the chips fit; a
  * resize resets to 0 (rAF-guarded) so the ladder re-evaluates from scratch on
  * width change. Steady-state cost is a few integer reads per render; no thrash
  * while idle. A resize also bumps `resizes`, because `setLevel(0)` does nothing
@@ -546,19 +571,18 @@ export function SessionConfigCluster(props: SessionConfigClusterProps) {
           ? COMPACT_EFFORT_LABELS[DEFAULT_EFFORT_LEVEL]
           : undefined;
   // Issue #3769 (R5): the suffix is the MODEL DEFAULT (nothing pinned) when no
-  // effort is pinned but the model supports effort. The chip renders it as a
-  // muted "High (default)" — never a fabricated pinned "· High" (#2506 D1a binds:
-  // the default must be shown, but marked AS a default).
+  // effort is pinned but the model supports effort. The chip renders it as the
+  // one muted word with an aria hint — never a fabricated pinned "· High"
+  // (#2506 D1a binds: the default must be shown, but marked AS a default).
   const effortIsDefault =
     applied === undefined &&
     requestedEffort === undefined &&
     modelSupportsEffort;
 
-  // Width-affecting content — the ladder re-evaluates whenever this changes. The
-  // default variant renders " (default)", so include it in the measure key
-  // (#3769: level 0 gets longer than the plain pinned label). #6166: the
-  // mismatch tone is part of the key too.
-  const measureKey = `${permissionLabel}|${modelLabel}|${effortLabel ?? ""}${effortIsDefault ? " (default)" : ""}${effortMismatch ? "|mismatch" : ""}|${chipEmail ?? ""}${chipLabel ?? ""}|${mcpStatus.connectedCount}|${mcpStatus.hostedCount}|${mcpStatus.needsAuthCount}|${mcpStatus.failedCount}`;
+  // Width-affecting content — the ladder re-evaluates whenever this changes.
+  // #6166: the mismatch tone is part of the key too. (A default effort is the
+  // same width as a pinned one now that " (default)" is gone.)
+  const measureKey = `${permissionLabel}|${modelLabel}|${effortLabel ?? ""}${effortMismatch ? "|mismatch" : ""}|${chipEmail ?? ""}${chipLabel ?? ""}|${mcpStatus.connectedCount}|${mcpStatus.hostedCount}|${mcpStatus.needsAuthCount}|${mcpStatus.failedCount}`;
   const { chipsRef, level } = useOverflowLadder(measureKey);
 
   const handleOpenMcpDetail = () => {

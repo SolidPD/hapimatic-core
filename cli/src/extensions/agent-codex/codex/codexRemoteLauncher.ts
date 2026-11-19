@@ -33,6 +33,11 @@ import type { EnhancedMode } from "./loop";
 import { hasCodexCliOverrides } from "./utils/codexCliOverrides";
 import { buildCodexStartConfig } from "./utils/codexStartConfig";
 import { convertCodexEvent } from "./utils/codexEventConverter";
+import {
+  mcpToolCallBeginMessage,
+  mcpToolCallEndMessage,
+  OpenMcpCalls,
+} from "./utils/mcpToolCallMessages";
 import { AgentTurnReporter } from "@/agent/utils/agentTurnReporter";
 import type { ProviderUsageSnapshotWindow } from "@hapi/protocol/schemas";
 import {
@@ -173,6 +178,7 @@ export class CodexRemoteLauncher extends RemoteLauncherBase {
   private happyServer: HappyServer | null = null;
   private abortController: AbortController = new AbortController();
   private storedSessionIdForResume: string | null = null;
+  private readonly openMcpCalls = new OpenMcpCalls();
 
   constructor(session: CodexSession) {
     super(process.env.DEBUG ? session.logPath : undefined);
@@ -205,6 +211,9 @@ export class CodexRemoteLauncher extends RemoteLauncherBase {
       this.permissionHandler?.reset();
       this.reasoningProcessor?.abort();
       this.diffProcessor?.reset();
+      for (const result of this.openMcpCalls.closeAll()) {
+        this.session.sendCodexMessage({ ...result, id: randomUUID() });
+      }
       logger.debug("[Codex] Abort completed - session remains active");
     } catch (error) {
       logger.debug("[Codex] Error during abort:", error);
@@ -713,6 +722,17 @@ export class CodexRemoteLauncher extends RemoteLauncherBase {
           },
           id: randomUUID(),
         });
+      }
+      // #6724: an MCP tool call (pin_post among them) gets its chat row.
+      if (msg.type === "mcp_tool_call_begin") {
+        const message = mcpToolCallBeginMessage(msg);
+        if (message) this.openMcpCalls.note(message);
+        if (message) session.sendCodexMessage({ ...message, id: randomUUID() });
+      }
+      if (msg.type === "mcp_tool_call_end") {
+        const message = mcpToolCallEndMessage(msg);
+        if (message) this.openMcpCalls.note(message);
+        if (message) session.sendCodexMessage({ ...message, id: randomUUID() });
       }
       if (msg.type === "turn_diff") {
         if (msg.unified_diff) {

@@ -29,12 +29,15 @@ import {
   plusNodeBadgeRadius,
 } from "@/components/session/rowAnchors";
 import { SessionListNotesModal } from "@/components/SessionListNotesModal";
-import { ClockIcon, SessionTimer } from "@/components/SessionTimer";
+import { SessionTimer, TimeBlockGlyph } from "@/components/SessionTimer";
+import { BillableSwitchDialog } from "@/components/billableSwitch/BillableSwitchDialog";
+import { useBillableSessionSwitch } from "@/hooks/useBillableSwitch";
 import { SpawnStatusBadge } from "@/components/SpawnStatusBadge";
 import { Spinner } from "@/components/Spinner";
 import { StatusDotPopover } from "@/components/StatusDotPopover";
 import { useToast } from "@/components/Toast";
 import { Button } from "@/components/ui/button";
+import { HoverTooltip } from "@/components/ui/tooltip";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { WorktreeDeleteDialog } from "@/components/WorktreeDeleteDialog";
 import { useFanOutMenu } from "@/components/FanOut/useFanOutMenu";
@@ -71,6 +74,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -104,6 +108,12 @@ export function SessionItem(props: {
   selectMode?: boolean;
   selected?: boolean;
   onToggleSelect?: (sessionId: string) => void;
+  /**
+   * #6646 (Task 14, AGL-A): this row in the "To confirm" section. Its status
+   * slot names the project and offers Keep (not while billable sessions are
+   * closed) and Reverse, through the row's own switch (Reverse opens CONF-A).
+   */
+  toConfirm?: { project: string; canKeep: boolean; cause?: ReactNode };
   showPath?: boolean;
   api: ApiClient | null;
   needsReview: boolean;
@@ -235,6 +245,14 @@ export function SessionItem(props: {
   const pendingActions = useSessionActionPending(s.id);
 
   const sessionName = getSessionTitle(s);
+  // #6646 (ROW-C, CONF-A): the coin, the timer menu's switch, and the
+  // confirmation this row owns beside it.
+  const billable = useBillableSessionSwitch({
+    api,
+    session: s,
+    sessionName,
+    nodeLabel: s.nodeLabel,
+  });
 
   // Timer should pause when waiting for user response to AskUserQuestion.
   //
@@ -756,15 +774,21 @@ export function SessionItem(props: {
                     className="flex min-w-[104px] shrink-0 items-center gap-1 whitespace-nowrap" /* design-tokens-allow: 104px E6 `.timeblock` anchor width (worst-case timer + relative time); no --space token is 104px */
                     data-testid={`session-time-block-${s.id}`}
                   >
-                    <span className="flex h-2.5 w-2.5 items-center justify-center shrink-0">
-                      <ClockIcon className="h-2.5 w-2.5 text-[var(--app-hint)]" />
-                    </span>
                     <SessionTimer
                       sessionId={s.id}
                       thinking={effectiveThinking}
                       serverAccumulatedMs={s.serverAccumulatedMs}
                       serverThinkingStartedAt={s.thinkingStartedAt}
                       compact
+                      glyph={
+                        <span className="mr-1 flex h-2.5 w-2.5 items-center justify-center shrink-0">
+                          <TimeBlockGlyph
+                            mark={billable.mark}
+                            className="h-2.5 w-2.5"
+                          />
+                        </span>
+                      }
+                      {...billable.block}
                     />
                     {/* E6: `00:05:00 · 12m` — middle dot before the compact time.
                         Round 14 follow-up (operator pick "mockup C"): no opacity
@@ -777,7 +801,14 @@ export function SessionItem(props: {
                   {/* Session Status Badge (#1804: linked-issue workflow state when it
                     resolves; #2479 managed pill; else standard/scheduled type badge,
                     clickable for spawned sessions → schedules page). */}
-                  {isSpawnedSession ? (
+                  {props.toConfirm ? (
+                    <ToConfirmActions
+                      sessionId={s.id}
+                      sessionName={sessionName}
+                      {...props.toConfirm}
+                      onDecide={decision => billable.block?.onConfirm(decision)}
+                    />
+                  ) : isSpawnedSession ? (
                     <button /* design-tokens-allow: caller-styled status-badge pill — badgeTextClass is dynamic per session type; Button's ghost hover:text-[--app-fg] would override the runtime badge color on hover (a visual regression #3354 forbids), un-neutralizable without a static color; keep raw */
                       type="button"
                       onClick={handleBadgeClick}
@@ -1053,6 +1084,14 @@ export function SessionItem(props: {
         </div>
       </div>
 
+      <BillableSwitchDialog
+        request={billable.request}
+        session={s}
+        sessionName={sessionName}
+        onClose={billable.closeRequest}
+        onConfirm={billable.confirmRequest}
+      />
+
       <ConfirmDialog
         isOpen={disconnectOpen}
         onClose={() => setDisconnectOpen(false)}
@@ -1169,5 +1208,75 @@ export function SessionItem(props: {
         api={api}
       />
     </>
+  );
+}
+
+/**
+ * #6646 (Task 14, AGL-A): the project's short name, then Keep · Reverse. Each
+ * chip's hit area is 24px tall (the negative-margin pattern of the title bar's
+ * Help button) with a 16px gap, because every other pixel of the row opens the
+ * session. A tap never reaches the row.
+ */
+function ToConfirmActions(props: {
+  sessionId: string;
+  sessionName: string;
+  project: string;
+  canKeep: boolean;
+  /** The tooltip naming what made the session billable (on the project name). */
+  cause?: ReactNode;
+  onDecide: (decision: "keep" | "reverse") => void;
+}) {
+  // Hover and disabled as select mode's toned chips (PATTERN-AUDIT).
+  const chip =
+    "-my-1.5 inline-flex h-6 shrink-0 items-center px-0 text-[length:var(--text-caption-xs)] font-semibold leading-none hover:opacity-80 disabled:opacity-50";
+  const decide = (e: ReactMouseEvent, decision: "keep" | "reverse") => {
+    e.stopPropagation();
+    props.onDecide(decision);
+  };
+  // `min-w-40`: row 2 wraps, so on a narrow row (a phone, where the time
+  // block leaves about 67 px) the project and Keep · Reverse take a line of
+  // their own under the time block instead of squeezing the project to 0 px;
+  // at desktop width they stay on row 2. The project truncates first; the
+  // chips never shrink (#6646 Task 16, the Project Manager's ruling).
+  return (
+    <span
+      className="flex min-w-40 flex-1 items-center gap-4"
+      data-testid={`to-confirm-actions-${props.sessionId}`}
+    >
+      <HoverTooltip content={props.cause ?? "Started billable"}>
+        <span
+          className="min-w-0 truncate text-[length:var(--text-caption-xs)] text-[var(--app-hint)]"
+          data-testid={`to-confirm-project-${props.sessionId}`}
+          // On a phone a tap reveals the tooltip; it never opens the session.
+          onClick={e => e.stopPropagation()}
+        >
+          {props.project}
+        </span>
+      </HoverTooltip>
+      {props.canKeep ? (
+        <Button
+          type="button"
+          variant="ghostStatic"
+          size="bare"
+          className={`${chip} text-[var(--app-accent)] disabled:text-[var(--app-hint)]`}
+          aria-label={`Keep ${props.sessionName} billable`}
+          title={`Keep ${props.sessionName} billable`}
+          onClick={e => decide(e, "keep")}
+        >
+          Keep
+        </Button>
+      ) : null}
+      <Button
+        type="button"
+        variant="ghostStatic"
+        size="bare"
+        className={`${chip} text-[var(--status-cat-attention)]`}
+        aria-label={`Reverse ${props.sessionName}: make it non-billable`}
+        title={`Reverse ${props.sessionName}: make it non-billable`}
+        onClick={e => decide(e, "reverse")}
+      >
+        Reverse
+      </Button>
+    </span>
   );
 }

@@ -10,7 +10,8 @@ import type {
   SetSessionPaymentMethodRequest,
   InVmLoginCancelResponse,
 } from "@/types/api";
-import type { ProviderId } from "@hapi/protocol";
+import type { AccountExhaustion, ProviderId } from "@hapi/protocol";
+import { exhaustedLimitText, readAccountExhausted } from "@/lib/accountLimit";
 import { queryKeys } from "@/lib/query-keys";
 import { useToast } from "@/components/Toast";
 import { reloginToastFromError } from "@/lib/reloginLink";
@@ -29,6 +30,12 @@ import {
  *
  * A 409 `last_account` rejection is deliberately left to propagate so the
  * calling `ConfirmDialog` surfaces it and stays open (R7).
+ *
+ * Issue #6742: a session switch picked through an at-limit confirm passes
+ * `forceAccount`, so the server binds the account past its 409
+ * `account_exhausted` refusal. A caller that shows its own confirm for that
+ * refusal (the Session Configuration modal) sets `callerConfirmsExhausted`,
+ * and the hook then shows no toast for it; the rejection still reaches it.
  */
 /**
  * One (account × node) removal outcome from the multi-account mutation (issue
@@ -80,6 +87,15 @@ export function mapSwitchError(err: unknown): {
   return { message: mapSwitchErrorText(err, code) };
 }
 
+/**
+ * Issue #6742: an at-limit refusal with no confirm left to ask (the Session
+ * Configuration modal closed before the server answered): the limit in the
+ * shared words, then what happened and how to use the account anyway.
+ */
+function exhaustedToastText(exhaustion: AccountExhaustion | null): string {
+  return `${exhaustedLimitText(exhaustion)} The session stays on its account; reopen Session Configuration to use it anyway.`;
+}
+
 function mapSwitchErrorText(err: unknown, code: string | undefined): string {
   switch (code) {
     case "at_capacity":
@@ -94,28 +110,33 @@ function mapSwitchErrorText(err: unknown, code: string | undefined): string {
       return "API-key billing requires the SDK launcher — start a new session on an API key.";
     case "api_key_local_mode_unsupported":
       return "Return the session to remote mode to switch it to an API key.";
-    case "api_key_remote_unsupported":
-      return "API keys are node-local — switch from the node that owns this session.";
     case "api_key_agent_unsupported":
       return "API-key billing is available for Claude Code sessions only.";
-    case "api_key_not_found":
-      return "That API key is no longer in this node's vault.";
-    // Issue #5879: a rebind onto an account at its usage cap. The server's own
-    // message names the window, its reset time and the best alternative, so it
-    // is shown as-is (falls through to the body read below).
+    // Issue #5879 → #6742: a rebind onto an account at its usage cap. The
+    // server's own text tells an API client to send forceAccount, so a web user
+    // gets the limit in the Session Configuration confirm's words instead.
     case "account_exhausted":
+      return exhaustedToastText(readAccountExhausted(err)?.exhaustion ?? null);
+    // Issue #6542: a key that is not found (it names where keys live and how to
+    // reach one on another node) and a peer-owned session (it names the owner)
+    // show the server's message, so `api_key_not_found` and
+    // `api_key_remote_unsupported` fall through to the body read below.
     default: {
+      let text =
+        err instanceof Error ? err.message : "Failed to switch account";
       if (err instanceof ApiError && err.body) {
         try {
           const parsed = JSON.parse(err.body) as { error?: unknown };
           if (typeof parsed.error === "string" && parsed.error) {
-            return parsed.error;
+            text = parsed.error;
           }
         } catch {
-          // Non-JSON body — fall through to the generic message below.
+          // Non-JSON body — fall back to the error's own message.
         }
       }
-      return err instanceof Error ? err.message : "Failed to switch account";
+      // Issue #6742: a server sentence that tells a client to send
+      // forceAccount never reaches a web user, whatever its code.
+      return text.includes("forceAccount") ? exhaustedToastText(null) : text;
     }
   }
 }
@@ -123,16 +144,27 @@ function mapSwitchErrorText(err: unknown, code: string | undefined): string {
 export function useAccountActions(
   api: ApiClient | null,
   // #3973: `nodeLabel` names the node in the per-node set-active toast.
-  opts?: { sessionId?: string; nodeId?: string; nodeLabel?: string }
+  // #6742: `callerConfirmsExhausted` leaves a 409 account_exhausted to the caller.
+  opts?: {
+    sessionId?: string;
+    nodeId?: string;
+    nodeLabel?: string;
+    // A function is read when the refusal arrives, so a caller that has
+    // closed by then (it returns false) gets the toast after all.
+    callerConfirmsExhausted?: boolean | (() => boolean);
+  }
 ): {
   /** #3982: `provider` sets that provider's per-node default (node scope only);
-   *  absent ⇒ the Anthropic default, byte-identical to before. */
+   *  absent ⇒ the Anthropic default, byte-identical to before. #6742:
+   *  `forceAccount` binds a session onto an account at its usage limit
+   *  (session scope only; a node default has no headroom check). */
   selectAccount: (
     accountUuid: string,
-    opts?: { provider?: ProviderId }
+    opts?: { provider?: ProviderId; forceAccount?: boolean }
   ) => Promise<void>;
-  /** Issue #4823: switch the SESSION onto a node-vault Anthropic API key (by
-   *  vault id). Session scope only — rejects for a node-scoped instance. */
+  /** Issue #4823: switch the SESSION onto an Anthropic API key by reference (a
+   *  bare vault id, or a shared key's bindingRef, #6542). Session scope only —
+   *  rejects for a node-scoped instance. */
   selectApiKey: (apiKeyId: string) => Promise<void>;
   removeAccount: (accountUuid: string) => Promise<void>;
   /**
@@ -152,6 +184,11 @@ export function useAccountActions(
   const sessionId = opts?.sessionId;
   const nodeId = opts?.nodeId;
   const nodeLabel = opts?.nodeLabel;
+  const callerConfirmsOpt = opts?.callerConfirmsExhausted;
+  const callerConfirmsExhausted = (): boolean =>
+    typeof callerConfirmsOpt === "function"
+      ? callerConfirmsOpt()
+      : callerConfirmsOpt === true;
 
   const selectMutation = useMutation({
     // Issue #4823: the target is a payment method — an account (every existing
@@ -166,6 +203,12 @@ export function useAccountActions(
       if (sessionId) {
         if ("apiKeyId" in target) {
           await api.setSessionPaymentMethod(sessionId, target);
+        } else if (target.forceAccount) {
+          // #6742: the operator confirmed an account at its usage limit.
+          await api.setSessionPaymentMethod(sessionId, {
+            accountUuid: target.accountUuid,
+            forceAccount: true,
+          });
         } else {
           await api.setSessionAccount(sessionId, target.accountUuid);
         }
@@ -196,6 +239,14 @@ export function useAccountActions(
     },
     onError: (err: unknown) => {
       if (sessionId) clearActionPending(sessionId, "switch");
+      // #6742: the caller asks its own at-limit confirm for this refusal.
+      if (
+        err instanceof ApiError &&
+        err.code === "account_exhausted" &&
+        callerConfirmsExhausted()
+      ) {
+        return;
+      }
       const { message, action } = mapSwitchError(err);
       showToast(message, { type: "error", action });
     },
@@ -460,12 +511,15 @@ export function useAccountActions(
   });
 
   return {
-    selectAccount: (accountUuid: string, opts?: { provider?: ProviderId }) =>
-      selectMutation.mutateAsync(
-        opts?.provider
-          ? { accountUuid, provider: opts.provider }
-          : { accountUuid }
-      ),
+    selectAccount: (
+      accountUuid: string,
+      opts?: { provider?: ProviderId; forceAccount?: boolean }
+    ) =>
+      selectMutation.mutateAsync({
+        accountUuid,
+        ...(opts?.provider ? { provider: opts.provider } : {}),
+        ...(opts?.forceAccount ? { forceAccount: true } : {}),
+      }),
     selectApiKey: (apiKeyId: string) =>
       selectMutation.mutateAsync({ apiKeyId }),
     removeAccount: removeMutation.mutateAsync,

@@ -4,7 +4,7 @@ import { Checkbox } from "@/components/ui/Checkbox";
 
 /** Issue #5127: the helper line under the checkbox — one copy for every add form. */
 export const SHARE_ACROSS_NODES_HELP =
-  "Sessions on your other federation nodes can use this key. It stays stored on this node.";
+  "Sessions on your other federation nodes can use this key: new sessions, restarts, and switching a running session onto it. It stays stored on this node.";
 
 /**
  * Issue #5127: the "Make available to all nodes" checkbox an Anthropic key's

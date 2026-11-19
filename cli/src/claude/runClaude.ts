@@ -621,6 +621,9 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   session.updateMetadata(currentMetadata => ({
     ...currentMetadata,
     launcherKind: activeLauncherKind,
+    // Issue #4877 item 1: a respawn reattaches to the stored record, whose
+    // cached `hostPid` is the killed runner's; stamp this process's own.
+    hostPid: process.pid,
     ...(spawnModelModePin && spawnModelModePin !== "default"
       ? { modelMode: spawnModelModePin }
       : {}),

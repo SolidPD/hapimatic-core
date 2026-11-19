@@ -39,7 +39,7 @@ import { SessionLoopCronBadge } from "@/components/session/SessionLoopCronBadge"
 import { SessionAgentsBadge } from "@/components/session/SessionAgentsBadge";
 import {
   agentCompactForm,
-  formatMessageCount,
+  messageCountDisplay,
   pinCountDisplay,
   shellBadgeForm,
 } from "@/components/session/badgeFormat";
@@ -72,6 +72,16 @@ type SessionRightMetaRowProps = {
  *  `design-tokens-allow` marker — the gate only honors a same-line suppression. */
 const QUEUED_BUBBLE_CLASS =
   "text-[var(--app-badge-warning-text)] fill-[var(--app-badge-warning-bg)]";
+/** The queued signal for a count with no bubble (1,000 and up): the number
+ *  itself takes the warning color, so the signal never depends on the icon. */
+const QUEUED_COUNT_CLASS = "text-[var(--app-badge-warning-text)]";
+/** An abbreviated count has no bubble to line up under the Node Badge's edge, so
+ *  it starts 3px into the slot's own left pad (the badge's 6px corner radius).
+ *  Measured on the deployed build, 2026-11-16: `16.9K` and `99.9K` are 31.7px
+ *  wide, 0.7px more than the 31px slot; with the 3px they fit with room to
+ *  spare, and so does the widest form, `99.9M` (34.0px). */
+const ABBREVIATED_COUNT_CLASS =
+  "-ml-[3px]"; /* design-tokens-allow: 3px of the slot's 6px left pad (NODE_BADGE_RADIUS), used only by a bubble-less abbreviated count; no --space token is 3px */
 
 /** #6660 Pins Waiting slot: one constant per fixed-px class string, so each
  *  `design-tokens-allow` marker sits on the same line as the px it excuses. */
@@ -91,6 +101,12 @@ export function SessionRightMetaRow({
   // E9: the queued signal. Server-backed queue (#1325); non-empty ⇒ yellow bubble.
   const { length: queuedCount } = useQueuedMessages(api, sessionId);
   const queued = queuedCount > 0;
+  const messages = messageCountDisplay(messageCount);
+  // The exact count is the slot's title everywhere it shows (Matt, 2026-11-16);
+  // a queue is named first, because it is the thing to act on.
+  const messagesTitle = queued
+    ? `${queuedCount} queued message${queuedCount > 1 ? "s" : ""} · ${messages.exact}`
+    : messages.exact;
   const pins = pinCountDisplay(openPinCount);
 
   // Issue #4383: the slot composes the loop badge and/or the agents badge. Read
@@ -148,8 +164,9 @@ export function SessionRightMetaRow({
       </span>
       {/* #3287 R4: Message Count — fixed 31px slot holding an SVG line-icon chat
           bubble (`MessageSquareIcon`, the exact E6 path — NEVER the 💬 emoji) and
-          the tabular count with NO space between them (formatMessageCount →
-          `999` / `1k+`). Operator ruling (2026-09-07, round 10): the content is
+          the tabular count with NO space between them (messageCountDisplay →
+          `999`, then `1.1K` / `16.9K` with the bubble giving its room to the
+          number; Matt, 2026-11-16). Operator ruling (2026-09-07, round 10): the content is
           LEFT-justified and the slot is padded left by the Node Badge's corner
           RADIUS (`NODE_BADGE_RADIUS_CSS`, box-content so the 31px stays the
           content width), so the bubble's left edge sits where the badge's
@@ -162,23 +179,29 @@ export function SessionRightMetaRow({
           — operator ruling 2026-09-05: no dead cell where the count will appear
           once the user starts messaging. E9: while ≥1 message is queued the
           bubble turns yellow (warning token, tinted fill) — the queued signal
-          that replaced the dedicated queued icon. */}
+          that replaced the dedicated queued icon; with no bubble (1,000 and up)
+          the number turns yellow instead. The title is the exact count, a
+          native `title` on a non-interactive span like the pin slot beside it
+          (the D1 exception below). */}
       <span
         className="box-content flex w-[31px] shrink-0 items-center justify-start gap-px whitespace-nowrap tabular-nums text-[length:var(--text-caption)] text-[var(--app-hint)]" /* design-tokens-allow: 31px fixed anchor slot for worst-case `999` + icon (#3287 R4); no --space token is 31px */
         style={{ paddingLeft: NODE_BADGE_RADIUS_CSS }}
         data-testid={`message-count-${sessionId}`}
         data-queued={queued ? "true" : undefined}
-        title={
-          queued
-            ? `${queuedCount} queued message${queuedCount > 1 ? "s" : ""}`
-            : undefined
-        }
+        data-abbreviated={messages.glyph ? undefined : "true"}
+        title={messagesTitle}
+        aria-label={messagesTitle}
+        role="img"
       >
-        <MessageSquareIcon
-          className={`h-[11px] w-[11px] shrink-0 ${queued ? QUEUED_BUBBLE_CLASS : ""}`} /* design-tokens-allow: 11px E6 message-bubble glyph (mockup-pinned); no icon-size token at 11px */
-        />
-        <span className="leading-none">
-          {formatMessageCount(messageCount ?? 0)}
+        {messages.glyph && (
+          <MessageSquareIcon
+            className={`h-[11px] w-[11px] shrink-0 ${queued ? QUEUED_BUBBLE_CLASS : ""}`} /* design-tokens-allow: 11px E6 message-bubble glyph (mockup-pinned); no icon-size token at 11px */
+          />
+        )}
+        <span
+          className={`leading-none ${messages.glyph ? "" : ABBREVIATED_COUNT_CLASS} ${queued && !messages.glyph ? QUEUED_COUNT_CLASS : ""}`}
+        >
+          {messages.text}
         </span>
       </span>
       {/* #6660: Pins Waiting — where the bell was (Matt's ROW-D). A plain

@@ -620,6 +620,34 @@ export function LayersIcon(props: IconProps) {
 }
 
 /**
+ * #6646 (ROW-C): the billable coin, lucide `circle-dollar-sign` as the mock-up
+ * draws it. It takes the clock's place in a billable session's time block.
+ */
+export function CoinIcon(props: IconProps) {
+  return createIcon(
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8" />
+      <path d="M12 18V6" />
+    </>,
+    props,
+    2
+  );
+}
+
+/** #6646 (ROW-C): the lock shown where a session's billable switch cannot be read. */
+export function LockIcon(props: IconProps) {
+  return createIcon(
+    <>
+      <rect width="18" height="11" x="3" y="11" rx="2" ry="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </>,
+    props,
+    2
+  );
+}
+
+/**
  * Paperclip glyph shared by the prompt composer and the notes field (#1075).
  * Fixed 16px geometry + 2.5 stroke (not createIcon's 24px/class sizing) so the
  * two attachment buttons stay pixel-identical. Lives here rather than in

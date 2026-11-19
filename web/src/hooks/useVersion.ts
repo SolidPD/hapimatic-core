@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useQuery } from "@tanstack/react-query";
+import { queryKeys } from "@/lib/query-keys";
 
 export interface VersionInfo {
   version: string;
@@ -20,11 +21,15 @@ export interface VersionInfo {
   /** #6447/#6449: present (and `true`) only while this instance's pins gate is
    * open (`HAPI_PINS_ENABLED`). Absent keeps every Pins surface hidden. */
   pinsEnabled?: true;
+  /** #6646: the server's billable sessions gate, `on` or `closed`; absent while
+   * it is off (and from an older server). Read once per page life, so a billable
+   * route's 404 or 409 refetches it (`useBillableSwitch.ts`). */
+  billableSwitch?: "on" | "closed";
 }
 
 export function useVersion() {
   return useQuery<VersionInfo>({
-    queryKey: ["version"],
+    queryKey: queryKeys.version,
     queryFn: async () => {
       const res = await fetch("/api/version");
       if (!res.ok) {

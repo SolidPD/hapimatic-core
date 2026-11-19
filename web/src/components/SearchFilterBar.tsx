@@ -41,6 +41,11 @@ type SearchFilterBarProps = {
   onFilterProviderChange: (provider: string) => void;
   onFilterReviewChange: (review: Filters["review"]) => void;
   onFilterLinkedIssueChange: (linkedIssue: Filters["linkedIssue"]) => void;
+  /**
+   * #6646 (FLT-MENU, Matt 2026-11-17): the Billable section's setter, given
+   * only while billable sessions are not off; absent, the section is not drawn.
+   */
+  onFilterBillableChange?: (billable: Filters["billable"]) => void;
   onSortChange: (sort: SearchFilterPreferences["sort"]) => void;
   onSortDirectionChange: (
     direction: SearchFilterPreferences["sortDirection"]
@@ -70,6 +75,12 @@ const STATUS_OPTIONS: { value: Filters["status"]; label: string }[] = [
   { value: "all", label: "All" },
   { value: "active", label: "Active" },
   { value: "inactive", label: "Inactive" },
+];
+const BILLABLE_OPTIONS: { value: Filters["billable"]; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "billable", label: "Billable" },
+  { value: "non-billable", label: "Non-billable" },
+  { value: "to-confirm", label: "To confirm" },
 ];
 const TYPE_OPTIONS: { value: Filters["type"]; label: string }[] = [
   { value: "all", label: "All" },
@@ -147,7 +158,9 @@ export function getSearchFilterEngagement(state: {
     filters.account !== "all" ||
     filters.provider !== "all" ||
     filters.review !== "all" ||
-    filters.linkedIssue !== "all";
+    filters.linkedIssue !== "all" ||
+    // #6646: the caller passes "all" while billable sessions are off.
+    filters.billable !== "all";
   // #3114: a live custom drag order counts as a non-default sort ("Manual"), so
   // the Sort trigger + the per-menu clear both light up while it is active.
   const sortActive =
@@ -174,6 +187,7 @@ export function SearchFilterBar({
   onFilterProviderChange,
   onFilterReviewChange,
   onFilterLinkedIssueChange,
+  onFilterBillableChange,
   onSortChange,
   onSortDirectionChange,
   onClearAll,
@@ -232,6 +246,17 @@ export function SearchFilterBar({
               options={STATUS_OPTIONS}
               onChange={onFilterStatusChange}
             />
+            {onFilterBillableChange ? (
+              <>
+                <DropdownMenuSeparator className="my-0.5" />
+                <MenuRadioSection
+                  label="Billable"
+                  value={filters.billable}
+                  options={BILLABLE_OPTIONS}
+                  onChange={onFilterBillableChange}
+                />
+              </>
+            ) : null}
             <DropdownMenuSeparator className="my-0.5" />
             <MenuRadioSection
               label="Type"

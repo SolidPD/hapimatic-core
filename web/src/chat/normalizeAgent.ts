@@ -552,7 +552,9 @@ export function normalizeAgentRecord(
             type: "tool-result",
             tool_use_id: data.callId,
             content: data.output,
-            is_error: false,
+            // #6724: a Codex MCP result carries the flag; every other result
+            // has none and stays false, as before.
+            is_error: data.is_error === true,
             uuid,
             parentUUID: null,
           },

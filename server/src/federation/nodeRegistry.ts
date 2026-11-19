@@ -456,20 +456,6 @@ export function getPollBackoffDelay(consecutiveFailures: number): number {
 }
 
 /**
- * Check whether a session is "interesting" to a given node — i.e. the session
- * originated from that node, or has no originator (backward compat).
- * Mirrors the filter expression in getAllRemoteSessions().
- */
-export function isSessionInteresting(
-  session: { metadata?: Record<string, unknown> | null },
-  ownNodeId: string
-): boolean {
-  const meta = session.metadata as Record<string, unknown> | null;
-  const origin = meta?.originatingNodeId ?? meta?.originatingHubId;
-  return !origin || origin === ownNodeId;
-}
-
-/**
  * Issue #2761 (Fix B): is a session's `activeAt` heartbeat still "fresh" (within
  * `LIVE_SESSION_FRESHNESS_WINDOW_MS` of `now`)? Mirrors the R4 conservatism of the
  * daemon guard `isSessionLiveForGuard` (`cli/src/daemon/sessionLiveness.ts`): a
@@ -485,38 +471,16 @@ function isActiveAtFresh(activeAt: number | undefined, now: number): boolean {
 }
 
 /**
- * Determine whether an SSE bridge event should be forwarded to local clients.
- *
- * - Non-session events (no sessionId) → always forward
- * - Session in interestingSessions Set → forward (O(1) fast path)
- * - Session NOT in Set → check sessionCache for definitive ownership:
- *   - Not in cache (cache miss / pre-poll) → forward (safe default)
- *   - In cache with different originatingNodeId → drop
+ * Determine whether an SSE bridge event from a peer should be forwarded to this
+ * hub's browsers. The hub forwards every event from a peer, whatever the
+ * session's origin (mesh-wide visibility, #6759, ADR-0009); the only drop is a
+ * peer's pin event on a hub whose Pins gate is closed (#6447).
  */
 export function shouldForwardBridgeEvent(
   event: SyncEvent,
-  interestingSessions: Set<string>,
-  sessionCache: Map<string, { sessions: SessionSummary[] }>,
-  ownNodeId: string
+  pinsEnabled: boolean
 ): boolean {
-  // Non-session events: always forward
-  const sessionId = "sessionId" in event ? event.sessionId : undefined;
-  if (!sessionId) return true;
-
-  // Fast path: session is known-interesting
-  if (interestingSessions.has(sessionId)) return true;
-
-  // Slow path: check cache for definitive ownership
-  for (const cached of sessionCache.values()) {
-    const session = cached.sessions.find(s => s.id === sessionId);
-    if (session) {
-      return isSessionInteresting(session, ownNodeId);
-    }
-  }
-
-  // Cache miss: session not yet polled — forward to avoid dropping
-  // real-time events for newly-spawned sessions
-  return true;
+  return !(event.type === "pin-changed" && !pinsEnabled);
 }
 
 /**
@@ -700,14 +664,6 @@ export class NodeRegistry {
     string,
     ReturnType<typeof setTimeout>
   >();
-
-  /**
-   * Set of sessionIds this node considers "interesting" — sessions where
-   * originatingNodeId matches our own nodeId, or sessions without an
-   * originator (backward compat). Rebuilt on each poll cycle for O(1)
-   * lookup in the SSE event bridge filter.
-   */
-  private interestingSessions = new Set<string>();
 
   /** Event bridge stats: counters reset each poll cycle for observability. */
   private bridgeStats = { forwarded: 0, filtered: 0 };
@@ -1224,50 +1180,46 @@ export class NodeRegistry {
     return this.nodeStates.has(nodeId);
   }
 
-  /** Get all remote sessions merged from all nodes, with federation metadata.
-   *  Dual-node visibility: shows sessions spawned by this node (originatingNodeId match)
-   *  plus sessions without an originator (backward compat with pre-P2P sessions).
+  /** Every remote session the registry has polled, from every peer (mesh-wide
+   *  visibility, #6759), with federation metadata.
    */
   getAllRemoteSessions(): SessionSummary[] {
-    const ownNodeId = this.config.nodeId;
     const now = Date.now();
     const all: SessionSummary[] = [];
     for (const cached of this.sessionCache.values()) {
       const state = this.nodeStates.get(cached.nodeId);
       const nodeStatus = state?.status ?? "offline";
       const nodeUrl = state?.config.url;
-      const enriched = cached.sessions
-        .filter(s => isSessionInteresting(s, ownNodeId))
-        .map(s => ({
-          ...s,
-          nodeStatus,
-          nodeUrl,
-          // Issue #2761 (Fix B): dual-corroborated read-path projection. Show an
-          // offline node's frozen-zombie session as `active:false` to consumers of
-          // /api/federation/all-sessions — but ONLY when the node is offline AND the
-          // session's `activeAt` heartbeat is stale beyond the freshness window.
-          //
-          // WHY dual-corroboration, never offline-alone: the daemon idle-refresh
-          // P-REVOKE guard consumes THIS SAME endpoint (run.ts → webClient.ts →
-          // getAllRemoteSessions), and `isSessionLiveForGuard` short-circuits on
-          // `!active` BEFORE its own freshness check. An unconditional offline
-          // projection would therefore launder node-offline into a standalone
-          // not-live trigger, violating the landed #1852 R24 invariant and reopening
-          // a 45-120s false-rotation window on connectivity blips (a node flips
-          // offline in ~30-45s, i.e. BEFORE `activeAt` staleness at 120s). Requiring
-          // BOTH conditions still kills the 20h frozen-zombie UI case this fix
-          // targets (20h ≫ 120s). `nodeStatus` is the 3-valued node state, so
-          // "online"/"degraded", offline-but-fresh, and offline-with-missing-
-          // `activeAt` (R4 conservatism) all fall through to `s.active`.
-          //
-          // Read-path only (R2): this is a fresh spread, so the cached
-          // `SessionSummary` in `sessionCache` is never mutated — `markSessionInactive`'s
-          // targeted mutations and the next successful poll's write are left intact.
-          active:
-            nodeStatus === "offline" && !isActiveAtFresh(s.activeAt, now)
-              ? false
-              : s.active,
-        }));
+      const enriched = cached.sessions.map(s => ({
+        ...s,
+        nodeStatus,
+        nodeUrl,
+        // Issue #2761 (Fix B): dual-corroborated read-path projection. Show an
+        // offline node's frozen-zombie session as `active:false` to consumers of
+        // /api/federation/all-sessions — but ONLY when the node is offline AND the
+        // session's `activeAt` heartbeat is stale beyond the freshness window.
+        //
+        // WHY dual-corroboration, never offline-alone: the daemon idle-refresh
+        // P-REVOKE guard consumes THIS SAME endpoint (run.ts → webClient.ts →
+        // getAllRemoteSessions), and `isSessionLiveForGuard` short-circuits on
+        // `!active` BEFORE its own freshness check. An unconditional offline
+        // projection would therefore launder node-offline into a standalone
+        // not-live trigger, violating the landed #1852 R24 invariant and reopening
+        // a 45-120s false-rotation window on connectivity blips (a node flips
+        // offline in ~30-45s, i.e. BEFORE `activeAt` staleness at 120s). Requiring
+        // BOTH conditions still kills the 20h frozen-zombie UI case this fix
+        // targets (20h ≫ 120s). `nodeStatus` is the 3-valued node state, so
+        // "online"/"degraded", offline-but-fresh, and offline-with-missing-
+        // `activeAt` (R4 conservatism) all fall through to `s.active`.
+        //
+        // Read-path only (R2): this is a fresh spread, so the cached
+        // `SessionSummary` in `sessionCache` is never mutated — `markSessionInactive`'s
+        // targeted mutations and the next successful poll's write are left intact.
+        active:
+          nodeStatus === "offline" && !isActiveAtFresh(s.activeAt, now)
+            ? false
+            : s.active,
+      }));
       all.push(...enriched);
     }
     return all;
@@ -3806,29 +3758,22 @@ export class NodeRegistry {
   }
 
   /**
-   * Rebuild the `interestingSessions` Set from the current session cache.
-   * Delegates to the exported `isSessionInteresting()` pure function.
+   * Log the event bridge counters for the sweep that just ended, then reset
+   * them. Prints only in a sweep where either counter is non-zero. The counts
+   * are hub-wide; `forwarded` counts events handed to `broadcast`, not events
+   * a browser received.
    */
-  private rebuildInterestingSessions(): void {
-    const ownNodeId = this.config.nodeId;
-    const next = new Set<string>();
-    for (const cached of this.sessionCache.values()) {
-      for (const s of cached.sessions) {
-        if (isSessionInteresting(s, ownNodeId)) {
-          next.add(s.id);
-        }
-      }
-    }
-
-    // Log stats from the previous cycle before resetting
+  private logBridgeStats(): void {
     if (this.bridgeStats.forwarded > 0 || this.bridgeStats.filtered > 0) {
+      let cachedCount = 0;
+      for (const cached of this.sessionCache.values()) {
+        cachedCount += cached.sessions.length;
+      }
       console.log(
-        `[Federation] Event bridge stats: ${this.bridgeStats.forwarded} forwarded, ${this.bridgeStats.filtered} filtered (${next.size} interesting sessions)`
+        `[Federation] Event bridge stats: ${this.bridgeStats.forwarded} forwarded, ${this.bridgeStats.filtered} filtered (${cachedCount} cached remote sessions)`
       );
     }
     this.bridgeStats = { forwarded: 0, filtered: 0 };
-
-    this.interestingSessions = next;
   }
 
   /**
@@ -3836,13 +3781,7 @@ export class NodeRegistry {
    * Delegates to the exported `shouldForwardBridgeEvent()` pure function.
    */
   private shouldForwardEvent(event: SyncEvent): boolean {
-    if (event.type === "pin-changed" && !this.pinsEnabled) return false;
-    return shouldForwardBridgeEvent(
-      event,
-      this.interestingSessions,
-      this.sessionCache,
-      this.config.nodeId
-    );
+    return shouldForwardBridgeEvent(event, this.pinsEnabled);
   }
 
   /**
@@ -3864,7 +3803,7 @@ export class NodeRegistry {
 
   /**
    * One federation poll sweep: refresh dynamic peers, poll every node not in
-   * backoff, then rebuild the interesting-sessions set. Callers go through the
+   * backoff, then log and reset the event bridge stats. Callers go through the
    * guarded `pollAllNodes()`; `forcePoll()` (#3456) clears the backoff map first
    * so this sweep skips nobody.
    */
@@ -3881,8 +3820,8 @@ export class NodeRegistry {
       .map(node => this.pollNode(node));
     await Promise.allSettled(polls);
 
-    // Rebuild the interesting sessions Set after all polls complete
-    this.rebuildInterestingSessions();
+    // Log and reset the event bridge stats after all polls complete
+    this.logBridgeStats();
     this.raiseBillableSwitchReportsChanged();
   }
 
@@ -4011,9 +3950,9 @@ export class NodeRegistry {
           // [#2147 Quick Win #1] Broadcast a session-added nudge for each newly
           // discovered remote session. pollNode replaces sessionCache wholesale
           // and otherwise broadcasts NOTHING, and the remote's own bridged
-          // session-added arrives BEFORE the hub has cached the session
-          // (cache-miss → forwarded), so the client's federated-sessions refetch
-          // on that event misses. Emitting here — for EVERY poll trigger, not
+          // session-added arrives BEFORE the hub has polled the session, so the
+          // client's federated-sessions refetch triggered by it misses the
+          // row. Emitting here — for EVERY poll trigger, not
           // just spawn-status — is what carries the hub's discovery to the
           // browser within one SSE cycle instead of waiting for an incidental
           // event or the 30s client backstop. Mirrors the local analogue in

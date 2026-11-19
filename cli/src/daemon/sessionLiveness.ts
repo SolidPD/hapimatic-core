@@ -21,7 +21,7 @@
  *
  * The predicate is a pure, exported, unit-tested function (R6) mirroring the
  * codebase convention (`clampAliveTime` in server/src/sync/aliveTime.ts,
- * `isSessionInteresting` in server/src/federation/nodeRegistry.ts).
+ * `getPollBackoffDelay` in server/src/federation/nodeRegistry.ts).
  */
 
 // Issue #2761 (R4): the freshness window is the SINGLE SOURCE OF TRUTH in

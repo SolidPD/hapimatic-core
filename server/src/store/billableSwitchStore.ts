@@ -519,6 +519,15 @@ export const BILLABLE_SWITCH_REPORT_REFRESH_MS = 60_000;
 export class BillableSwitchStore {
   constructor(private readonly db: Database) {}
 
+  /**
+   * True when this database's switch storage passed the boot readiness check
+   * (both columns and every billable_switch_* table). A loop that reads the
+   * tables checks it before it starts (PR-2 item E3).
+   */
+  storageReady(): boolean {
+    return isBillableSwitchStorageReady(this.db);
+  }
+
   // ---- the switch ---------------------------------------------------------
 
   /** This session's switch, or null when the row does not exist. */

@@ -120,8 +120,10 @@ const mcpSetDesiredSchema = z.object({
 
 // Issue #1451 (Sub-Issue E): set an existing session's Anthropic account.
 // Issue #4823: the payment-method target — EXACTLY ONE of a subscription account
-// (`accountUuid`) or a node-vault Anthropic API key (`apiKeyId`, the vault id —
-// never the key; same bounds as the spawn body). Both or neither → 400.
+// (`accountUuid`) or an Anthropic API key (`apiKeyId`, a key REFERENCE — never
+// the key; same bounds as the spawn body): a bare vault id for a key on the
+// session's own node, or the `bindingRef` of a key another node shares (#6542).
+// Both or neither → 400.
 const setSessionAccountSchema = z
   .object({
     accountUuid: z.string().uuid().optional(),
@@ -1419,9 +1421,9 @@ export function createSessionsRoutes(
         domain: "accounts",
         surface: "rest",
         description:
-          "Switch an existing session's payment method on its owning node — a subscription account or a node-vault Anthropic API key — restarting or staging the session process.",
+          "Switch a session's payment method on its owning node, restarting or staging it: an account, or an Anthropic API key by reference (a bare vault id, or the bindingRef of a key another node shares).",
         whenToUse:
-          "When the user changes which account or Anthropic API key a session runs under.",
+          "When the user changes which account or Anthropic API key a session runs under, including a key another node shares.",
         invocation: {
           kind: "rest",
           method: "POST",
@@ -1472,10 +1474,10 @@ export function createSessionsRoutes(
       }
 
       // Account existence + refreshability (and, issue #4823, an API-key target's
-      // vault entry + launcher / local-mode / agent fitness) are validated inside
-      // the engine on the OWNING node — the account record and the vault live
-      // where the session runs. A key target for a peer-owned session is refused
-      // by the service before any proxy (keys are node-local).
+      // launcher / local-mode / agent fitness and its key: a bare id in the vault,
+      // or a shared key's home check, #6542) are validated inside the engine on
+      // the OWNING node — where the session runs. A key target for a peer-owned
+      // session is refused by the service before any proxy, naming the owner.
       const target: PaymentMethodTarget =
         parsed.data.apiKeyId !== undefined
           ? { kind: "api-key", apiKeyId: parsed.data.apiKeyId }
@@ -1779,10 +1781,11 @@ export function createSessionsRoutes(
       }
 
       // #3083: resolve the session for the hub-side flavor fast-path. A remote-owned
-      // session is resolved from the hub's cached summaries; the findNodeForSession
-      // fallback covers a cached-but-not-interesting session (the receiver validates
-      // authoritatively). NO !active guard — round-11 (#3285) stages a disconnected
-      // session via engine.applySessionConfig → stageSessionConfig.
+      // session is resolved from the hub's cached summaries (every peer's sessions
+      // since #6759). `findNodeForSession` reads the same cache, so the second check
+      // is kept only as a guard (the receiver validates authoritatively). NO !active
+      // guard — round-11 (#3285) stages a disconnected session via
+      // engine.applySessionConfig → stageSessionConfig.
       const registry = options?.getNodeRegistry?.();
       const view =
         localSession ??

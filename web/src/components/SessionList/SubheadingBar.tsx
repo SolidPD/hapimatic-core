@@ -34,7 +34,7 @@
 // HUE-AGNOSTIC: the composite hard-codes NO color. The caller passes the tint
 // (bg / border-l rail / text / hover) via `className`; the base owns only
 // layout (flex / gap / height / padding / alignment).
-import type { ReactNode } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { ChevronIcon } from "@/components/icons";
 import { cn } from "@/lib/utils";
 
@@ -66,6 +66,13 @@ export interface SubheadingBarProps {
   className?: string;
   /** Optional passthrough for the count/secondary-text span (e.g. opacity). */
   countClassName?: string;
+  /**
+   * #6646 (Task 14, review P17): an optional control beside the toggle (e.g. the
+   * "To confirm" bar's Keep all). With it, the bar is a `div` holding the toggle
+   * button, the action and the chevron as a second button calling `onToggle`,
+   * so no button nests in another. Without it the markup is unchanged.
+   */
+  action?: ReactNode;
   "aria-controls"?: string;
   "data-testid"?: string;
 }
@@ -80,9 +87,55 @@ export function SubheadingBar({
   nestedInRail = false,
   className,
   countClassName,
+  action,
   "aria-controls": ariaControls,
   "data-testid": dataTestid,
 }: SubheadingBarProps) {
+  const toggle = (e: MouseEvent) => {
+    e.stopPropagation();
+    onToggle();
+  };
+  if (action != null) {
+    return (
+      <div
+        data-testid={dataTestid}
+        data-nested-in-rail={nestedInRail ? "true" : undefined}
+        className={cn(
+          "flex w-full items-center gap-1.5 pr-2 transition-colors",
+          nestedInRail ? "pl-1" : "pl-2",
+          className
+        )}
+      >
+        <button /* design-tokens-allow: SubheadingBar's toggle (#3484) — hue-agnostic, every tint arrives via the caller's className on the wrapping div. */
+          type="button"
+          onClick={toggle}
+          aria-expanded={!collapsed}
+          aria-controls={ariaControls}
+          className="flex min-w-0 flex-1 items-center gap-1.5 py-1.5 text-left"
+        >
+          <SubheadingBarText
+            cluster={cluster}
+            icon={icon}
+            label={label}
+            count={count}
+            countClassName={countClassName}
+          />
+        </button>
+        {action}
+        <button /* design-tokens-allow: SubheadingBar's chevron (#3484), the same toggle as a second button so the action sits between them; no color of its own. */
+          type="button"
+          onClick={toggle}
+          aria-expanded={!collapsed}
+          aria-controls={ariaControls}
+          aria-label={collapsed ? "Expand" : "Collapse"}
+          data-subheading-chevron
+          className="flex shrink-0 items-center justify-center self-stretch w-[var(--icon-btn-size)]"
+        >
+          <ChevronIcon className="h-2.5 w-2.5 shrink-0" collapsed={collapsed} />
+        </button>
+      </div>
+    );
+  }
   return (
     <button /* design-tokens-allow: SubheadingBar is the shared, hue-agnostic subheading composite (#3484) — it hard-codes NO color; every tint arrives via the caller's className. It consolidates the previously grandfathered per-site raw subheading buttons into one primitive. */
       type="button"
@@ -149,5 +202,38 @@ export function SubheadingBar({
         <ChevronIcon className="h-2.5 w-2.5 shrink-0" collapsed={collapsed} />
       </span>
     </button>
+  );
+}
+
+/** The bar's cluster, icon, label and count, inside the toggle (with an action). */
+function SubheadingBarText(props: {
+  cluster?: ReactNode;
+  icon?: ReactNode;
+  label: ReactNode;
+  count?: ReactNode;
+  countClassName?: string;
+}) {
+  return (
+    <>
+      {props.cluster != null && (
+        <span data-subheading-cluster className="flex shrink-0 mr-1.5">
+          {props.cluster}
+        </span>
+      )}
+      {props.icon}
+      <span className="min-w-0 truncate select-none text-[length:var(--text-caption-xs)] font-medium leading-none">
+        {props.label}
+      </span>
+      {props.count != null && (
+        <span
+          className={cn(
+            "shrink-0 select-none text-[length:var(--text-caption-xs)] leading-none",
+            props.countClassName
+          )}
+        >
+          {props.count}
+        </span>
+      )}
+    </>
   );
 }

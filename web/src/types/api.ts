@@ -398,9 +398,12 @@ export type SetSessionAccountResponse = {
 };
 
 /** Issue #4823: the payment-method switch body — EXACTLY ONE of a subscription
- *  account or a node-vault Anthropic API key (its vault id, never the key). */
+ *  account or a node-vault Anthropic API key (its vault id, never the key).
+ *  Issue #6742: `forceAccount` rebinds onto an account at its usage limit
+ *  anyway, past the 409 `account_exhausted` refusal (the server's
+ *  `setSessionAccountSchema`, #5879). */
 export type SetSessionPaymentMethodRequest =
-  | { accountUuid: string }
+  | { accountUuid: string; forceAccount?: boolean }
   | { apiKeyId: string };
 
 export type DirectoryEntry = {

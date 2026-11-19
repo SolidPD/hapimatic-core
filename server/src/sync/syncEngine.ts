@@ -121,6 +121,7 @@ import { McpCatalogService } from "../services/mcpCatalogService";
 import { SessionRespawn } from "./sessionRespawn";
 import {
   AccountRestart,
+  type ApiKeyRefResolver,
   type PaymentMethodTarget,
   type PaymentMethodSwitchResult,
   type PaymentMethodStageResult,
@@ -612,6 +613,14 @@ export class SyncEngine {
    * fail-closes when absent.
    */
   private accountService: AccountValidator | null = null;
+
+  /**
+   * Issue #6542: resolves a key reference that names another node for the
+   * payment-method switch. Injected post-construction via
+   * setApiKeyRefResolver() — the shared-key service is built in buildWebApp.ts,
+   * after SyncEngine. Null until wired; the switch then refuses such a ref.
+   */
+  private apiKeyRefResolver: ApiKeyRefResolver | null = null;
 
   /**
    * Issue #2453 (Task 7): loop-cron ↔ session lifecycle coupler. Injected
@@ -1139,6 +1148,9 @@ export class SyncEngine {
       // key" (fail closed — the switch is refused, nothing is killed), logged.
       // #5819: the same reader serves the placement re-check (readApiKeyById).
       getApiKeyById: id => this.readApiKeyById(id),
+      // Issue #6542: a key reference containing `@` resolves through #5127's
+      // shared-key service. Lazy — the service is injected post-construction.
+      getApiKeyRefResolver: () => this.apiKeyRefResolver,
       // #4914: waiting-for-slot / account-unrefreshable / session-restart-failed.
       notifyUser: input => this.notifyUser(input),
     });
@@ -4593,6 +4605,15 @@ export class SyncEngine {
    */
   setAccountService(svc: AccountValidator): void {
     this.accountService = svc;
+  }
+
+  /**
+   * Inject the resolver for a key reference that names another node (issue
+   * #6542). Wired in buildWebApp.ts beside setAccountService, with the one
+   * SharedApiKeyService that also serves the spawn, launcher and picker.
+   */
+  setApiKeyRefResolver(fn: ApiKeyRefResolver): void {
+    this.apiKeyRefResolver = fn;
   }
 
   /**

@@ -363,7 +363,8 @@ export function deriveSessionInfoRecord(
     "Thinking Time": formatHms(thinkingMs),
     Context: contextValue(src),
     // The exact count behind the surface's message badge (the badge itself
-    // abbreviates ≥1000 to `1k+`), ungrouped so it reads the same number.
+    // abbreviates ≥1000 to one decimal, `1.1K`), ungrouped so it reads the same
+    // number.
     Messages:
       typeof ctx.messageCount === "number"
         ? String(Math.round(ctx.messageCount))

@@ -67,6 +67,15 @@ export function start(opts: {
   turnMirrorConfig: TurnMirrorConfig;
 }): void {
   if (loop) return;
+  // PR-2 item E3: with the switch storage not ready (a failed migration) every
+  // tick's store call would throw, and each origin was logged once a minute as
+  // unreachable. Say once what is wrong and leave the loop unstarted.
+  if (!opts.store.storageReady()) {
+    console.error(
+      "[BillableSwitchMirrorPull] not started: this node's billable switch storage is not ready (its migration failed), so other nodes' switch events are not copied here"
+    );
+    return;
+  }
   const { turnMirrorConfig } = opts;
   loop = new SupervisedLoop({
     name: "billable-switch-mirror-pull",

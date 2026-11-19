@@ -20,6 +20,7 @@ import type { WebAppEnv } from "../../middleware/auth";
 import { isSafeMachinePath } from "../../../utils/pathSecurity";
 import { expandTilde } from "../../../utils/expandTilde";
 import { validateApiKeySpawn } from "../machines";
+import { refuseUnhonourableBillableAnswer } from "../agentEscalation";
 import { resolveSpawnMcpSet } from "../../../services/mcpSetResolver";
 import {
   resolveModelFamily,
@@ -142,6 +143,21 @@ export async function spawnForPeer(
     wireBillableSwitchStart,
     c.req.header("x-hapi-caller-namespace") ?? undefined
   );
+  // A person's explicit billable answer that this node's own gate cannot honour
+  // is refused with the local Create's two codes (409 billable_feature_unsupported
+  // or billable_feature_closed, naming this node), never dropped: the hub's tags
+  // for this node can be one poll old, so its gate may have changed since. The
+  // hub passes the coded refusal on to the person (webClient.ts). The check reads
+  // only the kind and the choice.
+  const billableRefusal = refuseUnhonourableBillableAnswer(c, engine, {
+    kind: billableSwitchStart.kind === "person" ? "person" : "unattended",
+    choice: billableSwitchStart.choice,
+    actor: { kind: "client" },
+    via: "direct",
+  });
+  if (billableRefusal) {
+    return billableRefusal;
+  }
 
   // H-4: validate the directory against the path-security blacklist BEFORE
   // spawning a session in it. Without this, any federation-authorized caller

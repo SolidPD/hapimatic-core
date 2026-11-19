@@ -740,6 +740,16 @@ export function buildWebApp(options: {
   // so this is a setter rather than a constructor arg.
   options.getSyncEngine()?.setAccountService(accountService);
 
+  // Issue #6542: let the payment-method switch resolve a key another node shares
+  // (`<uuid>@<home>`) through the same service the spawn, launcher and picker use.
+  // No `requireShared`: a switch picked on the session's own node may bill any of
+  // its keys, and the home itself refuses a foreign key it does not share.
+  options
+    .getSyncEngine()
+    ?.setApiKeyRefResolver((ref, o) =>
+      sharedApiKeyService.resolve(ref, undefined, o)
+    );
+
   // Issue #6028: let spawnSession stamp the pinned model's supported effort
   // levels from THIS node's catalog (one instance — the same one behind
   // GET /api/claude/models). Wired here, not in index.ts, because this file owns

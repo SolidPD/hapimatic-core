@@ -33,6 +33,7 @@ import type { BillableSwitchInitial } from "../store/sessions";
 import type {
   BillableSwitchNodeRegistryView,
   NodeRegistry,
+  PeerReadOutcome,
 } from "../federation/nodeRegistry";
 
 // The billable switch's service (issue #6646, Task 5): the one place that decides
@@ -97,7 +98,32 @@ export type BillableSwitchHistoryEvent = {
   timerMs: number | null;
   unloggedMs: number | null;
   loggedKnown: boolean;
+  /**
+   * #6646 (Task 14): on a start event only, the nodes whose header made the
+   * session billable (its label's `causeNodes`), as label and report time and
+   * nothing else. Absent when the start had no cause.
+   */
+  causeNodes?: Array<{ nodeLabel: string; reportedAt: number | null }>;
 };
+
+/** A start event label's cause nodes, as the history read shows them. */
+function historyCauseNodes(
+  label: Record<string, unknown> | null
+): Array<{ nodeLabel: string; reportedAt: number | null }> {
+  const raw = label?.causeNodes;
+  if (!Array.isArray(raw)) return [];
+  const out: Array<{ nodeLabel: string; reportedAt: number | null }> = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const { nodeLabel, reportedAt } = entry as Record<string, unknown>;
+    if (typeof nodeLabel !== "string") continue;
+    out.push({
+      nodeLabel,
+      reportedAt: typeof reportedAt === "number" ? reportedAt : null,
+    });
+  }
+  return out;
+}
 
 export type BillableSwitchHistory = {
   sessionId: string;
@@ -179,6 +205,12 @@ export class BillableSwitchService {
   private readonly now: () => number;
   /** Nodes that answered the push with `has-registry`: skipped from then on. */
   private readonly pushSkip = new Set<string>();
+  /**
+   * PR-2 item E2: each node whose header-report push is failing, with how many
+   * pushes in a row failed. A streak is logged when it starts and when it ends,
+   * so a push that fails every time is seen without a line every round.
+   */
+  private readonly pushFailing = new Map<string, number>();
   private pushTimer: ReturnType<typeof setTimeout> | null = null;
   private sweepTimer: ReturnType<typeof setTimeout> | null = null;
   private pushInFlight: Promise<void> | null = null;
@@ -714,13 +746,18 @@ export class BillableSwitchService {
    * advertises billable:switch or billable:switch-closed. Best-effort: a node
    * that answers `has-registry` is skipped from then on.
    */
-  async pushPeerReports(): Promise<{ sent: string[]; skipped: string[] }> {
+  async pushPeerReports(): Promise<{
+    sent: string[];
+    skipped: string[];
+    failed: string[];
+  }> {
     const registry = this.deps.getRegistry();
     const sent: string[] = [];
     const skipped: string[] = [];
+    const failed: string[] = [];
     const mode = this.mode();
     if (!registry || (mode !== "on" && mode !== "closed") || !this.isPusher()) {
-      return { sent, skipped };
+      return { sent, skipped, failed };
     }
     const now = this.now();
     const usable = this.crossNodeView().filter(
@@ -746,7 +783,12 @@ export class BillableSwitchService {
         view.nodeId,
         { reports }
       );
-      if (outcome.kind !== "ok") continue;
+      if (outcome.kind !== "ok") {
+        failed.push(view.nodeId);
+        this.notePushFailure(view.nodeId, view.nodeLabel, outcome);
+        continue;
+      }
+      this.notePushSuccess(view.nodeId, view.nodeLabel);
       const body = outcome.body as {
         applied?: unknown;
         reason?: unknown;
@@ -758,7 +800,33 @@ export class BillableSwitchService {
         sent.push(view.nodeId);
       }
     }
-    return { sent, skipped };
+    return { sent, skipped, failed };
+  }
+
+  private notePushFailure(
+    nodeId: string,
+    nodeLabel: string,
+    outcome: Exclude<PeerReadOutcome, { kind: "ok" }>
+  ): void {
+    const streak = (this.pushFailing.get(nodeId) ?? 0) + 1;
+    this.pushFailing.set(nodeId, streak);
+    if (streak !== 1) return;
+    const why =
+      outcome.kind === "unreachable"
+        ? `${outcome.reason}${outcome.status ? ` (${outcome.status})` : ""}: ${outcome.message}`
+        : outcome.kind;
+    console.warn(
+      `[BillableSwitch] Header report push to ${nodeLabel} (${nodeId}) failed: ${why}. Its copy of the other nodes' headers ages out after 7 days unless a push lands; logged again when it recovers.`
+    );
+  }
+
+  private notePushSuccess(nodeId: string, nodeLabel: string): void {
+    const streak = this.pushFailing.get(nodeId);
+    if (streak === undefined) return;
+    this.pushFailing.delete(nodeId);
+    console.warn(
+      `[BillableSwitch] Header report push to ${nodeLabel} (${nodeId}) works again after ${streak} failed push${streak === 1 ? "" : "es"}.`
+    );
   }
 
   /** The registry raised "a report changed this round": push now (one at a time). */
@@ -815,6 +883,7 @@ export class BillableSwitchService {
 
   /** Section 6 item 4: the response carries no user agent, project key, label or path. */
   static toHistoryEvent(e: BillableSwitchEvent): BillableSwitchHistoryEvent {
+    const causeNodes = e.kind === "start" ? historyCauseNodes(e.label) : [];
     return {
       id: e.id,
       at: e.at,
@@ -834,6 +903,7 @@ export class BillableSwitchService {
       timerMs: e.timerMs,
       unloggedMs: e.unloggedMs,
       loggedKnown: e.loggedKnown,
+      ...(causeNodes.length > 0 ? { causeNodes } : {}),
     };
   }
 

@@ -112,9 +112,10 @@ const RESULT_JSON_MAX = 16 * 1024;
 
 /**
  * Whether a completed pin call's result is the tool's refusal: its first line
- * is the JSON payload `hapiPinTools.ts` builds, and `ok` is false. Codex and
- * ACP report a refused call as completed (`normalizeAgent.ts` writes their
- * results with `is_error: false`), so the state alone does not tell. A payload
+ * is the JSON payload `hapiPinTools.ts` builds, and `ok` is false. ACP, and a
+ * Codex CLI older than #6724, report a refused call as completed
+ * (`normalizeAgent.ts` writes their results with `is_error: false`), so the
+ * state alone does not tell; Codex MCP results now carry the flag. A payload
  * that is itself a tool result's content is read one level down.
  */
 function refusedResult(result: unknown, depth = 0): boolean {

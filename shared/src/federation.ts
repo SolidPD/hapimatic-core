@@ -287,7 +287,7 @@ export const FederationSpawnBodySchema = z.object({
   sourceBranch: SourceBranchSchema.optional(),
   name: optionalSessionNameSchema,
   emoji: z.string().optional(),
-  /** NodeId of the peer that initiated this spawn (for dual-node visibility filtering) */
+  /** NodeId of the peer that initiated this spawn (attribution, spawn-status callbacks and API-key placement; it no longer limits which hubs list the session, #6759) */
   originatingNodeId: z.string().optional(),
   /** Multi-account (epic #1446, R5 of Sub-Issue F #1452): bind the spawned
    *  session to this stored account on the receiving node. The receiver threads

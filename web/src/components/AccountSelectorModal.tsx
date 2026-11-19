@@ -68,6 +68,7 @@ import {
   rowMonogram,
 } from "@/components/AccountUsage/AccountCardRow1";
 import { AccountSelectorEmptyState } from "@/components/AccountSelectorEmptyState";
+import { limitWindowName } from "@/lib/accountLimit";
 import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
 import { useVisualViewportHeight } from "@/hooks/useVisualViewportHeight";
 import { useAccounts } from "@/hooks/queries/useAccounts";
@@ -100,7 +101,8 @@ export type AccountSelectorModalProps = {
    * (Sub-Issue G); "spawn" is selection-only for the create page (#1496);
    * "stage" (epic #3285 round 14) is selection-only for an EXISTING session —
    * the Session Configuration Modal stages the pick in its draft and performs
-   * the switch on "Apply changes", so no mutation and no confirm happen here.
+   * the switch on "Apply changes", so no mutation happens here; an account at
+   * its usage limit is staged only through the at-limit confirm (#6742).
    */
   scope?: "per-session" | "per-node" | "spawn" | "stage";
   /** Required when scope is "per-session". */
@@ -321,15 +323,9 @@ type PendingAction =
   | { kind: "confirm-stale-spawn"; account: RedactedAccount }
   // Issue #5879: spawn-scope confirm for an account at a usage cap. Confirming
   // selects it WITH forceAccount, so the server's 409 refusal is overridden.
-  | { kind: "confirm-locked-spawn"; account: RedactedAccount; lock: HardLock }
+  // Issue #6742: the stage scope (Session Configuration) uses it too.
+  | { kind: "confirm-locked"; account: RedactedAccount; lock: HardLock }
   | null;
-
-/** Issue #5879: "weekly" / "5-hour" for a lock's caption and confirm copy. */
-function lockWindowName(lock: HardLock): string {
-  if (lock.window === "five_hour") return "5-hour";
-  if (lock.window === "weekly_scoped") return `${lock.model ?? "model"} weekly`;
-  return "weekly";
-}
 
 /**
  * Account-switching modal (epic #1446, Sub-Issue H). Three states modelled as
@@ -379,14 +375,16 @@ export function AccountSelectorModal({
     [allAccounts, targetProvider]
   );
 
-  // Issue #4568: the Anthropic vault keys this scope offers (only when a select
-  // callback is wired and the target provider is anthropic).
+  // Issue #4568: this scope offers API keys only when a select callback is wired
+  // and the target provider is anthropic. The key rows, the unavailable-node
+  // hints and the reason-only section (#6542) all read this one gate.
+  const keysOffered = Boolean(onSelectApiKey) && targetProvider === "anthropic";
   const offeredKeys = useMemo(
     () =>
-      onSelectApiKey && targetProvider === "anthropic"
+      keysOffered
         ? (apiKeys ?? []).filter(k => k.provider === "anthropic")
         : [],
-    [apiKeys, onSelectApiKey, targetProvider]
+    [apiKeys, keysOffered]
   );
 
   // #3290 (S5, R4): CLI-incompat greying. Every stored account is a Claude
@@ -721,9 +719,10 @@ export function AccountSelectorModal({
   };
 
   // Issue #5879: the user chose an account at its usage cap anyway — select it
-  // WITH the override so the create page sends forceAccount: true.
-  const handleConfirmLockedSpawn = () => {
-    if (pendingAction?.kind !== "confirm-locked-spawn") return;
+  // WITH the override so the create page (or, #6742, the Session Configuration
+  // modal's Apply) sends forceAccount: true.
+  const handleConfirmLocked = () => {
+    if (pendingAction?.kind !== "confirm-locked") return;
     onSelect?.(pendingAction.account.accountUuid, { forceAccount: true });
     handleClose();
   };
@@ -749,7 +748,7 @@ export function AccountSelectorModal({
       // confirm that carries the override (the server refuses it otherwise).
       const lock = lockFor(account);
       if (lock) {
-        setPendingAction({ kind: "confirm-locked-spawn", account, lock });
+        setPendingAction({ kind: "confirm-locked", account, lock });
         return;
       }
       // #1707 + #1961: hard-confirm before selecting an account whose live token
@@ -769,9 +768,16 @@ export function AccountSelectorModal({
     // Modal owns the commit — it stages this pick in its draft and performs the
     // switch on "Apply changes" (its R8 impact copy carries the "relaunches the
     // session" warning the "select" confirm used to). So: onSelect + close, NO
-    // mutation, NO confirm. Dead accounts stay unselectable (D-G6).
+    // mutation. Dead accounts stay unselectable (D-G6).
     if (scope === "stage") {
       if (account.unrefreshable === true) return;
+      // Issue #6742: an account at a usage cap is warned about, never refused —
+      // it stages only through the at-limit confirm, which carries the override.
+      const lock = lockFor(account);
+      if (lock) {
+        setPendingAction({ kind: "confirm-locked", account, lock });
+        return;
+      }
       onSelect?.(account.accountUuid);
       handleClose();
       return;
@@ -788,12 +794,15 @@ export function AccountSelectorModal({
     handleClose();
   };
 
-  const unavailableHints =
-    onSelectApiKey && targetProvider === "anthropic"
-      ? (apiKeysUnavailableHints ?? [])
-      : [];
+  const unavailableHints = keysOffered ? (apiKeysUnavailableHints ?? []) : [];
+  // #6542: the reason alone also mounts the section — a session whose keys the
+  // caller does not list (a peer-owned session) must still say why.
+  const keysReasonAlone = keysOffered && Boolean(apiKeysDisabledReason);
   const apiKeySection =
-    (offeredKeys.length > 0 || unavailableHints.length > 0) && !showHelp ? (
+    (offeredKeys.length > 0 ||
+      unavailableHints.length > 0 ||
+      keysReasonAlone) &&
+    !showHelp ? (
       <ApiKeyRows
         apiKeys={offeredKeys}
         selectedApiKeyId={selectedApiKeyId ?? null}
@@ -896,8 +905,8 @@ export function AccountSelectorModal({
               // Issue #4568 (D-4568-3 A): name each Codex credential's kind.
               const kindLabel = openAiKindLabel(account);
               // Issue #5879: an account at a usage cap renders greyed with its
-              // reset time in every scope; in spawn scope selecting it opens the
-              // override confirm (handleRowSelect).
+              // reset time in every scope; in the spawn and stage scopes
+              // selecting it opens the override confirm (handleRowSelect).
               const lock = lockFor(account);
               const card = (
                 <AccountUsageCard
@@ -926,7 +935,7 @@ export function AccountSelectorModal({
                   data-testid="account-locked-caption"
                   className="px-1 text-[length:var(--text-caption-xs)] font-medium text-[var(--app-hint)]"
                 >
-                  {`Locked · ${lockWindowName(lock)} limit · ${formatResetCountdown(lock.resetsAt)}`}
+                  {`Locked · ${limitWindowName(lock)} limit · ${formatResetCountdown(lock.resetsAt)}`}
                 </span>
               ) : null;
               if (!kindLabel && !lockCaption) return card;
@@ -1271,19 +1280,22 @@ export function AccountSelectorModal({
         isPending={false}
       />
 
-      {/* Issue #5879: spawn-scope confirm for an account at a usage cap. */}
+      {/* Issue #5879: spawn-scope confirm for an account at a usage cap.
+          Issue #6742: the stage scope's copy names the account it switches to. */}
       <ConfirmDialog
-        isOpen={pendingAction?.kind === "confirm-locked-spawn"}
+        isOpen={pendingAction?.kind === "confirm-locked"}
         onClose={() => setPendingAction(null)}
         title="This account is at its usage limit"
         description={
-          pendingAction?.kind === "confirm-locked-spawn"
-            ? `This account is at its ${lockWindowName(pendingAction.lock)} limit until ${formatResetAbsolute(pendingAction.lock.resetsAt)}. Sessions on it fail on their first turn until then. Use it anyway?`
-            : ""
+          pendingAction?.kind !== "confirm-locked"
+            ? ""
+            : scope === "stage"
+              ? `${pendingAction.account.emailAddress || pendingAction.account.displayName} is at its ${limitWindowName(pendingAction.lock)} limit until ${formatResetAbsolute(pendingAction.lock.resetsAt)}. This session's turns fail until then. Use it anyway?`
+              : `This account is at its ${limitWindowName(pendingAction.lock)} limit until ${formatResetAbsolute(pendingAction.lock.resetsAt)}. Sessions on it fail on their first turn until then. Use it anyway?`
         }
         confirmLabel="Use anyway"
         confirmingLabel="Selecting…"
-        onConfirm={async () => handleConfirmLockedSpawn()}
+        onConfirm={async () => handleConfirmLocked()}
         isPending={false}
       />
 

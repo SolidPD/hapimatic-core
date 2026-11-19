@@ -148,10 +148,17 @@ function isRenderCandidate(entry: CatalogEntry): boolean {
  */
 /**
  * The gates whose entries a self-knowledge doc shows, with their names. A gate
- * with no label stays out of every doc, as #6448 built gated entries (#6646's
- * billable-switch among them); add one here only when its entries should show.
+ * with no label stays out of every doc, as #6448 built gated entries; add one
+ * here only when its entries should show. `billable-switch` (#6646) shows,
+ * named as its screens name the feature: under ruling AGS-2 an agent switches a
+ * session off only with the `api sessions billable` command, so an agent on a
+ * node whose gate is open has to learn that the command exists (the Business
+ * Admin Project Manager's ruling of 2026-11-16).
  */
-const GATE_LABELS: Partial<Record<CatalogGate, string>> = { pins: "Pins" };
+const GATE_LABELS: Partial<Record<CatalogGate, string>> = {
+  pins: "Pins",
+  "billable-switch": "Billable sessions",
+};
 
 /** The compact invocation coordinate for an entry (never rendered for destructive). */
 function invocationAction(inv: Invocation): string {

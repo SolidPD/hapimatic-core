@@ -48,7 +48,7 @@ export interface SpawnSessionOptions {
   parentSessionId?: string;
   /** #2479: relationship to the parent — "branch" (forked) or "spawn" (managed peer) */
   parentRelationship?: "branch" | "spawn";
-  /** Federation: nodeId of the peer that initiated this spawn (dual-node visibility) */
+  /** Federation: nodeId of the peer that initiated this spawn (attribution, spawn-status callbacks and API-key placement; it no longer limits which hubs list the session, #6759) */
   originatingNodeId?: string;
   /** Multi-account (epic #1446, Sub-Issue J): account to bind the spawned
    *  process to via HAPI_ACCOUNT_UUID (daemon sets the env; D's launcher

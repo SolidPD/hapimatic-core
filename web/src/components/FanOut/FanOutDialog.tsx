@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useEffect, useMemo, useState } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
-import { LOCAL_NODE_ID } from "@hapi/protocol";
+import { LOCAL_NODE_ID, resolveModelFamily } from "@hapi/protocol";
 import type { EffortLevel } from "@hapi/protocol";
 import { resolveDefaultSpawnPermissionMode } from "@hapi/protocol/modes";
 import type { ApiClient } from "@/api/client";
@@ -73,6 +73,8 @@ type PeerDraft = {
   /** #4497: the directory on the remote node (prefilled with the parent's). */
   directory: string;
   accountUuid: string | null;
+  /** #6742: the account was picked through the at-limit confirm. */
+  accountForced: boolean;
   sessionType: SessionType;
   selectedModel: string;
   rawModel: string;
@@ -105,6 +107,7 @@ function newPeer(
     nodeId: null,
     directory,
     accountUuid: null,
+    accountForced: false,
     sessionType: "worktree",
     selectedModel: "",
     rawModel: "",
@@ -483,7 +486,13 @@ export function FanOutDialog(props: {
         codexReasoningEffort: eff.codexReasoningEffort,
         cloneRepo: null,
       });
-      const { input, cutFrom } = buildPeerInput(base, fanParent);
+      // #6742 (the #5879 override): only a confirmed pick, and only while the
+      // payload pins that account (a local spawn).
+      const forced = p.accountForced && base.accountUuid;
+      const { input, cutFrom } = buildPeerInput(
+        forced ? { ...base, forceAccount: true } : base,
+        fanParent
+      );
       return {
         key: p.key,
         label: `Peer ${i + 1}`,
@@ -823,8 +832,17 @@ export function FanOutDialog(props: {
             (editingPeer && providerFor(editingPeer.agent)) ?? "anthropic"
           }
           selectedAccountUuid={editingPeer?.accountUuid ?? null}
-          onSelect={uuid => {
-            if (accountFor) update(accountFor, { accountUuid: uuid });
+          // #6742 (as the create page, #5879): lock rows on the peer's model's
+          // own weekly window too, as the server's refusal does.
+          modelFamily={
+            editingPeer?.agent === "claude"
+              ? resolveModelFamily(editingPeer.rawModel || "default")
+              : null
+          }
+          onSelect={(uuid, opts) => {
+            const accountForced = opts?.forceAccount === true;
+            if (accountFor)
+              update(accountFor, { accountUuid: uuid, accountForced });
             setAccountFor(null);
           }}
         />

@@ -1187,7 +1187,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Switch an existing session's payment method on its owning node — a subscription account or a node-vault Anthropic API key — restarting or staging the session process.",
+    "description": "Switch a session's payment method on its owning node, restarting or staging it: an account, or an Anthropic API key by reference (a bare vault id, or the bindingRef of a key another node shares).",
     "domain": "accounts",
     "id": "accounts.session-switch",
     "invocation": {
@@ -1200,7 +1200,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "When the user changes which account or Anthropic API key a session runs under."
+    "whenToUse": "When the user changes which account or Anthropic API key a session runs under, including a key another node shares."
   },
   {
     "auth": "jwt",

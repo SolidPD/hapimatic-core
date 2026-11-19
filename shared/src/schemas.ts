@@ -432,7 +432,7 @@ export const MetadataSchema = z
     scheduleId: z.string().optional(),
     /** Git repo identity resolved at session creation (grouping + display) */
     repoIdentity: RepoIdentitySchema.optional(),
-    /** Federation: nodeId of the peer that spawned this session (dual-node visibility) */
+    /** Federation: nodeId of the peer that spawned this session (attribution, spawn-status callbacks and API-key placement; it no longer limits which hubs list the session, #6759) */
     originatingNodeId: z.string().optional(),
     /** Multi-account (epic #1446): the account this session is bound to. Absent → host-credential fallback. Stamped by issue-worker (Sub-Issue D) from HAPI_ACCOUNT_UUID; the value is set by a future spawn-wiring sub-issue. */
     accountUuid: z.string().optional(),
@@ -1139,8 +1139,9 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
   // Issue #1119: Server-authoritative midnight reset.
   // Emitted per-session AFTER all DB writes complete in performMidnightReset.
   // Clients invalidate timelog query caches and re-render at 0:00.
-  // Carries sessionId from SessionChangedSchema so the federation event
-  // bridge's `interestingSessions` filter applies cleanly per audience.
+  // Carries sessionId from SessionChangedSchema, so a connection watching that
+  // session receives it; an `all: true` connection receives every event in its
+  // namespace, and the federation event bridge forwards it to every hub (#6759).
   SessionChangedSchema.extend({
     type: z.literal("timer-reset"),
     data: z
@@ -1321,8 +1322,10 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
     namespace: z.string().optional(),
   }),
   // Issue #1233 (part of Epic #1231): API error visibility (overloaded_error
-  // toast). Uses SessionChangedSchema.extend so the top-level sessionId feeds
-  // the federation event bridge's `interestingSessions` filter (like tool-error).
+  // toast). Uses SessionChangedSchema.extend so the top-level sessionId lets a
+  // connection watching that session receive it (like tool-error); an `all: true`
+  // connection receives every event in its namespace, and the federation event
+  // bridge forwards it to every hub (#6759).
   // Payload is NESTED (locked contract LC-1): { type, sessionId, namespace,
   // data: { phase, errorType, ... } } — #1234 (Sub-Issue C) reads event.data.*.
   // `errorType` is a string (not enum) intentionally — Anthropic may add new
@@ -1376,10 +1379,11 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
   }),
   // Issue #1969 (File Conflict Monitor Sub D): federation-wide claim sync. A node
   // publishes its full live-claim snapshot on any local claim mutation; the SSE
-  // event bridge forwards it to every peer (shouldForwardBridgeEvent returns true
-  // for non-session events), where each peer's NodeRegistry merges it into its
-  // per-node FileClaimSync replica. NON-session (no top-level `sessionId` — it
-  // must reach ALL peers, never be namespace/interest-filtered on the bridge).
+  // event bridge forwards it to every peer (the bridge forwards every event
+  // except a closed hub's pin events), where each peer's NodeRegistry merges it
+  // into its per-node FileClaimSync replica. NON-session (no top-level
+  // `sessionId` — it must reach ALL peers, never be namespace-filtered on the
+  // bridge).
   // 🔴 `namespace` is DECLARED (exactly like account-captured above) so the direct
   // property accesses on the union — `event.namespace` at syncEngine.ts and
   // sseManager.ts — typecheck across every member; but it is NEVER populated at
@@ -1450,9 +1454,10 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
   // `namespace` is REQUIRED and populated at emit, so `SSEManager.shouldSend()`
   // delivers it to that namespace's `all: true` connection. Deliberately NO
   // top-level `sessionId`: it would narrow delivery to a connection watching that
-  // session, and the federation event bridge (`shouldForwardBridgeEvent`) only
-  // forwards session-less events unconditionally — which is how a peer's
-  // notifications reach the hub's browsers. Never add it to
+  // session. The federation event bridge (`shouldForwardBridgeEvent`) forwards
+  // every event (#6759), so a peer's notifications reach the hub's browsers
+  // either way; the delivery narrowing is the reason to keep `sessionId` off this
+  // event. Never add it to
   // HOST_GLOBAL_EVENT_TYPES (that would leak it across namespaces).
   z.object({
     type: z.literal("notification"),
@@ -1549,6 +1554,13 @@ export const SearchFilterPreferencesSchema = z.object({
       provider: z.string().default("all"), // "all" | <providerId>
       review: z.enum(["all", "needsReview", "read"]).default("all"),
       linkedIssue: z.enum(["all", "hasIssue", "noIssue"]).default("all"),
+      // #6646 (FLT-MENU): the Filter menu's Billable section. `.catch` so a
+      // stored value this build does not know reads as All and never fails the
+      // whole parse.
+      billable: z
+        .enum(["all", "billable", "non-billable", "to-confirm"])
+        .catch("all")
+        .default("all"),
     })
     .default({
       status: "all",
@@ -1560,6 +1572,7 @@ export const SearchFilterPreferencesSchema = z.object({
       provider: "all",
       review: "all",
       linkedIssue: "all",
+      billable: "all",
     }),
   sort: z.enum(["updated", "created", "name", "timeLogged"]).default("updated"),
   sortDirection: z.enum(["asc", "desc"]).default("desc"),

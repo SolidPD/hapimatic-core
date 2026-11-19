@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useState, useCallback, useRef, useEffect } from "react";
+import type { ReactNode } from "react";
 import { formatDuration, parseTimeInput } from "@/utils/duration";
 import {
   anyLiveSegment,
@@ -13,6 +14,20 @@ import { useToast } from "@/components/Toast";
 import type { ApiClient } from "@/api/client";
 import type { TimelogAdjustmentRequest } from "@/types/api";
 import { Button } from "@/components/ui/button";
+import { BareButton } from "@/components/ui/BareButton";
+import { Switch } from "@/components/ui/Switch";
+import { CoinIcon, LockIcon } from "@/components/icons";
+import type {
+  BillableMark,
+  BillableTimerBlock,
+} from "@/hooks/useBillableSwitch";
+
+/**
+ * The data attribute on the timer menu's root. It is part of the list's
+ * `INTERACTIVE_SELECTOR` (`SortableListEntry.tsx`), so a tap on the menu's own
+ * padding neither opens the session nor arms a drag of its row (#6646).
+ */
+export const SESSION_TIMER_MENU_ATTR = "data-session-timer-menu";
 
 interface TimelogControlMenuProps {
   isOpen: boolean;
@@ -20,6 +35,116 @@ interface TimelogControlMenuProps {
   sessionId: string;
   api: ApiClient | null;
   anchorRef: React.RefObject<HTMLElement | null>;
+  /** #6646: the billable block above the clock controls; absent renders none. */
+  billable?: BillableTimerBlock;
+}
+
+/** One line of the timer menu: Adjust, Set, Reset, Undo and the billable Keep and Reverse. */
+const MENU_ITEM_CLASS =
+  "w-full h-auto justify-start rounded-none px-3 py-1.5 text-left text-xs font-normal text-[var(--app-fg)] hover:bg-[var(--app-hover)] disabled:opacity-50 disabled:cursor-not-allowed";
+
+/**
+ * #6646 (ROW-C): the billable block at the top of the timer menu. The switch
+ * only reports intent upward and closes the menu; the session's row (or the
+ * open session's header) owns the confirmation, because the menu renders
+ * nothing once it closes. While the session waits ("To confirm"), Keep acts at
+ * once and Reverse asks for the switch-off confirmation (ruling REV-1).
+ */
+function BillableMenuBlock({
+  block,
+  onClose,
+}: {
+  block: BillableTimerBlock;
+  onClose: () => void;
+}) {
+  const {
+    billable,
+    billableConfirm,
+    sessionName,
+    switchState,
+    switchNote,
+    onRequestBillable,
+    onConfirm,
+  } = block;
+  const canSwitch =
+    switchState === "can-switch" ||
+    (switchState === "off-only" && billable === true);
+  const waiting = billable === true && billableConfirm === "pending";
+  const lineClass =
+    "flex w-full items-center justify-between gap-2 px-3 py-1.5 text-xs text-[var(--app-fg)]";
+  return (
+    <div
+      className="mb-1 border-b border-[var(--app-divider)] pb-1"
+      data-testid="billable-menu-block"
+    >
+      {canSwitch ? (
+        <Button
+          type="button"
+          variant="ghost"
+          role="switch"
+          aria-checked={billable === true}
+          onClick={e => {
+            e.stopPropagation();
+            onRequestBillable(billable !== true);
+            onClose();
+          }}
+          className={`${lineClass} h-auto rounded-none font-normal hover:bg-[var(--app-hover)]`}
+        >
+          <span>Billable</span>
+          <Switch checked={billable === true} />
+        </Button>
+      ) : (
+        <div className={lineClass}>
+          <span>Billable</span>
+          <LockIcon className="h-3 w-3 text-[var(--app-hint)]" />
+        </div>
+      )}
+      {switchNote ? (
+        <div className="px-3 pb-1 text-[length:var(--text-caption-xs)] text-[var(--app-hint)]">
+          {switchNote}
+        </div>
+      ) : null}
+      {waiting ? (
+        <>
+          <div className="px-3 py-1 text-xs text-[var(--status-cat-attention)]">
+            To confirm
+          </div>
+          {/* P2 (2026-11-18): the menu's own ghost lines, in the colours the
+              row's Keep and Reverse use. */}
+          {switchState === "can-switch" ? (
+            <Button
+              type="button"
+              variant="ghost"
+              aria-label={`Keep ${sessionName} billable`}
+              onClick={e => {
+                e.stopPropagation();
+                onConfirm("keep");
+                onClose();
+              }}
+              className={`${MENU_ITEM_CLASS} text-[var(--app-accent)] hover:text-[var(--app-accent)]`}
+            >
+              Keep
+            </Button>
+          ) : null}
+          <Button
+            type="button"
+            variant="ghost"
+            aria-label={`Reverse ${sessionName}: make it non-billable`}
+            onClick={e => {
+              e.stopPropagation();
+              onConfirm("reverse");
+              onClose();
+            }}
+            className={`${MENU_ITEM_CLASS} text-[var(--status-cat-attention)] hover:text-[var(--status-cat-attention)]`}
+          >
+            Reverse
+          </Button>
+        </>
+      ) : null}
+      {/* #6203 slot: the three amounts (tracked today, logged not synced,
+          synced) go here, above the clock controls. */}
+    </div>
+  );
 }
 
 /**
@@ -35,6 +160,7 @@ function TimelogControlMenu({
   sessionId,
   api,
   anchorRef,
+  billable,
 }: TimelogControlMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -158,13 +284,19 @@ function TimelogControlMenu({
 
   if (!isOpen) return null;
 
-  const itemClass =
-    "w-full h-auto justify-start rounded-none px-3 py-1.5 text-left text-xs font-normal text-[var(--app-fg)] hover:bg-[var(--app-hover)] disabled:opacity-50 disabled:cursor-not-allowed";
+  const itemClass = MENU_ITEM_CLASS;
 
   return (
     <div
       ref={menuRef}
-      className="absolute top-full left-0 mt-1 z-50 bg-[var(--app-bg)] border border-[var(--app-divider)] rounded-md shadow-lg py-1 min-w-[140px]" /* design-tokens-allow: 140px menu min-width; no exact spacing token (--space tops at 32px) - L2 exception (#3404) */
+      {...{ [SESSION_TIMER_MENU_ATTR]: "" }}
+      // #6646: a key pressed inside the menu (Space on the switch) acts on the
+      // menu only; the row under it would otherwise open the session.
+      onKeyDown={e => e.stopPropagation()}
+      // `whitespace-normal`: the list row's time block is `whitespace-nowrap`,
+      // which the menu would inherit and lay its inline-flex items out on one
+      // line, off the menu's right edge (seen at 393 px, #6646 Task 16).
+      className={`absolute top-full left-0 mt-1 z-50 whitespace-normal bg-[var(--app-bg)] border border-[var(--app-divider)] rounded-md shadow-lg py-1 ${billable ? "w-56" : "min-w-[140px]"}`} /* design-tokens-allow: 140px menu min-width; no exact spacing token (--space tops at 32px) - L2 exception (#3404) */
     >
       {mode !== "menu" ? (
         <div
@@ -200,6 +332,9 @@ function TimelogControlMenu({
         </div>
       ) : (
         <>
+          {billable ? (
+            <BillableMenuBlock block={billable} onClose={onClose} />
+          ) : null}
           <Button
             type="button"
             variant="ghost"
@@ -312,7 +447,7 @@ export function ClockIcon(props: { className?: string }) {
  * list (#2505 R7). `resyncKey` forces an immediate resync when a new thinking
  * segment begins.
  */
-function useLiveNow(active: boolean, resyncKey?: unknown): number {
+export function useLiveNow(active: boolean, resyncKey?: unknown): number {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     if (!active) return;
@@ -324,7 +459,78 @@ function useLiveNow(active: boolean, resyncKey?: unknown): number {
   return nowMs;
 }
 
-interface SessionTimerProps {
+/**
+ * #6646 (ROW-C): the time block's glyph. The clock, or the coin for a billable
+ * session (the accent; the attention orange while it waits to be confirmed),
+ * or the lock where its switch cannot be read. On a phone the coin's meaning
+ * is read in the timer menu; the `title` serves a pointer.
+ */
+export function TimeBlockGlyph(props: {
+  mark: BillableMark;
+  className: string;
+}) {
+  const { mark, className } = props;
+  if (mark === "coin" || mark === "coin-pending") {
+    const waiting = mark === "coin-pending";
+    return (
+      <span
+        title={waiting ? "Billable, to confirm" : "Billable"}
+        className="flex items-center justify-center"
+        data-billable-mark={mark}
+      >
+        <CoinIcon
+          className={`${className} ${
+            waiting
+              ? "text-[var(--status-cat-attention)]"
+              : "text-[var(--app-accent)]"
+          }`}
+        />
+      </span>
+    );
+  }
+  if (mark === "lock") {
+    return (
+      <span
+        title="The billable switch cannot be read here"
+        className="flex items-center justify-center"
+        data-billable-mark="lock"
+      >
+        <LockIcon className={`${className} text-[var(--app-hint)]`} />
+      </span>
+    );
+  }
+  return <ClockIcon className={`${className} text-[var(--app-hint)]`} />;
+}
+
+/**
+ * The billable block's props, all optional: none given (the server's state
+ * `off`, a placeholder) draws today's menu.
+ */
+type SessionTimerBillableProps = Partial<BillableTimerBlock>;
+
+function toBillableBlock(
+  p: SessionTimerBillableProps
+): BillableTimerBlock | undefined {
+  if (
+    !p.switchState ||
+    !p.onRequestBillable ||
+    !p.onConfirm ||
+    p.sessionName === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    billable: p.billable,
+    billableConfirm: p.billableConfirm ?? null,
+    sessionName: p.sessionName,
+    switchState: p.switchState,
+    switchNote: p.switchNote ?? null,
+    onRequestBillable: p.onRequestBillable,
+    onConfirm: p.onConfirm,
+  };
+}
+
+interface SessionTimerProps extends SessionTimerBillableProps {
   sessionId: string;
   thinking: boolean;
   /** Server-tracked accumulated thinking time in ms */
@@ -333,6 +539,13 @@ interface SessionTimerProps {
   serverThinkingStartedAt?: number | null;
   /** Compact mode for session list items */
   compact?: boolean;
+  /**
+   * TGT-1 (Matt, 2026-11-17): compact only, the time block's glyph, drawn
+   * inside the same button as the time, so a tap on it opens the menu too.
+   */
+  glyph?: ReactNode;
+  /** Compact only: classes on the root (the menu's anchor). */
+  className?: string;
 }
 
 /**
@@ -352,8 +565,12 @@ export function SessionTimer({
   serverAccumulatedMs,
   serverThinkingStartedAt,
   compact = false,
+  glyph,
+  className = "",
+  ...billableProps
 }: SessionTimerProps) {
   const { api } = useAppContext();
+  const billable = toBillableBlock(billableProps);
 
   const [menuOpen, setMenuOpen] = useState(false);
   const timerRef = useRef<HTMLDivElement>(null);
@@ -387,28 +604,36 @@ export function SessionTimer({
     )
   );
 
-  // Compact mode (session list): time only, no icon.
+  // Compact mode (session list, session header): the caller's glyph and the
+  // time are ONE button (TGT-1), so a tap on either, or between, opens the menu.
   if (compact) {
     return (
       <div
-        className="relative inline-flex"
+        className={`relative inline-flex ${className}`}
         ref={timerRef as React.RefObject<HTMLDivElement>}
       >
-        <span
+        <BareButton
+          type="button"
           onClick={handleClick}
-          className={`text-[length:var(--text-caption)] tabular-nums text-[var(--app-hint)] cursor-pointer hover:text-[var(--app-fg)] ${
-            thinking ? "animate-pulse" : ""
-          }`}
+          className="cursor-pointer font-normal hover:text-[var(--app-fg)]"
           title="Processing time (click for options)"
         >
-          {displayTotal}
-        </span>
+          {glyph}
+          <span
+            className={`text-[length:var(--text-caption)] tabular-nums ${
+              thinking ? "animate-pulse" : ""
+            }`}
+          >
+            {displayTotal}
+          </span>
+        </BareButton>
         <TimelogControlMenu
           isOpen={menuOpen}
           onClose={() => setMenuOpen(false)}
           sessionId={sessionId}
           api={api}
           anchorRef={timerRef}
+          billable={billable}
         />
       </div>
     );
@@ -434,6 +659,7 @@ export function SessionTimer({
         sessionId={sessionId}
         api={api}
         anchorRef={timerRef}
+        billable={billable}
       />
     </div>
   );

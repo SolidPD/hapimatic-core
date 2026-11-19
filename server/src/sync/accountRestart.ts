@@ -23,7 +23,11 @@
  * `engine.rpcGateway.spawnSession` still apply.
  */
 
-import { claudeAccountInfoFromStored } from "@hapi/protocol";
+import {
+  claudeAccountInfoFromStored,
+  isQualifiedApiKeyRef,
+  parseApiKeyRef,
+} from "@hapi/protocol";
 import { sessionBusyReason } from "@hapi/protocol/sessionBusy";
 import { buildRespawnBase } from "./respawnBase";
 import { gracefulTurnInterruptBeforeKill } from "./gracefulTurnInterrupt";
@@ -43,6 +47,13 @@ import { spawnWithRetry, CAPACITY_TAIL_DEADLINE_MS } from "./rpcGateway";
 import type { EventPublisher } from "./eventPublisher";
 import type { TurnLifecycle } from "./turnLifecycle";
 import type { ErrorLogger } from "../logging/errorLogger";
+import type {
+  ApiKeyRefusal,
+  ResolvedApiKey,
+} from "../services/sharedApiKeyService";
+// A fixed, non-secret label for a thrown error (never its message). syncEngine.ts
+// already imports this module, so the edge adds no new sync → routes dependency.
+import { errorClass } from "../web/routes/apiKeys";
 import {
   accountUnrefreshableNotification,
   type ProducerNotification,
@@ -62,6 +73,17 @@ type ArchiveSessionFn = (
   sessionId: string,
   opts?: { reapRemoteWindow?: boolean; isRespawn?: boolean }
 ) => Promise<void>;
+
+/**
+ * Issue #6542: resolve a key reference that names another node (`<uuid>@<home>`,
+ * #5127) to its non-secret identity — `SharedApiKeyService.resolve`, narrowed to
+ * a function type so the switch can never reach `fetchSecret`. `sessionId` lets
+ * the home audit the session the check is for.
+ */
+export type ApiKeyRefResolver = (
+  ref: string,
+  opts: { sessionId: string }
+) => Promise<ResolvedApiKey | ApiKeyRefusal>;
 
 /**
  * Issue #2299 (Task 4): the bound on switchAccount's PRE-KILL wait-for-slot loop.
@@ -103,12 +125,19 @@ export interface AccountRestartDeps {
   getTurnLifecycle: () => TurnLifecycle | null;
   /**
    * Issue #4823: read ONE node-vault entry by id, REDACTED (id / provider / label
-   * / maskedKey — never the key). A payment-method switch validates its key
-   * target with it BEFORE the kill. Optional: absent ⇒ every key target fails
-   * closed with `api_key_not_found`, so an un-wired engine can never bind a key
-   * it could not check.
+   * / maskedKey — never the key). A payment-method switch validates a BARE key
+   * id with it BEFORE the kill. Optional: absent ⇒ every bare id fails closed
+   * with `api_key_not_found`, so an un-wired engine can never bind a key it
+   * could not check.
    */
   getApiKeyById?: (id: string) => Promise<RedactedApiKey | null>;
+  /**
+   * Issue #6542: lazy read of the resolver for a key reference containing `@`
+   * (#5127's shared keys). The service is built after the engine, so it is read
+   * at call time. Absent or null ⇒ such a reference is refused with
+   * `api_key_shared_unavailable` (fail closed); a bare id never uses it.
+   */
+  getApiKeyRefResolver?: () => ApiKeyRefResolver | null;
   /**
    * Issue #4914: raise a user notification (`SyncEngine.notifyUser`). Optional,
    * so a construction without it raises none; the legacy events still fire.
@@ -117,14 +146,22 @@ export interface AccountRestartDeps {
 }
 
 /**
- * Issue #4823: what a session is switched ONTO — a subscription account or a
- * node-vault Anthropic API key (by vault id; never key material).
+ * Issue #4823: what a session is switched ONTO — a subscription account or an
+ * Anthropic API key by reference, never key material (#5127, #6542): a bare
+ * vault id for a key on this node, or `<uuid>@<home>` for a key another node
+ * shares.
  */
 export type PaymentMethodTarget =
   | { kind: "account"; accountUuid: string }
   | { kind: "api-key"; apiKeyId: string };
 
-type SwitchError = { type: "error"; message: string; code?: string };
+/** `httpStatus`: a shared-key refusal's own status (#6542), when it has one. */
+type SwitchError = {
+  type: "error";
+  message: string;
+  code?: string;
+  httpStatus?: number;
+};
 
 type AccountSwitchSuccess = {
   type: "success";
@@ -219,6 +256,7 @@ export class AccountRestart {
   private readonly getApiKeyById: (
     id: string
   ) => Promise<RedactedApiKey | null>;
+  private readonly getApiKeyRefResolver: () => ApiKeyRefResolver | null;
   private readonly notifyUser: (input: ProducerNotification) => void;
 
   constructor(deps: AccountRestartDeps) {
@@ -232,6 +270,7 @@ export class AccountRestart {
     this.getTurnLifecycle = deps.getTurnLifecycle;
     // Issue #4823: fail closed when no vault reader was wired.
     this.getApiKeyById = deps.getApiKeyById ?? (async () => null);
+    this.getApiKeyRefResolver = deps.getApiKeyRefResolver ?? (() => null);
     this.notifyUser = deps.notifyUser ?? (() => {});
   }
 
@@ -390,10 +429,12 @@ export class AccountRestart {
    * same targets. An account target keeps #1456's checks. A key target must be a
    * Claude session on the SDK launcher (a missing `launcherKind` is refused: the
    * respawn would run on the node's default launcher, which may be PTY/tmux and
-   * would strip the key — D-4568-2 A), not in local mode (live switch only — the
-   * terminal owns a local-mode session's process), and an `anthropic` entry in
-   * this node's vault. Returns the redacted values the binding writer needs;
-   * never key material.
+   * would strip the key — D-4568-2 A) and not in local mode (live switch only —
+   * the terminal owns a local-mode session's process). Then, by reference form
+   * (#6542, ruling D1): a bare id must be an `anthropic` entry in this node's
+   * vault; a reference containing `@` is resolved through #5127's shared-key
+   * service. Returns the redacted values the binding writer needs; never key
+   * material.
    */
   private async resolveSwitchTarget(
     session: {
@@ -401,7 +442,7 @@ export class AccountRestart {
       agentState?: Session["agentState"];
     },
     target: PaymentMethodTarget,
-    opts: { liveSwitch: boolean }
+    opts: { liveSwitch: boolean; sessionId: string }
   ): Promise<ResolvedTarget | SwitchError> {
     if (target.kind === "account") {
       // R1: validate the target account BEFORE killing anything. Fail-closed if
@@ -460,11 +501,17 @@ export class AccountRestart {
         code: "api_key_local_mode_unsupported",
       };
     }
+    // #6542 (ruling D1): split by reference form, as the daemon and the
+    // placement re-check do. A bare id keeps this node's vault read, unchanged.
+    if (parseApiKeyRef(target.apiKeyId)?.homeNodeId !== null) {
+      return this.resolveSharedKeyTarget(target.apiKeyId, opts.sessionId);
+    }
     const key = await this.getApiKeyById(target.apiKeyId);
     if (!key || key.provider !== "anthropic") {
       return {
         type: "error",
-        message: "No Anthropic API key with that id in this node's vault",
+        message:
+          "No Anthropic API key with that id is stored on this node. To use a key stored on another node, pick it in Session Configuration or send its bindingRef from GET /api/api-keys/available.",
         code: "api_key_not_found",
       };
     }
@@ -474,6 +521,64 @@ export class AccountRestart {
       apiKeyMasked: key.maskedKey,
       // The daemon's spawn-time label rule (resolveApiKeyDisplayLabelById).
       displayIdentity: key.label?.trim() || key.maskedKey,
+    };
+  }
+
+  /**
+   * Issue #6542: resolve a key reference containing `@` through the shared-key
+   * service (#5127) — the same check a new session on that key gets, so the
+   * switch, the spawn and the reconnect refuse the same keys with the same
+   * messages. Fails closed: no resolver, a refusal or a throw changes nothing.
+   * The binding is the CANONICAL ref (a ref homed on this node comes back bare),
+   * the exact string the secret route later compares (`cliApiKeys.ts`).
+   */
+  private async resolveSharedKeyTarget(
+    ref: string,
+    sessionId: string
+  ): Promise<ResolvedTarget | SwitchError> {
+    const resolver = this.getApiKeyRefResolver();
+    if (!resolver) {
+      return {
+        type: "error",
+        message: "This node cannot use API keys stored on other nodes",
+        code: "api_key_shared_unavailable",
+        httpStatus: 503,
+      };
+    }
+    let outcome: ResolvedApiKey | ApiKeyRefusal;
+    try {
+      outcome = await resolver(ref, { sessionId });
+    } catch (error) {
+      // The class only: a thrown error's message can carry what it was handling.
+      this.errorLogger?.error(
+        `switchPaymentMethod ${sessionId}: the API-key check threw (${errorClass(error)})`,
+        { category: "sync", sessionId }
+      );
+      return {
+        type: "error",
+        message:
+          "The API key could not be checked, so nothing was changed. Try again.",
+        code: "api_key_vault_unreadable",
+        httpStatus: 503,
+      };
+    }
+    if (!outcome.ok) {
+      return {
+        type: "error",
+        message: outcome.message,
+        code: outcome.code,
+        httpStatus: outcome.httpStatus,
+      };
+    }
+    const name = outcome.label?.trim() || outcome.maskedKey;
+    return {
+      kind: "api-key",
+      apiKeyId: outcome.canonicalRef,
+      apiKeyMasked: outcome.maskedKey,
+      // The daemon's label for a new session on the same key (sessionSpawner.ts).
+      displayIdentity: isQualifiedApiKeyRef(outcome.canonicalRef)
+        ? `${name} (${outcome.homeNodeLabel})`
+        : name,
     };
   }
 
@@ -509,6 +614,7 @@ export class AccountRestart {
 
     const resolved = await this.resolveSwitchTarget(session, target, {
       liveSwitch: true,
+      sessionId,
     });
     if ("type" in resolved) {
       return resolved;
@@ -734,8 +840,9 @@ export class AccountRestart {
           apiKeyId: resolved.kind === "api-key" ? resolved.apiKeyId : undefined,
           apiKeyMasked:
             resolved.kind === "api-key" ? resolved.apiKeyMasked : undefined,
-          // Issue #5819: a switch target is chosen on this node, so it is a
-          // local binding (persistBinding already dropped the record's marker).
+          // Issue #5819: a switch target is chosen on the session's own node, so
+          // it is a local binding (persistBinding already dropped the record's
+          // marker). A foreign ref (#6542) needs none: its home re-checks sharing.
           apiKeyPlacedBy: undefined,
         }),
       {
@@ -977,6 +1084,7 @@ export class AccountRestart {
     // inside the launcher at reconnect).
     const resolved = await this.resolveSwitchTarget(session, target, {
       liveSwitch: false,
+      sessionId,
     });
     if ("type" in resolved) {
       return resolved;

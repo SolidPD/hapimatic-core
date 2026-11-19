@@ -403,8 +403,10 @@ export class TimelogResetService {
     for (const session of sessionsInNs) {
       try {
         // Emit the per-session timer-reset SSE event. Carries sessionId
-        // from SessionChangedSchema so the federation event bridge's
-        // interestingSessions filter applies cleanly. Clients use it to
+        // from SessionChangedSchema, so a connection watching the session
+        // receives it; an `all: true` connection receives every event in its
+        // namespace, and the federation event bridge forwards it to every
+        // hub (#6759). Clients use it to
         // refresh daily-scoped time-log views only — the session-list
         // timers read the untouched lifetime serverAccumulatedMs.
         this.eventPublisher.emit({

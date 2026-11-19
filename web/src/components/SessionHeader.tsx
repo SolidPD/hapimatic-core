@@ -67,7 +67,9 @@ import { BranchConfirmDialog } from "@/components/BranchConfirmDialog";
 import { useFanOutMenu } from "@/components/FanOut/useFanOutMenu";
 import { WorktreeDeleteDialog } from "@/components/WorktreeDeleteDialog";
 import { EmojiPickerPopover } from "@/components/EmojiPickerPopover";
-import { SessionTimer, ClockIcon } from "@/components/SessionTimer";
+import { SessionTimer, TimeBlockGlyph } from "@/components/SessionTimer";
+import { BillableSwitchDialog } from "@/components/billableSwitch/BillableSwitchDialog";
+import { useBillableSessionSwitch } from "@/hooks/useBillableSwitch";
 import { RecoveryStatusBadge } from "@/components/RecoveryStatusBadge";
 import { StatusDotPopover } from "@/components/StatusDotPopover";
 import {
@@ -131,6 +133,24 @@ export function SessionHeader(props: {
     onToggleReadStatus,
   } = props;
   const title = useMemo(() => getSessionTitle(session), [session]);
+  // Timer data for start timestamp and play/pause control
+  // Timer should pause when waiting for user response to AskUserQuestion
+  const isWaitingForUserQuestion = checkIsWaitingForUserQuestion(
+    session.agentState
+  );
+  // #6646 (ROW-C, CONF-A): the open session's own coin and switch; the person
+  // is here when they notice a session should be billable. It reads the same
+  // paused state as the header's timer, so the confirmation's figure matches.
+  const billableSession = useMemo(
+    () => ({ ...session, nodeId: props.nodeId, isWaitingForUserQuestion }),
+    [session, props.nodeId, isWaitingForUserQuestion]
+  );
+  const billable = useBillableSessionSwitch({
+    api,
+    session: billableSession,
+    sessionName: title,
+    nodeLabel: props.nodeLabel,
+  });
   const worktreeBranch = session.metadata?.worktree?.branch;
   const hasPath = Boolean(session.metadata?.path);
   const projectPath = session.metadata?.path;
@@ -162,11 +182,6 @@ export function SessionHeader(props: {
   const branchUrl =
     repoUrl && branchName ? `${repoUrl}/tree/${branchName}` : null;
 
-  // Timer data for start timestamp and play/pause control
-  // Timer should pause when waiting for user response to AskUserQuestion
-  const isWaitingForUserQuestion = checkIsWaitingForUserQuestion(
-    session.agentState
-  );
   // #3505 (ruling D7): a running/pending tool contributes to the "thinking"
   // indicator only while it is RECENT — `session.thinking` is true (handled by
   // the OR in `effectiveThinking`) OR the newest running/pending block started
@@ -609,20 +624,30 @@ export function SessionHeader(props: {
 
               {/* Row 2: Time info - clock aligned under status dot */}
               <div className="flex items-center gap-2 min-w-0">
-                <span className="flex h-3 w-3 items-center justify-center shrink-0">
-                  <ClockIcon className="h-3 w-3 text-[var(--app-hint)]" />
-                </span>
                 {/* `flex-1`: the wrap row must SPAN the column (not size to its
                     content) — IssueStateBadge measures the room left in this
                     row to pick its ladder rung, and a content-sized row would
                     move its right edge with the badge's own width (E9). */}
-                <div className="flex flex-1 flex-wrap items-center gap-x-1.5 text-[length:var(--text-body-dense)] text-[var(--app-hint)] min-w-0">
+                <div className="flex flex-1 flex-wrap items-center gap-x-1.5 pl-5 text-[length:var(--text-body-dense)] text-[var(--app-hint)] min-w-0">
+                  {/* TGT-1: the glyph sits in the timer's button; `-ml-5`
+                      puts it back in the column under the status dot (the
+                      row's `pl-5` keeps a wrapped line where it was). */}
                   <SessionTimer
                     sessionId={session.id}
                     thinking={effectiveThinking}
                     serverAccumulatedMs={session.serverAccumulatedMs}
                     serverThinkingStartedAt={session.thinkingStartedAt}
                     compact
+                    className="-ml-5"
+                    glyph={
+                      <span className="mr-2 flex h-3 w-3 items-center justify-center shrink-0">
+                        <TimeBlockGlyph
+                          mark={billable.mark}
+                          className="h-3 w-3"
+                        />
+                      </span>
+                    }
+                    {...billable.block}
                   />
                   {lastActivityTime && (
                     // E6: `00:05:00 · 12m` — a dimmed middle dot separates the
@@ -851,6 +876,14 @@ export function SessionHeader(props: {
         isPending={isPending}
       />
 
+      <BillableSwitchDialog
+        request={billable.request}
+        session={billableSession}
+        sessionName={title}
+        onClose={billable.closeRequest}
+        onConfirm={billable.confirmRequest}
+      />
+
       <ConfirmDialog
         isOpen={disconnectOpen}
         onClose={() => setDisconnectOpen(false)}
@@ -976,8 +1009,8 @@ export function SessionHeader(props: {
         session={session}
         api={api}
         nodeLabel={props.nodeLabel}
-        // Issue #4823: the header knows its node — a remote session's modal
-        // disables the API-key group (keys are node-local).
+        // Issue #4823 / #6542: the header knows its node — a peer-owned
+        // session's modal disables the API-key group and names the owner.
         nodeId={props.nodeId}
       />
     </>

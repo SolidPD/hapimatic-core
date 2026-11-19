@@ -3,7 +3,7 @@ import { queryOptions, useQuery } from "@tanstack/react-query";
 import type { ApiClient } from "@/api/client";
 import type { EffortLevel, FederationNodeStatus } from "@hapi/protocol";
 import type { DaemonCapSource } from "@hapi/protocol/schemas";
-import type { SessionSummary } from "@/types/api";
+import type { FederationNodesResponse, SessionSummary } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 import { applyFederationOverrides } from "@/lib/federation-mutation-overrides";
 import {
@@ -98,6 +98,9 @@ export function useFederationSessionsCache(api: ApiClient | null): void {
   useQuery({ ...federationAllSessionsQuery(api), notifyOnChangeProps: [] });
 }
 
+/** #6542: a stable empty list, so a consumer's memo does not re-run each render. */
+const NO_NODES: FederationNodesResponse["nodes"] = [];
+
 /**
  * Issue #6208: the local federation node identity, from the nodes query alone.
  *
@@ -109,6 +112,8 @@ export function useFederationLocalNode(api: ApiClient | null): {
   localNode: { nodeId: string; nodeLabel: string } | null;
   /** #4461: the federation-nodes read has answered or failed (not pending). */
   localNodeSettled: boolean;
+  /** #6542: the nodes this one tracks, from the same read (empty until it answers). */
+  nodes: FederationNodesResponse["nodes"];
 } {
   const nodesQuery = useQuery({
     queryKey: queryKeys.federationNodes,
@@ -128,6 +133,7 @@ export function useFederationLocalNode(api: ApiClient | null): {
     // A null `localNode` alone cannot tell a pending read from a failed one, and
     // the re-login deep link must not decide "UI host or not" while pending.
     localNodeSettled: nodesQuery.isFetched,
+    nodes: nodesQuery.data?.nodes ?? NO_NODES,
   };
 }
 

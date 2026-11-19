@@ -39,13 +39,21 @@ import { SupervisedLoop } from "@hapi/protocol";
 import { logger } from "@/ui/logger";
 import type { ClockSeams, DaemonContext } from "./daemonContext";
 import { detectSelfUnitName } from "./systemdInvariants";
-import { kickExpiredWorktreePurge } from "./worktree";
+import { kickExpiredWorktreePurge, resolveRepoRoot } from "./worktree";
 import { resolveWorktreeHostBase } from "./worktreeHostBase";
 
 /** Trash holding dir name — mirrors the module-private const in worktree.ts. */
 const TRASH_DIR_NAME = ".trash";
 /** Parent of every CIFS-mounted repo root the daemon may own. */
 const NETSHARE_GIT_PARENT = "/mnt/netshare/git";
+/**
+ * Opt-in that lets this daemon's collector sweep the NAS repositories (#6776,
+ * D-6776-1). A NAS `.git/` is shared by every node that mounts it, while the
+ * purge single-flight map, the eviction lock and the wrong-root rule are per
+ * host, so exactly one node's host daemon (RP1's) carries it. Only the string
+ * "1" counts, as for `HAPI_WORKTREE_COLLECTOR`.
+ */
+const NETSHARE_OPT_IN_ENV = "HAPI_WORKTREE_COLLECTOR_NETSHARE";
 /** Default per-op filesystem/kick timeout (see the watchdog-horizon note above). */
 const DEFAULT_FS_TIMEOUT_MS = 30_000;
 /** Suppress a `getIntervalMs`-early double tick within this window (1B #3451-15). */
@@ -66,6 +74,18 @@ export interface CollectorSeams {
   readdirFn?: (path: string) => Promise<string[]>;
   /** Existence probe (defaults to `fs/promises.stat`; only resolve/throw matters). */
   statFn?: (path: string) => Promise<unknown>;
+  /**
+   * Real-path resolution for the dedupe key and the NAS gate (defaults to
+   * `fs/promises.realpath`). The suite's paths are fake, so a candidate that is
+   * a symlink into the NAS needs this seam (#6776 Task 12).
+   */
+  realpathFn?: (path: string) => Promise<string>;
+  /**
+   * Resolves a root to the repository the kick purges (defaults to
+   * `resolveRepoRoot`, which runs git). Used by the NAS gate without the
+   * opt-in only, so the suite never runs git (#6776 R1).
+   */
+  resolveRepoRootFn?: (path: string) => Promise<string>;
   /** Per-root purge kick (defaults to `kickExpiredWorktreePurge`). */
   kickFn?: (repoRoot: string) => Promise<number>;
   /**
@@ -180,6 +200,17 @@ export function runningInsideWorktreeInstanceDaemon(
 }
 
 /**
+ * True iff the absolute `path` is the NAS parent or lies under it. A lexical
+ * prefix test: callers pass a `resolve`d or `realpath`ed value, and the `sep`
+ * boundary keeps a sibling such as `/mnt/netshare/git2` out.
+ */
+function isUnderNetshareGitParent(path: string): boolean {
+  return (
+    path === NETSHARE_GIT_PARENT || path.startsWith(NETSHARE_GIT_PARENT + sep)
+  );
+}
+
+/**
  * Discover the deduped set of repo **ROOTS** (directories containing `.git`)
  * whose `.worktrees/.trash` should be swept.
  *
@@ -195,19 +226,43 @@ export function runningInsideWorktreeInstanceDaemon(
  *
  * Candidates: `HAPI_WORKTREE_COLLECTOR_ROOTS` (colon-separated, B-D12 = A) ∪
  * `homedir()` (owns `~/.worktrees/.trash`) ∪ each `~/projects/*` ∪ each
- * `/mnt/netshare/git/*`. A candidate is KEPT iff BOTH `<root>/.git` exists AND
+ * `/mnt/netshare/git/*` (the last only with the NAS opt-in, below). A candidate
+ * is KEPT iff BOTH `<root>/.git` exists AND
  * `resolveWorktreeHostBase(root)/.worktrees/.trash` exists — that filter is what
  * keeps non-repo directories out (each would otherwise reproduce the "not a git
  * repository" failure once per day). Dedupe by realpath (the kick re-dedupes on
  * the resolved repo root, so a residual collision merely double-counts telemetry).
+ *
+ * NAS gate (#6776 Task 12, D-6776-1): unless `HAPI_WORKTREE_COLLECTOR_NETSHARE`
+ * is exactly "1", the NAS parent is never listed, and a candidate whose path or
+ * real path lies under it is dropped, whatever produced it (a
+ * `HAPI_WORKTREE_COLLECTOR_ROOTS` entry, or a `~/projects` symlink into the NAS).
+ * A lexical NAS path is dropped before any stat, so such a node never reads the
+ * share for it; a symlink is caught on the real path the dedupe step reads.
+ * Because the kick purges the repository git resolves a root to, a root is also
+ * dropped when that repository or its `.git` lies under the NAS parent (a local
+ * linked worktree of a NAS repository, a `.git` symlink into the NAS), or when
+ * it cannot be resolved. With the opt-in none of this runs and no git call is
+ * made. This gates the collector only: the spawn-time purge is unchanged.
+ *
  * Never throws: a missing parent ⇒ silent skip; a genuine CIFS timeout ⇒ skip +
- * one `daemon-worktree-collector` report.
+ * one `daemon-worktree-collector` report (a `realpath` timeout included, on
+ * every daemon); a listing or `stat` error other than a missing path (ENOENT,
+ * ENOTDIR), such as EIO, ESTALE or EACCES ⇒ skip + one report. Without the NAS opt-in, a root whose real path cannot be read,
+ * or whose repository cannot be resolved, for any other reason is skipped (it
+ * may lie on the NAS) with one report naming the root and the error, so a
+ * broken repository stays visible once a day as it was through the kick's
+ * report before #6776; with the opt-in, the dedupe key falls back to the
+ * lexical path.
  */
 export async function discoverWorktreeRoots(
   seams: CollectorSeams = {}
 ): Promise<string[]> {
   const readdirFn = seams.readdirFn ?? (path => readdir(path));
   const statFn = seams.statFn ?? (path => stat(path));
+  const realpathFn = seams.realpathFn ?? (path => realpath(path));
+  const resolveRepoRootFn = seams.resolveRepoRootFn ?? resolveRepoRoot;
+  const sweepNetshare = process.env[NETSHARE_OPT_IN_ENV] === "1";
   const timeoutMs = seams.timeoutMs ?? DEFAULT_FS_TIMEOUT_MS;
   const setTimeoutFn =
     seams.setTimeoutFn ?? ((handler, ms) => setTimeout(handler, ms));
@@ -230,9 +285,62 @@ export async function discoverWorktreeRoots(
       setTimeoutFn,
       clearTimeoutFn
     );
+  const raceRealpath = (path: string): Promise<string> =>
+    raceTimeout(
+      Promise.resolve().then(() => realpathFn(path)),
+      `realpath ${path}`,
+      timeoutMs,
+      setTimeoutFn,
+      clearTimeoutFn
+    );
+  // A path that is absent (ENOENT, or ENOTDIR under a plain file in
+  // `~/projects`) is the normal filter path and stays silent. Any other error
+  // (EIO, ESTALE, EACCES, …) still skips the path, with one report, so a root
+  // whose trash is kept by a fault stays visible.
+  const reportUnlessMissing = (what: string, err: unknown): void => {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") return;
+    reportCollectorWarn(
+      `${what} failed (${
+        err instanceof Error ? err.message : String(err)
+      }) — skipping`
+    );
+  };
+
+  // The kick purges the repository git resolves a root to, not the root
+  // (`kickExpiredWorktreePurge` → `resolveRepoRoot`, the dirname of
+  // `--git-common-dir`). True iff that repository and its `.git` are off the
+  // NAS: a local linked worktree of a NAS repository, or a folder whose `.git`
+  // is a symlink into the NAS, would otherwise purge against the shared NAS
+  // `.git/` (#6776 R1). A repository that cannot be resolved counts as on the
+  // NAS (fail closed, trash kept), and the failure is reported, a timeout or
+  // any other error (#6776 G1).
+  const repositoryOffNetshare = async (root: string): Promise<boolean> => {
+    try {
+      const repoRoot = await raceTimeout(
+        Promise.resolve().then(() => resolveRepoRootFn(root)),
+        `resolve repository of ${root}`,
+        timeoutMs,
+        setTimeoutFn,
+        clearTimeoutFn
+      );
+      if (isUnderNetshareGitParent(resolve(repoRoot))) return false;
+      const gitData = await raceRealpath(join(repoRoot, ".git"));
+      return !isUnderNetshareGitParent(gitData);
+    } catch (err) {
+      reportCollectorWarn(
+        err instanceof CollectorTimeoutError
+          ? `${err.message} — skipping`
+          : `repository of ${root} could not be checked (${
+              err instanceof Error ? err.message : String(err)
+            }) — skipping`
+      );
+      return false;
+    }
+  };
 
   // List a parent's direct children as absolute paths. Missing parent (ENOENT) ⇒
-  // silent []; a hang ⇒ [] + one report.
+  // silent []; a hang or any other error ⇒ [] + one report.
   const childDirs = async (parent: string): Promise<string[]> => {
     try {
       const entries = await raceReaddir(parent);
@@ -242,6 +350,8 @@ export async function discoverWorktreeRoots(
         reportCollectorWarn(
           `readdir ${parent} timed out — skipping its children`
         );
+      } else {
+        reportUnlessMissing(`readdir ${parent}`, err);
       }
       return [];
     }
@@ -257,18 +367,27 @@ export async function discoverWorktreeRoots(
   candidates.push(...envRoots);
   candidates.push(homedir());
   candidates.push(...(await childDirs(join(homedir(), "projects"))));
-  candidates.push(...(await childDirs(NETSHARE_GIT_PARENT)));
+  // The NAS parent is listed only with the opt-in (#6776 Task 12): a hard CIFS
+  // mount can stall a listing, and a node without it never sweeps the share.
+  if (sweepNetshare) {
+    candidates.push(...(await childDirs(NETSHARE_GIT_PARENT)));
+  }
 
   // 2. Filter: keep iff `<root>/.git` exists (a .git FILE is fine — a linked
   //    worktree; the kick's resolveRepoRoot maps it to the main repo) AND the
   //    (possibly relocated) host base has a `.worktrees/.trash`.
   const kept: string[] = [];
   for (const cand of candidates) {
+    // Without the opt-in, a candidate that names a NAS path is dropped before
+    // any stat, so this node never reads the share for it (#6776 Task 12).
+    if (!sweepNetshare && isUnderNetshareGitParent(resolve(cand))) continue;
     try {
       await raceStat(join(cand, ".git"));
     } catch (err) {
       if (err instanceof CollectorTimeoutError) {
         reportCollectorWarn(`stat ${join(cand, ".git")} timed out — skipping`);
+      } else {
+        reportUnlessMissing(`stat ${join(cand, ".git")}`, err);
       }
       continue; // no .git (ENOENT) is the normal filter path — stay silent
     }
@@ -282,6 +401,8 @@ export async function discoverWorktreeRoots(
     } catch (err) {
       if (err instanceof CollectorTimeoutError) {
         reportCollectorWarn(`stat ${trashPath} timed out — skipping`);
+      } else {
+        reportUnlessMissing(`stat ${trashPath}`, err);
       }
       continue; // no .trash (ENOENT) ⇒ nothing to sweep here — stay silent
     }
@@ -289,15 +410,45 @@ export async function discoverWorktreeRoots(
   }
 
   // 3. Dedupe by realpath (fall back to resolve); return the UNMAPPED candidate.
+  //    The NAS gate reads the same real path, so a root whose real path lies
+  //    under the NAS parent (a `~/projects` symlink into the share, say) is
+  //    dropped without the opt-in (#6776 Task 12).
   const seen = new Set<string>();
+  const visited = new Set<string>();
   const deduped: string[] = [];
   for (const root of kept) {
+    // A root listed twice (a repeated ROOTS entry, or one equal to `~` or a
+    // `~/projects` child) is checked, and any skip reported, once per run.
+    if (visited.has(resolve(root))) continue;
+    visited.add(resolve(root));
     let key: string;
     try {
-      key = await realpath(root);
-    } catch {
+      key = await raceRealpath(root);
+    } catch (err) {
+      if (err instanceof CollectorTimeoutError) {
+        // A hang is skipped (its trash is kept) and reported, as for every
+        // timeout in this module, with or without the NAS opt-in.
+        reportCollectorWarn(`realpath ${root} timed out — skipping`);
+        continue;
+      }
+      // Without the opt-in, a root whose real path cannot be read may be a
+      // symlink into the NAS, so it is skipped (trash kept) and reported, so
+      // the fault stays visible (#6776 G1). With it, the dedupe key falls back
+      // to the lexical path, as before #6776.
+      if (!sweepNetshare) {
+        reportCollectorWarn(
+          `realpath ${root} failed (${
+            err instanceof Error ? err.message : String(err)
+          }) — skipping`
+        );
+        continue;
+      }
       key = resolve(root);
     }
+    if (!sweepNetshare && isUnderNetshareGitParent(key)) continue;
+    // Without the opt-in, also gate on the repository the kick will purge.
+    // With it, nothing is resolved here and no git call is added.
+    if (!sweepNetshare && !(await repositoryOffNetshare(root))) continue;
     if (!seen.has(key)) {
       seen.add(key);
       deduped.push(root);

@@ -85,6 +85,9 @@ const NO_ALIVE_EDGES: SessionAliveResult = {
 /** Issue #6646: how long a tag-keyed spawn entry (start context or parent link) is kept. */
 export const PENDING_BY_TAG_MAX_AGE_MS = 30 * 60 * 1000;
 
+/** Issue #6646 (PR-2 item E4): the error-log category of a failed billable start. */
+export const BILLABLE_SWITCH_START_FAILURE_CATEGORY = "billable-switch-start";
+
 /** Issue #6646: the start hook's input; it returns the new row's start value, or null. */
 export type BillableSwitchStartHook = (input: {
   tag: string;
@@ -477,10 +480,29 @@ export class SessionCache {
 
   private noteBillableSwitchStartFailure(tag: string, error: unknown): void {
     this.billableSwitchStartFailures += 1;
+    const reason = error instanceof Error ? error.message : String(error);
     console.error(
       `[SessionCache] Billable switch start failed for ${tag}; the session registers non-billable with no event (#6646):`,
-      error instanceof Error ? error.message : error
+      reason
     );
+    // PR-2 item E4: also one row in the error log (Settings → Error Log), so an
+    // operator sees each failed start and the count since boot. Best-effort: a
+    // failed write never stops the registration this path is already saving.
+    try {
+      this.store.errorLogs.createEntry({
+        severity: "error",
+        category: BILLABLE_SWITCH_START_FAILURE_CATEGORY,
+        source: "server",
+        message: `Billable switch start failed for session ${tag}: it started non-billable with no event (${this.billableSwitchStartFailures} since this server started).`,
+        context: JSON.stringify({
+          tag,
+          reason,
+          failuresSinceStart: this.billableSwitchStartFailures,
+        }),
+      });
+    } catch {
+      // The console line above stands.
+    }
   }
 
   /** Issue #6646: install (or remove) the start hook. */

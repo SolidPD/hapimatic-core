@@ -52,6 +52,9 @@ import {
   splitDragHandle,
   type SortableDragHandle,
 } from "@/components/SessionList/SortableListEntry";
+// Issue #6742: the absolute reset stamp lives in `lib/accountLimit.ts` (the
+// account hook words a refusal with it); re-exported for this card's importers.
+export { formatResetAbsolute } from "@/lib/accountLimit";
 
 export type RateLimitKey =
   | "five_hour"
@@ -111,29 +114,6 @@ export function formatResetCountdown(
   }
   const days = deltaMs / 86_400_000;
   return `resets in ${days.toFixed(1)}d`;
-}
-
-/**
- * Format `resetsAt` as an exact Eastern-Time wall-clock stamp with the weekday,
- * date, time, and zone abbreviation ("Mon, Jun 23, 11:34 PM EDT"). Pinning
- * `timeZone: "America/New_York"` makes the stamp DST-aware and identical
- * regardless of the viewing device's timezone. Returns "" when missing/unparseable.
- */
-export function formatResetAbsolute(
-  resetsAt: string | null | undefined
-): string {
-  if (!resetsAt) return "";
-  const t = Date.parse(resetsAt);
-  if (!Number.isFinite(t)) return "";
-  return new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York",
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZoneName: "short",
-  }).format(new Date(t));
 }
 
 /**

@@ -6,7 +6,11 @@ import type { SpawnResponse } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { ModelMode, PermissionMode } from "@hapi/protocol/modes";
-import type { EffortLevel, McpSet } from "@hapi/protocol";
+import type {
+  BillableSwitchStartChoice,
+  EffortLevel,
+  McpSet,
+} from "@hapi/protocol";
 
 // Exported so the shared spawn-command assembler (NewSession/spawnCommand.ts,
 // #1949 A2) and the formState memo (#1950 A3) build from ONE payload definition.
@@ -107,6 +111,10 @@ export type SpawnInput = {
    *  options object (never a new positional); both branches forward it. Absent
    *  ⇒ the target's project default, else every server. */
   mcpSet?: McpSet;
+  /** Issue #6646 (ruling T-1): the Create form's `not-billable` where the
+   *  target takes the switch. Rides the trailing object on both branches; the
+   *  body carries only `{ choice }`. Absent ⇒ no field. */
+  billableSwitchStart?: { choice: BillableSwitchStartChoice };
 };
 
 export function useSpawnSession(api: ApiClient | null): {
@@ -131,7 +139,8 @@ export function useSpawnSession(api: ApiClient | null): {
         input.sourceBranch ||
         input.forceAccount ||
         input.permissionMode ||
-        input.mcpSet
+        input.mcpSet ||
+        input.billableSwitchStart
           ? {
               parentSessionId: input.parentSessionId,
               parentRelationship: input.parentRelationship,
@@ -142,6 +151,14 @@ export function useSpawnSession(api: ApiClient | null): {
                 : {}),
               // #6171: the MCP set rides the same trailing object.
               ...(input.mcpSet ? { mcpSet: input.mcpSet } : {}),
+              // #6646: the Create form's billable start (only `{ choice }`).
+              ...(input.billableSwitchStart
+                ? {
+                    billableSwitchStart: {
+                      choice: input.billableSwitchStart.choice,
+                    },
+                  }
+                : {}),
             }
           : undefined;
 

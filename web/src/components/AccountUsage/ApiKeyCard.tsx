@@ -380,7 +380,9 @@ export function ApiKeyCard(props: ApiKeyCardProps) {
                 <label
                   className="flex cursor-pointer items-center gap-1.5 text-[length:var(--text-body-dense)] text-[var(--app-fg)]"
                   title={`Stored on ${localNode.nodeLabel} · ${
-                    shared ? "available to all nodes" : "used on this node only"
+                    shared
+                      ? "sessions on every node can use it, including switching a running session onto it"
+                      : "used on this node only"
                   }`}
                 >
                   <Checkbox

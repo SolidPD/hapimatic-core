@@ -160,6 +160,8 @@ export class AppServerEventConverter {
   private readonly commandOutputBuffers = new Map<string, string>();
   private readonly commandMeta = new Map<string, Record<string, unknown>>();
   private readonly fileChanges = new Map<string, Record<string, unknown>>();
+  /** MCP tool call ids whose begin event was sent (#6724). */
+  private readonly startedMcpCalls = new Set<string>();
   private readonly reasoningSectionBreakKeys = new Set<string>();
   /** The last non-terminal `error` text per turn (failure text fallback). */
   private readonly errorTextByTurn = new Map<string, string>();
@@ -412,6 +414,11 @@ export class AppServerEventConverter {
         return started
           ? this.patchBegin(itemId, item)
           : this.patchEnd(itemId, item);
+      // #6724: Codex's McpToolCallBeginEvent / McpToolCallEndEvent (protocol.rs).
+      case "mcpToolCall":
+        return started
+          ? this.mcpBegin(itemId, item)
+          : this.mcpEnd(itemId, item);
       default:
         // userMessage and anything newer: nothing to show.
         return [];
@@ -482,12 +489,73 @@ export class AppServerEventConverter {
     return [event];
   }
 
+  private mcpInvocation(
+    itemId: string,
+    item: Record<string, unknown>
+  ): Record<string, unknown> | null {
+    const server = asString(item.server);
+    const tool = asString(item.tool);
+    if (!server || !tool) {
+      logger.debug(
+        `[CodexAppServer] mcpToolCall ${itemId} without server or tool, not shown`
+      );
+      return null;
+    }
+    return { server, tool, arguments: item.arguments ?? null };
+  }
+
+  private mcpBegin(
+    itemId: string,
+    item: Record<string, unknown>
+  ): CodexEvent[] {
+    const invocation = this.mcpInvocation(itemId, item);
+    if (!invocation) return [];
+    this.startedMcpCalls.add(itemId);
+    return [{ type: "mcp_tool_call_begin", call_id: itemId, invocation }];
+  }
+
+  private mcpEnd(itemId: string, item: Record<string, unknown>): CodexEvent[] {
+    const started = this.startedMcpCalls.delete(itemId);
+    const invocation = this.mcpInvocation(itemId, item);
+    if (!invocation) return [];
+    const completed = asString(item.status) === "completed";
+    const record = asRecord(item.result);
+    let result: Record<string, unknown>;
+    if (completed || record) {
+      // A tool's own isError result arrives as "failed" with the result kept.
+      result = {
+        Ok: {
+          content:
+            record && Array.isArray(record.content) ? record.content : [],
+          structuredContent: record?.structuredContent ?? null,
+          isError: !completed,
+        },
+      };
+    } else {
+      result = {
+        Err: asString(asRecord(item.error)?.message) ?? "MCP tool call failed",
+      };
+    }
+    const end: CodexEvent = {
+      type: "mcp_tool_call_end",
+      call_id: itemId,
+      invocation,
+      result,
+    };
+    // A completion whose start was missed still needs its call first: the web
+    // drops a result that has no call.
+    return started
+      ? [end]
+      : [{ type: "mcp_tool_call_begin", call_id: itemId, invocation }, end];
+  }
+
   reset(): void {
     this.agentMessageBuffers.clear();
     this.reasoningBuffers.clear();
     this.commandOutputBuffers.clear();
     this.commandMeta.clear();
     this.fileChanges.clear();
+    this.startedMcpCalls.clear();
     this.reasoningSectionBreakKeys.clear();
     this.errorTextByTurn.clear();
   }

@@ -178,6 +178,25 @@ export function applySessionSearchFilter(
     if (f.linkedIssue === "hasIssue" && !hasIssue) return false;
     if (f.linkedIssue === "noIssue" && hasIssue) return false;
 
+    // #6646 (FLT-MENU): the Filter menu's Billable section. A session whose
+    // switch is unknown (`billable` absent) and a spawning or failed
+    // placeholder show only under All; "to-confirm" keeps the waiting sessions
+    // (the router then shows the "To confirm" section alone).
+    const billable = f.billable ?? "all";
+    if (billable !== "all") {
+      if (
+        s.billable === undefined ||
+        s.lifecycleState === "spawning" ||
+        s.lifecycleState === "failed"
+      ) {
+        return false;
+      }
+      if (billable === "billable" && s.billable !== true) return false;
+      if (billable === "non-billable" && s.billable !== false) return false;
+      if (billable === "to-confirm" && s.billableConfirm !== "pending")
+        return false;
+    }
+
     return true;
   });
 }

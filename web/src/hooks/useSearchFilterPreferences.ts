@@ -17,6 +17,9 @@ const DEFAULTS: SearchFilterPreferences = {
     provider: "all",
     review: "all",
     linkedIssue: "all",
+    // #6646 (FLT-MENU): the Filter menu's Billable section; Clear filters and
+    // Revert reset it.
+    billable: "all",
   },
   sort: "updated",
   sortDirection: "desc",
@@ -182,6 +185,14 @@ export function useSearchFilterPreferences(api: ApiClient | null) {
     [prefs.filters, updateDebounced]
   );
 
+  // #6646 (FLT-MENU): the Billable section's choice, applied at once.
+  const setFilterBillable = useCallback(
+    (billable: SearchFilterPreferences["filters"]["billable"]) => {
+      updateImmediate({ filters: { ...prefs.filters, billable } });
+    },
+    [prefs.filters, updateImmediate]
+  );
+
   const setSort = useCallback(
     (sort: SearchFilterPreferences["sort"]) => {
       updateImmediate({ sort });
@@ -229,6 +240,7 @@ export function useSearchFilterPreferences(api: ApiClient | null) {
     setFilterProvider,
     setFilterReview,
     setFilterLinkedIssue,
+    setFilterBillable,
     setSort,
     setSortDirection,
     clearAll,

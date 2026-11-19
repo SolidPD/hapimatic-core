@@ -135,7 +135,8 @@ export const TIMELINE_FETCH_GRACE_MS = 5_000;
 export const MAX_CONSECUTIVE_TIMEOUTS = 2;
 /**
  * #2503 fix round 3 (the operator's 146 a): a final round whose fetch failed
- * is retried in the next tick, at most this many rounds in all, then dropped.
+ * is retried in the next tick, at most this many rounds in all, then dropped
+ * (#6719 fix round 7: a fetch the tick's timeout carry keeps is not counted).
  */
 export const MAX_FINAL_ROUND_FETCHES = 3;
 /** The characters of stderr a failed fetch's error carries (its tail). */
@@ -330,18 +331,48 @@ export class WorkflowReconcileService {
    * #2503 fix round 2 (the delta reviewer's F3), fix round 3 (R3-1): the
    * `repo#number` keys a round left unwritten (a write the busy window
    * skipped or the database answered busy, or a key after a busy answer or
-   * R7's break); the next tick puts each in its fetch set while a session
+   * R7's break), the keys a throw in the tick left unwritten (#6719: the key
+   * it hit and every key after it, but not a key whose fetch ran and
+   * failed), and a key with no active session whose timeout in a hang the
+   * tiers' order would have
+   * carried behind R7's break (#6719 fix round 7, at the fetch's catch in
+   * {@link tick}); the next tick puts each in its fetch set while a session
    * still links it, one with no active session behind the active keys and
-   * ahead of the rest (fix round 4, C1), and a key it does not reach is
-   * carried again.
+   * ahead of the rest (fix round 4, C1) unless its last attempt timed out
+   * (the closer's S-1: then after every tier), and a key it does not reach
+   * is carried again.
    */
   private skippedWrites = new Set<string>();
+  /**
+   * #2503 closer (S-1, the board-26 PM's F-1): the `repo#number` keys whose
+   * last fetch attempt in a tick timed out, each with that attempt's sequence
+   * number. The next tick fetches them after every key of every tier, oldest
+   * timeout first, except that a kept key with no active session ({@link
+   * keptAt}) goes after the others; a key leaves when an attempt of it
+   * answers or fails otherwise, or when it is not in the tick's fetch set.
+   */
+  private readonly timedOutAt = new Map<string, number>();
+  private timeoutSeq = 0;
+  /**
+   * #6719 fix round 7 (the board-26 PM's G4 ruling, 2026-11-16): the keys
+   * of the timed-out map whose last timeout the tick's timeout carry kept.
+   * While a kept key has no active session it sorts after the map's other
+   * keys, so it waits behind them while they keep timing out, as the tiers
+   * kept it behind R7's break; once its lane is active again it sorts with
+   * them, by its timeout (fix round 8, the re-review's R1: an active key is
+   * never kept behind the group). Oldest timeout first and R3's bound hold
+   * for the map's other keys. A
+   * key leaves when an attempt of it answers, fails otherwise or times out
+   * without being kept, or when it is not in the tick's fetch set.
+   */
+  private readonly keptAt = new Set<string>();
   /**
    * #2503 fix round 3 (the operator's 146 a): the final rounds owed, by
    * `repo#number`, each with its failed fetches so far. A final round is the
    * one more round of an issue whose last active session on this node ended
    * (R6); it leaves the map when it lands or its write failed (K1), when
-   * its fetch fails for the {@link MAX_FINAL_ROUND_FETCHES}th time, when a
+   * its fetch fails for the {@link MAX_FINAL_ROUND_FETCHES}th time (a fetch
+   * the timeout carry keeps is not counted, #6719 fix round 7), when a
    * session of the issue is active again, or when no session links it; a
    * lane that works again starts a new final round with its count afresh.
    */
@@ -476,22 +507,43 @@ export class WorkflowReconcileService {
    * a round leaves unwritten is carried into the next tick. Fix round 4
    * (C1): each tick fetches the active keys first, then the carried keys
    * with no active session, then the rest, so an active key never waits
-   * behind keys with no active session that hang, and a carried key with
-   * no active session is carried again while two keys in a row ahead of it
-   * time out (R7's break: two active keys that hang keep it carried) or a
-   * write ahead of it answers busy. The operator's 146 a: a final round
+   * behind keys with no active session that hang; the closer's S-1: a key
+   * whose last attempt timed out goes after every tier (the bound is at the
+   * sort below). A key is carried again when two keys in a row ahead of it
+   * time out (R7's break) or a write ahead of it answers busy; keys that
+   * keep timing out do that to a key outside the timed-out group only at
+   * their first timeout, since after it they go last (inside the group the
+   * two oldest go first and break the round, so the group takes turns).
+   * A throw that ends the tick carries the key it hit and every key after
+   * it, but not a key whose fetch ran and failed (#6719); and the timeout of
+   * a key with no active session in a hang where the tiers' order would
+   * have carried it behind R7's break carries it (#6719 fix round 7, at the
+   * fetch's catch); such a kept key goes after the timed-out group's other
+   * keys while it has no active session (the PM's G4 ruling; fix round 8).
+   * The operator's 146 a: a final round
    * whose fetch failed is retried, at most
-   * {@link MAX_FINAL_ROUND_FETCHES} rounds.
+   * {@link MAX_FINAL_ROUND_FETCHES} rounds (a fetch the timeout carry keeps
+   * is not counted).
    * The first tick's pass is not a final round for a session last active
    * before `start()`: a fetch that fails there still waits for the next
    * restart. A lane active since `start()` and not active at the first tick
    * gets its final round there (fix round 4, B6).
    */
   async tick(): Promise<void> {
+    // #6719 (the PM's adjacent ruling): a throw anywhere in the loop below
+    // leaves carried the key it hit and every key after it, as R7's break
+    // and a busy write do; the throw itself does not carry a key whose
+    // fetch ran and failed (fix round 7's timeout carry may already have),
+    // and a key before it keeps what its own round did (written, or a write
+    // or fetch that failed, not carried unless that timeout carry took it).
+    // A throw before the fetch order is built keeps the keys the previous
+    // tick carried (the second adjacent ruling: the set is swapped after
+    // the sort).
+    let entries: Array<[string, { repo: string; number: number }]> = [];
+    let unreached = 0;
     try {
       this.retryOwedClears();
       const carried = this.skippedWrites; // F3, R3-1: one more round each
-      this.skippedWrites = new Set();
       const fullPass = !this.fullPassDone;
       // A fetch that fails in the pass waits for the next restart, unless
       // its session was active since start() (a final round, fix round 4).
@@ -548,22 +600,66 @@ export class WorkflowReconcileService {
         if (!activeKeys.has(key)) this.finalRounds.set(key, 0);
       }
       this.previousActiveKeys = activeKeys;
+      for (const key of this.timedOutAt.keys()) {
+        if (!fetchSet.has(key)) this.timedOutAt.delete(key);
+      }
+      for (const key of this.keptAt) {
+        if (!fetchSet.has(key)) this.keptAt.delete(key);
+      }
 
       // R3-1, fix round 4 (C1, R3): the active keys first, then the carried
       // keys with no active session, then the rest (a stable sort keeps each
-      // tier's order). So keys with no active session that hang never keep
-      // an active key from its fetch; a key is still carried to the next
-      // tick when two keys in a row ahead of it time out (R7's break) or a
-      // write ahead of it answers busy (R10).
-      const rank = (key: string): number =>
+      // tier's order). The closer's S-1 (the board-26 PM's F-1): a key whose
+      // last attempt timed out goes after every tier, oldest timeout first
+      // (but see the kept keys below), so keys that keep timing out never
+      // keep a key that answers from its fetch. Measured in the model to 4
+      // hangers per tier (the rows measure the service): every key that
+      // answers is fetched, an active one at every tick after its first fetch
+      // while the keys that time out keep timing out (two keys ahead of it
+      // that start to time out still skip it for one tick); a key that
+      // answers again after timing out is fetched within ceil(g/2)+1 ticks
+      // (g = the keys that keep timing out, all tiers), where the tiers alone
+      // retried the first two hangers of a tier at every tick and every other
+      // hanger never; a key whose last attempt timed out waits behind every
+      // key whose last timeout is older, of any tier, and may wait behind
+      // keys of a lower tier that time out for the first time. These hold for
+      // the group without its kept keys that have no active session (below),
+      // which wait behind it. A key
+      // is still carried to the next tick when two keys in a row ahead of it
+      // time out (R7's break) or a write ahead of it answers busy (R10). A
+      // throw that ends the tick carries the key it hit and every key after
+      // it, but not a key whose fetch ran and failed (#6719); and the
+      // timeout of a key with no active session in a hang where the tiers'
+      // order would have carried it behind R7's break carries it (fix round
+      // 7, at the fetch's catch). The PM's G4 ruling (2026-11-16): such a kept
+      // key ranks 4, after the group's other keys, oldest timeout first,
+      // while it has no active session; fix round 8: once its lane is active
+      // again it ranks 3 with the group, by its timeout.
+      const tier = (key: string): number =>
         activeKeys.has(key) ? 0 : carried.has(key) ? 1 : 2;
-      const entries = [...fetchSet].sort(([a], [b]) => rank(a) - rank(b));
+      const rank = (key: string): number =>
+        this.timedOutAt.has(key)
+          ? this.keptAt.has(key) && !activeKeys.has(key)
+            ? 4
+            : 3
+          : tier(key);
+      // #6719 fix round 7: the tiers' order alone, as before the closer's
+      // S-1, read at the catch below (it never reads the timed-out map).
+      const tiers = [...fetchSet.keys()].sort((a, b) => tier(a) - tier(b));
+      entries = [...fetchSet].sort(
+        ([a], [b]) =>
+          rank(a) - rank(b) ||
+          (this.timedOutAt.get(a) ?? 0) - (this.timedOutAt.get(b) ?? 0)
+      );
+      // #6719: swapped only now, so a throw above leaves `carried` in place.
+      this.skippedWrites = new Set();
       /** R3-1: the keys from `from` on get the next tick's round. */
       const carryFrom = (from: number): void => {
         for (const [key] of entries.slice(from)) this.skippedWrites.add(key);
       };
       let consecutiveTimeouts = 0;
       for (const [i, [key, entry]] of entries.entries()) {
+        unreached = i;
         if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
           // #2503 (R7): stop fetching for this round, so a tick of sequential
           // timed-out fetches never reaches the loop's 3 × interval stall.
@@ -579,21 +675,42 @@ export class WorkflowReconcileService {
         try {
           events = await this.fetchShared(entry.repo, entry.number);
           consecutiveTimeouts = 0;
+          this.timedOutAt.delete(key);
+          this.keptAt.delete(key);
         } catch (error) {
-          consecutiveTimeouts =
-            error instanceof TimelineFetchError && error.timedOut
-              ? consecutiveTimeouts + 1
-              : 0;
+          const timedOut =
+            error instanceof TimelineFetchError && error.timedOut;
+          // #6719 fix round 7: while every fetch of the tick so far timed out
+          // (a hang), a key with no active session that the tiers' order puts
+          // behind two other keys would have waited there behind R7's break,
+          // carried, as the tiers alone kept it; so its timeout carries it,
+          // and its final round's count stays. Named limits: a hang that ends
+          // later in the tick gives it one more round; after a fetch of the
+          // tick that did not time out, its timeout is a failed fetch.
+          const kept =
+            timedOut &&
+            consecutiveTimeouts === i &&
+            !activeKeys.has(key) &&
+            tiers.indexOf(key) >= MAX_CONSECUTIVE_TIMEOUTS;
+          consecutiveTimeouts = timedOut ? consecutiveTimeouts + 1 : 0;
+          if (timedOut) this.timedOutAt.set(key, ++this.timeoutSeq);
+          else this.timedOutAt.delete(key);
+          if (kept) this.keptAt.add(key);
+          else this.keptAt.delete(key);
           // 146 a: a final round whose fetch failed gets the next tick's round,
-          // at most MAX_FINAL_ROUND_FETCHES rounds in all.
+          // at most MAX_FINAL_ROUND_FETCHES rounds in all (a kept fetch is not
+          // counted, fix round 7).
           const failed = this.finalRounds.get(key);
-          if (failed !== undefined) {
+          if (kept) {
+            this.skippedWrites.add(key);
+          } else if (failed !== undefined) {
             if (failed + 1 >= MAX_FINAL_ROUND_FETCHES) {
               this.finalRounds.delete(key);
             } else {
               this.finalRounds.set(key, failed + 1);
             }
           }
+          unreached = i + 1; // its fetch ran: a throw does not carry it
           this.logLine("warn", "[WorkflowReconcile] timeline fetch failed", {
             category: "workflow-reconcile",
             stack: error instanceof Error ? error.stack : null,
@@ -619,6 +736,9 @@ export class WorkflowReconcileService {
         this.finalRounds.delete(key); // 146 a: the round was written (or failed, K1)
       }
     } catch (error) {
+      for (const [key] of entries.slice(unreached)) {
+        this.skippedWrites.add(key);
+      }
       this.logLine("warn", "[WorkflowReconcile] tick failed", {
         category: "workflow-reconcile",
         stack: error instanceof Error ? error.stack : null,

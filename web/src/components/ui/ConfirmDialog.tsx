@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useState, useEffect } from "react";
+import { useState, useEffect, type ReactNode } from "react";
 import {
   Dialog,
   DialogContent,
@@ -32,6 +32,12 @@ type ConfirmDialogProps = {
   onError?: (err: unknown) => void;
   /** Label for the dismiss button (default "Cancel"; issue #1006 uses "Later"). */
   cancelLabel?: string;
+  /**
+   * Optional content under the description (#6646): further lines the person
+   * reads before confirming (the billable switch's figure, its record). Absent
+   * renders nothing, so every other consumer is unchanged.
+   */
+  body?: ReactNode;
 };
 
 export function ConfirmDialog(props: ConfirmDialogProps) {
@@ -48,6 +54,7 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
     nonBlocking = false,
     onError,
     cancelLabel = "Cancel",
+    body,
   } = props;
 
   const [error, setError] = useState<string | null>(null);
@@ -93,6 +100,15 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription className="mt-2">{description}</DialogDescription>
         </DialogHeader>
+
+        {body ? (
+          <div
+            data-confirm-body=""
+            className="mt-2 space-y-1.5 text-sm text-[var(--app-hint)]"
+          >
+            {body}
+          </div>
+        ) : null}
 
         {error ? (
           <div className="mt-3 rounded-md bg-red-900/20 p-3 text-sm text-red-400">

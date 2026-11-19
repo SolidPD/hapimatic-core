@@ -78,6 +78,7 @@ import { Input } from "@/components/ui/Input";
 import { Textarea } from "@/components/ui/Textarea";
 import { Select } from "@/components/ui/Select";
 import { Checkbox } from "@/components/ui/Checkbox";
+import { Switch } from "@/components/ui/Switch";
 import { HoverTooltip } from "@/components/ui/tooltip";
 import { CatalogEntry, SpecimenRow, Specimen } from "./CatalogKit";
 
@@ -657,6 +658,7 @@ function CollapsibleSectionEntry() {
 function ConfirmDialogEntry() {
   const [open, setOpen] = useState(false);
   const [destructiveOpen, setDestructiveOpen] = useState(false);
+  const [bodyOpen, setBodyOpen] = useState(false);
   return (
     <CatalogEntry
       id="confirm-dialog"
@@ -670,6 +672,9 @@ function ConfirmDialogEntry() {
         </Button>
         <Button variant="destructive" onClick={() => setDestructiveOpen(true)}>
           Delete…
+        </Button>
+        <Button variant="outline" onClick={() => setBodyOpen(true)}>
+          With a body…
         </Button>
       </SpecimenRow>
       <ConfirmDialog
@@ -690,6 +695,18 @@ function ConfirmDialogEntry() {
         confirmLabel="Delete"
         confirmingLabel="Deleting…"
         onConfirm={async () => setDestructiveOpen(false)}
+        isPending={false}
+        destructive
+      />
+      <ConfirmDialog
+        isOpen={bodyOpen}
+        onClose={() => setBodyOpen(false)}
+        title='Make "Nightly lint run" non-billable?'
+        description="00:42:10 tracked on its timer will not be logged."
+        body={<p>Recorded: switched off, Nov 16, 9:30 AM.</p>}
+        confirmLabel="Make non-billable"
+        confirmingLabel="Making non-billable…"
+        onConfirm={async () => setBodyOpen(false)}
         isPending={false}
         destructive
       />
@@ -1026,6 +1043,41 @@ function CheckboxEntry() {
   );
 }
 
+function SwitchEntry() {
+  const [on, setOn] = useState(true);
+  return (
+    <CatalogEntry
+      id="switch"
+      title="Switch"
+      kind="primitive"
+      note="The track and thumb only; the caller's button carries role=switch and its label, so the whole line is the tap target (#6646)."
+    >
+      <SpecimenRow label="sizes and states">
+        <Specimen caption="sm, in a menu line (tap)">
+          <Button
+            type="button"
+            variant="ghost"
+            role="switch"
+            aria-checked={on}
+            onClick={() => setOn(v => !v)}
+            className="h-auto w-40 justify-between px-3 py-1.5 text-xs font-normal text-[var(--app-fg)]"
+          >
+            <span>Billable</span>
+            <Switch checked={on} />
+          </Button>
+        </Specimen>
+        <Specimen caption="md, a settings row">
+          <Switch checked size="md" />
+        </Specimen>
+        <Specimen caption="off / disabled">
+          <Switch checked={false} />
+          <Switch checked={false} disabled />
+        </Specimen>
+      </SpecimenRow>
+    </CatalogEntry>
+  );
+}
+
 export function PrimitiveEntries() {
   return (
     <>
@@ -1059,6 +1111,7 @@ export function PrimitiveEntries() {
       <TextareaEntry />
       <SelectEntry />
       <CheckboxEntry />
+      <SwitchEntry />
     </>
   );
 }

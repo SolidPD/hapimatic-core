@@ -8,6 +8,7 @@ import {
   type SpawnInput,
 } from "@/hooks/mutations/useSpawnSession";
 import { queryKeys } from "@/lib/query-keys";
+import { exhaustedLimitText, readAccountExhausted } from "@/lib/accountLimit";
 import { randomUuid } from "@/lib/randomUuid";
 import {
   addPendingSpawn,
@@ -365,11 +366,16 @@ async function spawnLocalPeer(
       (err.code === "at_capacity" || err.code === "insufficient_memory")
         ? err.code
         : classifyRefusalMessage(errorMessage(err));
+    // Issue #6742: an account at its usage limit is named in the web's words,
+    // never the server's text, which tells an API client to send forceAccount.
+    const exhausted = readAccountExhausted(err);
     return {
       ...head,
       status: "refused",
       refusal,
-      message: errorMessage(err),
+      message: exhausted
+        ? `${exhaustedLimitText(exhausted.exhaustion)} Fan out again with another account, or pick this one for a peer and choose Use anyway.`
+        : errorMessage(err),
     };
   }
   if (result.type !== "success" || !result.sessionId) {

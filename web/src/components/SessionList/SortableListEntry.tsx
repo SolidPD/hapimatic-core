@@ -46,9 +46,14 @@ export type SortableDragHandle = {
  * All menu). Such a menu is portaled to `<body>`, but its React events still
  * bubble to the row that owns it, so a press on the menu's own padding would
  * otherwise arm a drag of that row, or a tap there open the session.
+ *
+ * `[data-session-timer-menu]` covers the timer menu (#6646), which renders
+ * inside the row and holds a switch and a text input: a tap on its padding, or
+ * a press there, belongs to the menu. It is a data attribute rather than
+ * `role="menu"`, a role that block does not have.
  */
 export const INTERACTIVE_SELECTOR =
-  'button, input, a, .icon-row, [role="menu"]';
+  'button, input, a, .icon-row, [role="menu"], [data-session-timer-menu]';
 
 /** True when the pointer/click target is (inside) an interactive child. */
 export function isInteractiveTarget(target: EventTarget | null): boolean {

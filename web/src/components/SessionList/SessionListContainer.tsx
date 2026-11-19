@@ -31,6 +31,7 @@ import type {
 } from "@/types/api";
 import { SessionItem } from "./SessionItem";
 import { ProjectHeader } from "./ProjectHeader";
+import type { ToConfirmSplit } from "@/components/billableSwitch/ToConfirmSection";
 import { SessionCountBadge } from "./SessionCountBadge";
 import { SubheadingBar } from "./SubheadingBar";
 import { SchedulerSubheader } from "./SchedulerSubheader";
@@ -199,6 +200,8 @@ export function SessionList(props: {
    * relationship lookups below read it.
    */
   visibleSessionIds?: ReadonlySet<string>;
+  /** #6646 (Task 14): "To confirm" holds these; they leave the schedule rows. */
+  toConfirm?: Pick<ToConfirmSplit, "ids" | "shown"> | null;
 }) {
   const { api } = props;
   const filterView = props.filterView ?? "all";
@@ -215,6 +218,7 @@ export function SessionList(props: {
     const map = new Map<string, SessionSummary[]>();
     for (const session of props.sessions) {
       if (visibleSessionIds && !visibleSessionIds.has(session.id)) continue;
+      if (props.toConfirm?.ids.has(session.id)) continue;
       const sid = schedulerScheduleId(session);
       if (sid) {
         const list = map.get(sid) ?? [];
@@ -223,7 +227,7 @@ export function SessionList(props: {
       }
     }
     return map;
-  }, [props.sessions, visibleSessionIds]);
+  }, [props.sessions, visibleSessionIds, props.toConfirm]);
 
   // #2700: ids of every schedule that renders a row. A scheduler-spawned session is
   // nested (and excluded from the main list) only when its schedule is in this set;
@@ -962,11 +966,13 @@ export function SessionList(props: {
         {/* Filter-aware empty state (issue #942 R18): sessions exist but the
             active search/filter narrowed everything out. Distinct from the
             genuine no-sessions-at-all state (props.sessions.length === 0). */}
-        {allGroups.length === 0 && props.sessions.length > 0 && (
-          <div className="mx-auto w-full max-w-content px-3 py-10 text-center text-sm text-[var(--app-hint)]">
-            No sessions match your filters
-          </div>
-        )}
+        {allGroups.length === 0 &&
+          props.sessions.length > 0 &&
+          !props.toConfirm?.shown.length && (
+            <div className="mx-auto w-full max-w-content px-3 py-10 text-center text-sm text-[var(--app-hint)]">
+              No sessions match your filters
+            </div>
+          )}
         {/* Unified grouped list: each group renders its sessions + matched schedules + pending spawns */}
         {(() => {
           const listItems = groupsToRender.map(group => {

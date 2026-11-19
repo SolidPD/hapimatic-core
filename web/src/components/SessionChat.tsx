@@ -1397,7 +1397,7 @@ export function SessionChat(props: {
               onClose={() => setConfigModalOpen(false)}
               session={props.session}
               api={props.api}
-              nodeId={props.nodeId} // #4823: API keys are node-local
+              nodeId={props.nodeId} // #4823 / #6542: is the session peer-owned
             />
 
             {/* Issue #1079: merged/expanded dock rows. HappyComposer above is

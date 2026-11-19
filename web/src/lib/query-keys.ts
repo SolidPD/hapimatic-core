@@ -214,6 +214,12 @@ export const queryKeys = {
   federationNodes: ["federation-nodes"] as const,
   tailscaleStatus: ["tailscale-status"] as const,
   federationAllSessions: ["federation-all-sessions"] as const,
+  // #6646: every node's billable project headers, and one session's history.
+  billableSwitchHeaders: ["billable-switch-headers"] as const,
+  billableSwitchHistory: (sessionId: string) =>
+    ["billable-switch-history", sessionId] as const,
+  // The version read (`useVersion`), which carries the billable gate's state.
+  version: ["version"] as const,
   // File Conflict Monitor (#1971): per-repo live claims + umbrella recompute key.
   fileClaims: (repo: string) => ["file-claims", repo] as const,
   fileConflicts: ["file-conflicts"] as const,

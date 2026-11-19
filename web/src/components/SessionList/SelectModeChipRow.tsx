@@ -80,10 +80,13 @@ type ConfirmKind = "abort" | "archive" | "delete";
 
 const CHIP_CLASS =
   "text-[length:var(--text-caption)] font-semibold text-[var(--app-fg)] hover:text-[var(--app-accent)] disabled:text-[var(--app-hint)] disabled:opacity-50";
-const CHIP_WARNING_CLASS =
+export const CHIP_WARNING_CLASS =
   "text-[length:var(--text-caption)] font-semibold text-[var(--app-badge-warning-text)] hover:opacity-80 disabled:opacity-50";
 const CHIP_DANGER_CLASS =
   "text-[length:var(--text-caption)] font-semibold text-[var(--app-badge-error-text)] hover:opacity-80 disabled:opacity-50";
+/** #6646: the mint the drawing uses for "Keep" and "Keep all" (their tests read it). */
+export const CHIP_ACCENT_CLASS =
+  "text-[length:var(--text-caption)] font-semibold text-[var(--app-accent)] hover:opacity-80 disabled:text-[var(--app-hint)] disabled:opacity-50";
 
 /** One Select-Mode chip: plain clickable text (no bubble), in a tone. */
 function Chip({

@@ -74,7 +74,7 @@ import type {
   FeedbackConvertResponse,
   McpCatalogRouteResponse,
 } from "@/types/api";
-import type { McpSet } from "@hapi/protocol";
+import type { BillableSwitchStartChoice, McpSet } from "@hapi/protocol";
 import type { QueuedMessage, SessionView } from "@hapi/protocol/types";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type {
@@ -325,6 +325,15 @@ const TELEMETRY_REPORT_OPTS: RequestReportOptions = {
 };
 
 /**
+ * Issue #6646: the billable routes answer a bare 404 while billable sessions are
+ * off, 409 while they are closed or the owning node lacks them, and 503 while
+ * the owning node has not been reached; each is a designed answer the hooks map.
+ */
+const BILLABLE_REPORT_OPTS: RequestReportOptions = {
+  expectedStatuses: [404, 409, 503],
+};
+
+/**
  * Issue #6367: the five throughput reads under `/api/telemetry/throughput/*`
  * answer 503 from exactly one place, the `unavailable` helper in
  * `server/src/web/routes/throughput.ts`, when the throughput service is null:
@@ -503,6 +512,9 @@ export type SpawnParentOptions = {
   /** Issue #6171: the MCP servers the session starts with. Absent → the
    *  target project's default, else every server (the body has no field). */
   mcpSet?: McpSet;
+  /** Issue #6646 (ruling T-1): the Create form's billable start; a client
+   *  sends only `{ choice }`. Absent → the body has no field. */
+  billableSwitchStart?: { choice: BillableSwitchStartChoice };
 };
 
 /**
@@ -585,6 +597,86 @@ export interface OutputStyleInfo {
 export interface OutputStyleCatalog {
   styles: OutputStyleInfo[];
 }
+
+// ─── Issue #6646: the billable switch (the routes of the server's Task 7) ───
+
+/** The answer of a switch or a confirm (`BillableSwitchSetResponseSchema`). */
+export type BillableSwitchSetResult = {
+  ok: true;
+  changed: boolean;
+  billable: boolean;
+  billableConfirm: "pending" | null;
+  timerMs: number;
+  unloggedMs: number;
+  loggedKnown: boolean;
+};
+
+/** One session's result of Keep all. */
+export type BillableKeepAllResult = {
+  id: string;
+  outcome:
+    | "ok"
+    | "not_pending"
+    | "not_found"
+    | "forbidden"
+    | "node_offline"
+    | "unsupported"
+    | "timeout"
+    | "failed";
+};
+
+/** One node's billable project headers, as the headers read lists them. */
+export type BillableSwitchHeadersNode = {
+  nodeId: string;
+  nodeLabel: string;
+  /** `local` for this server; else the registry's status or `not-tracked`. */
+  status: string;
+  isLocal: boolean;
+  /** The node's gate is on (`billable:switch`). */
+  on: boolean;
+  /** The node's gate is closed (`billable:switch-closed`). */
+  closed: boolean;
+  /** When the node's last report arrived; null when it never reported. */
+  reportedAt: number | null;
+  headers: Array<{
+    projectKey: string;
+    keyKind: "repo" | "path";
+    billable: boolean;
+    updatedAt: number;
+  }>;
+};
+
+export type BillableSwitchHeadersResponse = {
+  nodes: BillableSwitchHeadersNode[];
+};
+
+export type BillableSwitchHistoryEvent = {
+  id: number;
+  at: number;
+  kind: string;
+  reason: string | null;
+  billableBefore: boolean | null;
+  billableAfter: boolean | null;
+  confirmBefore: "pending" | null;
+  confirmAfter: "pending" | null;
+  startKind?: string;
+  actor: { kind: string; sessionId?: string };
+  via: string;
+  entryNodeId: string | null;
+  timerMs: number | null;
+  unloggedMs: number | null;
+  loggedKnown: boolean;
+  /** #6646 (Task 14): a start's cause nodes; absent from an older node. */
+  causeNodes?: Array<{ nodeLabel: string; reportedAt: number | null }>;
+};
+
+export type BillableSwitchHistory = {
+  sessionId: string;
+  source: "local" | "origin" | "mirror";
+  originNodeId: string | null;
+  mirrorSyncedAt: number | null;
+  events: BillableSwitchHistoryEvent[];
+};
 
 export class ApiClient {
   private token: string;
@@ -1659,9 +1751,10 @@ export class ApiClient {
 
   /**
    * Issue #4823: switch (or, for a disconnected session, stage) a session's
-   * payment method — a subscription account or a node-vault Anthropic API key
-   * (by vault id; the key itself never leaves the node). Same route as the
-   * account switch; the server restarts the session with `--resume`.
+   * payment method — a subscription account or an Anthropic API key by
+   * reference, never the key itself (#6542: a bare vault id, or the bindingRef
+   * of a key another node shares). Same route as the account switch; the server
+   * restarts the session with `--resume`.
    */
   async setSessionPaymentMethod(
     sessionId: string,
@@ -2137,6 +2230,7 @@ export class ApiClient {
           forceAccount: parent?.forceAccount,
           permissionMode: parent?.permissionMode,
           mcpSet: parent?.mcpSet,
+          billableSwitchStart: parent?.billableSwitchStart,
         }),
       },
       0,
@@ -2232,6 +2326,7 @@ export class ApiClient {
           forceAccount: parent?.forceAccount,
           permissionMode: parent?.permissionMode,
           mcpSet: parent?.mcpSet,
+          billableSwitchStart: parent?.billableSwitchStart,
         }),
       },
       0,
@@ -2748,6 +2843,99 @@ export class ApiClient {
         method: "PUT",
         body: JSON.stringify(autoRecover),
       }
+    );
+  }
+
+  // ─── Issue #6646: the billable switch ─────────────────────────────────────
+  // Each route answers a bare 404 while the server's billable sessions are off,
+  // and 409 `billable_feature_closed` / `billable_feature_unsupported` naming the
+  // node; the hooks in `useBillableSwitch.ts` map both.
+
+  /** Switch one session billable or not (`PUT /api/sessions/:id/billable`). */
+  async setSessionBillable(
+    sessionId: string,
+    billable: boolean
+  ): Promise<BillableSwitchSetResult> {
+    return await this.request<BillableSwitchSetResult>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/billable`,
+      { method: "PUT", body: JSON.stringify({ billable }) },
+      0,
+      undefined,
+      undefined,
+      BILLABLE_REPORT_OPTS
+    );
+  }
+
+  /** Keep or Reverse a waiting session (`POST .../billable/confirm`). */
+  async confirmSessionBillable(
+    sessionId: string,
+    decision: "keep" | "reverse"
+  ): Promise<BillableSwitchSetResult> {
+    return await this.request<BillableSwitchSetResult>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/billable/confirm`,
+      { method: "POST", body: JSON.stringify({ decision }) },
+      0,
+      undefined,
+      undefined,
+      BILLABLE_REPORT_OPTS
+    );
+  }
+
+  /** Keep all: confirm several waiting sessions, on any node, in one request. */
+  async keepAllBillable(
+    ids: string[]
+  ): Promise<{ ok: true; results: BillableKeepAllResult[] }> {
+    return await this.request<{ ok: true; results: BillableKeepAllResult[] }>(
+      "/api/sessions/bulk-billable-keep",
+      { method: "POST", body: JSON.stringify({ ids }) },
+      0,
+      undefined,
+      undefined,
+      BILLABLE_REPORT_OPTS
+    );
+  }
+
+  /** Every node's billable project headers in the caller's namespace. */
+  async getBillableSwitchHeaders(): Promise<BillableSwitchHeadersResponse> {
+    return await this.request<BillableSwitchHeadersResponse>(
+      "/api/billable-switch/headers",
+      undefined,
+      0,
+      undefined,
+      undefined,
+      BILLABLE_REPORT_OPTS
+    );
+  }
+
+  /** One session's switch history, oldest first (also after its deletion). */
+  async getSessionBillableHistory(
+    sessionId: string
+  ): Promise<BillableSwitchHistory> {
+    return await this.request<BillableSwitchHistory>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/billable/history`,
+      undefined,
+      0,
+      undefined,
+      undefined,
+      BILLABLE_REPORT_OPTS
+    );
+  }
+
+  /** Switch events across sessions and nodes (`GET /api/billable-switch/events`). */
+  async listBillableSwitchEvents(
+    opts: { after?: string; kinds?: string[] } = {}
+  ): Promise<unknown> {
+    const params = new URLSearchParams();
+    if (opts.after) params.set("after", opts.after);
+    if (opts.kinds?.length) params.set("kinds", opts.kinds.join(","));
+    const qs = params.toString();
+    return await this.request<unknown>(
+      `/api/billable-switch/events${qs ? `?${qs}` : ""}`,
+      undefined,
+      0,
+      undefined,
+      undefined,
+      BILLABLE_REPORT_OPTS
     );
   }
 

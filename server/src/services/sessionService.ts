@@ -143,10 +143,8 @@ function switchAccountCodeToStatus(code: string | undefined): number {
     case "account_not_found":
     case "api_key_not_found":
       return 404;
-    // Issue #4823: a key target the session cannot take — a non-SDK (or
-    // unrecorded) launcher, local mode, a non-Claude agent, or a session owned by
-    // another node (keys are node-local). Refused BEFORE any kill: a conflict with
-    // the session's state, not a server fault.
+    // Issue #4823: a key target the session cannot take (launcher, local mode,
+    // agent, or a peer-owned session, #6542). Refused BEFORE any kill: 409.
     case "api_key_launcher_unsupported":
     case "api_key_local_mode_unsupported":
     case "api_key_agent_unsupported":
@@ -693,12 +691,10 @@ export class SessionService {
   }
 
   /**
-   * Issue #4823: switch (or stage) a session's payment method — a subscription
-   * account or a node-vault Anthropic API key. Local → the engine's one
-   * validation / persistence / rollback body. Remote → an ACCOUNT target is
-   * proxied to the owning node exactly as before; a KEY target is refused here
-   * with `api_key_remote_unsupported` before any proxy, because a node's vault is
-   * node-local and unsynced (#1996) — a key id can never cross the federation.
+   * Issue #4823: switch (or stage) a session's payment method — an account or an
+   * API-key reference (#6542: a key another node shares, too). Local → the
+   * engine's body. Remote → an account is proxied; a key is refused before any
+   * proxy, naming the owner (switching it from a hub is #6740).
    */
   async switchPaymentMethod(
     sessionId: string,
@@ -726,7 +722,7 @@ export class SessionService {
       return {
         type: "error",
         message: result.message,
-        status: switchAccountCodeToStatus(result.code),
+        status: result.httpStatus ?? switchAccountCodeToStatus(result.code),
         code: result.code ?? "unknown",
         ...this.refusalStamp(
           result.code,
@@ -737,15 +733,14 @@ export class SessionService {
     }
 
     if (target.kind === "api-key") {
-      // A session this node does not own: refuse a key target before any proxy.
-      // An unknown session stays a 404 (no existence leak beyond the account path).
-      if (!this.registry?.findNodeForSession(sessionId)) {
-        return { type: "not-found" };
-      }
+      // An unknown (or offline) owner stays a 404, as for an account target.
+      const owner = this.registry?.findNodeForSession(sessionId);
+      if (!owner) return { type: "not-found" };
+      const ownerLabel =
+        this.registry?.getNodeIdentity(owner.nodeId)?.nodeLabel ?? owner.nodeId;
       return {
         type: "error",
-        message:
-          "API keys are node-local — switch to an API key from the node that owns this session",
+        message: `Open this session on ${ownerLabel} to switch it to an API key.`,
         status: switchAccountCodeToStatus("api_key_remote_unsupported"),
         code: "api_key_remote_unsupported",
       };

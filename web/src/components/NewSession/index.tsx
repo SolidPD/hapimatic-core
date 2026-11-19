@@ -28,14 +28,21 @@ import { useAccounts, useNodeActiveAccount } from "@/hooks/queries/useAccounts";
 import { useAccountUsage } from "@/hooks/queries/useAccountUsage";
 import { useRecentPaths } from "@/hooks/useRecentPaths";
 import { useVersion } from "@/hooks/useVersion";
+import {
+  billableStartForCreate,
+  useBillableSwitchHeaders,
+  useBillableSwitchMode,
+} from "@/hooks/useBillableSwitch";
 import { addPendingSpawn, markSpawnFailed } from "@/lib/pending-spawns";
 import { apiErrorMessage } from "@/lib/apiErrorMessage";
+import { exhaustedLimitText, readAccountExhausted } from "@/lib/accountLimit";
 import { beginSpawnHandover, takeRetryForm } from "@/lib/spawn-draft";
 import { buildClaimedIssueIndex } from "@/lib/claimedIssues";
 import { selectOptimalAccountUuid } from "@/lib/selectOptimalAccount";
 import type { LinkedIssue } from "@hapi/protocol/types";
 import {
   findUsageRowHardLock,
+  LOCAL_NODE_ID,
   MCP_SET_CAPABILITY,
   resolveModelFamily,
   validateSessionName,
@@ -716,6 +723,11 @@ export const NewSession = forwardRef<
     account: githubAccount,
     directory,
   });
+
+  // #6646 (ruling T-1, 2026-11-18, under D-1): a person's start from the
+  // Create form is non-billable, with no question (billableStartForCreate).
+  const billableMode = useBillableSwitchMode();
+  const { data: billableHeaders } = useBillableSwitchHeaders(props.api);
 
   // #3558: auto-detection owns the Repo field. When the directory is already a
   // repo checkout — e.g. the `~/projects/<name>` destination of a clone pick
@@ -1398,6 +1410,15 @@ export const NewSession = forwardRef<
     if (!spawnTarget || !directory.trim()) return;
     if (pathExistence[directory.trim()] === false) return;
 
+    // #6646 (ruling T-1): non-billable where the target takes the switch,
+    // nothing elsewhere; no question and no notice after Create.
+    const billableSwitchStart = billableStartForCreate({
+      mode: billableMode,
+      headers: billableHeaders?.nodes,
+      targetNodeId:
+        spawnTarget.kind === "remote" ? spawnTarget.nodeId : LOCAL_NODE_ID,
+    });
+
     // For remote targets, add a pending spawn stub immediately for instant
     // visual feedback. The stub appears in the session list before the API
     // call returns and persists until the real session appears via federation
@@ -1429,7 +1450,10 @@ export const NewSession = forwardRef<
       // #1496 R7 accountUuid) byte-for-byte. Runtime-only fields (emoji,
       // spawnCorrelationId) are merged here — they never live in SpawnSelections
       // and never surface in the preview.
-      const spawnInput = buildSpawnInput(spawnSelections);
+      const spawnInput = buildSpawnInput({
+        ...spawnSelections,
+        billableSwitchStart,
+      });
       const result = await spawnSession({
         // #1950 A3: model now flows through buildSpawnInput via spawnSelections
         // (formState.effective.model, gated on codex + openrouter + selection),
@@ -1527,9 +1551,15 @@ export const NewSession = forwardRef<
       haptic.notification("error");
       // A pre-dispatch refusal (e.g. #5127: the node storing a shared key is
       // offline) is a non-2xx `{ error, code }`; show its message, not the
-      // `HTTP <status>: <body>` composite.
-      const msg =
-        e instanceof Error ? apiErrorMessage(e) : "Failed to create session";
+      // `HTTP <status>: <body>` composite. Issue #6742: an account at its usage
+      // limit is named in the web's words, never the server's text, which tells
+      // an API client to send forceAccount.
+      const exhausted = readAccountExhausted(e);
+      const msg = exhausted
+        ? `${exhaustedLimitText(exhausted.exhaustion)} Pick another account, or pick this one again and choose Use anyway.`
+        : e instanceof Error
+          ? apiErrorMessage(e)
+          : "Failed to create session";
       setError(msg);
       // Mark stub as failed on network/unexpected errors
       if (pendingSpawnId) {

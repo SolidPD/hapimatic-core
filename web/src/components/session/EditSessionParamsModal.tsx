@@ -40,7 +40,7 @@
  * opened from inside the fullscreen prompt editor). Before that it was a raw
  * `createPortal` overlay like the MCP-detail modal in `AssistantChat/StatusBar.tsx`.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
   EFFORT_LEVEL_LABELS,
@@ -48,7 +48,9 @@ import {
   isYoloEquivalentMode,
   LOCAL_NODE_ID,
   MODEL_MODE_LABELS,
+  resolveModelFamily,
   stripModelTierSuffix,
+  type AccountExhaustion,
   type EffortLevel,
   type McpSet,
   type ModelMode,
@@ -58,6 +60,7 @@ import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { Session } from "@/types/api";
 import { ApiError, type ApiClient } from "@/api/client";
 import { apiErrorServerMessage } from "@/lib/apiErrorMessage";
+import { exhaustedLimitText, readAccountExhausted } from "@/lib/accountLimit";
 import type { AgentType } from "@/components/NewSession/types";
 import type { SpawnInput } from "@/hooks/mutations/useSpawnSession";
 import { effortLevelsForCurrent } from "@/components/AssistantChat/ModelModePicker";
@@ -86,6 +89,7 @@ import { BareButton } from "@/components/ui/BareButton";
 import { ChevronIcon } from "@/components/icons";
 import { FormField } from "@/components/NewSession/FormField";
 import { AccountSelectorModal } from "@/components/AccountSelectorModal";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { McpServersSection } from "@/components/session/McpServersSection";
 import {
   SessionAccountUsageMeters,
@@ -101,14 +105,18 @@ import { useAccounts } from "@/hooks/queries/useAccounts";
 import { useAccountUsage } from "@/hooks/queries/useAccountUsage";
 import { useAccountsUsageView } from "@/hooks/useAccountsUsageView";
 import { useAccountActions } from "@/hooks/mutations/useAccountActions";
-import { useApiKeys } from "@/hooks/queries/useApiKeys";
+import { useAvailableApiKeys } from "@/hooks/queries/useAvailableApiKeys";
 import { useFederationLocalNode } from "@/hooks/queries/useFederatedSessions";
-import { apiKeyDisplayName } from "@/lib/apiKeyStatus";
+import {
+  apiKeyDisplayName,
+  sharedKeysUnavailableHint,
+} from "@/lib/apiKeyStatus";
 
 /**
- * Issue #4823: the session's payment method — a subscription account or a
- * node-vault Anthropic API key (by vault id). The Account row stages one of
- * these; "Apply changes" switches the session onto it.
+ * Issue #4823: the session's payment method — a subscription account or an
+ * Anthropic API key by reference (#6542: a bare vault id, or the `bindingRef`
+ * of a key another node shares). The Account row stages one of these; "Apply
+ * changes" switches the session onto it.
  */
 type PaymentMethod =
   | { kind: "account"; accountUuid: string }
@@ -173,8 +181,9 @@ export type EditSessionParamsInput = {
     /** Round 14 (item 7): the bound account uuid (`metadata.accountUuid`) —
      *  the baseline the staged Account row diffs against. */
     accountUuid?: string;
-    /** Issue #4823: the bound API key's vault id (`metadata.apiKeyId`; the list
-     *  row's `SessionSummary` projects it too) — the current key, if any. */
+    /** Issue #4823: the bound API key's reference (`metadata.apiKeyId`, a bare
+     *  vault id or a shared key's `<uuid>@<home>`, #6542; the list row's
+     *  `SessionSummary` projects it too) — the current key, if any. */
     apiKeyId?: string;
     /** #3290: the session's Claude account (for the Account row + selector). */
     claudeAccount?: { email?: string } | null;
@@ -270,7 +279,15 @@ type Draft = {
    *  the session, so a switch made outside the open modal (e.g.
    *  autoSwitchOnRateLimit) never reads as staged and Apply never reverts it. */
   paymentMethod: PaymentMethod | null;
+  /** Issue #6742: true only while the staged account came through the picker's
+   *  at-limit confirm, so Apply sends forceAccount; any other pick clears it. */
+  accountForced?: boolean;
 };
+
+/** Issue #6742: the at-limit confirm's text for a switch the server refused. */
+function exhaustedRefusalText(exhaustion: AccountExhaustion | null): string {
+  return `${exhaustedLimitText(exhaustion)} This session's turns fail until ${exhaustion ? "then" : "it resets"}. Use it anyway?`;
+}
 
 function EditSessionParamsForm({
   onClose,
@@ -294,7 +311,9 @@ function EditSessionParamsForm({
 
   // Issue #4823 / #6171: the session's node. A remote session's MCP list and
   // API keys live on THAT node (the hub's own would be the wrong list).
-  const { localNode } = useFederationLocalNode(api);
+  // #6542: `localNodeSettled` — until the nodes read answers, `localNode` is null
+  // and a peer-owned session would read as local; `nodes` names its owner.
+  const { localNode, localNodeSettled, nodes } = useFederationLocalNode(api);
   const effectiveNodeId = nodeId ?? session.nodeId;
   const isRemoteSession =
     effectiveNodeId != null &&
@@ -404,6 +423,11 @@ function EditSessionParamsForm({
 
   const [error, setError] = useState<string | null>(null);
   const [accountModalOpen, setAccountModalOpen] = useState(false);
+  // Issue #6742: a switch the server refused at the usage limit, shown as the
+  // at-limit confirm instead of the red refusal box.
+  const [exhaustedRefusal, setExhaustedRefusal] = useState<{
+    exhaustion: AccountExhaustion | null;
+  } | null>(null);
 
   // R6 → round 11 (epic #3285, 2026-09-07): a disconnected session keeps every
   // control LIVE and the primary action becomes "Save changes" — the server
@@ -425,7 +449,20 @@ function EditSessionParamsForm({
   // the R8 impact copy states ("account" is in FORCES_RELAUNCH). The row and
   // the selector's "Current" marker both show the STAGED account while one is
   // pending, so what the user sees is what Apply will do.
-  const accountActions = useAccountActions(api, { sessionId: session.id });
+  // Issue #6742: a 409 account_exhausted on Apply opens this modal's own
+  // at-limit confirm, so the hook shows no toast for it — only while this form
+  // is mounted: closed mid-Apply, the refusal falls back to the hook's toast.
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const accountActions = useAccountActions(api, {
+    sessionId: session.id,
+    callerConfirmsExhausted: () => mountedRef.current,
+  });
   // Issue #4823: a staged change of payment method — another account, a key, or
   // a key → account move. Staging is selection-only; Apply performs the switch.
   const accountStaged =
@@ -450,18 +487,41 @@ function EditSessionParamsForm({
       ? accounts.find(a => a.accountUuid === shownAccountUuid)
       : undefined;
 
-  // Issue #4823: the node's Anthropic vault keys, offered beside the accounts
-  // for a Claude session (keys are node-local, so a remote session lists none).
-  const { data: vaultKeys } = useApiKeys(api, {
-    enabled: claudeSession && (accountModalOpen || stagedKind === "api-key"),
+  // Issue #4823 / #6542: the Anthropic keys a session this node owns can bill —
+  // this node's own and the keys other nodes share (`GET /api/api-keys/available`,
+  // no target), each with the `bindingRef` the switch sends. A peer-owned session
+  // lists none (switching it from here is #6740), nor does any session before the
+  // nodes read has said which node owns it. A successful read always names this
+  // node (#2332), so a settled read with no `localNode` FAILED: a session that
+  // names a node then has an unknown owner, not this one.
+  const ownsSession =
+    localNodeSettled &&
+    !isRemoteSession &&
+    (localNode != null ||
+      effectiveNodeId == null ||
+      effectiveNodeId === LOCAL_NODE_ID);
+  const { data: keysData } = useAvailableApiKeys(api, null, {
+    enabled:
+      claudeSession &&
+      ownsSession &&
+      (accountModalOpen || stagedKind === "api-key"),
   });
+  // A disabled query still returns cached rows, so the LOOKUP is gated too.
+  const availableKeys = ownsSession ? keysData : undefined;
   const anthropicKeys = useMemo(
-    () => (vaultKeys ?? []).filter(k => k.provider === "anthropic"),
-    [vaultKeys]
+    () => (availableKeys?.keys ?? []).filter(k => k.provider === "anthropic"),
+    [availableKeys]
   );
+  // #5127: one hint line per node whose shared keys could not be listed.
+  const apiKeysUnavailableHints = useMemo(
+    () =>
+      (availableKeys?.unavailableNodes ?? []).map(sharedKeysUnavailableHint),
+    [availableKeys]
+  );
+  // #6542 (ruling D2): a row is matched by the string the switch sends.
   const stagedKey =
     stagedKind === "api-key"
-      ? anthropicKeys.find(k => k.id === shownApiKeyId)
+      ? anthropicKeys.find(k => (k.bindingRef ?? k.id) === shownApiKeyId)
       : undefined;
   // The row names the STAGED binding while one is pending: a staged key shows
   // no email (an account switch's email must not linger beside it).
@@ -508,14 +568,18 @@ function EditSessionParamsForm({
   // Issue #4823 (R6): the keys group is disabled — with the reason — when the
   // server would refuse a key target. Launcher: the RAW recorded kind (a missing
   // kind is refused: the respawn would use the node's default launcher; NOT
-  // `current.launcher`, which defaults it to "sdk"). Remote: keys are node-local
-  // (`isRemoteSession`, above). Local mode: a live session the terminal controls
-  // (a stopped session stages).
+  // `current.launcher`, which defaults it to "sdk"). Remote: a peer-owned session
+  // is switched to a key on its owner (#6542 names the owner; #6740 is the hub
+  // switch). Local mode: a live session the terminal controls (a stopped session
+  // stages).
+  const ownerLabel = isRemoteSession
+    ? nodes.find(n => n.config.id === effectiveNodeId)?.config.label
+    : undefined;
   const keysDisabledReason =
     session.metadata?.launcherKind !== "sdk"
       ? "API-key billing requires the SDK launcher — start a new session on an API key."
       : isRemoteSession
-        ? "API keys are node-local — switch from the node that owns this session."
+        ? `Open this session on ${ownerLabel ?? "the node that owns it"} to switch it to an API key.`
         : session.active !== false &&
             session.agentState?.controlledByUser === true
           ? "Return to remote mode to switch to an API key."
@@ -685,16 +749,26 @@ function EditSessionParamsForm({
     return assembleSpawnCommand(spawnInput, display, enabledMcp);
   }
 
-  async function applyLivePlaneChanges() {
-    if (changedFields.has("modelMode"))
-      await actions.setModelMode(shown.modelMode);
-    if (changedFields.has("rawModel"))
-      await actions.setSessionRawModel(shown.rawModel);
-    if (changedFields.has("effort") && shown.effort)
-      await actions.setSessionEffort(shown.effort);
-    if (changedFields.has("permissionMode"))
-      await actions.setPermissionMode(shown.permissionMode);
-    if (changedFields.has("mcp")) await actions.setMcpDesired(mcpDelta);
+  /**
+   * Issue #6742: `accountOnly` re-sends only the account step (with its set
+   * save and restore) after the at-limit confirm — the fields above it already
+   * applied, and re-sending a raw model can relaunch a PTY or tmux session.
+   */
+  async function applyLivePlaneChanges(opts?: {
+    accountOnly?: boolean;
+    forceAccount?: boolean;
+  }) {
+    if (!opts?.accountOnly) {
+      if (changedFields.has("modelMode"))
+        await actions.setModelMode(shown.modelMode);
+      if (changedFields.has("rawModel"))
+        await actions.setSessionRawModel(shown.rawModel);
+      if (changedFields.has("effort") && shown.effort)
+        await actions.setSessionEffort(shown.effort);
+      if (changedFields.has("permissionMode"))
+        await actions.setPermissionMode(shown.permissionMode);
+      if (changedFields.has("mcp")) await actions.setMcpDesired(mcpDelta);
+    }
     // Issue #6171: a set session's new set. Saved without a restart when an
     // account switch (which restarts anyway) or a reconnect will apply it;
     // otherwise relaunched LAST, after everything above is on the record.
@@ -706,9 +780,17 @@ function EditSessionParamsForm({
     // Round 14: the account switch goes LAST — it restarts the session, and the
     // live-plane fields above must already be persisted on the record first.
     // Issue #4823: the staged payment method may be an account OR an API key.
+    // Issue #6742: an account staged through the at-limit confirm, or confirmed
+    // after a refusal, goes with forceAccount; any other switch goes without.
+    const forceAccount =
+      opts?.forceAccount === true || draft.accountForced === true;
     try {
       if (changedFields.has("account") && shownAccountUuid)
-        await accountActions.selectAccount(shownAccountUuid);
+        await (forceAccount
+          ? accountActions.selectAccount(shownAccountUuid, {
+              forceAccount: true,
+            })
+          : accountActions.selectAccount(shownAccountUuid));
       else if (changedFields.has("account") && shownApiKeyId)
         await accountActions.selectApiKey(shownApiKeyId);
     } catch (e) {
@@ -776,14 +858,39 @@ function EditSessionParamsForm({
     };
   }
 
-  async function handleApply() {
+  async function handleApply(opts?: {
+    accountOnly?: boolean;
+    forceAccount?: boolean;
+  }) {
     setError(null);
     try {
       // Live-plane fields apply in place; a set session's MCP set relaunches
       // (issue #6171), last.
-      await applyLivePlaneChanges();
+      await applyLivePlaneChanges(opts);
       onClose();
     } catch (e) {
+      // Issue #6742: a switch refused at the usage limit asks for confirmation
+      // instead of showing the refusal. A forced request is never refused there
+      // (the server binds it, accountHeadroom.ts); this guard stops a loop.
+      const refusal = readAccountExhausted(e);
+      if (
+        refusal &&
+        stagedKind === "account" &&
+        !opts?.forceAccount &&
+        draft.accountForced !== true
+      ) {
+        setExhaustedRefusal(refusal);
+        return;
+      }
+      // Issue #6742: an at-limit refusal the confirm does not take (a forced
+      // switch the server still refused) names the limit in the same words,
+      // never the server's text, which tells an API client to send forceAccount.
+      if (refusal) {
+        setError(
+          `${exhaustedLimitText(refusal.exhaustion)} The switch was refused, so the session stays on its account.`
+        );
+        return;
+      }
       // Issue #6617 (D7-1): a refused mode change (a running tmux or pty
       // session) carries a message saying how to make it; show it as is.
       setError(
@@ -1202,15 +1309,26 @@ function EditSessionParamsForm({
         currentAccountEmail={shownEmail}
         sessionFlavor={flavor}
         selectedAccountUuid={shownAccountUuid}
-        onSelect={uuid =>
+        // Issue #6742: lock rows on the model the session runs after Apply.
+        modelFamily={
+          claudeSession
+            ? resolveModelFamily(shown.rawModel || shown.modelMode)
+            : null
+        }
+        onSelect={(uuid, opts) =>
           setDraft(d => ({
             ...d,
             paymentMethod: { kind: "account", accountUuid: uuid },
+            accountForced: opts?.forceAccount === true,
           }))
         }
-        // Issue #4823: the node's Anthropic keys beside the accounts (Claude
-        // sessions only). A pick stages the key; Apply performs the switch.
+        // Issue #4823 / #6542: the Anthropic keys a session this node owns can
+        // bill, shared ones included (Claude sessions only). A pick stages the
+        // row's bindingRef; Apply performs the switch.
         apiKeys={claudeSession ? anthropicKeys : undefined}
+        apiKeysUnavailableHints={
+          claudeSession ? apiKeysUnavailableHints : undefined
+        }
         selectedApiKeyId={shownApiKeyId ?? null}
         onSelectApiKey={
           claudeSession
@@ -1218,10 +1336,29 @@ function EditSessionParamsForm({
                 setDraft(d => ({
                   ...d,
                   paymentMethod: { kind: "api-key", apiKeyId },
+                  accountForced: false,
                 }))
             : undefined
         }
         apiKeysDisabledReason={keysDisabledReason}
+      />
+      {/* Issue #6742: Apply was refused at the usage limit — warn, never block. */}
+      <ConfirmDialog
+        isOpen={exhaustedRefusal !== null}
+        onClose={() => setExhaustedRefusal(null)}
+        title="This account is at its usage limit"
+        description={
+          exhaustedRefusal
+            ? exhaustedRefusalText(exhaustedRefusal.exhaustion)
+            : ""
+        }
+        confirmLabel="Use anyway"
+        confirmingLabel="Switching…"
+        isPending={accountActions.isPending}
+        onConfirm={async () => {
+          setExhaustedRefusal(null);
+          await handleApply({ accountOnly: true, forceAccount: true });
+        }}
       />
     </>
   );

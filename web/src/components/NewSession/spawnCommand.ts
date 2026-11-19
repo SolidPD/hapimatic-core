@@ -8,7 +8,11 @@ import {
 } from "@hapi/protocol/modes";
 import { DEFAULT_OUTPUT_STYLE_DEFAULT } from "@hapi/protocol/schemas";
 import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
-import type { EffortLevel, McpSet } from "@hapi/protocol";
+import type {
+  BillableSwitchStartChoice,
+  EffortLevel,
+  McpSet,
+} from "@hapi/protocol";
 import type { ExistingBranch } from "@hapi/protocol/gitBranches";
 import type { AgentType, SessionType } from "./types";
 
@@ -133,6 +137,12 @@ export type SpawnSelections = {
    * target applies the project's default, else every server.
    */
   mcpSet?: McpSet;
+  /**
+   * Issue #6646 (ruling T-1): the Create form's billable start. Set by the
+   * spawn site from `billableStartForCreate`, never by the form, so the preview
+   * never shows it. Absent ⇒ no field (the gate-off, closed and unsupported Create).
+   */
+  billableSwitchStart?: { choice: BillableSwitchStartChoice };
 };
 
 /**
@@ -245,6 +255,10 @@ export function buildSpawnInput(sel: SpawnSelections): SpawnInput {
         : undefined,
     // #6171: Claude-only (the server refuses a set for another agent).
     mcpSet: sel.agent === "claude" ? sel.mcpSet : undefined,
+    // #6646: only `{ choice }`; absent ⇒ no field.
+    billableSwitchStart: sel.billableSwitchStart
+      ? { choice: sel.billableSwitchStart.choice }
+      : undefined,
   };
 }
 

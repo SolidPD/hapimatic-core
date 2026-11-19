@@ -79,8 +79,8 @@ export function loopCronColor(
 
 /**
  * Issue #4383 (Task 5) — pure helpers for the background-agents badge (DD4–DD8,
- * DD7). All numeric displays route through `clampCount` (the `formatMessageCount`
- * `1k+` precedent) so the fixed slot can never overflow.
+ * DD7). All numeric displays route through `clampCount` (like the abbreviating
+ * `formatMessageCount`) so the fixed slot can never overflow.
  */
 
 /** Max displayed count — clamped at 99 so the compact (S3) slot can never
@@ -194,9 +194,13 @@ export function formatMcp(a: number, b: number, c: number): string {
 }
 
 /**
- * The Message Count number (R4/R6): `999` for sub-1000 counts; a count `≥ 1000`
- * collapses to `1k+` so the fixed 31px slot never overflows. Negative or
- * fractional inputs are floored to a safe non-negative integer.
+ * The Message Count number (R4/R6; Matt, 2026-11-16): the exact count below
+ * 1,000, then one decimal with a unit — `1.1K`, `16.9K` — and whole thousands
+ * from 100,000 (`120K`); millions the same way (`1.2M`). It is cut, never
+ * rounded up, so the number never claims a message that was not sent (1,999 is
+ * `1.9K`). It replaced a flat `1k+`, which read the same at 1,000 and at
+ * 16,000. Negative or fractional inputs are floored to a safe non-negative
+ * integer.
  *
  * Correction pass 1 (epic #3285, 2026-09-05): the chat bubble is an SVG line
  * icon (`MessageSquareIcon`, the exact E6 path) rendered by the row — NOT the
@@ -204,8 +208,43 @@ export function formatMcp(a: number, b: number, c: number): string {
  * "no space after the icon" rule is the row's `gap-px` layout.
  */
 export function formatMessageCount(n: number): string {
-  const safe = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
-  return safe >= 1000 ? "1k+" : String(safe);
+  const safe = safeCount(n);
+  if (safe < 1_000) return String(safe);
+  if (safe < 100_000) return `${(Math.floor(safe / 100) / 10).toFixed(1)}K`;
+  if (safe < 1_000_000) return `${Math.floor(safe / 1_000)}K`;
+  if (safe < 100_000_000) {
+    return `${(Math.floor(safe / 100_000) / 10).toFixed(1)}M`;
+  }
+  return `${Math.floor(safe / 1_000_000)}M`;
+}
+
+function safeCount(n: number): number {
+  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+}
+
+/**
+ * What the Row-2 Message Count slot shows (Matt, 2026-11-16):
+ * - `text`: `formatMessageCount`.
+ * - `glyph`: whether the bubble icon shows. The fixed 31px slot holds the icon
+ *   and three digits, so an abbreviated count (`1.1K`, `16.9K`, `120K`) takes
+ *   the icon's room: the icon gives way and the number stays whole.
+ * - `exact`: the count in full, for the slot's title ("16,932 messages").
+ */
+export type MessageCountDisplay = {
+  text: string;
+  glyph: boolean;
+  exact: string;
+};
+
+export function messageCountDisplay(
+  n: number | undefined
+): MessageCountDisplay {
+  const safe = safeCount(n ?? 0);
+  return {
+    text: formatMessageCount(safe),
+    glyph: safe < 1_000,
+    exact: `${safe.toLocaleString("en-US")} message${safe === 1 ? "" : "s"}`,
+  };
 }
 
 /**

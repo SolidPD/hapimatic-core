@@ -57,8 +57,13 @@ const BADGE_CATEGORIES: ReadonlyArray<{
 // columns an equal share of a fixed 60px box sized for "9 · 9 · 9 · 99"; a
 // three-digit inactive count pushed the row out of that box and under the search
 // field.
+//
+// Each count is CENTERED in its column (Matt, 2026-11-16), so the space between a
+// number and the dot on either side of it is equal. Right-aligned, as the columns
+// first shipped, every number sat against the dot to its right and a one-digit
+// count left its whole spare width on the left: the row read as clumps.
 const COUNT_COLUMN_SIZER =
-  "shrink-0 text-right before:block before:h-0 before:overflow-hidden before:invisible";
+  "shrink-0 text-center before:block before:h-0 before:overflow-hidden before:invisible";
 
 /** Column classes for the aligned cluster, keyed by status category. */
 export const STATUS_COUNT_COLUMN_CLASS: Record<keyof StatusBreakdown, string> =
@@ -78,12 +83,13 @@ export const STATUS_COUNT_COLUMN_CLASS: Record<keyof StatusBreakdown, string> =
 const SEPARATOR_DOT = "shrink-0 text-[var(--app-hint)] text-[6px] leading-none";
 
 /**
- * The separator dot of the aligned cluster. 1px each side, against the compact
- * cluster's 4px: at 393px the search field beside the toolbar cluster has room for
- * its "Search" placeholder only if the dots give the width back (measured: 2px
- * each side clips the placeholder by 3px).
+ * The separator dot of the aligned cluster. 2px each side, against the compact
+ * cluster's 4px, so a column filled to its last digit ("99 · 99") still shows
+ * space on both sides of its dot (Matt, 2026-11-16). At 1px each side the numbers
+ * touched the dots. The search field beside the toolbar cluster pays for it: see
+ * the toolbar block in router.tsx.
  */
-export const STATUS_COUNT_SEPARATOR_CLASS = SEPARATOR_DOT + " px-px";
+export const STATUS_COUNT_SEPARATOR_CLASS = SEPARATOR_DOT + " px-0.5";
 const COMPACT_SEPARATOR_CLASS = SEPARATOR_DOT + " px-1";
 
 /**

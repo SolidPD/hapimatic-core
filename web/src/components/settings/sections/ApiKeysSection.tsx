@@ -23,7 +23,7 @@ import { ShareAcrossNodesCheckbox } from "@/components/ShareAcrossNodesCheckbox"
 
 /** Issue #5127: the confirm copy for turning a key's sharing off. */
 export const UNSHARE_CONFIRM_TEXT =
-  "Other nodes can no longer start or restart sessions on this key. Sessions already running there keep it until they stop.";
+  "Other nodes can no longer start or restart sessions on this key, or switch a session onto it. Sessions already running there keep it until they stop.";
 
 /** Issue #5127: the server's reason for refusing a sharing change, else a retry
  *  line. Shared with the Accounts page's key cards (#4466 R19). */

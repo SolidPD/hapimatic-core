@@ -107,6 +107,11 @@ import {
 } from "@/components/SearchFilterBar";
 import { SelectModeChipRow } from "@/components/SessionList/SelectModeChipRow";
 import {
+  ToConfirmSection,
+  toConfirmSplit,
+} from "@/components/billableSwitch/ToConfirmSection";
+import { useBillableSwitchMode } from "@/hooks/useBillableSwitch";
+import {
   STATUS_COUNT_COLUMN_CLASS,
   STATUS_COUNT_SEPARATOR_CLASS,
 } from "@/components/SessionList/SessionCountBadge";
@@ -253,6 +258,7 @@ function SessionsPage() {
     setFilterProvider,
     setFilterReview,
     setFilterLinkedIssue,
+    setFilterBillable,
     setSort,
     setSortDirection,
     clearAll: clearSearchFilters,
@@ -315,14 +321,23 @@ function SessionsPage() {
   // vanish automatically since groupSessionsByProject only emits non-empty
   // groups). #942. #3810: the resolved node→account map feeds the account
   // predicate; it is a memo dep so a late node-account resolution re-filters.
-  const filteredSessions = useMemo(
+  // #6646 (FLT-MENU): with billable sessions off the Filter menu has no
+  // Billable section, so its stored value reads as All everywhere.
+  const billableMode = useBillableSwitchMode();
+  const filterPrefs = useMemo(
     () =>
-      applySessionSearchFilter(
-        sessions,
-        searchFilterPrefs,
-        resolvedNodeAccounts
-      ),
-    [sessions, searchFilterPrefs, resolvedNodeAccounts]
+      billableMode === "off" && searchFilterPrefs.filters.billable !== "all"
+        ? {
+            ...searchFilterPrefs,
+            filters: { ...searchFilterPrefs.filters, billable: "all" as const },
+          }
+        : searchFilterPrefs,
+    [billableMode, searchFilterPrefs]
+  );
+  const billableFilter = filterPrefs.filters.billable;
+  const filteredSessions = useMemo(
+    () => applySessionSearchFilter(sessions, filterPrefs, resolvedNodeAccounts),
+    [sessions, filterPrefs, resolvedNodeAccounts]
   );
 
   // The search text also narrows what rides UNDER the project headers: the
@@ -332,17 +347,19 @@ function SessionsPage() {
   // attached for ANY query (unmatched ones synthesized their own project group),
   // so searching for an emoji returned the schedulers instead of the sessions
   // carrying it.
+  // #6646: under the Billable filter's "To confirm" the section shows alone.
   const filteredSchedules = useMemo(
     () =>
-      applyScheduleSearchFilter(schedules, searchFilterPrefs, filteredSessions),
-    [schedules, searchFilterPrefs, filteredSessions]
+      billableFilter === "to-confirm"
+        ? []
+        : applyScheduleSearchFilter(schedules, filterPrefs, filteredSessions),
+    [billableFilter, schedules, filterPrefs, filteredSessions]
   );
-  const visibleHeartbeatConfig = heartbeatMatchesSearch(
-    heartbeatConfig,
-    searchFilterPrefs
-  )
-    ? heartbeatConfig
-    : null;
+  const visibleHeartbeatConfig =
+    billableFilter !== "to-confirm" &&
+    heartbeatMatchesSearch(heartbeatConfig, filterPrefs)
+      ? heartbeatConfig
+      : null;
   const visibleSessionIds = useMemo(
     () => new Set(filteredSessions.map(s => s.id)),
     [filteredSessions]
@@ -398,6 +415,41 @@ function SessionsPage() {
   // single collapse path in `App.tsx`'s split-toggle handler (#3280 Task 6, R7).
   const { isSplit, paneAView, paneBView, setPaneView } = useSplitViewContext();
 
+  // #6646 (Task 14, AGL-A): waiting sessions gather in "To confirm" and leave
+  // their project groups (and, in the list, their schedule rows). With billable
+  // sessions off nothing of this phase renders, so they stay where they are.
+  // The section passes the search and every filter but the Billable one (P18).
+  const sectionPassing = useMemo(
+    () =>
+      billableFilter === "all"
+        ? filteredSessions
+        : applySessionSearchFilter(
+            sessions,
+            {
+              ...filterPrefs,
+              filters: { ...filterPrefs.filters, billable: "all" },
+            },
+            resolvedNodeAccounts
+          ),
+    [
+      billableFilter,
+      filteredSessions,
+      sessions,
+      filterPrefs,
+      resolvedNodeAccounts,
+    ]
+  );
+  const toConfirm = useMemo(
+    () =>
+      billableMode === "off" ? null : toConfirmSplit(sessions, sectionPassing),
+    [billableMode, sessions, sectionPassing]
+  );
+  // Pane A's open (the list and the "To confirm" section share it).
+  const openFromPaneA = (sessionId: string) => {
+    if (isSplit) setPaneView("A", { type: "session", sessionId });
+    else void navigate({ to: "/sessions/$sessionId", params: { sessionId } });
+  };
+
   // Lifted expand/collapse state for global chevron control (Pane A — persisted)
   const groups = useMemo(() => {
     // KD-2: keep the active/pending-first priority order for the DEFAULT sort
@@ -412,8 +464,14 @@ function SessionsPage() {
           searchFilterPrefs.sort,
           searchFilterPrefs.sortDirection
         );
-    return groupSessionsByProject(filteredSessions, comparator);
+    return groupSessionsByProject(
+      toConfirm
+        ? filteredSessions.filter(s => !toConfirm.ids.has(s.id))
+        : filteredSessions,
+      comparator
+    );
   }, [
+    toConfirm,
     filteredSessions,
     searchFilterPrefs.sort,
     searchFilterPrefs.sortDirection,
@@ -540,7 +598,7 @@ function SessionsPage() {
   // directly under the app bar's split icon, and shows only while a filter or a
   // non-default sort is engaged (the Search Field's own ✕ clears a search term).
   const { filtersActive, sortActive } = getSearchFilterEngagement({
-    filters: searchFilterPrefs.filters,
+    filters: filterPrefs.filters,
     sort: searchFilterPrefs.sort,
     sortDirection: searchFilterPrefs.sortDirection,
     searchText: searchFilterPrefs.searchText,
@@ -551,9 +609,19 @@ function SessionsPage() {
   // (`setPaneView` is now provided by the split-view context — #3280 Task 3.)
   const renderPaneToolbar = (pane?: "A" | "B"): React.ReactElement => (
     <div className="mx-auto w-full max-w-content flex items-center gap-2 pl-2 pr-2 py-1">
-      {/* Left: Timer + status counts */}
-      <div className="flex flex-col leading-none w-fit">
-        <div className="flex items-center gap-1">
+      {/* Left: Timer + status counts. The block gives 4px of the row gap back
+          to the search field (`-mr-1`): the padded dots below made the block
+          6px wider, and at 393px the field's "Search" placeholder needs 48px
+          (measured 2026-11-16: 44.9px without this, 48.9px with it). */}
+      <div className="flex flex-col leading-none w-fit -mr-1">
+        {/* The clock sits at the block's left edge and the total at its right
+            edge, which is the right edge of the inactive column below it (Matt,
+            2026-11-16): the two rows share both edges. The total is always
+            HH:MM:SS (`formatDuration`), so it only grows to the left. */}
+        <div
+          className="flex items-center justify-between gap-1"
+          data-testid="toolbar-total-timer-row"
+        >
           <span className="flex h-2.5 w-2.5 items-center justify-center shrink-0">
             <ClockIcon className="h-2.5 w-2.5 text-[var(--app-hint)]" />
           </span>
@@ -602,7 +670,7 @@ function SessionsPage() {
           right after it, immediately left of the Revert slot below. */}
       <SearchFilterBar
         searchText={searchFilterPrefs.searchText}
-        filters={searchFilterPrefs.filters}
+        filters={filterPrefs.filters}
         sort={searchFilterPrefs.sort}
         sortDirection={searchFilterPrefs.sortDirection}
         nodeOptions={nodeFilterOptions}
@@ -619,6 +687,9 @@ function SessionsPage() {
         onFilterProviderChange={setFilterProvider}
         onFilterReviewChange={setFilterReview}
         onFilterLinkedIssueChange={setFilterLinkedIssue}
+        onFilterBillableChange={
+          billableMode === "off" ? undefined : setFilterBillable
+        }
         onSortChange={handleSortChange}
         onSortDirectionChange={setSortDirection}
         onClearAll={handleClearAll}
@@ -808,17 +879,23 @@ function SessionsPage() {
                     }
                   />
                 )}
+                {toConfirm && toConfirm.total > 0 ? (
+                  <ToConfirmSection
+                    api={api}
+                    mode={billableMode}
+                    split={toConfirm}
+                    onSelect={openFromPaneA}
+                    isExpanded={id => expandedSessions.has(id)}
+                    onToggleExpanded={toggleSessionExpanded}
+                    selectMode={selectMode}
+                    selectedIds={selectedIds}
+                    onToggleSelect={toggleSelect}
+                  />
+                ) : null}
                 <SessionList
                   sessions={sessions}
                   localNodeId={localNode?.nodeId ?? LOCAL_NODE_ID}
-                  onSelect={sessionId =>
-                    isSplit
-                      ? setPaneView("A", { type: "session", sessionId })
-                      : navigate({
-                          to: "/sessions/$sessionId",
-                          params: { sessionId },
-                        })
-                  }
+                  onSelect={openFromPaneA}
                   onNewSession={() =>
                     isSplit
                       ? setPaneView("A", { type: "new-session" })
@@ -847,6 +924,7 @@ function SessionsPage() {
                   onEditHeartbeat={handleEditHeartbeat}
                   onCreateSchedule={handleCreateSchedule}
                   initialScheduleId={searchScheduleId}
+                  toConfirm={toConfirm}
                 />
               </>
             )}
@@ -884,38 +962,56 @@ function SessionsPage() {
                     onNavigate={v => setPaneView("B", v)}
                   />
                 ) : (
-                  <SessionList
-                    sessions={sessions}
-                    localNodeId={localNode?.nodeId ?? LOCAL_NODE_ID}
-                    onSelect={sessionId =>
-                      setPaneView("B", { type: "session", sessionId })
-                    }
-                    onNewSession={() =>
-                      setPaneView("B", { type: "new-session" })
-                    }
-                    onRefresh={handleRefresh}
-                    isLoading={isLoading}
-                    api={api}
-                    liftedGroups={groups}
-                    liftedProjectExpandState={paneBProjectExpand}
-                    liftedSetProjectExpanded={setPaneBProjectExpandFn}
-                    liftedExpandedSessions={paneBExpandedSessions}
-                    liftedToggleSessionExpanded={togglePaneBSessionExpanded}
-                    liftedManualActive={manualActive}
-                    liftedSetManualActive={setManualActive}
-                    liftedManualSeedRef={manualSeedRef}
-                    selectMode={selectMode}
-                    selectedIds={selectedIds}
-                    onToggleSelect={toggleSelect}
-                    schedules={filteredSchedules}
-                    heartbeatConfig={visibleHeartbeatConfig}
-                    visibleSessionIds={visibleSessionIds}
-                    heartbeatStatus={heartbeatStatus}
-                    filterView={filterView}
-                    onEditSchedule={handleEditSchedule}
-                    onEditHeartbeat={handleEditHeartbeat}
-                    onCreateSchedule={handleCreateSchedule}
-                  />
+                  <>
+                    {toConfirm && toConfirm.total > 0 ? (
+                      <ToConfirmSection
+                        api={api}
+                        mode={billableMode}
+                        split={toConfirm}
+                        onSelect={sessionId =>
+                          setPaneView("B", { type: "session", sessionId })
+                        }
+                        isExpanded={id => paneBExpandedSessions.has(id)}
+                        onToggleExpanded={togglePaneBSessionExpanded}
+                        selectMode={selectMode}
+                        selectedIds={selectedIds}
+                        onToggleSelect={toggleSelect}
+                      />
+                    ) : null}
+                    <SessionList
+                      sessions={sessions}
+                      localNodeId={localNode?.nodeId ?? LOCAL_NODE_ID}
+                      onSelect={sessionId =>
+                        setPaneView("B", { type: "session", sessionId })
+                      }
+                      onNewSession={() =>
+                        setPaneView("B", { type: "new-session" })
+                      }
+                      onRefresh={handleRefresh}
+                      isLoading={isLoading}
+                      api={api}
+                      liftedGroups={groups}
+                      liftedProjectExpandState={paneBProjectExpand}
+                      liftedSetProjectExpanded={setPaneBProjectExpandFn}
+                      liftedExpandedSessions={paneBExpandedSessions}
+                      liftedToggleSessionExpanded={togglePaneBSessionExpanded}
+                      liftedManualActive={manualActive}
+                      liftedSetManualActive={setManualActive}
+                      liftedManualSeedRef={manualSeedRef}
+                      selectMode={selectMode}
+                      selectedIds={selectedIds}
+                      onToggleSelect={toggleSelect}
+                      schedules={filteredSchedules}
+                      heartbeatConfig={visibleHeartbeatConfig}
+                      visibleSessionIds={visibleSessionIds}
+                      heartbeatStatus={heartbeatStatus}
+                      filterView={filterView}
+                      onEditSchedule={handleEditSchedule}
+                      onEditHeartbeat={handleEditHeartbeat}
+                      onCreateSchedule={handleCreateSchedule}
+                      toConfirm={toConfirm}
+                    />
+                  </>
                 )}
                 {/* Per-pane toolbar (bottom): pinned above the footer when the
                     pref is "bottom" (#3276). */}
