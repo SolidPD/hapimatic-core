@@ -49,8 +49,8 @@ export const HAPI_MCP_SERVER_NAME = "hapi";
  * poisoned `hapi` entry there silently drops the HAPI MCP server before the
  * handshake (the ~10:00Z temporal-boundary symptom). When `HAPI_ACCOUNT_UUID`
  * is set this function makes a SECOND, independent toggle against the isolated
- * config. It is **additive** (Fallback Preservation Rule): host-default
- * (unbound) sessions still read the home file, so the home scrub is preserved
+ * config. It is **additive** (Fallback Preservation Rule): unbound
+ * sessions still read the home file, so the home scrub is preserved
  * untouched; the two calls hold per-config-file locks so they never contend.
  * A removal from the isolated config is logged at **WARN** (it is the exact
  * silent failure this fixes); a missing isolated config is benign and quiet.
@@ -95,7 +95,7 @@ export async function scrubHapiFromDisabledMcps(
   // scrub above is unchanged; this is a second, independent toggle against the
   // file an account-bound Claude child actually reads (see the JSDoc's
   // "Account-bound isolated config" note). Gated purely on HAPI_ACCOUNT_UUID so
-  // host-default (unbound) sessions are byte-identical to before.
+  // unbound sessions are byte-identical to before.
   const accountUuid = process.env.HAPI_ACCOUNT_UUID;
   if (accountUuid) {
     try {
@@ -121,9 +121,9 @@ export async function scrubHapiFromDisabledMcps(
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      // A missing isolated config is BENIGN: a host-default account-bound
-      // session has no isolated `.claude.json` (Claude reads `~/.claude.json`,
-      // covered by the home scrub above), so keep that quiet. Any OTHER error —
+      // A missing isolated config is BENIGN: a bound session whose folder has
+      // no `.claude.json` yet (seeded on first spawn) reads none (and the home
+      // scrub above covers `~/.claude.json`), so keep that quiet. Any OTHER error —
       // corrupt JSON, lock timeout, unsafe path, malformed UUID — is a config
       // Claude may read that we could NOT verify: surface it at WARN (R3).
       // Non-fatal either way (R5) — the spawn proceeds on the home scrub.

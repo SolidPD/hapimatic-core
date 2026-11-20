@@ -36,12 +36,14 @@ import {
 import type { AccountService } from "../../services/accountService";
 import {
   computeApiKeyBudget,
+  lastTopUpAtOrBefore,
   resolveTimeZone,
 } from "../../services/apiKeyBudget";
 import { uuidV5 } from "../../services/providerAccountImport";
 import type { NicknameStore } from "../../accounts/nicknameStore";
 import type { MonogramStore } from "../../accounts/monogramStore";
 import type { ErrorLogger, ErrorLogOptions } from "../../logging/errorLogger";
+import { DEGRADED_LOG_REPEAT_MS } from "./federation/degradedLog";
 
 /**
  * API Keys routes (issue #1955, epic #1954 — the secrets-vault management UI).
@@ -122,8 +124,9 @@ export function toRedactedApiKey(entry: StoredApiKey): RedactedApiKey {
     // Settings switch reads an explicit value; only `true` in the vault shares.
     shareAcrossNodes: entry.shareAcrossNodes === true,
     // API key budgets: the operator's budget and monthly top-up — non-secret
-    // settings, copied field-by-field. The read-time estimate is added by the
-    // routes that can meter spend (`withCredit`).
+    // settings, copied field-by-field. The read-time credit is added on top by
+    // `createApiKeyViewer` (#6789), which every list and answer that carries a
+    // key to a client goes through.
     ...(entry.budget
       ? {
           budget: {
@@ -157,6 +160,350 @@ export type ApiKeySpendLookup = (
   fromMs: number,
   toMs: number
 ) => number;
+
+/** #6789 (Task 6, rung 2): the earliest start any key of ONE list may ask
+ *  spend for, so the source can build one reader for the whole list. */
+export type ApiKeySpendWindow = { sinceMs: number };
+
+/** This node's spend reader. Called with a window ⇒ one reader for one list
+ *  (built and dropped with it); with none ⇒ a reader for one key. */
+export type ApiKeySpendSource = (
+  window?: ApiKeySpendWindow
+) => ApiKeySpendLookup | null;
+
+/** #6789: how long one list may spend on credit work before its remaining
+ *  budgeted keys answer `creditUnavailable`. Well inside the requester's 3 s
+ *  (`NOTIFICATION_PROXY_TIMEOUT_MS`), past which a home reads as offline. */
+export const SHARED_LIST_CREDIT_DEADLINE_MS = 1000;
+
+export type ApiKeyViewerOptions = {
+  /** This node's metered spend per key; absent ⇒ no estimate, and a budgeted
+   *  key says so (`creditUnavailable`). A list view takes it ONCE, with the
+   *  list's window; a single key's view takes it with no window. */
+  getApiKeySpend?: ApiKeySpendSource;
+  /** Wall clock for the budget arithmetic. Default `Date.now`. */
+  now?: () => number;
+  /** ONE monotonic clock for the deadline and every elapsed time. Default
+   *  `() => performance.now()`. */
+  clock?: () => number;
+  /** One non-secret warn line. Default: `console.warn`. */
+  warn?: (
+    message: string,
+    options: { category: string; context: Record<string, unknown> }
+  ) => void;
+};
+
+export type ApiKeyViewOptions = {
+  /** On `viewer.clock`'s scale. Once reached, no further spend lookup starts
+   *  for this key. */
+  creditDeadlineAtMs?: number;
+  /** Called once for each key the deadline left without a reading (the caller
+   *  counts them). */
+  onCreditDeadline?: () => void;
+};
+
+export type ApiKeyViewer = {
+  /** "The key as a user sees it": the redacted view plus its read-time credit.
+   *  Every response that carries a key to a client goes through this;
+   *  `toRedactedApiKey` stays the one redaction point under it. The credit part
+   *  never throws. */
+  userView: (entry: StoredApiKey, opts?: ApiKeyViewOptions) => RedactedApiKey;
+  /** The user view without `descriptor` (it stays on this node), for the
+   *  federation shared list. */
+  peerView: (entry: StoredApiKey, opts?: ApiKeyViewOptions) => RedactedApiKey;
+  /** Every key of one list, as `userView` builds each, from ONE spend reader
+   *  taken for the list's earliest window (Task 6, rung 2). */
+  listView: (
+    entries: readonly StoredApiKey[],
+    opts?: ApiKeyViewOptions
+  ) => RedactedApiKey[];
+  /** `listView` without `descriptor`, for the federation shared list. */
+  peerListView: (
+    entries: readonly StoredApiKey[],
+    opts?: ApiKeyViewOptions
+  ) => RedactedApiKey[];
+  /** The injected monotonic clock, so a caller computes its deadline and its
+   *  elapsed time on the same scale. */
+  clock: () => number;
+};
+
+/** #6789: a list whose credit work took longer than this is logged, deadline
+ *  reached or not (the event-loop signal, directive §11). */
+export const SLOW_CREDIT_WORK_MS = 250;
+
+/** One list's credit work, reported once per request. */
+export type CreditWorkReport = {
+  /** Keys the deadline left without a reading. */
+  skipped: number;
+  /** The list's credit work, on the viewer's clock. */
+  elapsedMs: number;
+};
+
+/**
+ * #6789: the one warn line for a list whose credit work hit the deadline or ran
+ * slow (category `api-keys-budget`, shared with the per-key line under the
+ * ErrorLogger's per-category rate limit). Throttled the way `createDegradedLog`
+ * throttles: logged when it first appears, again when its reason changes, and
+ * otherwise at most once per {@link DEGRADED_LOG_REPEAT_MS}; a line the logger
+ * dropped (`false`) counts as unlogged, so the next request tries again.
+ */
+export function createCreditWorkLog(
+  log: (
+    message: string,
+    options: { category: string; context: Record<string, unknown> }
+  ) => boolean | void,
+  wallNow: () => number = Date.now
+): (list: string, report: CreditWorkReport) => void {
+  const last = new Map<string, { reason: string; at: number }>();
+  return (list, { skipped, elapsedMs }) => {
+    const deadline = skipped > 0;
+    if (!deadline && elapsedMs <= SLOW_CREDIT_WORK_MS) return;
+    const reason = deadline ? "deadline" : "slow";
+    const t = wallNow();
+    const prev = last.get(list);
+    if (
+      prev &&
+      prev.reason === reason &&
+      t - prev.at < DEGRADED_LOG_REPEAT_MS
+    ) {
+      return;
+    }
+    const ms = Math.round(elapsedMs);
+    const message = deadline
+      ? `API keys (${list}): ${skipped} key(s) got no credit reading; the credit work passed its ${SHARED_LIST_CREDIT_DEADLINE_MS} ms deadline (${ms} ms)`
+      : `API keys (${list}): the credit work took ${ms} ms`;
+    let recorded: boolean | void;
+    try {
+      recorded = log(message, {
+        category: "api-keys-budget",
+        context: { list, skipped, elapsedMs: ms },
+      });
+    } catch {
+      return;
+    }
+    if (recorded === false) return;
+    last.set(list, { reason, at: t });
+  };
+}
+
+/** Thrown by the deadline-guarded spend lookup; never leaves the viewer. */
+class CreditDeadlineError extends Error {
+  constructor() {
+    super("credit deadline reached");
+    this.name = "CreditDeadlineError";
+  }
+}
+
+/**
+ * #6789: the one function that builds a key as a user sees it (the redacted
+ * view plus its credit). Every case without an estimate — no spend reader, a
+ * spend read that throws, the deadline, an unreadable budget date — returns
+ * through ONE "no reading" path, so a standing "Out of credit" survives each of
+ * them alike and a budgeted key always says `creditUnavailable`, never reads
+ * as a key with no budget.
+ *
+ * The deadline is checked before EVERY spend lookup, not only between keys:
+ * one key makes one lookup per top-up since its budget was set (up to 241), so
+ * a list's credit work is bounded by the deadline plus one lookup.
+ */
+export function createApiKeyViewer(
+  opts: ApiKeyViewerOptions = {}
+): ApiKeyViewer {
+  const now = opts.now ?? Date.now;
+  const clock = opts.clock ?? (() => performance.now());
+  const warn =
+    opts.warn ??
+    ((message: string, o: { category: string }) =>
+      console.warn(`[${o.category}]`, message));
+
+  function warnUnreadable(entry: StoredApiKey, error: unknown): void {
+    const failure = errorClass(error);
+    try {
+      warn(`API key ${entry.id}: its spend could not be read (${failure})`, {
+        category: "api-keys-budget",
+        context: { vaultId: entry.id, error: failure },
+      });
+    } catch {
+      // A logger that throws must not fail the list it reports on.
+    }
+  }
+
+  /** The view when no estimate exists. `outOfCredit` stands when the stamp
+   *  stands on the checks that need no spend (no later budget edit, no top-up
+   *  after it): a zero spend is assumed, and only its `outOfCredit` is taken,
+   *  never its `status` (that would print the whole budget as left). */
+  function noReading(
+    entry: StoredApiKey,
+    redacted: RedactedApiKey,
+    nowMs: number
+  ): RedactedApiKey {
+    const flag =
+      entry.budget !== undefined || entry.budgetRecurrence !== undefined
+        ? { creditUnavailable: true as const }
+        : {};
+    if (!entry.outOfCreditAt) return { ...redacted, ...flag };
+    try {
+      const { outOfCredit } = computeApiKeyBudget({
+        budget: entry.budget,
+        recurrence: entry.budgetRecurrence,
+        outOfCreditAt: entry.outOfCreditAt,
+        nowMs,
+        spend: () => 0,
+      });
+      return {
+        ...redacted,
+        ...flag,
+        ...(outOfCredit ? { outOfCredit: true } : {}),
+      };
+    } catch (error) {
+      // A recurrence the route's unparsed read let through (no `dayOfMonth`).
+      warnUnreadable(entry, error);
+      return { ...redacted, ...flag };
+    }
+  }
+
+  /** A reader taken at most once, on first need: `undefined` until then. */
+  type Reader = () =>
+    | { lookup: ApiKeySpendLookup | null }
+    | { lookup: null; error: unknown };
+  function readerOnce(window?: ApiKeySpendWindow): Reader {
+    let taken:
+      | { lookup: ApiKeySpendLookup | null }
+      | { lookup: null; error: unknown }
+      | undefined;
+    return () => {
+      if (taken) return taken;
+      try {
+        taken = { lookup: opts.getApiKeySpend?.(window) ?? null };
+      } catch (error) {
+        taken = { lookup: null, error };
+      }
+      return taken;
+    };
+  }
+
+  const needsReading = (entry: StoredApiKey): boolean =>
+    Boolean(entry.budget || entry.budgetRecurrence || entry.outOfCreditAt);
+
+  /** The earliest start the budget walk can ask spend for: the budget's
+   *  `setAt` (capped at now), else the latest top-up, and the stamp. Null when
+   *  none is readable (a reader then reloads on its first earlier window). */
+  function readingStart(entry: StoredApiKey, nowMs: number): number | null {
+    const starts: number[] = [];
+    const setAt = entry.budget ? Date.parse(entry.budget.setAt) : Number.NaN;
+    if (Number.isFinite(setAt)) {
+      starts.push(Math.min(setAt, nowMs));
+    } else if (entry.budgetRecurrence) {
+      try {
+        starts.push(lastTopUpAtOrBefore(entry.budgetRecurrence, nowMs));
+      } catch {
+        // An unparsed recurrence; the view itself answers creditUnavailable.
+      }
+    }
+    const outAt = entry.outOfCreditAt
+      ? Date.parse(entry.outOfCreditAt)
+      : Number.NaN;
+    if (Number.isFinite(outAt)) starts.push(outAt);
+    const earliest = Math.min(...starts);
+    return Number.isFinite(earliest) ? earliest : null;
+  }
+
+  function userView(
+    entry: StoredApiKey,
+    viewOpts: ApiKeyViewOptions = {}
+  ): RedactedApiKey {
+    return viewWith(entry, viewOpts, readerOnce());
+  }
+
+  function listView(
+    entries: readonly StoredApiKey[],
+    viewOpts: ApiKeyViewOptions = {}
+  ): RedactedApiKey[] {
+    const nowMs = now();
+    let since = Number.POSITIVE_INFINITY;
+    for (const entry of entries) {
+      if (!needsReading(entry)) continue;
+      const start = readingStart(entry, nowMs);
+      if (start !== null && start < since) since = start;
+    }
+    const reader = readerOnce(
+      Number.isFinite(since) ? { sinceMs: since } : undefined
+    );
+    return entries.map(entry => viewWith(entry, viewOpts, reader));
+  }
+
+  function viewWith(
+    entry: StoredApiKey,
+    viewOpts: ApiKeyViewOptions,
+    reader: Reader
+  ): RedactedApiKey {
+    const redacted = toRedactedApiKey(entry);
+    if (!needsReading(entry)) return redacted;
+    const nowMs = now();
+    const taken = reader();
+    if ("error" in taken) {
+      warnUnreadable(entry, taken.error);
+      return noReading(entry, redacted, nowMs);
+    }
+    const lookup = taken.lookup;
+    if (!lookup) return noReading(entry, redacted, nowMs);
+    const read = lookup;
+    const deadline = viewOpts.creditDeadlineAtMs;
+    if (deadline !== undefined && clock() >= deadline) {
+      viewOpts.onCreditDeadline?.();
+      return noReading(entry, redacted, nowMs);
+    }
+    const spend =
+      deadline === undefined
+        ? (fromMs: number, toMs: number) => read(entry.id, fromMs, toMs)
+        : (fromMs: number, toMs: number) => {
+            if (clock() >= deadline) throw new CreditDeadlineError();
+            return read(entry.id, fromMs, toMs);
+          };
+    try {
+      const { status, outOfCredit } = computeApiKeyBudget({
+        budget: entry.budget,
+        recurrence: entry.budgetRecurrence,
+        outOfCreditAt: entry.outOfCreditAt,
+        nowMs,
+        spend,
+      });
+      const budgeted =
+        entry.budget !== undefined || entry.budgetRecurrence !== undefined;
+      return {
+        ...redacted,
+        ...(status ? { budgetStatus: status } : {}),
+        // A budget whose `setAt` cannot be read gives no status.
+        ...(!status && budgeted ? { creditUnavailable: true } : {}),
+        ...(outOfCredit ? { outOfCredit: true } : {}),
+      };
+    } catch (error) {
+      if (error instanceof CreditDeadlineError) {
+        // A partly computed status is discarded.
+        viewOpts.onCreditDeadline?.();
+      } else {
+        warnUnreadable(entry, error);
+      }
+      return noReading(entry, redacted, nowMs);
+    }
+  }
+
+  /** `descriptor` stays on this node: a passthrough object with free-text
+   *  notes, which the picker does not need. */
+  const withoutDescriptor = (view: RedactedApiKey): RedactedApiKey => {
+    const { descriptor: _descriptor, ...rest } = view;
+    return rest;
+  };
+
+  return {
+    userView,
+    peerView: (entry, viewOpts) => withoutDescriptor(userView(entry, viewOpts)),
+    listView,
+    peerListView: (entries, viewOpts) =>
+      listView(entries, viewOpts).map(withoutDescriptor),
+    clock,
+  };
+}
 
 /**
  * Issue #4823: read ONE vault entry by id, redacted. The mid-session payment-method
@@ -264,8 +611,9 @@ export interface ApiKeysRoutesOptions {
   /** #5127: the picker's cross-node key list (`GET /api-keys/available`). */
   getSharedApiKeyService?: () => SharedApiKeyService | null;
   /** API key budgets: the spend this node metered on a key (the turn ledger).
-   *  Absent ⇒ answers carry the budget settings but no estimate. */
-  getApiKeySpend?: () => ApiKeySpendLookup | null;
+   *  Absent ⇒ answers carry the budget settings and `creditUnavailable` on a
+   *  budgeted key. */
+  getApiKeySpend?: ApiKeySpendSource;
   /** Test seam: the clock for budget estimates and stale-probe checks. */
   now?: () => number;
   /** Re-probe a key in the background when a list read finds its last probe
@@ -320,42 +668,19 @@ export function createApiKeysRoutes(
 
   const now = opts.now ?? Date.now;
 
-  /** The redacted view plus the read-time credit estimate (API key budgets).
-   *  Fail-open: a spend read that throws leaves the estimate out and is logged;
-   *  the list still answers. */
-  function withCredit(entry: StoredApiKey): RedactedApiKey {
-    const redacted = toRedactedApiKey(entry);
-    const lookup = opts.getApiKeySpend?.();
-    if (!lookup) return redacted;
-    if (!entry.budget && !entry.budgetRecurrence && !entry.outOfCreditAt) {
-      return redacted;
-    }
-    try {
-      const { status, outOfCredit } = computeApiKeyBudget({
-        budget: entry.budget,
-        recurrence: entry.budgetRecurrence,
-        outOfCreditAt: entry.outOfCreditAt,
-        nowMs: now(),
-        spend: (fromMs, toMs) => lookup(entry.id, fromMs, toMs),
-      });
-      return {
-        ...redacted,
-        ...(status ? { budgetStatus: status } : {}),
-        ...(outOfCredit ? { outOfCredit: true } : {}),
-      };
-    } catch (error) {
-      const failure = errorClass(error);
-      logFault(
-        "warn",
-        `API key ${entry.id}: its spend could not be read (${failure})`,
-        {
-          category: "api-keys-budget",
-          context: { vaultId: entry.id, error: failure },
-        }
-      );
-      return redacted;
-    }
-  }
+  /** #6789: the key as a user sees it (the redacted view plus its read-time
+   *  credit). A spend read that throws is logged and the key answers
+   *  `creditUnavailable` (keeping a standing "Out of credit"); the list still
+   *  answers. Lists use `viewer.listView` (one spend reader per list); one
+   *  key's answer uses `withCredit`, which takes one argument only, so it can
+   *  never receive an array index as the view's options. */
+  const viewer = createApiKeyViewer({
+    getApiKeySpend: opts.getApiKeySpend,
+    now,
+    warn: (message, o) => logFault("warn", message, o),
+  });
+  const withCredit = (entry: StoredApiKey): RedactedApiKey =>
+    viewer.userView(entry);
 
   /** Keys being re-probed in the background (one probe per key at a time). */
   const revalidating = new Set<string>();
@@ -458,7 +783,7 @@ export function createApiKeysRoutes(
       const settings = await readSettings(settingsFile);
       const entries = settings?.apiKeys ?? [];
       for (const entry of entries) revalidateIfStale(entry);
-      return c.json(entries.map(withCredit));
+      return c.json(viewer.listView(entries));
     }
   );
 
@@ -473,7 +798,7 @@ export function createApiKeysRoutes(
         domain: "accounts",
         surface: "rest",
         description:
-          "List the Anthropic keys a spawn on a given node may use: this node's keys and every federation node's shared keys, redacted, each with the reference the spawn must send.",
+          "List the Anthropic keys a spawn on a given node may use: this node's keys and every federation node's shared keys, redacted, each with the reference the spawn must send and each key's credit.",
         whenToUse:
           "When the Create page offers API keys for a local or remote target.",
         invocation: {
@@ -788,7 +1113,7 @@ export function createApiKeysRoutes(
         }
         if (monogram) syncAccountIdentity(id, boundUuid, { monogram });
       }
-      return c.json(toRedactedApiKey(entry), 201);
+      return c.json(withCredit(entry), 201);
     }
   );
 
@@ -1022,7 +1347,7 @@ export function createApiKeysRoutes(
         throw error;
       }
       if (accountKept) c.header("X-Hapi-Account-Kept", accountKept);
-      return c.json(remaining.map(withCredit));
+      return c.json(viewer.listView(remaining));
     }
   );
 

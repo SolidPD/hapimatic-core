@@ -22,7 +22,6 @@ import { configuration } from "@/configuration";
 import { getAuthToken } from "@/api/auth";
 import { ApiMachineClient } from "./apiMachine";
 import { ApiSessionClient, type ApiSessionClientOptions } from "./apiSession";
-import type { AccountCaptureNotice } from "@/accounts/credentialsWatcher";
 import { RUNNER_REFUSED, type RunnerAttachInfo } from "@hapi/protocol";
 
 /**
@@ -236,25 +235,5 @@ export class ApiClient {
       },
       timeout: 10_000,
     });
-  }
-
-  /**
-   * Issue #1449: relay a redacted account-capture notice to the server, which
-   * broadcasts an account-captured SSE so the web UI updates the account
-   * dropdown live. Mirrors updateMcpStatus (daemon-side POST to a /cli route).
-   * The notice carries identity ONLY — never a token (R5/R10).
-   */
-  async reportAccountCaptured(notice: AccountCaptureNotice): Promise<void> {
-    await axios.post(
-      `${configuration.serverUrl}/cli/account-captured`,
-      notice,
-      {
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 10_000,
-      }
-    );
   }
 }

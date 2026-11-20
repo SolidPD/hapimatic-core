@@ -1,14 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import {
-  memo,
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  type CSSProperties,
-  type ReactNode,
-} from "react";
+import { memo, useCallback, type CSSProperties, type ReactNode } from "react";
 import { Check, Star, X } from "lucide-react";
 import { isReservedPinKey } from "@hapi/protocol";
 import { tokens } from "@/design/tokens";
@@ -31,6 +22,7 @@ import {
   PinTipButton,
   stopRowToggle,
   usePinsContext,
+  useTitleWraps,
 } from "@/components/pins/pinsShared";
 import {
   isPinNew,
@@ -177,62 +169,6 @@ function AnswerPill(props: { model: PinViewModel; armed: boolean }) {
   );
 }
 
-/**
- * #6458 (TITLE-D, Matt 2026-11-12): whether an expanded pin's title needs more
- * than one line. It is always measured in the one-line layout, the title on one
- * line beside the signals in their cell, so moving the signals to the facts
- * line cannot change the answer and flip it back. While the title wraps, the
- * read lifts the title's wrap and the row copy's stowed styles and puts them
- * back before paint (as `RecommendedLabel` in `DecisionOptions.tsx` does). It
- * measures again when the title cell's width changes (the screen, or a pill
- * that grows) and when the age label changes.
- */
-function useTitleWraps(expanded: boolean, title: string, ageLabel: string) {
-  const cellRef = useRef<HTMLDivElement>(null);
-  const [wraps, setWraps] = useState(false);
-  const [pass, setPass] = useState(0);
-
-  useLayoutEffect(() => {
-    if (!expanded) {
-      setWraps(false);
-      return;
-    }
-    const cell = cellRef.current;
-    const text = cell?.querySelector<HTMLElement>("[data-pin-title-text]");
-    if (!cell || !text) return;
-    const signals =
-      cell.parentElement?.querySelector<HTMLElement>("[data-pin-signals]");
-    const textStyle = text.style.cssText;
-    const signalsStyle = signals?.style.cssText ?? "";
-    text.style.whiteSpace = "nowrap";
-    text.style.overflow = "hidden";
-    if (signals) {
-      signals.style.width = "";
-      signals.style.overflow = "";
-      signals.style.visibility = "";
-    }
-    const overflows = text.scrollWidth > text.clientWidth + 1;
-    text.style.cssText = textStyle;
-    if (signals) signals.style.cssText = signalsStyle;
-    setWraps(overflows);
-  }, [expanded, title, ageLabel, pass]);
-
-  useEffect(() => {
-    const cell = cellRef.current;
-    if (!expanded || !cell || typeof ResizeObserver === "undefined") return;
-    let width = cell.clientWidth;
-    const resize = new ResizeObserver(() => {
-      if (cell.clientWidth === width) return;
-      width = cell.clientWidth;
-      setPass(n => n + 1);
-    });
-    resize.observe(cell);
-    return () => resize.disconnect();
-  }, [expanded]);
-
-  return { cellRef, wraps };
-}
-
 export type PinRowProps = {
   model: PinViewModel;
   expanded: boolean;
@@ -284,7 +220,11 @@ export const PinRow = memo(function PinRow(props: PinRowProps) {
     (element: HTMLDivElement | null) => observe(pin.key, element),
     [observe, pin.key]
   );
-  const { cellRef, wraps } = useTitleWraps(expanded, pin.title, props.ageLabel);
+  const { cellRef, wraps } = useTitleWraps<HTMLDivElement>(
+    expanded,
+    pin.title,
+    props.ageLabel
+  );
   // One set of props for the row's signals and their facts-line copy: the row's
   // (stowed) copy is the one the title measurement reads, so the two must match.
   const signals = {

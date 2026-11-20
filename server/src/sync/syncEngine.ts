@@ -102,7 +102,12 @@ import { isNewUserFacingAssistantContent } from "./needsReviewContent";
 import { PinService } from "./pinService";
 import { PinFenceIngest } from "./pinFenceIngest";
 import { PinPromptMirror } from "./pinPromptMirror";
-import { openPinInNamespace, PinTurnCheck } from "./pinTurnCheck";
+import {
+  managedPeerCheck,
+  openPinInNamespace,
+  PinTurnCheck,
+  type ParentSessionState,
+} from "./pinTurnCheck";
 import { resolvePinsEnabled } from "../config/pinsConfig";
 import type { MessageOrigin, SentFrom } from "./sentFrom";
 import {
@@ -989,6 +994,14 @@ export class SyncEngine {
         getSessionByNamespace: (sid, namespace) =>
           this.getSessionByNamespace(sid, namespace),
       }),
+      // #6738 (R12): a PM-managed peer's turns are never nudged or pinned. The
+      // parent is read from this node's cache, then the registry's (late-bound).
+      isManagedPeer: managedPeerCheck({
+        getSession: sid => this.sessionCache.getSession(sid),
+        getParent: pid => this.pinParentState(pid),
+      }),
+      // #6739: a Detected pin's body cut or refused build is logged here.
+      errorLogger: this.errorLogger,
     });
     this.eventPublisher.subscribe(event => {
       try {
@@ -1485,6 +1498,33 @@ export class SyncEngine {
 
   getOpenPinCount(sessionId: string): number {
     return this.pins.countOpen(sessionId);
+  }
+
+  /**
+   * #6738 (R12): what a hub or peer node's registry knows of a remote session,
+   * set by index.ts after the federation block. Null on a `node` role and until
+   * it is set: the turn check then reads only this node's cache.
+   */
+  private remoteParentState:
+    | ((sessionId: string) => ParentSessionState | null)
+    | null = null;
+
+  setRemoteParentState(
+    read: ((sessionId: string) => ParentSessionState | null) | null
+  ): void {
+    this.remoteParentState = read;
+  }
+
+  /** What this node knows of a parent session, in memory only; null when it finds none. */
+  private pinParentState(sessionId: string): ParentSessionState | null {
+    const local = this.sessionCache.getSession(sessionId);
+    if (local) {
+      return {
+        active: local.active,
+        lifecycleState: local.metadata?.lifecycleState ?? null,
+      };
+    }
+    return this.remoteParentState?.(sessionId) ?? null;
   }
 
   getSession(sessionId: string): Session | undefined {

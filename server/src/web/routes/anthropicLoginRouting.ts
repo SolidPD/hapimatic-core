@@ -67,6 +67,8 @@ const PeerLoginStartAnswerSchema = z.union([
     ok: z.literal(true),
     loginToken: z.string().min(1),
     authorizeUrl: z.string().min(1),
+    // #6800: instance names of the peer's live older sibling daemons.
+    olderSiblingDaemons: z.array(z.string().max(200)).max(50).optional(),
   }),
   z.object({ ok: z.literal(false), code: z.string(), error: z.string() }),
 ]);
@@ -217,6 +219,9 @@ export function createAnthropicLoginRouting(deps: {
       authorizeUrl: answer.data.authorizeUrl,
       nodeId: gate.nodeId,
       nodeLabel: label,
+      ...(answer.data.olderSiblingDaemons?.length
+        ? { olderSiblingDaemons: answer.data.olderSiblingDaemons }
+        : {}),
     });
   }
 

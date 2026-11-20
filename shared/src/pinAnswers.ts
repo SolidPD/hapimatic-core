@@ -25,9 +25,24 @@ import { APPROVAL_TOKEN_PATTERN } from "./pins";
 //
 // A new optional field on an entry is the documented extension, not a version
 // bump, because readers are loose: `automaticPick` (#6452), `savedTo` (#6453),
-// `dismissed` with `title` (#6539) and `pinId` (#6574, placed right after `kind`)
-// each arrived this way. Renaming, removing or re-ordering an existing field is a
-// version bump.
+// `dismissed` with `title` (#6539), `pinId` (#6574, placed right after `kind`) and
+// `notSaved` (#6540, right after `savedTo`) each arrived this way. Renaming,
+// removing or re-ordering an existing field is a version bump.
+//
+// ## What `notSaved` says, and what its absence says (#6540)
+//
+// `notSaved` rides the one message that reports a partial Save, never a later one.
+// 1. On an entry that carries only a Save (the identity fields and `savedTo`), no
+//    `notSaved` means that Save skipped nothing; when the notice did not fit the
+//    message, the same Save is reported again in the next message, with `notSaved`.
+// 2. On an entry with an answer, a dismissal, a note, or questions, no `notSaved`
+//    says nothing about a Save.
+// 3. `pin_get` with the pin's key holds the record of the last Save
+//    (`savedSkipped`, `savedSkippedFiles`) until the next Save replaces it.
+// 4. `files: []` beside a count means the names were withheld for size, or none
+//    could be recorded (every path over the cap or holding a control character, a
+//    Save made before this change, a Save by an older binary, or a stored list that
+//    did not read back).
 
 export const PIN_ANSWERS_SCHEMA = "hapi_pin_answers/1";
 export const PIN_ANSWERS_FENCE_LANGUAGE = "hapi_pin_answers";
@@ -90,6 +105,13 @@ export type PinAnswersEntry = {
   marks?: PinAnswerMark[];
   steps?: { done: number; total: number };
   savedTo?: string;
+  /**
+   * #6540 S-4: on the entry that reports a partial Save, how many of the pin's
+   * files it did not copy (`count`, every one) and up to ten of them, each a path
+   * relative to the session's folder and a reason. See the header for what its
+   * absence means.
+   */
+  notSaved?: { count: number; files: { path: string; reason: string }[] };
 };
 
 export type PinAnswersBlock = {
@@ -128,6 +150,15 @@ const PinAnswersEntrySchema = z
       .loose()
       .optional(),
     savedTo: z.string().optional(),
+    notSaved: z
+      .object({
+        count: z.number().int(),
+        files: z.array(
+          z.object({ path: z.string(), reason: z.string() }).loose()
+        ),
+      })
+      .loose()
+      .optional(),
   })
   .loose();
 
@@ -254,6 +285,24 @@ function cleanEntry(entry: PinAnswersEntry): PinAnswersEntry {
   if (entry.savedTo !== undefined) {
     out.savedTo = neutralizeApprovalTokens(entry.savedTo);
   }
+  // #6540 S-4: only a positive whole count is sent, because the summary line
+  // prints it; the paths are agent-written file names, so each text is cleaned,
+  // and only a string path and a string reason are kept from each file.
+  const notSaved = entry.notSaved;
+  if (notSaved && Number.isSafeInteger(notSaved.count) && notSaved.count > 0) {
+    out.notSaved = {
+      count: notSaved.count,
+      files: (Array.isArray(notSaved.files) ? notSaved.files : [])
+        .filter(
+          file =>
+            typeof file?.path === "string" && typeof file.reason === "string"
+        )
+        .map(file => ({
+          path: neutralizeApprovalTokens(file.path),
+          reason: neutralizeApprovalTokens(file.reason),
+        })),
+    };
+  }
   // Only identity fields (pin, rev, kind and, when present, pinId) means nothing to send.
   if (Object.keys(out).length <= (out.pinId === undefined ? 3 : 4)) {
     throw new Error(
@@ -296,7 +345,8 @@ export type PinAnswersMessage =
  * The exact message: `Pins answers, <time>: <counts> (<item>, …)`, where an
  * item is `<key> (dismissed by you: <title>)` for a dismissal (#6539),
  * `<key> → <choice>` for an answer, `<key> (saved to <folder>)` for an
- * entry that carries only a save (#6453), or the bare `<key>` otherwise
+ * entry that carries only a save (#6453), `<key> (saved to <folder>, <N> not
+ * saved)` when that save was partial (#6540), or the bare `<key>` otherwise
  * (`Pins automatic pick, …` for an automatic pick, #6452),
  * a blank line, and the fenced block pretty-printed with two-space indent, which
  * can never close the fence early (every JSON line is indented or starts `{`/`}`).
@@ -327,7 +377,11 @@ export function formatPinAnswersMessage(
       : entry.answer
         ? `${entry.pin} → ${summaryToken(entry.answer.choice)}`
         : entry.savedTo !== undefined
-          ? `${entry.pin} (saved to ${summaryToken(entry.savedTo)})`
+          ? `${entry.pin} (saved to ${summaryToken(entry.savedTo)}${
+              // #6540: the cleaned count, a positive safe integer, is all of
+              // `notSaved` this line prints, so line 1 stays one line.
+              entry.notSaved ? `, ${entry.notSaved.count} not saved` : ""
+            })`
           : entry.pin
   );
   const shown = items.slice(0, PIN_ANSWERS_SUMMARY_MAX_ITEMS);

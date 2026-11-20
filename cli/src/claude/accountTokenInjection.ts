@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { hostname } from "node:os";
 import type { Session } from "@/claude/session";
 import type { SessionModelMode } from "@/api/types";
 import type { ClaudeAccountInfo } from "@hapi/protocol/schemas";
@@ -13,10 +14,7 @@ import {
 import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { accountStore } from "@/accounts/accountStore";
 import { TokenRefreshService } from "@/accounts/tokenRefreshService";
-import {
-  computePlanLabel,
-  readHostDefaultAccountUuid,
-} from "@/utils/claudeCredentials";
+import { computePlanLabel } from "@/utils/claudeCredentials";
 import {
   accountConfigDirFor,
   hasIsolatedConfigDir,
@@ -39,6 +37,7 @@ import {
 } from "@/accounts/legacyConfigDirMigration";
 import { logger } from "@/ui/logger";
 import { isTenantVm, tenantSignInRequiredMessage } from "@/accounts/tenantMode";
+import { sharesHostChain as defaultSharesHostChain } from "@/accounts/hostChainQuarantine";
 import {
   permissionNarrowingHolds,
   relaunchPermissionArgs,
@@ -317,20 +316,19 @@ export async function verifyApiKeyForSession(
  * dir is the fast path; the token is the preserved fallback.
  *
  * Returns the isolated config dir (after ensuring it is seeded) when ALL hold:
- *  - an account is bound (`HAPI_ACCOUNT_UUID` set),
- *  - the bound account is NOT the host-default (defensive — the daemon's
- *    `shouldSkipBinding` already excludes it; this is belt-and-suspenders for the
- *    single-owner invariant / #1520 double-rotation class, R2),
+ *  - an account is bound (`HAPI_ACCOUNT_UUID` set) — since #6800 that includes the
+ *    account `~/.claude.json` names, which runs from its own folder like any other,
  *  - the account record loads cleanly, and
  *  - it either already owns an isolated dir (native is the live rotator — return
  *    it WITHOUT re-seeding so a stale store token never clobbers native's
  *    freshly-rotated one, KD-2) OR it is refreshable and seeds cleanly from the
  *    store (`overwrite:false` bootstrap).
  *
- * Returns `null` (→ token fallback) when no account is bound, the account is the
- * host-default, the record is unknown/malformed, the account is `unrefreshable`
- * with no isolated dir (the token path then throws the re-login error — R4), or
- * a transient seed failure occurs (the token path is still a valid spawn).
+ * Returns `null` (→ token fallback) when no account is bound, the record is
+ * unknown/malformed, the account is `unrefreshable` with no isolated dir (the
+ * token path then throws the re-login error — R4), the folder or the store token
+ * holds the `~/.claude` chain (#6800), or a transient seed failure occurs (the
+ * token path is still a valid spawn).
  * NEVER throws — the env-token fallback owns the loud-failure surface.
  */
 export async function resolveAccountConfigDirForSession(
@@ -381,15 +379,6 @@ export async function resolveAccountConfigDirForSession(
   if (!accountUuid) return null; // no binding — host-credential path (R2)
 
   try {
-    // Defensive single-owner guard (R2): never isolate the host-default account —
-    // native already owns it via the host dir, and a second isolated rotator
-    // would reproduce the #1520 double-rotation invalid_grant. The daemon's
-    // shouldSkipBinding normally prevents HAPI_ACCOUNT_UUID being set for it.
-    const hostDefaultUuid = await readHostDefaultAccountUuid().catch(
-      () => null
-    );
-    if (hostDefaultUuid && accountUuid === hostDefaultUuid) return null;
-
     const store = deps.accountStore ?? accountStore;
     const res = await store.get(accountUuid);
     // Unknown/malformed → defer to the token path, which throws the precise
@@ -460,9 +449,15 @@ export async function resolveAccountConfigDirForSession(
     // falls through to the existing seed paths (the bootstrap branch handles the
     // no-legacy case). Self-gates to no-op under the HAPI_ACCOUNT_CONFIG_SHARED
     // kill-switch.
-    if (!(await hasIsolatedConfigDir(accountUuid))) {
+    //
+    // Issue #6800 (Task 1b (ii)): never re-populate the folder of a flagged
+    // account from a legacy folder — a flagged account may be quarantined for
+    // sharing the ~/.claude chain, and a legacy copy is that same chain.
+    if (!account.unrefreshable && !(await hasIsolatedConfigDir(accountUuid))) {
       await (deps.migrateLegacy ?? migrateLegacyIsolatedDir)(accountUuid);
     }
+
+    const sharesHost = deps.sharesHostChain ?? defaultSharesHostChain;
 
     // Isolated dir already owned by native — the dir is the source of truth
     // (KD-2). Do NOT blind-trust it, though (issue #1635, R1): the snapshot
@@ -474,6 +469,18 @@ export async function resolveAccountConfigDirForSession(
     // Fallback Preservation Rule). The validator NEVER throws. (Post-#1643 this
     // branch also catches a just-migrated shared dir.)
     if (await hasIsolatedConfigDir(accountUuid)) {
+      // Issue #6800 (Task 1b (i), invariant I1): a folder that holds the
+      // ~/.claude login chain is refused at the point of use, so a copy an older
+      // daemon made between two detector passes never reaches a session. The
+      // token path then throws the re-login error or uses an independent store
+      // token. The folder is left as it is: the detector owns the move-aside.
+      const folder = await readIsolatedCredentials(accountUuid);
+      if (folder && (await sharesHost(folder.refreshToken))) {
+        logger.warn(
+          `[ACCOUNT_CONFIG_DIR] the folder of ${accountUuid} holds the ~/.claude login chain (#6800); refusing it and falling back to the token path`
+        );
+        return null;
+      }
       const validate =
         deps.validateSnapshot ??
         (acct =>
@@ -497,6 +504,10 @@ export async function resolveAccountConfigDirForSession(
     // No isolated dir yet. A dead store token can't bootstrap one — defer to the
     // token path so its `unrefreshable` throw surfaces the re-login state (R4).
     if (account.unrefreshable) return null;
+
+    // Issue #6800 (Task 1b (iii)): a store token that is the ~/.claude chain
+    // never seeds a folder; the token path throws the re-login error.
+    if (await sharesHost(account.refreshToken)) return null;
 
     // Bootstrap: seed from the store token (overwrite:false is a no-op if a
     // concurrent spawn already seeded). On success, native takes over rotation.
@@ -562,8 +573,14 @@ export interface ResolveAccountTokenDeps {
   tenantVm?: () => boolean;
   /** Issue #4349: whether an account's own dir holds the binary's credential (test seam). */
   hasConfigDir?: (accountUuid: string) => Promise<boolean>;
-  /** Issue #4349: the host `~/.claude` login's account uuid (test seam). */
-  hostDefaultUuid?: () => Promise<string | null>;
+  /**
+   * Issue #6800: "is this refresh token the current ~/.claude token?" (test
+   * seam). Defaults to `hostChainQuarantine.sharesHostChain`, which compares
+   * sha256 fingerprints read fresh on each call.
+   */
+  sharesHostChain?: (
+    refreshToken: string | null | undefined
+  ) => Promise<boolean>;
 }
 
 /**
@@ -573,9 +590,10 @@ export interface ResolveAccountTokenDeps {
  * (`validateAndRecoverIsolatedSnapshot`), never rotated or bootstrapped by Hapimatic, and the
  * `HAPI_ACCOUNT_CONFIG_ISOLATION` kill switch does not apply (its fallback is token injection).
  *
- * Returns the dir, or `null` for: an unbound session and the host-default account (native Claude
- * Code reads `~/.claude`, nothing injected), and a bound account whose dir holds no credential —
- * then {@link resolveAccountTokenForSession} raises "sign in to this account". The user-scope
+ * Returns the dir, or `null` for: an unbound session (native Claude Code reads `~/.claude`,
+ * nothing injected), and a bound account whose dir holds no credential — then
+ * {@link resolveAccountTokenForSession} raises "sign in to this account". Since #6800 the
+ * account `~/.claude.json` names binds its own dir here like any other account (R9). The user-scope
  * config (skills, CLAUDE.md, settings) is still linked into the dir — symlinks, never a
  * credential; a provisioning gap is logged, not a reason to inject a token.
  */
@@ -584,10 +602,6 @@ async function resolveTenantConfigDir(
 ): Promise<string | null> {
   const accountUuid = readBoundAccountUuid();
   if (!accountUuid) return null;
-  const hostDefault = await (
-    deps.hostDefaultUuid ?? readHostDefaultAccountUuid
-  )().catch(() => null);
-  if (hostDefault && hostDefault === accountUuid) return null;
   if (!(await (deps.hasConfigDir ?? hasIsolatedConfigDir)(accountUuid)))
     return null;
   const dir = accountConfigDirFor(accountUuid);
@@ -708,16 +722,13 @@ export async function resolveAccountTokenForSession(
   const now = deps.now ?? Date.now;
 
   // Issue #4349 (R3): a TENANT VM never injects CLAUDE_CODE_OAUTH_TOKEN — not a stored token, not
-  // the instance credential, not a refreshed one. An unbound session and the host-default account
-  // get nothing (native reads ~/.claude); a bound account reaches here only when its own dir holds
-  // no credential (resolveTenantConfigDir), so the customer must sign in to it in the VM.
+  // the instance credential, not a refreshed one. An unbound session gets nothing (native reads
+  // ~/.claude); a bound account — since #6800 including the one ~/.claude.json names (R9) —
+  // reaches here only when its own dir holds no credential (resolveTenantConfigDir), so the
+  // customer must sign in to it in the VM.
   if (tenantSpawn(deps)) {
     const bound = readBoundAccountUuid();
     if (!bound || readBoundApiKeyId()) return null;
-    const hostDefault = await (
-      deps.hostDefaultUuid ?? readHostDefaultAccountUuid
-    )().catch(() => null);
-    if (hostDefault && hostDefault === bound) return null;
     logger.warn(`[TENANT] ${tenantSignInRequiredMessage(bound)}`);
     throw new Error(tenantSignInRequiredMessage(bound));
   }
@@ -747,6 +758,19 @@ export async function resolveAccountTokenForSession(
     ); // R3
   }
   let account = res.account;
+  const sharesHost = deps.sharesHostChain ?? defaultSharesHostChain;
+  // Issue #6800 (Task 1b, invariant I1): a store record that holds the
+  // ~/.claude login chain is never injected. Two refreshers on one chain is the
+  // #1520 race; the account needs a sign-in through Provider Accounts.
+  if (!isEnvTokenAccount(account) && (await sharesHost(account.refreshToken))) {
+    const node = hostname();
+    logger.warn(
+      `[TOKEN_REFRESH] account ${accountUuid} shares the ~/.claude login on ${node} — re-login required (spawn refused)`
+    );
+    throw new Error(
+      `Account ${accountUuid} (${account.emailAddress}) shares the ~/.claude login on ${node} — re-login required`
+    );
+  }
   // #4423: each spawn-failure throw below is preceded by a [TOKEN_REFRESH]-tagged
   // log line with the same wording — the soak filter matches tagged lines only,
   // and these messages are plain Errors. The thrown messages stay byte-identical.
@@ -778,7 +802,14 @@ export async function resolveAccountTokenForSession(
   // snapshot-recovery fallback. All R3 throws above/below stay byte-identical.
   if (await hasIsolatedConfigDir(accountUuid)) {
     const oauth = await readIsolatedCredentials(accountUuid);
-    if (oauth && oauth.accessToken !== account.accessToken) {
+    // Issue #6800 (invariant I1): a folder that holds the ~/.claude chain is
+    // neither injected nor copied into the store; the independent store token
+    // below is used instead.
+    if (
+      oauth &&
+      oauth.accessToken !== account.accessToken &&
+      !(await sharesHost(oauth.refreshToken))
+    ) {
       account = {
         ...account,
         accessToken: oauth.accessToken,

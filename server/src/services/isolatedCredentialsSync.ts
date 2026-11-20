@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { SIGN_IN_MARKER_FILE, type SignInMarker } from "@hapi/protocol";
 
 /**
  * Write-through of a freshly-obtained OAuth token into an account's EXISTING
@@ -204,6 +205,45 @@ export function syncIsolatedCredentials(
     }
   }
   return updated;
+}
+
+/**
+ * Issue #6800 (round 2, R2-1): leave the sign-in marker ({@link SIGN_IN_MARKER_FILE})
+ * in every EXISTING folder of `accountUuid`, naming only the sha256 fingerprint of
+ * the refresh token this sign-in produced. Another instance on this machine lifts
+ * its own `host-chain-shared` flag only when the folder's token matches it.
+ * Never creates a folder (the same #3541 reason as the write-through above).
+ * Best-effort by contract: never throws; returns the marker paths written.
+ */
+export function writeSignInMarker(
+  accountUuid: string,
+  refreshToken: string,
+  opts: IsolatedCredentialsSyncOptions = {},
+  now: () => number = Date.now
+): string[] {
+  const written: string[] = [];
+  if (!refreshToken) return written;
+  const marker: SignInMarker = {
+    version: 1,
+    refreshFingerprint: createHash("sha256").update(refreshToken).digest("hex"),
+    writtenAt: new Date(now()).toISOString(),
+  };
+  for (const credentialsPath of resolveIsolatedCredentialPaths(
+    accountUuid,
+    opts
+  )) {
+    const dir = dirname(credentialsPath);
+    if (!existsSync(dir)) continue;
+    try {
+      const path = join(dir, SIGN_IN_MARKER_FILE);
+      atomicWrite600(path, JSON.stringify(marker, null, 2));
+      written.push(path);
+    } catch {
+      // Best-effort: a missing marker only leaves the flag on the other
+      // instances until a sign-in there, which is the safe side.
+    }
+  }
+  return written;
 }
 
 /** Atomic write via a per-call unique tmp sibling + rename (mode 0600). */

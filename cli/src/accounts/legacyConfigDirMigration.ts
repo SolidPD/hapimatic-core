@@ -53,6 +53,7 @@ import {
   type ProbeFetchLike,
   type ProbeOutcome,
 } from "@/accounts/isolatedSnapshotRecovery";
+import { sharesHostChain } from "@/accounts/hostChainQuarantine";
 import {
   RECOVERY_LOCK_NAME,
   withAccountCredentialLock,
@@ -94,6 +95,12 @@ export interface LegacyConfigDirMigrationDeps {
    * sweep is what eventually deletes them, conservatively).
    */
   deleteLegacyAfterMigrate?: boolean;
+  /**
+   * Issue #6800 (invariant I1): true for a legacy head that must never be
+   * migrated. Defaults to {@link sharesHostChain}: a legacy copy of the
+   * `~/.claude` login chain is never copied into the machine-global folder.
+   */
+  skipHead?: (refreshToken: string) => Promise<boolean>;
 }
 
 /** A legacy candidate that read + probed successfully. */
@@ -183,10 +190,17 @@ export async function migrateLegacyIsolatedDir(
     if (await hasIsolatedConfigDir(accountUuid)) return "skipped";
 
     const credPaths = await enumerateLegacyCredentialPaths(accountUuid, deps);
+    const skipHead = deps.skipHead ?? (token => sharesHostChain(token));
     const heads: LegacyHead[] = [];
     for (const credPath of credPaths) {
       const oauth = await readLegacyCredentials(credPath);
       if (!oauth) continue;
+      if (await skipHead(oauth.refreshToken)) {
+        logger.warn(
+          `[LEGACY_MIGRATION] ${credPath} holds the ~/.claude login chain; not migrated (#6800)`
+        );
+        continue;
+      }
       const probe = await probeAccessToken(oauth.accessToken, {
         fetchImpl: deps.probeFetch,
       });

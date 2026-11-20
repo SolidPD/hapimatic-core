@@ -15,6 +15,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute, join, parse, sep } from "node:path";
 import {
+  cleanElicitationText,
   isPinSessionId,
   PIN_SAVE_MAX_BYTES,
   PIN_SAVE_MAX_FILES,
@@ -78,6 +79,13 @@ export type PinFileRefusal = {
     | "over_limit"
     | "write_failed";
   error: string;
+  /**
+   * #6540 S-2: only `nothing_to_save` sets these, when every entry was skipped:
+   * each skipped entry and its reason, at most 50, with `skippedMore` counting
+   * the rest, as a successful Save reports them.
+   */
+  skipped?: Skipped[];
+  skippedMore?: number;
 };
 
 type Roots =
@@ -165,6 +173,36 @@ async function mkdirReal(path: string): Promise<string | null> {
 
 function refusal(code: PinFileRefusal["code"], error: string): PinFileRefusal {
   return { ok: false, code, error };
+}
+
+/** The longest entry label the all-skipped refusal's text prints (#6540 S-2). */
+const ALL_SKIPPED_LABEL_MAX = 120;
+
+/**
+ * #6540 S-2: a Save whose every entry was skipped. Its text names one entry and
+ * its reason, `<path> is <reason>`, because the text is all the hub's proxy keeps
+ * of a remote session's refusal; the list rides beside it on the owning node. It
+ * names the first entry that is not a git folder (a `.git` next to the pin's
+ * pages is rarely why), else the first. Every reason pass 1 gives reads after
+ * "is"; the same-name and write-failure reasons cannot reach this refusal.
+ */
+function allSkippedRefusal(all: Skipped[]): PinFileRefusal {
+  const named = all.find(s => s.reason !== "a git folder") ?? all[0];
+  const others = all.length - 1;
+  const tail =
+    others === 0
+      ? ""
+      : `, and ${others} more ${others === 1 ? "was" : "were"} skipped`;
+  const skipped = all.slice(0, SKIPPED_REPORT_MAX);
+  const skippedMore = all.length - skipped.length;
+  return {
+    ...refusal(
+      "nothing_to_save",
+      `${cleanElicitationText(named.path, ALL_SKIPPED_LABEL_MAX)} is ${named.reason}${tail}`
+    ),
+    skipped,
+    ...(skippedMore > 0 ? { skippedMore } : {}),
+  };
 }
 
 /**
@@ -562,6 +600,7 @@ export async function savePinFiles(
     files.push(read.file);
   }
   if (files.length === 0) {
+    if (walk.skipped.length > 0) return allSkippedRefusal(walk.skipped);
     return refusal("nothing_to_save", "the pin has no files to save");
   }
 

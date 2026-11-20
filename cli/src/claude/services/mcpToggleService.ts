@@ -77,7 +77,7 @@ function configWriteErrorToCode(err: Error): McpToggleErrorCode {
  *
  * Mirrors {@link scrubHapiFromDisabledMcps}. The home write's error is RETURNED
  * (callers map it to an {@link McpToggleErrorCode}); the isolated write is
- * best-effort — a missing isolated config is benign (host-default session), any
+ * best-effort — a missing isolated config is benign (an unseeded folder), any
  * other failure is reported at WARN (it is the file CC reads).
  */
 async function applyDurableDisabledToggle(

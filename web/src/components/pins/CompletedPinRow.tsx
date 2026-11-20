@@ -10,6 +10,7 @@ import {
   PinKindBadge,
   stopRowToggle,
   usePinsContext,
+  useTitleWraps,
 } from "@/components/pins/pinsShared";
 import {
   completedAnswerText,
@@ -94,6 +95,11 @@ export type CompletedPinRowProps = {
  * #6555: the pin is one rounded box (`PIN_BOX_CLASS`) around the row and its
  * detail. `pins-completed-row` stays on the row, so the row recedes and the
  * box's outline does not.
+ * #6739 (TITLE-D): collapsed, the title fades at its edge; expanded, a title
+ * that does not fit one line wraps whole, as an open pin's does, and the other
+ * cells keep the first line. Below 600px (Pins PM ruling E2) the wrapped title
+ * takes the row's width and the answer, time, channel, and receipt move to the
+ * line below it (`pins-completed-row[data-title-wraps]` in index.css).
  */
 export const CompletedPinRow = memo(function CompletedPinRow(
   props: CompletedPinRowProps
@@ -111,24 +117,58 @@ export const CompletedPinRow = memo(function CompletedPinRow(
   const time = formatPinTime(at, timeZone);
   const channel = completedChannel(pin);
   const note = settlingAnswerNote(pin);
+  // Keyed on the title and `expanded` only: the row is memoized and gets no clock.
+  const { cellRef, wraps } = useTitleWraps<HTMLSpanElement>(
+    expanded,
+    pin.title
+  );
+  // While the title wraps, each other cell keeps the first line's 28 px.
+  const firstLine = wraps ? " h-7 items-center" : "";
+  const firstLineText = wraps ? " leading-7" : "";
   return (
     <div data-pin-box className={PIN_BOX_CLASS}>
       <div
         id={`pin-row-${pin.key}`}
         ref={armed ? undefined : register}
         onClick={toggle}
-        className="pins-completed-row cursor-pointer items-center py-px pl-1.5 pr-0.5 text-[var(--app-hint)]"
+        data-title-wraps={wraps ? "" : undefined}
+        className={`pins-completed-row cursor-pointer ${
+          wraps ? "items-start" : "items-center"
+        } py-px pl-1.5 pr-0.5 text-[var(--app-hint)]`}
         style={ROW_STYLE}
       >
-        <PinKindBadge kind={pin.kind} armed={armed} />
+        <PinKindBadge
+          kind={pin.kind}
+          armed={armed}
+          className={wraps ? "h-7 items-center" : undefined}
+        />
         {/* #6458 (TITLE-D): the title fades at its edge, never an ellipsis. Its
             12 px size sits on the cell, because FadeTruncate sets its own style. */}
-        <span className="flex min-w-0" style={TITLE_STYLE}>
-          <FadeTruncate className="font-medium text-[var(--app-fg)]">
-            {pin.title}
-          </FadeTruncate>
+        <span
+          ref={cellRef}
+          className={`pins-c-title flex min-w-0${wraps ? " py-1.5 leading-4" : ""}`}
+          style={TITLE_STYLE}
+        >
+          {wraps ? (
+            <span
+              data-pin-title-text=""
+              className="min-w-0 whitespace-normal font-medium text-[var(--app-fg)] [overflow-wrap:anywhere]"
+            >
+              {pin.title}
+            </span>
+          ) : (
+            <FadeTruncate
+              data-pin-title-text=""
+              className="font-medium text-[var(--app-fg)]"
+            >
+              {pin.title}
+            </FadeTruncate>
+          )}
         </span>
-        <span onClick={stopRowToggle} className={CELL}>
+        <span
+          onClick={stopRowToggle}
+          className={`${CELL} pins-c-ans${firstLineText}`}
+        >
           <PinIndicator
             armed={armed}
             label={answer === "—" ? "No answer on record" : answer}
@@ -137,20 +177,32 @@ export const CompletedPinRow = memo(function CompletedPinRow(
             {answer}
           </PinIndicator>
         </span>
-        <span onClick={stopRowToggle} className={`${CELL} pins-c-time`}>
+        <span
+          onClick={stopRowToggle}
+          className={`${CELL} pins-c-time${firstLineText}`}
+        >
           <PinIndicator armed={armed} label={`Completed ${time}`}>
             {time}
           </PinIndicator>
         </span>
-        <span onClick={stopRowToggle} className={`${CELL} pins-c-via`}>
+        <span
+          onClick={stopRowToggle}
+          className={`${CELL} pins-c-via${firstLineText}`}
+        >
           <PinIndicator armed={armed} label={`Answered ${channel}`}>
             {channel}
           </PinIndicator>
         </span>
-        <span onClick={stopRowToggle} className="flex min-w-0">
+        <span
+          onClick={stopRowToggle}
+          className={`pins-c-receipt flex min-w-0${firstLine}`}
+        >
           <Receipt model={model} armed={armed} />
         </span>
-        <span onClick={stopRowToggle} className="flex self-stretch">
+        <span
+          onClick={stopRowToggle}
+          className={`pins-c-toggle ${wraps ? "flex h-7" : "flex self-stretch"}`}
+        >
           <PinDetailsToggle
             pinKey={pin.key}
             expanded={expanded}

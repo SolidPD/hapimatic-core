@@ -146,7 +146,6 @@ export function makeFakeApi(apiMachine: FakeApiMachine) {
   return {
     getOrCreateMachine: vi.fn(async () => ({ id: "machine-1" })),
     machineSyncClient: vi.fn(() => apiMachine),
-    reportAccountCaptured: vi.fn(async () => undefined),
     updateMcpStatus: vi.fn(async () => undefined),
   };
 }

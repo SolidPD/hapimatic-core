@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { STOP_HOOK_FEEDBACK_PREFIX } from "@hapi/protocol";
 import { unwrapRoleWrappedRecordEnvelope } from "@hapi/protocol/messages";
 
 /**
@@ -185,4 +186,41 @@ export function extractUserFacingAssistantTexts(
   return message !== null && message.trim() !== ""
     ? [{ text: message, complete: false }]
     : [];
+}
+
+/**
+ * #6738: whether a stored record is the one Claude Code writes when a Stop hook
+ * blocks a turn end (any Stop hook's, not only Pins'): an agent `output` record
+ * whose data is a meta `user` record, not a sidechain one, whose first text
+ * block (or plain-string content) starts with "Stop hook feedback:" and a
+ * newline. The turn-end check reads the message just before each one as the
+ * message that Stop hook judged. A tool result that quotes the text, an
+ * assistant record, a Codex record and a record that only holds the prefix
+ * later are not one. Total: never throws.
+ */
+export function isStopHookFeedbackRecord(content: unknown): boolean {
+  const record = unwrapRoleWrappedRecordEnvelope(content);
+  if (!record || record.role !== "agent" || !isObject(record.content)) {
+    return false;
+  }
+  const inner = record.content;
+  if (inner.type !== "output") return false;
+  const data = isObject(inner.data) ? inner.data : null;
+  if (!data || data.type !== "user" || data.isMeta !== true) return false;
+  if (data.isSidechain === true) return false;
+  const message = isObject(data.message) ? data.message : null;
+  if (!message) return false;
+  let text: unknown = null;
+  if (typeof message.content === "string") {
+    text = message.content;
+  } else if (Array.isArray(message.content)) {
+    const block = message.content.find(
+      b => isObject(b) && b.type === "text"
+    ) as Record<string, unknown> | undefined;
+    text = block?.text;
+  }
+  return (
+    typeof text === "string" &&
+    text.startsWith(`${STOP_HOOK_FEEDBACK_PREFIX}\n`)
+  );
 }

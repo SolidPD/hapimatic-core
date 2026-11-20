@@ -2,19 +2,21 @@
 import {
   chmod,
   mkdir,
+  readdir,
   readFile,
   rename,
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { FileLockTimeoutError, withFileLock } from "@/utils/fileLock";
 import { isTenantVm } from "@hapi/protocol/tenantMode";
 import { configuration } from "@/configuration";
 import { logger } from "@/ui/logger";
 import {
+  HOST_CHAIN_SHARED_REASON,
+  isEnvTokenAccount,
   validateAccountIndex,
   validateStoredAccount,
   validateAnyStoredAccount,
@@ -25,6 +27,10 @@ import {
   type ValidateAnyAccountResult,
 } from "@hapi/protocol/accounts";
 import { deserializeAccount, serializeAccount } from "@/accounts/storedAccount";
+import {
+  readSignInMarkerIn,
+  signInMarkerNamesToken,
+} from "@/accounts/signInMarker";
 import type { UtilizationSnapshot } from "@/accounts/selectHealthyAccount";
 
 /**
@@ -72,7 +78,7 @@ export class AccountStoreLockTimeoutError extends Error {
   }
 }
 
-/** Relevant slice of ~/.claude/.credentials.json (migration source — tokens). */
+/** Relevant slice of a folder's `.credentials.json` (adoption source — tokens). */
 interface ClaudeCredentialsFile {
   claudeAiOauth?: {
     accessToken?: string;
@@ -84,7 +90,7 @@ interface ClaudeCredentialsFile {
   };
 }
 
-/** Relevant slice of ~/.claude.json (migration source — identity + PK). */
+/** Relevant slice of a folder's `.claude.json` (adoption source — identity + PK). */
 interface ClaudeConfigFile {
   oauthAccount?: {
     accountUuid?: string;
@@ -97,14 +103,35 @@ interface ClaudeConfigFile {
 }
 
 /**
- * Override points for the initial-population migration sources. Default to the
- * real `~/.claude/.credentials.json` + `~/.claude.json`. Tests inject temp-dir
- * paths so they never touch the real files (issue #1447 R8 test isolation).
+ * Override points for the boot-time folder adoption (issue #6800; it replaced
+ * the #1447 first-run migration from `~/.claude`). Tests inject temp-dir values
+ * so they never touch the real files.
  */
-export interface AccountStoreMigrationSources {
-  credentialsPath?: string;
-  claudeConfigPath?: string;
+export interface AccountStoreAdoptionSources {
+  /** The machine-global account-configs root. Default `configuration.accountConfigsDir`. */
+  accountConfigsDir?: string;
+  /**
+   * The sha256 fingerprint of the `~/.claude` refresh token, or null. A folder
+   * holding that token is never adopted. The daemon passes
+   * `hostChainQuarantine.readHostRefreshFingerprint` to the method instead,
+   * because that module imports this one.
+   */
+  readHostRefreshFingerprint?: () => Promise<string | null>;
+  /**
+   * Issue #6837 (R6): the account uuid `~/.claude.json` names, null when it names
+   * none, or `"unreadable"`. The folder of that account is adopted quarantined
+   * unless a Provider Accounts sign-in marker names its token. The daemon passes
+   * `hostChainQuarantine.readHostNamedUuid` to the method instead, because that
+   * module imports this one. With no reader, adoption is skipped (adopting
+   * unflagged could create an unquarantined copy of the `~/.claude` chain).
+   */
+  readHostNamedUuid?: () => Promise<string | null | "unreadable">;
 }
+
+/** Issue #6837 (R6): reads of `~/.claude.json` before adoption gives up for this boot. */
+const HOST_NAMED_READ_ATTEMPTS = 3;
+/** Issue #6837 (R6): the wait between those reads, for a file caught mid-write. */
+const HOST_NAMED_READ_RETRY_MS = 300;
 
 /** Empty index used when no index file exists yet or the on-disk one is corrupt. */
 function emptyIndex(): AccountIndex {
@@ -125,20 +152,13 @@ function emptyIndex(): AccountIndex {
  * - `get()` returns `{ok:true,account}` for a valid record, `{ok:false,error}`
  *   for a malformed one (skip-or-surface, R6), and `null` for an unknown UUID
  *   (R3). The discriminated union distinguishes "absent" from "corrupt".
- * - The initial-population migration (capturing the machine's existing Claude
- *   Code account) runs lazily on the FIRST `list()` call — never in the
- *   constructor, never on `get`/`put`/`delete`. It never deletes the source
- *   files (R8).
+ * - Issue #6800: there is no first-run migration from `~/.claude` any more.
+ *   The daemon calls {@link AccountStore.adoptIndependentAccountFolders} once at
+ *   boot; `list()`, `get()`, `put()` and `delete()` never adopt or migrate.
  * - Token VALUES never reach the logger at any level — only `accountUuid` /
  *   `emailAddress` / counts (R9).
  */
 export class AccountStore {
-  private initialized = false;
-  /** Set to true after the first successful account write (migration or explicit put).
-   * Guards the mid-run recovery path in list() so it only fires when the store was
-   * previously seeded — not on every list() call for a fresh/empty store (#1513). */
-  private wasSeeded = false;
-
   /**
    * In-memory utilization snapshot cache (issue #3023). The daemon's per-tick sampler
    * (`utilizationSampler.ts`) writes each account's `{score, fetchedAt}` here; the
@@ -154,13 +174,12 @@ export class AccountStore {
 
   /**
    * @param tenantVm Issue #4349 (R3): the tenant predicate (test seam). On a TENANT VM the
-   * first-run migration is a no-op — Hapimatic never copies the host `claude /login` credential
-   * into its own store there. Defaults to `@hapi/protocol/tenantMode`'s `isTenantVm` (imported
+   * boot adoption is a no-op. Defaults to `@hapi/protocol/tenantMode`'s `isTenantVm` (imported
    * directly, not through the cli's tenantMode module, so this foundation module has no cycle).
    */
   constructor(
     private readonly accountsDir: string,
-    private readonly migrationSources: AccountStoreMigrationSources = {},
+    private readonly adoptionSources: AccountStoreAdoptionSources = {},
     private readonly tenantVm: () => boolean = isTenantVm
   ) {}
 
@@ -191,37 +210,17 @@ export class AccountStore {
 
   /**
    * Enumerate accounts from the index file. Returns `[]` on a fresh/empty
-   * directory or a malformed index (never crashes — R1). Triggers the lazy
-   * initial-population migration on first call.
+   * directory or a malformed index (never crashes — R1). Never adopts or
+   * migrates (#6800): a lost store is refilled by the next daemon boot's
+   * {@link adoptIndependentAccountFolders}, or by a sign-in.
    */
   async list(): Promise<AccountIndexEntry[]> {
-    await this.ensureInitialized();
-
     let raw: string;
     try {
       raw = await readFile(this.indexPath, "utf-8");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      // Accounts directory was lost mid-run (issue #1513). Only attempt recovery
-      // when the store was previously seeded (this.wasSeeded === true) — avoids
-      // spurious warns on fresh stores where migration found no credentials.
-      if (this.initialized && this.wasSeeded) {
-        logger.warn(
-          "[ACCOUNT_STORE] index file absent after initialization — accounts directory lost mid-run; attempting re-seed"
-        );
-        // Reset both flags so a second failed recovery doesn't repeatedly warn.
-        // put() will re-set wasSeeded to true if migration succeeds.
-        this.initialized = false;
-        this.wasSeeded = false;
-        await this.ensureInitialized();
-        try {
-          raw = await readFile(this.indexPath, "utf-8");
-        } catch {
-          return [];
-        }
-      } else {
-        return [];
-      }
+      return [];
     }
 
     let parsed: unknown;
@@ -322,7 +321,6 @@ export class AccountStore {
       return { ...index, accounts: [...others, entry] };
     });
 
-    this.wasSeeded = true;
     logger.debug(
       `[ACCOUNT_STORE] put account ${account.accountUuid} (email: ${account.emailAddress ? "present" : "absent"})`
     );
@@ -352,6 +350,41 @@ export class AccountStore {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * Issue #6800 (R2): the node's ANTHROPIC default account — `active.json`'s
+   * top-level `activeAccountUuid` (written by the server-side `AccountService`).
+   * An un-pinned Anthropic spawn binds it explicitly. Mirrors
+   * {@link getActiveProviderDefault}: `undefined` when the file is absent or
+   * malformed, or the value fails the UUID gate.
+   */
+  async getActiveAnthropicDefault(): Promise<string | undefined> {
+    let raw: string;
+    try {
+      raw = await readFile(this.activePath, "utf-8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") {
+        // An unreadable default is not "no default": say so, because the
+        // spawn then binds a fallback account (#6800 review F7).
+        logger.warn(
+          `[ACCOUNT_STORE] active.json cannot be read (${code ?? "read error"}); un-pinned spawns use the fallback account`
+        );
+      }
+      return undefined;
+    }
+    let uuid: unknown;
+    try {
+      uuid = (JSON.parse(raw) as { activeAccountUuid?: unknown })
+        ?.activeAccountUuid;
+    } catch {
+      logger.warn(
+        "[ACCOUNT_STORE] active.json is not valid JSON; un-pinned spawns use the fallback account"
+      );
+      return undefined;
+    }
+    return typeof uuid === "string" && UUID_REGEX.test(uuid) ? uuid : undefined;
   }
 
   /**
@@ -503,101 +536,291 @@ export class AccountStore {
   }
 
   /**
-   * Run the initial-population migration once, on the first `list()` in a fresh
-   * instance (no index yet). Guarded by an in-memory flag set BEFORE migration
-   * runs, so the `put()` it issues never re-enters here. Best-effort: migration
-   * failures are logged and swallowed so they never break `list()`.
+   * True when this store holds a usable Anthropic OAuth record: provider absent
+   * or `anthropic`, not an env-token account, and not quarantined with reason
+   * `host-chain-shared` (#6800). A record flagged for any other reason counts.
    */
-  private async ensureInitialized(): Promise<void> {
-    if (this.initialized) return;
-    this.initialized = true;
-    try {
-      if (!(await this.indexExists())) {
-        await this.migrateFromClaudeCredentials();
+  private async hasUsableAnthropicAccount(): Promise<boolean> {
+    for (const entry of await this.list()) {
+      if ((entry.provider ?? "anthropic") !== "anthropic") continue;
+      const res = await this.get(entry.accountUuid).catch(() => null);
+      if (!res || !res.ok) continue;
+      const account = res.account;
+      if (isEnvTokenAccount(account)) continue;
+      if (
+        account.unrefreshable === true &&
+        account.unrefreshableReason === HOST_CHAIN_SHARED_REASON
+      ) {
+        continue;
       }
-    } catch (err) {
-      logger.debug(
-        `[ACCOUNT_STORE] initial migration failed (continuing empty): ${err instanceof Error ? err.message : String(err)}`
-      );
+      return true;
     }
+    return false;
   }
 
-  private async indexExists(): Promise<boolean> {
+  /**
+   * Issue #6800 (ruling D3 (ii)): when this store holds no usable Anthropic OAuth
+   * record ({@link hasUsableAnthropicAccount}), adopt every independent account
+   * folder on the machine. Called ONCE at each daemon boot (after the
+   * shared-chain detector's boot pass, before the control server); `list()` and
+   * the CLI commands never adopt. It replaces the #1447 first-run migration,
+   * which copied the `~/.claude` login chain into the store.
+   *
+   * A folder is a UUID-named directory directly under the machine-global
+   * account-configs root (legacy per-instance folders are not adopted). It is
+   * adopted only when:
+   *  - its `.claude.json` `oauthAccount.accountUuid` is a UUID equal to the
+   *    folder name (`buildIsolatedClaudeJson` writes it; a non-Anthropic
+   *    provider folder has none);
+   *  - its `.credentials.json` holds both tokens, and the refresh token's
+   *    fingerprint differs from the `~/.claude` fingerprint;
+   *  - this store has no record for that uuid yet (a quarantined record is
+   *    left as it is);
+   *  - the uuid is not in this instance's removal tombstone,
+   *    `accounts/removed.json` (issue #6837 R5): an Anthropic delete removes only
+   *    the store record and leaves the machine-global folder, so without this an
+   *    account the operator removed came back at the next daemon boot.
+   * The folder of the account `~/.claude.json` names is adopted QUARANTINED
+   * (`unrefreshable`, reason `host-chain-shared`, the fingerprint of the folder's
+   * own token) unless a Provider Accounts sign-in marker names the folder's
+   * current refresh token (issue #6837 R6). A token that merely differs from the
+   * current `~/.claude` token is no proof of independence: it may be an older
+   * token of the same chain (#6800 round 2, `shared/src/accounts.ts`
+   * `SIGN_IN_MARKER_FILE`). Known limit: that quarantine fires on every fresh
+   * store unless a Provider Accounts sign-in happened within the current token's
+   * lifetime, because the marker is written only by a sign-in while every refresh
+   * replaces the folder's token; one sign-in clears it.
+   * Fails closed for the boot (adopts nothing, one warn) when there is no reader
+   * of the account `~/.claude.json` names, when `~/.claude.json` still cannot be
+   * read after {@link HOST_NAMED_READ_ATTEMPTS} reads, or when the tombstone
+   * exists but cannot be read.
+   * The tokens come from the FOLDER, never from `~/.claude`. Never on a tenant.
+   * Never throws, never writes a folder, never writes `active.json` (I10).
+   *
+   * @returns the adopted uuids (quarantined ones included).
+   */
+  async adoptIndependentAccountFolders(
+    sources: Pick<
+      AccountStoreAdoptionSources,
+      "readHostRefreshFingerprint" | "readHostNamedUuid"
+    > = {}
+  ): Promise<string[]> {
+    const adopted: string[] = [];
     try {
-      await readFile(this.indexPath, "utf-8");
-      return true;
+      if (this.tenantVm()) return adopted;
+      if (await this.hasUsableAnthropicAccount()) return adopted;
+      const readHostFp =
+        sources.readHostRefreshFingerprint ??
+        this.adoptionSources.readHostRefreshFingerprint;
+      if (!readHostFp) {
+        logger.warn(
+          "[ACCOUNT_STORE] folder adoption skipped: no ~/.claude fingerprint reader"
+        );
+        return adopted;
+      }
+      const readHostNamed =
+        sources.readHostNamedUuid ?? this.adoptionSources.readHostNamedUuid;
+      if (!readHostNamed) {
+        logger.warn(
+          "[ACCOUNT_STORE] folder adoption skipped: no reader of the account ~/.claude.json names"
+        );
+        return adopted;
+      }
+      // Fixed reason text in both warns, never parser text, which could quote
+      // file content.
+      const removed = await this.readRemovedUuids();
+      if (removed === "unreadable") {
+        logger.warn(
+          "[ACCOUNT_STORE] folder adoption skipped this boot: accounts/removed.json cannot be read; fix or delete accounts/removed.json, then restart the daemon"
+        );
+        return adopted;
+      }
+      const hostNamed = await this.readHostNamedWithRetry(readHostNamed);
+      if (hostNamed === "unreadable") {
+        logger.warn(
+          "[ACCOUNT_STORE] folder adoption skipped this boot: ~/.claude.json cannot be read; it runs again at the next daemon start"
+        );
+        return adopted;
+      }
+      const hostFp = await readHostFp().catch(() => null);
+      const root =
+        this.adoptionSources.accountConfigsDir ??
+        configuration.accountConfigsDir;
+      const entries = await readdir(root, { withFileTypes: true }).catch(
+        () => []
+      );
+      for (const entry of entries) {
+        const uuid = entry.name;
+        if (!entry.isDirectory() || !UUID_REGEX.test(uuid)) continue;
+        const skip = (why: string): void => {
+          logger.info(`[ACCOUNT_STORE] folder ${uuid} not adopted: ${why}`);
+        };
+        // A record it cannot read is not "no record": adopting would overwrite
+        // it and drop its flag (#6800 review F12).
+        let existing: Awaited<ReturnType<AccountStore["get"]>>;
+        try {
+          existing = await this.get(uuid);
+        } catch {
+          skip("its store record cannot be read");
+          continue;
+        }
+        if (existing !== null) {
+          skip("this store already has a record for it");
+          continue;
+        }
+        if (removed.has(uuid)) {
+          skip("it was removed on this instance (accounts/removed.json)");
+          continue;
+        }
+        const identity = (
+          await this.readJsonSlice<ClaudeConfigFile>(
+            join(root, uuid, ".claude.json")
+          )
+        )?.oauthAccount;
+        if (!identity?.accountUuid || identity.accountUuid !== uuid) {
+          skip("its .claude.json names no matching account");
+          continue;
+        }
+        const oauth = (
+          await this.readJsonSlice<ClaudeCredentialsFile>(
+            join(root, uuid, ".credentials.json")
+          )
+        )?.claudeAiOauth;
+        if (!oauth?.accessToken || !oauth.refreshToken) {
+          skip("its .credentials.json holds no login");
+          continue;
+        }
+        const fingerprint = createHash("sha256")
+          .update(oauth.refreshToken)
+          .digest("hex");
+        if (hostFp && fingerprint === hostFp) {
+          skip("it holds the ~/.claude login chain");
+          continue;
+        }
+        // Issue #6837 (R6): the account ~/.claude.json names is independent of
+        // the ~/.claude chain only when a Provider Accounts sign-in produced the
+        // folder's current token. All three flag fields go together: without the
+        // reason the stale-flag clear takes its legacy probe arm, and without the
+        // fingerprint the detector never sees the record as already flagged.
+        const quarantine =
+          hostNamed === uuid &&
+          !signInMarkerNamesToken(
+            await readSignInMarkerIn(join(root, uuid)),
+            oauth.refreshToken
+          );
+        const now = Date.now();
+        const validation = validateStoredAccount({
+          schema_version: 1 as const,
+          accountUuid: uuid,
+          emailAddress: identity.emailAddress ?? "",
+          organizationUuid: identity.organizationUuid ?? "",
+          organizationName: identity.organizationName ?? "",
+          displayName: identity.displayName ?? "",
+          billingType: identity.billingType ?? "",
+          subscriptionType: oauth.subscriptionType ?? "",
+          rateLimitTier: oauth.rateLimitTier ?? "",
+          accessToken: oauth.accessToken,
+          refreshToken: oauth.refreshToken,
+          expiresAt: oauth.expiresAt ?? 0,
+          scopes: oauth.scopes ?? [],
+          capturedAt: now,
+          lastUsedAt: 0,
+          lastRefreshedAt: 0,
+          ...(quarantine
+            ? {
+                unrefreshable: true,
+                unrefreshableReason: HOST_CHAIN_SHARED_REASON,
+                unrefreshableTokenFingerprint: fingerprint,
+              }
+            : {}),
+        });
+        if (!validation.ok) {
+          skip(`the record failed validation (${validation.error})`);
+          continue;
+        }
+        await this.put(validation.account);
+        adopted.push(uuid);
+        const email = validation.account.emailAddress ? "present" : "absent";
+        if (quarantine) {
+          logger.info(
+            `[ACCOUNT_STORE] adopted the account folder ${uuid} quarantined (host-chain-shared): it is the account ~/.claude.json names and no Provider Accounts sign-in marker names its token; sign it in again under Settings → Provider Accounts (email: ${email})`
+          );
+        } else {
+          logger.info(
+            `[ACCOUNT_STORE] adopted the independent account folder ${uuid} (email: ${email})`
+          );
+        }
+      }
+      if (adopted.length === 0) {
+        logger.info(
+          "[ACCOUNT_STORE] no independent account folder on this machine; sign an account in through Provider Accounts"
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        `[ACCOUNT_STORE] folder adoption failed (continuing): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    return adopted;
+  }
+
+  /**
+   * Issue #6837 (R5): the uuids this instance's removal tombstone lists,
+   * `accounts/removed.json`, written by the server's `AccountService` on every
+   * account delete. Keep the shape in step with its reader
+   * (`server/src/services/accountService.ts` `readTombstones`):
+   * `{ schema_version, removed: string[] }`, keeping only UUID strings. A missing
+   * file is an empty set. A file that exists but cannot be read, is not JSON, or
+   * has no `removed` array is `"unreadable"`: adoption then fails closed, unlike
+   * the server, which reads such a file as "nothing removed" because its importer
+   * only hides records, while adoption would re-create a removed account. The
+   * CLI never writes or deletes the file.
+   */
+  private async readRemovedUuids(): Promise<Set<string> | "unreadable"> {
+    let raw: string;
+    try {
+      raw = await readFile(join(this.accountsDir, "removed.json"), "utf-8");
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "ENOENT"
+        ? new Set<string>()
+        : "unreadable";
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const removed =
+        typeof parsed === "object" && parsed !== null
+          ? (parsed as { removed?: unknown }).removed
+          : undefined;
+      if (!Array.isArray(removed)) return "unreadable";
+      return new Set(
+        removed.filter(
+          (uuid): uuid is string =>
+            typeof uuid === "string" && UUID_REGEX.test(uuid)
+        )
+      );
     } catch {
-      return false;
+      return "unreadable";
     }
   }
 
   /**
-   * Capture the machine's existing Claude Code account as the initial store
-   * entry (R8). Tokens come from `~/.claude/.credentials.json` `claudeAiOauth`;
-   * identity (incl. the primary key `accountUuid`) from `~/.claude.json`
-   * `oauthAccount`. Skips gracefully when either source lacks the required
-   * pieces — a record cannot exist without its PK or tokens. NEVER reads
-   * `mcpOAuth` and NEVER deletes the source files.
+   * Issue #6837 (R6): read the account `~/.claude.json` names, retrying a few
+   * hundred ms apart, because adoption runs only at daemon start and a file
+   * caught mid-write would otherwise leave a fresh store empty until the next
+   * restart. A throw counts as `"unreadable"`.
    */
-  private async migrateFromClaudeCredentials(): Promise<void> {
-    if (this.tenantVm()) {
-      logger.info(
-        "[ACCOUNT_STORE] tenant VM: the host credential is not copied into the account store (#4349)"
+  private async readHostNamedWithRetry(
+    read: () => Promise<string | null | "unreadable">
+  ): Promise<string | null | "unreadable"> {
+    for (let attempt = 1; ; attempt++) {
+      const named = await read().catch(() => "unreadable" as const);
+      if (named !== "unreadable" || attempt >= HOST_NAMED_READ_ATTEMPTS) {
+        return named;
+      }
+      await new Promise<void>(resolve =>
+        setTimeout(resolve, HOST_NAMED_READ_RETRY_MS)
       );
-      return;
     }
-    const credentialsPath =
-      this.migrationSources.credentialsPath ??
-      join(homedir(), ".claude", ".credentials.json");
-    const claudeConfigPath =
-      this.migrationSources.claudeConfigPath ?? join(homedir(), ".claude.json");
-
-    const credFile =
-      await this.readJsonSlice<ClaudeCredentialsFile>(credentialsPath);
-    const cfgFile =
-      await this.readJsonSlice<ClaudeConfigFile>(claudeConfigPath);
-    const oauth = credFile?.claudeAiOauth;
-    const identity = cfgFile?.oauthAccount;
-
-    if (!oauth?.accessToken || !identity?.accountUuid) {
-      logger.debug(
-        `[ACCOUNT_STORE] migration skipped (tokens: ${oauth?.accessToken ? "present" : "absent"}, accountUuid: ${identity?.accountUuid ? "present" : "absent"})`
-      );
-      return;
-    }
-
-    const now = Date.now();
-    const candidate = {
-      schema_version: 1 as const,
-      accountUuid: identity.accountUuid,
-      emailAddress: identity.emailAddress ?? "",
-      organizationUuid: identity.organizationUuid ?? "",
-      organizationName: identity.organizationName ?? "",
-      displayName: identity.displayName ?? "",
-      billingType: identity.billingType ?? "",
-      subscriptionType: oauth.subscriptionType ?? "",
-      rateLimitTier: oauth.rateLimitTier ?? "",
-      accessToken: oauth.accessToken,
-      refreshToken: oauth.refreshToken ?? "",
-      expiresAt: oauth.expiresAt ?? 0,
-      scopes: oauth.scopes ?? [],
-      capturedAt: now,
-      lastUsedAt: 0,
-      lastRefreshedAt: 0,
-    };
-
-    const validation = validateStoredAccount(candidate);
-    if (!validation.ok) {
-      logger.debug(
-        `[ACCOUNT_STORE] migration candidate failed validation (${validation.error}); skipping`
-      );
-      return;
-    }
-
-    await this.put(validation.account);
-    logger.debug(
-      `[ACCOUNT_STORE] migrated initial account ${validation.account.accountUuid} (email: ${validation.account.emailAddress ? "present" : "absent"})`
-    );
   }
 
   /** Read + JSON.parse a file; undefined on any error (missing/corrupt). */

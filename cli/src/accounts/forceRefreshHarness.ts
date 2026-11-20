@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { SiblingBindingScan } from "@/accounts/machineRotator";
 import type {
   ForceRefreshOutcome,
   TokenRefreshAccountStore,
@@ -19,6 +20,10 @@ import type {
  *   2. store delta               (accessToken changed, expiresAt advanced, lastRefreshedAt updated)
  *   3. restartBoundSessions fired
  *   4. bound-session respawn
+ *
+ * Issue #6847: before step 1, a sibling-instance guard refuses (`overall:
+ * "skipped"`) an account a session of another Hapimatic instance on this machine
+ * holds, because step 3 restarts only this instance's sessions.
  *
  * Pure + dependency-injected (mirrors `tokenRefreshService.test.ts` style) so it is
  * unit-testable without the network, the daemon, or the real account store.
@@ -41,7 +46,114 @@ export interface ForceRefreshHarnessDeps {
   restartBoundSessions: (accountUuid: string) => Promise<RestartSummary>;
   /** Clock seam (default `Date.now`) — for `durationMs`. DI for tests. */
   now?: () => number;
+  /**
+   * Issue #6837 (R4): whether the account's token lives in its machine-global
+   * folder. The daemon passes `isIsolatedAccountAnywhere`, the predicate
+   * `TokenRefreshService.forceRefresh` routes on. Absent, or a throw, reads as
+   * non-isolated, which keeps the stale-copy warning.
+   */
+  isIsolatedAccount?: (accountUuid: string) => Promise<boolean>;
+  /**
+   * Issue #6837 (R4): `configuration.accountConfigsShared`. With the
+   * `HAPI_ACCOUNT_CONFIG_SHARED=0` switch each instance has its own folder, so
+   * nothing copies the new token to the others. Absent reads as `true`.
+   */
+  accountConfigsShared?: boolean;
+  /**
+   * Issue #6847: the accounts bound by a live session of ANOTHER Hapimatic
+   * instance on this machine — the same view the idle backstop skips on
+   * (`tokenRefreshService.ts` `refreshIdleIsolatedAccounts`, #4423 R5). The
+   * daemon passes the one closure it also gives the service. A sibling-bound
+   * account is refused before any OAuth call, because the restart step reaches
+   * only this instance's sessions; a degraded view (or a throw) refuses too.
+   * The scan reads `/proc`, so off Linux it is empty and nothing is refused, as
+   * for the idle backstop. Absent: no guard (unit tests that do not exercise it).
+   */
+  getSiblingBoundAccounts?: () => Promise<SiblingBindingScan>;
 }
+
+/**
+ * Issue #6837 (R4): the line a successful force-refresh of an isolated account
+ * reports. Every running non-tenant daemon's maintenance tick mirrors a newer
+ * folder pair into its own store (`isolatedCredentialsMirror.ts`). Issue #6847:
+ * on Linux a session of the account already running in another instance on this
+ * machine refuses the run (SKIPPED) before the rotation. Off Linux the sibling
+ * scan sees nothing, so such a session, like one that starts while the rotation
+ * runs, is not restarted. It stays in `warnings[]`, so it prints under
+ * "Warnings".
+ */
+export const ISOLATED_RESYNC_NOTE =
+  "The account's folder holds the new token; each running Hapimatic instance on this machine that holds this account copies it into its store on its next maintenance tick (about a minute), and a stopped one on its first tick after it starts. On Linux a session of this account in another instance on this machine stops the rotation (the run reports SKIPPED); on other systems, or when it starts while the rotation runs, that session is not restarted and may need a restart.";
+
+/** Issue #6847: the guard step's name in a report. */
+export const SIBLING_GUARD_STEP = "sibling-instance guard";
+
+/**
+ * Issue #6847 (R1-R3): the report for a run the sibling guard refused. No OAuth
+ * call was made and nothing was written or restarted, so the later steps are
+ * `skipped` and the report carries no `tokenRotated` and no stale-copy warning.
+ */
+function siblingRefusalReport(
+  accountUuid: string,
+  emailAddress: string | undefined,
+  durationMs: number,
+  scan: SiblingBindingScan,
+  reason: "sibling-bound" | "sibling-view-degraded"
+): ForceRefreshReport {
+  // One entry per session: a session's native `claude` child inherits the
+  // wrapper's HAPI_SESSION_ID, so the scan lists both under one tag. The first
+  // process seen for a tag stands for it; an untagged process is kept by pid.
+  const seenTags = new Set<string>();
+  const holders = (
+    reason === "sibling-bound" ? (scan.holders?.get(accountUuid) ?? []) : []
+  )
+    .filter(h => {
+      if (h.sessionTag === null) return true;
+      if (seenTags.has(h.sessionTag)) return false;
+      seenTags.add(h.sessionTag);
+      return true;
+    })
+    .map(h => ({ pid: h.pid, hapiHome: h.hapiHome, sessionTag: h.sessionTag }));
+  let detail: string;
+  if (reason === "sibling-bound") {
+    const named =
+      holders.length > 0
+        ? holders
+            .map(h => {
+              const home = h.hapiHome ?? "unknown";
+              return h.sessionTag === null
+                ? `pid ${h.pid} (instance ${home})`
+                : `${h.sessionTag} (instance ${home}, pid ${h.pid})`;
+            })
+            .join("; ")
+        : "its process could not be named";
+    detail = `a session of this account is running under another Hapimatic instance on this machine: ${named}. Rotating the login would end that session's access, and only this instance's sessions are restarted. Stop that session, or run \`hapi accounts force-refresh ${accountUuid}\` from that instance.`;
+  } else {
+    detail =
+      "cannot list this machine's processes (/proc), so a session of this account under another Hapimatic instance cannot be ruled out; not rotated (fail-safe). Retry, or run it from the instance whose session uses this account.";
+  }
+  const notRun = "not run: sibling-instance guard";
+  return {
+    accountUuid,
+    emailAddress,
+    overall: "skipped",
+    durationMs,
+    steps: [
+      { name: SIBLING_GUARD_STEP, status: "skipped", detail },
+      { name: "OAuth fetch", status: "skipped", detail: notRun },
+      { name: "store delta", status: "skipped", detail: notRun },
+      { name: "restartBoundSessions", status: "skipped", detail: notRun },
+    ],
+    tokenRotated: false,
+    crossInstanceResyncNeeded: false,
+    warnings: [],
+    skip: { reason, holders },
+  };
+}
+
+/** The line for a non-isolated account, whose other store copies nothing re-syncs. */
+export const STALE_COPY_WARNING =
+  "Token rotated — if this account exists in another Hapimatic instance's store, that copy is now STALE and must be re-synced (no store copy is re-synced automatically).";
 
 /**
  * Redacted fingerprint of an access token for delta comparison. NEVER returns the
@@ -86,36 +198,47 @@ export async function runForceRefreshHarness(
   const beforeExpiresAt = beforeAccount.expiresAt;
   const beforeLastRefreshed = beforeAccount.lastRefreshedAt;
 
+  // Issue #6847: refuse an account a session of a SIBLING instance on this machine
+  // holds, before any OAuth call — the idle backstop's guard (#4423 R5). Read the
+  // view fresh, right before the rotation, to keep the race window narrow; a
+  // throwing scan fails safe as degraded, as the idle backstop's does.
+  if (deps.getSiblingBoundAccounts) {
+    const scan: SiblingBindingScan = await deps
+      .getSiblingBoundAccounts()
+      .catch(() => ({ uuids: new Set<string>(), degraded: true }));
+    if (scan.uuids.has(accountUuid)) {
+      return siblingRefusalReport(
+        accountUuid,
+        emailAddress,
+        now() - start,
+        scan,
+        "sibling-bound"
+      );
+    }
+    if (scan.degraded) {
+      return siblingRefusalReport(
+        accountUuid,
+        emailAddress,
+        now() - start,
+        scan,
+        "sibling-view-degraded"
+      );
+    }
+  }
+
+  // Issue #6837 (R4): read ONCE, before the refresh, so the message describes the
+  // path forceRefresh takes (it routes on the same predicate).
+  let isolated = false;
+  if (deps.accountConfigsShared !== false && deps.isIsolatedAccount) {
+    try {
+      isolated = await deps.isIsolatedAccount(accountUuid);
+    } catch {
+      isolated = false;
+    }
+  }
+
   // --- Force the refresh (step 1) ----------------------------------------------
   const outcome = await deps.forceRefresh(accountUuid);
-
-  if (outcome.kind === "host-default-deferred") {
-    // R3: expected outcome, NOT a failure.
-    steps.push({
-      name: "OAuth fetch",
-      status: "skipped",
-      detail:
-        "deferred to native — host-default account is not refreshable by Hapimatic (#1520)",
-    });
-    steps.push({
-      name: "store delta",
-      status: "skipped",
-      detail: "no refresh attempted (host-default deferral)",
-    });
-    steps.push({
-      name: "restartBoundSessions",
-      status: "skipped",
-      detail: "no refresh attempted (host-default deferral)",
-    });
-    return {
-      accountUuid,
-      emailAddress: outcome.emailAddress,
-      overall: "deferred",
-      durationMs: now() - start,
-      steps,
-      warnings,
-    };
-  }
 
   if (outcome.kind === "not-found") {
     // Race: the account vanished between the snapshot and the refresh.
@@ -244,13 +367,11 @@ export async function runForceRefreshHarness(
     }
   }
 
-  // R6: a successful refresh of a non-host account rotates the token and stales the
-  // same account's stored copy in every OTHER Hapimatic instance (prod/dev/other
-  // worktrees). forceRefresh already deferred the host-default account, so reaching
-  // here means this IS a non-host account → the rotation always needs a re-sync flag.
-  warnings.push(
-    "Token rotated — if this account exists in another Hapimatic instance's store, that copy is now STALE and must be re-synced (only the host-default account is auto-synced by the CredentialsWatcher)."
-  );
+  // Issue #6837 (R4): an isolated account's other store copies are re-synced by
+  // each running daemon's mirror on its next tick; a non-isolated account's (or
+  // any account's with HAPI_ACCOUNT_CONFIG_SHARED=0) are not. Beside a sibling
+  // instance on a build before #5020 (no mirror), the isolated line overstates.
+  warnings.push(isolated ? ISOLATED_RESYNC_NOTE : STALE_COPY_WARNING);
 
   const deltaPass =
     accessTokenChanged && expiresAtAdvanced && lastRefreshedUpdated;
@@ -264,16 +385,10 @@ export async function runForceRefreshHarness(
     durationMs: now() - start,
     steps,
     tokenRotated: true,
-    // Issue #1643: with the machine-global SHARED isolated dir, the live token
-    // for an isolated account lives in the ONE shared dir all instances read —
-    // so a force-refresh no longer staleing per-instance store TOKEN copies is no
-    // longer a cross-instance hazard for isolated accounts (the store token is
-    // advisory cache; the shared dir is token-authoritative, R8). Left `true`
-    // conservatively (NOT a behavior change): the per-instance store mirror still
-    // exists for the UI badge, and the host-default / non-isolated paths still
-    // genuinely need the operator to re-sync. Narrowing this to a per-account
-    // conditional is post-Task-9-sweep cleanup, not this PR.
-    crossInstanceResyncNeeded: true,
+    // Issue #6837 (R4): false for an isolated account, whose live token is in the
+    // one machine-global folder that each instance's mirror copies from (#1643,
+    // #5020); true for a non-isolated account or with per-instance folders.
+    crossInstanceResyncNeeded: !isolated,
     warnings,
   };
 }

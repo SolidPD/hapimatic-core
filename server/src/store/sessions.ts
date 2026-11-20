@@ -10,8 +10,6 @@ import { updateVersionedField } from "./versionedUpdates";
 import {
   insertBillableSwitchEvent,
   isBillableSwitchStorageReady,
-  readProjectDefaultRow,
-  upsertProjectDefaultRow,
   type BillableSwitchEventInsert,
 } from "./billableSwitchStore";
 
@@ -131,28 +129,23 @@ function toStoredSession(
 
 /**
  * Issue #6646: the start value of a new session row (the plan's Task 3), applied
- * on the INSERT branch only, in the same transaction as the row: the switch, its
- * `start` event, and for row 2 of the truth table this node's header for the
- * project with its `header-on` event. The caller computes it only when the gate
- * is `on`; the store fills in the new row's id.
+ * on the INSERT branch only, in the same transaction as the row: the switch and
+ * its `start` event. Since #6778 PR-A (R12) no start writes a project header.
+ * The caller computes it only when the gate is `on`; the store fills in the new
+ * row's id.
  */
 export type BillableSwitchInitial = {
   billable: boolean;
   confirm: "pending" | null;
   event: Omit<BillableSwitchEventInsert, "sessionId">;
-  header?: {
-    projectKey: string;
-    keyKind: "repo" | "path";
-    event: Omit<BillableSwitchEventInsert, "sessionId">;
-  };
 };
 
 /**
  * The one place a session row is created (every registration reaches it through
  * `sessionCache.getOrCreateSession` from `POST /cli/sessions`). The existence
  * SELECT, the base INSERT (unchanged, so registration never names a column a
- * failed migration could lack), the switch UPDATE, the `start` event and the
- * header write all run in ONE `.immediate()` transaction: the check and the
+ * failed migration could lack), the switch UPDATE and the `start` event all
+ * run in ONE `.immediate()` transaction: the check and the
  * insert are atomic across processes (the CLI and operator scripts can hold the
  * same file), and a busy writer waits for `busy_timeout` instead of failing on
  * a lock upgrade (#3631). `initial` is called only when a row is inserted;
@@ -225,30 +218,6 @@ export function getOrCreateSessionWithFlag(
           start.billable ? start.confirm : null,
           id
         );
-        if (start.header) {
-          const prior = readProjectDefaultRow(
-            db,
-            namespace,
-            start.header.projectKey
-          );
-          if (prior === null || !prior.billable) {
-            upsertProjectDefaultRow(
-              db,
-              namespace,
-              start.header.projectKey,
-              start.header.keyKind,
-              true,
-              now
-            );
-            insertBillableSwitchEvent(db, {
-              ...start.header.event,
-              namespace,
-              sessionId: null,
-              billableBefore: prior === null ? null : prior.billable,
-              billableAfter: true,
-            });
-          }
-        }
         insertBillableSwitchEvent(db, {
           ...start.event,
           namespace,

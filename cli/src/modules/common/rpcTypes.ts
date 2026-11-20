@@ -268,20 +268,40 @@ export interface ForceRefreshStep {
  * `overall`:
  *  - `pass`     — OAuth fetch + all store-delta assertions passed
  *  - `fail`     — OAuth fetch failed (e.g. invalid_grant) or a delta assertion failed
- *  - `deferred` — host-default account (#1520); not refreshable by Hapimatic (NOT a failure)
  *  - `not-found`— no such account in the store
- * `tokenRotated`/`crossInstanceResyncNeeded` flag a successful non-host rotation
- * that staled the same account's stored copy in other Hapimatic instances (R6).
+ *  - `skipped`  — not run (#6847): a session of this account is running under
+ *                 another Hapimatic instance on this machine, or that view was
+ *                 degraded; no OAuth call, nothing written. `skip` says which.
+ * `tokenRotated` flags a successful rotation. `crossInstanceResyncNeeded` is true
+ * when other Hapimatic instances' stored copies of the account are now stale and
+ * nothing re-syncs them (a non-isolated account, or `HAPI_ACCOUNT_CONFIG_SHARED=0`);
+ * false for an isolated account, whose copies each running instance's mirror
+ * re-syncs on its next tick (#6837).
  */
 export interface ForceRefreshReport {
   accountUuid: string;
   emailAddress?: string;
-  overall: "pass" | "fail" | "deferred" | "not-found";
+  // Issue #6800 removed `deferred` (the host-default account): every account is
+  // refreshable the same way.
+  overall: "pass" | "fail" | "not-found" | "skipped";
   durationMs: number;
   steps: ForceRefreshStep[];
   tokenRotated?: boolean;
   crossInstanceResyncNeeded?: boolean;
   warnings: string[];
+  /**
+   * Issue #6847: present only when `overall` is `skipped`. `holders` names the
+   * sibling-instance processes that bind the account (empty when the reason is
+   * `sibling-view-degraded`), so `--json` callers need not parse step text.
+   */
+  skip?: {
+    reason: "sibling-bound" | "sibling-view-degraded";
+    holders: Array<{
+      pid: number;
+      hapiHome: string | null;
+      sessionTag: string | null;
+    }>;
+  };
 }
 
 // --- Session liveness RPC (issue #1661) -----------------------------------------

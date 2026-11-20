@@ -31,7 +31,7 @@ export const cliCatalogEntries = [
     domain: "accounts",
     surface: "cli",
     description:
-      "Manage Anthropic accounts: list, add, force-refresh, migrate config dirs.",
+      "Manage Anthropic accounts: list, add, force-refresh, read sign-in ages, migrate config dirs.",
     whenToUse: "To manage the node's Anthropic accounts from the CLI.",
     invocation: { kind: "cli", command: "accounts" },
     auth: "cli-token",

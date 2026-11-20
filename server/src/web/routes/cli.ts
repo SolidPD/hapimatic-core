@@ -1274,6 +1274,13 @@ export function createCliRoutes(
   // session-scoped, so it sits OUTSIDE `if (store)` (no error_logs row) with no
   // resolveSessionForNamespace. Mirrors /cli/error-reports' broadcast (#1078):
   // validate -> getSyncEngine() guard -> handleRealtimeEvent.
+  //
+  // Issue #6800: no current CLI sends this any more — the credentials watcher
+  // that posted it is retired, and no web code consumes the `account-captured`
+  // event. The route and the SSE schema stay because they are a catalogued
+  // capability (`accounts.cli-account-captured`); removing them (and
+  // regenerating the catalog) is a follow-up candidate. A daemon only posts to
+  // its own server, so removing them later is safe.
   const accountCapturedLimiter = createRateLimiter({
     name: "cli-account-captured",
   });

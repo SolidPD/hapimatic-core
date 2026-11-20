@@ -23,7 +23,6 @@ interface ClaudeCredentialsFile {
  */
 interface ClaudeConfigFile {
   oauthAccount?: {
-    accountUuid?: string;
     emailAddress?: string;
     displayName?: string;
     organizationName?: string;
@@ -51,35 +50,6 @@ async function readEmailFromConfig(): Promise<string | undefined> {
   } catch {
     // File doesn't exist or isn't readable - this is normal
     return undefined;
-  }
-}
-
-/**
- * Read the host-default account's UUID from `~/.claude.json` `oauthAccount.accountUuid`
- * (issue #1520). This is the account whose OAuth refresh-token family is SHARED with
- * native Claude Code — Hapimatic must NOT rotate it (double-rotation produces the
- * `invalid_grant` lockout). The `TokenRefreshService` reads this on every refresh
- * decision (dynamic keying), so logging into a different host account automatically
- * re-targets which account Hapimatic defers.
- *
- * Identity ONLY — never reads or returns token values (the credential lives in
- * `~/.claude/.credentials.json`, which this function does not touch).
- *
- * @param configPath Override for `~/.claude.json` (test seam). Defaults to the real file.
- * @returns the host-default `accountUuid`, or `null` on any missing/corrupt/absent input.
- */
-export async function readHostDefaultAccountUuid(
-  configPath: string = join(os.homedir(), ".claude.json")
-): Promise<string | null> {
-  try {
-    const content = await readFile(configPath, "utf-8");
-    const config: ClaudeConfigFile = JSON.parse(content);
-    return config.oauthAccount?.accountUuid ?? null;
-  } catch {
-    // Missing or unreadable ~/.claude.json — no host-default to key off. A missing
-    // config also means native Claude Code has no active login, so the shared-family
-    // contention this defends against is moot.
-    return null;
   }
 }
 

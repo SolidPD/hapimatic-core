@@ -306,6 +306,12 @@ export type AccountLoginStartResponse = {
   /** #4462: present when the login runs on another federation node. */
   nodeId?: string;
   nodeLabel?: string;
+  /**
+   * #6800: the live Hapimatic daemons on that machine that run an older build
+   * (instance names). Their CredentialsWatcher would overwrite this sign-in.
+   * Absent when there are none.
+   */
+  olderSiblingDaemons?: string[];
 };
 export type AccountLoginCompleteResponse =
   | {

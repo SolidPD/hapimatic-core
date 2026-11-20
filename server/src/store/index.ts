@@ -1249,6 +1249,9 @@ export class Store {
     // many it skipped, so a partial save never reads as a full one.
     this.migrateAddColumn("session_pins", "saved_files", "INTEGER");
     this.migrateAddColumn("session_pins", "saved_skipped", "INTEGER");
+    // #6540 S-4: which files that Save did not save, as `{savedAt, files}` JSON,
+    // for the agent's report. Nullable, so a reverted binary ignores it.
+    this.migrateAddColumn("session_pins", "saved_skipped_json", "TEXT");
 
     // Issue #6452 (epic #6446): automatic picks. The deadline is server-owned
     // state beside the pin, never content: an operator's move must not bump the

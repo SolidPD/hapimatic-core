@@ -17,6 +17,7 @@ import {
 import {
   buildBillableSwitchStart,
   floorAgentMcpEnable,
+  refuseRetiredBillableAnswer,
 } from "../agentEscalation";
 import { z } from "zod";
 import { cataloged } from "../../../capabilities/cataloged";
@@ -407,10 +408,12 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       const nodeId = c.req.param("nodeId");
 
       // Issue #6646: the start context, built HERE by the entry hub (Task 6's
-      // signal order). An explicit answer to the question at Create would be
-      // dropped silently by an older or gate-off peer, so refuse it unless the
-      // target advertises billable:switch (the MCP-set precedent above); while
-      // the target has not been polled yet, say so instead of "unsupported".
+      // signal order). A person's retired answer is refused first, whatever the
+      // target (#6778 PR-A, R12: 400 billable_choice_retired). A person's
+      // explicit `not-billable` would be dropped silently by an older or
+      // gate-off peer, so refuse it unless the target advertises billable:switch
+      // (the MCP-set precedent above); while the target has not been polled
+      // yet, say so instead of "unsupported".
       const routeStart = buildBillableSwitchStart(
         c,
         deps.getSyncEngine(),
@@ -422,6 +425,10 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         deps.getSyncEngine()?.getBillableSwitchService?.()?.localNodeId() ??
           fedConfig?.nodeId
       );
+      const retiredRefusal = refuseRetiredBillableAnswer(c, routeStart);
+      if (retiredRefusal) {
+        return retiredRefusal;
+      }
       if (
         routeStart.kind === "person" &&
         routeStart.choice !== undefined &&

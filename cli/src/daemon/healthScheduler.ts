@@ -763,6 +763,19 @@ export function createHealthScheduler(
       // its flags and never mirrors a native credential into its own store — native Claude Code
       // owns each account's dir there. Skip all three provider-credential steps below.
       if (ctx.tenantVm) return;
+
+      // Issue #6800 (R6): the shared-chain detector runs FIRST in the
+      // provider-credential group, on EVERY non-tenant daemon. An account it
+      // quarantines this tick is then skipped by the backstop, the stale-flag
+      // clear and the mirror below on the same tick. Never throws.
+      try {
+        await tokenRefreshService.quarantineHostChains();
+      } catch (err) {
+        logger.warn(
+          `[DAEMON RUN] shared-chain detector failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+
       if (ctx.machineRotator) {
         try {
           await tokenRefreshService.refreshIdleIsolatedAccounts();

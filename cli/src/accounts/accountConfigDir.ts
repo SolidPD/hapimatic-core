@@ -15,7 +15,11 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import type { StoredAccount } from "@hapi/protocol/accounts";
+import {
+  parseSignInMarker,
+  SIGN_IN_MARKER_FILE,
+  type StoredAccount,
+} from "@hapi/protocol/accounts";
 import {
   REPAIRABLE_FILE_DIMS,
   USER_SCOPE_CONFIG_DIMS,
@@ -36,17 +40,17 @@ import {
  * Hapimatic binds one Anthropic account per session. The original mechanism
  * (#1446) injected `CLAUDE_CODE_OAUTH_TOKEN` into the native `claude` child,
  * which BYPASSES Claude Code's own auto-refresh — so Hapimatic had to own
- * refresh, and a non-host account's stored refresh token froze and got revoked
- * server-side once it lost host-default status (#1546 Tier-1: rotating refresh
- * tokens with per-account revocation), producing `HTTP 400 invalid_grant`.
+ * refresh, and an account's stored refresh token froze and got revoked
+ * server-side once it stopped being the host login (#1546 Tier-1: rotating
+ * refresh tokens with per-account revocation), producing `HTTP 400 invalid_grant`.
  *
- * This module gives each NON-host account its own config dir at
+ * This module gives each account its own config dir at
  * `<accountConfigsDir>/<uuid>/` holding `.credentials.json` (tokens) and
  * `.claude.json` (identity). A native `claude` spawned with
  * `CLAUDE_CONFIG_DIR=<that-dir>` reads AND rotates the account's token there
  * (native `utils/secureStorage/plainTextStorage.ts` → `getClaudeConfigHomeDir()`
- * on Linux), making native Claude Code the SOLE owner/rotator per account —
- * generalizing #1520's host-default deferral to every account. Because
+ * on Linux), making native Claude Code the SOLE owner/rotator per account.
+ * Since #6800 that includes the account `~/.claude.json` names. Because
  * revocation is per-account, isolated accounts never cross-kill.
  *
  * Security: `accountUuid` becomes a path component, so every public function
@@ -59,7 +63,7 @@ import {
  * Field set mirrors the host's `~/.claude/.credentials.json` `claudeAiOauth`
  * exactly (accessToken, refreshToken, expiresAt, scopes, subscriptionType,
  * rateLimitTier). `mcpOAuth` is intentionally NEVER written (parity with
- * `CredentialsWatcher` R8).
+ * retired credentials watcher's R8, #1449).
  */
 export interface IsolatedClaudeAiOauth {
   accessToken: string;
@@ -108,8 +112,8 @@ export function isolatedConfigPath(accountUuid: string): string {
  * True when the account already has an isolated config dir that native Claude
  * Code owns (i.e. its `.credentials.json` exists). The presence of this file is
  * the single-owner signal: once present, native owns rotation and Hapimatic
- * MUST NOT overwrite it (except the deliberate host-capture re-seed in
- * {@link CredentialsWatcher} while the account is host-default).
+ * MUST NOT overwrite it (except spawn-time recovery's `overwrite:true` re-seed
+ * from a fresher store head, `isolatedSnapshotRecovery.ts`).
  */
 export async function hasIsolatedConfigDir(
   accountUuid: string
@@ -189,40 +193,72 @@ export async function isIsolatedAccountAnywhere(
 
   // Transitional legacy fallback (#1643 R6): scan sibling ~/.hapimatic-*
   // per-instance dirs for an un-migrated holder. Removable post-sweep (Task 9).
-
-  const home = opts.homeDir ?? homedir();
-  let homes: string[];
-  const cacheable = opts.homeDir === undefined;
-  if (
-    cacheable &&
-    instanceHomesCache &&
-    Date.now() - instanceHomesCache.at < INSTANCE_HOMES_CACHE_TTL_MS
-  ) {
-    homes = instanceHomesCache.homes;
-  } else {
-    const entries = await readdir(home, { withFileTypes: true }).catch(
-      () => []
-    );
-    homes = entries
-      .filter(e => e.isDirectory() && e.name.startsWith(".hapimatic-"))
-      .map(e => join(home, e.name));
-    if (cacheable) {
-      instanceHomesCache = { homes, at: Date.now() };
-    }
-  }
-
-  for (const instanceHome of homes) {
+  const paths = await isolatedCredentialPathsAnywhere(accountUuid, opts);
+  for (const path of paths.slice(1)) {
     try {
-      await readFile(
-        join(instanceHome, "account-configs", accountUuid, ".credentials.json"),
-        "utf-8"
-      );
+      await readFile(path, "utf-8");
       return true;
     } catch {
       // not isolated in this instance — keep scanning
     }
   }
   return false;
+}
+
+/**
+ * The `~/.hapimatic-*` instance homes directly under the home dir
+ * (prefix-bound, never a generic glob), cached for
+ * {@link INSTANCE_HOMES_CACHE_TTL_MS}. Passing `opts.homeDir` (a test seam)
+ * bypasses the cache so fixtures never leak across tests. Never throws: an
+ * unreadable home dir yields an empty list.
+ */
+export async function listInstanceHomes(
+  opts: { homeDir?: string } = {}
+): Promise<string[]> {
+  const home = opts.homeDir ?? homedir();
+  const cacheable = opts.homeDir === undefined;
+  if (
+    cacheable &&
+    instanceHomesCache &&
+    Date.now() - instanceHomesCache.at < INSTANCE_HOMES_CACHE_TTL_MS
+  ) {
+    return instanceHomesCache.homes;
+  }
+  const entries = await readdir(home, { withFileTypes: true }).catch(() => []);
+  const homes = entries
+    .filter(e => e.isDirectory() && e.name.startsWith(".hapimatic-"))
+    .map(e => join(home, e.name));
+  if (cacheable) {
+    instanceHomesCache = { homes, at: Date.now() };
+  }
+  return homes;
+}
+
+/**
+ * Every path where an account's isolated `.credentials.json` can live on this
+ * machine: the machine-global folder first, then each legacy per-instance
+ * `~/.hapimatic-*\/account-configs/<uuid>/.credentials.json` (the same
+ * enumeration {@link isIsolatedAccountAnywhere} uses), without duplicates. The
+ * paths are not checked for existence. Gates `accountUuid` through
+ * {@link UUID_REGEX} first (it becomes a directory name). Used by the #6800
+ * shared-chain detector.
+ */
+export async function isolatedCredentialPathsAnywhere(
+  accountUuid: string,
+  opts: { homeDir?: string } = {}
+): Promise<string[]> {
+  const shared = isolatedCredentialsPath(accountUuid);
+  const paths = [shared];
+  for (const instanceHome of await listInstanceHomes(opts)) {
+    const legacy = join(
+      instanceHome,
+      "account-configs",
+      accountUuid,
+      ".credentials.json"
+    );
+    if (!paths.includes(legacy)) paths.push(legacy);
+  }
+  return paths;
 }
 
 /** Atomic 0600 write (tmp + chmod + rename) — mirrors `accountStore.put`. */
@@ -534,10 +570,10 @@ async function buildIsolatedClaudeJson(
  *    absent; a no-op (returns `false`) when native already owns the dir, so a
  *    stale store token can never clobber native's freshly-rotated one. This is
  *    the launcher's just-in-time seed path.
- *  - `overwrite: true` — the deliberate host-capture re-seed (CredentialsWatcher),
- *    valid ONLY while the account is host-default (no isolated session rotates
- *    it, so there is no live owner to race). Keeps the dir warm for the moment
- *    the account later loses host status.
+ *  - `overwrite: true` — spawn-time recovery's re-seed from a fresher store head
+ *    (`isolatedSnapshotRecovery.ts`), under the per-account recovery lock. (The
+ *    retired credentials watcher used it to copy the `~/.claude` chain in; #6800
+ *    removed that copy.)
  *
  * Issue #5020: the `.credentials.json` write joins native Claude Code's lock
  * protocol (`nativeCredentialLock.ts`) — always under native's storage-write
@@ -667,6 +703,26 @@ export async function seedAccountConfigDir(
     `[ACCOUNT_CONFIG_DIR] seeded ${account.accountUuid} (email: ${account.emailAddress ? "present" : "absent"}, overwrite: ${opts.overwrite})`
   );
   return true;
+}
+
+/**
+ * Issue #6800 (round 2, R2-1): the refresh fingerprint named by the sign-in
+ * marker a Provider Accounts sign-in left in the account's folder
+ * ({@link SIGN_IN_MARKER_FILE}), or null when there is none or it is not a
+ * well-formed marker. Never throws.
+ */
+export async function readSignInMarkerFingerprint(
+  accountUuid: string
+): Promise<string | null> {
+  try {
+    const raw = await readFile(
+      join(accountConfigDirFor(accountUuid), SIGN_IN_MARKER_FILE),
+      "utf-8"
+    );
+    return parseSignInMarker(raw);
+  } catch {
+    return null;
+  }
 }
 
 /**

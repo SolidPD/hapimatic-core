@@ -38,6 +38,7 @@
     "./graph/examples/phase2": "./src/graph/examples/phase2/index.ts",
     "./harnessManifest": "./src/harnessManifest.ts",
     "./harnessManifests": "./src/harnessManifests/index.ts",
+    "./mergePatch": "./src/mergePatch.ts",
     "./messageHookDedup": "./src/messageHookDedup.ts",
     "./messages": "./src/messages.ts",
     "./modes": "./src/modes.ts",

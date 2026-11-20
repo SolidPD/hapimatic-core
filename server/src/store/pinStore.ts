@@ -18,6 +18,9 @@ import {
   type PinStatus,
   PIN_ANSWER_NOTE_MAX_CHARS,
   PIN_ANSWERS_MAX_BYTES,
+  PIN_SAVE_NOT_SAVED_MAX,
+  PIN_SAVE_NOT_SAVED_PATH_MAX,
+  type PinNotSavedFile,
   settlingAnswer,
 } from "@hapi/protocol";
 import {
@@ -62,6 +65,8 @@ type PinRow = {
   // #6458 (#6540 S-4), added by `migrateAddColumn`; null on a save made before it.
   saved_files?: number | null;
   saved_skipped?: number | null;
+  // #6540 S-4: `{savedAt, files}` JSON; null on a full save.
+  saved_skipped_json?: string | null;
   // #6574, added by `migrateAddColumn` (store/index.ts); null only on a row an
   // older binary inserted, until the next start's backfill.
   pin_id?: string | null;
@@ -279,6 +284,39 @@ function isSaveReportPending(
 }
 
 /**
+ * #6540 S-4: the not-saved list, read only for the Save that wrote it (its
+ * `savedAt` equals `saved_at`), so a later Save by an older binary never reports
+ * an earlier Save's files. Never throws: a bad row reads as no list.
+ */
+function parseNotSaved(
+  json: string | null | undefined,
+  savedAt: number | null | undefined
+): PinNotSavedFile[] | null {
+  try {
+    if (typeof json !== "string" || !json || typeof savedAt !== "number") {
+      return null;
+    }
+    const parsed: unknown = JSON.parse(json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    const { savedAt: at, files } = parsed as Record<string, unknown>;
+    if (at !== savedAt || !Array.isArray(files) || files.length === 0) {
+      return null;
+    }
+    const kept: PinNotSavedFile[] = [];
+    for (const file of files as unknown[]) {
+      const { path, reason } = (file ?? {}) as Record<string, unknown>;
+      if (typeof path !== "string" || typeof reason !== "string") return null;
+      if (kept.length < PIN_SAVE_NOT_SAVED_MAX) kept.push({ path, reason });
+    }
+    return kept;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * A note as stored: within the read schema's cap. Cleaning can lengthen a note
  * that arrived at the cap (an approval token becomes a longer placeholder), and
  * one oversized note would make every read of the session's pins fail (#6450).
@@ -342,6 +380,7 @@ export class PinStore {
       saveReportPending: isSaveReportPending(row),
       savedFiles: row.saved_files ?? null,
       savedSkipped: row.saved_skipped ?? null,
+      savedSkippedFiles: parseNotSaved(row.saved_skipped_json, row.saved_at),
       // #6574: after the content spread, so content can never shadow the ID.
       pinId: row.pin_id ?? null,
       createdAt: iso(row.created_at),
@@ -863,7 +902,10 @@ export class PinStore {
    * Record "Save to session folder" (#6453): where the files went, the revision
    * saved, and a new unreported save. Leaves `updated_at` and `revision` alone,
    * like the star, and is never a no-op, because each Save is new news for the
-   * agent. #6458 (#6540 S-4): with how many files it left and skipped.
+   * agent. #6458 (#6540 S-4): with how many files it left and skipped, and
+   * (#6540) up to ten of the skipped files, none over the path cap or holding a
+   * control character, tied to this Save's `saved_at`. Every Save writes the list
+   * column, so a full Save clears an earlier partial one.
    */
   setSaved(
     sessionId: string,
@@ -873,21 +915,35 @@ export class PinStore {
       revision: number;
       files?: number;
       skipped?: number;
+      skippedFiles?: PinNotSavedFile[];
       now?: number;
     }
   ): { pin: Pin; changed: boolean } | null {
+    // One time for the column and the list, so the list reads back for this Save.
+    const savedAt = save.now ?? Date.now();
+    const notSaved = (save.skippedFiles ?? [])
+      .filter(
+        f =>
+          f.path.length <= PIN_SAVE_NOT_SAVED_PATH_MAX &&
+          !/\p{Cc}/u.test(f.path)
+      )
+      .slice(0, PIN_SAVE_NOT_SAVED_MAX)
+      .map(f => ({ path: f.path, reason: f.reason }));
     const result = this.db
       .prepare(
         `UPDATE session_pins SET saved_to = ?, saved_revision = ?, saved_at = ?,
-           saved_files = ?, saved_skipped = ?
+           saved_files = ?, saved_skipped = ?, saved_skipped_json = ?
          WHERE session_id = ? AND key = ?`
       )
       .run(
         save.savedTo,
         save.revision,
-        save.now ?? Date.now(),
+        savedAt,
         save.files ?? null,
         save.skipped ?? null,
+        notSaved.length > 0
+          ? JSON.stringify({ savedAt, files: notSaved })
+          : null,
         sessionId,
         key
       );

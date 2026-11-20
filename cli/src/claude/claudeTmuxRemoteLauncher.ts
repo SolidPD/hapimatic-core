@@ -245,6 +245,22 @@ export function resolveRetryBudget(
 }
 
 /**
+ * Issue #1635 (R3/R4), #6837 (R8): the one actionable message for an auth-dead
+ * spawn (a 401/403 latched from the transcript). The remedy is a Provider
+ * Accounts sign-in: a sign-in made in a terminal shell writes `~/.claude`,
+ * which Hapimatic sessions do not read (#6800). Exported for unit testing.
+ */
+export function buildAuthExhaustionMessage(email: string | null): string {
+  return (
+    `Session failed with an authentication error (401/403) for the bound account` +
+    `${email ? ` ${email}` : ""}. The account's stored credentials were revoked ` +
+    `server-side (token-family rotation — issue #1635). Retrying cannot fix this: ` +
+    `sign the account in again under Settings → Provider Accounts, or switch the ` +
+    `session to a healthy account. Launcher did NOT consume burst retries.`
+  );
+}
+
+/**
  * R19 (#1429) — conservative burst-load classifier. Returns true iff the
  * spawn primitive reported a fast (<5s), non-clean exit AND we're NOT
  * currently aborting. The abort guard prevents retrying when the kill
@@ -995,13 +1011,9 @@ export async function claudeTmuxRemoteLauncher(
         // without a transcript latch is flagged auth-suspect.
         let exhaustionMessage: string;
         if (authLatched) {
-          const email = await resolveBoundAccountEmail();
-          exhaustionMessage =
-            `Session failed with an authentication error (401/403) for the bound account` +
-            `${email ? ` ${email}` : ""}. The account's stored credentials were revoked ` +
-            `server-side (token-family rotation — issue #1635). Retrying cannot fix this: ` +
-            `re-login the account on the host (\`claude /login\`) or re-bind the session ` +
-            `to a healthy account. Launcher did NOT consume burst retries.`;
+          exhaustionMessage = buildAuthExhaustionMessage(
+            await resolveBoundAccountEmail()
+          );
         } else if (accountBound) {
           exhaustionMessage =
             `Tmux launcher stopped after ${attempt} burst-load ${attempt === 1 ? "retry" : "retries"} ` +

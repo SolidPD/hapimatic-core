@@ -179,7 +179,11 @@ import type { SettingsSyncService } from "../services/settingsSyncService";
 import type { HarnessPollService } from "../harness/harnessPollService";
 import { harnessRegistry } from "../harness/registry";
 import { ClaudeModelCatalogService } from "../services/claudeModelCatalog";
-import { createApiKeysRoutes } from "./routes/apiKeys";
+import {
+  createApiKeysRoutes,
+  type ApiKeySpendLookup,
+  type ApiKeySpendWindow,
+} from "./routes/apiKeys";
 import { SharedApiKeyService } from "../services/sharedApiKeyService";
 import { createPorterKeyRoutes } from "./routes/porterKey";
 import { createPorterStatusRoutes } from "./routes/porterStatus";
@@ -516,11 +520,22 @@ export function buildWebApp(options: {
   // Issue #5127: one requesting-side service for API keys homed on other
   // federation nodes — the /cli routes (daemon, launcher, apiKeyHelper), the
   // local spawn pre-check, the remote key-bound spawn receiver and the picker.
+  // #6789: ONE spend reader for every surface that shows a key's credit (the
+  // Provider Accounts list, the picker's available keys, the home's shared
+  // list), so the three cannot diverge.
+  // A list asks with its window and gets one reader for the whole list
+  // (#6789 Task 6, rung 2); one key asks with none.
+  const apiKeySpend = (window?: ApiKeySpendWindow): ApiKeySpendLookup =>
+    window
+      ? options.store.turns.apiKeySpendReader(window.sinceMs)
+      : (apiKeyId, fromMs, toMs) =>
+          options.store.turns.sumApiKeyCost(apiKeyId, fromMs, toMs);
   const sharedApiKeyService = new SharedApiKeyService({
     getSettingsFile: () => configuration.settingsFile,
     getFederationConfig: () => options.federationConfig,
     getNodeRegistry: options.getNodeRegistry,
     errorLogger: options.errorLogger,
+    getApiKeySpend: apiKeySpend,
   });
 
   app.route(
@@ -897,6 +912,8 @@ export function buildWebApp(options: {
       // every cross-node request in its hapi.db.
       getSettingsFile: () => configuration.settingsFile,
       getApiKeyShareAudit: () => options.store.apiKeyShareAudit,
+      // #6789: the shared list answers each key's credit computed here.
+      getApiKeySpend: apiKeySpend,
       // #5127: the /federation/spawn-api-key receiver confirms the key with
       // its home through this node's requesting-side service.
       getSharedApiKeyService: () => sharedApiKeyService,
@@ -1792,9 +1809,9 @@ export function buildWebApp(options: {
       // every node's shared keys.
       getFederationConfig: () => options.federationConfig,
       getSharedApiKeyService: () => sharedApiKeyService,
-      // API key budgets: each key's metered spend, from this node's turn ledger.
-      getApiKeySpend: () => (apiKeyId, fromMs, toMs) =>
-        options.store.turns.sumApiKeyCost(apiKeyId, fromMs, toMs),
+      // API key budgets: each key's metered spend, from this node's turn ledger
+      // (the same reader as the picker's list and the shared list, #6789).
+      getApiKeySpend: apiKeySpend,
       // A key revoked at the provider stops showing "Valid": a list read
       // re-probes a key whose last result is over six hours old.
       revalidateStaleKeys: true,

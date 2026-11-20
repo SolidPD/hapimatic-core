@@ -1,22 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import {
   BILLABLE_SWITCH_EVENT_KINDS,
   BillableConfirmSchema,
   BillableSwitchActorSchema,
-  BillableSwitchKeyKindSchema,
   BillableSwitchViaSchema,
   defineCapability,
-  LOCAL_NODE_ID,
   type BillableSwitchActor,
   type BillableSwitchEvent,
   type BillableSwitchMode,
 } from "@hapi/protocol";
 
 import { BillableSwitchService } from "../../billableSwitch/billableSwitchService";
-import { cataloged } from "../../capabilities/cataloged";
+import { cataloged, markClosedGate } from "../../capabilities/cataloged";
 import type {
   BillableSwitchNodeRegistryView,
   NodeRegistry,
@@ -40,8 +38,9 @@ import type { ProxyResult } from "./sessionMutationHandlers";
 
 /**
  * The billable switch's hub routes (issue #6646, Task 7): switch, confirm, the
- * history, the headers read and write, and the event list, plus the Keep all
- * fan-out that `sessions.ts` mounts beside the other bulk routes. Written by hand
+ * history, the headers read (the header write is closed for good, #6778 PR-A)
+ * and the event list, plus the Keep all fan-out that `sessions.ts` mounts
+ * beside the other bulk routes. Written by hand
  * on the Pins pattern (`pinRouteHelpers.ts`), never through the generic field
  * descriptor, because that path drops the peer's reply, relays a peer's 401 to
  * the browser, and its one schema would let a client body carry an actor.
@@ -78,17 +77,6 @@ export const BillableSwitchKeepAllRequestSchema = z
   .object({ ids: z.array(SessionIdSchema).min(1).max(200) })
   .strict();
 
-/** `POST /api/billable-switch/headers` from a client. */
-export const BillableSwitchHeaderRequestSchema = z
-  .object({
-    nodeId: z.string().min(1).max(200),
-    projectKey: z.string().min(1).max(500),
-    keyKind: BillableSwitchKeyKindSchema,
-    billable: z.boolean(),
-    sessionIds: z.array(SessionIdSchema).max(200).optional(),
-  })
-  .strict();
-
 /** What the hub claims on every forwarded write (one shared mesh token). */
 const ForwardedActorFields = {
   actor: BillableSwitchActorSchema.strict(),
@@ -115,25 +103,6 @@ export const FederationBillableConfirmBodySchema = z
   })
   .strict();
 
-/** The hub → owning node body of a header write. */
-export const FederationBillableHeaderBodySchema = z
-  .object({
-    projectKey: z.string().min(1).max(500),
-    keyKind: BillableSwitchKeyKindSchema,
-    billable: z.boolean(),
-    picks: z
-      .array(
-        z
-          .object({ sessionId: SessionIdSchema, loggedMs: LoggedMsSchema })
-          .strict()
-      )
-      .max(200),
-    actor: BillableSwitchActorSchema.strict(),
-    via: BillableSwitchViaSchema,
-    entryNodeId: EntryNodeIdSchema,
-  })
-  .strict();
-
 /** The answer of a switch or a confirm, from either end. */
 export const BillableSwitchSetResponseSchema = z.object({
   ok: z.literal(true),
@@ -143,23 +112,6 @@ export const BillableSwitchSetResponseSchema = z.object({
   timerMs: z.number(),
   unloggedMs: z.number(),
   loggedKnown: z.boolean(),
-});
-
-/** The answer of a header write, from either end. */
-export const BillableSwitchHeaderResponseSchema = z.object({
-  ok: z.literal(true),
-  header: z.object({
-    projectKey: z.string(),
-    keyKind: BillableSwitchKeyKindSchema,
-    billable: z.boolean(),
-    updatedAt: z.number(),
-  }),
-  sessions: z.array(
-    z.object({
-      id: z.string(),
-      outcome: z.enum(["ok", "unchanged", "not_found", "not_in_project"]),
-    })
-  ),
 });
 
 /** The history answer (section 6 item 4), as the owning node sends it. */
@@ -207,44 +159,6 @@ export const BillableSwitchHistoryResponseSchema = z.object({
 });
 
 // ─── shared checks ─────────────────────────────────────────────────────────
-
-/**
- * A project key as a header write may name it: a `repo` key has two or more
- * non-empty segments and no leading slash (GitLab subgroups give three or more);
- * its case is never changed. A `path` key must not have that shape (PR-2 item
- * Y1): other nodes count only `repo` headers, so a repository stored as `path`
- * would never read as billable there. Null when it is acceptable.
- */
-export function projectKeyProblem(
-  projectKey: string,
-  keyKind: "repo" | "path"
-): string | null {
-  if (keyKind !== "repo") {
-    return hasRepoKeyShape(projectKey)
-      ? "A key shaped like owner/name is a repository key: send keyKind repo"
-      : null;
-  }
-  if (projectKey.startsWith("/")) {
-    return "A repository key has no leading slash";
-  }
-  const segments = projectKey.split("/");
-  if (segments.length < 2 || segments.some(s => s.trim() === "")) {
-    return "A repository key names an owner and a repository (owner/name)";
-  }
-  return null;
-}
-
-/**
- * The shape of a repository key (`owner/name`, or deeper): two or more
- * non-empty segments, not led by "/", "~" or ".", with no backslash or drive
- * colon, so no path a session can carry (absolute, home-relative, Windows)
- * has it.
- */
-function hasRepoKeyShape(projectKey: string): boolean {
-  if (/^[/~.]/.test(projectKey) || /[\\:]/.test(projectKey)) return false;
-  const segments = projectKey.split("/");
-  return segments.length >= 2 && segments.every(seg => seg.trim() !== "");
-}
 
 /** The first issue of a failed parse, as one line. */
 export function describeIssue(error: z.ZodError): string {
@@ -541,6 +455,10 @@ export function createBillableSwitchRoutes(
   const mode = options.billableSwitchMode;
   const gate = billableSwitchGate(mode);
   const closed = mode === "closed";
+  // #6778 PR-A: the header write, closed in every gate state.
+  const retiredRoute = markClosedGate<MiddlewareHandler<WebAppEnv>>(async c =>
+    c.notFound()
+  );
 
   // ─── PUT /sessions/:id/billable ──────────────────────────────────
   app.put(
@@ -893,7 +811,10 @@ export function createBillableSwitchRoutes(
     }
   );
 
-  // ─── POST /billable-switch/headers ───────────────────────────────
+  // ─── POST /billable-switch/headers (closed for good, #6778 PR-A) ──
+  // R12: no header decides a start, so nothing writes one. The route stays
+  // mounted and cataloged (the catalog ratchet sees no drift); the closed gate
+  // answers 404 in every gate state and drops it from the served catalog.
   app.post(
     "/billable-switch/headers",
     cataloged(
@@ -915,135 +836,8 @@ export function createBillableSwitchRoutes(
         availability: { scope: "user" },
       })
     ),
-    gate,
-    async c => {
-      const ready = requireBillable(c, getSyncEngine);
-      if (ready instanceof Response) return ready;
-      const body = await readBody(c, BillableSwitchHeaderRequestSchema);
-      if (!body.ok) return body.response;
-      const req = body.data;
-      const sessionIds = dedupeIds(req.sessionIds ?? []);
-      if (!req.billable && sessionIds.length > 0) {
-        return c.json(
-          { error: "Sessions are picked only when a header goes on" },
-          400
-        );
-      }
-      const keyProblem = projectKeyProblem(req.projectKey, req.keyKind);
-      if (keyProblem) return c.json({ error: keyProblem }, 400);
-      const refused = refuseAgentBillableWrite(c, ready.engine, "header");
-      if (refused) return refused;
-      if (closed) return closedRefusal(c, ready.service.localNodeLabel());
-
-      const namespace = c.get("namespace");
-      const actor = billableSwitchActor(c, ready.engine);
-      const via = billableSwitchVia(c);
-      const entryNodeId = ready.service.localNodeId();
-      const picks = sessionIds.map(sessionId => ({
-        sessionId,
-        loggedMs: ready.service.loggedMsFor(sessionId),
-      }));
-
-      if (req.nodeId === LOCAL_NODE_ID || req.nodeId === entryNodeId) {
-        const result = ready.service.applyHeader({
-          namespace,
-          projectKey: req.projectKey,
-          keyKind: req.keyKind,
-          billable: req.billable,
-          picks,
-          actor,
-          via,
-          entryNodeId,
-        });
-        return c.json({
-          ok: true,
-          header: {
-            projectKey: result.header.projectKey,
-            keyKind: result.header.keyKind,
-            billable: result.header.billable,
-            updatedAt: result.header.updatedAt,
-          },
-          sessions: result.sessions,
-        } satisfies z.infer<typeof BillableSwitchHeaderResponseSchema>);
-      }
-
-      const registry = options.getNodeRegistry();
-      const view = registryView(registry, req.nodeId);
-      const nodeRefused = remoteNodeRefusal(c, view, "on");
-      if (nodeRefused) return nodeRefused;
-      const nodeLabel = view?.nodeLabel ?? req.nodeId;
-      const outcome = await registry?.callBillableSwitchPeerRoute?.(
-        req.nodeId,
-        "/api/federation/billable-switch/headers",
-        {
-          projectKey: req.projectKey,
-          keyKind: req.keyKind,
-          billable: req.billable,
-          picks,
-          actor,
-          via,
-          entryNodeId,
-        } satisfies z.infer<typeof FederationBillableHeaderBodySchema>,
-        { namespace }
-      );
-      if (!outcome || outcome.kind === "offline") {
-        return notReachableYet(c, nodeLabel);
-      }
-      if (outcome.kind === "unsupported") {
-        return unsupportedRefusal(c, nodeLabel);
-      }
-      if (outcome.kind === "unreachable") {
-        if (outcome.code === "billable_feature_closed") {
-          return closedRefusal(c, nodeLabel);
-        }
-        if (outcome.reason === "auth") {
-          return c.json(
-            {
-              error: "The node refused this node's federation token",
-              code: "peer_unauthorized",
-            },
-            502
-          );
-        }
-        const status = outcome.status;
-        if (status !== undefined && status >= 400 && status < 500) {
-          return c.json(
-            {
-              error: outcome.message,
-              ...(outcome.code ? { code: outcome.code } : {}),
-            },
-            status as ContentfulStatusCode
-          );
-        }
-        return c.json(
-          { error: `${nodeLabel} did not answer`, code: "node_unreachable" },
-          502
-        );
-      }
-      const parsed = BillableSwitchHeaderResponseSchema.safeParse(outcome.body);
-      if (!parsed.success) {
-        return c.json(
-          {
-            error: "The node returned an unexpected answer",
-            code: "peer_bad_response",
-          },
-          502
-        );
-      }
-      // The federation rule: the hub's own view follows the write at once, and
-      // the advanced report counter keeps an older poll from undoing it.
-      for (const s of parsed.data.sessions) {
-        if (s.outcome === "ok") {
-          registry?.updateCachedSessionBillable?.(s.id, true, null);
-        }
-      }
-      ready.service.recordRemoteHeader(req.nodeId, {
-        namespace,
-        ...parsed.data.header,
-      });
-      registry?.advanceBillableSwitchReportCounter?.(req.nodeId);
-      return c.json(parsed.data);
-    }
+    retiredRoute,
+    c => c.notFound()
   );
 
   // ─── GET /billable-switch/events ─────────────────────────────────

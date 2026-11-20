@@ -20,7 +20,7 @@ import type { WebAppEnv } from "../../middleware/auth";
 import { isSafeMachinePath } from "../../../utils/pathSecurity";
 import { expandTilde } from "../../../utils/expandTilde";
 import { validateApiKeySpawn } from "../machines";
-import { refuseUnhonourableBillableAnswer } from "../agentEscalation";
+import { refuseRetiredBillableAnswer } from "../agentEscalation";
 import { resolveSpawnMcpSet } from "../../../services/mcpSetResolver";
 import {
   resolveModelFamily,
@@ -143,17 +143,14 @@ export async function spawnForPeer(
     wireBillableSwitchStart,
     c.req.header("x-hapi-caller-namespace") ?? undefined
   );
-  // A person's explicit billable answer that this node's own gate cannot honour
-  // is refused with the local Create's two codes (409 billable_feature_unsupported
-  // or billable_feature_closed, naming this node), never dropped: the hub's tags
-  // for this node can be one poll old, so its gate may have changed since. The
-  // hub passes the coded refusal on to the person (webClient.ts). The check reads
-  // only the kind and the choice.
-  const billableRefusal = refuseUnhonourableBillableAnswer(c, engine, {
+  // #6778 PR-A (R12; review C9): a person's retired billable answer, which an
+  // older hub can still send, is refused with 400 billable_choice_retired in
+  // every gate state, never dropped (it would start the session non-billable
+  // with a 200). The hub passes the coded refusal on to the person
+  // (webClient.ts). The check reads only the kind and the choice.
+  const billableRefusal = refuseRetiredBillableAnswer(c, {
     kind: billableSwitchStart.kind === "person" ? "person" : "unattended",
     choice: billableSwitchStart.choice,
-    actor: { kind: "client" },
-    via: "direct",
   });
   if (billableRefusal) {
     return billableRefusal;

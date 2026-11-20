@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { Hono, type Context } from "hono";
+import { Hono, type Context, type MiddlewareHandler } from "hono";
 import type { z } from "zod";
 import { defineCapability } from "@hapi/protocol";
 
@@ -7,19 +7,16 @@ import {
   BillableSwitchPushBodySchema,
   type BillableSwitchService,
 } from "../../../billableSwitch/billableSwitchService";
-import { cataloged } from "../../../capabilities/cataloged";
+import { cataloged, markClosedGate } from "../../../capabilities/cataloged";
 import type { Session, SyncEngine } from "../../../sync/syncEngine";
 import type { WebAppEnv } from "../../middleware/auth";
 import { billableSwitchGate } from "../../middleware/billableSwitchGate";
 import {
-  BillableSwitchHeaderResponseSchema,
   BillableSwitchSetResponseSchema,
   closedRefusal,
   describeIssue,
   FederationBillableConfirmBodySchema,
-  FederationBillableHeaderBodySchema,
   FederationBillableSetBodySchema,
-  projectKeyProblem,
 } from "../billableSwitch";
 import {
   checkCallerNamespace,
@@ -53,6 +50,10 @@ export function createBillableSwitchReceiverRoutes(
   const mode = deps.getSyncEngine()?.getBillableSwitchMode?.() ?? "off";
   const gate = billableSwitchGate(mode);
   const closed = mode === "closed";
+  // #6778 PR-A: the header write, closed in every gate state.
+  const retiredRoute = markClosedGate<MiddlewareHandler<WebAppEnv>>(async c =>
+    c.notFound()
+  );
 
   type Node =
     | { ok: true; engine: SyncEngine; service: BillableSwitchService }
@@ -287,7 +288,11 @@ export function createBillableSwitchReceiverRoutes(
     }
   );
 
-  // ─── POST /federation/billable-switch/headers ────────────────────
+  // ─── POST /federation/billable-switch/headers (closed for good, #6778 PR-A) ──
+  // R12: no header decides a start, so no node writes one. Still mounted and
+  // cataloged; the closed gate answers 404 in every gate state and drops it
+  // from the served catalog. An older hub then answers its caller 409
+  // billable_feature_unsupported, which is wrong but harmless (review H12).
   app.post(
     "/federation/billable-switch/headers",
     cataloged(
@@ -309,45 +314,8 @@ export function createBillableSwitchReceiverRoutes(
         availability: { scope: "operator" },
       })
     ),
-    gate,
-    async c => {
-      const node = requireNode(c);
-      if (!node.ok) return node.response;
-      const namespace = callerNamespace(c);
-      if (!namespace) return c.json({ error: "Not found" }, 404);
-      const body = await readBody(c, FederationBillableHeaderBodySchema);
-      if (!body.ok) return body.response;
-      const req = body.data;
-      if (!req.billable && req.picks.length > 0) {
-        return c.json(
-          { error: "Sessions are picked only when a header goes on" },
-          400
-        );
-      }
-      const keyProblem = projectKeyProblem(req.projectKey, req.keyKind);
-      if (keyProblem) return c.json({ error: keyProblem }, 400);
-      if (closed) return closedRefusal(c, node.service.localNodeLabel());
-      const result = node.service.applyHeader({
-        namespace,
-        projectKey: req.projectKey,
-        keyKind: req.keyKind,
-        billable: req.billable,
-        picks: req.picks,
-        actor: req.actor,
-        via: req.via,
-        entryNodeId: req.entryNodeId,
-      });
-      return c.json({
-        ok: true,
-        header: {
-          projectKey: result.header.projectKey,
-          keyKind: result.header.keyKind,
-          billable: result.header.billable,
-          updatedAt: result.header.updatedAt,
-        },
-        sessions: result.sessions,
-      } satisfies z.infer<typeof BillableSwitchHeaderResponseSchema>);
-    }
+    retiredRoute,
+    c => c.notFound()
   );
 
   // ─── POST /federation/billable-switch/sessions ───────────────────

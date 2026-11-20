@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { STOP_HOOK_FEEDBACK_PREFIX } from "@hapi/protocol";
 import type { AgentTextBlock } from "./types";
 
 // #3778: the literal prefix Claude Code emits at the start of a Stop-hook feedback
 // record (verbatim from `getStopHookMessage`; empirically confirmed in the prod DB as
 // `"Stop hook feedback:\n…"`). Used only as the FALLBACK signal for the ~218 legacy
 // records that predate the #2162 `isMeta` flag — the flag is the primary signal.
-export const STOP_HOOK_FEEDBACK_PREFIX = "Stop hook feedback:";
+// #6738: declared once in `@hapi/protocol`, where the server's turn-end check reads it too.
+export { STOP_HOOK_FEEDBACK_PREFIX };
 
 // #3778 (R5): the dimmed banner rendered between the two responses in place of the
 // hook part's prose.

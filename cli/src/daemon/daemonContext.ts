@@ -116,7 +116,7 @@ export interface DaemonContext {
    * can serve the primary account, so no tmux server or child inherits it; this
    * held copy is delivered EXPLICITLY (tmux arm: the 0600 spawn env file; direct
    * arm: the child's spawn env) to strictly unbound claude spawns only — never to a
-   * bound or host-default spawn, and never over a token passed with the request. Absent on
+   * bound spawn, and never over a token passed with the request. Absent on
    * nodes without an onboarding token (e.g. RP1). Never logged.
    */
   instanceOAuthToken?: string;

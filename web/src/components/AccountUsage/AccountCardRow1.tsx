@@ -120,6 +120,11 @@ export type AccountCardRow1Props = {
    *  key card's name is its whole label. It fades only when the row is truly
    *  too narrow. */
   nicknameUncapped?: boolean;
+  /** #6801: the nickname may give way (it fades) after the secondary when the
+   *  row is too narrow, so a `trailing` element (the account switcher's sign-in
+   *  age) never pushes the alert icon, the score or the chevron off the card.
+   *  The 96 px / 192 px cap is unchanged. */
+  nicknameShrinks?: boolean;
   /** Hide the secondary text below `sm` (a key card's masked key gives way
    *  first on a phone). */
   secondaryFromSm?: boolean;
@@ -234,6 +239,7 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
     statusPill,
     trailing,
     nicknameUncapped = false,
+    nicknameShrinks = false,
     secondaryFromSm = false,
     statusPillWraps = false,
     currentMarker = false,
@@ -284,6 +290,8 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
   const nicknameClass = nicknameUncapped
     ? `min-w-0 ${nicknameText}`
     : `max-w-24 ${nicknameText} sm:max-w-48`;
+  // Whether the nickname may shrink; when it may, the secondary gives way first.
+  const nicknameGivesWay = nicknameUncapped || nicknameShrinks;
 
   const pill =
     statusPill == null ? null : statusPillWraps ? (
@@ -317,11 +325,15 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
             onClick={onSelect}
             className="flex min-w-0 flex-1 cursor-pointer items-center justify-start gap-1.5 text-left font-normal hover:text-[var(--app-fg)] disabled:cursor-not-allowed"
           >
-            <FadeTruncate className={`shrink-0 ${nicknameClass}`}>
+            <FadeTruncate
+              className={`${nicknameShrinks ? "shrink" : "shrink-0"} ${nicknameClass}`}
+            >
               {nickname}
             </FadeTruncate>
             {secondary ? (
-              <FadeTruncate className={`shrink ${secondaryClass}`}>
+              <FadeTruncate
+                className={`${nicknameShrinks ? "shrink-[20]" : "shrink"} ${secondaryClass}`}
+              >
                 {secondary}
               </FadeTruncate>
             ) : null}
@@ -335,7 +347,7 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
               content={revealText}
               onClick={e => e.stopPropagation()}
               className={`flex min-w-0 ${
-                nicknameUncapped ? "shrink" : "shrink-0"
+                nicknameGivesWay ? "shrink" : "shrink-0"
               } items-center rounded-sm text-left`}
             >
               <FadeTruncate className={nicknameClass}>{nickname}</FadeTruncate>
@@ -355,8 +367,8 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
                 className={`${
                   secondaryFromSm ? "hidden sm:flex" : "flex"
                 } min-w-0 ${
-                  // With an uncapped name, the secondary gives way first.
-                  nicknameUncapped ? "shrink-[20]" : "shrink"
+                  // With a name that may shrink, the secondary gives way first.
+                  nicknameGivesWay ? "shrink-[20]" : "shrink"
                 } items-center justify-start text-left font-normal hover:text-[var(--app-fg)]`}
               >
                 <FadeTruncate className={secondaryClass}>

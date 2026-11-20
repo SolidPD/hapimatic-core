@@ -64,6 +64,7 @@ export function PinsDefaultsSection(props: { api: ApiClient | null }) {
           }
           onClear={() => setDefaults({ filters: null })}
           disabled={!ready}
+          align="start"
         />
         <PinsSortMenu
           sort={view.sort}
@@ -74,6 +75,7 @@ export function PinsDefaultsSection(props: { api: ApiClient | null }) {
           onGroup={group => setDefaults({ group })}
           onClear={() => setDefaults({ sort: null, dir: null, group: null })}
           disabled={!ready}
+          align="start"
         />
         <span
           data-testid="pins-defaults-summary"

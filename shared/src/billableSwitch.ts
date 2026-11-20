@@ -50,7 +50,14 @@ export const BillableSwitchStartKindSchema = z.enum(
   BILLABLE_SWITCH_START_KINDS
 );
 
-/** A person's answer to the question at Create (POP-1). */
+/**
+ * The `choice` a person's start may carry in `billableSwitchStart`. Only
+ * `not-billable` decides a start (it starts off); `follow-header` is no answer.
+ * The other two are retired (#6778 PR-A, R12): they billed through the project
+ * header, which no longer decides a start, so the spawn routes refuse them with
+ * 400 `billable_choice_retired`. They stay listed so that the refusal can name
+ * them and an older client's value still parses.
+ */
 export const BILLABLE_SWITCH_START_CHOICES = [
   "follow-header",
   "header-and-session",
@@ -62,6 +69,19 @@ export type BillableSwitchStartChoice =
 export const BillableSwitchStartChoiceSchema = z.enum(
   BILLABLE_SWITCH_START_CHOICES
 );
+
+/** The answers the spawn routes refuse with 400 `billable_choice_retired` (#6778). */
+export const BILLABLE_SWITCH_RETIRED_CHOICES = [
+  "header-and-session",
+  "session-only",
+] as const satisfies readonly BillableSwitchStartChoice[];
+
+/** True for an answer the spawn routes refuse as retired. */
+export function isRetiredBillableSwitchChoice(choice: unknown): boolean {
+  return (BILLABLE_SWITCH_RETIRED_CHOICES as readonly unknown[]).includes(
+    choice
+  );
+}
 
 /**
  * The channel a write came in on: `direct` for a token-authenticated request,
@@ -113,9 +133,10 @@ export const BillableSwitchHeaderSchema = z.object({
 export type BillableSwitchHeader = z.infer<typeof BillableSwitchHeaderSchema>;
 
 /**
- * How old another node's header report may be before the start rule stops
- * using it: 7 days. Older, it counts as never reported (unknown), so a node
- * that missed a peer's eviction stops being steered by its stale report.
+ * How old another node's header report may be before the push stops passing it
+ * on: 7 days. Since #6778 PR-A no start reads a report and none is stored; the
+ * push still sends this node's own, empty one (an older node replaces its
+ * stored copy with it).
  */
 export const BILLABLE_SWITCH_REPORT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -134,7 +155,11 @@ export const BILLABLE_SWITCH_EVENT_KINDS = [
 export type BillableSwitchEventKind =
   (typeof BILLABLE_SWITCH_EVENT_KINDS)[number];
 
-/** The reasons a `start` event may carry, one per row of the truth table. */
+/**
+ * The reasons a `start` event may carry. Since #6778 PR-A a new start writes
+ * only `explicit-not-billable`, `inherit`, `system` or `default`; the others
+ * stay because events #6646 recorded carry them and the history reads them.
+ */
 export const BILLABLE_SWITCH_START_REASONS = [
   "explicit-header-and-session",
   "explicit-session-only",
@@ -142,9 +167,9 @@ export const BILLABLE_SWITCH_START_REASONS = [
   "inherit",
   "system",
   "header",
-  // Row 8: a person switched this node's header off. The plan wrote this reason
-  // as `header-off`, which is also the name of a kind; the plan's own rule says
-  // no reason shares a name with a kind, so the reason carries this name.
+  // #6646's row 8: a person switched this node's header off. The plan wrote
+  // this reason as `header-off`, which is also the name of a kind; the plan's
+  // own rule says no reason shares a name with a kind, so it carries this name.
   "header-switched-off",
   "cross-node",
   "cross-node-unasked",
@@ -161,7 +186,8 @@ export const BILLABLE_SWITCH_REASONS_BY_KIND = {
   keep: ["confirm", "confirm-all", "switch"],
   reverse: ["confirm-reverse", "switch", "switch-off-and-delete", "never-bill"],
   "header-on": ["switch", "create-choice"],
-  "header-off": ["switch"],
+  // `retired`: #6778 PR-A's start-up step switched a header off for good (R12).
+  "header-off": ["switch", "retired"],
 } as const satisfies Record<BillableSwitchEventKind, readonly string[]>;
 
 export type BillableSwitchReason =
@@ -324,20 +350,9 @@ export function projectKeyKind(
   return metadata?.repoIdentity?.name ? "repo" : "path";
 }
 
-/**
- * The key two nodes compare for the same project: a `repo` key, lower-cased
- * (A3). A `path` key never matches across nodes (X1), even when two nodes share
- * the path.
- */
-export function crossNodeMatchKey(
-  key: string,
-  kind: BillableSwitchKeyKind
-): string | null {
-  return kind === "repo" ? key.toLowerCase() : null;
-}
-
 // ---------------------------------------------------------------------------
-// "Billable on another node"
+// The node view of `GET /api/billable-switch/headers` (its header lists are
+// empty from #6778 PR-A on: no header decides a start)
 
 export type BillableSwitchNodeView = {
   nodeId: string;
@@ -354,93 +369,14 @@ export type BillableSwitchNodeView = {
   >;
 };
 
-export type BillableSwitchCauseNode = {
-  nodeId: string;
-  nodeLabel: string;
-  reportedAt: number | null;
-};
-
-export type CrossNodeBillableState = "yes" | "no" | "unknown";
-
-export type CrossNodeBillable = {
-  state: CrossNodeBillableState;
-  /** The nodes whose report has the project on (empty unless `state` is `yes`). */
-  nodes: BillableSwitchCauseNode[];
-};
-
-/**
- * Is the project billable on a node other than `targetNodeId`?
- *
- * `views` holds one entry per node; the target is always excluded. With
- * `maxAgeMs`, another node's report older than that counts as never reported
- * (the local entry is always fresh). `yes`: some other node has a `repo` header
- * on with this match key in this namespace. `no`: every other node has a usable
- * report and none has it on. `unknown`: no other node, a null match key, or
- * nothing on while at least one other node has no usable report. The start
- * rule passes `maxAgeMs`; the Create dialog does not, and shows "last seen".
- */
-export function crossNodeBillable(
-  views: readonly BillableSwitchNodeView[],
-  matchKey: string | null,
-  namespace: string,
-  targetNodeId: string,
-  opts?: { now?: number; maxAgeMs?: number }
-): CrossNodeBillable {
-  if (matchKey === null) return { state: "unknown", nodes: [] };
-  const others = views.filter(v => v.nodeId !== targetNodeId);
-  if (others.length === 0) return { state: "unknown", nodes: [] };
-
-  const now = opts?.now ?? Date.now();
-  const usable = (v: BillableSwitchNodeView): boolean => {
-    if (v.isLocal) return true;
-    if (v.reportedAt === null) return false;
-    if (opts?.maxAgeMs !== undefined && now - v.reportedAt > opts.maxAgeMs) {
-      return false;
-    }
-    return true;
-  };
-
-  const nodes: BillableSwitchCauseNode[] = [];
-  let anyUnusable = false;
-  for (const view of others) {
-    if (!usable(view)) {
-      anyUnusable = true;
-      continue;
-    }
-    const on = view.headers.some(
-      h =>
-        h.billable &&
-        h.keyKind === "repo" &&
-        h.namespace === namespace &&
-        h.projectKey.toLowerCase() === matchKey
-    );
-    if (on) {
-      nodes.push({
-        nodeId: view.nodeId,
-        nodeLabel: view.nodeLabel,
-        reportedAt: view.reportedAt,
-      });
-    }
-  }
-  if (nodes.length > 0) return { state: "yes", nodes };
-  if (anyUnusable) return { state: "unknown", nodes: [] };
-  return { state: "no", nodes: [] };
-}
-
 // ---------------------------------------------------------------------------
-// The start rule (the truth table of the plan's Task 1, first matching row wins)
+// The start rule (first matching row wins)
 
 export type BillableSwitchStartInput = {
   mode: BillableSwitchMode;
   context: Pick<BillableSwitchStartContext, "kind" | "choice">;
   /** The parent row's switch, for kind `inherit`; null when it was not found. */
   parent: { billable: boolean; confirm: BillableConfirm } | null;
-  /**
-   * This node's header for the project: `off` only when a row exists with
-   * billable 0 (a person switched it off), `unset` when there is no row.
-   */
-  header: "on" | "off" | "unset";
-  crossNode: CrossNodeBillable;
 };
 
 export type BillableSwitchStartResult = {
@@ -448,56 +384,36 @@ export type BillableSwitchStartResult = {
   confirm: BillableConfirm;
   /** Null for row 1 (the gate is not `on`): no event is written. */
   reason: BillableSwitchStartReason | null;
-  /** Row 2: the node's header for the project goes on in the same transaction. */
-  headerOn?: true;
-  /** Rows 9 and 10: the nodes whose report made the session start billable. */
-  causeNodes?: BillableSwitchCauseNode[];
 };
 
 /**
  * The start value of a new session row. Rows, first match wins:
  *  1. gate not `on` → off, no event
- *  2-4. kind `person` with an answer → that answer
- *  5. kind `inherit`, parent found → the parent's switch and confirm state
- *  6. kind `system` (support, self-update, heartbeat) → off, whatever else (SYS-1)
- *  7. this node's header on → on
- *  8. this node's header off (a person switched it off) → off (HOFF-1)
- *  9. billable on another node, kind `agent` or `schedule` → on, waiting (AG-1)
- *  10. billable on another node, any other kind that reaches here → on, waiting (CLI-1)
- *  11. otherwise → off
+ *  2. kind `person` answering `not-billable` → off
+ *  3. kind `inherit`, parent found → the parent's switch and confirm state
+ *  4. kind `system` (support, self-update, heartbeat) → off, whatever else (SYS-1)
+ *  5. otherwise → off
  * A choice counts only for kind `person`; `follow-header` is no answer.
- * `unknown` never starts a session billable.
+ *
+ * Issue #6778 PR-A (R12): no project header and no other node's report decides
+ * a start any more; their rows (#6646's 7 to 10) and the two answers that billed
+ * through the header (`header-and-session`, `session-only`, #6646's rows 2 and
+ * 3) are gone. The spawn routes refuse a retired answer (400
+ * `billable_choice_retired`); one that still reaches this rule is no answer, so
+ * the start is off. PR-B replaces this rule with the tracking record's.
  */
 export function resolveBillableSwitchStart(
   input: BillableSwitchStartInput
 ): BillableSwitchStartResult {
-  const { mode, context, parent, header, crossNode } = input;
+  const { mode, context, parent } = input;
   if (mode !== "on") return { billable: false, confirm: null, reason: null };
 
-  if (context.kind === "person") {
-    switch (context.choice) {
-      case "header-and-session":
-        return {
-          billable: true,
-          confirm: null,
-          reason: "explicit-header-and-session",
-          headerOn: true,
-        };
-      case "session-only":
-        return {
-          billable: true,
-          confirm: null,
-          reason: "explicit-session-only",
-        };
-      case "not-billable":
-        return {
-          billable: false,
-          confirm: null,
-          reason: "explicit-not-billable",
-        };
-      default:
-        break; // no answer, or `follow-header`: on to row 7
-    }
+  if (context.kind === "person" && context.choice === "not-billable") {
+    return {
+      billable: false,
+      confirm: null,
+      reason: "explicit-not-billable",
+    };
   }
 
   if (context.kind === "inherit" && parent) {
@@ -510,22 +426,6 @@ export function resolveBillableSwitchStart(
 
   if (context.kind === "system") {
     return { billable: false, confirm: null, reason: "system" };
-  }
-
-  if (header === "on")
-    return { billable: true, confirm: null, reason: "header" };
-  if (header === "off") {
-    return { billable: false, confirm: null, reason: "header-switched-off" };
-  }
-
-  if (crossNode.state === "yes") {
-    const asked = context.kind === "agent" || context.kind === "schedule";
-    return {
-      billable: true,
-      confirm: "pending",
-      reason: asked ? "cross-node" : "cross-node-unasked",
-      causeNodes: crossNode.nodes,
-    };
   }
 
   return { billable: false, confirm: null, reason: "default" };

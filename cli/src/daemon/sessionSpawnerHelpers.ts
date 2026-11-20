@@ -525,7 +525,7 @@ export function computeAuthBinding(input: {
  * EXPLICITLY to a spawn, or `undefined` when none may be delivered.
  *
  * An UNBOUND claude spawn (no `accountUuid` — an un-pinned CLI / scheduler / peer /
- * federation spawn on a node with no host-default login, or a store-less VM) has
+ * federation spawn on a node with no bindable account (#6800 R3), or a store-less VM) has
  * no explicit binding: its only credential on a paste-token node is the onboarding
  * `CLAUDE_CODE_OAUTH_TOKEN`. That token used to reach it AMBIENTLY (daemon env →
  * tmux global table → pane), which is exactly the path that leaked it into
@@ -536,10 +536,10 @@ export function computeAuthBinding(input: {
  *
  * Returns the held token ONLY when all hold:
  *  - `agent` is claude (the default) — codex/gemini/opencode never consume it;
- *  - `accountUuid` is empty — a BOUND spawn binds explicitly, and a host-default
- *    spawn (`accountUuid` set, `shouldSkipBinding`) is bound to the host login, so
- *    the instance token must never reach either (it would override their
- *    credentials — the bug being fixed);
+ *  - `accountUuid` is empty — a BOUND spawn binds explicitly (since #6800 every
+ *    bound account, including the one `~/.claude.json` names), so the instance
+ *    token must never reach it (it would override its credentials — the bug
+ *    being fixed);
  *  - no explicit token was passed with the spawn request (`explicitToken`) — an
  *    explicitly passed token always wins, on both the tmux and the direct arm;
  *  - a non-empty token is held.

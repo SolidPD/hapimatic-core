@@ -19,7 +19,8 @@ import {
  * (provenance `global`/`local`); #4516's local value is only the first-paint
  * cache and the fallback when none exists or the read fails, and is NEVER
  * published on its own. The dock toggle is optimistic — `setExpanded` writes the
- * cache and fires the PUT without awaiting the server's ≤5s peer fan-out.
+ * cache and fires the PUT without awaiting it; the PUT answers once the value is
+ * stored locally, without waiting for the push to the other nodes (#6526).
  *
  * Pattern: `useChatSectionPrefs` (cache, generation guard, adopt-without-PUT)
  * plus #4467's focus/visibility refetch. This hook deliberately does NOT use or

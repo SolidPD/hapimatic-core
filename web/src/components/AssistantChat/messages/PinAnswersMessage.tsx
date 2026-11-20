@@ -2,7 +2,12 @@
 import { Suspense, type ReactElement, type ReactNode } from "react";
 import { lazyWithLoadError } from "@/lib/lazyWithPreload";
 
-type PinAnswersBodyProps = { text: string; fallback: ReactNode };
+type PinAnswersBodyProps = {
+  text: string;
+  /** What a copy from inside the message carries (#6662); defaults to `text`. */
+  copyText?: string;
+  fallback: ReactNode;
+};
 
 /** A compact body whose chunk cannot load stays the ordinary markdown. */
 function PinAnswersBodyLoadError(props: PinAnswersBodyProps): ReactElement {
@@ -29,15 +34,24 @@ export function looksLikePinAnswers(text: string): boolean {
  * full-height JSON block on a phone. Any other message renders `children` (the
  * ordinary markdown) unchanged, and so does this one until the parser loads or
  * if it cannot read the block.
+ *
+ * #6662: `copyText` is what a copy from inside the compact body carries, the
+ * text the message's "Copy message" button copies. The markdown fallback is
+ * copied natively.
  */
 export function PinAnswersMessage(props: {
   text: string;
+  copyText?: string;
   children: ReactNode;
-}) {
+}): ReactElement {
   if (!looksLikePinAnswers(props.text)) return <>{props.children}</>;
   return (
     <Suspense fallback={props.children}>
-      <LazyPinAnswersBody text={props.text} fallback={props.children} />
+      <LazyPinAnswersBody
+        text={props.text}
+        copyText={props.copyText}
+        fallback={props.children}
+      />
     </Suspense>
   );
 }

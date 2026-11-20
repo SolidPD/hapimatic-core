@@ -7,6 +7,7 @@ import { cataloged } from "../../../capabilities/cataloged";
 import { RedactedAccountSchema } from "../../../services/accountService";
 import { IN_VM_SIGN_IN_REQUIRED } from "../../../services/accountLoginService";
 import { checkFederationToken, type FederationDeps } from "./shared";
+import { listOlderLiveSiblingDaemons } from "../../../services/siblingDaemonVersions";
 
 /**
  * Node-targeted Anthropic login, peer side (issue #4462, epic #4460 B).
@@ -65,7 +66,7 @@ export function createFederationAnthropicLoginRoutes(
         probe: "skip",
       })
     ),
-    c => {
+    async c => {
       if (!checkFederationToken(deps, c.req.header("authorization"))) {
         return c.json({ error: "Unauthorized" }, 401);
       }
@@ -84,7 +85,17 @@ export function createFederationAnthropicLoginRoutes(
       }
       try {
         const { loginToken, authorizeUrl } = svc.start();
-        return c.json({ ok: true, loginToken, authorizeUrl });
+        // #6800: this node's live sibling daemons on an older build; the hub
+        // forwards the names beside nodeLabel (a warning, never a refusal).
+        const older = await (
+          deps.listOlderSiblingDaemons ?? listOlderLiveSiblingDaemons
+        )();
+        return c.json({
+          ok: true,
+          loginToken,
+          authorizeUrl,
+          ...(older.length > 0 ? { olderSiblingDaemons: older } : {}),
+        });
       } catch (error) {
         deps.errorLogger?.error("Federation Anthropic login start failed", {
           category: "accounts",

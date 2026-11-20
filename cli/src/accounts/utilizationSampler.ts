@@ -27,7 +27,11 @@ import {
   computeUtilizationScore,
   withEffectiveFiveHour,
 } from "@hapi/protocol/usage";
-import type { AccountIndexEntry } from "@hapi/protocol/accounts";
+import {
+  HOST_CHAIN_SHARED_REASON,
+  type AccountIndexEntry,
+  type StoredAccount,
+} from "@hapi/protocol/accounts";
 import { logger } from "@/ui/logger";
 import {
   ANTHROPIC_OAUTH_USAGE_URL,
@@ -174,11 +178,32 @@ export async function sampleAccountUtilization(
 }
 
 /**
+ * Issue #6800 (ruling S1): the access token the daemon's sampler may poll the
+ * usage endpoint with for a store record. None for a record quarantined
+ * host-chain-shared — its token is the `~/.claude` login chain's, which this
+ * change stops Hapimatic from using — so nothing is called and the snapshot reads
+ * `unknown`. Every other record (flagged for any other reason included) keeps
+ * its stored access token, as before.
+ */
+export function samplingAccessToken(
+  account: StoredAccount | null | undefined
+): string | null {
+  if (!account) return null;
+  if (
+    account.unrefreshable === true &&
+    account.unrefreshableReason === HOST_CHAIN_SHARED_REASON
+  ) {
+    return null;
+  }
+  return account.accessToken || null;
+}
+
+/**
  * Sample utilization for every supplied account and refresh the veto's cache. Best-effort
  * and fully parallel: a slow/failed account never blocks the others, and nothing throws.
  * Per-account throttled by {@link SAMPLE_INTERVAL_MS} so frequent ticks do not hammer the
  * usage endpoint. This is the callback the `TokenRefreshService` invokes at its tick
- * loop-top (covering EVERY account, including the host-default the refresh loop defers).
+ * loop-top (covering EVERY account, including the isolated ones the refresh loop defers).
  */
 export async function sampleUtilizationForAccounts(
   entries: readonly AccountIndexEntry[],

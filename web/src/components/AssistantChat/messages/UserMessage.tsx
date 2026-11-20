@@ -400,7 +400,9 @@ export function HappyUserMessage() {
               <div className="flex items-end gap-2">
                 <div className="flex-1 min-w-0">
                   {marker ? <UserMarkerChip marker={marker} /> : null}
-                  <PinAnswersMessage text={displayText}>
+                  {/* #6662: a copy from inside a Pins answers message carries
+                      `text`, the "Copy message" button's value below. */}
+                  <PinAnswersMessage text={displayText} copyText={text}>
                     <LazyRainbowText
                       text={displayText}
                       remarkPlugins={USER_MARKDOWN_PLUGINS}

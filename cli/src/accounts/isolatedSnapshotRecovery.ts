@@ -61,7 +61,10 @@
  * rotation itself is compare-and-swap and why the store head is a last resort.
  */
 
-import type { StoredAccount } from "@hapi/protocol/accounts";
+import {
+  HOST_CHAIN_SHARED_REASON,
+  type StoredAccount,
+} from "@hapi/protocol/accounts";
 import {
   readIsolatedCredentials,
   seedAccountConfigDir,
@@ -72,12 +75,14 @@ import {
   ROTATE_LOCK_NAME,
   refreshTokenFingerprint,
   withAccountCredentialLock,
+  withUnrefreshableFlag,
 } from "@/accounts/machineRotator";
 import {
   TokenRefreshService,
   type ForceRefreshOutcome,
 } from "@/accounts/tokenRefreshService";
 import { logger } from "@/ui/logger";
+import { sharesHostChain } from "@/accounts/hostChainQuarantine";
 
 /** OAuth profile endpoint — same wire target as `oauthProfile.ts` (CC source). */
 export const PROBE_URL = "https://api.anthropic.com/api/oauth/profile";
@@ -126,13 +131,21 @@ export interface SnapshotRecoveryDeps {
   /** Seed seam. Defaults to the real {@link seedAccountConfigDir}. */
   seedFn?: typeof seedAccountConfigDir;
   /**
+   * Issue #6800 (invariant I1): true for a store head on the `~/.claude` login
+   * chain, which the last-resort seed never writes. Defaults to
+   * {@link sharesHostChain}.
+   */
+  sharesHostChain?: (refreshToken: string) => Promise<boolean>;
+  /**
    * Issue #5020 (R5): flag the account `unrefreshable` with a reason and the
    * failed head's fingerprint. Defaults to a merge into this instance's store.
+   * `nowMs` (#6801) is the death time the flag carries when it is the first one.
    */
   markUnrefreshable?: (
     accountUuid: string,
     reason: string,
-    fingerprint: string | undefined
+    fingerprint: string | undefined,
+    nowMs: number
   ) => Promise<void>;
   /** Probe timeout override (tests). */
   probeTimeoutMs?: number;
@@ -182,6 +195,16 @@ export async function validateAndRecoverIsolatedSnapshot(
 ): Promise<"ok" | "fallback"> {
   const now = deps.now ?? Date.now;
   const accountUuid = account.accountUuid;
+  // Issue #6800 (round 2, R2-1): an account quarantined for sharing the
+  // ~/.claude chain is never probed, rotated, seeded or re-flagged here. Its
+  // folder may hold an older token of that chain, and a rewritten reason would
+  // let the folder-token clear lift the quarantine without a sign-in.
+  if (isHostChainQuarantined(account)) {
+    logger.info(
+      `[SNAPSHOT_RECOVERY] ${accountUuid} is quarantined host-chain-shared; no recovery, falling back (#6800)`
+    );
+    return "fallback";
+  }
   try {
     const cachedAt = healthyCache.get(accountUuid);
     if (cachedAt !== undefined && now() - cachedAt < HEALTHY_CACHE_TTL_MS) {
@@ -204,8 +227,8 @@ export async function validateAndRecoverIsolatedSnapshot(
       // buildLauncherEnv binding-var strip), not native blanking, drove the
       // apparent token burn. So this branch fires only on genuine
       // malformation/partial writes — enter recovery rather than bailing (the
-      // store may hold a fresher head, e.g. a CredentialsWatcher capture from a
-      // host re-login of this account).
+      // store may hold a fresher head, e.g. from a Provider Accounts sign-in
+      // of this account).
       logger.warn(
         `[SNAPSHOT_RECOVERY] isolated credentials unreadable/malformed for ${accountUuid} — entering recovery (#1635)`
       );
@@ -347,8 +370,19 @@ export function storeHeadSeedability(
   return "seedable";
 }
 
-/** Seed the store head over the file, with `overwrite: true`, and log it. */
-async function lastResortSeed(ctx: RecoveryContext): Promise<void> {
+/**
+ * Seed the store head over the file, with `overwrite: true`, and log it. False,
+ * with nothing written, when the store head is the `~/.claude` login chain
+ * (#6800 invariant I1).
+ */
+async function lastResortSeed(ctx: RecoveryContext): Promise<boolean> {
+  const shares = ctx.deps.sharesHostChain ?? (t => sharesHostChain(t));
+  if (ctx.account.refreshToken && (await shares(ctx.account.refreshToken))) {
+    logger.warn(
+      `[SNAPSHOT_RECOVERY] the store head of ${ctx.account.accountUuid} holds the ~/.claude login chain; not seeded (#6800)`
+    );
+    return false;
+  }
   await ctx.seed(ctx.account, {
     overwrite: true,
     writer: "recovery-last-resort",
@@ -356,6 +390,7 @@ async function lastResortSeed(ctx: RecoveryContext): Promise<void> {
   logger.info(
     `[SNAPSHOT_RECOVERY] last-resort seed for ${ctx.account.accountUuid}`
   );
+  return true;
 }
 
 /**
@@ -369,7 +404,7 @@ async function refuseOlderLineage(ctx: RecoveryContext): Promise<"fallback"> {
   const fp = ctx.account.refreshToken
     ? refreshTokenFingerprint(ctx.account.refreshToken)
     : undefined;
-  await ctx.markUnrefreshable(uuid, STORE_LINEAGE_STALE_REASON, fp);
+  await ctx.markUnrefreshable(uuid, STORE_LINEAGE_STALE_REASON, fp, ctx.now());
   logger.warn(
     `[SNAPSHOT_RECOVERY] recovery exhausted for ${uuid}: store pair older than the isolated head — re-login required (store head ${fp ? fp.slice(0, 8) : "none"} not presented)`
   );
@@ -379,18 +414,43 @@ async function refuseOlderLineage(ctx: RecoveryContext): Promise<"fallback"> {
 /** `unrefreshableReason` when the store pair is older than the file lineage. */
 export const STORE_LINEAGE_STALE_REASON = "store-lineage-stale";
 
+/** True for a record quarantined because it shared the `~/.claude` chain (#6800). */
+function isHostChainQuarantined(account: StoredAccount): boolean {
+  return (
+    account.unrefreshable === true &&
+    account.unrefreshableReason === HOST_CHAIN_SHARED_REASON
+  );
+}
+
+/**
+ * The store merge {@link markUnrefreshableInStore} applies: the flag, its reason
+ * and the failed token's fingerprint. A record already quarantined
+ * `host-chain-shared` is returned unchanged (#6800 round 2, R2-1), because its
+ * clear rule keys on that reason: a rewritten reason would let a folder token
+ * that merely differs lift the quarantine without a sign-in. Any other record is
+ * flagged through `withUnrefreshableFlag` (#6801), so the first flag stamps the
+ * death time `nowMs` and a re-flag keeps the earlier one.
+ */
+export function withUnrefreshableMark(
+  current: StoredAccount,
+  reason: string,
+  fingerprint: string | undefined,
+  nowMs: number
+): StoredAccount {
+  if (isHostChainQuarantined(current)) return current;
+  return withUnrefreshableFlag(current, { reason, fingerprint }, nowMs);
+}
+
 /** Production {@link SnapshotRecoveryDeps.markUnrefreshable}: merge into this instance's store. */
 async function markUnrefreshableInStore(
   accountUuid: string,
   reason: string,
-  fingerprint: string | undefined
+  fingerprint: string | undefined,
+  nowMs: number
 ): Promise<void> {
-  await accountStore.update(accountUuid, current => ({
-    ...current,
-    unrefreshable: true,
-    unrefreshableReason: reason,
-    ...(fingerprint ? { unrefreshableTokenFingerprint: fingerprint } : {}),
-  }));
+  await accountStore.update(accountUuid, current =>
+    withUnrefreshableMark(current, reason, fingerprint, nowMs)
+  );
 }
 
 /**
@@ -487,8 +547,7 @@ async function recoverReadableFile(
       );
       if (seedability === "older-lineage") return "older-lineage";
       if (seedability !== "seedable") return "none";
-      await lastResortSeed(ctx);
-      return "seeded";
+      return (await lastResortSeed(ctx)) ? "seeded" : "none";
     }
   );
   if (step === "changed") {
@@ -530,8 +589,9 @@ async function recoverUnreadableFile(
       const seedability = storeHeadSeedability(ctx.account, null, null);
       if (seedability === "older-lineage") return { kind: "older-lineage" };
       if (seedability !== "seedable") return { kind: "none" };
-      await lastResortSeed(ctx);
-      return { kind: "seeded" };
+      return (await lastResortSeed(ctx))
+        ? { kind: "seeded" }
+        : { kind: "none" };
     }
   );
   if (step.kind === "readable") {

@@ -41,7 +41,12 @@ import { readdirSync, readFileSync } from "node:fs";
 import { mkdir, utimes } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { WORKTREE_PORT_MAX, WORKTREE_PORT_MIN } from "@hapi/protocol";
-import type { StoredAccount } from "@hapi/protocol/accounts";
+import {
+  HOST_CHAIN_SHARED_REASON,
+  isNonDeathFlag,
+  trustedUnrefreshableAt,
+  type StoredAccount,
+} from "@hapi/protocol/accounts";
 import {
   accountConfigDirFor,
   readIsolatedCredentials,
@@ -213,11 +218,31 @@ export function machineRotatorRoleLine(
 
 // --- Sibling-instance liveness (R5) ---------------------------------------------
 
+/**
+ * Issue #6847 (R2): one process of another Hapimatic instance that binds an
+ * account, so a refusal can name it. `sessionTag` is its `HAPI_SESSION_ID`
+ * (a session wrapper carries it on both spawn paths; a native `claude` child
+ * may not), `hapiHome` its `HAPI_HOME`. `kind` says which branch matched it:
+ * a session wrapper, a native `claude`, or a process whose argv was unreadable.
+ */
+export interface SiblingHolder {
+  pid: number;
+  hapiHome: string | null;
+  sessionTag: string | null;
+  kind: "wrapper" | "native" | "unknown";
+}
+
 /** Accounts bound by a live session of ANOTHER Hapimatic instance on this machine. */
 export interface SiblingBindingScan {
   uuids: Set<string>;
   /** `/proc` could not be listed: liveness is unknown, so the caller fails safe. */
   degraded: boolean;
+  /**
+   * Issue #6847 (R2): the processes behind each uuid in `uuids`. Optional and
+   * additive: the idle backstop and the host-chain detector read only `uuids`
+   * and `degraded`, and a fake or fallback scan may leave it out.
+   */
+  holders?: Map<string, SiblingHolder[]>;
 }
 
 export interface SiblingScanOptions {
@@ -234,7 +259,13 @@ export interface SiblingScanOptions {
 }
 
 /** The env keys the scan reads — nothing else is parsed out of an environ. */
-const SCAN_ENV_KEYS = ["HAPI_ACCOUNT_UUID", "CLAUDE_CONFIG_DIR", "HAPI_HOME"];
+const SCAN_ENV_KEYS = [
+  "HAPI_ACCOUNT_UUID",
+  "CLAUDE_CONFIG_DIR",
+  "HAPI_HOME",
+  // Issue #6847 (R2): names the sibling session in a force-refresh refusal.
+  "HAPI_SESSION_ID",
+];
 
 function parseScanEnv(raw: string): Map<string, string> {
   const out = new Map<string, string>();
@@ -332,6 +363,7 @@ export function scanSiblingBoundAccounts(
     return none(true);
   }
   const uuids = new Set<string>();
+  const holders = new Map<string, SiblingHolder[]>();
   for (const pid of pids) {
     if (Number(pid) === selfPid) continue;
     const envRaw = read(pid, "environ");
@@ -348,12 +380,16 @@ export function scanSiblingBoundAccounts(
     const argvRaw = read(pid, "cmdline");
     const argv = argvRaw ? argvRaw.split("\0").filter(Boolean) : [];
     let uuid: string | null;
+    let kind: SiblingHolder["kind"];
     if (argv.length === 0) {
       uuid = wrapperUuid ?? nativeUuid; // kind unknown → count it
+      kind = "unknown";
     } else if (isSessionWrapperArgv(argv)) {
       uuid = wrapperUuid;
+      kind = "wrapper";
     } else if (isNativeClaudeArgv(argv)) {
       uuid = nativeUuid;
+      kind = "native";
     } else {
       continue; // a shell or tool started inside a session
     }
@@ -361,8 +397,17 @@ export function scanSiblingBoundAccounts(
     const home = normalizeHapiHome(env.get("HAPI_HOME"));
     if (home !== null && home === ownHome) continue;
     uuids.add(uuid);
+    const holder: SiblingHolder = {
+      pid: Number(pid),
+      hapiHome: env.get("HAPI_HOME") ?? null,
+      sessionTag: env.get("HAPI_SESSION_ID") ?? null,
+      kind,
+    };
+    const list = holders.get(uuid);
+    if (list) list.push(holder);
+    else holders.set(uuid, [holder]);
   }
-  return { uuids, degraded: false };
+  return { uuids, degraded: false, holders };
 }
 
 // --- Failed-token fingerprint ---------------------------------------------------
@@ -376,16 +421,72 @@ export function refreshTokenFingerprint(refreshToken: string): string {
   return createHash("sha256").update(refreshToken).digest("hex");
 }
 
-/** A copy of `account` without the failed-token fingerprint and its reason. */
+/**
+ * A copy of `account` without the flag's detail fields: the failed-token
+ * fingerprint, its reason, and the time it was set (`unrefreshableAt` and its
+ * binding `unrefreshableAtFor`, #6801 R3). Keeps `signInDeaths`, which is
+ * history. The ONLY clear choke point: every flag clear spreads it.
+ */
 export function withoutFailedTokenFingerprint(
   account: StoredAccount
 ): StoredAccount {
   const {
     unrefreshableTokenFingerprint: _dropped,
     unrefreshableReason: _reason,
+    unrefreshableAt: _at,
+    unrefreshableAtFor: _atFor,
     ...rest
   } = account;
   return rest as StoredAccount;
+}
+
+/**
+ * Issue #6801 (R1, R2, R14): `current` flagged `unrefreshable`, with the death
+ * time the flag carries. Sets ONLY the detail keys it is given (a site that has
+ * no fingerprint or no reason leaves the stored one), then the time:
+ *
+ * - a non-death flag (#6800's `host-chain-shared` quarantine, `isNonDeathFlag`)
+ *   carries no time: both time fields are dropped, so a quarantine written
+ *   through this helper can never become a death;
+ * - already flagged with a TRUSTED time: keep it (first flag wins) and rebind it
+ *   to the new flag key;
+ * - already flagged with no trusted time (an older build's flag, or a stamp bound
+ *   to another flag): drop both fields, never invent a time;
+ * - not flagged: stamp `nowMs`, bound to `unrefreshableTokenFingerprint ??
+ *   unrefreshableReason`.
+ *
+ * Evaluate it inside the caller's locked store merge, against the `current`
+ * read under the lock.
+ */
+export function withUnrefreshableFlag(
+  current: StoredAccount,
+  detail: { reason?: string; fingerprint?: string },
+  nowMs: number
+): StoredAccount {
+  const {
+    unrefreshableAt: _at,
+    unrefreshableAtFor: _atFor,
+    ...withoutTime
+  } = current;
+  const merged = {
+    ...withoutTime,
+    unrefreshable: true,
+    ...(detail.reason ? { unrefreshableReason: detail.reason } : {}),
+    ...(detail.fingerprint
+      ? { unrefreshableTokenFingerprint: detail.fingerprint }
+      : {}),
+  } as StoredAccount;
+  if (isNonDeathFlag(merged)) return merged;
+  const key =
+    merged.unrefreshableTokenFingerprint ?? merged.unrefreshableReason;
+  if (key === undefined) return merged;
+  if (current.unrefreshable === true) {
+    const kept = trustedUnrefreshableAt(current);
+    return kept === null
+      ? merged
+      : { ...merged, unrefreshableAt: kept, unrefreshableAtFor: key };
+  }
+  return { ...merged, unrefreshableAt: nowMs, unrefreshableAtFor: key };
 }
 
 /**
@@ -393,7 +494,10 @@ export function withoutFailedTokenFingerprint(
  * credentials now on disk hold a refresh token OTHER than the one recorded as
  * failed (a re-login, a sibling's successful rotation, or a last-resort seed).
  * False for an unflagged record, a legacy flag with no fingerprint (the caller
- * keeps its probe arm for that case), or the same token.
+ * keeps its probe arm for that case), or the same token. Always false for a
+ * `host-chain-shared` flag (#6800 round 2, R2-1): a token that merely differs
+ * from the flagged one may be an older token of the same `~/.claude` chain, so
+ * only a sign-in's own marker lifts it (`clearStaleUnrefreshableFlags`).
  */
 export function fingerprintedFlagIsStale(
   account: StoredAccount,
@@ -402,6 +506,7 @@ export function fingerprintedFlagIsStale(
   const failed = account.unrefreshableTokenFingerprint;
   return (
     account.unrefreshable === true &&
+    account.unrefreshableReason !== HOST_CHAIN_SHARED_REASON &&
     typeof failed === "string" &&
     failed.length > 0 &&
     failed !== refreshTokenFingerprint(onDiskRefreshToken)
@@ -549,6 +654,13 @@ export interface IsolatedRotationDeps {
   ) => Promise<void>;
   now: () => number;
   expiryBufferMs: number;
+  /**
+   * Issue #6800 (invariant I1): "is this refresh token the current ~/.claude
+   * token?" — `hostChainQuarantine.sharesHostChain` in production. Required, so
+   * no caller can forget the guard. It is passed in, not imported, because
+   * `hostChainQuarantine.ts` imports this module.
+   */
+  sharesHostChain: (refreshToken: string) => Promise<boolean>;
   /** Test seam; production uses {@link CREDENTIAL_LOCK_BUDGETS}. */
   budgets?: CredentialLockBudgets;
   /** Test seam; production uses `NATIVE_LOCK_BUDGETS` (#5020). */
@@ -624,6 +736,18 @@ async function rotateLocked(
     );
     return { status: "not-found" };
   }
+  // Issue #6800 (Task 1b): checked after the locked read, so a shared chain an
+  // older daemon wrote while this caller waited for the lock is still refused:
+  // no adopt, no OAuth call, no flag (the shared-chain detector owns flagging).
+  if (await deps.sharesHostChain(onDisk.refreshToken)) {
+    logger.warn(
+      `[TOKEN_REFRESH] isolated rotation for ${uuid} refused: the file holds the ~/.claude login chain (#6800); no OAuth call`
+    );
+    return {
+      status: "transient",
+      detail: "isolated credentials share the ~/.claude login chain",
+    };
+  }
   if (decision.action === "adopt") {
     return await adoptOnDisk(deps, onDisk);
   }
@@ -646,11 +770,11 @@ async function rotateLocked(
       };
     }
     const fingerprint = refreshTokenFingerprint(presented);
-    await deps.mergeStore(current => ({
-      ...current,
-      unrefreshable: true,
-      unrefreshableTokenFingerprint: fingerprint,
-    }));
+    // #6801: first flag wins — the death time is evaluated against the record
+    // read under the store lock.
+    await deps.mergeStore(current =>
+      withUnrefreshableFlag(current, { fingerprint }, deps.now())
+    );
     logger.warn(
       `[TOKEN_REFRESH] isolated rotation for ${uuid} permanently rejected (${detail}); marked unrefreshable (failed token ${fingerprint.slice(0, 8)})`
     );
@@ -667,6 +791,32 @@ async function rotateLocked(
     onDiskNow &&
     lateWriterWins(presented, onDiskNow, deps.now(), deps.expiryBufferMs)
   ) {
+    if (await deps.sharesHostChain(onDiskNow.refreshToken)) {
+      // Issue #6800 (Task 1b): the late writer put the ~/.claude chain in the
+      // file. Never adopt it. The pair just rotated is this account's own,
+      // independent chain, so keep it in the store (the file is left for the
+      // detector to move aside; the next spawn re-seeds it from the store).
+      await deps.mergeStore(current =>
+        withIsolatedLineage(
+          {
+            ...withoutFailedTokenFingerprint(current),
+            accessToken: rotated.accessToken,
+            refreshToken: rotated.refreshToken,
+            expiresAt: rotated.expiresAt,
+            lastRefreshedAt: deps.now(),
+            unrefreshable: false,
+          },
+          rotated.expiresAt
+        )
+      );
+      logger.warn(
+        `[TOKEN_REFRESH] isolated rotation for ${uuid}: a late writer put the ~/.claude login chain in the file (#6800); kept the rotated pair in the store only`
+      );
+      return {
+        status: "transient",
+        detail: "a late writer put the ~/.claude login chain in the file",
+      };
+    }
     return await adoptOnDisk(deps, onDiskNow);
   }
   // Write the rotated pair back FIRST (the source of truth native re-reads);

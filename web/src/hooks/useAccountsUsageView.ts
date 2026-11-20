@@ -26,8 +26,9 @@ export const DEFAULT_USAGE_VIEW: UsageViewId = "bars";
  *   `setView` does nothing, because a merge against the empty fallback would
  *   PUT a record holding only this provider and erase the others' choices on
  *   every node. A failed first GET heals on the next focus refetch.
- * - The switch is optimistic: the PUT awaits the peer fan-out (peers are posted
- *   in parallel, so up to ~5 s when one is unreachable), so it is never awaited.
+ * - The switch is optimistic and its PUT is never awaited. The PUT answers once
+ *   the value is stored locally; the push to the other nodes is not waited for
+ *   (#6526).
  * - The view is re-read on window focus and visibility (ruling G-3 A).
  * - A `null` client reads Bars, is never ready and makes no request (the
  *   Session Configuration modal, #4600, will pass one for a non-Claude or

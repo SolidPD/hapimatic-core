@@ -421,6 +421,34 @@ textarea[placeholder*="notes"] {
   .pins-completed-row .pins-c-via {
     visibility: hidden;
   }
+  /* #6739 (Pins PM ruling E2): an expanded completed row whose title wraps
+   * gives the title the row's width, and its answer, time, channel, and
+   * receipt move to the line below, as an open pin moves its signals to its
+   * facts line. A collapsed row has no data-title-wraps, so it is unchanged. */
+  .pins-completed-row[data-title-wraps] .pins-c-title {
+    grid-column: 2 / 7;
+    grid-row: 1;
+  }
+  .pins-completed-row[data-title-wraps] .pins-c-toggle {
+    grid-column: 7;
+    grid-row: 1;
+  }
+  .pins-completed-row[data-title-wraps] .pins-c-ans {
+    grid-column: 2 / 4;
+    grid-row: 2;
+  }
+  .pins-completed-row[data-title-wraps] .pins-c-time {
+    grid-column: 4;
+    grid-row: 2;
+  }
+  .pins-completed-row[data-title-wraps] .pins-c-via {
+    grid-column: 5;
+    grid-row: 2;
+  }
+  .pins-completed-row[data-title-wraps] .pins-c-receipt {
+    grid-column: 6;
+    grid-row: 2;
+  }
 }
 
 /* #6449: an expanded pin (mockup v6 :288-289): indented under the row's

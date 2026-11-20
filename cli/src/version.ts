@@ -11,40 +11,15 @@
  * and session metadata and daemon.state.json all name the build that is running.
  * Always take the version from here, never from cli/package.json.
  */
+import { compareBuildVersions } from "@hapi/protocol";
 import { VERSION, VERSION_TIMESTAMP } from "../../server/src/version.generated";
 
 export const CLI_VERSION: string = VERSION;
 export const CLI_VERSION_TIMESTAMP: string = VERSION_TIMESTAMP;
 
-const BUILD_VERSION_RE = /^(\d+)\.(\d+)\.(\d+)(?:-([A-Z]+))?$/;
-
-/**
- * Orders two build versions: negative when `a` is older than `b`, positive when
- * newer, 0 when equal, and null when either does not parse.
- *
- * This is NOT semver. A suffixed local test build sits ON TOP of its base
- * (#1819: `version:test` claims no patch number), so `1.0.N-AA` is newer than
- * `1.0.N`, and `-AB` is newer than `-AA`.
- */
-export function compareBuildVersions(a: string, b: string): number | null {
-  const ma = a.match(BUILD_VERSION_RE);
-  const mb = b.match(BUILD_VERSION_RE);
-  if (!ma || !mb) {
-    return null;
-  }
-  for (let i = 1; i <= 3; i++) {
-    const delta = Number(ma[i]) - Number(mb[i]);
-    if (delta !== 0) {
-      return Math.sign(delta);
-    }
-  }
-  const suffixA = ma[4] ?? "";
-  const suffixB = mb[4] ?? "";
-  if (suffixA.length !== suffixB.length) {
-    return Math.sign(suffixA.length - suffixB.length);
-  }
-  return suffixA === suffixB ? 0 : suffixA < suffixB ? -1 : 1;
-}
+// Issue #6800: the build order moved to shared, so the server's sign-in warning
+// and the CLI's shared-chain detector use the same rule.
+export { compareBuildVersions } from "@hapi/protocol";
 
 /**
  * The line `hapi doctor` and `daemon start` print when the running daemon

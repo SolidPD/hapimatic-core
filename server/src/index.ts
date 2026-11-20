@@ -202,6 +202,10 @@ import {
 } from "./config/billableSwitchConfig";
 import { setProcessBillableSwitchGate } from "./federation/capabilityDetector";
 import { BillableSwitchService } from "./billableSwitch/billableSwitchService";
+import {
+  describeBillableTrackingStartup,
+  runBillableTrackingStartup,
+} from "./billableSwitch/trackingStartup";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyBunServer = BunServer<any>;
@@ -344,6 +348,20 @@ async function main() {
   }
 
   const store = new Store(config.dbPath);
+  // Issue #6778 PR-A (plan 3.4 step 4): the rows billable tracking writes at
+  // start-up, once, before the gate is resolved (the Store's migrations write
+  // no row). The step catches its own failure; this `try` only keeps a throw
+  // from ever stopping the boot.
+  try {
+    console.log(
+      describeBillableTrackingStartup(runBillableTrackingStartup(store))
+    );
+  } catch (error) {
+    console.error(
+      "[Server] Billable tracking start-up step threw:",
+      error instanceof Error ? error.message : error
+    );
+  }
   // Issue #6646: the billable-sessions gate, resolved ONCE for this process
   // (the store's readiness check has run by now). A node whose event table
   // holds any row never runs dark: with the variable unset or not on it runs
@@ -1376,6 +1394,20 @@ async function main() {
     healthAggregator.start();
   }
 
+  // Issue #6738 (R12): the Pins turn check reads a managed peer's parent from
+  // this node's cache, then, on a hub or peer node, from the registry's cache of
+  // remote sessions (in memory; no node is asked). Set after the federation
+  // block, because the registry exists only from there and only off a `node` role.
+  syncEngine.setRemoteParentState(sessionId => {
+    const hit = nodeRegistry?.locateSession(sessionId);
+    return hit
+      ? {
+          active: hit.session.active,
+          lifecycleState: hit.session.lifecycleState ?? null,
+        }
+      : null;
+  });
+
   // Issue #6646 (Task 5): the billable switch's service, constructed after the
   // engine exists (never inside the `new SyncEngine(` call) and after the
   // federation block, so its late-bound registry is the one the hub polls with.
@@ -1393,6 +1425,7 @@ async function main() {
     sweepPendingByTag: () => syncEngine?.sweepPendingSpawnQueues(),
   });
   syncEngine.setBillableSwitchService(billableSwitchService);
+
   if (billableSwitchGateState.mode === "on") {
     // The start rule runs only while the gate is on; without a hook the insert
     // writes the same row as before (not billable, no event), now inside one

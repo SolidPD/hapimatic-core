@@ -23,6 +23,20 @@ import { ProviderIdSchema, type ProviderId } from "./providerAuthState";
  * shape only.
  */
 
+/**
+ * Issue #6801 (R13): one past login death, carried across re-logins in
+ * {@link StoredAccount.signInDeaths}. `signedInAt` is that login's `capturedAt`,
+ * `diedAt` the time Hapimatic first flagged it (a detection time, so the real
+ * death lies between `lastAliveAt` — its last refresh — and `diedAt`). Epoch ms.
+ */
+export const SignInDeathSchema = z.object({
+  signedInAt: z.number(),
+  diedAt: z.number(),
+  lastAliveAt: z.number(),
+});
+
+export type SignInDeath = z.infer<typeof SignInDeathSchema>;
+
 export const StoredAccountSchema = z
   .object({
     schema_version: z.literal(1).default(1),
@@ -64,7 +78,7 @@ export const StoredAccountSchema = z
     // A Hapimatic-synthesized copy of the token expiry that LAGS the live isolated
     // `.credentials.json` by up to ~24h for isolated (non-host) accounts: native
     // Claude Code owns the isolated refresh and Hapimatic's scheduler defers it
-    // (#1635), so this copy is only re-written by migration / host-default capture /
+    // (#1635), so this copy is only re-written by a sign-in / the folder mirror /
     // a Hapimatic-owned refresh — otherwise it freezes and rots. Availability ⟺ the
     // `UsageService.resolveToken` per-tier token source has a non-empty `accessToken`
     // AND `unrefreshable != true` (an expired-but-refreshable token is still
@@ -96,9 +110,33 @@ export const StoredAccountSchema = z
     // Issue #5020: why `unrefreshable` was set when the cause is not a rejected
     // Hapimatic rotation — `native-cleared` (native Claude Code emptied the
     // isolated file after its own refresh failed) or `store-lineage-stale` (the
-    // store holds a pair older than the file's lineage). Diagnostic only;
+    // store holds a pair older than the file's lineage). Issue #6800 adds
+    // `host-chain-shared` ({@link HOST_CHAIN_SHARED_REASON}): the record or its
+    // folder held the same refresh-token chain as `~/.claude`, so it is
+    // quarantined until a sign-in writes a different token. Diagnostic only;
     // dropped with the fingerprint when the flag clears.
     unrefreshableReason: z.string().optional(),
+    // Issue #6801 (R1, R2): epoch ms when `unrefreshable` was first set on THIS
+    // store (first flag wins; a re-flag never moves it). Set only through the CLI
+    // helper `withUnrefreshableFlag` (`cli/src/accounts/machineRotator.ts`) and
+    // dropped with the flag's other detail fields when the flag clears. Read only
+    // through {@link trustedUnrefreshableAt}. Optional (never `.default`), so every
+    // existing record and every older node parses unchanged; a malformed value
+    // (a hand edit setting it to `null`) reads as absent instead of making the
+    // whole record invalid, which would hide the account and refuse its spawns.
+    unrefreshableAt: z.number().optional().catch(undefined),
+    // Issue #6801 (R2): the `unrefreshableTokenFingerprint ?? unrefreshableReason`
+    // that `unrefreshableAt` was recorded for. A time is trusted only while this
+    // still names the record's current flag, so a stamp an older build kept through
+    // its clear and a later re-flag on another token reads as unknown. Set and
+    // dropped with `unrefreshableAt`. A malformed value reads as absent.
+    unrefreshableAtFor: z.string().optional().catch(undefined),
+    // Issue #6801 (R13): past login deaths, newest last, at most
+    // {@link SIGN_IN_DEATHS_MAX}. Written only by the server sign-in builder
+    // (`accountLoginService.complete`, via {@link carrySignInDeaths}); history,
+    // so a flag clear keeps it. A malformed history reads as absent, never as an
+    // invalid record.
+    signInDeaths: z.array(SignInDeathSchema).optional().catch(undefined),
     // Issue #5020: the newest `expiresAt` this instance has observed on the
     // account's isolated `.credentials.json` (mirrored by the daemon each tick
     // and written by every Hapimatic rotation). Spawn-time recovery never seeds
@@ -133,6 +171,136 @@ export type StoredAccount = z.infer<typeof StoredAccountSchema>;
  */
 export function isEnvTokenAccount(account: StoredAccount): boolean {
   return account.authKind === "env-token";
+}
+
+/**
+ * Issue #6800: the `unrefreshableReason` the shared-chain detector writes when an
+ * account's store record (or, on the identity pass, the account `~/.claude.json`
+ * names) holds the same OAuth refresh-token chain as `~/.claude`. Two refreshers
+ * on one chain is the #1520 race, so the account is quarantined until a sign-in
+ * through Provider Accounts writes a different token. It is not a login death:
+ * the chain may still be alive in `~/.claude` for terminal `claude`. Defined once
+ * here, for the CLI and the server.
+ */
+export const HOST_CHAIN_SHARED_REASON = "host-chain-shared";
+
+/**
+ * Issue #6801 (R14): the ONE list of `unrefreshableReason` values that flag a
+ * record without its login having died. #6800's `host-chain-shared` quarantine
+ * is the only one: the chain may still be alive in `~/.claude`. A record flagged
+ * for one of these gets no death time, reads as no death time, and never enters
+ * the death list or the death history.
+ */
+export const NON_DEATH_UNREFRESHABLE_REASONS: ReadonlySet<string> = new Set([
+  HOST_CHAIN_SHARED_REASON,
+]);
+
+/** True when the record is flagged for a non-death reason (R14). */
+export function isNonDeathFlag(account: {
+  unrefreshable?: boolean;
+  unrefreshableReason?: string | null;
+}): boolean {
+  return (
+    account.unrefreshable === true &&
+    typeof account.unrefreshableReason === "string" &&
+    NON_DEATH_UNREFRESHABLE_REASONS.has(account.unrefreshableReason)
+  );
+}
+
+/** Issue #6801 (R13): the most past deaths a record keeps. */
+export const SIGN_IN_DEATHS_MAX = 10;
+
+/**
+ * Issue #6801 (R2): the record's death time, or null when it has none it can
+ * trust. A time is trusted only while the record is flagged for a death (not a
+ * {@link isNonDeathFlag} quarantine), the time is a finite positive number, and
+ * `unrefreshableAtFor` still names the current flag
+ * (`unrefreshableTokenFingerprint ?? unrefreshableReason`). An older build's
+ * clear keeps the stamp (its clear spreads the rest of the record) and its later
+ * re-flag on a new token writes a new fingerprint, so the stale stamp stops
+ * matching and reads as unknown instead of a death age that is too young.
+ */
+export function trustedUnrefreshableAt(
+  account: Pick<
+    StoredAccount,
+    | "unrefreshable"
+    | "unrefreshableAt"
+    | "unrefreshableAtFor"
+    | "unrefreshableTokenFingerprint"
+    | "unrefreshableReason"
+  >
+): number | null {
+  if (account.unrefreshable !== true || isNonDeathFlag(account)) return null;
+  const at = account.unrefreshableAt;
+  if (typeof at !== "number" || !Number.isFinite(at) || at <= 0) return null;
+  const key =
+    account.unrefreshableTokenFingerprint ?? account.unrefreshableReason;
+  if (key === undefined || account.unrefreshableAtFor !== key) return null;
+  return at;
+}
+
+/**
+ * Issue #6801 (R13, Task 15): the death history a sign-in carries into the
+ * record it writes over `existing`. Starts from the existing history and, when
+ * `existing` died with a trusted time, appends that death (its sign-in, its
+ * death, and its last refresh as the last time known alive). Keeps the newest
+ * {@link SIGN_IN_DEATHS_MAX}; undefined when there is nothing to carry. A
+ * quarantine or a flag with no trusted time appends nothing.
+ */
+export function carrySignInDeaths(
+  existing: StoredAccount | null
+): StoredAccount["signInDeaths"] {
+  if (!existing) return undefined;
+  const deaths: SignInDeath[] = [...(existing.signInDeaths ?? [])];
+  const diedAt = trustedUnrefreshableAt(existing);
+  if (diedAt !== null) {
+    deaths.push({
+      signedInAt: existing.capturedAt,
+      diedAt,
+      lastAliveAt:
+        existing.lastRefreshedAt > 0
+          ? existing.lastRefreshedAt
+          : existing.capturedAt,
+    });
+  }
+  const kept = deaths.slice(-SIGN_IN_DEATHS_MAX);
+  return kept.length > 0 ? kept : undefined;
+}
+
+/**
+ * Issue #6800 (round 2, R2-1): the file a Provider Accounts sign-in leaves in the
+ * account's existing folder, naming the sha256 fingerprint of the refresh token
+ * that sign-in produced (never the token). A `host-chain-shared` flag is lifted
+ * from a folder token only when the token matches this fingerprint, because a
+ * token that merely differs from the flagged one may be an older token of the
+ * same `~/.claude` chain. Written by the server, read by the CLI daemon.
+ */
+export const SIGN_IN_MARKER_FILE = ".hapimatic-sign-in.json";
+
+/** The sign-in marker's on-disk shape (see {@link SIGN_IN_MARKER_FILE}). */
+export interface SignInMarker {
+  version: 1;
+  /** sha256 hex of the refresh token the sign-in produced. */
+  refreshFingerprint: string;
+  /** ISO 8601 UTC time of the sign-in. */
+  writtenAt: string;
+}
+
+/**
+ * The refresh fingerprint a sign-in marker names, or null for anything that is
+ * not a well-formed version-1 marker. Never throws.
+ */
+export function parseSignInMarker(raw: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const marker = parsed as Partial<SignInMarker>;
+    if (marker.version !== 1) return null;
+    const fp = marker.refreshFingerprint;
+    return typeof fp === "string" && /^[0-9a-f]{64}$/.test(fp) ? fp : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -3,19 +3,28 @@
 import { delay, exponentialBackoffDelay } from "@/utils/time";
 import { logger } from "@/ui/logger";
 import type { JobHealthStatus, JobRegistry } from "@hapi/protocol";
-import { readHostDefaultAccountUuid } from "@/utils/claudeCredentials";
 import {
   isIsolatedAccountAnywhere,
   readIsolatedCredentials,
+  readSignInMarkerFingerprint,
 } from "@/accounts/accountConfigDir";
 import {
   fingerprintedFlagIsStale,
   refreshTokenFingerprint,
   rotateIsolatedCredentials,
+  withUnrefreshableFlag,
   withoutFailedTokenFingerprint,
   type SiblingBindingScan,
 } from "@/accounts/machineRotator";
 import { runIsolatedCredentialsMirror } from "@/accounts/isolatedCredentialsMirror";
+import {
+  boundOnMachine,
+  productionQuarantineDeps,
+  readHostRefreshFingerprint,
+  runHostChainQuarantine,
+  sharesHostChain,
+  type HostChainQuarantineDeps,
+} from "@/accounts/hostChainQuarantine";
 import {
   decideMixedBindingRotation,
   type ChainIndependence,
@@ -25,7 +34,10 @@ import type {
   StoredAccount,
   ValidateAccountResult,
 } from "@hapi/protocol/accounts";
-import { isEnvTokenAccount } from "@hapi/protocol/accounts";
+import {
+  HOST_CHAIN_SHARED_REASON,
+  isEnvTokenAccount,
+} from "@hapi/protocol/accounts";
 
 /** Stable registry name for the daemon's token-refresh loop (#1964, Sub-D). */
 const TOKEN_REFRESH_JOB_NAME = "token-refresh";
@@ -240,22 +252,11 @@ export interface TokenRefreshServiceOptions {
   /** Clock seam (default = `Date.now`). DI for tests. */
   now?: () => number;
   /**
-   * Host-default-account resolver (issue #1520). Returns the `accountUuid` whose
-   * OAuth refresh-token family is shared with native Claude Code (read fresh from
-   * `~/.claude.json` `oauthAccount.accountUuid`), or `null`. Hapimatic defers that
-   * account's refresh to native Claude Code instead of competing (the double-rotation
-   * would produce `invalid_grant` lockouts). Default = the real
-   * {@link readHostDefaultAccountUuid}; tests inject a fixed value. Read on each
-   * refresh decision so the deferral target follows the current host login (dynamic
-   * keying).
-   */
-  getHostDefaultAccountUuid?: () => Promise<string | null>;
-  /**
    * Issue #1551: predicate "does this account have an isolated config dir native
-   * Claude Code owns?". When true, Hapimatic DEFERS the account's refresh exactly
-   * like the host-default account (#1520) — native rotates it in its own
-   * CLAUDE_CONFIG_DIR, so Hapimatic must not race it. Generalizes the deferral
-   * from host-default-only to every natively-owned account.
+   * Claude Code owns?". When true, Hapimatic DEFERS the account's refresh —
+   * native rotates it in its own CLAUDE_CONFIG_DIR, so Hapimatic must not race
+   * it. (Issue #6800 removed the host-default deferral: the account
+   * `~/.claude.json` names is treated exactly like every other account.)
    *
    * Issue #1635 (R2): the default is the MACHINE-GLOBAL
    * {@link isIsolatedAccountAnywhere} — a sibling instance's isolated dir also
@@ -268,10 +269,8 @@ export interface TokenRefreshServiceOptions {
    * Issue #1507: called after each successful proactive or reactive refresh with
    * the refreshed `accountUuid`. Fires from `refreshOnceImpl` AFTER `persistPatch`
    * completes, for BOTH scheduled (`tick`) and reactive (`handleAuthFailure`)
-   * refreshes. NOTE: because #1520 makes `tick`/`handleAuthFailure` early-return
-   * for the host-default account BEFORE reaching `refreshOnce`, this never fires
-   * for the host-default account — by design (those sessions defer to native).
-   * The daemon uses this to restart any sessions bound to the refreshed account.
+   * refreshes. The daemon uses this to restart any sessions bound to the
+   * refreshed account.
    *
    * Issue #3541 adds a SECOND fire site: `refreshIdleIsolatedAccounts` fires this
    * hook directly after a rotate-anyway rotation of a LOCALLY-bound account (the
@@ -355,6 +354,26 @@ export interface TokenRefreshServiceOptions {
    */
   getIsolatedExpiresAt?: (accountUuid: string) => Promise<number | null>;
   /**
+   * Issue #6800: the sha256 fingerprint of the `~/.claude` refresh token, or
+   * null (read fresh on each call). Every rotation, adopt and flag clear first
+   * refuses a token with this fingerprint (invariant I1), and the shared-chain
+   * detector compares with it. Default = the real reader; tests inject one so
+   * they never read the runner's own `~/.claude`.
+   */
+  readHostRefreshFingerprint?: () => Promise<string | null>;
+  /**
+   * Issue #6800 (round 2, R2-1): the refresh fingerprint the sign-in marker in
+   * an account's folder names, or null. A `host-chain-shared` flag clears only
+   * when the folder's token matches it. Default = the real reader.
+   */
+  readSignInMarkerFingerprint?: (accountUuid: string) => Promise<string | null>;
+  /**
+   * Issue #6800: overrides for the shared-chain detector's machine seams (the
+   * marker path, the credentials paths, the sibling daemons, the version).
+   * Production uses `productionQuarantineDeps`; tests pass fakes.
+   */
+  hostChainQuarantineDeps?: Partial<HostChainQuarantineDeps>;
+  /**
    * Issue #3544: non-destructive validity probe for an isolated account's
    * access token — used by {@link TokenRefreshService.clearStaleUnrefreshableFlags}
    * for a LEGACY flag only (one with no failed-token fingerprint, #4423).
@@ -403,9 +422,9 @@ export interface TokenRefreshServiceOptions {
   /**
    * Issue #3023: optional per-tick utilization sampler for the un-pinned spawn veto.
    * When provided, `tick()` invokes it at the LOOP-TOP with the full account list —
-   * BEFORE the host-default / isolated deferral branches — so the veto's utilization
-   * cache is refreshed for EVERY account, including the host-default that the refresh
-   * loop defers to native (#1520). It is called best-effort and must never throw into
+   * BEFORE the isolated deferral branch — so the veto's utilization cache is
+   * refreshed for EVERY account, including the isolated ones the refresh loop defers
+   * to native. It is called best-effort and must never throw into
    * the tick (the daemon wires `createUtilizationSampler`, which swallows its own
    * errors). Default **absent** ⇒ an unconfigured service (tests / no daemon) is
    * byte-equivalent to pre-#3023 (no sampling, no network).
@@ -461,15 +480,14 @@ type RefreshOutcome =
 /**
  * Structured outcome of {@link TokenRefreshService.forceRefresh} — the on-demand
  * force-refresh harness (issue #1547). Distinguishes every terminal state the
- * harness reports per-step, including the host-default deferral (#1520) as a
- * first-class EXPECTED outcome rather than a false failure.
+ * harness reports per-step. (Issue #6800 removed the host-default deferral
+ * outcome: every account is refreshable the same way.)
  */
 export type ForceRefreshOutcome =
   | { kind: "success"; accessToken: string }
   // #4423: `rejectedTokenFingerprint` names the token that failed (isolated path).
   | { kind: "permanent"; detail: string; rejectedTokenFingerprint?: string }
   | { kind: "transient"; detail: string }
-  | { kind: "host-default-deferred"; emailAddress: string }
   | { kind: "not-found" };
 
 /** Map a single-attempt outcome to the force-refresh harness's shape. */
@@ -561,7 +579,6 @@ export class TokenRefreshService {
   private readonly store: TokenRefreshAccountStore;
   private readonly refreshFn: (refreshToken: string) => Promise<RefreshResult>;
   private readonly now: () => number;
-  private readonly getHostDefaultAccountUuid: () => Promise<string | null>;
   private readonly isIsolatedAccount: (accountUuid: string) => Promise<boolean>;
   private readonly onSuccessfulRefresh?: (accountUuid: string) => void;
   private readonly acquireRotationLease: (
@@ -578,6 +595,14 @@ export class TokenRefreshService {
   private readonly getIsolatedExpiresAt: (
     accountUuid: string
   ) => Promise<number | null>;
+  /** #6800: the `~/.claude` refresh-token fingerprint reader (see the option). */
+  private readonly readHostFp: () => Promise<string | null>;
+  /** #6800 round 2 (R2-1): the sign-in marker reader (see the option). */
+  private readonly readSignInMarker: (
+    accountUuid: string
+  ) => Promise<string | null>;
+  /** #6800: the detector's machine-seam overrides (see the option). */
+  private readonly hostChainQuarantineDeps: Partial<HostChainQuarantineDeps>;
   /**
    * Issue #3544: injected non-destructive token-validity probe (see the option
    * doc). Undefined ⇒ a legacy (fingerprint-less) flag never clears.
@@ -638,8 +663,6 @@ export class TokenRefreshService {
     this.refreshFn =
       options.refreshFn ?? (refreshToken => refreshOAuthToken(refreshToken));
     this.now = options.now ?? Date.now;
-    this.getHostDefaultAccountUuid =
-      options.getHostDefaultAccountUuid ?? readHostDefaultAccountUuid;
     // #1635 R2: machine-global default — see the option's doc comment. The
     // resolver's own local check (`accountTokenInjection.ts`) and the seed
     // guard (`seedAccountConfigDir` overwrite:false) deliberately stay LOCAL:
@@ -678,6 +701,12 @@ export class TokenRefreshService {
     this.getIsolatedExpiresAt =
       options.getIsolatedExpiresAt ??
       (async uuid => (await readIsolatedCredentials(uuid))?.expiresAt ?? null);
+    this.readHostFp =
+      options.readHostRefreshFingerprint ??
+      (() => readHostRefreshFingerprint());
+    this.readSignInMarker =
+      options.readSignInMarkerFingerprint ?? readSignInMarkerFingerprint;
+    this.hostChainQuarantineDeps = options.hostChainQuarantineDeps ?? {};
     // #3544: injected token-validity probe for the stale-flag backstop.
     this.probeToken = options.probeToken;
     // #3541: default false ⇒ byte-equivalent to the pre-#3541 P-REVOKE skip.
@@ -781,28 +810,17 @@ export class TokenRefreshService {
     }
     // Issue #2268: env-token accounts carry no refresh token — never rotate them
     // (the bound-spawn path injects their stored token directly). Mirrors the
-    // host-default / isolated deferrals below.
+    // isolated deferral below.
     if (isEnvTokenAccount(res.account)) {
       return { refreshed: false };
     }
     if (res.account.unrefreshable) {
       return { refreshed: false };
     }
-    // Host-default account (issue #1520): do NOT OAuth-rotate here either — that
-    // would race native Claude Code on the shared refresh-token family. Return the
-    // current stored token (kept fresh by the CredentialsWatcher); the sole caller
-    // (`resolveAccountTokenForSession`) then re-reads the store and checks expiry,
-    // throwing only if the token is genuinely expired.
-    const hostDefaultUuid = await this.getHostDefaultAccountUuid().catch(
-      () => null
-    );
-    if (hostDefaultUuid && accountUuid === hostDefaultUuid) {
-      return { refreshed: false };
-    }
     // Issue #1551: an account with an isolated config dir is rotated by native
-    // Claude Code in that dir — defer (never rotate here), mirroring the
-    // host-default deferral. The launcher uses CLAUDE_CONFIG_DIR for these, so
-    // this reactive path is rarely reached for them; defensive parity.
+    // Claude Code in that dir — defer (never rotate here). The launcher uses
+    // CLAUDE_CONFIG_DIR for these, so this reactive path is rarely reached for
+    // them; defensive parity.
     if (await this.isIsolatedAccount(accountUuid).catch(() => false)) {
       return { refreshed: false };
     }
@@ -822,12 +840,12 @@ export class TokenRefreshService {
    * harness needs:
    *  1. Returns the granular {@link ForceRefreshOutcome} (incl. `invalid_grant`
    *     detail) instead of a coarse `{refreshed}` boolean.
-   *  2. Reports the host-default account (#1520) as an EXPECTED `host-default-deferred`
-   *     outcome (never rotates it — the safety-critical shared-family skip lives HERE,
-   *     before any OAuth attempt).
-   *  3. Does NOT short-circuit on `unrefreshable` — the harness deliberately hits
-   *     the endpoint to surface the live `invalid_grant` (or recover) on a
-   *     previously-flagged account.
+   *  2. Refuses an account quarantined `host-chain-shared` (#6800) before any
+   *     OAuth attempt: its token is the `~/.claude` chain, which terminal `claude`
+   *     refreshes too.
+   *  3. Otherwise does NOT short-circuit on `unrefreshable` — the harness
+   *     deliberately hits the endpoint to surface the live `invalid_grant` (or
+   *     recover) on a previously-flagged account.
    *
    * Passes `fireCallback=false` to {@link dedupedRefresh}: on the force path the
    * daemon harness orchestrates `restartBoundSessions` EXPLICITLY (so it can
@@ -846,20 +864,16 @@ export class TokenRefreshService {
       return { kind: "not-found" };
     }
     const account = res.account;
-    // Host-default account (issue #1520): NEVER OAuth-rotate — that races native
-    // Claude Code on the shared refresh-token family and causes the ~8h
-    // invalid_grant lockout. Report it as an expected deferral, not a failure.
-    const hostDefaultUuid = await this.getHostDefaultAccountUuid().catch(
-      () => null
-    );
-    if (hostDefaultUuid && accountUuid === hostDefaultUuid) {
-      logger.info(
-        `[TOKEN_REFRESH] forceRefresh: account ${accountUuid} (${account.emailAddress}) is host-default — deferred to native Claude Code`
-      );
-      return {
-        kind: "host-default-deferred",
-        emailAddress: account.emailAddress,
-      };
+    // Issue #6800 (review item 4): an account quarantined because it shared the
+    // ~/.claude login chain is refused before any OAuth call. Every other flagged
+    // account keeps today's behaviour (the harness still probes it).
+    if (
+      account.unrefreshable === true &&
+      account.unrefreshableReason === HOST_CHAIN_SHARED_REASON
+    ) {
+      const detail = `account ${accountUuid} (${account.emailAddress}) shares the ~/.claude login — re-login required`;
+      logger.warn(`[TOKEN_REFRESH] forceRefresh: ${detail}`);
+      return { kind: "permanent", detail };
     }
     // Issue #1551 (Task 9, KD-3 Option A): an isolated account's live token is in
     // its CLAUDE_CONFIG_DIR (the source of truth), NOT the store. The steady-state
@@ -904,6 +918,17 @@ export class TokenRefreshService {
       );
       return { kind: "not-found" };
     }
+    // Issue #6800 (Task 1b): the isolated file holds the ~/.claude login chain —
+    // no OAuth call, no flag (the shared-chain detector owns flagging).
+    if (await this.sharesHostChain(oauth.refreshToken)) {
+      logger.warn(
+        `[TOKEN_REFRESH] forceRefreshIsolated: ${accountUuid}'s isolated credentials hold the ~/.claude login chain (#6800); not rotated`
+      );
+      return {
+        kind: "transient",
+        detail: "isolated credentials share the ~/.claude login chain",
+      };
+    }
     // Issue #1635 (F3): route through the shared per-uuid `inFlight` dedup —
     // the pre-#1635 direct `refreshFn` call let two concurrent isolated
     // rotations of the SAME account each present the same refresh token; the
@@ -942,6 +967,7 @@ export class TokenRefreshService {
       mergeStore: mergeFn => this.persistMerge(accountUuid, mergeFn),
       now: this.now,
       expiryBufferMs: this.expiryBufferMs,
+      sharesHostChain: token => this.sharesHostChain(token),
     });
   }
 
@@ -961,7 +987,7 @@ export class TokenRefreshService {
    * disjoint (`tick()` proactively rotates NON-isolated accounts; this rotates
    * the isolated ones `tick()` defers). NEVER throws into the daemon loop (R7).
    *
-   * Guard order (cheapest first): host-default → not-isolated → unrefreshable →
+   * Guard order (cheapest first): not-isolated → unrefreshable →
    * not-near-expiry (#4679: `boundRotationLeadMs` for a locally-bound account,
    * the buffer otherwise) → remote-bound-skip → local-bound-switch-off-skip →
    * federation-degraded-skip → [#3541 rotate-anyway gate: local ∧ ¬inferring ∧
@@ -986,10 +1012,6 @@ export class TokenRefreshService {
       // probed against api.anthropic.com. `store.get()` below is also Anthropic-only
       // (defence in depth), but the sampler reads the raw entries.
       const entries = await this.listAnthropicEntries();
-      // Resolve once per pass (mirrors tick()'s dynamic host-default keying).
-      const hostDefaultUuid = await this.getHostDefaultAccountUuid().catch(
-        () => null
-      );
       const live = await this.getLiveAccountKeys().catch(() => ({
         uuids: new Set<string>(),
         emails: new Set<string>(),
@@ -1026,8 +1048,6 @@ export class TokenRefreshService {
         // also never owns an isolated dir, so the isolated-only gate below would
         // already `continue` — this is the explicit, kind-first guard.
         if (isEnvTokenAccount(account)) continue;
-        // R2: never rotate the host-default account (native owns it).
-        if (hostDefaultUuid && uuid === hostDefaultUuid) continue;
         // Only isolated accounts — tick() already proactively rotates the
         // non-isolated ones (this backstop must not double-rotate them).
         if (!(await this.isIsolatedAccount(uuid).catch(() => false))) continue;
@@ -1327,24 +1347,30 @@ export class TokenRefreshService {
   async clearStaleUnrefreshableFlags(): Promise<void> {
     try {
       const entries = await this.listAnthropicEntries();
-      const hostDefaultUuid = await this.getHostDefaultAccountUuid().catch(
-        () => null
-      );
       for (const entry of entries) {
         if (this.stopped) return;
         const res = await this.store.get(entry.accountUuid);
         if (!res || !res.ok || !res.account.unrefreshable) continue;
         const account = res.account;
         const uuid = account.accountUuid;
-        // Env-token records have no refresh token (#2268); the host-default's
-        // flag is cleared by tick() (#1520); a non-isolated account has no file.
+        // Env-token records have no refresh token (#2268); a non-isolated
+        // account has no file.
         if (isEnvTokenAccount(account)) continue;
-        if (hostDefaultUuid && uuid === hostDefaultUuid) continue;
         if (!(await this.isIsolatedAccount(uuid).catch(() => false))) continue;
         const oauth = await readIsolatedCredentials(uuid).catch(() => null);
         if (!oauth) continue;
+        // Issue #6800 (invariant I8): the ~/.claude chain on disk clears no flag.
+        if (await this.sharesHostChain(oauth.refreshToken)) continue;
         let reason: string;
-        if (account.unrefreshableTokenFingerprint) {
+        if (account.unrefreshableReason === HOST_CHAIN_SHARED_REASON) {
+          // Issue #6800 (round 2, R2-1): a token that only differs from the
+          // flagged one may be an older token of the same ~/.claude chain, so
+          // this flag clears only for the token a sign-in left its marker for.
+          const signedIn = await this.readSignInMarker(uuid).catch(() => null);
+          if (signedIn !== refreshTokenFingerprint(oauth.refreshToken))
+            continue;
+          reason = "a Provider Accounts sign-in wrote this token";
+        } else if (account.unrefreshableTokenFingerprint) {
           if (!fingerprintedFlagIsStale(account, oauth.refreshToken)) continue;
           reason = "a different refresh token is on disk";
         } else {
@@ -1372,6 +1398,58 @@ export class TokenRefreshService {
   }
 
   /**
+   * Issue #6800 (R6): one shared-chain detector pass over this instance's store
+   * (see `hostChainQuarantine.ts`). Called FIRST in the maintenance tick's
+   * provider-credential group on every non-tenant daemon; the move-aside waits
+   * while a live session on this machine (this instance or a sibling) is bound
+   * to the account, or while either view is degraded. Never throws.
+   */
+  async quarantineHostChains(): Promise<void> {
+    try {
+      // The live-session views are read at most once per pass, and only when a
+      // folder file matches. Unknown counts as bound (no move this pass).
+      let views: Promise<{
+        live: LiveAccountKeys;
+        sibling: SiblingBindingScan;
+      }> | null = null;
+      const isBound = async (uuid: string): Promise<boolean> => {
+        views ??= (async () => ({
+          live: await this.getLiveAccountKeys().catch(() => ({
+            uuids: new Set<string>(),
+            emails: new Set<string>(),
+            localDegraded: true,
+          })),
+          sibling: await this.getSiblingBoundAccounts().catch(() => ({
+            uuids: new Set<string>(),
+            degraded: true,
+          })),
+        }))();
+        const v = await views;
+        return boundOnMachine(uuid, v.live, v.sibling);
+      };
+      await runHostChainQuarantine(
+        productionQuarantineDeps({
+          listAccountUuids: async () =>
+            (await this.listAnthropicEntries()).map(e => e.accountUuid),
+          getAccount: async uuid => {
+            const res = await this.store.get(uuid);
+            return res && res.ok ? res.account : null;
+          },
+          mergeStore: (uuid, mergeFn) => this.persistMerge(uuid, mergeFn),
+          isBound,
+          now: this.now,
+          readHostRefreshFingerprint: this.readHostFp,
+          ...this.hostChainQuarantineDeps,
+        })
+      );
+    } catch (err) {
+      logger.warn(
+        `[ACCOUNTS] shared-chain pass failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
    * Issue #5020 (R3, R4): mirror every isolated account's credentials file into
    * this instance's store — a fresher pair native saved, the file's lineage, and
    * a native wipe (flagged `unrefreshable`, reason `native-cleared`, one
@@ -1388,8 +1466,8 @@ export class TokenRefreshService {
         return res && res.ok ? res.account : null;
       },
       mergeStore: (uuid, mergeFn) => this.persistMerge(uuid, mergeFn),
-      hostDefaultUuid: () => this.getHostDefaultAccountUuid(),
       now: this.now,
+      sharesHostChain: token => this.sharesHostChain(token),
     });
   }
 
@@ -1419,8 +1497,8 @@ export class TokenRefreshService {
       // the sampler (which probes api.anthropic.com) and the refresh loop.
       const entries = await this.listAnthropicEntries();
       // #3023: refresh the un-pinned spawn veto's utilization cache for EVERY account
-      // at the loop-top — BEFORE the host-default / isolated deferral `continue`s below,
-      // so the host-default (which the refresh loop defers to native) is still sampled.
+      // at the loop-top — BEFORE the isolated deferral `continue` below, so an
+      // isolated account (which the refresh loop defers to native) is still sampled.
       // Best-effort: the injected sampler swallows its own errors, and this await is
       // additionally guarded so a sampler fault can never abort the refresh tick.
       if (this.sampleUtilization) {
@@ -1430,13 +1508,6 @@ export class TokenRefreshService {
           )
         );
       }
-      // Resolve the host-default account ONCE per tick (issue #1520). Read fresh
-      // (no caching) so the deferral follows the current host login — dynamic
-      // keying (R4). A read failure → null → no deferral (a missing ~/.claude.json
-      // also breaks native Claude Code, so the shared-family contention is moot).
-      const hostDefaultUuid = await this.getHostDefaultAccountUuid().catch(
-        () => null
-      );
       // Issue #4679: lazily read live bindings at most once per tick, and only
       // when an account is inside the lead window. A failed read or a degraded
       // local view counts as "not idle", so the account waits for the buffer.
@@ -1457,33 +1528,16 @@ export class TokenRefreshService {
         if (!res || !res.ok) continue;
         const account = res.account;
         // Issue #2268: an env-token account has no refresh token and is never
-        // Hapimatic-refreshed — skip it here (mirrors the host-default / isolated
-        // deferrals below) so it is never rotated, never scheduled by its
-        // synthesized `expiresAt`, and never marked `unrefreshable`.
+        // Hapimatic-refreshed — skip it here (mirrors the isolated deferral
+        // below) so it is never rotated, never scheduled by its synthesized
+        // `expiresAt`, and never marked `unrefreshable`.
         if (isEnvTokenAccount(account)) continue;
-        if (hostDefaultUuid && account.accountUuid === hostDefaultUuid) {
-          // Host-default account (issue #1520): defer refresh to native Claude
-          // Code. Hapimatic and native share this account's OAuth refresh-token
-          // family; rotating it here races native and yields invalid_grant
-          // lockouts. The CredentialsWatcher syncs the host's rotated token into
-          // the store from disk, so Hapimatic never needs to rotate it.
-          // R7: clear a stale `unrefreshable` flag — the rotation premise that set
-          // it no longer applies, and the account is now disk-sourced.
-          if (account.unrefreshable) {
-            await this.persistMerge(account.accountUuid, current => ({
-              ...withoutFailedTokenFingerprint(current),
-              unrefreshable: false,
-            }));
-            logger.info(
-              `[TOKEN_REFRESH] cleared unrefreshable on host-default account ${account.accountUuid} (${account.emailAddress}); refresh deferred to native Claude Code`
-            );
-          }
-          continue; // never OAuth-rotate the host-default family
-        }
+        // Issue #6800: the account ~/.claude.json names is no longer special —
+        // no deferral, and no unconditional `unrefreshable` clear (that clear
+        // would undo the shared-chain quarantine; a flag clears only by the
+        // fingerprint rule or a sign-in).
         // Issue #1551: native owns rotation for an account with an isolated
-        // config dir (its own CLAUDE_CONFIG_DIR) — defer exactly like the
-        // host-default account. Generalizes the #1520 deferral from
-        // host-default-only to every natively-owned account, so the proactive
+        // config dir (its own CLAUDE_CONFIG_DIR) — defer, so the proactive
         // scheduler never races native's in-dir rotation.
         if (
           await this.isIsolatedAccount(account.accountUuid).catch(() => false)
@@ -1524,7 +1578,7 @@ export class TokenRefreshService {
           // Issue #1644: acquire the cross-machine family lease before
           // proactively rotating. A non-holder defers — mirrors the
           // isolated-account `continue` above. Only non-deferred accounts reach
-          // here (host-default + isolated already `continue`d), so this gates
+          // here (isolated ones already `continue`d), so this gates
           // exactly the accounts this scheduler would otherwise rotate (R1).
           if (!(await this.acquireRotationLease(account.accountUuid))) {
             logger.info(
@@ -1670,6 +1724,18 @@ export class TokenRefreshService {
       return { status: "transient", detail: "account has no refresh token" };
     }
     const refreshToken = account.refreshToken;
+    // Issue #6800 (Task 1b, invariant I1): never present the ~/.claude login
+    // chain — terminal `claude` refreshes it too (the #1520 race). No OAuth
+    // call and no flag; the shared-chain detector owns flagging.
+    if (await this.sharesHostChain(refreshToken)) {
+      logger.warn(
+        `[TOKEN_REFRESH] refresh of ${account.accountUuid} (${account.emailAddress}) refused: its refresh token is the ~/.claude login chain (#6800)`
+      );
+      return {
+        status: "transient",
+        detail: "refresh token shares the ~/.claude login chain",
+      };
+    }
     try {
       const result = await this.refreshFn(refreshToken);
       await this.persistPatch(account.accountUuid, {
@@ -1682,8 +1748,7 @@ export class TokenRefreshService {
         `[TOKEN_REFRESH] refreshed account ${account.accountUuid} (${account.emailAddress})`
       );
       // Issue #1507: notify the daemon so it can restart sessions bound to this
-      // account with the fresh token. Fires for scheduled + reactive refreshes;
-      // never fires for the host-default account (#1520 short-circuits before here).
+      // account with the fresh token. Fires for scheduled + reactive refreshes.
       // Suppressed on the force-refresh path (#1547, fireCallback=false) — the
       // harness drives restartBoundSessions explicitly so it can observe + report it.
       if (fireCallback) {
@@ -1693,10 +1758,13 @@ export class TokenRefreshService {
     } catch (err) {
       if (err instanceof PermanentRefreshError) {
         // #4423: record WHICH token failed (a fingerprint, never the token).
-        await this.persistPatch(account.accountUuid, {
-          unrefreshable: true,
-          unrefreshableTokenFingerprint: refreshTokenFingerprint(refreshToken),
-        });
+        // #6801: merge (not a patch built before the lock), so the first-flag-
+        // wins death time is decided against the record read under the lock.
+        const fingerprint = refreshTokenFingerprint(refreshToken);
+        const flaggedAt = this.now();
+        await this.persistMerge(account.accountUuid, current =>
+          withUnrefreshableFlag(current, { fingerprint }, flaggedAt)
+        );
         logger.warn(
           `[TOKEN_REFRESH] account ${account.accountUuid} (${account.emailAddress}) marked unrefreshable: ${err.message}`
         );
@@ -1748,6 +1816,11 @@ export class TokenRefreshService {
       ...current,
       ...patch,
     }));
+  }
+
+  /** Issue #6800: true when `refreshToken` is the current `~/.claude` token. */
+  private sharesHostChain(refreshToken: string): Promise<boolean> {
+    return sharesHostChain(refreshToken, this.readHostFp);
   }
 
   /** {@link persistPatch} with a merge function (issue #4423: conditional clears). */

@@ -61,6 +61,13 @@ import {
   formatResetAbsolute,
   formatResetCountdown,
 } from "@/components/AccountUsage/AccountUsageCard";
+import {
+  ApiKeyCredit,
+  UseFirstChip,
+  apiKeyCreditFacts,
+  type ApiKeyCreditFacts,
+} from "@/components/AccountUsage/ApiKeyCredit";
+import { pickUseFirstKeyId } from "@/lib/apiKeyBudget";
 import { findUsageRowHardLock, type HardLock } from "@hapi/protocol";
 import {
   AccountCardRow1,
@@ -72,6 +79,8 @@ import { limitWindowName } from "@/lib/accountLimit";
 import { AddToProviderModal } from "@/components/AccountUsage/AddToProviderModal";
 import { useVisualViewportHeight } from "@/hooks/useVisualViewportHeight";
 import { useAccounts } from "@/hooks/queries/useAccounts";
+import { useAccountHealth } from "@/hooks/queries/useAccountHealth";
+import { SignInAgeToken } from "@/components/AccountUsage/SignInAgeToken";
 import { useAccountActions } from "@/hooks/mutations/useAccountActions";
 import {
   useAccountUsage,
@@ -208,11 +217,26 @@ function apiKeyRowRef(key: ApiKeyRowItem): string {
   return key.bindingRef ?? key.id;
 }
 
+/** Issue #6789: a key's credit as the row's select button says it, e.g.
+ *  "≈$71.20 left, 10 days to top-up" or "No estimate" (the row's name carries
+ *  "· <node>" for a key stored on another node). */
+function spokenCredit(facts: ApiKeyCreditFacts): string {
+  if (facts.state !== "budget") return facts.text.join(" ");
+  const remaining = facts.facts.find(f => f.id === "remaining")?.text ?? "";
+  const days = facts.facts.find(f => f.id === "days")?.text;
+  const n = days ? Number.parseInt(days, 10) : null;
+  return n === null
+    ? `${remaining} left`
+    : `${remaining} left, ${n} ${n === 1 ? "day" : "days"} to top-up`;
+}
+
 /**
  * Issue #4568: the "API keys" section — one row per Anthropic vault key, named by
- * its label (else its masked form), with its validation status. A key whose last
- * probe was a definitive rejection (`invalid`) is greyed + unselectable, like an
- * `unrefreshable` account. Label-only by construction (redacted view).
+ * its label (else its masked form), with its credit (#6789: the same
+ * `ApiKeyCredit` the Provider Accounts card shows). A key whose last probe was a
+ * definitive rejection (`invalid`) is greyed + unselectable, like an
+ * `unrefreshable` account; an out-of-credit key stays selectable and says so.
+ * Label and credit only: no key material (redacted view).
  */
 function ApiKeyRows({
   apiKeys,
@@ -229,6 +253,10 @@ function ApiKeyRows({
   /** #5127: nodes whose shared keys could not be listed. */
   unavailableHints?: string[];
 }) {
+  // #6789: one clock per render for every row's credit, and "Use first" over
+  // the picker's own list (it can hold keys shared from other nodes).
+  const nowMs = Date.now();
+  const useFirstId = pickUseFirstKeyId(apiKeys, nowMs);
   return (
     <section
       data-testid="account-selector-api-keys"
@@ -257,10 +285,18 @@ function ApiKeyRows({
         const isCurrent = ref === selectedApiKeyId;
         // #5127: a key stored on another node names its home ("· RP1").
         const name = apiKeyDisplayNameWithHome(key);
+        const credit = apiKeyCreditFacts(key, nowMs);
+        // The card's rule (#6225): a pill only for an unverified or never-probed
+        // key; a rejected key says so once, in its credit.
+        const showPill = key.status === "unverified" || key.status === "none";
+        const useFirst = key.id === useFirstId;
+        const spokenStatus = credit?.state === "rejected" ? null : status.label;
         return (
           // #4466 T41: a key row is the shared row 1's picker variant — one
-          // select button over the name, the masked key and "API key"; no
-          // score, alert or node row.
+          // select button over the name and the masked key, then the key's
+          // credit, the same `ApiKeyCredit` the Provider Accounts card shows
+          // (#6789); no score, alert or node row. No "API key" plan chip: the
+          // section heading names the kind (#6789 DEC-1 rung 2).
           <div
             key={ref}
             data-testid="account-selector-api-key-row"
@@ -279,15 +315,29 @@ function ApiKeyRows({
               revealText={name}
               secondary={key.maskedKey}
               secondaryMono
-              planLabel="API key"
-              statusPill={<ApiKeyStatusPill status={key.status} />}
-              statusPillWraps={
-                key.status === "unverified" || key.status === "none"
+              statusPill={
+                showPill ? (
+                  <span className="inline-flex items-center gap-1.5">
+                    {useFirst ? <UseFirstChip /> : null}
+                    <ApiKeyStatusPill status={key.status} />
+                  </span>
+                ) : useFirst ? (
+                  <UseFirstChip />
+                ) : undefined
               }
+              statusPillWraps={showPill}
+              trailing={<ApiKeyCredit apiKey={key} nowMs={nowMs} />}
               currentMarker={isCurrent}
               onSelect={() => onSelect(ref)}
               selectDisabled={unselectable}
-              selectLabel={`API key ${name} (${key.maskedKey}) — ${status.label}${isCurrent ? " — current" : ""}`}
+              selectLabel={[
+                `API key ${name} (${key.maskedKey})`,
+                spokenStatus,
+                credit ? spokenCredit(credit) : null,
+                isCurrent ? "current" : null,
+              ]
+                .filter(Boolean)
+                .join(" — ")}
             />
           </div>
         );
@@ -648,6 +698,35 @@ export function AccountSelectorModal({
       ? undefined
       : () => setShowAddWizard(true);
 
+  // #6801 (R7): the sign-in age token reads the scope's node — `addNodeId`, or
+  // the UI host when the scope names none — from that node's account-health row
+  // (the page's query key, so the cache is shared). Resolved as NodeLoginList
+  // does; a non-`ok` row, a loading read, or a node without the account shows
+  // no token, never another node's. The token reads its own clock, so this
+  // modal does not re-render every minute.
+  const signInHealth = useAccountHealth(
+    api,
+    isOpen && !keysOnly && targetProvider === "anthropic"
+  );
+  const signInRow = useMemo(() => {
+    const wantsUiHost = !addNodeId || addNodeId === LOCAL_NODE_ID;
+    const row = signInHealth.nodes.find(n =>
+      wantsUiHost
+        ? n.isLocal || n.nodeId === signInHealth.localNodeId
+        : n.nodeId === addNodeId
+    );
+    return row && row.status === "ok" ? row : undefined;
+  }, [signInHealth.nodes, signInHealth.localNodeId, addNodeId]);
+  const signInToken = (accountUuid: string) => {
+    if (targetProvider !== "anthropic" || !signInRow) return undefined;
+    const entry = signInRow.accounts.find(
+      e => e.provider === "anthropic" && e.accountUuid === accountUuid
+    );
+    return entry ? (
+      <SignInAgeToken entry={entry} nodeLabel={signInRow.nodeLabel} />
+    ) : undefined;
+  };
+
   // #4466 R13: an unrefreshable record shows the row-1 re-login alert, naming
   // the scope node when one is in scope (the per-node scope). The picker's
   // records carry no `since`, so the alert line has no timestamp.
@@ -928,6 +1007,8 @@ export function AccountSelectorModal({
                     isUnselectable ? undefined : () => handleRowSelect(account)
                   }
                   className={isUnselectable || lock ? "opacity-50" : undefined}
+                  rowTrailing={signInToken(account.accountUuid)}
+                  nameGivesWay
                 />
               );
               const lockCaption = lock ? (

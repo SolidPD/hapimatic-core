@@ -20,9 +20,17 @@
  *
  * Every column carries `data-state` (`default` | `default-relogin` | `relogin`
  * | `plain`), the deterministic state the replaced chip (#3973) exposed.
+ *
+ * Beside each pill (#6801), an Anthropic `oauth` record's sign-in age token
+ * ("12d", "died 30d"); the caption stays on its own line underneath. The token
+ * reads its own clock, so this row never re-renders every minute.
  */
 import { useState } from "react";
-import type { NodeAccountHealth, ProviderId } from "@hapi/protocol";
+import type {
+  NodeAccountHealth,
+  ProviderId,
+  SignInAgeInput,
+} from "@hapi/protocol";
 import type { ApiClient } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -30,6 +38,8 @@ import { NodeBadge } from "@/components/NodeBadge";
 import { useNodeActiveAccount } from "@/hooks/queries/useNodeActiveAccount";
 import { useAccountActions } from "@/hooks/mutations/useAccountActions";
 import { requestRelogin } from "@/lib/reloginLink";
+import { pickSignInAgeInput } from "@/lib/signInAge";
+import { SignInAgeToken } from "./SignInAgeToken";
 
 export type AccountNodeItem = {
   /** Absent ⇒ a `machines` label that resolves to no known node (plain label). */
@@ -42,6 +52,11 @@ export type AccountNodeItem = {
   needsRelogin: boolean;
   /** The node serving this UI (its label is passed through as received). */
   isUiHost?: boolean;
+  /**
+   * #6801: this node's record for the account, for the sign-in age token.
+   * Absent for a `machines` label, which has no health entry.
+   */
+  signIn?: SignInAgeInput;
 };
 
 /** A resolved node: its id and its label. */
@@ -99,6 +114,7 @@ export function buildAccountNodeItems(input: {
       ...facts,
       isUiHost: row.isLocal || facts.isUiHost === true,
       needsRelogin: input.provider === "anthropic" && entry.needsRelogin,
+      signIn: pickSignInAgeInput(entry),
     });
   }
   const labels =
@@ -188,31 +204,37 @@ function NodeColumn(props: {
     <div
       data-testid={`account-node-${item.nodeId}`}
       data-state={state}
-      className="flex flex-col items-center gap-0.5"
+      // #6801: no gap under the pill line and 8 px between wrapped lines (the
+      // row's gap-y-2), so the sign-in age token's raised 24 px hit area clears
+      // both its own caption and the line above's; two lines stay 63 px.
+      className="flex flex-col items-center"
     >
-      <NodeBadge
-        nodeId={item.nodeId}
-        nodeLabel={item.nodeLabel}
-        nodeUrl={item.nodeUrl}
-        nodeStatus={item.nodeStatus}
-        labelAsReceived={item.isUiHost === true}
-        ring={relogin ? "alert" : isDefault ? "default" : undefined}
-        title={
-          relogin
-            ? `Re-login required on ${item.nodeLabel} · tap to log in there`
-            : undefined
-        }
-        onActivate={
-          relogin
-            ? () =>
-                requestRelogin({
-                  provider: "anthropic",
-                  nodeId: item.nodeId,
-                  accountUuid,
-                })
-            : undefined
-        }
-      />
+      <div className="flex items-center gap-2">
+        <NodeBadge
+          nodeId={item.nodeId}
+          nodeLabel={item.nodeLabel}
+          nodeUrl={item.nodeUrl}
+          nodeStatus={item.nodeStatus}
+          labelAsReceived={item.isUiHost === true}
+          ring={relogin ? "alert" : isDefault ? "default" : undefined}
+          title={
+            relogin
+              ? `Re-login required on ${item.nodeLabel} · tap to log in there`
+              : undefined
+          }
+          onActivate={
+            relogin
+              ? () =>
+                  requestRelogin({
+                    provider: "anthropic",
+                    nodeId: item.nodeId,
+                    accountUuid,
+                  })
+              : undefined
+          }
+        />
+        <SignInAgeToken entry={item.signIn} nodeLabel={item.nodeLabel} lift />
+      </div>
       {isDefault ? (
         <span
           data-testid="account-node-default"
@@ -272,7 +294,7 @@ export function AccountNodeRow(props: AccountNodeRowProps) {
   return (
     <div
       data-testid="account-node-row"
-      className="flex flex-wrap items-start gap-x-1.5 gap-y-1"
+      className="flex flex-wrap items-start gap-x-1.5 gap-y-2"
     >
       {items.map((item, i) =>
         item.nodeId ? (

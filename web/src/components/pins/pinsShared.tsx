@@ -3,6 +3,8 @@ import {
   createContext,
   useContext,
   useEffect,
+  useLayoutEffect,
+  useRef,
   useState,
   type CSSProperties,
   type MouseEvent,
@@ -290,4 +292,73 @@ export function useMinuteClock(): number {
     return () => clearInterval(timer);
   }, []);
   return now;
+}
+
+/**
+ * #6458 (TITLE-D, Matt 2026-11-12): whether an expanded pin's title needs more
+ * than one line. It is always measured in the one-line layout, the title on one
+ * line beside the signals in their cell, so moving the signals to the facts
+ * line cannot change the answer and flip it back. While the title wraps, the
+ * read lifts the title's wrap and the row copy's stowed styles and puts them
+ * back before paint (as `RecommendedLabel` in `DecisionOptions.tsx` does). It
+ * measures again when the title cell's width changes (the screen, or a pill
+ * that grows) and when the age label changes.
+ * #6739: shared by the open row and the completed row, so an expanded completed
+ * pin shows its whole title too. The cell holds the `[data-pin-title-text]`
+ * element it measures; a row with no signals cell (the completed row) passes no
+ * age label. The read also lifts the row's `data-title-wraps`, because the
+ * completed row's narrow-screen layout keys on it (ruling E2: the wrapped title
+ * takes the row's width), so it too is measured in the one-line layout.
+ */
+export function useTitleWraps<T extends HTMLElement = HTMLElement>(
+  expanded: boolean,
+  title: string,
+  ageLabel?: string
+) {
+  const cellRef = useRef<T>(null);
+  const [wraps, setWraps] = useState(false);
+  const [pass, setPass] = useState(0);
+
+  useLayoutEffect(() => {
+    if (!expanded) {
+      setWraps(false);
+      return;
+    }
+    const cell = cellRef.current;
+    const text = cell?.querySelector<HTMLElement>("[data-pin-title-text]");
+    if (!cell || !text) return;
+    const signals =
+      cell.parentElement?.querySelector<HTMLElement>("[data-pin-signals]");
+    const row = cell.closest<HTMLElement>("[data-title-wraps]");
+    const textStyle = text.style.cssText;
+    const signalsStyle = signals?.style.cssText ?? "";
+    row?.removeAttribute("data-title-wraps");
+    text.style.whiteSpace = "nowrap";
+    text.style.overflow = "hidden";
+    if (signals) {
+      signals.style.width = "";
+      signals.style.overflow = "";
+      signals.style.visibility = "";
+    }
+    const overflows = text.scrollWidth > text.clientWidth + 1;
+    text.style.cssText = textStyle;
+    if (signals) signals.style.cssText = signalsStyle;
+    row?.setAttribute("data-title-wraps", "");
+    setWraps(overflows);
+  }, [expanded, title, ageLabel, pass]);
+
+  useEffect(() => {
+    const cell = cellRef.current;
+    if (!expanded || !cell || typeof ResizeObserver === "undefined") return;
+    let width = cell.clientWidth;
+    const resize = new ResizeObserver(() => {
+      if (cell.clientWidth === width) return;
+      width = cell.clientWidth;
+      setPass(n => n + 1);
+    });
+    resize.observe(cell);
+    return () => resize.disconnect();
+  }, [expanded]);
+
+  return { cellRef, wraps };
 }

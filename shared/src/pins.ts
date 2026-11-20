@@ -101,6 +101,17 @@ export const PIN_ANSWERS_MAX_BYTES = 8 * 1024;
  * neutralizing an approval token lengthens the text and every read checks it.
  */
 export const PIN_ANSWER_NOTE_MAX_CHARS = 2048;
+/** An agent's pin title, at most (`pin_post`, a `hapi_pin` fence, a federation write). */
+export const PIN_TITLE_MAX_CHARS = 200;
+/**
+ * A title the server writes into its own pin (#6739: a Detected pin, a mirrored
+ * prompt), at most: one complete sentence or a whole quoted line, never cut.
+ * Past it the writer stores its fixed label and puts the whole text in the pin's
+ * body (ruling RV-1). It is the bound the prompt mirror puts on the same text in
+ * a pin's context (`CONTEXT_MAX_CHARS`, pinPromptMirror.ts), and a test there
+ * keeps the two equal. Only {@link ServerPinContentSchema} allows it.
+ */
+export const PIN_SERVER_TITLE_MAX_CHARS = 4000;
 export const PIN_LIST_DEFAULT_LIMIT = 200;
 export const PIN_LIST_MAX_LIMIT = 500;
 /** Server-created pins only (#6455), so an agent cannot overwrite or withdraw one. */
@@ -265,11 +276,17 @@ export type PinIfUnanswered = z.infer<typeof PinIfUnansweredSchema>;
  * A field added here later must be optional with no `.default()`, because a default
  * changes the canonical JSON of every stored row: an identical re-post would then
  * bump an open pin's revision and earn an answered pin a 409.
+ *
+ * `title` is an agent's limit ({@link PIN_TITLE_MAX_CHARS}). A stored row may hold
+ * a server-made title of up to {@link PIN_SERVER_TITLE_MAX_CHARS} (#6739,
+ * {@link ServerPinContentSchema}), so a stored row must never be re-validated
+ * with {@link PinContentSchema}: it would refuse that title. Stored rows are read
+ * with a bare `JSON.parse` today (pinStore.ts).
  */
 export const PinContentObjectSchema = z.strictObject({
   key: PinKeySchema,
   kind: z.enum(PIN_KINDS),
-  title: z.string().min(1).max(200),
+  title: z.string().min(1).max(PIN_TITLE_MAX_CHARS),
   /** Markdown. */
   context: z.string().max(PIN_TEXT_MAX_CHARS).optional(),
   evidence: z.array(PinEvidenceSchema).max(20).optional(),
@@ -358,79 +375,106 @@ function addDuplicateIdIssues(
   });
 }
 
-/** The content object plus its cross-field rules. */
-export const PinContentSchema = PinContentObjectSchema.superRefine(
-  (pin, ctx) => {
-    addDuplicateIdIssues(
-      (pin.options ?? []).map(o => o.id),
-      "options",
-      ctx
-    );
-    addDuplicateIdIssues(
-      (pin.steps ?? []).map(s => s.id),
-      "steps",
-      ctx
-    );
+/**
+ * A pin's cross-field rules, shared by {@link PinContentSchema} and
+ * {@link ServerPinContentSchema} (#6739). A named function, not a derived schema,
+ * because zod refuses to `.extend` a refined object and its handling of derived
+ * refined objects varies by version (see {@link PinContentObjectSchema}).
+ */
+function addPinContentIssues(pin: PinContent, ctx: z.RefinementCtx): void {
+  addDuplicateIdIssues(
+    (pin.options ?? []).map(o => o.id),
+    "options",
+    ctx
+  );
+  addDuplicateIdIssues(
+    (pin.steps ?? []).map(s => s.id),
+    "steps",
+    ctx
+  );
 
-    const optionIds = new Set((pin.options ?? []).map(o => o.id));
-    if (pin.recommended !== undefined && !optionIds.has(pin.recommended)) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["recommended"],
-        message: `must name an option id, but no option is "${pin.recommended}"`,
-      });
-    }
-    if (pin.ifUnanswered && !optionIds.has(pin.ifUnanswered.option)) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["ifUnanswered", "option"],
-        message: `must name an option id, but no option is "${pin.ifUnanswered.option}"`,
-      });
-    }
-    // The safety boundary for automatic picks: a hole here lets a costly or
-    // irreversible decision be made with no one asked (#6452). The same rule as
-    // `isAutoPickEligible`, split so each failure names its reason.
-    if (
-      pin.ifUnanswered &&
-      (pin.stakes !== "reversible" || pin.risk !== "low")
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["ifUnanswered"],
-        message: "automatic picks are for reversible, low-risk pins only",
-      });
-    }
-    if (pin.ifUnanswered && !isAutoPickKind(pin.kind)) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["ifUnanswered"],
-        message: `automatic picks are for ${PIN_AUTO_PICK_KINDS.join(" or ")} pins only`,
-      });
-    }
-    if (pin.lanes !== undefined && pin.kind !== "dashboard") {
-      ctx.addIssue({
-        code: "custom",
-        path: ["lanes"],
-        message: 'lanes are for a pin of kind "dashboard"',
-      });
-    }
-    addLaneIssues(pin.lanes, ctx);
-    if (pin.kind === "steps" && !pin.steps?.length) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["steps"],
-        message: 'a pin of kind "steps" must carry at least one step',
-      });
-    }
-    if (utf8ByteLength(canonicalJson(pin)) > PIN_CONTENT_MAX_BYTES) {
-      ctx.addIssue({
-        code: "custom",
-        path: [],
-        message: `content is over the ${PIN_CONTENT_MAX_BYTES}-byte limit`,
-      });
-    }
+  const optionIds = new Set((pin.options ?? []).map(o => o.id));
+  if (pin.recommended !== undefined && !optionIds.has(pin.recommended)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["recommended"],
+      message: `must name an option id, but no option is "${pin.recommended}"`,
+    });
   }
-);
+  if (pin.ifUnanswered && !optionIds.has(pin.ifUnanswered.option)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["ifUnanswered", "option"],
+      message: `must name an option id, but no option is "${pin.ifUnanswered.option}"`,
+    });
+  }
+  // The safety boundary for automatic picks: a hole here lets a costly or
+  // irreversible decision be made with no one asked (#6452). The same rule as
+  // `isAutoPickEligible`, split so each failure names its reason.
+  if (pin.ifUnanswered && (pin.stakes !== "reversible" || pin.risk !== "low")) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["ifUnanswered"],
+      message: "automatic picks are for reversible, low-risk pins only",
+    });
+  }
+  if (pin.ifUnanswered && !isAutoPickKind(pin.kind)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["ifUnanswered"],
+      message: `automatic picks are for ${PIN_AUTO_PICK_KINDS.join(" or ")} pins only`,
+    });
+  }
+  if (pin.lanes !== undefined && pin.kind !== "dashboard") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["lanes"],
+      message: 'lanes are for a pin of kind "dashboard"',
+    });
+  }
+  addLaneIssues(pin.lanes, ctx);
+  if (pin.kind === "steps" && !pin.steps?.length) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["steps"],
+      message: 'a pin of kind "steps" must carry at least one step',
+    });
+  }
+  if (utf8ByteLength(canonicalJson(pin)) > PIN_CONTENT_MAX_BYTES) {
+    ctx.addIssue({
+      code: "custom",
+      path: [],
+      message: `content is over the ${PIN_CONTENT_MAX_BYTES}-byte limit`,
+    });
+  }
+}
+
+/** The content object plus its cross-field rules. */
+export const PinContentSchema =
+  PinContentObjectSchema.superRefine(addPinContentIssues);
+
+/**
+ * The schema the server's own pin writers parse with, and only they: the
+ * Detected pin (pinTurnCheck.ts) and the prompt mirror (pinPromptMirror.ts),
+ * #6739. It is {@link PinContentSchema} with a title of up to
+ * {@link PIN_SERVER_TITLE_MAX_CHARS}, allowed past {@link PIN_TITLE_MAX_CHARS}
+ * only on a reserved key, so a server-made title is stored whole (TITLE-D: an
+ * expanded pin shows its whole title). An agent's write never reaches it: the
+ * CLI, fence and federation surfaces use {@link parseAgentPin}, whose title stays
+ * at most {@link PIN_TITLE_MAX_CHARS}.
+ */
+export const ServerPinContentSchema = PinContentObjectSchema.extend({
+  title: z.string().min(1).max(PIN_SERVER_TITLE_MAX_CHARS),
+}).superRefine((pin, ctx) => {
+  addPinContentIssues(pin, ctx);
+  if (pin.title.length > PIN_TITLE_MAX_CHARS && !isReservedPinKey(pin.key)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["title"],
+      message: `only a pin the server writes (a key starting ${PIN_RESERVED_KEY_PREFIXES.join(" or ")}) may have a title over ${PIN_TITLE_MAX_CHARS} characters`,
+    });
+  }
+});
 
 /** {@link PinContentSchema} plus what only the server may create. */
 const AgentPinContentSchema = PinContentSchema.superRefine((pin, ctx) => {
@@ -581,6 +625,13 @@ export function answerOnRecord(
   return settled?.revision === pin.revision ? settled : undefined;
 }
 
+/**
+ * #6540 S-4: one file a Save did not copy, as a path relative to the session's
+ * folder (the form `pin_folder` gives the agent) and the reason. Defined here, not
+ * in `./pinFiles`, because that module imports a value from this one.
+ */
+export type PinNotSavedFile = { path: string; reason: string };
+
 /** A pin as the server returns it: the content plus everything the server owns. */
 export type Pin = PinContent & {
   sessionId: string;
@@ -614,6 +665,13 @@ export type Pin = PinContent & {
    */
   savedFiles?: number | null;
   savedSkipped?: number | null;
+  /**
+   * #6540 S-4: up to 10 of the files the last Save did not save, each relative to
+   * the session's folder; null on a full save or one made before this field.
+   * Server-owned like `savedTo`; optional, because a peer older than this omits it.
+   * `savedSkipped` counts every skipped file, so it can be larger than this list.
+   */
+  savedSkippedFiles?: PinNotSavedFile[] | null;
   /**
    * #6458 (D-b): on an open `prompt:` pin only, whether the request it mirrors
    * still waits. False when it is gone (a restart left the pin open), so the
@@ -672,6 +730,13 @@ export const PinSchema = z
     // #6458 (#6540 S-4): optional, because a peer older than L omits them.
     savedFiles: z.number().int().nullable().optional(),
     savedSkipped: z.number().int().nullable().optional(),
+    // #6540 S-4: a wrong-shaped list from another node reads as no list, so it
+    // never fails a pin list.
+    savedSkippedFiles: z
+      .array(z.object({ path: z.string(), reason: z.string() }).loose())
+      .nullable()
+      .optional()
+      .catch(null),
     requestLive: z.boolean().optional(),
     // #6574: optional, because a peer older than P omits it.
     pinId: z.string().nullable().optional(),

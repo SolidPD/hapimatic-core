@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
+  BILLABLE_SWITCH_EVENT_KINDS,
   BillableSwitchEventFeedPageSchema,
   SupervisedLoop,
   type BillableSwitchEventFeedPage,
@@ -28,7 +29,9 @@ import type { BillableSwitchStore } from "../store/billableSwitchStore";
  *    `unsupported` (the cursor itself is kept);
  *  - otherwise one page after the stored cursor. An offline or unreachable
  *    outcome, or a page that fails its schema, skips the origin this tick and
- *    keeps its state.
+ *    keeps its state. A row of a kind this node does not know (a newer
+ *    origin's) is left out of its page, the cursor moves past it, and the
+ *    origin is named in the log once (#6778 F1).
  * Resync (the cursor back to 0 under the page's incarnation, every copied row
  * kept): no cursor row, another incarnation (a rebuilt node), or a highest id
  * below the cursor (a database restored from a backup under the same
@@ -125,24 +128,74 @@ export async function pullAllOnce(
   return outcomes;
 }
 
+/** Origins already named in the log for a kind this node does not know. */
+const warnedUnknownKind = new Set<string>();
+
+/**
+ * Leaves out of a page, before it is parsed, every row whose `kind` this build
+ * does not know (#6778 F1), so a newer origin's new kind cannot fail the page.
+ * Before, the strict parse failed the whole page, and because the cursor is
+ * written only after a page is applied, every tick re-read the same page and
+ * the origin's copy stalled with nothing in the log. A row whose `kind` is
+ * missing or not a string is not left out, so it still fails the page.
+ * `received` is the row count the origin sent, which decides whether to read on.
+ */
+function dropUnknownKinds(body: unknown): {
+  body: unknown;
+  received: number;
+  dropped: string[];
+} {
+  const events =
+    typeof body === "object" && body !== null
+      ? (body as { events?: unknown }).events
+      : undefined;
+  if (!Array.isArray(events)) return { body, received: 0, dropped: [] };
+  const known = BILLABLE_SWITCH_EVENT_KINDS as readonly string[];
+  const dropped: string[] = [];
+  const kept = events.filter(row => {
+    const kind =
+      typeof row === "object" && row !== null
+        ? (row as { kind?: unknown }).kind
+        : undefined;
+    if (typeof kind === "string" && !known.includes(kind)) {
+      dropped.push(kind);
+      return false;
+    }
+    return true;
+  });
+  return {
+    body: { ...(body as object), events: kept },
+    received: events.length,
+    dropped,
+  };
+}
+
+type FetchedPage = {
+  kind: "page";
+  page: BillableSwitchEventFeedPage;
+  received: number;
+};
+
 async function fetchPage(
   registry: BillableSwitchPullRegistry,
   nodeId: string,
   cursor: number
-): Promise<
-  | { kind: "page"; page: BillableSwitchEventFeedPage }
-  | { kind: "unreachable" }
-  | { kind: "malformed" }
-> {
+): Promise<FetchedPage | { kind: "unreachable" } | { kind: "malformed" }> {
   const outcome = await registry.getBillableSwitchEventFeedOnNode(nodeId, {
     cursor,
     limit: PAGE_LIMIT,
   });
   if (outcome.kind !== "ok") return { kind: "unreachable" };
-  const parsed = BillableSwitchEventFeedPageSchema.safeParse(outcome.body);
-  return parsed.success
-    ? { kind: "page", page: parsed.data }
-    : { kind: "malformed" };
+  const { body, received, dropped } = dropUnknownKinds(outcome.body);
+  const parsed = BillableSwitchEventFeedPageSchema.safeParse(body);
+  if (!parsed.success) return { kind: "malformed" };
+  if (dropped.length > 0 && !warnedUnknownKind.has(nodeId)) {
+    warnedUnknownKind.add(nodeId);
+    console.warn(
+      `[BillableSwitchMirrorPull] origin ${nodeId} sent switch events of a kind this node does not know (${[...new Set(dropped)].join(", ")}); they are not copied here, and the copy goes on past them`
+    );
+  }
+  return { kind: "page", page: parsed.data, received };
 }
 
 /** One origin, one tick. */
@@ -184,8 +237,9 @@ export async function pullOriginOnce(
   }
 
   let pagesLeft = MAX_PAGES_PER_TICK;
-  let page: BillableSwitchEventFeedPage | null = fetched.page;
-  while (page && pagesLeft-- > 0) {
+  let current: FetchedPage | null = fetched;
+  while (current && pagesLeft-- > 0) {
+    const { page, received } = current;
     const at = now();
     store.upsertMirrorEvents(nodeId, page.incarnation, page.events, at);
     store.setMirrorCursor(nodeId, {
@@ -198,9 +252,10 @@ export async function pullOriginOnce(
     });
     const advanced = page.nextCursor > cursor;
     cursor = page.nextCursor;
-    if (page.events.length < PAGE_LIMIT || !advanced) break;
+    // The origin's own row count: rows left out above still fill its page.
+    if (received < PAGE_LIMIT || !advanced) break;
     const next = await fetchPage(registry, nodeId, cursor);
-    page = next.kind === "page" ? next.page : null;
+    current = next.kind === "page" ? next : null;
   }
   return "copied";
 }

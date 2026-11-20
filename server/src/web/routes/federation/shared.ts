@@ -16,6 +16,7 @@ import type { CodexLoginService } from "../../../services/codexLoginService";
 import type { AccountLoginService } from "../../../services/accountLoginService";
 import type { LeaseStore } from "../../../store/leaseStore";
 import type { ApiKeyShareAuditStore } from "../../../store/apiKeyShareAuditStore";
+import type { ApiKeySpendSource } from "../apiKeys";
 import type { SharedApiKeyService } from "../../../services/sharedApiKeyService";
 import type { SystemJobsService } from "../../../systemJobs/service";
 import type { OutputStyleSyncService } from "../../../services/outputStyleSyncService";
@@ -96,6 +97,12 @@ export type FederationDeps = {
   // receivers, so a node-targeted login is stored on the OWNING node. Optional
   // because federation test stubs omit it (mirrors getCodexLoginService).
   getAccountLoginService?: () => AccountLoginService | null;
+  /**
+   * Issue #6800: this node's live sibling daemons on an older build, for the
+   * sign-in start answer's warning. Defaults to the daemon.state.json reader;
+   * tests inject.
+   */
+  listOlderSiblingDaemons?: () => Promise<string[]>;
   // Issue #4462 Task 8 (epic #4460 overview T7): re-import provider records after a
   // peer-side OpenAI login lands, so the new account surfaces without a restart.
   // Injected (never imported from routes/accounts.ts) so a stub that omits it stays
@@ -138,6 +145,14 @@ export type FederationDeps = {
   // or no audit store refuses rather than serve unaudited.
   getSettingsFile?: () => string;
   getApiKeyShareAudit?: () => ApiKeyShareAuditStore | null;
+  /** Issue #6789: this node's metered spend per key, so the shared list answers
+   *  each key's credit computed here, on its home. Optional (federation test
+   *  stubs omit it): absent ⇒ every budgeted key answers `creditUnavailable`. */
+  getApiKeySpend?: ApiKeySpendSource;
+  /** Issue #6789 test seam: the wall clock for the budget arithmetic. */
+  now?: () => number;
+  /** Issue #6789 test seam: the monotonic clock of the credit deadline. */
+  clock?: () => number;
   /** Issue #5127: the requesting-side service the api-key spawn receiver
    *  confirms a key with before it accepts the spawn. */
   getSharedApiKeyService?: () => SharedApiKeyService | null;

@@ -3,9 +3,6 @@ import type { Database } from "bun:sqlite";
 import {
   BILLABLE_SWITCH_EVENT_KINDS,
   isBillableSwitchReasonForKind,
-  projectBaseKey,
-  projectKeyKind,
-  unloggedAmount,
   type BillableConfirm,
   type BillableSwitchActorKind,
   type BillableSwitchEvent,
@@ -235,6 +232,26 @@ const asConfirm = (v: string | null | undefined): BillableConfirm =>
   v === "pending" ? "pending" : null;
 
 /**
+ * The `kind` clause of an event read. No filter, or an empty one, reads every
+ * kind. A filter that names only kinds this build does not know reads nothing
+ * (`null`): before #6778 (F2) its unknown kinds were dropped and the empty rest
+ * read every kind, the opposite of what was asked.
+ */
+function kindFilter(
+  requested: readonly string[] | undefined
+): { clause: string; kinds: string[] } | null {
+  if (!requested || requested.length === 0) return { clause: "", kinds: [] };
+  const kinds = requested.filter(k =>
+    (BILLABLE_SWITCH_EVENT_KINDS as readonly string[]).includes(k)
+  );
+  if (kinds.length === 0) return null;
+  return {
+    clause: ` AND kind IN (${kinds.map(() => "?").join(", ")})`,
+    kinds,
+  };
+}
+
+/**
  * Append one event. Throws when the kind and reason are not a pair of the
  * event table (section 6 item 3), so a bad pair rolls back the write it
  * belongs to. Returns the new id.
@@ -433,32 +450,6 @@ export type BillableSwitchSetResult =
       after: BillableSwitchState;
       eventId: number | null;
     };
-
-export type BillableSwitchPick = {
-  sessionId: string;
-  timerMs: number;
-  loggedMs: number | null;
-};
-
-export type BillableSwitchPickOutcome =
-  | "ok"
-  | "unchanged"
-  | "not_found"
-  | "not_in_project";
-
-export type BillableSwitchApplyHeaderResult = {
-  header: {
-    namespace: string;
-    projectKey: string;
-    keyKind: BillableSwitchKeyKind;
-    billable: boolean;
-    updatedAt: number;
-  };
-  headerChanged: boolean;
-  sessions: Array<{ id: string; outcome: BillableSwitchPickOutcome }>;
-  /** The sessions whose switch changed (for the caller's cache refresh). */
-  changedSessionIds: string[];
-};
 
 export type BillableSwitchPeerReport = {
   nodeId: string;
@@ -659,21 +650,16 @@ export class BillableSwitchStore {
     afterId: number,
     opts?: { kinds?: readonly string[]; limit?: number }
   ): BillableSwitchEvent[] {
-    const kinds = (opts?.kinds ?? []).filter(k =>
-      (BILLABLE_SWITCH_EVENT_KINDS as readonly string[]).includes(k)
-    );
+    const filter = kindFilter(opts?.kinds);
+    if (!filter) return [];
     const limit = Math.max(1, Math.min(opts?.limit ?? 500, 1000));
-    const kindClause =
-      kinds.length > 0
-        ? ` AND kind IN (${kinds.map(() => "?").join(", ")})`
-        : "";
     const rows = this.db
       .prepare(
         `SELECT * FROM billable_switch_events
-          WHERE namespace = ? AND id > ?${kindClause}
+          WHERE namespace = ? AND id > ?${filter.clause}
           ORDER BY id ASC LIMIT ${limit}`
       )
-      .all(namespace, afterId, ...kinds) as EventRow[];
+      .all(namespace, afterId, ...filter.kinds) as EventRow[];
     return rows.map(rowToEvent);
   }
 
@@ -745,158 +731,65 @@ export class BillableSwitchStore {
   }
 
   /**
-   * Set this node's header for a project and switch the picked sessions on,
-   * all in ONE IMMEDIATE transaction (R12): a failed write rolls back the
-   * header and every pick. No header event when the header is already at the
-   * requested value; the picks still apply. Every pick must be a session of
-   * this namespace whose project key and key kind equal the header's; a pick
-   * that is not found, of another project, or already billable is reported and
-   * skipped. Picks are allowed only when switching the header on.
+   * #6778 PR-A (section 3.4 step 4; reviews S6, H7, H9, T10): the header
+   * retirement, run at every start-up by `runBillableTrackingStartup`, never by
+   * a migration (the Store's migrations write no row). In ONE IMMEDIATE
+   * transaction every header row that is on is switched off, with one
+   * `header-off` event per row (reason `retired`, actor `system`, channel
+   * `internal`), and every stored header row of another node's report is
+   * deleted, so a previous binary after a roll back starts nothing billable
+   * from either. The rows themselves stay, so D-1's "D-1 c" undo can switch
+   * one back on. A second run finds nothing and writes nothing.
    */
-  applyHeader(input: {
-    namespace: string;
-    projectKey: string;
-    keyKind: BillableSwitchKeyKind;
-    billable: boolean;
-    picks: readonly BillableSwitchPick[];
-    actor: {
-      kind: BillableSwitchActorKind;
-      sessionId?: string | null;
-      userAgent?: string | null;
-    };
-    via: BillableSwitchVia;
-    entryNodeId: string | null;
-    now?: number;
-  }): BillableSwitchApplyHeaderResult {
-    if (!input.billable && input.picks.length > 0) {
-      throw new Error(
-        "billable switch: picks are allowed only when switching a header on"
-      );
-    }
-    const now = input.now ?? Date.now();
-    const run = this.db.transaction((): BillableSwitchApplyHeaderResult => {
-      const prior = readProjectDefaultRow(
-        this.db,
-        input.namespace,
-        input.projectKey
-      );
-      const headerChanged = prior === null || prior.billable !== input.billable;
-      const actorFields = {
-        actorKind: input.actor.kind,
-        actorSessionId: input.actor.sessionId ?? null,
-        actorUserAgent: input.actor.userAgent ?? null,
-        via: input.via,
-        entryNodeId: input.entryNodeId,
-      };
-      if (headerChanged) {
+  retireHeaders(opts: { entryNodeId: string | null; now?: number }): {
+    switchedOff: number;
+    peerHeadersDeleted: number;
+  } {
+    const now = opts.now ?? Date.now();
+    const run = this.db.transaction(() => {
+      const on = this.db
+        .prepare(
+          `SELECT namespace, project_key, key_kind
+             FROM billable_switch_project_defaults
+            WHERE billable = 1
+            ORDER BY namespace, project_key`
+        )
+        .all() as Array<{
+        namespace: string;
+        project_key: string;
+        key_kind: string;
+      }>;
+      for (const row of on) {
+        const keyKind: BillableSwitchKeyKind =
+          row.key_kind === "path" ? "path" : "repo";
         upsertProjectDefaultRow(
           this.db,
-          input.namespace,
-          input.projectKey,
-          input.keyKind,
-          input.billable,
+          row.namespace,
+          row.project_key,
+          keyKind,
+          false,
           now
         );
         insertBillableSwitchEvent(this.db, {
-          ...actorFields,
-          namespace: input.namespace,
+          namespace: row.namespace,
           sessionId: null,
-          projectKey: input.projectKey,
-          keyKind: input.keyKind,
-          kind: input.billable ? "header-on" : "header-off",
-          reason: "switch",
-          billableBefore: prior === null ? null : prior.billable,
-          billableAfter: input.billable,
-          label: {
-            projectKey: input.projectKey,
-            keyKind: input.keyKind,
-            picks: input.picks.length,
-          },
+          projectKey: row.project_key,
+          keyKind,
+          kind: "header-off",
+          reason: "retired",
+          billableBefore: true,
+          billableAfter: false,
+          actorKind: "system",
+          via: "internal",
+          entryNodeId: opts.entryNodeId,
+          label: { projectKey: row.project_key, keyKind, picks: 0 },
           at: now,
         });
       }
-
-      const sessions: BillableSwitchApplyHeaderResult["sessions"] = [];
-      const changedSessionIds: string[] = [];
-      for (const pick of input.picks) {
-        const row = this.db
-          .prepare(
-            "SELECT metadata, billable FROM sessions WHERE id = ? AND namespace = ?"
-          )
-          .get(pick.sessionId, input.namespace) as {
-          metadata: string | null;
-          billable: number | null;
-        } | null;
-        if (row == null) {
-          sessions.push({ id: pick.sessionId, outcome: "not_found" });
-          continue;
-        }
-        const metadata = safeJsonParse(row.metadata) as Parameters<
-          typeof projectBaseKey
-        >[0];
-        if (
-          projectBaseKey(metadata) !== input.projectKey ||
-          projectKeyKind(metadata) !== input.keyKind
-        ) {
-          sessions.push({ id: pick.sessionId, outcome: "not_in_project" });
-          continue;
-        }
-        if (row.billable === 1) {
-          sessions.push({ id: pick.sessionId, outcome: "unchanged" });
-          continue;
-        }
-        const amount = unloggedAmount({
-          timerMs: pick.timerMs,
-          loggedMs: pick.loggedMs,
-        });
-        const meta = (metadata ?? {}) as { name?: unknown; path?: unknown };
-        // A nested `transaction()` is a savepoint, so a throw here rolls back
-        // the header and every earlier pick with the outer transaction.
-        const result = this.setSwitch(
-          pick.sessionId,
-          input.namespace,
-          { billable: true, confirm: null },
-          () => ({
-            ...actorFields,
-            kind: "on",
-            reason: "pick",
-            projectKey: input.projectKey,
-            keyKind: input.keyKind,
-            timerMs: pick.timerMs,
-            unloggedMs: amount.ms,
-            loggedKnown: amount.loggedKnown,
-            label: {
-              name: typeof meta.name === "string" ? meta.name : null,
-              projectKey: input.projectKey,
-              path: typeof meta.path === "string" ? meta.path : null,
-            },
-            at: now,
-          })
-        );
-        if (result.found && result.changed) {
-          sessions.push({ id: pick.sessionId, outcome: "ok" });
-          changedSessionIds.push(pick.sessionId);
-        } else {
-          sessions.push({ id: pick.sessionId, outcome: "unchanged" });
-        }
-      }
-      const stored = readProjectDefaultRow(
-        this.db,
-        input.namespace,
-        input.projectKey
-      );
-      return {
-        header: {
-          namespace: input.namespace,
-          projectKey: input.projectKey,
-          keyKind: stored?.keyKind ?? input.keyKind,
-          billable: stored?.billable ?? input.billable,
-          updatedAt: stored?.updatedAt ?? now,
-        },
-        headerChanged,
-        sessions,
-        changedSessionIds,
-      };
+      const deleted = this.db
+        .prepare("DELETE FROM billable_switch_peer_headers")
+        .run().changes;
+      return { switchedOff: on.length, peerHeadersDeleted: deleted };
     });
     return run.immediate();
   }
@@ -1262,21 +1155,16 @@ export class BillableSwitchStore {
     afterMirrorSeq: number,
     opts?: { kinds?: readonly string[]; limit?: number }
   ): BillableSwitchMirrorEvent[] {
-    const kinds = (opts?.kinds ?? []).filter(k =>
-      (BILLABLE_SWITCH_EVENT_KINDS as readonly string[]).includes(k)
-    );
+    const filter = kindFilter(opts?.kinds);
+    if (!filter) return [];
     const limit = Math.max(1, Math.min(opts?.limit ?? 500, 1000));
-    const kindClause =
-      kinds.length > 0
-        ? ` AND kind IN (${kinds.map(() => "?").join(", ")})`
-        : "";
     const rows = this.db
       .prepare(
         `SELECT * FROM billable_switch_events_mirror
-          WHERE namespace = ? AND mirror_seq > ?${kindClause}
+          WHERE namespace = ? AND mirror_seq > ?${filter.clause}
           ORDER BY mirror_seq ASC LIMIT ${limit}`
       )
-      .all(namespace, afterMirrorSeq, ...kinds) as MirrorRow[];
+      .all(namespace, afterMirrorSeq, ...filter.kinds) as MirrorRow[];
     return rows
       .map(mirrorRowToEvent)
       .filter((e): e is BillableSwitchMirrorEvent => e !== null);

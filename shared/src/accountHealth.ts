@@ -2,6 +2,11 @@
 import { z } from "zod";
 
 import { AccountMonogramSchema, type AccountMonogram } from "./accountMonogram";
+import {
+  SignInDeathSchema,
+  isNonDeathFlag,
+  type SignInDeath,
+} from "./accounts";
 import { ProviderIdSchema, type ProviderId } from "./providerAuthState";
 import { AccountUsageStatusSchema, type AccountUsageStatus } from "./usage";
 
@@ -67,6 +72,23 @@ export const AccountHealthEntrySchema = z.object({
   since: z.number(),
   sinceSource: AccountHealthSinceSourceSchema,
   usageStatus: AccountUsageStatusSchema.nullable(),
+  /**
+   * Issue #6801 (R5): epoch ms when this node first flagged the record dead, or
+   * `null` when it is not flagged or has no trusted time. A node with #6801 always
+   * sends the key; an ABSENT key means an older node that does not report death
+   * times (see {@link computeSignInAge}'s `flagged-unreported`). Optional so an
+   * older peer's entry still parses; an older hub strips it (plain `z.object`).
+   */
+  unrefreshableAt: z.number().nullable().optional(),
+  /** Issue #6801 (R13): past login deaths on this node, newest last. */
+  signInDeaths: z.array(SignInDeathSchema).optional(),
+  /**
+   * Issue #6801 (R14): the record is flagged for a non-death reason (#6800's
+   * `host-chain-shared` quarantine). A boolean, never an enum of reasons, because
+   * a closed enum gains values on a newer node and an older hub would drop the
+   * whole entry (the #5420 rule).
+   */
+  quarantined: z.boolean().optional(),
 });
 export type AccountHealthEntry = z.infer<typeof AccountHealthEntrySchema>;
 
@@ -250,6 +272,15 @@ export type AccountHealthRecordInput = {
   lastRefreshedAt: number;
   capturedAt: number;
   expiresAt: number;
+  /**
+   * Issue #6801: the record's TRUSTED death time (`trustedUnrefreshableAt`), or
+   * `null` / absent when it has none. The caller never passes the raw stamp.
+   */
+  unrefreshableAt?: number | null;
+  /** Issue #6801 (R14): the stored reason, so the entry can mark a quarantine. */
+  unrefreshableReason?: string | null;
+  /** Issue #6801 (R13): the record's past deaths, already validated. */
+  signInDeaths?: SignInDeath[];
 };
 
 /** Node-local display context for one record. */
@@ -279,6 +310,9 @@ function normalizeAuthKind(
  *   OpenAI or Google row.
  * - `since` (D-A2 = A): `lastRefreshedAt` when it is non-zero, else `capturedAt`,
  *   with `sinceSource` naming which — never a 1970 date.
+ * - `unrefreshableAt` (#6801): ALWAYS emitted — the trusted death time while the
+ *   record is flagged, else `null` — so on the wire an absent key means an older
+ *   node. `signInDeaths` only when non-empty; `quarantined` (R14) always.
  */
 export function deriveAccountHealth(
   record: AccountHealthRecordInput,
@@ -304,5 +338,233 @@ export function deriveAccountHealth(
     since: refreshed ? record.lastRefreshedAt : record.capturedAt,
     sinceSource: refreshed ? "lastRefreshedAt" : "capturedAt",
     usageStatus: ctx.usageStatus ?? null,
+    unrefreshableAt:
+      record.unrefreshable &&
+      typeof record.unrefreshableAt === "number" &&
+      record.unrefreshableAt > 0
+        ? record.unrefreshableAt
+        : null,
+    ...(record.signInDeaths && record.signInDeaths.length > 0
+      ? { signInDeaths: record.signInDeaths }
+      : {}),
+    quarantined: isNonDeathFlag(record),
   };
+}
+
+/** Issue #6801: one day for the sign-in age (whole elapsed 24-hour days). */
+export const SIGN_IN_AGE_DAY_MS = 86_400_000;
+
+/**
+ * Issue #6801: the entry fields the sign-in age reads. The one input type for
+ * every caller (Tasks 10-12 use it, never a narrower copy: a copy without
+ * `quarantined` would show every quarantined row as "died").
+ */
+export type SignInAgeInput = Pick<
+  AccountHealthEntry,
+  | "provider"
+  | "authKind"
+  | "capturedAt"
+  | "unrefreshable"
+  | "unrefreshableAt"
+  | "quarantined"
+>;
+
+/**
+ * Issue #6801: a record's sign-in age on one node.
+ * - `running`: alive, `days` since the sign-in.
+ * - `stopped`: died `days` after its sign-in (the age at death; it does not rise).
+ * - `stopped-unknown`: died, and the node has no trusted time for it.
+ * - `quarantined`: #6800's non-death flag (R14), `days` since the sign-in.
+ * - `flagged-unreported`: flagged on a node that sends no death time (an older
+ *   build); not a death, and no age.
+ */
+export type SignInAge =
+  | { state: "running"; days: number; signedInAt: number }
+  | { state: "stopped"; days: number; signedInAt: number; diedAt: number }
+  | { state: "stopped-unknown"; signedInAt: number }
+  | { state: "quarantined"; days: number; signedInAt: number }
+  | { state: "flagged-unreported"; signedInAt: number };
+
+/**
+ * True for the two death states, the one rule `hapi accounts sign-in-ages
+ * --dead` and the web token's danger colour share. A quarantine and a
+ * `flagged-unreported` entry are not deaths. Exhaustive on purpose: a new state
+ * fails to compile until it is placed.
+ */
+export function isSignInDeath(state: SignInAge["state"]): boolean {
+  switch (state) {
+    case "stopped":
+    case "stopped-unknown":
+      return true;
+    case "running":
+    case "quarantined":
+    case "flagged-unreported":
+      return false;
+  }
+}
+
+/** Whole elapsed 24-hour days from `from` to `to`, clock skew clamped to 0. */
+export function wholeSignInDays(from: number, to: number): number {
+  return Math.floor(Math.max(0, to - from) / SIGN_IN_AGE_DAY_MS);
+}
+
+/**
+ * Issue #6801: the ONE age rule. `null` unless the entry is an Anthropic `oauth`
+ * record with a sign-in time (ruling D1: `env-token` and `native` records, and
+ * OpenAI and Google rows, have no age). Only `unrefreshable` decides death; a
+ * stray `unrefreshableAt` on an unflagged entry is ignored. Days are whole
+ * elapsed 24-hour days, with clock skew clamped to 0.
+ */
+export function computeSignInAge(
+  entry: SignInAgeInput,
+  nowMs: number
+): SignInAge | null {
+  if (entry.provider !== "anthropic" || entry.authKind !== "oauth") return null;
+  const signedInAt = entry.capturedAt;
+  if (!(signedInAt > 0)) return null;
+  if (entry.quarantined === true) {
+    return {
+      state: "quarantined",
+      days: wholeSignInDays(signedInAt, nowMs),
+      signedInAt,
+    };
+  }
+  if (entry.unrefreshable) {
+    if (entry.unrefreshableAt === undefined) {
+      return { state: "flagged-unreported", signedInAt };
+    }
+    const diedAt = entry.unrefreshableAt;
+    if (typeof diedAt === "number" && diedAt > 0) {
+      return {
+        state: "stopped",
+        days: wholeSignInDays(signedInAt, diedAt),
+        signedInAt,
+        diedAt,
+      };
+    }
+    return { state: "stopped-unknown", signedInAt };
+  }
+  return {
+    state: "running",
+    days: wholeSignInDays(signedInAt, nowMs),
+    signedInAt,
+  };
+}
+
+/** Issue #6801: one account record on one node, with its sign-in age. */
+export type SignInAgeRow = {
+  nodeId: string;
+  nodeLabel: string;
+  accountUuid: string;
+  emailAddress: string;
+  nickname: string | null;
+  age: SignInAge;
+  /**
+   * The last time the record was known alive: its last refresh, else its sign-in.
+   * The death time is when Hapimatic DETECTED the death, so the real death lies
+   * between this and `diedAt`.
+   */
+  lastAliveAt: number;
+};
+
+/** Issue #6801 (R13): one past death a node carries for a record. */
+export type SignInDeathRow = {
+  nodeId: string;
+  nodeLabel: string;
+  accountUuid: string;
+  emailAddress: string;
+  signedInAt: number;
+  diedAt: number;
+  lastAliveAt: number;
+  /** Whole days from the sign-in to the death. */
+  days: number;
+};
+
+/** Issue #6801 (R10): a node the list did not read in full. */
+export type SignInAgeCoverage = {
+  nodeId: string;
+  nodeLabel: string;
+  status: NodeAccountHealthStatus;
+  reason?: NodeAccountHealthReason;
+  rejectedEntries?: number;
+  /** An `ok` node with a flagged entry it sends no death time for (R14). */
+  deathsNotReported?: true;
+};
+
+/** Issue #6801: the cross-node sign-in age list. */
+export type SignInAgeList = {
+  rows: SignInAgeRow[];
+  past: SignInDeathRow[];
+  coverage: SignInAgeCoverage[];
+};
+
+/**
+ * Issue #6801 (R10, R13, R14): every Anthropic `oauth` record on every node the
+ * aggregate read, its age, the past deaths each node carries, and every node that
+ * was NOT read in full (`coverage`), so a gap in the evidence is never silent.
+ * Rows are ordered by node (envelope order), then email. A `quarantined` and a
+ * `flagged-unreported` row stay in `rows` with that state and are never a death.
+ */
+export function listSignInAges(
+  nodes: NodeAccountHealth[],
+  nowMs: number
+): SignInAgeList {
+  const rows: SignInAgeRow[] = [];
+  const past: SignInDeathRow[] = [];
+  const coverage: SignInAgeCoverage[] = [];
+  for (const node of nodes) {
+    const ident = { nodeId: node.nodeId, nodeLabel: node.nodeLabel };
+    if (node.status !== "ok") {
+      coverage.push({
+        ...ident,
+        status: node.status,
+        ...(node.reason ? { reason: node.reason } : {}),
+      });
+      continue;
+    }
+    const nodeRows: SignInAgeRow[] = [];
+    const nodePast: SignInDeathRow[] = [];
+    let deathsNotReported = false;
+    for (const entry of node.accounts) {
+      const age = computeSignInAge(entry, nowMs);
+      if (!age) continue;
+      if (age.state === "flagged-unreported") deathsNotReported = true;
+      nodeRows.push({
+        ...ident,
+        accountUuid: entry.accountUuid,
+        emailAddress: entry.emailAddress,
+        nickname: entry.nickname,
+        age,
+        lastAliveAt: entry.lastRefreshedAt ?? entry.capturedAt,
+      });
+      for (const death of entry.signInDeaths ?? []) {
+        nodePast.push({
+          ...ident,
+          accountUuid: entry.accountUuid,
+          emailAddress: entry.emailAddress,
+          signedInAt: death.signedInAt,
+          diedAt: death.diedAt,
+          lastAliveAt: death.lastAliveAt,
+          days: wholeSignInDays(death.signedInAt, death.diedAt),
+        });
+      }
+    }
+    const byEmail = (
+      a: { emailAddress: string },
+      b: { emailAddress: string }
+    ) => a.emailAddress.localeCompare(b.emailAddress);
+    rows.push(...nodeRows.sort(byEmail));
+    past.push(...nodePast.sort((a, b) => byEmail(a, b) || a.diedAt - b.diedAt));
+    if (node.rejectedEntries !== undefined || deathsNotReported) {
+      coverage.push({
+        ...ident,
+        status: node.status,
+        ...(node.rejectedEntries !== undefined
+          ? { rejectedEntries: node.rejectedEntries }
+          : {}),
+        ...(deathsNotReported ? { deathsNotReported: true as const } : {}),
+      });
+    }
+  }
+  return { rows, past, coverage };
 }

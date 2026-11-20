@@ -290,7 +290,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
-    "description": "Manage Anthropic accounts: list, add, force-refresh, migrate config dirs.",
+    "description": "Manage Anthropic accounts: list, add, force-refresh, read sign-in ages, migrate config dirs.",
     "domain": "accounts",
     "id": "accounts.cli-accounts",
     "invocation": {
@@ -568,7 +568,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
-    "description": "List the Anthropic keys THIS node shares with its federation, redacted (label and masked form only, never a key).",
+    "description": "List the Anthropic keys THIS node shares with its federation, redacted, with each key's credit estimate, never a key.",
     "domain": "accounts",
     "id": "accounts.federation-api-keys-shared",
     "invocation": {
@@ -948,7 +948,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "List the Anthropic keys a spawn on a given node may use: this node's keys and every federation node's shared keys, redacted, each with the reference the spawn must send.",
+    "description": "List the Anthropic keys a spawn on a given node may use: this node's keys and every federation node's shared keys, redacted, each with the reference the spawn must send and each key's credit.",
     "domain": "accounts",
     "id": "accounts.list-available-api-keys",
     "invocation": {
@@ -9488,7 +9488,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "Check whether a turn ends on an ask no pin covers: nudge mode answers block or none; detect mode pins the unpinned ask from the stored messages.",
+    "description": "Check whether a turn ends on an ask no pin covers: nudge mode answers block or none; detect mode pins an unpinned strong ask from the stored messages.",
     "domain": "session-introspection",
     "id": "session-introspection.cli-pin-turn-end",
     "invocation": {

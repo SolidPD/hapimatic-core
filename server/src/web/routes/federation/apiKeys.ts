@@ -20,7 +20,12 @@ import { readSettings } from "../../../config/settings";
 import { homePeerAllowed } from "../../../federation/secretTransport";
 import type { ApiKeySharePurpose } from "../../../store/apiKeyShareAuditStore";
 import { FixedWindowCounter } from "../../../utils/rateLimitCounter";
-import { errorClass, toRedactedApiKey } from "../apiKeys";
+import {
+  createApiKeyViewer,
+  createCreditWorkLog,
+  errorClass,
+  SHARED_LIST_CREDIT_DEADLINE_MS,
+} from "../apiKeys";
 import { checkFederationToken, type FederationDeps } from "./shared";
 
 /**
@@ -90,6 +95,22 @@ export function createFederationApiKeyRoutes(
   const app = new Hono<WebAppEnv>();
   const isTenant = deps.isTenantVm ?? (() => defaultIsTenantVm());
   const peerOf = deps.getPeerAddress ?? defaultPeerAddress;
+  // #6789: each shared key's credit is computed here, on its home, where the
+  // turn ledger holds this node's spend plus the turns mirrored from its peers.
+  const logger = deps.errorLogger;
+  const viewer = createApiKeyViewer({
+    getApiKeySpend: deps.getApiKeySpend,
+    now: deps.now,
+    clock: deps.clock,
+    warn: logger ? (m, o) => logger.warn(m, o) : undefined,
+  });
+  const creditWorkLog = createCreditWorkLog((m, o) =>
+    !logger
+      ? console.warn(`[${o.category}]`, m)
+      : typeof logger.log === "function"
+        ? logger.log("warn", m, o)
+        : logger.warn(m, o)
+  );
   const keyLimiter = new FixedWindowCounter({
     limit: FEDERATION_API_KEYS_RATE_LIMIT,
     windowMs: FEDERATION_API_KEYS_RATE_WINDOW_MS,
@@ -324,7 +345,7 @@ export function createFederationApiKeyRoutes(
         domain: "accounts",
         surface: "rest",
         description:
-          "List the Anthropic keys THIS node shares with its federation, redacted (label and masked form only, never a key).",
+          "List the Anthropic keys THIS node shares with its federation, redacted, with each key's credit estimate, never a key.",
         whenToUse:
           "Only node-to-node: a federation peer asking this node about a key it shares.",
         invocation: {
@@ -365,21 +386,37 @@ export function createFederationApiKeyRoutes(
           });
           if (!audited) return c.json(NO_AUDIT);
           if (!g.ok) return c.json(g.refusal);
-          const keys = g.entries
-            .filter(
+          // #6789 (R10): ONE deadline for the request, well inside the
+          // requester's 3 s timeout, checked before every spend lookup. A
+          // budgeted key it reaches answers `creditUnavailable` and keeps a
+          // standing "Out of credit"; the list always answers.
+          const started = viewer.clock();
+          const creditDeadlineAtMs = started + SHARED_LIST_CREDIT_DEADLINE_MS;
+          let skipped = 0;
+          // One spend reader for the whole list (Task 6, rung 2).
+          const keys = viewer.peerListView(
+            g.entries.filter(
               e => e.provider === "anthropic" && e.shareAcrossNodes === true
-            )
-            .map(e => {
-              // `descriptor` stays on this node: a passthrough object with
-              // free-text notes, which the picker does not need.
-              const { descriptor: _descriptor, ...redacted } =
-                toRedactedApiKey(e);
-              return redacted;
-            });
+            ),
+            {
+              creditDeadlineAtMs,
+              onCreditDeadline: () => {
+                skipped += 1;
+              },
+            }
+          );
+          creditWorkLog("federation-shared", {
+            skipped,
+            elapsedMs: viewer.clock() - started,
+          });
           return c.json({
             ok: true,
             homeNodeId: deps.federationConfig?.nodeId,
             keys,
+            // What this build reports on each key beyond the redacted view,
+            // whatever the spend reader's state: the per-key
+            // `creditUnavailable` says when a key has no reading.
+            includes: ["credit"],
           });
         },
         c

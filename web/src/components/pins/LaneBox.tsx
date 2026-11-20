@@ -30,6 +30,7 @@ import {
 } from "@/components/pins/pinsShared";
 import { useArmedRows } from "@/components/pins/useArmedRows";
 import { AccountChip } from "@/components/session/AccountChip";
+import { FadeTruncate } from "@/components/session/FadeTruncate";
 import { HoverTooltip, HoverTooltipButton } from "@/components/ui/tooltip";
 import {
   useAccountLabel,
@@ -330,10 +331,12 @@ function LaneSession(props: {
               }}
             >
               <PinGlyph className="h-3 w-3 shrink-0" aria-hidden />
-              <span className="line-clamp-2">
+              {/* #6739 (Matt, 2026-11-16): one line that fades at its edge,
+                  never an ellipsis. */}
+              <FadeTruncate>
                 {firstWaiting?.title ??
                   `${session.openPinCount} ${session.openPinCount === 1 ? "pin waits" : "pins wait"} on you`}
-              </span>
+              </FadeTruncate>
             </HoverTooltipButton>
           ) : (
             <>

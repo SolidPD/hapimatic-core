@@ -41,7 +41,7 @@ import {
   buildBillableSwitchStart,
   floorAgentMcpEnable,
   floorAgentSpawnPosture,
-  refuseUnhonourableBillableAnswer,
+  refuseRetiredBillableAnswer,
 } from "./agentEscalation";
 import { BillableSwitchStartChoiceSchema } from "@hapi/protocol";
 import { resolveSpawnMcpSet } from "../../services/mcpSetResolver";
@@ -198,9 +198,10 @@ export const spawnBodySchema = z.object({
   /** Issue #2479: "branch" | "spawn". Defaulted to "spawn" by the route when a
    *  parent is present and this is omitted (a PM-originated managed peer). */
   parentRelationship: z.enum(["branch", "spawn"]).optional(),
-  /** Issue #6646: a person's answer to the question at Create. The client sends
-   *  ONLY a choice (strict: a client cannot send a kind, an actor or a node); the
-   *  route builds the start context from the request (buildBillableSwitchStart). */
+  /** Issue #6646: the start answer a client may send with a spawn, `{ choice }`
+   *  ONLY (strict: a client cannot send a kind, an actor or a node); the route
+   *  builds the start context from the request (buildBillableSwitchStart). A
+   *  retired choice is refused with 400 `billable_choice_retired` (#6778). */
   billableSwitchStart: z
     .object({ choice: BillableSwitchStartChoiceSchema })
     .strict()
@@ -599,14 +600,13 @@ export function createMachinesRoutes(
         },
         engine.getBillableSwitchService?.()?.localNodeId()
       );
-      // Issue #6646 (closer review round 1, the Project Manager's ruling of
-      // 2026-11-13, clarifying R5 and Task 6): a person's explicit billable
-      // answer that this node cannot honour is refused, as the remote path
-      // refuses it (federation/webClient.ts), never dropped. No answer,
-      // `follow-header` and `not-billable` pass in every gate state.
-      const billableRefusal = refuseUnhonourableBillableAnswer(
+      // Issue #6778 PR-A (R12): a person's retired billable answer
+      // (`session-only`, `header-and-session`) is refused with 400
+      // `billable_choice_retired` in every gate state, as the hub's route to
+      // another node and the peer's receiver refuse it, never dropped. No
+      // answer, `follow-header` and `not-billable` pass in every gate state.
+      const billableRefusal = refuseRetiredBillableAnswer(
         c,
-        engine,
         billableSwitchStart
       );
       if (billableRefusal) {

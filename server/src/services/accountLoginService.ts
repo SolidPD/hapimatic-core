@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   NativeAnthropicStoredAccountSchema,
   StoredAccountSchema,
+  carrySignInDeaths,
   isNativeAnthropicAccount,
 } from "@hapi/protocol";
 import { isTenantVm } from "@hapi/protocol/tenantMode";
@@ -24,6 +25,7 @@ import {
 } from "./accountService";
 import {
   syncIsolatedCredentials,
+  writeSignInMarker,
   type FreshOauthToken,
   type IsolatedCredentialsSyncOptions,
 } from "./isolatedCredentialsSync";
@@ -192,6 +194,12 @@ export class AccountLoginService {
     token: FreshOauthToken,
     opts: IsolatedCredentialsSyncOptions
   ) => string[];
+  private readonly writeMarker: (
+    accountUuid: string,
+    refreshToken: string,
+    opts: IsolatedCredentialsSyncOptions,
+    now: () => number
+  ) => string[];
 
   constructor(
     private readonly accountService: AccountService,
@@ -209,6 +217,13 @@ export class AccountLoginService {
         accountUuid: string,
         token: FreshOauthToken,
         opts: IsolatedCredentialsSyncOptions
+      ) => string[];
+      /** #6800 round 2 (R2-1): the sign-in marker writer (test seam). */
+      writeSignInMarker?: (
+        accountUuid: string,
+        refreshToken: string,
+        opts: IsolatedCredentialsSyncOptions,
+        now: () => number
       ) => string[];
       /** #4349: the tenant predicate (test seam; defaults to `isTenantVm`). */
       tenantVm?: () => boolean;
@@ -239,6 +254,7 @@ export class AccountLoginService {
     this.now = opts.now ?? Date.now;
     this.isolatedSyncOptions = opts.isolatedSyncOptions ?? {};
     this.syncIsolated = opts.syncIsolated ?? syncIsolatedCredentials;
+    this.writeMarker = opts.writeSignInMarker ?? writeSignInMarker;
   }
 
   /** Number of in-flight login attempts (test/diagnostic visibility). */
@@ -406,6 +422,21 @@ export class AccountLoginService {
     }
 
     const nowMs = this.now();
+    // Issue #6801 (R13, Task 15): the sign-in rebuilds the record, so carry the
+    // existing death history over, plus the death of the record it replaces when
+    // that record died with a trusted time. The new record itself is unflagged
+    // and carries no death time.
+    // The read never fails the sign-in: the OAuth code is already spent, and an
+    // unreadable old record only means there is no history to carry.
+    let replaced: ReturnType<AccountService["getRaw"]> = null;
+    try {
+      replaced = this.accountService.getRaw(accountUuid);
+    } catch (err) {
+      console.warn(
+        `[accounts] sign-in for ${accountUuid}: could not read the existing record (${err instanceof Error ? err.message : String(err)}); its death history is not carried`
+      );
+    }
+    const signInDeaths = carrySignInDeaths(replaced);
     const candidate = {
       schema_version: 1 as const,
       accountUuid,
@@ -427,6 +458,7 @@ export class AccountLoginService {
       lastUsedAt: 0,
       lastRefreshedAt: 0,
       unrefreshable: false,
+      ...(signInDeaths ? { signInDeaths } : {}),
     };
 
     const parsed = StoredAccountSchema.safeParse(candidate);
@@ -464,6 +496,20 @@ export class AccountLoginService {
       // working login into a reported failure. `syncIsolatedCredentials` does
       // not throw by construction; this guard makes that guarantee independent
       // of the injected seam rather than dependent on the callee's discipline.
+    }
+    // Issue #6800 (round 2, R2-1): leave the sign-in marker in the account's
+    // existing folder, naming this token's fingerprint, so another instance on
+    // this machine may lift a `host-chain-shared` flag for this token and no
+    // other. Best-effort, like the write-through above.
+    try {
+      this.writeMarker(
+        accountUuid,
+        tokens.refreshToken,
+        this.isolatedSyncOptions,
+        this.now
+      );
+    } catch {
+      // A missing marker only keeps the flag on the other instances.
     }
     return { ok: true, account: toRedactedAccount(parsed.data) };
   }

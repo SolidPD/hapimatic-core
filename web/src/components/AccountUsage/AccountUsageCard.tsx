@@ -21,7 +21,7 @@
  * `resets_at` / the history projection via the injectable-`now` formatters — no
  * live ticker).
  */
-import { useContext, useState } from "react";
+import { useContext, useState, type ReactNode } from "react";
 import { findUsageRowHardLock } from "@hapi/protocol";
 import type {
   AccountUsage,
@@ -245,6 +245,17 @@ type AccountUsageCardProps = {
   onRemove?: () => void;
   /** Whose per-node default the node row reads and sets (default anthropic). */
   provider?: ProviderId;
+  /**
+   * #6801: rendered in row 1's `trailing` slot (after the spacer, before the
+   * alert and the score): the account switcher's sign-in age token.
+   */
+  rowTrailing?: ReactNode;
+  /**
+   * The account switcher: row 1's name may fade (after the email gives way) so
+   * the "Current" marker, the token, the alert icon, the score and the chevron
+   * stay on a 393 px card (#6801). Provider Accounts cards keep a fixed name.
+   */
+  nameGivesWay?: boolean;
 };
 
 export function AccountUsageCard(props: AccountUsageCardProps) {
@@ -262,6 +273,8 @@ export function AccountUsageCard(props: AccountUsageCardProps) {
     nodeItems,
     onRemove,
     provider = "anthropic",
+    rowTrailing,
+    nameGivesWay = false,
   } = props;
   const [expanded, setExpanded] = useState(defaultExpanded);
   const [monoEditorOpen, setMonoEditorOpen] = useState(false);
@@ -370,6 +383,11 @@ export function AccountUsageCard(props: AccountUsageCardProps) {
           toggleLabel={`Toggle details for ${nickname}`}
           dragAttributes={dragAttributes}
           dragKeyDown={dragKeyDown}
+          trailing={rowTrailing}
+          // #6801: in the switcher the token and the "Current" marker take
+          // width from the name, never from the alert icon, the score or the
+          // chevron (measured at 393 px).
+          nicknameShrinks={nameGivesWay || rowTrailing != null}
         />
         {/* #3621: the centered monogram+nickname editor (portaled Radix Dialog, so
             its JSX position is layout-inert), opened by the row-1 monogram. */}

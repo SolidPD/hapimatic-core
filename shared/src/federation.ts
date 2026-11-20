@@ -12,6 +12,7 @@ import {
   isSpawnOutputStyleArgValue,
 } from "./spawnArgValues";
 import {
+  ApiKeyBudgetStatusSchema,
   ApiKeyStatusSchema,
   DaemonCapSourceSchema,
   EffortLevelSchema,
@@ -20,6 +21,7 @@ import {
   NativeModelSelectionSchema,
   RedactedApiKeySchema,
   SessionRoleSchema,
+  type RedactedApiKey,
 } from "./schemas";
 
 // ─── Synthesized local-node identity (#2395) ─────────────────
@@ -447,11 +449,75 @@ export type FederationApiKeyRefusal = z.infer<
   typeof FederationApiKeyRefusalSchema
 >;
 
+/**
+ * #6789: one key of a home's shared list, with its credit fields read leniently.
+ * The list parse is all or nothing, and the credit fields are the first ones a
+ * home computes and a requester reads, so ONE unreadable credit value
+ * (`budgetStatus`, `outOfCredit`, `creditUnavailable`) degrades that key alone:
+ * its credit fields are dropped, and a key with a budget or a top-up comes out
+ * `creditUnavailable` (the picker reads "No estimate"). Every other field,
+ * `id`, `provider` and `maskedKey` included, stays strict. Used by this schema
+ * only: `RedactedApiKeySchema` stays strict everywhere else.
+ */
+/**
+ * #6789 (closer, adjacent): marks a parsed key whose credit this build could
+ * not read, so the requester can log it. Non-enumerable, so a spread or a
+ * JSON copy (what reaches a client) never carries it.
+ */
+export const CREDIT_UNREADABLE: unique symbol = Symbol("creditUnreadable");
+export function isCreditUnreadable(key: object): boolean {
+  return (key as Record<symbol, unknown>)[CREDIT_UNREADABLE] === true;
+}
+
+const FederationSharedApiKeySchema = RedactedApiKeySchema.extend({
+  budgetStatus: z.unknown().optional(),
+  outOfCredit: z.unknown().optional(),
+  creditUnavailable: z.unknown().optional(),
+}).transform((raw): RedactedApiKey => {
+  const { budgetStatus, outOfCredit, creditUnavailable, ...rest } = raw;
+  const status =
+    budgetStatus === undefined
+      ? undefined
+      : ApiKeyBudgetStatusSchema.safeParse(budgetStatus);
+  const readable =
+    (status === undefined || status.success) &&
+    (outOfCredit === undefined || typeof outOfCredit === "boolean") &&
+    (creditUnavailable === undefined || typeof creditUnavailable === "boolean");
+  if (!readable) {
+    const budgeted =
+      rest.budget !== undefined || rest.budgetRecurrence !== undefined;
+    const degraded = budgeted ? { ...rest, creditUnavailable: true } : rest;
+    return Object.defineProperty(degraded, CREDIT_UNREADABLE, { value: true });
+  }
+  return {
+    ...rest,
+    ...(status?.success ? { budgetStatus: status.data } : {}),
+    ...(typeof outOfCredit === "boolean" ? { outOfCredit } : {}),
+    ...(typeof creditUnavailable === "boolean" ? { creditUnavailable } : {}),
+  };
+});
+
 /** `shared`: the home's shared Anthropic keys, redacted. */
 export const FederationSharedApiKeysSchema = z.object({
   ok: z.literal(true),
   homeNodeId: z.string(),
-  keys: z.array(RedactedApiKeySchema),
+  keys: z.array(FederationSharedApiKeySchema),
+  /**
+   * #6789: what this home's build reports on each key beyond the redacted view:
+   * `"credit"` from #6789 on. Absent or without `"credit"` ⇒ the requester
+   * treats every budgeted key as `creditUnavailable`. Free strings, so an older
+   * requester parses a newer home's list (#6790 can add its own entry). Read
+   * tolerantly: non-string entries are dropped, a non-array reads as absent,
+   * and nothing here can fail the list.
+   */
+  includes: z
+    .unknown()
+    .optional()
+    .transform((value): string[] | undefined =>
+      Array.isArray(value)
+        ? value.filter((entry): entry is string => typeof entry === "string")
+        : undefined
+    ),
 });
 export type FederationSharedApiKeys = z.infer<
   typeof FederationSharedApiKeysSchema

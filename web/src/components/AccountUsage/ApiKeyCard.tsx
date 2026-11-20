@@ -8,8 +8,10 @@
  * label, never capped — it fades only when the row is truly too narrow) · masked
  * key (hidden on a phone) · "Use first" · a status pill ONLY when the key is
  * unverified or never probed · the credit column · chevron. The credit column
- * is the key's budget: a meter, the estimated dollars left and the days to the
- * next top-up; or "Key rejected · 401" / "Out of credit"; or "Set budget".
+ * is `ApiKeyCredit` (#6789), the same component and facts the Select Account
+ * picker's key rows show: a meter, the estimated dollars left and the days to
+ * the next top-up; or "Key rejected · 401" / "Out of credit"; or "No estimate";
+ * or "Set budget".
  *
  * Expanded is ONE line that wraps on a phone: the local node pill and an
  * Anthropic key's "All nodes" switch (#5127, with its unshare confirm), the
@@ -37,14 +39,10 @@ import {
 } from "@/components/settings/sections/ApiKeysSection";
 import { useApiKeyActions } from "@/hooks/mutations/useApiKeyActions";
 import {
-  budgetFraction,
-  budgetLevel,
-  daysUntil,
   formatShortDate,
   formatUsd,
   providerHasBudget,
   topUpPhrase,
-  type BudgetLevel,
 } from "@/lib/apiKeyBudget";
 import { formatRelativeTime } from "@/lib/sessionHelpers";
 import {
@@ -54,8 +52,8 @@ import {
 } from "./AccountCardRow1";
 import { AccountMonogramEditor } from "./AccountMonogramEditor";
 import { ApiKeyBudgetDialog } from "./ApiKeyBudgetDialog";
+import { ApiKeyCredit, UseFirstChip } from "./ApiKeyCredit";
 import { CardRemoveButton } from "./CardRemoveButton";
-import { LEVEL_COLOR } from "./UsageBar";
 
 const PROVIDER_NAME: Record<string, string> = {
   anthropic: "Anthropic",
@@ -88,155 +86,6 @@ export function validatedLine(
 
 const DETAIL_TEXT =
   "text-[length:var(--text-body-dense)] leading-snug text-[var(--app-hint)]";
-const ALERT_TEXT =
-  "shrink-0 whitespace-nowrap text-[length:var(--text-body-dense)] font-semibold text-[var(--status-hot)]";
-
-/** The meter colour for a budget level (the account gauges' palette). */
-const BUDGET_COLOR: Record<BudgetLevel, string> = LEVEL_COLOR;
-
-/**
- * Row 1's credit column. A rejected key or one the provider called out of
- * credit says so; a key with a budget shows the meter (from `sm`), the
- * estimated dollars left and the days to its next top-up; an editable
- * paid-credit key with no budget offers "Set budget".
- */
-function CreditColumn(props: {
-  apiKey: RedactedApiKey;
-  nowMs: number;
-  onEdit?: () => void;
-}) {
-  const { apiKey, nowMs, onEdit } = props;
-  if (apiKey.status === "invalid") {
-    const code = apiKey.lastValidation?.httpStatus;
-    return (
-      <span
-        data-testid="api-key-credit"
-        data-state="rejected"
-        className={ALERT_TEXT}
-      >
-        {code ? `Key rejected · ${code}` : "Key rejected"}
-      </span>
-    );
-  }
-  if (apiKey.outOfCredit) {
-    const title =
-      "The provider answered that this key's credit balance is too low.";
-    // An empty key is exactly the one the operator needs to top up, so the
-    // column opens the budget dialog like every other budget state.
-    return onEdit ? (
-      <Button
-        type="button"
-        variant="ghostStatic"
-        size="bare"
-        data-testid="api-key-credit"
-        data-state="out-of-credit"
-        title={`${title} Tap to enter the credit you added.`}
-        aria-label="Out of credit: enter the credit you added"
-        onClick={onEdit}
-        onPointerDown={e => e.stopPropagation()}
-        className={`${ALERT_TEXT} hover:opacity-80`}
-      >
-        Out of credit
-      </Button>
-    ) : (
-      <span
-        data-testid="api-key-credit"
-        data-state="out-of-credit"
-        className={ALERT_TEXT}
-        title={title}
-      >
-        Out of credit
-      </span>
-    );
-  }
-  const status = apiKey.budgetStatus;
-  if (status) {
-    const fraction = budgetFraction(status);
-    const color = BUDGET_COLOR[budgetLevel(fraction)];
-    const days = daysUntil(status.nextTopUpAt, nowMs);
-    const title = [
-      `≈ ${formatUsd(status.remainingUsd)} left of ${formatUsd(
-        status.periodStartBalanceUsd
-      )}`,
-      `estimated from ${formatUsd(status.spentUsd)} Hapimatic metered on this key since ${formatShortDate(
-        status.periodStart
-      )}`,
-      status.nextTopUpAt
-        ? `next top-up ${formatShortDate(status.nextTopUpAt)}`
-        : null,
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    const body = (
-      <>
-        <span
-          aria-hidden="true"
-          className="hidden h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-[var(--app-subtle-bg)] sm:block"
-        >
-          <span
-            className="block h-full rounded-full"
-            style={{ width: `${fraction * 100}%`, backgroundColor: color }}
-          />
-        </span>
-        <span
-          className="shrink-0 whitespace-nowrap text-right text-[length:var(--text-body-dense)] font-bold tabular-nums sm:min-w-16"
-          style={{ color }}
-        >
-          <span className="font-normal text-[var(--app-hint)]">≈</span>
-          {formatUsd(status.remainingUsd)}
-        </span>
-        {days !== null ? (
-          <span className="w-8 shrink-0 text-right text-[length:var(--text-caption-xs)] tabular-nums text-[var(--app-hint)]">
-            {days}d
-          </span>
-        ) : null}
-      </>
-    );
-    return onEdit ? (
-      <Button
-        type="button"
-        variant="ghostStatic"
-        size="bare"
-        data-testid="api-key-credit"
-        data-state="budget"
-        title={title}
-        aria-label={`Budget: ${title}`}
-        onClick={onEdit}
-        onPointerDown={e => e.stopPropagation()}
-        className="flex shrink-0 items-center gap-2 font-normal hover:opacity-80"
-      >
-        {body}
-      </Button>
-    ) : (
-      <span
-        data-testid="api-key-credit"
-        data-state="budget"
-        title={title}
-        className="flex shrink-0 items-center gap-2"
-      >
-        {body}
-      </span>
-    );
-  }
-  if (onEdit && providerHasBudget(apiKey.provider)) {
-    return (
-      <Button
-        type="button"
-        variant="ghostStatic"
-        size="bare"
-        data-testid="api-key-credit"
-        data-state="unset"
-        onClick={onEdit}
-        onPointerDown={e => e.stopPropagation()}
-        className="shrink-0 text-[length:var(--text-body-dense)] font-normal hover:text-[var(--app-accent)]"
-      >
-        Set budget
-      </Button>
-    );
-  }
-  return null;
-}
-
 export type ApiKeyCardProps = {
   apiKey: RedactedApiKey;
   api: ApiClient | null;
@@ -348,7 +197,7 @@ export function ApiKeyCard(props: ApiKeyCardProps) {
             statusPillWraps={showPill}
             trailing={
               local ? (
-                <CreditColumn
+                <ApiKeyCredit
                   apiKey={apiKey}
                   nowMs={nowMs}
                   onEdit={
@@ -524,18 +373,5 @@ export function ApiKeyCard(props: ApiKeyCardProps) {
         />
       ) : null}
     </>
-  );
-}
-
-/** The "spend this key first" marker. */
-function UseFirstChip() {
-  return (
-    <span
-      data-testid="api-key-use-first"
-      title="Spend this key first: its credit is the most at risk of expiring unused."
-      className="inline-flex shrink-0 items-center rounded-full border border-[color-mix(in_srgb,var(--app-accent)_45%,transparent)] bg-[color-mix(in_srgb,var(--app-accent)_12%,transparent)] px-1.5 py-0 text-[length:var(--text-caption-xs)] font-semibold leading-none text-[var(--app-accent)]"
-    >
-      Use first
-    </span>
   );
 }

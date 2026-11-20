@@ -20,7 +20,6 @@ import {
 // fallback buildView shows for the timeLogTimezone key before any global write.
 import { readLocalTimeLogTimezone } from "../../config/timeLogConfig";
 import {
-  SETTING_REGISTRY,
   buildView,
   resolveEffective,
   type SettingsSyncService,
@@ -1064,12 +1063,15 @@ export function createPreferencesRoutes(
     }
   );
 
-  // PUT /preferences/federation-settings/:key — `{ value?, inherit? }`.
-  // `inherit` is the ONLY path that flips 🌐 (setInheritFlag); `value` follows
-  // the same inheriting/not-inheriting write semantics as A's PUTs above. When
-  // both are present the flag applies FIRST, so `{inherit:false, value}` writes
-  // a local override and `{inherit:true, value}` writes a global. Responds with
-  // the fresh view — the client re-hydrates from it, so toggling 🌐 back ON
+  // PUT /preferences/federation-settings/:key — `{ value?, merge?, inherit? }`.
+  // `inherit` is the ONLY path that flips 🌐; `value` follows the same
+  // inheriting/not-inheriting write semantics as A's PUTs above, and `merge`
+  // (#6526) is an RFC 7396 patch applied to the stored raw value. The whole
+  // patch is validated before anything is written, and the flag applies FIRST
+  // in the same write-chain step, so `{inherit:false, value}` writes a local
+  // override and `{inherit:true, value}` writes a global (svc.applyPatch).
+  // Responds with the fresh view once the value is stored locally — it does
+  // not wait for the push to the other nodes — so toggling 🌐 back ON
   // re-adopts the current federation-global value (R8).
   app.put(
     "/preferences/federation-settings/:key",
@@ -1110,8 +1112,15 @@ export function createPreferencesRoutes(
         );
       }
       const patch = parsed.data;
-      if (patch.value === undefined && patch.inherit === undefined) {
-        return c.json({ error: "Patch must set value and/or inherit" }, 400);
+      if (
+        patch.value === undefined &&
+        patch.merge === undefined &&
+        patch.inherit === undefined
+      ) {
+        return c.json(
+          { error: "Patch must set value, merge, or inherit" },
+          400
+        );
       }
       // [expert-review 2026-08-05: 2623-3] DO-NOT-WRITE guard, same contract as
       // A's PUTs (the service's own unreadable guard would silently no-op and
@@ -1122,24 +1131,8 @@ export function createPreferencesRoutes(
           500
         );
       }
-      if (patch.inherit !== undefined) {
-        await svc.setInheritFlag(fedKey, patch.inherit);
-      }
-      if (patch.value !== undefined) {
-        const vparsed = SETTING_REGISTRY[fedKey].schema.safeParse(patch.value);
-        if (!vparsed.success) {
-          return c.json(
-            { error: "Invalid value", details: vparsed.error.issues },
-            400
-          );
-        }
-        const block = await svc.readBlock();
-        if (block.inheritFlags[fedKey] !== false) {
-          await svc.writeGlobalValue(fedKey, vparsed.data);
-        } else {
-          await svc.writeLocalValue(fedKey, vparsed.data);
-        }
-      }
+      const refused = await svc.applyPatch(fedKey, patch);
+      if (refused) return c.json(refused.body, refused.status);
       const block = await svc.readBlock();
       return c.json(await federationView(block));
     }

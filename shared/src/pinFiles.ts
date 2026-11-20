@@ -30,6 +30,10 @@ export const PIN_FOLDER_NAME_MAX = 64;
 export const PIN_SAVE_MAX_FILES = 200;
 /** ...and at most this many bytes, or nothing at all. */
 export const PIN_SAVE_MAX_BYTES = 50 * 1024 * 1024;
+/** #6540 S-4: the most not-saved files a Save records for the agent; the count covers the rest. */
+export const PIN_SAVE_NOT_SAVED_MAX = 10;
+/** #6540 S-4: the longest path a Save records; a longer one is left out, and the count still covers it. */
+export const PIN_SAVE_NOT_SAVED_PATH_MAX = 512;
 
 const SESSION_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;

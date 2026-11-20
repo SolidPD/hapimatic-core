@@ -645,8 +645,8 @@ export function buildBwrapJailCommand(
     rwBind(opts.hapiHome),
     // Default ~/.claude — RW. Holds Claude Code's own config/projects AND (on
     // rp1-home) the absolute-path hooks/skills every in-session hook invokes, so
-    // masking it would break hook execution. Re-exposes the host-default
-    // credential set (the fallback identity, per R1). #3813: `~/.claude` is ALWAYS
+    // masking it would break hook execution. Re-exposes the host-credential
+    // set (the identity an unbound session reads, per R1). #3813: `~/.claude` is ALWAYS
     // bound (every tmux-path session — claude AND codex — runs hooks); the flavor's
     // `reexposeHomeDirs` ADD its own home(s) (codex → `~/.codex`). Deduped via a Set
     // so claude's declared `[".claude"]` is a no-op — the claude argv stays

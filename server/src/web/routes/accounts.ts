@@ -43,6 +43,7 @@ import type { UsageHistoryStore } from "../../store";
 import { buildHistoryResponse } from "../../accounts/usageHistory";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { readOnboardingSeedState } from "../../utils/daemonControlClient";
+import { listOlderLiveSiblingDaemons } from "../../services/siblingDaemonVersions";
 
 /**
  * Account management HTTP routes (issue #1451, Sub-Issue E of epic #1446).
@@ -243,6 +244,10 @@ export function createAccountsRoutes(opts: {
   // Issue #4736: the local daemon's onboarding-seed state for GET /accounts'
   // `onboardingRegistration`. Defaults to the daemon.state.json reader; tests inject.
   readOnboardingSeedState?: () => AmbientOnboardingTokenState | null;
+  // Issue #6800: the live sibling daemons on this machine that run an older
+  // build (their CredentialsWatcher would overwrite a fresh sign-in). Defaults to
+  // the daemon.state.json reader; tests inject.
+  listOlderSiblingDaemons?: () => Promise<string[]>;
 }): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   const errorLogger = opts.errorLogger ?? null;
@@ -1142,7 +1147,16 @@ export function createAccountsRoutes(opts: {
         );
       }
       try {
-        return c.json(login.start());
+        const started = login.start();
+        // #6800: a warning, never a refusal — the sign-in proceeds either way.
+        const older = await (
+          opts.listOlderSiblingDaemons ?? listOlderLiveSiblingDaemons
+        )();
+        return c.json(
+          older.length > 0
+            ? { ...started, olderSiblingDaemons: older }
+            : started
+        );
       } catch (error) {
         return logAndJson(c, error, 500, {
           errorLogger,

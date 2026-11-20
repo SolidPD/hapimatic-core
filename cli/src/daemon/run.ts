@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { ApiClient } from "@/api/api";
 import { accountStore } from "@/accounts/accountStore";
-import { createUtilizationSampler } from "@/accounts/utilizationSampler";
-import { CredentialsWatcher } from "@/accounts/credentialsWatcher";
+import { isIsolatedAccountAnywhere } from "@/accounts/accountConfigDir";
+import {
+  readHostNamedUuid,
+  readHostRefreshFingerprint,
+  runBootHostChainQuarantine,
+} from "@/accounts/hostChainQuarantine";
+import {
+  createUtilizationSampler,
+  samplingAccessToken,
+} from "@/accounts/utilizationSampler";
 import {
   isTenantVm,
   scrubTenantProviderEnv,
@@ -10,7 +18,6 @@ import {
   tenantUsageReadAllowed,
 } from "@/accounts/tenantMode";
 import { createTenantUtilizationSampler } from "@/accounts/tenantUtilizationSampler";
-import { fetchOauthProfile } from "@/accounts/oauthProfile";
 import {
   seedAccountsAtBoot,
   decodeDeliveredIdentities,
@@ -112,6 +119,7 @@ import {
   machineRotatorRoleLine,
   resolveMachineRotatorRole,
   scanSiblingBoundAccounts,
+  type SiblingBindingScan,
 } from "@/accounts/machineRotator";
 
 /**
@@ -512,6 +520,18 @@ export async function startDaemon(
       uid: process.getuid?.(),
     });
 
+    // #6800: before any spawn can arrive, flag a ~/.claude chain (flag only), then
+    // let a store with no usable Anthropic account adopt the independent folders.
+    // #6837: adoption also reads the account ~/.claude.json names, to quarantine
+    // its folder unless a Provider Accounts sign-in produced the folder's token.
+    if (!tenantVm) {
+      await runBootHostChainQuarantine(accountStore);
+      await accountStore.adoptIndependentAccountFolders({
+        readHostRefreshFingerprint,
+        readHostNamedUuid,
+      });
+    }
+
     // Start control server
     const {
       port: controlPort,
@@ -695,40 +715,18 @@ export async function startDaemon(
     // Connect to server
     apiMachine.connect();
 
-    // Issue #1449: auto-capture new Anthropic accounts on a manual claude /login.
-    // await accountStore.list() triggers + completes Sub-Issue A's lazy initial-
-    // population migration BEFORE the watcher starts, so the watcher never fires
-    // during migration (R6 suppression by construction). The watcher then live-
-    // captures subsequent credential changes and relays a redacted notice to the
-    // /cli/account-captured SSE route.
-    let credentialsWatcher: CredentialsWatcher | undefined;
+    // Issue #6800: the credentials watcher (#1449) is retired — every token it
+    // copied was the ~/.claude chain. A new account comes in only through Provider
+    // Accounts; a fresh store adopts the machine's independent account folders at
+    // boot (above, before the control server). The env-token seed below needs this
+    // list() to have finished.
     try {
       await accountStore.list();
-      // #4349 (R3): a tenant never captures a `claude /login` into Hapimatic's store.
-      credentialsWatcher = tenantVm
-        ? undefined
-        : new CredentialsWatcher({
-            accountStore,
-            notify: notice => api.reportAccountCaptured(notice),
-            profileFetch: fetchOauthProfile,
-            jobRegistry: daemonJobRegistry,
-            jobNode: daemonJobNode,
-          });
-      credentialsWatcher?.start();
-      logger.debug(
-        tenantVm
-          ? "[TENANT] credentials watcher not started (#4349)"
-          : "[DAEMON RUN] Credentials watcher started (account auto-capture)"
-      );
     } catch (error) {
       logger.debug(
-        "[DAEMON RUN] Failed to start credentials watcher (continuing)",
+        "[DAEMON RUN] account store list failed (continuing)",
         error
       );
-      logger.reportCaught(error, {
-        category: "daemon-credentials-watcher-start",
-        severity: "warn",
-      });
     }
     // Issue #2268 (Sub-B of #2267): seed the account store from the service-env
     // CLAUDE_CODE_OAUTH_TOKEN so a user VM (the #1004 onboarding paste path,
@@ -737,8 +735,8 @@ export async function startDaemon(
     // carry `metadata.claudeAccount`. `writeVmEnvFile` triggers
     // DAEMON_RELOAD_RESTART after every credential install, so this startup hook
     // fires exactly when a fresh token lands (no gateway change needed). It runs
-    // AFTER `accountStore.list()` above (which completed the lazy initial-population
-    // migration), and is FIRE-AND-FORGET: the profile fetch has a 10s timeout and
+    // AFTER `accountStore.list()` above (the folder adoption ran earlier in the
+    // boot, #6800), and is FIRE-AND-FORGET: the profile fetch has a 10s timeout and
     // must never delay daemon/session readiness. The module is fail-soft (never
     // throws — Fallback Preservation Rule) and idempotent (skips when a record for
     // the uuid already exists). Gated on the token being present so operator
@@ -1139,17 +1137,21 @@ export async function startDaemon(
       warn: msg => logger.warn(msg),
     });
 
+    // #4423 R5 / #6847: accounts a SIBLING instance's live session binds. ONE closure
+    // for the idle backstop + host-chain detector (via the service) and force-refresh.
+    const getSiblingBoundAccounts = async (): Promise<SiblingBindingScan> =>
+      scanSiblingBoundAccounts({
+        ownHapiHome: configuration.happyHomeDir,
+        accountConfigsDir: configuration.accountConfigsDir,
+      });
+
     const tokenRefreshService = new TokenRefreshService({
       accountStore,
       onSuccessfulRefresh: refreshedAccountUuid => {
         void restartBoundSessions(refreshedAccountUuid);
       },
       // #4423 (R5): skip accounts bound by a SIBLING instance's live session.
-      getSiblingBoundAccounts: async () =>
-        scanSiblingBoundAccounts({
-          ownHapiHome: configuration.happyHomeDir,
-          accountConfigsDir: configuration.accountConfigsDir,
-        }),
+      getSiblingBoundAccounts,
       // Issue #1644: gate proactive rotation on the cross-machine family lease,
       // acquired through the shared manager. Default-off feature gate ⇒ no-op true.
       acquireRotationLease: uuid => rotationLeaseManager.acquire(uuid),
@@ -1200,9 +1202,10 @@ export async function startDaemon(
       sampleUtilization: tenantVm
         ? undefined
         : createUtilizationSampler({
+            // #6800 (S1): never a host-chain-shared record's token.
             readAccessToken: async uuid => {
               const res = await accountStore.get(uuid).catch(() => null);
-              return res && res.ok ? res.account.accessToken : null;
+              return samplingAccessToken(res && res.ok ? res.account : null);
             },
             writeSnapshot: (uuid, snapshot) =>
               accountStore.setUtilizationSnapshot(uuid, snapshot),
@@ -1347,6 +1350,11 @@ export async function startDaemon(
             accountStore,
             forceRefresh: uuid => tokenRefreshService.forceRefresh(uuid),
             restartBoundSessions,
+            // #6837 (R4): the same predicate forceRefresh routes on (the service
+            // is built without overriding it), so the report says what happened.
+            isIsolatedAccount: isIsolatedAccountAnywhere,
+            accountConfigsShared: configuration.accountConfigsShared,
+            getSiblingBoundAccounts, // #6847: the idle backstop's closure
           });
 
     // #2081: assign the late-created members the health scheduler reads onto
@@ -1389,12 +1397,6 @@ export async function startDaemon(
       logger.debug("[DAEMON RUN] Worktree collector loop stopped");
 
       sliceWatchdog.stop(); // #6156: also gives up the node lease
-      // Issue #1449: stop the credentials watcher — tears down the fs watch +
-      // any pending debounce timer (R9) so the daemon shuts down cleanly.
-      if (credentialsWatcher) {
-        credentialsWatcher.stop();
-        logger.debug("[DAEMON RUN] Credentials watcher stopped");
-      }
       // Stop the OAuth token-refresh service (issue #1448) — clears its timer
       // and awaits any in-flight refresh within a bounded timeout so daemon
       // shutdown can't hang.

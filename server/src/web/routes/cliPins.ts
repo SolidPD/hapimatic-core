@@ -563,8 +563,11 @@ export function createCliPinRoutes(
   // #6455: the Stop-hook turn check. `nudge` takes the final message's text and
   // writes nothing; `detect` takes NO text and reads the turn from the stored
   // messages, because `detected` is a kind only the server creates and the agent
-  // holds this token. Under `/pins/*` for the bearer middleware; no POST exists on
-  // `/pins/:key`, so a pin keyed `turn-end` stays readable and writable.
+  // holds this token. Since #6738 `detect` pins only a strong ask the agent
+  // neither pinned nor answered with a plain "nothing is asked", and neither mode
+  // acts for a PM-managed peer (`managed_peer`). Under `/pins/*` for the bearer
+  // middleware; no POST exists on `/pins/:key`, so a pin keyed `turn-end` stays
+  // readable and writable.
   app.post(
     "/sessions/:id/pins/turn-end",
     cataloged(
@@ -573,7 +576,7 @@ export function createCliPinRoutes(
         domain: "session-introspection",
         surface: "rest",
         description:
-          "Check whether a turn ends on an ask no pin covers: nudge mode answers block or none; detect mode pins the unpinned ask from the stored messages.",
+          "Check whether a turn ends on an ask no pin covers: nudge mode answers block or none; detect mode pins an unpinned strong ask from the stored messages.",
         whenToUse:
           "When Hapimatic's Stop hook decides whether to nudge the agent to pin a decision, or pins it anyway.",
         invocation: {

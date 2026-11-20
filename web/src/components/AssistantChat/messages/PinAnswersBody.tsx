@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { useMemo, type ReactNode } from "react";
+import { useCallback, useMemo, type ReactElement, type ReactNode } from "react";
 import {
   normalizePinId,
   parsePinAnswersMessage,
   type PinAnswersEntry,
 } from "@hapi/protocol";
 import { PinIdControl } from "@/components/pins/PinIdControl";
+import { registerPinAnswersCopyText } from "@/lib/pinAnswersCopy";
 
 function describe(entry: PinAnswersEntry): string {
   const parts: string[] = [];
@@ -31,17 +32,32 @@ function describe(entry: PinAnswersEntry): string {
     parts.push(`${questions} question${questions === 1 ? "" : "s"}`);
   }
   if (entry.note) parts.push("note");
+  // #6540 S-4: the Save this message reports left files out.
+  if (entry.notSaved && entry.notSaved.count > 0) {
+    parts.push(`${entry.notSaved.count} not saved`);
+  }
   return parts.join(" · ");
 }
 
 /** The compact body of a `hapi_pin_answers` message (lazy chunk). */
 export default function PinAnswersBody(props: {
   text: string;
+  /** What a copy from inside the message carries (#6662); defaults to `text`. */
+  copyText?: string;
   fallback: ReactNode;
-}) {
+}): ReactElement {
   const parsed = useMemo(
     () => parsePinAnswersMessage(props.text),
     [props.text]
+  );
+  // #6662: a copy from inside the message carries the whole message, marker
+  // included (`@/lib/pinAnswersCopy`). React 19's ref-callback cleanup form;
+  // a hook, so it sits above the early return.
+  const copyText = props.copyText ?? props.text;
+  const registerCopy = useCallback(
+    (el: HTMLDivElement | null) =>
+      el ? registerPinAnswersCopyText(el, copyText) : undefined,
+    [copyText]
   );
   if (!parsed.ok) return <>{props.fallback}</>;
   const summary = props.text.split("\n", 1)[0] ?? "";
@@ -49,7 +65,7 @@ export default function PinAnswersBody(props: {
   const raw = start >= 0 ? props.text.slice(start) : props.text;
   const pins = parsed.block.pins;
   return (
-    <div data-pin-answers>
+    <div data-pin-answers ref={registerCopy}>
       <p className="whitespace-pre-wrap break-words">{summary}</p>
       <details className="mt-1">
         <summary className="cursor-pointer text-[var(--app-hint)]">

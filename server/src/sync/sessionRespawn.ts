@@ -507,10 +507,10 @@ export class SessionRespawn {
           // reconnect-style respawn MUST thread the session's bound account, or the
           // daemon spawns with no HAPI_ACCOUNT_UUID and the launcher applies no
           // per-account CLAUDE_CONFIG_DIR — silently reverting an account-bound
-          // session to the host-default login (observed as rate-limited-account
-          // drift after a user disconnect/reconnect). `undefined` => host-credential
-          // session, handled by the daemon's `accountUuid && !shouldSkipBinding`
-          // guard (cli/src/daemon/run.ts).
+          // session to the ~/.claude login (observed as rate-limited-account drift
+          // after a user disconnect/reconnect). `undefined` => a session that was
+          // started unbound; the daemon keeps it unbound and logs one warn
+          // (#6800 ruling D1 = (a), cli/src/daemon/sessionSpawner.ts).
           accountUuid: session.metadata?.accountUuid,
           // Issue #4568 (R6): the same parity for an API-key binding — without it a
           // reconnect respawns the key session on the node-default subscription.
@@ -768,9 +768,9 @@ export class SessionRespawn {
       sessionType: "simple",
       // Inherit the parent's bound account (same parity fix as
       // reconnectSession): a branched child must spawn under the parent's
-      // account or it reverts to the host-default login. `undefined` =>
-      // host-credential parent, handled by the daemon's
-      // `accountUuid && !shouldSkipBinding` guard.
+      // account or it reverts to the ~/.claude login. `undefined` => a parent
+      // that was started unbound; the daemon keeps the branch unbound and logs
+      // one warn (#6800 ruling D1 = (a)).
       accountUuid: session.metadata?.accountUuid,
       // Issue #4568 (R6): a branch of an API-key session bills the SAME key (the
       // daemon forces the SDK launcher for it); absent for a subscription parent.

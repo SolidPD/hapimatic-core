@@ -1744,7 +1744,7 @@ export type AutoSwitchOnRateLimitPreferencePatch = z.infer<
  * spawn that never passes through the web create page.
  *
  * Default `enabled: false` — OPT-IN (OFF by default): with it off, an un-pinned
- * spawn binds exactly the account it binds today (#3023's host-default-first
+ * spawn binds exactly the account it binds today (#3023's default-first
  * decision, byte-identical — R3). The shared constant is the SINGLE source of the
  * default on BOTH sides — the server schema default (below) and the web
  * localStorage cache default (`useAdminPreferences.ts`) — so a frontend/backend
@@ -2068,9 +2068,17 @@ export const ACCOUNTS_USAGE_VIEW_DEFAULT: AccountsUsageViewPreference = {};
 // is optional and catches to undefined, so a value written by a newer node (a
 // new facet value, sort or grouping) loses only that one field on an older
 // node, where a strict schema would drop the whole record (the registry checks
-// both the wire value and the stored value with this one schema). Known gap:
-// an edit made on that older node writes the whole record back without the
-// field, so the newer node loses it too (the #6451 sink follow-up).
+// both the wire value and the stored value with this one schema). An edit is
+// sent as a merge patch ({@link PinsViewPreferenceMergeSchema}, #6526) that the
+// server applies to the stored raw value, so a field an older node cannot read
+// survives that node's edits, and `null` clears a field, readable or not.
+// Release rule (#6526 R9), two parts. First, a new facet value, sort, grouping
+// or field may ship only after the merge path runs on every federation node,
+// because a node without it still writes the whole parsed record back. Second,
+// a `{value}` write still stores the parsed record, so the build that adds the
+// first new value or field must also make the server refuse `{value}` for a
+// key whose registry row has a merge schema. A test in schemas.test.ts pins
+// these lists and fails on a new value.
 export const PINS_VIEW_SORTS = [
   "priority",
   "deadline",
@@ -2158,6 +2166,51 @@ export const PinsViewPreferenceSchema = z.object({
   group: looseEnum(PINS_VIEW_GROUPS),
 });
 export type PinsViewPreference = z.infer<typeof PinsViewPreferenceSchema>;
+
+/** One merge-patch field: a known value sets it, `null` clears it. */
+function mergeEnum<const T extends readonly string[]>(values: T) {
+  return z.enum(values).nullable().optional();
+}
+
+/**
+ * #6526: an edit to the Pins defaults, as an RFC 7396 merge patch (the
+ * `merge` field of {@link FederationSettingPatchSchema}). It names only the
+ * fields the operator changed; `null` clears a field and `filters: null`
+ * clears every facet. Built from the same constants as
+ * {@link PinsViewPreferenceSchema}, so the two cannot drift. Strict on
+ * purpose: a client of this build never sends an unknown field, facet or
+ * value, and a newer bundle talking to an older server then fails visibly
+ * instead of silently.
+ */
+export const PinsViewPreferenceMergeSchema = z
+  .object({
+    filters: z
+      .object({
+        status: mergeEnum(PINS_VIEW_FACETS.status),
+        kind: mergeEnum(PINS_VIEW_FACETS.kind),
+        blocking: mergeEnum(PINS_VIEW_FACETS.blocking),
+        stakes: mergeEnum(PINS_VIEW_FACETS.stakes),
+        risk: mergeEnum(PINS_VIEW_FACETS.risk),
+        deadline: mergeEnum(PINS_VIEW_FACETS.deadline),
+        decidedBy: mergeEnum(PINS_VIEW_FACETS.decidedBy),
+        answer: mergeEnum(PINS_VIEW_FACETS.answer),
+        comments: mergeEnum(PINS_VIEW_FACETS.comments),
+        files: mergeEnum(PINS_VIEW_FACETS.files),
+        starred: mergeEnum(PINS_VIEW_FACETS.starred),
+        changed: mergeEnum(PINS_VIEW_FACETS.changed),
+        source: mergeEnum(PINS_VIEW_FACETS.source),
+      })
+      .strict()
+      .nullable()
+      .optional(),
+    sort: mergeEnum(PINS_VIEW_SORTS),
+    dir: mergeEnum(PINS_VIEW_DIRECTIONS),
+    group: mergeEnum(PINS_VIEW_GROUPS),
+  })
+  .strict();
+export type PinsViewPreferenceMerge = z.infer<
+  typeof PinsViewPreferenceMergeSchema
+>;
 /** No defaults set: every field falls back to {@link PINS_VIEW_BUILTIN}. */
 export const PINS_VIEW_DEFAULT: PinsViewPreference = {};
 /** The built-in view: every facet "all", Priority, Descending, by Status. It
@@ -2300,10 +2353,20 @@ export type FederationSettingsView = z.infer<
 // PUT /preferences/federation-settings/:key body — set the value and/or toggle
 // 🌐. inherit is the ONLY path that flips the inherit flag. [expert-review
 // 2026-08-05: 2624-1]
-export const FederationSettingPatchSchema = z.object({
-  value: z.unknown().optional(),
-  inherit: z.boolean().optional(),
-});
+// `merge` (#6526) is an RFC 7396 merge patch (`@hapi/protocol/mergePatch`)
+// that the server applies to the key's stored raw value, so the fields the
+// patch does not name are kept, including ones this build cannot read. Only a
+// key whose registry row has a `mergeSchema` accepts it (the route answers
+// 400 otherwise), and it cannot be sent together with `value`.
+export const FederationSettingPatchSchema = z
+  .object({
+    value: z.unknown().optional(),
+    merge: z.record(z.string(), z.unknown()).optional(),
+    inherit: z.boolean().optional(),
+  })
+  .refine(patch => patch.value === undefined || patch.merge === undefined, {
+    message: "value and merge cannot be sent together",
+  });
 export type FederationSettingPatch = z.infer<
   typeof FederationSettingPatchSchema
 >;
@@ -3235,12 +3298,20 @@ export const RedactedApiKeySchema = z.object({
   /** The operator's budget and monthly top-up (non-secret settings). */
   budget: ApiKeyBudgetSchema.optional(),
   budgetRecurrence: ApiKeyBudgetRecurrenceSchema.optional(),
-  /** The read-time credit estimate; present only where the server could meter
-   *  the key's spend (the GET list and PATCH answers on the key's own node). */
+  /** The read-time credit estimate (#6789). Present on every response built by
+   *  the server's `createApiKeyViewer` on the key's own node: the Provider
+   *  Accounts list and its PATCH answer, `GET /api/api-keys/available`, and the
+   *  federation shared list (computed on the home, forwarded by the requester). */
   budgetStatus: ApiKeyBudgetStatusSchema.optional(),
   /** The provider said the key's credit is exhausted, and nothing since (spend,
    *  a budget edit, a top-up) says otherwise. */
   outOfCredit: z.boolean().optional(),
+  /** #6789: this view has no credit reading for a key that has a budget or a
+   *  top-up: its spend could not be read, the deadline passed, the home's build
+   *  predates #6789, or the home sent a credit value this build cannot read. The
+   *  client shows "No estimate", never "No budget" or $0. Set only on a key with
+   *  `budget` or `budgetRecurrence`. */
+  creditUnavailable: z.boolean().optional(),
 });
 export type RedactedApiKey = z.infer<typeof RedactedApiKeySchema>;
 
@@ -3248,7 +3319,10 @@ export type RedactedApiKey = z.infer<typeof RedactedApiKeySchema>;
  *  federation. `bindingRef` is the exact `apiKeyId` the spawn must carry for the
  *  picker's target (a bare id for a key on the UI node spawned there, otherwise
  *  `<uuid>@<homeNodeId>`). `homeNodeId` is the home's own node id; the label is
- *  the UI node's name for it. */
+ *  the UI node's name for it. #6789: every entry carries the key's credit as the
+ *  Provider Accounts card shows it (`budgetStatus`, `outOfCredit`,
+ *  `creditUnavailable`): this node's keys computed here, a peer's keys computed
+ *  on their home and forwarded. */
 export const AvailableApiKeySchema = RedactedApiKeySchema.extend({
   homeNodeId: z.string(),
   homeNodeLabel: z.string(),

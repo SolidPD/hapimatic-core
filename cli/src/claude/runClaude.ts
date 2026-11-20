@@ -50,6 +50,7 @@ import {
 import { registerKillSessionHandler } from "./registerKillSessionHandler";
 import type { Session } from "./session";
 import {
+  readBoundAccountUuid,
   readBoundApiKeyBinding,
   resolveEntitledModelForBoundAccount,
 } from "@/claude/accountTokenInjection";
@@ -233,7 +234,11 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
         });
       }
     },
-    { settings: buildMcpProbeSettings(mcpPolicy) }
+    {
+      settings: buildMcpProbeSettings(mcpPolicy),
+      // #6800 (ruling P1): the probe runs in the session's own account folder.
+      accountUuid: readBoundAccountUuid() ?? undefined,
+    }
   );
 
   // Start HAPI MCP server. This launcher owns an `allowedTools` list, so it may

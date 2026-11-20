@@ -52,11 +52,21 @@ import {
 const MENU_PANEL =
   "max-h-[min(85vh,var(--radix-dropdown-menu-content-available-height))] overflow-y-auto p-0.5";
 
+/**
+ * Which edge of the trigger the panel lines up with: the end on the Pins tab,
+ * where the triggers sit at the toolbar's end. The Preferences section passes
+ * "start": its triggers sit at the column's left, where an end-aligned panel
+ * wider than the room to its left is shifted out of the column into the
+ * letterbox (#6526).
+ */
+type MenuAlign = "start" | "end";
+
 export function PinsFilterMenu(props: {
   filters: PinsViewFilters;
   onChange: (facet: PinsViewFacet, value: string) => void;
   onClear: () => void;
   disabled?: boolean;
+  align?: MenuAlign;
 }) {
   const active = isFilterActive(props.filters);
   return (
@@ -72,7 +82,7 @@ export function PinsFilterMenu(props: {
           <span className="hidden sm:inline">Filter</span>
         </MenuTrigger>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className={MENU_PANEL}>
+      <DropdownMenuContent align={props.align ?? "end"} className={MENU_PANEL}>
         <MenuHeader
           title="Filter"
           clearLabel="Clear filters"
@@ -104,6 +114,7 @@ export function PinsSortMenu(props: {
   onGroup: (group: PinsViewGroup) => void;
   onClear: () => void;
   disabled?: boolean;
+  align?: MenuAlign;
 }) {
   const active = isSortActive(props);
   const code = PIN_SORT_OPTIONS.find(o => o.value === props.sort)?.code ?? "";
@@ -121,7 +132,7 @@ export function PinsSortMenu(props: {
           <span>{code}</span>
         </MenuTrigger>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className={MENU_PANEL}>
+      <DropdownMenuContent align={props.align ?? "end"} className={MENU_PANEL}>
         <MenuHeader
           title="Sort"
           clearLabel="Clear sort"

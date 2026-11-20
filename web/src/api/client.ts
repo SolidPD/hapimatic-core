@@ -4432,8 +4432,10 @@ export class ApiClient {
   }
 
   /** Patch one registered setting: `{inherit}` flips 🌐 (the ONLY path that
-   *  does), `{value}` writes global-or-override per the current flag. Responds
-   *  with the fresh view (re-adopted values included). */
+   *  does), `{value}` writes global-or-override per the current flag, and
+   *  `{merge}` (#6526) applies an RFC 7396 merge patch to the stored value for
+   *  a key with a merge schema. Responds with the fresh view (re-adopted values
+   *  included) once the value is stored locally. */
   async putFederationSetting(
     key: string,
     patch: FederationSettingPatch

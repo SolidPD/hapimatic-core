@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { logger } from "@/ui/logger";
-import type { ResolvedIdentity } from "@/accounts/credentialsWatcher";
+
+/**
+ * An account's identity, resolved from a profile fetch or a delivered identity
+ * payload (never a token). Moved here from the retired credentials watcher
+ * (#6800), which used to export it.
+ */
+export interface ResolvedIdentity {
+  accountUuid: string;
+  emailAddress?: string;
+  organizationUuid?: string;
+  organizationName?: string;
+  displayName?: string;
+  billingType?: string;
+}
 
 /**
  * OAuth profile-fetch fallback for account auto-capture (issue #1449, Sub-Issue

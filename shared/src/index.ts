@@ -52,6 +52,7 @@ export * from "./holidays";
 export * from "./sentryScrub";
 export * from "./worktreeMeta";
 export * from "./accounts";
+export * from "./buildVersion";
 export * from "./accountMonogram";
 export * from "./accountHealth";
 export * from "./usage";

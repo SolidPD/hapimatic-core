@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
   bindingRefForTarget,
+  isCreditUnreadable,
   isUsableNodeIdForSharing,
   LOCAL_NODE_ID,
   parseApiKeyRef,
@@ -12,6 +13,7 @@ import {
   type AvailableApiKey,
   type AvailableApiKeysResponse,
   type AvailableApiKeysUnavailableReason,
+  type RedactedApiKey,
   type StoredApiKey,
 } from "@hapi/protocol/schemas";
 import { isTenantVm as defaultIsTenantVm } from "@hapi/protocol/tenantMode";
@@ -22,7 +24,13 @@ import type {
 } from "../federation/nodeRegistry";
 import type { ErrorLogger } from "../logging/errorLogger";
 import { createDegradedLog } from "../web/routes/federation/degradedLog";
-import { toRedactedApiKey } from "../web/routes/apiKeys";
+import {
+  createApiKeyViewer,
+  createCreditWorkLog,
+  SHARED_LIST_CREDIT_DEADLINE_MS,
+  type ApiKeySpendSource,
+  type ApiKeyViewer,
+} from "../web/routes/apiKeys";
 
 /**
  * Shared API keys, requesting side (issue #5127).
@@ -68,7 +76,31 @@ export type SharedApiKeyServiceOptions = {
   getNodeRegistry: () => NodeRegistry | null;
   isTenantVm?: () => boolean;
   errorLogger?: ErrorLogger | null;
+  /** #6789: this node's metered spend per key, for the picker's credit. Absent
+   *  ⇒ every budgeted key answers `creditUnavailable` ("No estimate"), so a
+   *  wiring gap shows instead of reading as a key with no budget. */
+  getApiKeySpend?: ApiKeySpendSource;
+  /** #6789 test seam: the wall clock for the budget arithmetic. */
+  now?: () => number;
+  /** #6789 test seam: the monotonic clock of the credit deadline. */
+  clock?: () => number;
 };
+
+/** #6789: an older home's key (its answer has no `"credit"` in `includes`):
+ *  whatever credit it carried is dropped, and a key with a budget or a top-up
+ *  says it has no reading. A key with neither shows the no-budget state, as it
+ *  would on its own node. */
+function withoutHomeCredit(key: RedactedApiKey): RedactedApiKey {
+  const {
+    budgetStatus: _budgetStatus,
+    outOfCredit: _outOfCredit,
+    creditUnavailable: _creditUnavailable,
+    ...rest
+  } = key;
+  return rest.budget !== undefined || rest.budgetRecurrence !== undefined
+    ? { ...rest, creditUnavailable: true }
+    : rest;
+}
 
 const refusal = (
   code: string,
@@ -86,11 +118,23 @@ export class SharedApiKeyService {
   private readonly opts: SharedApiKeyServiceOptions;
   private readonly isTenant: () => boolean;
   private readonly degraded;
+  private readonly viewer: ApiKeyViewer;
+  private readonly creditWorkLog;
 
   constructor(opts: SharedApiKeyServiceOptions) {
     this.opts = opts;
     this.isTenant = opts.isTenantVm ?? (() => defaultIsTenantVm());
     this.degraded = createDegradedLog({ errorLogger: opts.errorLogger });
+    const logger = opts.errorLogger;
+    this.viewer = createApiKeyViewer({
+      getApiKeySpend: opts.getApiKeySpend,
+      now: opts.now,
+      clock: opts.clock,
+      warn: logger ? (m, o) => logger.warn(m, o) : undefined,
+    });
+    this.creditWorkLog = createCreditWorkLog((m, o) =>
+      logger ? logger.log("warn", m, o) : console.warn(`[${o.category}]`, m)
+    );
   }
 
   /** This node's own id, when it can share keys under it. */
@@ -345,6 +389,26 @@ export class SharedApiKeyService {
   async listAvailable(
     targetNodeId: string | null
   ): Promise<AvailableApiKeysResponse> {
+    const vault = (await this.readVault()) ?? [];
+    // #6789 (DEC-3): this node's own keys get the same credit deadline as a
+    // home's shared list, started after the vault read as the home's is;
+    // nothing is memoized.
+    const creditStarted = this.viewer.clock();
+    const creditDeadlineAtMs = creditStarted + SHARED_LIST_CREDIT_DEADLINE_MS;
+    let creditSkipped = 0;
+    /** One spend reader for the list (Task 6, rung 2), same order as given. */
+    const views = (entries: readonly StoredApiKey[]): RedactedApiKey[] =>
+      this.viewer.listView(entries, {
+        creditDeadlineAtMs,
+        onCreditDeadline: () => {
+          creditSkipped += 1;
+        },
+      });
+    const reportCredit = (): void =>
+      this.creditWorkLog("available", {
+        skipped: creditSkipped,
+        elapsedMs: this.viewer.clock() - creditStarted,
+      });
     const selfId = this.selfNodeId();
     const target =
       targetNodeId === null ||
@@ -352,34 +416,40 @@ export class SharedApiKeyService {
       targetNodeId === selfId
         ? null
         : targetNodeId;
-    const vault = (await this.readVault()) ?? [];
     const localAnthropic = vault.filter(e => e.provider === "anthropic");
 
     const registry = this.opts.getNodeRegistry();
     if (!selfId || this.isTenant() || !registry) {
       // No federation to share over: local keys only, bare refs.
-      const keys: AvailableApiKey[] = (
-        target === null ? localAnthropic : []
-      ).map(e => ({
-        ...toRedactedApiKey(e),
+      const offered = target === null ? localAnthropic : [];
+      const offeredViews = views(offered);
+      const keys: AvailableApiKey[] = offered.map((e, i) => ({
+        ...offeredViews[i]!,
         homeNodeId: LOCAL_NODE_ID,
         homeNodeLabel: this.selfLabel(),
         local: true,
         bindingRef: e.id,
       }));
+      reportCredit();
       return { localNodeId: null, keys, unavailableNodes: [] };
     }
 
     const ctx = { uiNodeId: selfId, targetNodeId: target ?? selfId };
-    const keys: AvailableApiKey[] = localAnthropic
-      .filter(e => target === null || e.shareAcrossNodes === true)
-      .map(e => ({
-        ...toRedactedApiKey(e),
-        homeNodeId: selfId,
-        homeNodeLabel: this.selfLabel(),
-        local: true,
-        bindingRef: bindingRefForTarget({ id: e.id, homeNodeId: selfId }, ctx),
-      }));
+    const offered = localAnthropic.filter(
+      e => target === null || e.shareAcrossNodes === true
+    );
+    const offeredViews = views(offered);
+    const keys: AvailableApiKey[] = offered.map((e, i) => ({
+      ...offeredViews[i]!,
+      homeNodeId: selfId,
+      homeNodeLabel: this.selfLabel(),
+      local: true,
+      bindingRef: bindingRefForTarget({ id: e.id, homeNodeId: selfId }, ctx),
+    }));
+    // The local work is done before the peers are asked; their requests leave
+    // only once it yields either way (`apiKeyCall` awaits `homeUrlGuard` before
+    // its fetch), so the deadline is what bounds it.
+    reportCredit();
 
     const unavailableNodes: AvailableApiKeysResponse["unavailableNodes"] = [];
     const summaries = registry.getNodeSummaries();
@@ -414,6 +484,18 @@ export class SharedApiKeyService {
             `Shared API keys on ${summary.nodeLabel} could not be listed`,
             { nodeId: summary.nodeId, reason }
           );
+        } else if (
+          reason === "offline" &&
+          (summary.status === "online" || summary.status === "degraded")
+        ) {
+          // #6789: up at the last poll, but no answer in time (a timeout maps
+          // to "offline"): a slow home, not a down one.
+          this.degraded.warn(
+            summary.nodeId,
+            reason,
+            `Shared API keys on ${summary.nodeLabel} did not answer in time`,
+            { nodeId: summary.nodeId, reason }
+          );
         }
         return;
       }
@@ -422,16 +504,35 @@ export class SharedApiKeyService {
       if (value.kind !== "ok") return;
       const home = value.value.homeNodeId;
       if (!isUsableNodeIdForSharing(home) || home === selfId) return;
+      // #6789: a home that reports credit says so in its answer; an older
+      // home's keys carry no reading this node can trust.
+      const homeReportsCredit =
+        value.value.includes?.includes("credit") === true;
       for (const k of value.value.keys) {
         if (k.provider !== "anthropic") continue;
         keys.push({
-          ...k,
+          ...(homeReportsCredit ? k : withoutHomeCredit(k)),
           homeNodeId: home,
           homeNodeLabel: summary.nodeLabel,
           local: false,
           bindingRef: bindingRefForTarget({ id: k.id, homeNodeId: home }, ctx),
         });
       }
+      // #6789 (closer, adjacent): say once per home when a credit value
+      // could not be read, so "No estimate" on its keys has a cause on record.
+      const unreadable = value.value.keys.filter(isCreditUnreadable).length;
+      if (unreadable > 0) {
+        this.degraded.warn(
+          `${summary.nodeId}:credit`,
+          "credit-unreadable",
+          `Credit on ${summary.nodeLabel} could not be read for ${unreadable} shared key(s)`,
+          {
+            nodeId: summary.nodeId,
+            reason: "credit-unreadable",
+            keys: unreadable,
+          }
+        );
+      } else this.degraded.ok(`${summary.nodeId}:credit`);
     });
 
     return { localNodeId: selfId, keys, unavailableNodes };

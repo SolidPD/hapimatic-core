@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import {
   EFFORT_LEVELS,
   FALLBACK_CLAUDE_MODELS,
+  HOST_CHAIN_SHARED_REASON,
   resolveModelEffortLevels,
   type ClaudeModelInfo,
   type ClaudeModelsResponse,
@@ -54,8 +55,6 @@ interface CacheEntry {
 
 /** Where the catalog reads credential files (test seams; production passes nothing). */
 export interface CatalogCredentialPaths {
-  /** Defaults to `~/.claude/.credentials.json`. */
-  hostCredentialsPath?: string;
   /** #4349: defaults to `${XDG_CONFIG_HOME:-~/.config}/hapimatic/account-configs`. */
   accountConfigsDir?: string;
 }
@@ -230,9 +229,11 @@ export class ClaudeModelCatalogService {
   /**
    * All candidate subscription OAuth tokens, in preference order (deduped): the
    * node's active account, then every stored account (kept fresh by the daemon's
-   * TokenRefreshService), then the host credentials (kept fresh by Claude Code
-   * itself). doFetch tries each until one authenticates, so a single stale token
-   * never forces a fallback. Never logs a token value.
+   * TokenRefreshService). doFetch tries each until one authenticates, so a single
+   * stale token never forces a fallback; with none, the static catalog is served.
+   * #6800: the `~/.claude` login is never read, and a record quarantined
+   * `host-chain-shared` (its token is that login's chain) is skipped. Never logs a
+   * token value.
    */
   private resolveTokens(): string[] {
     const tokens: string[] = [];
@@ -240,28 +241,38 @@ export class ClaudeModelCatalogService {
       if (token && !tokens.includes(token)) tokens.push(token);
     };
     // #4349 (ruling D10): on a TENANT VM the catalog read uses only the credential the binary keeps
-    // in each account's own dir (and the host login's own file) — never the account store — and
-    // HAPI_TENANT_USAGE_READ=0 turns it off (the static fallback catalog is served instead).
+    // in each account's own dir — never the account store — and HAPI_TENANT_USAGE_READ=0 turns it
+    // off (the static fallback catalog is served instead). #6800 overrides D10's "and the host
+    // login's own file": R5 forbids reading ~/.claude/.credentials.json as an account credential,
+    // so that read is gone here too.
     if (isTenantVm()) {
       if (!providerUsageReadAllowed(process.env, true)) return tokens;
       for (const account of this.accountService.list()) {
         if ((account.provider ?? "anthropic") !== "anthropic") continue;
         add(readIsolatedToken(this.paths, account.accountUuid));
       }
-      add(readHostToken(this.paths));
       return tokens;
     }
+    const usable = (uuid: string): string | undefined => {
+      const rec = this.accountService.getRaw(uuid);
+      if (
+        rec?.unrefreshable === true &&
+        rec.unrefreshableReason === HOST_CHAIN_SHARED_REASON
+      ) {
+        return undefined;
+      }
+      return rec?.accessToken;
+    };
     const activeUuid = this.accountService.getActiveAccount()?.accountUuid;
-    if (activeUuid) add(this.accountService.getRaw(activeUuid)?.accessToken);
+    if (activeUuid) add(usable(activeUuid));
     for (const account of this.accountService.list()) {
       // #3808 (R7): only Anthropic accounts carry an accessToken usable against
       // api.anthropic.com/v1/models. getRaw() is Anthropic-only (a provider record
       // returns null), so this skip is defence in depth + avoids a wasted read.
       // (absent provider ⇒ anthropic)
       if ((account.provider ?? "anthropic") !== "anthropic") continue;
-      add(this.accountService.getRaw(account.accountUuid)?.accessToken);
+      add(usable(account.accountUuid));
     }
-    add(readHostToken(this.paths));
     return tokens;
   }
 }
@@ -315,13 +326,6 @@ export function normalizeModels(body: unknown): ClaudeModelInfo[] {
     throw new Error("no Claude models parsed from /v1/models");
   }
   return out;
-}
-
-/** Host-default OAuth token from `~/.claude/.credentials.json`, or null. */
-function readHostToken(paths: CatalogCredentialPaths): string | null {
-  return readOauthToken(
-    paths.hostCredentialsPath ?? join(homedir(), ".claude", ".credentials.json")
-  );
 }
 
 /**

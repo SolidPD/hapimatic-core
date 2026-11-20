@@ -28,13 +28,17 @@
  * It never writes the credentials file and never calls OAuth. It runs on every
  * daemon (each instance has its own store; the same reason #4423's stale-flag
  * clear runs everywhere). It skips env-token accounts (no refresh token, never
- * isolated) and the host-default account (native's host credentials and the
- * CredentialsWatcher own that one, #1520). Never throws. Token values never
- * reach the logger.
+ * isolated). Since #6800 the account `~/.claude.json` names is mirrored like any
+ * other (a native-emptied folder of it is flagged `native-cleared`), and a file
+ * holding the `~/.claude` chain is never mirrored. Never throws. Token values
+ * never reach the logger.
  */
 
 import type { StoredAccount } from "@hapi/protocol/accounts";
-import { isEnvTokenAccount } from "@hapi/protocol/accounts";
+import {
+  HOST_CHAIN_SHARED_REASON,
+  isEnvTokenAccount,
+} from "@hapi/protocol/accounts";
 import {
   readIsolatedCredentialsState,
   type IsolatedClaudeAiOauth,
@@ -44,6 +48,7 @@ import {
   adoptPairIntoStore,
   refreshTokenFingerprint,
   withIsolatedLineage,
+  withUnrefreshableFlag,
 } from "@/accounts/machineRotator";
 import { logger } from "@/ui/logger";
 
@@ -65,7 +70,8 @@ export type MirrorDecision =
  *  - a readable pair the store already holds (or a newer one) but that is
  *    beyond the recorded lineage → advance the lineage only;
  *  - cleared → flag (once: an account already flagged `native-cleared` is left
- *    alone);
+ *    alone, and so is one quarantined `host-chain-shared` (#6800), so that
+ *    reason is never rewritten under a file it kept);
  *  - malformed → report.
  */
 export function decideMirror(
@@ -87,7 +93,8 @@ export function decideMirror(
     case "cleared":
       if (
         account.unrefreshable === true &&
-        account.unrefreshableReason === NATIVE_CLEARED_REASON
+        (account.unrefreshableReason === NATIVE_CLEARED_REASON ||
+          account.unrefreshableReason === HOST_CHAIN_SHARED_REASON)
       ) {
         return { action: "none" };
       }
@@ -131,9 +138,14 @@ export interface IsolatedMirrorDeps {
     uuid: string,
     mergeFn: (current: StoredAccount) => StoredAccount
   ) => Promise<void>;
-  /** The host-default account, or null. */
-  hostDefaultUuid: () => Promise<string | null>;
   now: () => number;
+  /**
+   * Issue #6800 (invariant I1): "is this refresh token the current ~/.claude
+   * token?" A readable file holding that chain is never mirrored into the
+   * store (no adopt, no flag clear, no lineage). Production passes
+   * `hostChainQuarantine.sharesHostChain`.
+   */
+  sharesHostChain: (refreshToken: string) => Promise<boolean>;
   /** Test seam; production reads the real file. */
   readState?: (uuid: string) => Promise<IsolatedCredentialsState>;
   /** Test seam; production writes to the server's `error_logs`. */
@@ -174,10 +186,8 @@ export async function runIsolatedCredentialsMirror(
   const report = deps.report ?? defaultReport;
   const reported = deps.reported ?? reportedMtimes;
   let uuids: string[];
-  let hostDefault: string | null;
   try {
     uuids = await deps.listAccountUuids();
-    hostDefault = await deps.hostDefaultUuid().catch(() => null);
   } catch (err) {
     logger.warn(
       `[ISOLATED_MIRROR] pass skipped: ${err instanceof Error ? err.message : String(err)}`
@@ -186,10 +196,15 @@ export async function runIsolatedCredentialsMirror(
   }
   for (const uuid of uuids) {
     try {
-      if (hostDefault && uuid === hostDefault) continue;
       const account = await deps.getAccount(uuid);
       if (!account || isEnvTokenAccount(account)) continue;
       const state = await readState(uuid);
+      if (
+        state.kind === "readable" &&
+        (await deps.sharesHostChain(state.oauth.refreshToken))
+      ) {
+        continue;
+      }
       const decision = decideMirror(account, state);
       switch (decision.action) {
         case "none":
@@ -210,14 +225,19 @@ export async function runIsolatedCredentialsMirror(
           );
           break;
         case "flag-cleared": {
-          await deps.mergeStore(uuid, current => ({
-            ...current,
-            unrefreshable: true,
-            unrefreshableReason: NATIVE_CLEARED_REASON,
-            ...(decision.fingerprint
-              ? { unrefreshableTokenFingerprint: decision.fingerprint }
-              : {}),
-          }));
+          // #6801: the death time follows the first-flag-wins rule, evaluated
+          // against the record read under the store lock.
+          const flaggedAt = deps.now();
+          await deps.mergeStore(uuid, current =>
+            withUnrefreshableFlag(
+              current,
+              {
+                reason: NATIVE_CLEARED_REASON,
+                fingerprint: decision.fingerprint ?? undefined,
+              },
+              flaggedAt
+            )
+          );
           const mtimeMs = state.kind === "cleared" ? state.mtimeMs : 0;
           logger.warn(
             `[ISOLATED_MIRROR] isolated credentials for ${uuid} (${account.emailAddress}) were cleared by a native refresh failure; marked unrefreshable (store head ${fp8(decision.fingerprint)}) — re-login required`

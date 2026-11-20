@@ -11,7 +11,11 @@ import {
   type SendMessageResult,
 } from "../sync/messageService";
 import { PinService } from "../sync/pinService";
-import { openPinInNamespace, PinTurnCheck } from "../sync/pinTurnCheck";
+import {
+  managedPeerCheck,
+  openPinInNamespace,
+  PinTurnCheck,
+} from "../sync/pinTurnCheck";
 import type { MessageOrigin } from "../sync/sentFrom";
 import type { Session, SyncEngine } from "../sync/syncEngine";
 
@@ -82,6 +86,19 @@ export function makePinWorld(dbPath = ":memory:") {
         getByPinId: pinId => pins.getByPinId(pinId),
         getSessionByNamespace: (id, namespace) =>
           sessions.find(s => s.id === id && s.namespace === namespace),
+      }),
+      // #6738 (R12): the same rule as the engine's, over this world's sessions.
+      isManagedPeer: managedPeerCheck({
+        getSession: id => sessions.find(s => s.id === id),
+        getParent: id => {
+          const parent = sessions.find(s => s.id === id);
+          return parent
+            ? {
+                active: parent.active,
+                lifecycleState: parent.metadata?.lifecycleState ?? null,
+              }
+            : null;
+        },
       }),
     }),
     getSession: (id: string) => sessions.find(s => s.id === id),

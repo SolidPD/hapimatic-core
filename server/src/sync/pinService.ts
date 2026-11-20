@@ -3,6 +3,7 @@ import type {
   Pin,
   PinChange,
   PinContent,
+  PinNotSavedFile,
   PinStatus,
   SyncEvent,
 } from "@hapi/protocol";
@@ -500,6 +501,8 @@ export class PinService {
       revision: number;
       files?: number;
       skipped?: number;
+      /** #6540 S-4: the skipped files, session-relative; the store applies the bounds. */
+      skippedFiles?: PinNotSavedFile[];
     },
     now?: number
   ): PinWriteResult | null {

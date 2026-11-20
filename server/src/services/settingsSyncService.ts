@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { SupervisedLoop } from "@hapi/protocol";
+import { applyMergePatch } from "@hapi/protocol/mergePatch";
 import { z } from "zod";
 import {
   ChatSectionsPreferenceSchema,
@@ -9,10 +10,12 @@ import {
   ShareApiKeysByDefaultPreferenceSchema,
   AccountsUsageViewPreferenceSchema,
   PinsViewPreferenceSchema,
+  PinsViewPreferenceMergeSchema,
   FEDERATION_SETTING_KEYS,
   FederationSettingsBlockSchema,
   FederationSettingsSyncSchema,
   type FederationSettingKey,
+  type FederationSettingPatch,
   type FederationSettingsBlock,
   type FederationSettingProvenance,
   type FederationSettingsSync,
@@ -21,6 +24,7 @@ import {
 } from "@hapi/protocol/schemas";
 import {
   readSettings,
+  SETTINGS_UNREADABLE_MESSAGE,
   SettingsUnreadableError,
   updateSettings,
 } from "../config/settings";
@@ -44,7 +48,8 @@ import {
  *    B does NOT migrate A's stored values into `globalValues` (R9).
  *
  *  - **Transport** — hybrid push-on-write + poll-reconcile (KD-1). A global write
- *    fans out `POST /api/federation/settings-sync` best-effort to every peer; a
+ *    fans out `POST /api/federation/settings-sync` best-effort to every peer
+ *    without making the write wait for it (#6526); a
  *    dedicated {@link SupervisedLoop} pulls each peer's `GET
  *    /api/federation/settings-digest` on a cadence so a peer offline at push time
  *    converges after it rejoins (R6/R7). The reconcile is a self-owned loop
@@ -72,6 +77,10 @@ export interface SettingRegistryEntry {
   /** Validates the setting's value on the wire and on read (mixed-version
    *  defense, 2624-6). */
   schema: z.ZodTypeAny;
+  /** #6526: validates a `merge` patch (RFC 7396) for this key, which
+   *  {@link SettingsSyncService.applyPatch} applies to the stored RAW value.
+   *  OPTIONAL: a key with no `mergeSchema` refuses `merge` with a 400. */
+  mergeSchema?: z.ZodTypeAny;
 }
 
 /** The registered settings, mapped to A's storage (when any) + schema. A future
@@ -115,8 +124,11 @@ export const SETTING_REGISTRY: Record<
   // Federation-native (#6451): the Pins tab's default filters, sort, direction
   // and grouping. No A-local storage; unset ⇒ the built-in view. The schema is
   // loose, so a newer node's unknown field drops alone, not the whole value.
+  // The browser edits it with a merge patch (#6526), applied to the stored raw
+  // value, so a field this build cannot read survives the edit.
   pinsView: {
     schema: PinsViewPreferenceSchema,
+    mergeSchema: PinsViewPreferenceMergeSchema,
   },
 };
 
@@ -215,6 +227,25 @@ export function writeGlobal(
   };
 }
 
+/**
+ * #6526 (R5): the clock for a new global write, always past the stored one:
+ * `max(now, stored + 1)`. With `now` alone, two writes from one node in the
+ * same millisecond tie, and a peer never adopts a same-origin tie
+ * ({@link applyIncoming}), so every peer would keep the first value; and a node
+ * whose clock is behind the stored value would have its edit reverted by the
+ * reconcile. Capped at `Number.MAX_SAFE_INTEGER`, because the block schema reads
+ * `updatedAt` back as an integer and a larger stamp would make every later read
+ * of the block throw.
+ */
+export function nextGlobalStamp(
+  block: FederationSettingsBlock,
+  key: FederationSettingKey,
+  now: number
+): number {
+  const stored = block.globalValues[key]?.updatedAt ?? -1;
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(now, stored + 1));
+}
+
 /** R4: set a node-local override only (no propagation). */
 export function writeLocalOverride(
   block: FederationSettingsBlock,
@@ -272,6 +303,19 @@ export interface SettingsSyncPeer {
   url: string;
 }
 
+/** #6526: why {@link SettingsSyncService.applyPatch} wrote nothing — the HTTP
+ *  status and body the route answers with. */
+export interface SettingPatchRefusal {
+  status: 400 | 500;
+  body: { error: string; details?: unknown };
+}
+
+/** What the `applyPatch` write-chain step decided. */
+type PatchStep =
+  | { kind: "written"; stamped: TimestampedValue | null }
+  | { kind: "invalid" }
+  | { kind: "unreadable" };
+
 /** Default cadence for the reconcile pull loop (matches E's output-style loop). */
 export const SETTINGS_RECONCILE_INTERVAL_MS = 60_000;
 
@@ -316,6 +360,10 @@ export class SettingsSyncService {
    * chain makes each cycle read the latest block.
    */
   private writeChain: Promise<unknown> = Promise.resolve();
+
+  /** #6526 (R10): pushes to the other nodes that are started and not awaited
+   *  ({@link startPush}); {@link whenPushesSettle} waits on them. */
+  private readonly pushes = new Set<Promise<void>>();
 
   constructor(opts: SettingsSyncServiceOptions) {
     this.settingsFile = opts.settingsFile;
@@ -367,29 +415,31 @@ export class SettingsSyncService {
   }
 
   /** R3: PUT while inheriting — persist the new federation-global value locally,
-   *  then fan it out best-effort to every peer. */
+   *  then fan it out best-effort to every peer. The clock is taken inside the
+   *  write chain ({@link nextGlobalStamp}, #6526 R5). Resolves once the value is
+   *  stored locally: the push is started, not awaited (#6526 R10). */
   async writeGlobalValue(
     key: FederationSettingKey,
     value: unknown
   ): Promise<void> {
-    const now = this.now();
-    const wrote = await this.mutate(
-      block => ({
-        block: writeGlobal(block, key, value, now, this.localNodeId),
-        result: true,
-        changed: true,
-      }),
-      () => false
-    );
-    if (wrote) {
-      await this.fanOutToPeers({
-        [key]: {
+    const stamped = await this.mutate<TimestampedValue | null>(
+      block => {
+        const next = writeGlobal(
+          block,
+          key,
           value,
-          updatedAt: now,
-          ...(this.localNodeId ? { originNodeId: this.localNodeId } : {}),
-        },
-      });
-    }
+          nextGlobalStamp(block, key, this.now()),
+          this.localNodeId
+        );
+        return {
+          block: next,
+          result: next.globalValues[key] ?? null,
+          changed: true,
+        };
+      },
+      () => null
+    );
+    if (stamped) this.startPush({ [key]: stamped });
   }
 
   /** R4: PUT while NOT inheriting — persist a node-local override only, no fan-out. */
@@ -422,6 +472,125 @@ export class SettingsSyncService {
     );
   }
 
+  /**
+   * #6526: the browser PUT (`PUT /preferences/federation-settings/:key`). The
+   * whole patch is validated before anything is written (R6), then ONE
+   * write-chain step applies `inherit`, decides global vs. local override from
+   * the resulting flag, and writes the value:
+   *  - `value` stores the parsed value, as before (R7);
+   *  - `merge` applies the RFC 7396 patch to the stored RAW value of the active
+   *    slot and stores the merged raw value, so a field this build cannot read
+   *    survives and `null` clears a field, readable or not (R3, R4). A merge
+   *    that changes nothing, with no `inherit` in the patch, writes nothing.
+   * A global write is stamped {@link nextGlobalStamp} and pushed to the other
+   * nodes without waiting for them (R10). Resolves with `null` once written, or
+   * with the refusal the route answers with.
+   */
+  async applyPatch(
+    key: FederationSettingKey,
+    patch: FederationSettingPatch
+  ): Promise<SettingPatchRefusal | null> {
+    const entry = SETTING_REGISTRY[key];
+    let parsedValue: unknown;
+    if (patch.value !== undefined) {
+      const vparsed = entry.schema.safeParse(patch.value);
+      if (!vparsed.success) {
+        return {
+          status: 400,
+          body: { error: "Invalid value", details: vparsed.error.issues },
+        };
+      }
+      parsedValue = vparsed.data;
+    }
+    let parsedMerge: unknown;
+    if (patch.merge !== undefined) {
+      if (!entry.mergeSchema) {
+        return { status: 400, body: { error: `Merge not supported: ${key}` } };
+      }
+      const mparsed = entry.mergeSchema.safeParse(patch.merge);
+      if (!mparsed.success) {
+        return {
+          status: 400,
+          body: { error: "Invalid merge", details: mparsed.error.issues },
+        };
+      }
+      parsedMerge = mparsed.data;
+    }
+
+    // Synchronous and free of awaits, so it moves unchanged into a rewritten
+    // write chain (#4056, #4365).
+    const step = await this.mutate<PatchStep>(
+      block => {
+        const flagChange = patch.inherit !== undefined;
+        let next =
+          patch.inherit !== undefined
+            ? setInherit(block, key, patch.inherit)
+            : block;
+        if (patch.value === undefined && patch.merge === undefined) {
+          return {
+            block: next,
+            result: { kind: "written", stamped: null },
+            changed: flagChange,
+          };
+        }
+        const inheriting = next.inheritFlags[key] !== false;
+        const base = inheriting
+          ? next.globalValues[key]?.value
+          : next.localOverrides[key];
+        let value = parsedValue;
+        if (patch.merge !== undefined) {
+          value = applyMergePatch(base, parsedMerge);
+          if (!entry.schema.safeParse(value).success) {
+            return { block, result: { kind: "invalid" }, changed: false };
+          }
+          if (!flagChange && JSON.stringify(value) === JSON.stringify(base)) {
+            return {
+              block,
+              result: { kind: "written", stamped: null },
+              changed: false,
+            };
+          }
+        }
+        if (!inheriting) {
+          next = writeLocalOverride(next, key, value);
+          return {
+            block: next,
+            result: { kind: "written", stamped: null },
+            changed: true,
+          };
+        }
+        next = writeGlobal(
+          next,
+          key,
+          value,
+          nextGlobalStamp(next, key, this.now()),
+          this.localNodeId
+        );
+        return {
+          block: next,
+          result: { kind: "written", stamped: next.globalValues[key] ?? null },
+          changed: true,
+        };
+      },
+      () => ({ kind: "unreadable" })
+    );
+
+    if (step.kind === "unreadable") {
+      return { status: 500, body: { error: SETTINGS_UNREADABLE_MESSAGE } };
+    }
+    if (step.kind === "invalid") {
+      return { status: 400, body: { error: "Invalid value" } };
+    }
+    if (step.stamped) this.startPush({ [key]: step.stamped });
+    return null;
+  }
+
+  /** #6526 (R10): resolves once every push started before the call has
+   *  settled. The one handle tests wait on; no route calls it. */
+  async whenPushesSettle(): Promise<void> {
+    await Promise.all([...this.pushes]);
+  }
+
   /** This node's global digest (fed-token GET /federation/settings-digest). */
   async buildDigest(): Promise<FederationSettingsSync> {
     const block = await this.readBlock();
@@ -429,6 +598,25 @@ export class SettingsSyncService {
   }
 
   // ── Federation transport ───────────────────────────────────────────────────
+
+  /**
+   * #6526 (R10, ruling RV-6): push a global write to the other nodes without
+   * making the caller wait. `fanOutToPeers` is called directly, so every peer's
+   * `fetch` has been called when this returns; only its answer is not waited
+   * for. A failed POST is already logged by {@link postToPeer}; a rejection of
+   * the fan-out itself is logged here, so the unawaited push never leaves an
+   * unhandled rejection. There is no retry: the reconcile pull is the backstop.
+   */
+  private startPush(values: Record<string, TimestampedValue>): void {
+    const push: Promise<void> = this.fanOutToPeers(values)
+      .catch(err => {
+        console.warn("[SettingsSync] push to peers failed:", err);
+      })
+      .finally(() => {
+        this.pushes.delete(push);
+      });
+    this.pushes.add(push);
+  }
 
   /** Fan a set of changed globals out to every peer (best-effort, KD-1). */
   async fanOutToPeers(values: Record<string, TimestampedValue>): Promise<void> {

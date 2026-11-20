@@ -8,6 +8,7 @@ import {
   PIN_DEADLINE_MIN_LEAD_MS,
   PIN_REQUEST_MAX_BYTES,
   pinSaveSources,
+  pinSessionDir,
   type Pin,
   type PinDeadlineRequest,
 } from "@hapi/protocol";
@@ -423,8 +424,16 @@ export async function pinSaveResponse(
     sources
   );
   if (!saved.ok) {
+    // #6540 S-2: an all-skipped refusal carries its list. It is local only: the
+    // app reads the `error` text, which names the first entry and its reason, and
+    // a hub's proxy keeps only `error` and `code` for a session on another node.
     return c.json(
-      { error: saved.error, code: saved.code },
+      {
+        error: saved.error,
+        code: saved.code,
+        ...(saved.skipped ? { skipped: saved.skipped } : {}),
+        ...(saved.skippedMore ? { skippedMore: saved.skippedMore } : {}),
+      },
       saved.code === "over_limit"
         ? 413
         : saved.code === "write_failed"
@@ -441,6 +450,12 @@ export async function pinSaveResponse(
       // #6458 (#6540 S-4): so the Save button can say a save was partial.
       files: saved.copied.length + saved.kept.length,
       skipped: saved.skipped.length + (saved.skippedMore ?? 0),
+      // #6540 S-4: which files, relative to the session's folder (the form
+      // `pin_folder` gave the agent); the store keeps up to ten.
+      skippedFiles: saved.skipped.map(s => ({
+        path: `${pinSessionDir(session.id)}/${s.path}`,
+        reason: s.reason,
+      })),
     }
   );
   if (!written) return pinNotFound(c);

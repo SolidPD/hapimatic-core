@@ -206,8 +206,11 @@ export async function buildSessionMetadata(options: {
   // `readClaudeAccountInfo` for an unbound session) is NOT what it runs on, and
   // stamping it would name the wrong credential on every account surface.
   const boundApiKeyId = readBoundApiKeyId() ?? undefined;
+  // Issue #6800 (R5): a BOUND session never opens `~/.claude/.credentials.json`
+  // (its identity comes from the store record below); only an unbound session
+  // reads the host login, which is the ruling-D1 residue R5 names.
   let claudeAccount =
-    isClaudeFlavor && !boundApiKeyId
+    isClaudeFlavor && !boundApiKeyId && !boundAccountUuid
       ? await readClaudeAccountInfo()
       : undefined;
   if (isClaudeFlavor && boundAccountUuid) {

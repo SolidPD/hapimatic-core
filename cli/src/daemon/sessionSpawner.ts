@@ -73,12 +73,9 @@ import {
   stopTmuxSession,
   getTmuxSessionPid,
 } from "./tmuxSpawnAdapter";
-import { readHostDefaultAccountUuid } from "@/utils/claudeCredentials";
+import { isEnvTokenAccount } from "@hapi/protocol/accounts";
 import { accountStore } from "@/accounts/accountStore";
-import {
-  classifyForSelection,
-  resolveUnpinnedSpawnAccount,
-} from "@/accounts/selectHealthyAccount";
+import { resolveUnpinnedSpawnAccount } from "@/accounts/selectHealthyAccount";
 import { generateSessionId } from "@/utils/id";
 import { TmuxManager } from "@/tmux";
 import { globalEnvNamesOrNull } from "@/tmux/TmuxManager";
@@ -300,7 +297,7 @@ export function createSessionSpawner(
       parentRelationship,
       originatingNodeId,
       // #3023: renamed from `accountUuid` — the un-pinned veto (below) resolves the
-      // EFFECTIVE `accountUuid` from this requested value + the host-default's cached
+      // EFFECTIVE `accountUuid` from this requested value + the default's cached
       // utilization, so every downstream consumer transparently uses the veto result.
       accountUuid: requestedAccountUuid,
       // Issue #4568: the API-key binding (vault id + the mask recorded at the
@@ -476,24 +473,12 @@ export function createSessionSpawner(
       }
     }
 
-    // Issue #1507 regression-shrink: if the bound account IS the host's native
-    // login (the account ~/.claude.json oauthAccount points at), skip env-var
-    // binding so Claude Code's own auto-refresh owns the running process — there
-    // is no frozen CLAUDE_CODE_OAUTH_TOKEN to expire mid-session. Reuses #1520's
-    // host-default resolver so this spawn layer agrees with TokenRefreshService's
-    // refresh-deferral layer. Only applies when bound == host-default; explicit
-    // switches to a DIFFERENT account stay bound (covered by the #1507 restart
-    // path). Computed once here so both injection sites below agree.
-    //
-    // Issue #1551: for a NON-host bound account, HAPI_ACCOUNT_UUID still travels
-    // (set below); the LAUNCHER now resolves it to a per-account
-    // CLAUDE_CONFIG_DIR (isolation) rather than a CLAUDE_CODE_OAUTH_TOKEN, so
-    // native Claude Code owns refresh in isolation. The host-default skip here
-    // is the single-owner guard (R2): the host-default account never gets a
-    // second isolated rotator — native owns it via the host dir.
-    const hostDefaultAccountUuid = await readHostDefaultAccountUuid().catch(
-      () => null
-    );
+    // Issue #6800 (R1): every bound account gets its own folder. Before #6800 the
+    // account ~/.claude.json names was left unbound (the #1507 skip) so
+    // native Claude Code refreshed it in ~/.claude; that put one OAuth chain in two
+    // places with two refreshers (#1520). HAPI_ACCOUNT_UUID now travels for every
+    // bound account, and the launcher resolves it to the account's own
+    // CLAUDE_CONFIG_DIR (#1551).
 
     // #3808 (NEW-3808-16): the EFFECTIVE bound account. The Anthropic un-pinned
     // veto below runs ONLY for an Anthropic spawn (claude / opencode). A codex or
@@ -501,6 +486,14 @@ export function createSessionSpawner(
     // it is never rebound to an Anthropic account; it binds the pinned provider account
     // (Task 4/4b add the provider node-default / first-record fallback).
     let accountUuid: string | undefined;
+    // Issue #6800 (R3): set when an un-pinned Anthropic spawn found no bindable
+    // account; it is refused below unless a held instance token can serve it.
+    let noBindableAccount = false;
+    // The flagged accounts behind a refusal, named in its message (#6800 I6).
+    let flaggedAccountLabels: string[] = [];
+    // A claude respawn or successor of an unbound session (ruling D1 = (a)):
+    // warned about below once it is known whether the instance token serves it.
+    let unboundCarryOver: "respawn" | "successor" | null = null;
     if (apiKeyBinding) {
       // Issue #4568 (R3/R6): an API-key session binds NO account — it skips the
       // #3023 un-pinned veto and the #3611 optimal pick entirely (treated as
@@ -526,14 +519,25 @@ export function createSessionSpawner(
       logger.info(
         `[DAEMON RUN] Non-Anthropic (${spawnProvider}) spawn — Anthropic un-pinned veto skipped; accountUuid=${accountUuid ?? "(none)"} (#3808)`
       );
+    } else if (agent !== "claude") {
+      // Issue #6800 (review): opencode reaches here as an Anthropic-provider agent
+      // but runs on OpenRouter and never uses the Anthropic account. It binds only
+      // an account its caller pinned: an automatic bind would stamp
+      // metadata.accountUuid, restart it on that account's refreshes, and hold
+      // that account's folder against the shared-chain move-aside.
+      accountUuid = requestedAccountUuid;
+      logger.info(
+        `[DAEMON RUN] ${agent} spawn — no automatic Anthropic account binding (#6800); accountUuid=${accountUuid ?? "(none)"}`
+      );
     } else {
       // Issue #3023: un-pinned spawn utilization veto. sessionSpawner is the single
       // universal spawn chokepoint — the apiMachine `spawn-happy-session` RPC path AND
       // the daemon controlServer `/spawn-session` bypass both land here — and
       // `requestedAccountUuid` is definitively empty for an un-pinned spawn. Before an
-      // un-pinned spawn binds the (possibly exhausted) host-default account, resolve
-      // against the cached utilization: bind a healthy account instead, or — when none is
-      // healthy — keep the host-default and log it loudly. The resolver never refuses a
+      // un-pinned spawn binds the (possibly exhausted) default account (#6800: the
+      // active.json default, bound explicitly), resolve against the cached utilization:
+      // bind a healthy account instead, or — when none is healthy — keep the default
+      // and log it loudly. The resolver never refuses a
       // spawn (#5460): usage never blocks creating a session. Pinned spawns and
       // respawns/resumes are exempt (a rebind would break `--resume` per-account
       // CLAUDE_CONFIG_DIR isolation).
@@ -541,12 +545,29 @@ export function createSessionSpawner(
       // by `tokenRefreshService` (via `utilizationSampler`) into the account-store cache.
       // #3808 (R7): the un-pinned veto is Anthropic-only today — restrict the
       // candidate pool to Anthropic records so a codex/gemini record can never be
-      // considered for an Anthropic host-default rebind. (absent provider ⇒ anthropic.)
+      // considered for an Anthropic default rebind. (absent provider ⇒ anthropic.)
       // Task 2 additionally gates the whole veto per-provider; Task 4 provider-scopes
       // this pool for non-Anthropic spawns.
-      const candidateUuids = (await accountStore.list().catch(() => []))
+      const candidateUuids = (
+        await accountStore.list().catch((err: unknown) => {
+          logger.warn(
+            `[DAEMON RUN] the account store cannot be listed (${err instanceof Error ? err.message : String(err)}); this spawn sees no account`
+          );
+          return [];
+        })
+      )
         .filter(e => (e.provider ?? "anthropic") === "anthropic")
         .map(e => e.accountUuid);
+      // Issue #6800 (R2): the default is this instance's active.json pointer, not
+      // the ~/.claude.json login. It must name an Anthropic store record (provider
+      // absent ⇒ anthropic); anything else is treated as no default (R3).
+      const storedDefault = await accountStore
+        .getActiveAnthropicDefault()
+        .catch(() => undefined);
+      const defaultUuid =
+        storedDefault && candidateUuids.includes(storedDefault)
+          ? storedDefault
+          : null;
       // Issue #3611 R7: the POSITIVE fresh-spawn whitelist. The optimal-pick fires
       // ONLY for a fresh, un-pinned, locally-originated spawn — every other shape
       // (reconnect/branch/relaunch respawn, successor handoff, federation
@@ -560,42 +581,41 @@ export function createSessionSpawner(
         !originatingNodeId &&
         !parentSessionId &&
         !parentRelationship;
-      // Issue #3611 R8 / #5460: build the `unrefreshable` exclusion set ONLY when a
-      // branch that consults it can run — the optimal pick (opt-in ON + fresh local
-      // spawn) or the unhealthy-host fallback (an un-pinned, non-respawn spawn whose
-      // host-default snapshot is exhausted / rate-limited / terminal). A healthy or
-      // unknown host-default still does ZERO extra store reads. An unrefreshable
-      // account can briefly present a stale `ok` snapshot, so the daemon honors the
-      // store flag explicitly rather than relying on its coarse status axis alone.
+      // Issue #6800 (ruling D1 = (a)): a successor is spawned with parentSessionId
+      // and no parentRelationship (successorHandoffWiring.ts); an MCP child sends
+      // parentRelationship "spawn", a branch "branch" with a resume id. Reaching the
+      // resolver un-pinned, this is the successor of an UNBOUND predecessor, which
+      // stays unbound (a bound predecessor's successor carries accountUuid).
+      const isSuccessorHandoff =
+        Boolean(parentSessionId) && !parentRelationship && !resumeSessionId;
+      // Issue #3611 R8 / #5460 / #6800: the `unrefreshable` set, built for every
+      // un-pinned, non-respawn spawn, so a flagged default goes to the fallback and
+      // no pick binds a dead login. A pinned spawn or a respawn never consults it,
+      // so it does no extra store reads there. The env-token set rides the same reads.
       const now = Date.now();
-      const hostClass =
-        hostDefaultAccountUuid && !requestedAccountUuid && !resumeSessionId
-          ? classifyForSelection(
-              accountStore.getUtilizationSnapshot(hostDefaultAccountUuid),
-              now
-            )
-          : null;
-      const hostNeedsFallback =
-        hostClass !== null &&
-        hostClass !== "healthy" &&
-        hostClass !== "unknown";
       let unrefreshableUuids = new Set<string>();
-      if (
-        (autoSelectOptimalAccount && isFreshLocalSpawn) ||
-        hostNeedsFallback
-      ) {
-        const flags = await Promise.all(
+      let envTokenUuids = new Set<string>();
+      if (!requestedAccountUuid && !resumeSessionId) {
+        const records = await Promise.all(
           candidateUuids.map(uuid =>
             accountStore
               .get(uuid)
-              .then(r =>
-                r?.ok && r.account.unrefreshable === true ? uuid : null
-              )
+              .then(r => (r?.ok ? r.account : null))
               .catch(() => null)
           )
         );
         unrefreshableUuids = new Set(
-          flags.filter((u): u is string => u !== null)
+          records
+            .filter(r => r?.unrefreshable === true)
+            .map(r => r!.accountUuid)
+        );
+        flaggedAccountLabels = records
+          .filter(r => r?.unrefreshable === true)
+          .map(r => r!.emailAddress ?? r!.accountUuid);
+        envTokenUuids = new Set(
+          records
+            .filter(r => r !== null && isEnvTokenAccount(r))
+            .map(r => r!.accountUuid)
         );
       }
       const unpinnedResolution = resolveUnpinnedSpawnAccount({
@@ -609,38 +629,77 @@ export function createSessionSpawner(
         // `resumeSessionId` (a prior claudeSessionId to resume) — the exact flows a
         // fallback-rebind would break via --resume's per-account CLAUDE_CONFIG_DIR.
         isRespawn: !!resumeSessionId,
-        hostDefaultUuid: hostDefaultAccountUuid,
+        defaultUuid,
+        isSuccessorHandoff,
         candidateUuids,
         readSnapshot: uuid => accountStore.getUtilizationSnapshot(uuid),
         now,
         // #3611: the opt-in pick + its R7 whitelist; #3611 R8 / #5460: the unrefreshable
-        // predicate, consulted by the optimal pick and the unhealthy-host fallback.
+        // predicate, consulted by the optimal pick and every fallback.
         autoSelectOptimalAccount,
         isFreshLocalSpawn,
         isUnrefreshable: uuid => unrefreshableUuids.has(uuid),
       });
+      let resolved = unpinnedResolution.accountUuid;
+      // "not-unpinned" covers a pinned spawn and a respawn; only a respawn with
+      // no requested account is unbound (#6800 closer review).
+      let source =
+        unpinnedResolution.decision === "not-unpinned"
+          ? requestedAccountUuid
+            ? resumeSessionId
+              ? "respawn"
+              : "pinned"
+            : "unbound-respawn"
+          : isSuccessorHandoff
+            ? "unbound-successor"
+            : unpinnedResolution.decision === "no-account"
+              ? "none"
+              : unpinnedResolution.accountUuid !== null &&
+                  unpinnedResolution.accountUuid === defaultUuid
+                ? "active.json"
+                : unpinnedResolution.decision.endsWith("last-resort")
+                  ? "last-resort"
+                  : "fallback";
+      // Issue #6800 (review item 10): an env-token default with a held instance
+      // token keeps the held-token delivery (#3731): the stored env-token copy is
+      // never updated after its first seed, so binding it could inject a stale token.
+      if (
+        resolved &&
+        envTokenUuids.has(resolved) &&
+        !ctx.tenantVm &&
+        (ctx.instanceOAuthToken ?? process.env.CLAUDE_CODE_OAUTH_TOKEN)
+      ) {
+        resolved = null;
+        source = "instance-token";
+      }
       // R2/AC2: the chosen account + utilization status is ALWAYS observable at spawn
       // (no silent UNCHECKED pass-through) — logged for every un-pinned resolution. A
-      // last-resort bind (host-default rate-limited, at its usage cap, or answering the
-      // probe with 401/403, and no healthy account) is logged LOUDLY (warn) so it is
-      // never silent. The resolver never refuses the spawn (#5460).
+      // last-resort bind is logged LOUDLY (warn) so it is never silent. The resolver
+      // never refuses the spawn on usage (#5460).
       {
-        const line = `[DAEMON RUN] Un-pinned spawn account resolution (#3023): decision=${unpinnedResolution.decision} — ${unpinnedResolution.reason}`;
-        const lastResort =
-          unpinnedResolution.decision === "degraded-last-resort" ||
-          unpinnedResolution.decision === "exhausted-last-resort" ||
-          unpinnedResolution.decision === "rejected-last-resort";
+        const line = `[DAEMON RUN] Un-pinned spawn account resolution (#3023): decision=${unpinnedResolution.decision} bound=${resolved ?? requestedAccountUuid ?? "none"} source=${source} — ${unpinnedResolution.reason}`;
+        const lastResort = unpinnedResolution.decision.endsWith("last-resort");
         if (lastResort) {
           logger.warn(line);
         } else {
           logger.info(line);
         }
       }
-      // The EFFECTIVE account: the veto's healthy-fallback UUID when it rebound, else the
-      // originally-requested account (or empty for an un-pinned pass-through). Every
-      // downstream `accountUuid` consumer (shouldSkipBinding, HAPI_ACCOUNT_UUID injection)
-      // reads this resolved value.
-      accountUuid = unpinnedResolution.accountUuid ?? requestedAccountUuid;
+      // Issue #6800 (ruling D1 = (a)): a respawn or a successor of a session that
+      // was started unbound stays unbound (warned below, after the instance-token
+      // check, because a held instance token serves it instead of ~/.claude).
+      if (!requestedAccountUuid && (resumeSessionId || isSuccessorHandoff)) {
+        unboundCarryOver = resumeSessionId ? "respawn" : "successor";
+      }
+      // The EFFECTIVE account: the resolved binding when there is one, else the
+      // originally-requested account (or empty: a respawn, a successor, the
+      // instance-token path or no bindable account). Every downstream `accountUuid`
+      // consumer (HAPI_ACCOUNT_UUID injection, the instance-token delivery) reads it.
+      accountUuid = resolved ?? requestedAccountUuid;
+      // A successor of an unbound session stays unbound (D1 = (a)), so it is not
+      // refused: it keeps reading what its predecessor read.
+      noBindableAccount =
+        unpinnedResolution.decision === "no-account" && !isSuccessorHandoff;
     } // end Anthropic-only veto (#3808)
 
     // #3808: load the bound account's full record (provider-aware) so the codex
@@ -659,18 +718,10 @@ export function createSessionSpawner(
       record: boundAccountRecord,
     });
 
-    const shouldSkipBinding =
-      !!accountUuid && accountUuid === hostDefaultAccountUuid;
-    if (shouldSkipBinding) {
-      logger.info(
-        `[DAEMON RUN] Skipping HAPI_ACCOUNT_UUID binding for ${accountUuid} — matches host-default login; native Claude Code owns refresh (issue #1507)`
-      );
-    }
-
     // Issue #3731 (R0b, ruling D3): the node's instance credential, delivered
     // EXPLICITLY ONLY to a strictly-unbound claude spawn — the tmux arm through
     // its 0600 spawn env file, the direct arm through the child's spawn env —
-    // never to a bound or host-default spawn, and never over a token passed
+    // never to a bound spawn, and never over a token passed
     // explicitly with the request (`options.token` wins on both arms; see
     // resolveUnboundInstanceToken). `ctx.instanceOAuthToken` is captured by
     // run.ts's buildDaemonBootRecord BEFORE the control server starts (#4153), so
@@ -687,6 +738,39 @@ export function createSessionSpawner(
       // Issue #4568: the vault key is an API-key session's only credential.
       apiKeyBound: apiKeyBinding !== null,
     });
+
+    // Issue #6800 (R3, ruling D2 option 1): with no bindable account and no held
+    // instance token, an un-pinned claude spawn with no explicit token is refused
+    // here, before any tmux/window work, with an error that names the node and the
+    // fix. opencode binds no account and an explicit-token spawn has its own
+    // credential: both keep the unbound path.
+    if (unboundCarryOver && !unboundInstanceToken && !options.token) {
+      logger.warn(
+        `[ACCOUNT] ${unboundCarryOver} of unbound session ${hapiSessionId} on ${os.hostname()} reads ~/.claude — switch its account`
+      );
+    }
+    if (
+      noBindableAccount &&
+      !unboundInstanceToken &&
+      agent === "claude" &&
+      !options.token
+    ) {
+      const needs =
+        flaggedAccountLabels.length > 0
+          ? `${flaggedAccountLabels.join(", ")} ${flaggedAccountLabels.length === 1 ? "needs" : "need"} a re-login`
+          : null;
+      const errorMessage = ctx.tenantVm
+        ? needs
+          ? `No Claude account can run this session on this VM: ${needs} under Settings → Provider Accounts`
+          : "No Claude account is signed in on this VM: open Settings → Provider Accounts → Add account and use the paste sign-in there"
+        : needs
+          ? `No Claude account can run this session on ${os.hostname()}: ${needs} on ${os.hostname()} under Settings → Provider Accounts`
+          : `No Claude account can run this session on ${os.hostname()}: sign in an account under Settings → Provider Accounts → Add account`;
+      logger.warn(
+        `[DAEMON RUN] spawn refused (no_bindable_account): ${errorMessage}`
+      );
+      return { type: "error", code: "no_bindable_account", errorMessage };
+    }
 
     // Issue #3731 (R4): observability — warn when a BOUND claude spawn happens while
     // the onboarding token is still ambient: in the daemon env (a seed-failed or
@@ -705,8 +789,7 @@ export function createSessionSpawner(
         `[DAEMON RUN] Ambient CLAUDE_CODE_OAUTH_TOKEN present (${sources.join(" + ")}) on a bound spawn for account ${accountUuid} — the per-pane unset and the explicit binding win (#3731)`
       );
     };
-    const isBoundClaudeSpawn =
-      agent === "claude" && Boolean(accountUuid) && !shouldSkipBinding;
+    const isBoundClaudeSpawn = agent === "claude" && Boolean(accountUuid);
     const ambientTokenSources: string[] =
       isBoundClaudeSpawn && process.env.CLAUDE_CODE_OAUTH_TOKEN
         ? ["daemon env"]
@@ -1966,9 +2049,7 @@ export function createSessionSpawner(
             : {}),
           // Issue #1456: bind the spawned process to an account so D's
           // launcher injection resolves its token (mirrors HAPI_ORIGINATING_NODE_ID).
-          ...(accountUuid && !shouldSkipBinding
-            ? { HAPI_ACCOUNT_UUID: accountUuid }
-            : {}),
+          ...(accountUuid ? { HAPI_ACCOUNT_UUID: accountUuid } : {}),
           // Issue #4568: the API-key binding — the vault id + the spawn-time mask
           // the launcher re-checks at every launch. Never the key itself: Claude
           // Code obtains it from the session's `apiKeyHelper`, so it never enters
@@ -2767,7 +2848,7 @@ export function createSessionSpawner(
 
       // Issue #1456: bind the spawned process to an account (mirrors
       // HAPI_ORIGINATING_NODE_ID); D's launcher injection reads the env var.
-      if (accountUuid && !shouldSkipBinding) {
+      if (accountUuid) {
         extraEnv = {
           ...extraEnv,
           HAPI_ACCOUNT_UUID: accountUuid,
@@ -2988,12 +3069,12 @@ export function createSessionSpawner(
       // Issue #3731 (R3 parity on the direct path): for a claude spawn, the
       // wrapper's account-binding env is EXACTLY what the daemon delivers
       // explicitly in `extraEnv` (HAPI_ACCOUNT_UUID when bound; a token passed
-      // with the request; else the instance credential when strictly unbound;
-      // nothing for a host-default spawn) — ambient BINDING_ENV_VARS never pass.
+      // with the request; else the instance credential when strictly unbound)
+      // — ambient BINDING_ENV_VARS never pass.
       // This mirrors the tmux arm's per-pane unset, and it is what makes the
       // wrapper-side R2b rule sound: an unbound wrapper treats its launch-time
-      // CLAUDE_CODE_OAUTH_TOKEN as its explicit binding, so a host-default spawn
-      // must not inherit a stray one here.
+      // CLAUDE_CODE_OAUTH_TOKEN as its explicit binding, so a bound spawn must
+      // not inherit a stray one here.
       //
       // Issue #4884 (PM ruling): `wrapperEnv` — this is the WRAPPER's env, so it
       // keeps an inherited ANTHROPIC_BASE_URL for a key session's wrapper to pass

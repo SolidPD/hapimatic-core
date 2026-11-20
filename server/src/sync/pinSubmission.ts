@@ -11,6 +11,7 @@ import {
   PIN_ANSWERS_MESSAGE_MAX_CHARS,
   type Pin,
   type PinAnswersEntry,
+  type PinAnswersMessageInput,
   type PinAutomaticPick,
   type PinSubmissionEntry,
   type PinSubmissionRequest,
@@ -22,7 +23,11 @@ import {
   isValidTimezone,
   loadTimeLogPreferenceTimezone,
 } from "../config/timeLogConfig";
-import type { PinBatchAnswer, PinBatchOutcome } from "../store/pinStore";
+import type {
+  PendingSave,
+  PinBatchAnswer,
+  PinBatchOutcome,
+} from "../store/pinStore";
 import { RecordVetoError } from "./messageService";
 import { isPromptPinLive } from "./pinPromptMirror";
 import { PROMPT_PIN_PREFIX } from "./pinService";
@@ -194,13 +199,30 @@ function labelOf({ entry, pin, stale }: Kept): string | undefined {
   return option?.label ?? entry.choice;
 }
 
-function messageEntry(kept: Kept): PinAnswersEntry {
+/**
+ * #6540 S-4: which files a pending partial Save did not copy, read from the
+ * pending save's own pin, so it describes exactly the Save this message reports.
+ * Nothing for a full Save, or one made before L's counts (which reads as complete).
+ */
+function notSavedOf(
+  save: PendingSave | undefined
+): PinAnswersEntry["notSaved"] {
+  const pin = save?.pin;
+  if (!pin?.savedTo || !pin.savedSkipped || pin.savedSkipped <= 0) {
+    return undefined;
+  }
+  return { count: pin.savedSkipped, files: pin.savedSkippedFiles ?? [] };
+}
+
+function messageEntry(kept: Kept, save?: PendingSave): PinAnswersEntry {
   const { entry, pin } = kept;
   const label = labelOf(kept);
   const note = cleanNote(entry);
   const questions = (entry.questions ?? []).map(clean);
   // #6453: the pin's saved folder rides every answer to it, Save's or the agent's own.
   const savedTo = effectiveSavedTo(pin);
+  // #6540: only with the pending Save this message reports, never on a later answer.
+  const notSaved = savedTo !== null ? notSavedOf(save) : undefined;
   return {
     pin: pin.key,
     rev: entry.rev,
@@ -219,18 +241,67 @@ function messageEntry(kept: Kept): PinAnswersEntry {
     ...(kept.report ? { automaticPick: kept.report } : {}),
     ...(entry.steps ? { steps: entry.steps } : {}),
     ...(savedTo !== null ? { savedTo } : {}),
+    ...(notSaved ? { notSaved } : {}),
   };
 }
 
 /** #6453: an unreported Save on a pin the operator answered nothing else about. */
-function saveEntry(pin: Pin): PinAnswersEntry {
+function saveEntry(save: PendingSave): PinAnswersEntry {
+  const { pin } = save;
+  const notSaved = notSavedOf(save);
   return {
     pin: pin.key,
     rev: pin.revision,
     kind: pin.kind,
     ...(pin.pinId ? { pinId: pin.pinId } : {}),
     savedTo: effectiveSavedTo(pin) ?? "",
+    ...(notSaved ? { notSaved } : {}),
   };
+}
+
+type ComposedAnswers =
+  | { ok: true; text: string; notSavedCut: boolean }
+  | { ok: false; reason: "empty" }
+  | { ok: false; reason: "too_large"; length: number };
+
+/**
+ * #6540 R8: compose the message, with the relay line when relayed, in up to three
+ * forms, so `notSaved` never makes a Submit refuse for size when today's code
+ * would send it: as built; with every `notSaved.files` emptied, counts kept; and
+ * without `notSaved`, which is exactly today's message. A refusal is form 3's, so
+ * its text is today's. `notSavedCut` says form 3 was sent. #6757 may add forms.
+ */
+function composeAnswers(
+  input: PinAnswersMessageInput,
+  relay: string | undefined
+): ComposedAnswers {
+  const forms = [input.entries];
+  if (input.entries.some(entry => entry.notSaved)) {
+    forms.push(
+      input.entries.map(entry =>
+        entry.notSaved
+          ? { ...entry, notSaved: { count: entry.notSaved.count, files: [] } }
+          : entry
+      ),
+      input.entries.map(({ notSaved: _, ...entry }) => entry)
+    );
+  }
+  let refusal: ComposedAnswers = { ok: false, reason: "empty" };
+  for (const [form, entries] of forms.entries()) {
+    const message = formatPinAnswersMessage({ ...input, entries });
+    if (!message.ok) {
+      if (message.reason === "empty") return message;
+      refusal = message;
+      continue;
+    }
+    const text =
+      relay === undefined ? message.text : `${relay}\n\n${message.text}`;
+    if (text.length <= PIN_ANSWERS_MESSAGE_MAX_CHARS) {
+      return { ok: true, text, notSavedCut: form === 2 };
+    }
+    refusal = { ok: false, reason: "too_large", length: text.length };
+  }
+  return refusal;
 }
 
 /**
@@ -565,9 +636,6 @@ export async function submitPinAnswers(
       drop(entry.key, "it has no saved files to report", "pin_not_saved");
     }
   }
-  // Every save the message reports: the appended ones and those riding an entry.
-  const reported = [...pendingSaves.values()];
-
   const refuse = (
     status: PinSubmissionRefusal["status"],
     code: PinSubmissionRefusal["code"],
@@ -679,15 +747,18 @@ export async function submitPinAnswers(
     return refuse(400, "pin_submission_empty", "Nothing left to send");
   }
   const now = context.now ?? Date.now();
-  const message = formatPinAnswersMessage({
-    session: session.tag ?? session.id,
-    now,
-    timeZone: context.timeZone,
-    entries: [
-      ...kept.map(messageEntry),
-      ...saves.map(({ pin }) => saveEntry(pin)),
-    ],
-  });
+  const message = composeAnswers(
+    {
+      session: session.tag ?? session.id,
+      now,
+      timeZone: context.timeZone,
+      entries: [
+        ...kept.map(item => messageEntry(item, pendingSaves.get(item.pin.key))),
+        ...saves.map(saveEntry),
+      ],
+    },
+    deliveredTo === undefined ? undefined : relayLine(session)
+  );
   if (!message.ok) {
     return message.reason === "too_large"
       ? refuse(
@@ -697,17 +768,13 @@ export async function submitPinAnswers(
         )
       : refuse(400, "pin_submission_empty", "Nothing left to send");
   }
-  const text =
-    deliveredTo === undefined
-      ? message.text
-      : `${relayLine(session)}\n\n${message.text}`;
-  if (text.length > PIN_ANSWERS_MESSAGE_MAX_CHARS) {
-    return refuse(
-      413,
-      "pin_submission_too_large",
-      `The message would be ${text.length} characters; the limit is ${MESSAGE_LIMIT}. Send fewer answers at once.`
-    );
-  }
+  const { text } = message;
+  // Every save the message reports: the appended ones and those riding an
+  // entry. #6540 (D2.1): a partial Save whose notice was cut for size stays
+  // pending, so the next Submit carries it again with `notSaved`.
+  const reported = [...pendingSaves.values()].filter(
+    save => !message.notSavedCut || notSavedOf(save) === undefined
+  );
   const relayed = deliveredTo !== undefined ? { deliveredTo } : {};
 
   const planned = (extra: Partial<PinSubmissionResult> = {}) => [

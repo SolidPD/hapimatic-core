@@ -3,15 +3,24 @@
  * The Pins nudge (issue #6455, epic #6446): Claude Code asks the Stop hook
  * whether a turn may end. When the agent's last message asks the operator for
  * something and no pin covers it, the hook blocks the stop once with a reason
- * that asks the agent to pin it. When the agent still ends the turn without a
- * pin, the server pins an excerpt itself (a Detected pin).
+ * that asks the agent to pin it, or, when the message asks nothing, to say "No
+ * decision is needed from you" and post no pin. Since #6738 the server pins
+ * only a strong ask the agent neither pinned nor answered with a plain
+ * statement that nothing is asked (a Detected pin); a weak ask nudges once and
+ * the reply stands. A PM-managed peer (a spawned session whose parent its node
+ * does not know to be gone or inactive) is never nudged: the server answers
+ * `none`, so its PM pins what is the operator's.
  *
  * The classifier runs here first, so a turn that asks nothing costs no request.
  * The server decides the match (it holds the pins) and writes the Detected pin
- * from the stored message, never from text this process sends.
+ * from the stored message, never from text this process sends. This process
+ * still asks for a detect after every nudge, because a strong reply after a
+ * weak nudge must be pinned; the server reads the stored Stop-hook record to
+ * tell the reply from the message the nudge judged.
  *
  * Every failure lets the turn end: a broken nudge must never hold a session.
- * A nudge request the server never answered still has the server pin the ask.
+ * A nudge request the server never answered still asks the server to detect,
+ * which pins a strong ask (Fallback Preservation Rule).
  */
 import {
   classifyDecisionSignals,

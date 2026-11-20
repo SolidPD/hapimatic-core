@@ -3,7 +3,7 @@ import { logger } from "@/ui/logger";
 import { accountStore } from "@/accounts/accountStore";
 import { fetchOauthProfile } from "@/accounts/oauthProfile";
 import { isTenantVm } from "@/accounts/tenantMode";
-import type { ResolvedIdentity } from "@/accounts/credentialsWatcher";
+import type { ResolvedIdentity } from "@/accounts/oauthProfile";
 import {
   StoredAccountSchema,
   type StoredAccount,

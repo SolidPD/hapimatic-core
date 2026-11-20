@@ -2,8 +2,6 @@
 import {
   BILLABLE_SWITCH_REPORT_MAX_AGE_MS,
   BillableConfirmSchema,
-  crossNodeBillable,
-  crossNodeMatchKey,
   projectBaseKey,
   projectKeyKind,
   resolveBillableSwitchStart,
@@ -24,7 +22,6 @@ import {
 import { z } from "zod";
 import type { Store } from "../store";
 import type {
-  BillableSwitchApplyHeaderResult,
   BillableSwitchListedSession,
   BillableSwitchMirrorEvent,
   BillableSwitchSessionEventFields,
@@ -37,9 +34,10 @@ import type {
 } from "../federation/nodeRegistry";
 
 // The billable switch's service (issue #6646, Task 5): the one place that decides
-// a new session's start value, writes a switch, a confirm and a header, keeps
-// other nodes' header reports, answers the history and the across-node list,
-// and sends the reports to a node that has no view of the mesh.
+// a new session's start value, writes a switch and a confirm, answers the
+// history and the across-node list, and sends a node with no view of the mesh
+// its (empty) header reports. Since #6778 PR-A (R12) no header is written and no
+// other node's report is kept: no header decides a start.
 
 /** One node in the cross-node view (the join of the stored reports and the registry). */
 export type BillableSwitchCrossNodeEntry = Omit<
@@ -283,11 +281,17 @@ export class BillableSwitchService {
   // ─── the cross-node view ──────────────────────────────────────────────────
 
   /**
-   * THE one definition of the join: this node's own table as the local entry;
-   * one entry per node with a stored report; one entry with no report (unknown)
-   * for every node the registry tracks that never reported; each joined with the
-   * registry's label, status and flags when it tracks the node, else shown from
-   * its stored label as `not-tracked` (a peer evicted automatically can re-join).
+   * The node view of `GET /api/billable-switch/headers`, whose `on` flags the
+   * web's Create reads. Since #6778 PR-A (R12) every entry's header list is
+   * empty: no header decides a start, the start-up step switched this node's
+   * rows off and removed the stored reports, and no report is stored again.
+   *
+   * THE one definition of the join: this node as the local entry; one entry
+   * per node with a stored report; one entry with no report (unknown) for every
+   * node the registry tracks that never reported, and for every node known only
+   * by a stored header row; each joined with the registry's label, status and
+   * flags when it tracks the node, else shown from its stored label as
+   * `not-tracked` (a peer evicted automatically can re-join).
    */
   crossNodeView(): BillableSwitchCrossNodeEntry[] {
     const localId = this.deps.getLocalNodeId();
@@ -304,7 +308,7 @@ export class BillableSwitchService {
         nodeLabel: this.deps.getLocalNodeLabel(),
         isLocal: true,
         reportedAt: this.now(),
-        headers: this.deps.store.billableSwitch.listHeaders(),
+        headers: [],
         status: "local",
         on: mode === "on",
         closed: mode === "closed",
@@ -313,18 +317,16 @@ export class BillableSwitchService {
       },
     ];
     const seen = new Set<string>([localId]);
-    const unreported = new Map<string, BillableSwitchHeader[]>();
-    for (const {
-      nodeId,
-      header,
-    } of this.deps.store.billableSwitch.listUnreportedPeerHeaders()) {
-      unreported.set(nodeId, [...(unreported.get(nodeId) ?? []), header]);
-    }
+    // Only the node ids: since #6778 PR-A no entry shows a header.
+    const unreported = new Set(
+      this.deps.store.billableSwitch
+        .listUnreportedPeerHeaders()
+        .map(row => row.nodeId)
+    );
     const remote = (
       nodeId: string,
       label: string | null,
-      reportedAt: number | null,
-      headers: BillableSwitchHeader[]
+      reportedAt: number | null
     ): BillableSwitchCrossNodeEntry => {
       const view = registryViews.get(nodeId);
       return {
@@ -332,7 +334,9 @@ export class BillableSwitchService {
         nodeLabel: view?.nodeLabel ?? label ?? nodeId,
         isLocal: false,
         reportedAt,
-        headers,
+        // #6778 PR-A: a stored report the start-up step has not removed yet
+        // shows no header either.
+        headers: [],
         status: view?.status ?? "not-tracked",
         on: view?.on ?? false,
         closed: view?.closed ?? false,
@@ -343,31 +347,17 @@ export class BillableSwitchService {
     for (const report of this.deps.store.billableSwitch.listPeerReports()) {
       if (seen.has(report.nodeId)) continue;
       seen.add(report.nodeId);
-      entries.push(
-        remote(
-          report.nodeId,
-          report.nodeLabel,
-          report.reportedAt,
-          report.headers
-        )
-      );
+      entries.push(remote(report.nodeId, report.nodeLabel, report.reportedAt));
     }
     for (const view of registryViews.values()) {
       if (seen.has(view.nodeId)) continue;
       seen.add(view.nodeId);
-      entries.push(
-        remote(
-          view.nodeId,
-          view.nodeLabel,
-          null,
-          unreported.get(view.nodeId) ?? []
-        )
-      );
+      entries.push(remote(view.nodeId, view.nodeLabel, null));
     }
-    for (const [nodeId, headers] of unreported) {
+    for (const nodeId of unreported) {
       if (seen.has(nodeId)) continue;
       seen.add(nodeId);
-      entries.push(remote(nodeId, null, null, headers));
+      entries.push(remote(nodeId, null, null));
     }
     return entries;
   }
@@ -402,29 +392,15 @@ export class BillableSwitchService {
     const projectKey = projectBaseKey(meta);
     const keyKind: BillableSwitchKeyKind = projectKeyKind(meta);
 
+    // #6778 PR-A (R12): no header and no other node's report is read here.
     const parent =
       kind === "inherit" && context?.fromSessionId
         ? this.deps.store.billableSwitch.getSwitch(context.fromSessionId)
         : null;
-    const headerRow = this.deps.store.billableSwitch.getHeader(
-      input.namespace,
-      projectKey
-    );
-    const header =
-      headerRow === null ? "unset" : headerRow.billable ? "on" : "off";
-    const crossNode = crossNodeBillable(
-      this.crossNodeView(),
-      crossNodeMatchKey(projectKey, keyKind),
-      input.namespace,
-      this.deps.getLocalNodeId(),
-      { now, maxAgeMs: BILLABLE_SWITCH_REPORT_MAX_AGE_MS }
-    );
     const result = resolveBillableSwitchStart({
       mode,
       context: { kind, choice: context?.choice },
       parent,
-      header,
-      crossNode,
     });
     if (result.reason === null) return null;
 
@@ -443,7 +419,6 @@ export class BillableSwitchService {
     }
     if (kind === "schedule" && context?.scheduleId)
       label.scheduleId = context.scheduleId;
-    if (result.causeNodes) label.causeNodes = result.causeNodes;
 
     const actorFields = {
       actorKind: context?.actor?.kind ?? ("system" as const),
@@ -475,24 +450,6 @@ export class BillableSwitchService {
         label,
         at: now,
       },
-      ...(result.headerOn
-        ? {
-            header: {
-              projectKey,
-              keyKind,
-              event: {
-                ...actorFields,
-                namespace: input.namespace,
-                projectKey,
-                keyKind,
-                kind: "header-on" as const,
-                reason: "create-choice",
-                label: { projectKey, keyKind, picks: 0 },
-                at: now,
-              },
-            },
-          }
-        : {}),
     };
   }
 
@@ -625,56 +582,20 @@ export class BillableSwitchService {
     };
   }
 
-  /**
-   * Set THIS node's header for a project and switch the picked sessions on, in
-   * one transaction (R12). Each pick's timer is read from the record here; its
-   * logged minutes come as given (the entry hub's provider, null today).
-   */
-  applyHeader(
-    input: BillableSwitchWriteActor & {
-      namespace: string;
-      projectKey: string;
-      keyKind: BillableSwitchKeyKind;
-      billable: boolean;
-      picks: ReadonlyArray<{ sessionId: string; loggedMs: number | null }>;
-    }
-  ): BillableSwitchApplyHeaderResult {
-    const now = this.now();
-    const result = this.deps.store.billableSwitch.applyHeader({
-      namespace: input.namespace,
-      projectKey: input.projectKey,
-      keyKind: input.keyKind,
-      billable: input.billable,
-      picks: input.picks.map(p => ({
-        sessionId: p.sessionId,
-        timerMs: this.timerMsFor(this.deps.getSession(p.sessionId), now),
-        loggedMs: p.loggedMs,
-      })),
-      actor: input.actor,
-      via: input.via,
-      entryNodeId: input.entryNodeId,
-      now,
-    });
-    for (const id of result.changedSessionIds) this.deps.refreshSession(id);
-    return result;
-  }
-
   // ─── other nodes' reports ────────────────────────────────────────────────
 
-  /** A node's header report (the registry's hook). Returns whether the stored report changed. */
+  /**
+   * A node's header report (the registry's hook). Since #6778 PR-A (R12) it is
+   * ignored: nothing is stored, so no report from an older node can steer a
+   * start, and `false` (nothing changed) means the registry raises no push.
+   */
   recordPeerReport(
-    nodeId: string,
-    nodeLabel: string | null,
-    headers: readonly BillableSwitchHeader[],
-    reportedAt: number
+    _nodeId: string,
+    _nodeLabel: string | null,
+    _headers: readonly BillableSwitchHeader[],
+    _reportedAt: number
   ): boolean {
-    if (nodeId === this.deps.getLocalNodeId()) return false;
-    return this.deps.store.billableSwitch.replacePeerReport(
-      nodeId,
-      nodeLabel,
-      headers,
-      reportedAt
-    ).changed;
+    return false;
   }
 
   /** A node left the mesh (an explicit eviction or a received tombstone). */
@@ -698,31 +619,16 @@ export class BillableSwitchService {
   }
 
   /**
-   * A registry-less node's side of the push: apply each report with its own
-   * report time and prune the nodes the push no longer names. A node with a
-   * registry refuses (its own polls are the truth).
+   * The receiving side of the push. Since #6778 PR-A (R12) nothing is stored:
+   * the answer is `applied` so a pusher keeps its count of good pushes, and an
+   * older pusher keeps pushing every five minutes, which is harmless (review
+   * H12).
    */
-  applyPushedReports(
-    body: BillableSwitchPushBody
-  ):
-    | { applied: true; nodes: number }
-    | { applied: false; reason: "has-registry" } {
-    if (this.deps.getRegistry())
-      return { applied: false, reason: "has-registry" };
-    const localId = this.deps.getLocalNodeId();
-    const named: string[] = [];
-    for (const report of body.reports) {
-      if (report.nodeId === localId) continue;
-      named.push(report.nodeId);
-      this.deps.store.billableSwitch.replacePeerReport(
-        report.nodeId,
-        report.nodeLabel,
-        report.headers,
-        report.reportedAt
-      );
-    }
-    this.deps.store.billableSwitch.prunePeerNodes(named);
-    return { applied: true, nodes: named.length };
+  applyPushedReports(_body: BillableSwitchPushBody): {
+    applied: true;
+    nodes: 0;
+  } {
+    return { applied: true, nodes: 0 };
   }
 
   /**
@@ -741,10 +647,12 @@ export class BillableSwitchService {
   }
 
   /**
-   * Send every usable report (at most 7 days old; this node's own headers
-   * included, the receiver's own left out) to each tracked node that
-   * advertises billable:switch or billable:switch-closed. Best-effort: a node
-   * that answers `has-registry` is skipped from then on.
+   * Send every usable report (at most 7 days old; this node's own included,
+   * the receiver's own left out) to each tracked node that advertises
+   * billable:switch or billable:switch-closed. Since #6778 PR-A every report's
+   * header list is empty (`crossNodeView`), so an older receiver replaces what
+   * it kept with nothing. Best-effort: a node that answers `has-registry` (an
+   * older one) is skipped from then on.
    */
   async pushPeerReports(): Promise<{
     sent: string[];
@@ -990,16 +898,6 @@ export class BillableSwitchService {
       local: store.listEventsSince(namespace, after.local, { kinds }),
       mirror: store.listMirrorEventsSince(namespace, after.mirror, { kinds }),
     };
-  }
-
-  /**
-   * After a header write proxied to another node succeeded: keep that one header
-   * row as the node now has it, so this node's view sees the change at once (the
-   * caller also advances the node's report counter, so an older poll skips).
-   */
-  recordRemoteHeader(nodeId: string, header: BillableSwitchHeader): void {
-    if (nodeId === this.deps.getLocalNodeId()) return;
-    this.deps.store.billableSwitch.upsertPeerHeader(nodeId, header);
   }
 
   /** This node's switched-on sessions of a namespace (the authoritative list, section 6 item 5). */

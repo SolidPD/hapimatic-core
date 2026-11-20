@@ -29,8 +29,8 @@ export function apiKeySessionLabel(
  * The account-store snapshot's access token is past expiry. NON-AUTHORITATIVE
  * for non-host accounts (#1658): the snapshot rots by design post-#1635 (the
  * scheduler defers isolated accounts machine-globally, native Claude Code
- * consumes-and-blanks the isolated copy, and only the host-default account is
- * watcher-synced). This predicate therefore means "snapshot is stale", NOT
+ * consumes-and-blanks the isolated copy, and since #6800 no account's store copy
+ * is watcher-synced). This predicate therefore means "snapshot is stale", NOT
  * "account unusable" — spawn-time recovery/refresh decides usability. Gate
  * selection on `unrefreshable` instead; use this only for the informational
  * "Stale" badge.

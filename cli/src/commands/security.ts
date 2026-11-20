@@ -632,8 +632,11 @@ function checkAccounts(accounts: {
         id: "account-unrefreshable",
         severity: "medium",
         message: `account ${accountLabel(account)} is marked unrefreshable — new sessions cannot bind it`,
+        // #6837 (R2): a terminal `claude /login` writes ~/.claude, which
+        // Hapimatic does not read (#6800). The sign-in clears the flag outright
+        // on the instance where it happens; other instances follow on their tick.
         fixHint:
-          "sign that account in again (claude /login as that account); Hapimatic re-captures the credentials and clears the flag",
+          "sign that account in again under this instance's Settings → Provider Accounts; the sign-in clears the flag",
         fixable: null,
       });
     }
@@ -995,7 +998,12 @@ async function probeAccountTokens(
         id: "account-token-revoked",
         severity: "medium",
         message: `the live probe rejected account ${accountLabel(account)}'s access token before its expiry`,
-        fixHint: "sign that account in again (claude /login as that account)",
+        // #6837 (R2): the store fallback above has no env-token filter, and a
+        // Provider Accounts sign-in does not replace an env-token credential.
+        fixHint:
+          account.authKind === "env-token"
+            ? "replace the instance's CLAUDE_CODE_OAUTH_TOKEN"
+            : "sign that account in again under this instance's Settings → Provider Accounts",
         fixable: null,
       });
     } else {

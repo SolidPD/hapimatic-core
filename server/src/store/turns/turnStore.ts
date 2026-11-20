@@ -20,11 +20,8 @@ import type {
 
 import { CEILING_RATE_WINDOW_MS } from "../../sync/ceilingGuardEvaluator";
 import { newUuidV7 } from "./ids";
-import {
-  BINDING_COLUMNS,
-  TURN_MIRROR_API_KEY_EXPR,
-  tableHasColumns,
-} from "./schema";
+import { BINDING_COLUMNS, tableHasColumns } from "./schema";
+import { createApiKeySpendReader, sumApiKeyCostIn } from "./apiKeySpend";
 import type {
   AppendEventsInput,
   FinalizeTurnInput,
@@ -183,52 +180,26 @@ export class TurnStore {
 
   /**
    * Dollars metered on one vault key for work that started in [fromMs, toMs):
-   * its turns plus its background agents. Matches the key's own id and a
-   * federation binding ref to it (`<id>@<homeNodeId>`; the range bound keeps the
-   * index usable). Counts this node's turns and background agents, and the
-   * other nodes' turns mirrored here (#4614). 0 when the binding columns are
+   * its turns plus its background agents, and the other nodes' turns mirrored
+   * here (#4614); see {@link sumApiKeyCostIn}. 0 when the binding columns are
    * missing or the window is empty.
    */
   sumApiKeyCost(apiKeyId: string, fromMs: number, toMs: number): number {
     if (!(toMs > fromMs) || !this.hasBindingColumns()) return 0;
-    const params = {
-      id: apiKeyId,
-      lo: `${apiKeyId}@`,
-      hi: `${apiKeyId}A`,
-      from: fromMs,
-      to: toMs,
-    };
-    const keyMatch =
-      "(api_key_id = @id OR (api_key_id >= @lo AND api_key_id < @hi))";
-    const sum = (table: "turns" | "background_agent_usage"): number => {
-      const row = this.db
-        .prepare(
-          `SELECT COALESCE(SUM(cost_total), 0) AS c FROM ${table}
-            WHERE ${keyMatch} AND started_at_ms >= @from AND started_at_ms < @to`
-        )
-        .get(params) as { c: number } | null;
-      return row?.c ?? 0;
-    };
-    let total = sum("turns");
-    if (tableHasColumns(this.db, "background_agent_usage", ["api_key_id"])) {
-      total += sum("background_agent_usage");
-    }
-    // A key shared with the federation (#5127) is also spent by sessions on
-    // other nodes; their finalized turns arrive as mirror rows (#4614).
-    if (tableHasColumns(this.db, "turn_mirror", ["row_json"])) {
-      const key = TURN_MIRROR_API_KEY_EXPR;
-      const row = this.db
-        .prepare(
-          `SELECT COALESCE(SUM(json_extract(row_json, '$.cost_total')), 0) AS c
-             FROM turn_mirror
-            WHERE ${key} IS NOT NULL
-              AND (${key} = @id OR (${key} >= @lo AND ${key} < @hi))
-              AND started_at_ms >= @from AND started_at_ms < @to`
-        )
-        .get(params) as { c: number } | null;
-      total += row?.c ?? 0;
-    }
-    return total;
+    return sumApiKeyCostIn(this.db, apiKeyId, fromMs, toMs);
+  }
+
+  /**
+   * #6789 (Task 6, rung 2): a spend reader for ONE list of keys, answering
+   * exactly what {@link sumApiKeyCost} answers (see
+   * {@link createApiKeySpendReader}). Short-lived: built per list and dropped
+   * with it.
+   */
+  apiKeySpendReader(
+    sinceMs: number
+  ): (apiKeyId: string, fromMs: number, toMs: number) => number {
+    if (!this.hasBindingColumns()) return () => 0;
+    return createApiKeySpendReader(this.db, sinceMs);
   }
 
   /**

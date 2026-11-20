@@ -163,10 +163,14 @@ export class AgentSessionBase<Mode> {
     }, 2000);
 
     // Seed initial account info for change detection (completes in ms,
-    // well before the first 30s refresh tick).
-    void readClaudeAccountInfo().then(info => {
-      this.lastKnownAccountInfo = info;
-    });
+    // well before the first 30s refresh tick). Issue #6800 (R5): a bound
+    // session never opens the `~/.claude` login, and its 30s check below
+    // returns early, so there is nothing to seed.
+    if (!process.env.HAPI_ACCOUNT_UUID) {
+      void readClaudeAccountInfo().then(info => {
+        this.lastKnownAccountInfo = info;
+      });
+    }
 
     // Periodic credential refresh: re-read Claude account info from disk
     // every 30s and push metadata update if the account changed (e.g., user

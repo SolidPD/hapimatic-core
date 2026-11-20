@@ -14,6 +14,15 @@
  * GitHub, AWS, provider and `CLI_API_TOKEN=` secrets), after approval tokens
  * are neutralized (#6530, #6458 Task 11c).
  *
+ * A title is never cut (#6739, TITLE-D): `serverPinTitle` keeps a question that
+ * fits 200 whole and makes a longer one its question sentence, and keeps every
+ * other source (a command's first line, a path, an MCP or terminal message)
+ * whole up to `PIN_SERVER_TITLE_MAX_CHARS`. Past that, or when the pin is
+ * refused for size, the pin is built once more under the writer's fixed label
+ * (`Allow Bash?`, `<server> asks for input`, …) with the whole text in its
+ * body, which is cut, at a word and marked "…", only when it cannot fit the
+ * pin's own limits.
+ *
  * ## Level-triggered, not edge-triggered
  * A pin is durable state, so each reconcile compares the session's open `prompt:`
  * pins with what is pending NOW, rather than diffing events the way the push
@@ -68,8 +77,9 @@ import {
   formatElicitationAnswers,
   isQuestionToolName,
   MCP_ELICITATION_TOOL,
-  PinContentSchema,
+  PIN_SERVER_TITLE_MAX_CHARS,
   PinKeySchema,
+  ServerPinContentSchema,
   type AgentStateCompletedRequest,
   type ElicitationField,
   type AgentStateRequest,
@@ -77,7 +87,12 @@ import {
   type PinContent,
   type SyncEvent,
 } from "@hapi/protocol";
-import { capPinText, cleanPinText } from "./pinText";
+import {
+  capPinText,
+  cleanPinText,
+  fitPinBody,
+  serverPinTitle,
+} from "./pinText";
 import type { ErrorLogger } from "../logging/errorLogger";
 import { isSqliteBusy } from "../socket/handlers/cli/messageWriteRetryQueue";
 import { PROMPT_PIN_PREFIX, type PinService } from "./pinService";
@@ -91,9 +106,16 @@ export const PROMPT_PIN_BUSY_RETRY_MS = 1000;
 export const TUI_PROMPT_PREFIX = `${PROMPT_PIN_PREFIX}tui-`;
 
 const LOG_CATEGORY = "pin-prompt";
-const CONTEXT_MAX_CHARS = 4000;
-const TITLE_MAX_CHARS = 200;
+/**
+ * A mirrored prompt's context when its title fits, at most. It equals
+ * `PIN_SERVER_TITLE_MAX_CHARS` (#6739), and a test keeps the two equal.
+ */
+export const CONTEXT_MAX_CHARS = PIN_SERVER_TITLE_MAX_CHARS;
 const ANSWER_MAX_CHARS = 4000;
+/** Room a fence takes, so a capped body and its fence fit `CONTEXT_MAX_CHARS`. */
+const FENCE_ROOM = 16;
+/** A pin's text field, at most (`PIN_TEXT_MAX_CHARS` in shared/src/pins.ts). */
+const PIN_BODY_MAX_CHARS = 16 * 1024;
 const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 const PLAN_TOOLS = new Set(["ExitPlanMode", "exit_plan_mode"]);
 
@@ -156,10 +178,48 @@ function str(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
-/** A fence that its content cannot close. */
+/**
+ * A fence that its content cannot close: one backtick longer than the body's
+ * longest backtick run, and at least three (#6739, R12).
+ */
 function fenced(body: string, lang = ""): string {
-  const fence = body.includes("```") ? "````" : "```";
+  // A loop, not a spread: a long command can hold more runs than a call takes.
+  let longest = 0;
+  for (const run of body.matchAll(/`+/g)) {
+    longest = Math.max(longest, run[0].length);
+  }
+  const fence = "`".repeat(Math.max(3, longest + 1));
   return `${fence}${lang}\n${body}\n${fence}`;
+}
+
+/**
+ * What a mirrored prompt's pin is built from (#6739). `title` is the title's
+ * source, before `serverPinTitle`; `context` is the context ready to store when
+ * that title fits (scrubbed, capped, and fenced); `label` is the writer's fixed
+ * title; `whole` is the scrubbed, uncut text the fixed-label build shows, in its
+ * context (fenced when `fence` is set) or in its plain text.
+ */
+type PromptParts = {
+  title: string;
+  context: string;
+  label: string;
+  whole: {
+    text: string;
+    fence?: string;
+    into: "context" | "plainText";
+  } | null;
+};
+
+/** A context ready to store from scrubbed text: capped. */
+function storedContext(clean: string): string {
+  return clean ? capPinText(clean, CONTEXT_MAX_CHARS) : "";
+}
+
+/** A fenced context from scrubbed text, capped first so its closing fence survives. */
+function fencedContext(clean: string, lang: string): string {
+  return clean
+    ? fenced(capPinText(clean, CONTEXT_MAX_CHARS - FENCE_ROOM), lang)
+    : "";
 }
 
 /**
@@ -215,10 +275,7 @@ export function promptPinKey(requestId: string): string {
   return `${PROMPT_PIN_PREFIX}h-${hash.slice(0, 24)}`;
 }
 
-function questionPrompt(args: Record<string, unknown>): {
-  title: string;
-  context: string;
-} {
+function questionPrompt(args: Record<string, unknown>): PromptParts {
   const questions = Array.isArray(args.questions) ? args.questions : [];
   const lines: string[] = [];
   let title = "";
@@ -236,32 +293,58 @@ function questionPrompt(args: Record<string, unknown>): {
       lines.push(`- ${label}${description ? ` — ${description}` : ""}`);
     }
   }
+  const label = "Answer the agent's question";
+  const body = cleanPinText(lines.join("\n"));
   return {
-    title: title || "Answer the agent's question",
-    context: lines.join("\n"),
+    title: title || label,
+    context: storedContext(body),
+    label,
+    whole: body ? { text: body, into: "context" } : null,
   };
 }
 
 function permissionPrompt(
   tool: string,
   args: Record<string, unknown>
-): { title: string; context: string } {
+): PromptParts {
   if (PLAN_TOOLS.has(tool)) {
-    return { title: "Approve the plan?", context: str(args.plan) ?? "" };
+    const plan = cleanPinText(str(args.plan) ?? "");
+    return {
+      title: "Approve the plan?",
+      context: storedContext(plan),
+      label: "Approve the plan?",
+      whole: plan ? { text: plan, into: "context" } : null,
+    };
   }
   if (tool === "Bash") {
     const command = str(args.command) ?? "";
-    const firstLine = command.split("\n")[0] ?? "";
-    // Scrub before cutting: a key cut at the cap no longer matches its
-    // pattern, so most of it would survive the later scrub.
+    const clean = cleanPinText(command);
+    // The whole first non-blank line (#6739, ruling Q1), scrubbed before it is
+    // measured: a key cut at a cap no longer matches its pattern.
+    const firstLine =
+      command
+        .split("\n")
+        .find(line => line.trim() !== "")
+        ?.trim() ?? "";
     return {
-      title: `Allow Bash: ${capPinText(cleanPinText(firstLine), 120)}?`,
-      context: command ? fenced(command, "bash") : "",
+      title: firstLine
+        ? `Allow Bash: ${cleanPinText(firstLine)}?`
+        : "Allow Bash?",
+      context: fencedContext(clean, "bash"),
+      label: "Allow Bash?",
+      whole: clean ? { text: clean, fence: "bash", into: "context" } : null,
     };
   }
   if (EDIT_TOOLS.has(tool)) {
     const path = str(args.file_path) ?? str(args.notebook_path) ?? "";
-    return { title: `Allow ${tool}: ${path}?`, context: "" };
+    return {
+      title: `Allow ${tool}: ${path}?`,
+      context: "",
+      label: `Allow ${tool}?`,
+      whole: path
+        ? { text: cleanPinText(path), fence: "", into: "context" }
+        : null,
+    };
   }
   let json = "";
   try {
@@ -269,28 +352,31 @@ function permissionPrompt(
   } catch {
     json = "";
   }
+  const clean = json !== "" && json !== "{}" ? cleanPinText(json) : "";
   return {
     title: `Allow ${tool}?`,
-    context: json && json !== "{}" ? fenced(json, "json") : "",
+    context: fencedContext(clean, "json"),
+    label: `Allow ${tool}?`,
+    whole: clean ? { text: clean, fence: "json", into: "context" } : null,
   };
 }
 
 /**
  * An MCP server's form or link request (#6606): the server's message goes
  * only into the plain-text title, and the context stays empty, because the
- * context is rendered as markdown and the message is the server's text.
+ * context is rendered as markdown and the message is the server's text. Past
+ * the title limit (#6739) the whole message goes into the plain text, which the
+ * Text view shows as plain text, under the fixed label.
  */
-function elicitationPrompt(args: Record<string, unknown>): {
-  title: string;
-  context: string;
-} {
+function elicitationPrompt(args: Record<string, unknown>): PromptParts {
   const server = str(args.server) ?? "An MCP server";
   const message = (str(args.message) ?? "").replace(/\s+/g, " ").trim();
+  const label = `${server} asks for input`;
   return {
-    title: message
-      ? `${server} asks for input: ${message}`
-      : `${server} asks for input`,
+    title: message ? `${label}: ${message}` : label,
     context: "",
+    label,
+    whole: message ? { text: cleanPinText(message), into: "plainText" } : null,
   };
 }
 
@@ -320,61 +406,159 @@ function elicitationOutcomeText(
   return line || "Submitted with every field left empty";
 }
 
+/**
+ * Build a mirrored prompt's pin from its parts (#6739). The first build carries
+ * `title` (null when it is past the server's limit); when that is null or the
+ * build is refused, it is built once more under the fixed label with the whole
+ * text in its body, shortened at a word only when the pin's own limits refuse
+ * it. `note` hears a body cut and each refused build; null when both are
+ * refused.
+ */
+function buildMirroredPin(
+  parts: PromptParts,
+  title: string | null,
+  build: (
+    title: string,
+    context: string,
+    plainText: string
+  ) => PinContent | null,
+  plainText: (title: string) => string,
+  note?: (message: string) => void
+): PinContent | null {
+  if (title) {
+    const first = build(title, parts.context, plainText(title));
+    if (first) return first;
+    note?.("a prompt pin was refused; retrying under its fixed label");
+  }
+  const { label, whole } = parts;
+  if (!whole) {
+    return build(label, parts.context, plainText(label));
+  }
+  const fitted = fitPinBody(whole.text, PIN_BODY_MAX_CHARS, body =>
+    whole.into === "context"
+      ? build(
+          label,
+          whole.fence === undefined ? body : fenced(body, whole.fence),
+          plainText(label)
+        )
+      : build(label, parts.context, plainText(`${label}: ${body}`))
+  );
+  if (fitted?.cut) note?.("a prompt pin's body was cut to fit");
+  return fitted?.pin ?? null;
+}
+
 /** The pin a pending request becomes: a blocking decision with no options. */
 export function buildPromptPin(
   key: string,
   request: Pick<AgentStateRequest, "tool" | "arguments">,
-  firstPid?: number
+  firstPid?: number,
+  note?: (message: string) => void
 ): PinContent | null {
   const args = asRecord(request.arguments);
   const tool = request.tool;
   const where = "in the chat";
-  const { title, context } =
+  const parts =
     tool === MCP_ELICITATION_TOOL
       ? elicitationPrompt(args)
       : isQuestionToolName(tool)
         ? questionPrompt(args)
         : permissionPrompt(tool, args);
-  const cleanTitle = capPinText(
-    cleanPinText(title.replace(/\s+/g, " ").trim()),
-    TITLE_MAX_CHARS
+  const source = cleanPinText(parts.title.replace(/\s+/g, " ").trim());
+  // An MCP message is the server's own text, kept whole (isQuestionToolName is
+  // also true for the MCP tool); a question is prose, shortened to its sentence.
+  const title = serverPinTitle(
+    source,
+    tool !== MCP_ELICITATION_TOOL && isQuestionToolName(tool)
+      ? "prose"
+      : "quote"
   );
-  const parsed = PinContentSchema.safeParse({
-    key,
-    kind: "decision",
-    title: cleanTitle || `Allow ${tool}?`,
-    ...(context
-      ? { context: capPinText(cleanPinText(context), CONTEXT_MAX_CHARS) }
-      : {}),
-    stakes: "costly",
-    risk: "medium",
-    blocking: true,
-    plainText: `${cleanTitle || tool} — waiting for your answer ${where}`,
-    // #6527: read back after a restart, so a resumed process that still lists
-    // this request is not taken for the process that raised it.
-    ...(Number.isInteger(firstPid) && (firstPid as number) > 0
-      ? { requestHostPid: firstPid }
-      : {}),
-  });
-  return parsed.success ? parsed.data : null;
+  const build = (
+    pinTitle: string,
+    context: string,
+    plainText: string
+  ): PinContent | null => {
+    const parsed = ServerPinContentSchema.safeParse({
+      key,
+      kind: "decision",
+      title: pinTitle,
+      ...(context ? { context } : {}),
+      stakes: "costly",
+      risk: "medium",
+      blocking: true,
+      plainText,
+      // #6527: read back after a restart, so a resumed process that still lists
+      // this request is not taken for the process that raised it.
+      ...(Number.isInteger(firstPid) && (firstPid as number) > 0
+        ? { requestHostPid: firstPid }
+        : {}),
+    });
+    return parsed.success ? parsed.data : null;
+  };
+  const content = buildMirroredPin(
+    parts,
+    title === "" ? parts.label : title,
+    build,
+    pinTitle => `${pinTitle} — waiting for your answer ${where}`,
+    note
+  );
+  if (!content) note?.("a prompt pin was refused under its fixed label too");
+  return content;
 }
 
-function tuiPromptPin(key: string, message: string): PinContent | null {
-  const title = capPinText(
-    cleanPinText(message.trim()) || "Claude is waiting in the terminal",
-    TITLE_MAX_CHARS
-  );
-  const parsed = PinContentSchema.safeParse({
-    key,
-    kind: "decision",
-    title,
-    context: "Answer this prompt in the session's Terminal tab.",
-    stakes: "costly",
-    risk: "medium",
-    blocking: true,
-    plainText: `${title} — waiting for your answer in the terminal`,
-  });
-  return parsed.success ? parsed.data : null;
+function tuiPromptPin(
+  key: string,
+  message: string,
+  note?: (message: string) => void
+): PinContent | null {
+  const label = "Claude is waiting in the terminal";
+  const sentence = "Answer this prompt in the session's Terminal tab.";
+  const clean = cleanPinText(message.trim());
+  const parts: PromptParts = {
+    title: clean || label,
+    context: sentence,
+    label,
+    whole: null,
+  };
+  const title = serverPinTitle(parts.title, "quote");
+  const build = (
+    pinTitle: string,
+    context: string,
+    plainText: string
+  ): PinContent | null => {
+    const parsed = ServerPinContentSchema.safeParse({
+      key,
+      kind: "decision",
+      title: pinTitle,
+      context,
+      stakes: "costly",
+      risk: "medium",
+      blocking: true,
+      plainText,
+    });
+    return parsed.success ? parsed.data : null;
+  };
+  const plainText = (pinTitle: string): string =>
+    `${pinTitle} — waiting for your answer in the terminal`;
+  let content =
+    title === null
+      ? null
+      : build(title || label, sentence, plainText(title || label));
+  if (!content) {
+    if (title !== null) {
+      note?.(
+        "a terminal prompt pin was refused; retrying under its fixed label"
+      );
+    }
+    // The whole message, fenced as plain text below the sentence.
+    const fitted = fitPinBody(clean, PIN_BODY_MAX_CHARS, body =>
+      build(label, `${sentence}\n\n${fenced(body)}`, plainText(label))
+    );
+    if (fitted?.cut) note?.("a terminal prompt pin's body was cut to fit");
+    content = fitted?.pin ?? null;
+  }
+  if (!content)
+    note?.("a terminal prompt pin was refused under its fixed label too");
+  return content;
 }
 
 /** What the operator answered, as the pin's answer text. */
@@ -591,7 +775,12 @@ export class PinPromptMirror {
 
     for (const [key, { id, request }] of pending) {
       if (open.has(key)) continue;
-      const content = buildPromptPin(key, request, state.pidById.get(id));
+      const content = buildPromptPin(
+        key,
+        request,
+        state.pidById.get(id),
+        note => this.log(note, sessionId, `tool ${request.tool}`)
+      );
       if (!content) {
         this.log(
           "request could not become a pin",
@@ -644,8 +833,14 @@ export class PinPromptMirror {
         [...open].find(key => key.startsWith(TUI_PROMPT_PREFIX)) ??
         `${TUI_PROMPT_PREFIX}${tui.since}`;
       if (!open.has(state.tuiKey)) {
-        const content = tuiPromptPin(state.tuiKey, tui.message);
-        if (content && "capped" in pins.upsert(ref, content)) retry = true;
+        const content = tuiPromptPin(state.tuiKey, tui.message, note =>
+          this.log(note, sessionId)
+        );
+        if (!content) {
+          this.log("terminal prompt could not become a pin", sessionId);
+        } else if ("capped" in pins.upsert(ref, content)) {
+          retry = true;
+        }
       }
     } else {
       state.tuiKey = null;
@@ -686,12 +881,16 @@ export class PinPromptMirror {
     return null;
   }
 
+  /** The session and detail go into the line too: ErrorLogger prints only it. */
   private log(message: string, sessionId?: string, error?: unknown): void {
-    this.options.errorLogger?.debug(`pin prompt mirror: ${message}`, {
+    const detail = error instanceof Error ? error.message : (error ?? null);
+    const where = [sessionId && `session ${sessionId}`, detail].filter(Boolean);
+    const suffix = where.length > 0 ? ` (${where.join(", ")})` : "";
+    this.options.errorLogger?.debug(`pin prompt mirror: ${message}${suffix}`, {
       category: LOG_CATEGORY,
       ...(sessionId ? { sessionId } : {}),
       context: {
-        error: error instanceof Error ? error.message : (error ?? null),
+        error: detail,
       },
       persist: false,
     });

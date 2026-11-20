@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  HOST_CHAIN_SHARED_REASON,
   UtilizationSchema,
   computePlanLabel,
   computeUtilizationScore,
@@ -43,12 +44,14 @@ import {
  *      with the per-instance `<dataDir>/account-configs/<uuid>/...` as a
  *      kill-switch-layout fallback,
  *   2. the store record `<dataDir>/accounts/<uuid>.json` (via `AccountService`),
- *   3. the host `~/.claude/.credentials.json` (only when `uuid` is the
- *      host-default account — that file is NOT keyed by uuid).
+ *      except a record quarantined `host-chain-shared` (#6800), whose token is
+ *      the `~/.claude` chain.
+ * Issue #6800: there is no third tier any more. Hapimatic never reads the
+ * `~/.claude/.credentials.json` login as an account credential.
  *
  * Read-only by design (#1857): an expired/unrefreshable token is classified
  * `expired` and the upstream call is skipped — NO token rotation on read. This
- * deliberately avoids the #1520 host-default and #1644 cross-machine token
+ * deliberately avoids the #1520 shared-chain and #1644 cross-machine token
  * races. Security: token values are NEVER logged or returned.
  */
 
@@ -154,11 +157,6 @@ interface ClaudeAiOauthFile {
   };
 }
 
-/** Shape of `~/.claude.json` (host-default identity only). */
-interface HostConfigFile {
-  oauthAccount?: { accountUuid?: string };
-}
-
 export interface UsageServiceOptions {
   /** Source of the account list + full records (token-bearing). */
   accountService: AccountService;
@@ -174,14 +172,10 @@ export interface UsageServiceOptions {
   accountConfigsDir?: string;
   /** Per-instance isolated-config base (kill-switch layout; test seam). */
   perInstanceConfigsDir?: string;
-  /** Host credentials path (test seam). */
-  hostCredentialsPath?: string;
-  /** Host config path — source of the host-default uuid (test seam). */
-  hostConfigPath?: string;
   /**
    * Issue #4349 (ruling D10): the tenant predicate (test seam; defaults to `isTenantVm`). On a
-   * tenant the usage read uses only the credential the binary keeps in the account's own dir (or
-   * the host login's own file) — never the account store — and `HAPI_TENANT_USAGE_READ=0` turns
+   * tenant the usage read uses only the credential the binary keeps in the account's own dir —
+   * never the account store — and `HAPI_TENANT_USAGE_READ=0` turns
    * the read off entirely.
    */
   tenantVm?: () => boolean;
@@ -220,8 +214,6 @@ export class UsageService {
   private readonly now: () => number;
   private readonly accountConfigsDir: string;
   private readonly perInstanceConfigsDir: string;
-  private readonly hostCredentialsPath: string;
-  private readonly hostConfigPath: string;
   private readonly nicknameLookup?: (uuid: string) => string | undefined;
   /** #4349: the tenant predicate (D10). */
   private readonly tenantVm: () => boolean;
@@ -257,11 +249,6 @@ export class UsageService {
       opts.accountConfigsDir ?? join(xdgBase, "hapimatic", "account-configs");
     this.perInstanceConfigsDir =
       opts.perInstanceConfigsDir ?? join(opts.dataDir, "account-configs");
-    this.hostCredentialsPath =
-      opts.hostCredentialsPath ??
-      join(homedir(), ".claude", ".credentials.json");
-    this.hostConfigPath =
-      opts.hostConfigPath ?? join(homedir(), ".claude.json");
     this.nicknameLookup = opts.nicknameLookup;
     this.tenantVm = opts.tenantVm ?? isTenantVm;
     this.staleAfterMs = opts.staleAfterMs ?? DEFAULT_USAGE_STALE_AFTER_MS;
@@ -479,6 +466,16 @@ export class UsageService {
     }
     // #4349: a tenant never reads a token from the store (Tier 2) — only the binary's own files.
     const rec = tenant ? null : this.accountService.getRaw(uuid);
+    // #6800 (ruling U1): an account quarantined for sharing the ~/.claude login
+    // chain needs a re-login, and none of its tokens is read: its folder can
+    // still hold that chain (the detector moves it only once no older daemon is
+    // live), and tier 1 below would otherwise call the usage endpoint with it.
+    if (
+      rec?.unrefreshable === true &&
+      rec.unrefreshableReason === HOST_CHAIN_SHARED_REASON
+    ) {
+      return this.buildUsage(account, "expired", {});
+    }
     const token = this.resolveToken(uuid, rec);
 
     // Cannot resolve any token → error (nothing to call the endpoint with).
@@ -613,7 +610,7 @@ export class UsageService {
 
   /**
    * Resolve the access token to use for this account, by priority (R2):
-   * isolated dir → store record → host credentials (host-default only).
+   * isolated dir → store record. (#6800: never the `~/.claude` login.)
    */
   private resolveToken(
     uuid: string,
@@ -627,21 +624,22 @@ export class UsageService {
       if (isolated) return isolated;
     }
 
-    // Tier 2: store record (advisory cache for isolated accounts; the synced
-    // record for the host-default; the Hapimatic-refreshed token otherwise).
+    // Tier 2: store record (advisory cache for isolated accounts; the
+    // Hapimatic-refreshed token otherwise). #6800 (review item 11): a record
+    // quarantined host-chain-shared still holds the ~/.claude chain's access
+    // token, which is never used.
+    if (
+      rec?.unrefreshable === true &&
+      rec.unrefreshableReason === HOST_CHAIN_SHARED_REASON
+    ) {
+      return null;
+    }
     if (rec?.accessToken) {
       return {
         accessToken: rec.accessToken,
         scopes: rec.scopes ?? [],
         expiresAt: rec.expiresAt ?? null,
       };
-    }
-
-    // Tier 3: host credentials — only meaningful when this IS the host-default
-    // account (the host file is not keyed by uuid; the uuid lives in ~/.claude.json).
-    if (uuid === this.readHostDefaultAccountUuid()) {
-      const host = this.readClaudeAiOauth(this.hostCredentialsPath);
-      if (host) return host;
     }
 
     return null;
@@ -660,18 +658,6 @@ export class UsageService {
         scopes: Array.isArray(oauth.scopes) ? oauth.scopes : [],
         expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : null,
       };
-    } catch {
-      return null;
-    }
-  }
-
-  /** The host-default account uuid from `~/.claude.json`; null on any failure. */
-  private readHostDefaultAccountUuid(): string | null {
-    try {
-      const parsed = JSON.parse(
-        readFileSync(this.hostConfigPath, "utf-8")
-      ) as HostConfigFile;
-      return parsed.oauthAccount?.accountUuid ?? null;
     } catch {
       return null;
     }

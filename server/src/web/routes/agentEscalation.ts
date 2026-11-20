@@ -87,6 +87,7 @@ import type { Context } from "hono";
 import {
   isPermissionMode,
   isPermissionModeAllowedForFlavor,
+  isRetiredBillableSwitchChoice,
   isYoloEquivalentMode,
   KNOWN_AGENT_IDS,
   type McpSet,
@@ -707,51 +708,32 @@ export function buildBillableSwitchStart(
 }
 
 /**
- * Issue #6646 (closer review round 1; the Project Manager's ruling of
- * 2026-11-13, a clarification of R5 and Task 6): the local Create refuses a
- * person's explicit billable answer (`session-only`, `header-and-session`)
- * while this node's gate is not `on`, with the codes the remote path and the
- * closed state use (`billable_feature_unsupported` when off,
- * `billable_feature_closed` when closed), because the start rule runs only
- * when the gate is on and the answer would otherwise be dropped without a word.
- * Every other start (no answer, `follow-header`, `not-billable`, an agent's or
- * an unattended start) passes in every gate state. Returns null to pass.
+ * Issue #6778 PR-A (R12; reviews H8, T11, C9): a person's start that carries a
+ * retired billable answer (`session-only`, `header-and-session`) is refused with
+ * 400 `billable_choice_retired`, in every gate state, by the local Create, the
+ * hub's route to another node and the peer's receiver (an older hub can still
+ * send one). Both answers billed through the project header, which no longer
+ * decides a start; passed on, the session would start non-billable with a 200
+ * and the person's answer would be lost without a word. Every other start (no
+ * answer, `follow-header`, `not-billable`, an agent's or an unattended start,
+ * whose body answer is ignored) passes. Returns null to pass.
  */
-export function refuseUnhonourableBillableAnswer(
+export function refuseRetiredBillableAnswer(
   c: Context<WebAppEnv>,
-  engine: Pick<
-    SyncEngine,
-    "getBillableSwitchMode" | "getBillableSwitchService"
-  >,
-  start: RouteBillableSwitchStart
+  start: Pick<RouteBillableSwitchStart, "kind" | "choice">
 ): Response | null {
-  if (
-    start.kind !== "person" ||
-    (start.choice !== "session-only" && start.choice !== "header-and-session")
-  ) {
+  if (start.kind !== "person" || !isRetiredBillableSwitchChoice(start.choice)) {
     return null;
   }
-  const mode = engine.getBillableSwitchMode?.() ?? "off";
-  if (mode === "on") {
-    return null;
-  }
-  const nodeLabel =
-    engine.getBillableSwitchService?.()?.localNodeLabel?.() ?? "this node";
-  const message =
-    mode === "closed"
-      ? `Billable sessions are closed on ${nodeLabel}: a new session there cannot start billable.`
-      : `${nodeLabel} cannot take a billable answer: billable sessions are not on there.`;
+  const message = `The billable answer "${start.choice}" is retired: no project setting decides whether a session is billable any more, so start the session without it.`;
   return c.json(
     {
       type: "error",
       error: message,
       message,
-      code:
-        mode === "closed"
-          ? "billable_feature_closed"
-          : "billable_feature_unsupported",
-      nodeLabel,
+      code: "billable_choice_retired",
+      choice: start.choice,
     },
-    409
+    400
   );
 }

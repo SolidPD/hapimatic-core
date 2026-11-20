@@ -6,6 +6,8 @@ import {
   type LegacySweepResult,
 } from "@/accounts/legacyConfigDirMigration";
 import { configuration } from "@/configuration";
+import { parseSignInAgesFlags, runSignInAges } from "./accountsSignInAges";
+import { authenticateCli } from "./cliAuth";
 import type { CommandDefinition } from "./types";
 
 /** Canonical UUID format — mirrors accountStore's UUID_REGEX (path-safety parity). */
@@ -25,6 +27,7 @@ function printHelp(isError: boolean): number {
   out("Usage:");
   out("  hapi accounts force-refresh <account-uuid> [--json]");
   out("  hapi accounts chain-probe <account-uuid> [--json]");
+  out("  hapi accounts sign-in-ages [--dead] [--json]");
   out(
     "  hapi accounts migrate-config-dirs [--dry-run] [--delete-legacy] [--json]"
   );
@@ -36,9 +39,19 @@ function printHelp(isError: boolean): number {
   out(
     "                            account and assert the full refresh → restart chain"
   );
+  out(
+    "                            (refuses an account a session of another Hapimatic"
+  );
+  out("                            instance on this machine is using: exit 3)");
   out("  chain-probe <uuid>        Read-only: each node's refresh-token chain");
   out(
     "                            fingerprint (a hash) + independence verdict (#3784)"
+  );
+  out(
+    "  sign-in-ages              Read-only: every node's Anthropic sign-ins, their age"
+  );
+  out(
+    "                            in days, and when a dead one stopped refreshing (#6801)"
   );
   out(
     "  migrate-config-dirs       Migrate legacy per-instance isolated account dirs"
@@ -59,6 +72,9 @@ function printHelp(isError: boolean): number {
   out("Flags:");
   out(
     "  --json, -j                Emit a machine-readable JSON result (for CI)"
+  );
+  out(
+    "  --dead                    (sign-in-ages) only logins that stopped refreshing"
   );
   out(
     "  --dry-run, -n             (migrate-config-dirs) report would-migrate without writing"
@@ -85,8 +101,9 @@ const STATUS_ICON: Record<string, string> = {
 const OVERALL_LABEL: Record<string, string> = {
   pass: "✅ PASS",
   fail: "❌ FAIL",
-  deferred: "⏭️  DEFERRED (host-default — not refreshable by Hapimatic)",
   "not-found": "❓ NOT FOUND",
+  // #6847: refused before any OAuth call; the guard step's detail names why.
+  skipped: "⏭️ SKIPPED (another instance's session uses this account)",
 };
 
 function printReportHuman(report: ForceRefreshReport): void {
@@ -118,9 +135,16 @@ function printReportHuman(report: ForceRefreshReport): void {
   console.log("");
 }
 
-/** Map the report's overall verdict to a process exit code. */
-function exitCodeForReport(report: ForceRefreshReport): number {
-  return report.overall === "pass" || report.overall === "deferred" ? 0 : 1;
+/**
+ * Map the report's overall verdict to a process exit code. Issue #6847: a
+ * refusal by the sibling-instance guard exits 3, apart from pass (0), fail (1)
+ * and a usage error (2): exit 0 must keep meaning "rotated and verified", and a
+ * refusal is not a failure of the refresh chain.
+ */
+export function exitCodeForReport(report: ForceRefreshReport): number {
+  if (report.overall === "pass") return 0;
+  if (report.overall === "skipped") return 3;
+  return 1;
 }
 
 async function runForceRefresh(
@@ -231,14 +255,9 @@ async function runChainProbe(
     return 2;
   }
   try {
-    const authResp = await fetch(`${configuration.serverUrl}/api/auth`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ accessToken: configuration.cliApiToken }),
-    });
-    if (!authResp.ok) throw new Error(`auth HTTP ${authResp.status}`);
-    const { token } = (await authResp.json()) as { token?: string };
-    if (!token) throw new Error("no JWT in /api/auth response");
+    // #6801: the house login (#5136), as sign-in-ages: CLI_API_TOKEN, else this
+    // instance's settings.json token, sent only to a loopback server URL.
+    const token = await authenticateCli();
     const resp = await fetch(
       `${configuration.serverUrl}/api/federation/account-chain-fingerprints?accountUuid=${encodeURIComponent(uuid)}`,
       { headers: { Authorization: `Bearer ${token}` } }
@@ -301,6 +320,8 @@ export const accountsCommand: CommandDefinition = {
       exit = await runForceRefresh(rest[0], parseFlags(rest.slice(1)));
     } else if (sub === "chain-probe") {
       exit = await runChainProbe(rest[0], parseFlags(rest.slice(1)));
+    } else if (sub === "sign-in-ages") {
+      exit = await runSignInAges(parseSignInAgesFlags(rest));
     } else if (sub === "migrate-config-dirs") {
       exit = await runMigrateConfigDirs(rest);
     } else if (sub === undefined || sub === "--help" || sub === "-h") {

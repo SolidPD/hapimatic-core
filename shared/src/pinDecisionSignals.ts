@@ -6,16 +6,29 @@
 // will run the same rules on stored messages, so the two defenses agree on what
 // an ask is.
 //
-// ## Tuned for recall
-// A false alarm costs the operator one tap; a miss costs a decision. So
-// `ambiguous` (a trailing question, an option list, "let me know") still counts
-// as a signal for the nudge, and only a plain report is `none`. The rules were
-// calibrated on 10,837 real end-of-turn messages (#6455 research): they catch
-// answer keys, "Needs from you" lists, mid-paragraph questions and consent offers
-// ("If you approve the write, I can …"), and skip "Needs from you: nothing new".
+// ## Tuned for recall, pinned for precision
+// A miss costs a decision, so `ambiguous` (a trailing question, an option list,
+// "let me know") still counts as a signal for the nudge, and only a plain report
+// is `none`. Only `decision` can become a Detected pin (#6738): a weak signal
+// nudges the agent once, and its reply stands. The rules were calibrated on
+// 10,837 real end-of-turn messages (#6455 research): they catch answer keys,
+// "Needs from you" lists, mid-paragraph questions and consent offers ("If you
+// approve the write, I can …"), and skip "Needs from you: nothing new".
 // Rules version 2 (#6527) was measured on a further 2,695 messages: it reads an
 // option list only from the message's last list run, and drops a weak ask when
 // the message says nothing is asked.
+// Rules version 3 (#6738) reads an option list only when a choice is put: the
+// sentence that introduces the list ends with ":" or "?" and holds a choice word
+// or asks "Which …", or the trailer's first sentence says "pick one", "choose
+// between" or the like, or an item labels itself an option. It widens the
+// "nothing is asked" withdrawal ("Nothing in my last message needs an answer
+// from you", "No decision is needed from you", the nudge's own "asks the
+// operator nothing"), but not for a scoped line ("Nothing else needs you"). A
+// "needs your …" after a later step in its sentence ("Next tick I'll …", "its
+// lane will need your token") is a heads-up, not an ask now. No sentence ends
+// after "e.g." or "Dr.". On the same 2,695 messages: fires 671 to 616, strong
+// 565 to 564 (one heads-up), weak 106 to 52, none added; #6527's labelled asks
+// unchanged at 14 of 35.
 //
 // ## Bounded and linear
 // The Stop hook runs this in the session wrapper, which also sends the 2 s
@@ -50,10 +63,19 @@ export const DECISION_EXCERPT_HEAD_CHARS = 300;
 /** `askTexts` keeps the last this-many strong asks. */
 export const DECISION_ASK_TEXTS_MAX = 8;
 /**
- * The rules' version: #6455's were 1, #6527's are 2. The turn-end detector
- * (#6456) records it; the turn-end route's answer does not carry it.
+ * The rules' version: #6455's were 1, #6527's 2, #6738's are 3. The turn-end
+ * detector (#6456) records it; the turn-end route's answer does not carry it.
  */
-export const DECISION_SIGNAL_RULES_VERSION = 2;
+export const DECISION_SIGNAL_RULES_VERSION = 3;
+/**
+ * How Claude Code begins the record it stores when a Stop hook blocks a turn:
+ * this, a newline, then the hook's reason (measured on Claude Code 2.1.321; the
+ * format is Claude Code's, not Hapimatic's). The server reads it to find the
+ * message a Stop hook judged (#6738), and the web chat shows it as a banner.
+ */
+export const STOP_HOOK_FEEDBACK_PREFIX = "Stop hook feedback:";
+/** How every Pins nudge reason begins (#6455). */
+export const PIN_NUDGE_HEAD = "📌 Pins: your last message ends with";
 /**
  * The pin count line Hapimatic's primer asks agents to write (#6458),
  * "📌 N open (M new: <titles>)", also after a list marker, in bold or backticks,
@@ -99,6 +121,25 @@ export type DecisionSignals = {
    * Read from the match text, so a `?` in a quote, a code span or a URL is not one.
    */
   question: string | null;
+  /**
+   * The ask's own uncut text for a pin title (#6739), read from the raw lines,
+   * inline code and quotes kept. A heading-led ask (an answer key, a needs list):
+   * the block's first line. Any other strong ask: `question` when there is one,
+   * else its whole sentence, else (a line-level ask) its whole line. A weak ask:
+   * `question` when there is one, else the ask tail's first line. Null for
+   * `none`. Output only: no verdict, signal, excerpt or question reads it. The
+   * excerpt keeps its bounds (600 and 1,200 characters, or head " … " tail), so a
+   * title is never cut by them.
+   */
+  titleSource: string | null;
+  /**
+   * The message says plainly that it asks the operator nothing ("No decision is
+   * needed from you", "Nothing in my last message needs an answer from you"), on
+   * any prose line, whatever the verdict (#6738). A scoped line ("Nothing else
+   * needs you") is not plain. The turn-end check reads it on the reply after a
+   * blocked Stop.
+   */
+  nothingAsked: boolean;
 };
 
 /** A fence line's start, as pinFence.ts reads it; nothing follows the run. */
@@ -121,13 +162,55 @@ const NEEDS_FROM_YOU =
 const NOTHING_NEEDED = /^[:\-—–\s]*(?:nothing|none|no new|no further|n\/a)\b/i;
 /** "Nothing is …", "No decision for you": the phrase reports that nothing is asked. */
 const NOTHING_BEFORE = /\b(?:nothing|no|none)\b[^.?!]{0,40}$/i;
-/** The agent says outright that nothing is asked: a weak ask before it is then not one. */
+/**
+ * The agent says outright that nothing is asked: a weak ask before it is then not
+ * one. Four patterns, run by `saysNothingAsked` with the scope guard; each ends
+ * "you" at a word boundary, so "your" never matches.
+ */
 const NOTHING_ASKED =
-  /\b(?:nothing (?:needs|is needed from|is waiting on|for) you|(?:needs?|what i need) from you[:\s*]{0,8}(?:nothing|none|n\/a)\b|no (?:decision|action|answer) (?:is )?needed from you)/i;
+  /\b(?:nothing (?:needs|is needed from|is waiting on|for) you\b|(?:needs?|what i need) from you[:\s*]{0,8}(?:nothing|none|n\/a)\b|no (?:decision|action|answer) (?:is )?needed from you\b)/gi;
+/** v3: "Nothing <up to 60 characters> needs (an answer from) you", in one clause. */
+const NOTHING_NEEDS_YOU =
+  /\bnothing\b[^.?!,;:\n]{0,60}?\b(?:needs?|requires?|is waiting on|waits on) (?:(?:an? )?(?:answer|decision|reply|action|input|word|response) from )?you\b/gi;
+/** v3: "nothing (is) needed from you", plural "no decisions needed from you", "Needs from you — nothing". */
+const NOTHING_ASKED_MORE =
+  /\b(?:nothing (?:is )?(?:needed|required) from you|no (?:decisions?|actions?|answers?|input) (?:is |are )?(?:needed|required) from you|(?:needs?|what i need) from you[ \t]{0,2}[—–-][ \t]{0,2}(?:nothing|none|n\/a))\b/gi;
+/** v3: the Pins nudge's own wording, "my message asks the operator nothing". */
+const ASKS_NOTHING =
+  /\bask(?:s|ed) (?:(?:you|the operator) nothing|nothing of (?:you|the operator))\b/gi;
+const NOTHING_ASKED_FAMILY: readonly RegExp[] = [
+  NOTHING_ASKED,
+  NOTHING_NEEDS_YOU,
+  NOTHING_ASKED_MORE,
+  ASKS_NOTHING,
+];
+/** A scoped statement, "Nothing else needs you": the matched text holds one of these. */
+const NOTHING_SCOPE_WORD = /\b(?:else|more|other|further|new|additional)\b/i;
+/** A scoped statement, "… needs you yet, but please confirm": one of these to its sentence's end. */
+const NOTHING_SCOPE_AFTER = /\b(?:except|but|until|unless|other than)\b/i;
+/**
+ * The end of a sentence: `.`, `?` or `!` that a space or the line's end follows.
+ * Read through `sentenceEndIn`, which skips one after an abbreviation (R13).
+ */
+const SENTENCE_END = /[.?!](?=\s|$)/g;
+/** How far past a "nothing" match the scope guard reads, at most. */
+const NOTHING_SCOPE_CHARS = 200;
 const NEEDS_YOUR =
   /\bneeds? your (?:answers?|decisions?|go|approval|reply|input|call|rulings?|two messages|messages|picks?|choice|word|sign-off)\b/gi;
 /** "needs your D1 or D2": an option id, case-sensitive so "needs your go2" is not one. */
 const NEEDS_YOUR_ID = /\b[Nn]eeds? your [A-Z]{1,3}\d{1,2}\b/g;
+/**
+ * v3 (R11): a later step the agent plans, before "needs your …" in its own
+ * sentence, makes it a heads-up, not an ask now. A time marker anywhere earlier
+ * in the sentence, or an auxiliary at most two words before the phrase; tested
+ * apart. "When", "once" and "would" are not markers: "When you have a minute,
+ * this needs your approval" is an ask.
+ */
+const LATER_TIME = /\b(?:next (?:tick|turn|time|step|round|pass)|later)\b/i;
+const LATER_AUX_END =
+  /(?:\bwill|\bI'll|\bwe'll|\bgoing to)(?: \w{1,20}){0,2} ?$/i;
+/** How far back from "needs your" the later-step rule reads, at most. */
+const LATER_LOOK_CHARS = 200;
 /** At most this many matches of one phrase are read on a line. */
 const MATCHES_PER_LINE = 8;
 const ASK_PHRASE =
@@ -140,14 +223,40 @@ const ASK_STATEMENT =
   /\b(?:let me know|please confirm|reply with|your call|your choice|tell me (?:which|whether|if))\b|\breply (?:with )?""/i;
 const LIST_ITEM = /^ {0,3}(?:[-*+]|\d{1,2}[.)]|[A-Z]\d?[.)])[ \t]+\S/;
 const INDENTED = /^[ \t]{2,}\S/;
+/** A choice word; v3 reads it only in the sentence that introduces a list. */
 const OPTION_WORD =
   /\b(?:options?|choices?|choose|pick|recommend(?:s|ed|ation)?)\b/i;
+/**
+ * v3 (#6738): a choice put as a phrase, "pick one", "choose between", "select
+ * from these", "which one", "which of these". The only rule a list's trailer reads.
+ */
+const CHOICE_VERB =
+  /\b(?:choose|pick|select)(?: (?:one|an? (?:option|number|letter)|between|from (?:these|them|the (?:list|options|above))|which))\b|\bwhich (?:one|option|of (?:these|them|the))\b/i;
+/** v3: an introducing sentence that asks "Which … you / should / shall / do / would". */
+const LEAD_WHICH =
+  /^(?:\*\*)?which\b[^:?\n]{0,60}\b(?:you|should|shall|do|would)\b/i;
+/** v3: an introducing sentence ends with `:` or `?`, bold marks and spaces allowed after. */
+const LEAD_INTRO = /[:?][ \t]{0,8}(?:\*\*)?[ \t]{0,8}$/;
+/**
+ * v3: the whole lead line is a heading or a bold-only line. Every run is bounded:
+ * an open run of spaces before the heading text took 37.9 s on one crafted
+ * 16,383-character message (#6738 expert review).
+ */
+const HEADING_OR_BOLD_ONLY =
+  /^ {0,3}(?:#{1,6}[ \t]{1,8}\S[^\n]{0,79}|\*\*[^*\n]{1,80}\*\*)[ \t]{0,8}$/;
 /** An item that labels itself an option: "- **Option 2:** …", "1. A1 (recommended): …". */
 const OPTION_ITEM =
   /^ {0,3}(?:[-*+]|\d{1,2}[.)]|[A-Z]\d?[.)])[ \t]+(?:\*\*)?(?:[Oo]ptions? (?:[A-Z]|\d{1,2})\b|[^\n]{0,80}\((?:[Rr]ecommended|[Mm]y [Rr]ecommendation)\))/;
 /** The lead-in and trailer searches look at this many non-blank lines. */
 const LIST_PROSE_LOOK = 3;
 const SENTENCE_BREAK = /(?<=[.?!])\s+/g;
+/**
+ * v3 (R13): no sentence ends after these. "e.g.", "i.e.", "vs.", "cf." and
+ * "approx." in any case; "Mr.", "Mrs.", "Ms." and "Dr." capitalized only, because
+ * "5 ms." ends a sentence. Tested on the 8 characters before a break.
+ */
+const ABBREVIATION_ANY_CASE = /\b(?:e\.g|i\.e|vs|cf|approx)\.$/i;
+const ABBREVIATION_TITLE = /\b(?:Mr|Mrs|Ms|Dr)\.$/;
 
 /** Strongest first: the excerpt comes from the strongest kind, the latest one. */
 const SIGNAL_ORDER: readonly DecisionSignal[] = [
@@ -282,6 +391,12 @@ function bounded(unit: string): string {
   return `${unit.slice(0, half)} … ${unit.slice(-half)}`;
 }
 
+/** Whether the break at `at` follows an abbreviation ("e.g.", "Dr."), so is no break. */
+function abbreviationBefore(text: string, at: number): boolean {
+  const before = text.slice(Math.max(0, at - 8), at);
+  return ABBREVIATION_ANY_CASE.test(before) || ABBREVIATION_TITLE.test(before);
+}
+
 /** The sentences of a match text, each trimmed, with its position. */
 function sentencesOf(text: string): Sentence[] {
   const sentences: Sentence[] = [];
@@ -295,11 +410,23 @@ function sentencesOf(text: string): Sentence[] {
   };
   let from = 0;
   for (const match of text.matchAll(SENTENCE_BREAK)) {
+    if (abbreviationBefore(text, match.index)) continue;
     push(from, match.index);
     from = match.index + match[0].length;
   }
   push(from, text.length);
   return sentences;
+}
+
+/**
+ * The trimmed sentences of one line, under the classifier's own sentence
+ * boundary: a break after `.`, `?` or `!` and whitespace, never after an
+ * abbreviation such as "e.g." or "Dr." (#6738, R13). Shared so a pin's title
+ * (#6739) cuts sentences where the classifier does. Never throws.
+ */
+export function splitPinSentences(text: string): string[] {
+  if (typeof text !== "string") return [];
+  return sentencesOf(text).map(s => text.slice(s.start, s.end));
 }
 
 /** The lines the classifier reads, and the lines before them that set its state. */
@@ -472,10 +599,72 @@ function asksForSomething(line: string): boolean {
   return false;
 }
 
-/** "needs your pick", unless "Nothing here needs your sign-off". */
+/**
+ * The part of `line` from the start of the sentence holding `at` up to `at`, at
+ * most `LATER_LOOK_CHARS` characters, under the classifier's sentence boundary.
+ */
+function sentenceBefore(line: string, at: number): string {
+  const slice = line.slice(Math.max(0, at - LATER_LOOK_CHARS), at);
+  let from = 0;
+  for (const match of slice.matchAll(SENTENCE_BREAK)) {
+    if (!abbreviationBefore(slice, match.index))
+      from = match.index + match[0].length;
+  }
+  return slice.slice(from);
+}
+
+/** "Next tick I'll …, so it needs your go" and "its lane will need your token": a later step. */
+function laterStepBefore(line: string, at: number): boolean {
+  const before = sentenceBefore(line, at);
+  return LATER_TIME.test(before) || LATER_AUX_END.test(before);
+}
+
+/**
+ * "needs your pick", unless "Nothing here needs your sign-off", or the sentence
+ * describes a later step ("its lane will need your approval once it rebases").
+ */
 function needsYour(line: string): boolean {
   return [NEEDS_YOUR, NEEDS_YOUR_ID].some(pattern =>
-    matchesOf(pattern, line).some(match => !negatedBefore(line, match.index))
+    matchesOf(pattern, line).some(
+      match =>
+        !negatedBefore(line, match.index) && !laterStepBefore(line, match.index)
+    )
+  );
+}
+
+/** Where the first sentence of `text` ends (its `.`, `?` or `!`), never after an abbreviation; -1 when it runs on. */
+function sentenceEndIn(text: string): number {
+  for (const match of text.matchAll(SENTENCE_END)) {
+    if (!abbreviationBefore(text, match.index + 1)) return match.index;
+  }
+  return -1;
+}
+
+/**
+ * Whether a match of the "nothing is asked" family is scoped to part of the work:
+ * "Nothing else needs you", "Nothing in the plan needs you yet, but please
+ * confirm the date". The matched text holds a scope word, or one of "except",
+ * "but", "until", "unless" or "other than" stands from the match to its
+ * sentence's end (at most `NOTHING_SCOPE_CHARS` characters past it). The
+ * sentence does not end after "e.g." or "Dr." (R13).
+ */
+function scopedStatement(line: string, match: RegExpExecArray): boolean {
+  if (NOTHING_SCOPE_WORD.test(match[0])) return true;
+  const after = match.index + match[0].length;
+  const rest = line.slice(after, after + NOTHING_SCOPE_CHARS);
+  const end = sentenceEndIn(rest);
+  return NOTHING_SCOPE_AFTER.test(
+    match[0] + (end >= 0 ? rest.slice(0, end) : rest)
+  );
+}
+
+/**
+ * The line says plainly that nothing is asked of the operator: a match of the
+ * "nothing is asked" family that is not scoped (#6738, R3).
+ */
+function saysNothingAsked(line: string): boolean {
+  return NOTHING_ASKED_FAMILY.some(pattern =>
+    matchesOf(pattern, line).some(match => !scopedStatement(line, match))
   );
 }
 
@@ -569,6 +758,33 @@ function nearestProse(
   return undefined;
 }
 
+/**
+ * v3 (#6738, R2): the lead-in puts a choice. Only its last sentence, the one
+ * that introduces the list, is read: it ends with `:` or `?` (or the whole line
+ * is a heading or a bold-only line), and it holds a choice word, a choice phrase,
+ * or asks "Which …". "The hook read its bullet lists as options." in an earlier
+ * sentence puts nothing.
+ */
+function leadPutsChoice(lead: Line | undefined): boolean {
+  if (!lead) return false;
+  const intro = sentencesOf(lead.text).at(-1)?.unit ?? "";
+  if (!LEAD_INTRO.test(intro) && !HEADING_OR_BOLD_ONLY.test(lead.text))
+    return false;
+  return (
+    OPTION_WORD.test(intro) || CHOICE_VERB.test(intro) || LEAD_WHICH.test(intro)
+  );
+}
+
+/**
+ * v3 (#6738, R2): the trailer puts a choice only as a choice phrase in its first
+ * sentence ("Pick one and I'll start"); "use the New Session page and pick …"
+ * is a how-to.
+ */
+function trailPutsChoice(trail: Line | undefined): boolean {
+  if (!trail) return false;
+  return CHOICE_VERB.test(sentencesOf(trail.text)[0]?.unit ?? "");
+}
+
 function findAmbiguous(kept: Line[]): Hit[] {
   const hits: Hit[] = [];
   for (const line of kept) {
@@ -596,11 +812,7 @@ function findAmbiguous(kept: Line[]): Hit[] {
     let optionItem = false;
     for (let i = run[0]; i <= run[1] && !optionItem; i++)
       optionItem = OPTION_ITEM.test(kept[i]!.text);
-    if (
-      (lead && OPTION_WORD.test(lead.text)) ||
-      (trail && OPTION_WORD.test(trail.text)) ||
-      optionItem
-    ) {
+    if (leadPutsChoice(lead) || trailPutsChoice(trail) || optionItem) {
       hits.push({ signal: "option_list", line: (lead ?? kept[run[0]]!).index });
     }
   }
@@ -703,6 +915,22 @@ function excerptFor(hit: Hit, lines: readonly string[], kept: Line[]): string {
 }
 
 /**
+ * A strong ask's uncut title source (#6739): a block's first line, else its
+ * question, else its own sentence, else its line, all raw.
+ */
+function titleSourceFor(
+  hit: Hit,
+  question: string | null,
+  lines: readonly string[],
+  kept: Line[]
+): string {
+  if (isBlock(hit)) return (lines[hit.line] ?? "").trim();
+  if (question) return question;
+  if (hit.raw !== undefined) return hit.raw.trim();
+  return (kept.find(l => l.index === hit.line)?.raw ?? "").trim();
+}
+
+/**
  * A weak ask's excerpt: the ask tail when it fits; else its first line's head,
  * " … ", and the tail's end, so a question above long options survives.
  */
@@ -726,11 +954,16 @@ export function classifyDecisionSignals(text: string): DecisionSignals {
     askTexts: [],
     askTextsCut: false,
     question: null,
+    titleSource: null,
+    nothingAsked: false,
   };
   if (typeof text !== "string" || text.trim() === "") return none;
   const window = readWindow(text);
   const { lines } = window;
   const kept = proseLines(window);
+  // The kept lines that say plainly that nothing is asked (#6738).
+  const plain = kept.filter(l => saysNothingAsked(l.text));
+  const nothingAsked = plain.length > 0;
   const strong = findHits(kept);
   let hits = strong;
   if (strong.length === 0) {
@@ -738,14 +971,11 @@ export function classifyDecisionSignals(text: string): DecisionSignals {
     // A "nothing needs you" line at or after the last weak ask withdraws it; one
     // above a later ask (one lane reporting, the next one asking) does not.
     const last = Math.max(-1, ...hits.map(h => h.line));
-    if (
-      hits.length > 0 &&
-      kept.some(l => l.index >= last && NOTHING_ASKED.test(l.text))
-    ) {
+    if (hits.length > 0 && plain.some(l => l.index >= last)) {
       hits = [];
     }
   }
-  if (hits.length === 0) return none;
+  if (hits.length === 0) return { ...none, nothingAsked };
   const signals = SIGNAL_ORDER.filter(s => hits.some(h => h.signal === s));
   const best = hits.reduce((a, b) =>
     rank(b) < rank(a) || (rank(b) === rank(a) && b.line >= a.line) ? b : a
@@ -754,6 +984,7 @@ export function classifyDecisionSignals(text: string): DecisionSignals {
     const from = Math.min(...hits.map(h => h.line));
     const tailLines = kept.filter(l => l.index >= from);
     const tail = tailLines.map(l => l.raw).join("\n");
+    const question = lastQuestion(tailLines);
     return {
       verdict: "ambiguous",
       signals,
@@ -761,7 +992,9 @@ export function classifyDecisionSignals(text: string): DecisionSignals {
       matchText: normalizeForMatch(tail),
       askTexts: [],
       askTextsCut: false,
-      question: lastQuestion(tailLines),
+      question,
+      titleSource: question ?? tailLines[0]?.raw.trim() ?? null,
+      nothingAsked,
     };
   }
   const ordered = [...strong].sort(
@@ -777,6 +1010,10 @@ export function classifyDecisionSignals(text: string): DecisionSignals {
         l => l.index >= best.line && l.index < blockEnd(lines, best.line)
       )
     : kept.filter(l => l.index === best.line);
+  const question = lastQuestion(
+    ownLines,
+    best.sentence ? { line: best.line, sentence: best.sentence } : undefined
+  );
   return {
     verdict: "decision",
     signals,
@@ -784,9 +1021,8 @@ export function classifyDecisionSignals(text: string): DecisionSignals {
     matchText: normalizeForMatch(ownText(best, lines, kept)),
     askTexts,
     askTextsCut: allAsks.length > askTexts.length,
-    question: lastQuestion(
-      ownLines,
-      best.sentence ? { line: best.line, sentence: best.sentence } : undefined
-    ),
+    question,
+    titleSource: titleSourceFor(best, question, lines, kept),
+    nothingAsked,
   };
 }

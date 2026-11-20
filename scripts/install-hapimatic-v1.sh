@@ -55,7 +55,7 @@
 #   -h | --help                        this help
 set -uo pipefail
 
-INSTALLER_VERSION="1.5.0"
+INSTALLER_VERSION="1.6.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MODE="install"                         # install | fetch | doctor | uninstall
@@ -905,13 +905,12 @@ cmd_doctor() {
     else dr_info "bun" "absent — BUILD-only, not required at runtime"; fi
     dr_info "gitleaks" "maintainer-only, not an install prerequisite"
 
-    # auth mode per harness (#3984; report only — never read or print values)
+    # auth mode per harness (#3984; report only — never read or print values). #6837: Hapimatic
+    # sessions run on accounts signed in under Provider Accounts (#6800), so the doctor reads no
+    # credential file: a terminal `claude` login in ~/.claude says nothing about Hapimatic sessions.
+    dr_info "auth mode (Claude)" "Hapimatic sessions run on accounts you sign in under Settings → Provider Accounts → Add account; a terminal 'claude' login (~/.claude) is for terminal claude only"
     if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
         dr_info "auth mode (Claude)" "API key present (ANTHROPIC_API_KEY set) — Claude Code bills it ahead of a subscription in any process that inherits it; run sessions on a key from Settings → Keys instead (workspace-scoped, sdk launcher only)"
-    elif [ -f "$HOME/.claude/.credentials.json" ] || [ -f "$HAPI_HOME_DIR/credentials.json" ]; then
-        dr_info "auth mode (Claude)" "subscription (OAuth credentials present) → sdk launcher by default; pty/tmux also run on a subscription"
-    else
-        dr_warn "auth mode (Claude)" "no Claude auth detected — run 'claude' once to sign in, or add a workspace-scoped API key in Settings → Keys (a key stored there is not detected by this check)"
     fi
     if [ -n "${GEMINI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then
         dr_info "auth mode (Gemini)" "API key present (API-key only per policy)"
