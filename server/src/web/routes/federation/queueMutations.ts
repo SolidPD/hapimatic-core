@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { receiveForwardedOrigin } from "../../../sync/callerOrigin";
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { defineCapability } from "@hapi/protocol";
@@ -103,7 +104,13 @@ export function createQueueMutationRoutes(
       }
 
       try {
+        // #6715 (R11): the hub's forwarded origin, kept as `via`.
+        const origin = receiveForwardedOrigin(
+          (body as { origin?: unknown } | null)?.origin,
+          "send"
+        );
         const result = engine.enqueueQueuedMessage({
+          ...(origin ? { origin } : {}),
           sessionId,
           namespace: session.namespace,
           body: parsed.data.body,
@@ -231,12 +238,24 @@ export function createQueueMutationRoutes(
       }
 
       try {
-        const row = engine.updateQueuedMessageAt(
-          sessionId,
-          session.namespace,
-          position,
-          parsed.data.body
+        const origin = receiveForwardedOrigin(
+          (body as { origin?: unknown } | null)?.origin,
+          "send"
         );
+        const row = origin
+          ? engine.updateQueuedMessageAt(
+              sessionId,
+              session.namespace,
+              position,
+              parsed.data.body,
+              origin
+            )
+          : engine.updateQueuedMessageAt(
+              sessionId,
+              session.namespace,
+              position,
+              parsed.data.body
+            );
         if (!row) {
           return c.json({ error: "Queued message not found" }, 404);
         }

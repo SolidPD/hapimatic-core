@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { BillingCategoryService } from "../../../billingCategories/billingCategoryService";
 import type { Context } from "hono";
 import type { FederationConfig } from "@hapi/protocol";
 import type { SyncEngine } from "../../../sync/syncEngine";
@@ -36,6 +37,9 @@ import type { WebAppEnv } from "../../middleware/auth";
 import type { NotificationService } from "../../../notifications/notificationService";
 
 export type FederationDeps = {
+  // Issue #6779: the billing-category service, for the two receivers (and
+  // #6778's federation spawn). Absent: the receivers answer 404.
+  getBillingCategoryService?: () => BillingCategoryService | null;
   // Issue #6447: the Pins gate. Absent reads as closed, so a federation test stub
   // that omits it serves no pin route and no count.
   pinsEnabled?: boolean;
@@ -226,6 +230,11 @@ export function checkCallerNamespace(
  * one shared mesh secret, and the user's JWT is signed by the sending node.
  * The routes #6224's later PRs add will use the strict `checkCallerNamespace`
  * instead, because only a node that sends the header knows them.
+ *
+ * #5291: the message-send receiver (`POST /federation/sessions/:id/messages`)
+ * uses this check for the same reason: no sender forwarded the header on that
+ * route before #5291. `since` names the change a header-less sender predates,
+ * so the warning stays accurate for each route.
  */
 const NAMESPACE_ABSENT_WARN_INTERVAL_MS = 60 * 60 * 1000;
 const namespaceAbsentWarnedAt = new Map<string, number>();
@@ -234,7 +243,8 @@ export function checkCallerNamespaceIfPresent(
   c: Context<WebAppEnv>,
   session: { namespace: string },
   deps: Pick<FederationDeps, "errorLogger">,
-  route: string
+  route: string,
+  since = "#6224"
 ): Response | null {
   const callerNamespace = c.req.header("x-hapi-caller-namespace");
   if (callerNamespace === undefined) {
@@ -243,7 +253,7 @@ export function checkCallerNamespaceIfPresent(
     if (last === undefined || now - last >= NAMESPACE_ABSENT_WARN_INTERVAL_MS) {
       namespaceAbsentWarnedAt.set(route, now);
       deps.errorLogger?.warn(
-        `Federation ${route} request carried no caller namespace (a sender built before #6224); allowed`,
+        `Federation ${route} request carried no caller namespace (a sender built before ${since}); allowed`,
         { category: "federation-namespace-absent", context: { route } }
       );
     }

@@ -10,8 +10,10 @@ import {
 } from "@/accounts/accountConfigDir";
 import {
   fingerprintedFlagIsStale,
+  logRotationValue,
   refreshTokenFingerprint,
   rotateIsolatedCredentials,
+  withRefreshDeadline,
   withUnrefreshableFlag,
   withoutFailedTokenFingerprint,
   type SiblingBindingScan,
@@ -36,6 +38,8 @@ import type {
 } from "@hapi/protocol/accounts";
 import {
   HOST_CHAIN_SHARED_REASON,
+  describeExpiresIn,
+  finiteExpiresIn,
   isEnvTokenAccount,
 } from "@hapi/protocol/accounts";
 
@@ -109,6 +113,17 @@ export interface RefreshResult {
   refreshToken: string;
   /** Unix epoch ms. */
   expiresAt: number;
+  /**
+   * Issue #6161 (R5): the response's `refresh_token_expires_in` (seconds) when
+   * it is a finite number, else null. A rotation only ever SHORTENS the
+   * deadline with it (`refreshDeadline`, `@hapi/protocol`).
+   */
+  refreshTokenExpiresIn: number | null;
+  /**
+   * Issue #6161 (R20): the non-secret tag the rotation log line prints for the
+   * raw value — the number, `absent`, or `non-number:<typeof>`.
+   */
+  refreshTokenExpiresInTag: string;
 }
 
 /**
@@ -134,6 +149,8 @@ interface RefreshTokenResponse {
   access_token: string;
   refresh_token?: string;
   expires_in: number;
+  /** Issue #6161: the refresh token's lifetime in seconds, when the server sends it. */
+  refresh_token_expires_in?: unknown;
 }
 
 /**
@@ -199,6 +216,10 @@ export async function refreshOAuthToken(
         accessToken: data.access_token,
         refreshToken: data.refresh_token ?? refreshToken,
         expiresAt: now() + data.expires_in * 1000,
+        refreshTokenExpiresIn: finiteExpiresIn(data.refresh_token_expires_in),
+        refreshTokenExpiresInTag: describeExpiresIn(
+          data.refresh_token_expires_in
+        ),
       };
     }
     // Non-2xx — read the OAuth error code for diagnostics (it is NOT a secret).
@@ -267,8 +288,8 @@ export interface TokenRefreshServiceOptions {
   isIsolatedAccount?: (accountUuid: string) => Promise<boolean>;
   /**
    * Issue #1507: called after each successful proactive or reactive refresh with
-   * the refreshed `accountUuid`. Fires from `refreshOnceImpl` AFTER `persistPatch`
-   * completes, for BOTH scheduled (`tick`) and reactive (`handleAuthFailure`)
+   * the refreshed `accountUuid`. Fires from `refreshOnceImpl` AFTER its store write
+   * (`persistMerge`, #6161) completes, for BOTH scheduled (`tick`) and reactive (`handleAuthFailure`)
    * refreshes. The daemon uses this to restart any sessions bound to the
    * refreshed account.
    *
@@ -1738,12 +1759,28 @@ export class TokenRefreshService {
     }
     try {
       const result = await this.refreshFn(refreshToken);
-      await this.persistPatch(account.accountUuid, {
-        accessToken: result.accessToken,
-        refreshToken: result.refreshToken,
-        expiresAt: result.expiresAt,
-        lastRefreshedAt: this.now(),
-      });
+      // Issue #6161 (R5): a merge against the record read under the lock (not a
+      // patch built before it), so the deadline follows Claude Code's refresh
+      // rule over the CURRENT value and never moves later.
+      const refreshedAt = this.now();
+      await this.persistMerge(account.accountUuid, current =>
+        withRefreshDeadline(
+          {
+            ...current,
+            accessToken: result.accessToken,
+            refreshToken: result.refreshToken,
+            expiresAt: result.expiresAt,
+            lastRefreshedAt: refreshedAt,
+          },
+          refreshedAt,
+          result.refreshTokenExpiresIn
+        )
+      );
+      logRotationValue(
+        account.accountUuid,
+        result.refreshTokenExpiresInTag,
+        refreshedAt
+      );
       logger.info(
         `[TOKEN_REFRESH] refreshed account ${account.accountUuid} (${account.emailAddress})`
       );

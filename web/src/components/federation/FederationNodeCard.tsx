@@ -18,9 +18,12 @@ import {
   severityToColor,
   LATENCY_FULL_SCALE_MS,
 } from "./federationHealthColors";
+import type { NodeAccountHealth } from "@hapi/protocol";
 import { ActiveAccountRow } from "./ActiveAccountRow";
 import { FederationStatusDot } from "./FederationStatusDot";
+import { NodeAccountRow } from "./NodeAccountRow";
 import { Button } from "@/components/ui/button";
+import type { AccountLabelSource } from "@/hooks/queries/useAccountLabels";
 
 export type NodeCardReading = {
   value: number | null;
@@ -43,6 +46,12 @@ export type FederationNodeCardProps = {
   };
   isLocalNode?: boolean;
   onOpen: (nodeId: string) => void;
+  /** #6884: this node's account-health row (the page's one read). */
+  accountRow?: NodeAccountHealth;
+  /** #6884: the account-health read has succeeded at least once. */
+  accountsRead?: boolean;
+  /** #6884: the UI host's account labels by uuid (the page's one read). */
+  accountLabels?: ReadonlyMap<string, AccountLabelSource>;
 };
 
 function formatLastSeen(ts: number | null): string {
@@ -106,6 +115,9 @@ function DimensionBar({
  * → navigates to the per-node detail view (R7). A chevron toggles the expanded
  * summary (mini-sparklines + Active Account row, R8) without navigating. The
  * card never renders full per-dimension meters — those live on #1444's page.
+ * Under the header, the accounts signed in on the node (#6884,
+ * `NodeAccountRow`): one line at any account count, so the collapsed card
+ * keeps one height; its controls never open the node.
  */
 export function FederationNodeCard({
   api,
@@ -117,11 +129,19 @@ export function FederationNodeCard({
   readings,
   isLocalNode,
   onOpen,
+  accountRow,
+  accountsRead = false,
+  accountLabels,
 }: FederationNodeCardProps) {
   const [expanded, setExpanded] = useState(false);
 
   const navigate = () => onOpen(nodeId);
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    // #6884 (in-path bug): only a key on the card itself opens the node. Enter
+    // or Space on a nested control (the expand chevron, the accounts line's
+    // controls) bubbles here; without this check the card cancelled the
+    // control's own activation and navigated instead.
+    if (e.target !== e.currentTarget) return;
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       navigate();
@@ -182,6 +202,17 @@ export function FederationNodeCard({
           />
         </Button>
       </div>
+
+      {/* #6884: the accounts on this node, one line whatever their count
+          (pattern C), always visible; its chevron opens the tiles in place. */}
+      <NodeAccountRow
+        api={api}
+        nodeId={nodeId}
+        nodeLabel={nodeLabel}
+        row={accountRow}
+        read={accountsRead}
+        labels={accountLabels}
+      />
 
       {/* Expanded summary: mini-sparklines + Active Account row. */}
       {expanded && (

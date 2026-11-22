@@ -13,7 +13,9 @@
  * (`cli/src/accounts/hostChainQuarantine.ts`): a sibling counts when its pid is
  * alive, its heartbeat is at most 180 s old or absent (a daemon built before
  * 1.0.1498, or in its first heartbeat interval), and its build is older by
- * `isOlderSiblingVersion` (`shared/src/buildVersion.ts`). Only `pid`,
+ * `isOlderSiblingVersion` (`shared/src/buildVersion.ts`), which since #6161
+ * (DEC-3) means older than 1.2.7, the first build without the watcher, for any
+ * own build at or above it (or a missing or unparsable version). Only `pid`,
  * `lastHeartbeatAt` and `startedWithCliVersion` are parsed out of each
  * `daemon.state.json`: the file also holds the daemon's control token, which
  * never leaves this module. Never throws.

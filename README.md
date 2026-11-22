@@ -155,8 +155,8 @@ is planned.
 
 ## Install and first session
 
-Install your agent CLI and sign in to it first (for Claude Code, run `claude` once). Then install
-Hapimatic with one command:
+Install your agent CLI first. For Claude Code, you sign your Claude account in once Hapimatic is
+running, under Settings → Provider Accounts → Add account. Then install Hapimatic with one command:
 
 ```bash
 curl -fsSL https://github.com/SolidPD/hapimatic-core/releases/latest/download/install-hapimatic-v1.sh | bash

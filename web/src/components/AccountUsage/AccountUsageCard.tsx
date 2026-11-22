@@ -368,6 +368,9 @@ export function AccountUsageCard(props: AccountUsageCardProps) {
           secondary={hasEmail || nickname !== primary ? primary : ""}
           planLabel={account.planLabel ?? undefined}
           alertNodes={alertNodes}
+          // #6161 (R13): the node items, so row 1's alert also lists an ending
+          // sign-in, read on the icon's own minute clock.
+          endingCandidates={nodeItems}
           score={account.score ?? null}
           // #5879: only rows whose meters are known decide a lock (the same
           // rule as the server's spawn refusal and the account picker). Page

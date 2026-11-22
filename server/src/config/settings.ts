@@ -126,6 +126,14 @@ export interface Settings {
     capHours?: number;
     typingQuietMinutes?: number;
   };
+  /**
+   * Issue #6779: `owner` true keeps the billing-category list on this node,
+   * false reads it through from the owner; unset applies the rule (no
+   * federation, or the hub). See `server/src/config/billingCategoriesConfig.ts`.
+   */
+  billingCategories?: {
+    owner?: boolean;
+  };
   /** Throughput telemetry (issue #6164); see `server/src/throughput/config.ts`. */
   throughput?: {
     disabled?: boolean;

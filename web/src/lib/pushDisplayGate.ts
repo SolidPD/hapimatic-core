@@ -45,9 +45,9 @@ export function getPreferenceKeyForType(
       return "usage";
     default:
       // Issue #4915: a push whose type is a notification kind name reads that
-      // kind's toggle, so one preference governs pop-up and push. No such push
-      // is sent today (`NOTIFICATION_KIND_DEFAULTS[k].pushType` is null for
-      // every non-push kind); this keeps the gate correct if one is added.
+      // kind's toggle, so one preference governs pop-up and push. #6161's
+      // `sign-in-ending` producer sends its own push of this shape (its kind's
+      // `pushType` is null), gated here by `signInEnding`.
       return type ? preferenceKeyForKind(type) : null;
   }
 }

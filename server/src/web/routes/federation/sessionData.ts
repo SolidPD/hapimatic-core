@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { receiveForwardedOrigin } from "../../../sync/callerOrigin";
 import {
   openPinCountField,
   readOpenPinCounts,
@@ -329,6 +330,17 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       if (!session) {
         return c.json({ error: "Session not found" }, 404);
       }
+      // #5291 (#1097): re-assert the caller's namespace before the active check,
+      // so another namespace's session reads as not found, never as inactive.
+      // Tolerant of a hub built before #5291, which sends no header (#6224 rule).
+      const namespaceError = checkCallerNamespaceIfPresent(
+        c,
+        session,
+        deps,
+        "POST /federation/sessions/:id/messages",
+        "#5291"
+      );
+      if (namespaceError) return namespaceError;
       if (!session.active) {
         return c.json({ error: "Session is inactive" }, 409);
       }
@@ -344,18 +356,12 @@ export function createSessionDataRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       // peer that dropped the origin field yields no origin here → the token gate
       // denies with provenance-rejected (never a silent mint with an empty
       // identity).
-      const fwd =
-        body.origin && typeof body.origin === "object"
-          ? body.origin
-          : undefined;
-      const federationOrigin: MessageOrigin | undefined = fwd
-        ? {
-            class: "federation",
-            uid: typeof fwd.uid === "number" ? fwd.uid : undefined,
-            sessionId:
-              typeof fwd.sessionId === "string" ? fwd.sessionId : undefined,
-          }
-        : undefined;
+      //
+      // #6715 (R3): the hub's verdict (evidence, door, raw facts, sender, its
+      // node id) is kept as `via` beside the `federation` class; uid and the raw
+      // sessionId stay on top. A forward without a valid verdict reads `none`.
+      const federationOrigin: MessageOrigin | undefined =
+        receiveForwardedOrigin(body.origin, "send");
 
       const result = await engine.sendMessage(sessionId, {
         text: body.text,

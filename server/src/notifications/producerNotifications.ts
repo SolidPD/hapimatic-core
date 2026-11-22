@@ -315,6 +315,39 @@ export function accountUnrefreshableNotification(args: {
 }
 
 /**
+ * Issue #6161 (R14): an account's sign-in on a node entered its warning window
+ * (or passed its deadline). One row per (account, node). The context names the
+ * node and the account explicitly, because the hub's event bridge stamps no
+ * node on a `notification` event, and the web's "Sign in again" action reads
+ * them. The title holds the account's nickname or email, so the caller passes
+ * `mirror: false` and the title never reaches `error_logs`.
+ */
+export function signInEndingNotification(args: {
+  accountUuid: string;
+  accountLabel: string;
+  nodeId: string;
+  nodeLabel: string;
+  daysLeft: number;
+  due: boolean;
+  estimated: boolean;
+}): ProducerNotification {
+  const days = args.daysLeft === 1 ? "1 day" : `${args.daysLeft} days`;
+  const when = args.due
+    ? "reached its end date"
+    : `ends in ${args.estimated ? "about " : ""}${days}`;
+  return {
+    kind: "sign-in-ending",
+    title: `Sign-in for ${args.accountLabel} on ${args.nodeLabel} ${when}`,
+    body: "Sign in again on that node before it ends, or sessions bound to it stop.",
+    context: {
+      accountUuid: args.accountUuid,
+      nodeId: args.nodeId,
+      nodeLabel: args.nodeLabel,
+    },
+  };
+}
+
+/**
  * A token-refresh restart whose respawn and rollback both failed: the session is
  * disconnected but reconnectable. Never coalesced.
  */

@@ -827,6 +827,9 @@ export async function submitPinAnswers(
       localId,
       sentFrom: "webapp",
       origin: context.origin,
+      // #6715 (R7): the token gate is a no-op on this server-composed message,
+      // defence in depth: the composer already neutralizes every code.
+      kind: "pin-answers",
       // #6452: recorded in the message's own transaction. The answers stay on
       // the submitting session's pins; a relay (#6454) stamps each with where it
       // was delivered, and marks the reports it carries, as the session's own

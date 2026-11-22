@@ -35,6 +35,10 @@ import { UserStore } from "./userStore";
 import { MidnightResetStateStore } from "./midnightResetStateStore";
 import { UsageHistoryStore } from "./usageHistoryStore";
 import { UsageAlertStore } from "./usageAlertStore";
+import {
+  SIGN_IN_DEADLINE_ALERTS_DDL,
+  SignInDeadlineAlertStore,
+} from "./signInDeadlineAlertStore";
 import { applyPinIdMigrations } from "./pinIds";
 import { applyBillableMigrations } from "./billable/schema";
 import { IntervalStore } from "./billable/intervalStore";
@@ -73,6 +77,17 @@ import {
   migrateBillableSwitchTables,
   setBillableSwitchStorageReady,
 } from "./billableSwitchStore";
+import {
+  BILLABLE_TRACKING_EVENT_COLUMNS,
+  BillableTrackingStore,
+  hasBillableTrackingStorage,
+  migrateBillableTrackingTables,
+} from "./billableTrackingStore";
+import {
+  BillingCategoryStore,
+  hasBillingCategoryStorage,
+  migrateBillingCategoryTables,
+} from "./billingCategoryStore";
 import { getConfiguration } from "../configuration";
 import { migrateRunnerIdentityDailyTable } from "./runnerIdentityDaily";
 
@@ -124,6 +139,7 @@ export {
   BillableSwitchStore,
   hasBillableSwitchStorage,
 } from "./billableSwitchStore";
+export { BillableTrackingStore } from "./billableTrackingStore";
 export { LeaseStore } from "./leaseStore";
 export { ApiKeyShareAuditStore } from "./apiKeyShareAuditStore";
 export type {
@@ -171,6 +187,7 @@ export type {
   InsertUsageSnapshot,
 } from "./usageHistoryStore";
 export { UsageAlertStore } from "./usageAlertStore";
+export { SignInDeadlineAlertStore } from "./signInDeadlineAlertStore";
 export { TurnStore } from "./turns/turnStore";
 export { PmRosterStore } from "./turns/pmRosterStore";
 export { BackgroundAgentUsageStore } from "./turns/backgroundAgentUsage";
@@ -236,6 +253,8 @@ export class Store {
   readonly queuedMessages: QueuedMessageStore;
   readonly usageHistory: UsageHistoryStore;
   readonly usageAlertState: UsageAlertStore;
+  /** Issue #6161 (R14): the sign-in deadline alert's one row per account. */
+  readonly signInDeadlineAlerts: SignInDeadlineAlertStore;
   readonly turns: TurnStore;
   /** Issue #6586: stored thinking intervals (billable time). */
   readonly billableIntervals: IntervalStore;
@@ -268,6 +287,8 @@ export class Store {
   readonly pins: PinStore;
   /** Issue #6646: the billable switch's storage (headers, reports, events, the copy). */
   readonly billableSwitch: BillableSwitchStore;
+  /** Issue #6778: the time-tracking record, its one writer and its pending starts. */
+  readonly billableTracking: BillableTrackingStore;
   /**
    * Issue #6646: both `sessions` columns and all six `billable_switch_*` tables
    * exist. When false the gate is `off` for this process and every summary
@@ -275,6 +296,15 @@ export class Store {
    * failed ALTER and a missing table would make every new session's insert throw.
    */
   readonly billableSwitchStorageReady: boolean;
+  /** Issue #6779: the billing-category list, its settings and its history. */
+  readonly billingCategories: BillingCategoryStore;
+  /**
+   * Issue #6779: all three `billing_categor*` tables exist. Separate from the
+   * billable switch's flag: a failed category table makes categories
+   * unavailable on this node (on an owner, `storage-not-ready`) and leaves the
+   * switch running.
+   */
+  readonly billingCategoriesReady: boolean;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
@@ -313,11 +343,20 @@ export class Store {
 
     // Issue #6646: ONE readiness check, after every migration step (the indexes
     // are left out: a missing index is slow, not wrong).
-    this.billableSwitchStorageReady = hasBillableSwitchStorage(this.db);
+    // #6778 (3.4 item 3): widened, so "the schema is there" also needs the
+    // tracking tables and the four history columns (the one writer uses them).
+    this.billableSwitchStorageReady =
+      hasBillableSwitchStorage(this.db) && hasBillableTrackingStorage(this.db);
     setBillableSwitchStorageReady(this.db, this.billableSwitchStorageReady);
     if (!this.billableSwitchStorageReady) {
       console.error(
-        "[Store] Billable switch storage is NOT ready (a column or a billable_switch_* table is missing): billable sessions stay off on this node and its sessions read as unknown (#6646)"
+        "[Store] Billable switch storage is NOT ready (a column, a billable_switch_* table or a billable_tracking_* table or column is missing): billable sessions stay off on this node and its sessions read as unknown (#6646, #6778)"
+      );
+    }
+    this.billingCategoriesReady = hasBillingCategoryStorage(this.db);
+    if (!this.billingCategoriesReady) {
+      console.error(
+        "[Store] Billing categories storage is NOT ready (a billing_categor* table is missing): this node cannot keep the category list; the billable switch is unaffected (#6779)"
       );
     }
 
@@ -368,6 +407,7 @@ export class Store {
     this.queuedMessages = new QueuedMessageStore(this.db);
     this.usageHistory = new UsageHistoryStore(this.db);
     this.usageAlertState = new UsageAlertStore(this.db);
+    this.signInDeadlineAlerts = new SignInDeadlineAlertStore(this.db);
     this.turns = new TurnStore(this.db);
     this.billableIntervals = new IntervalStore(this.db);
     this.turnMirror = new TurnMirrorStore(this.db);
@@ -388,6 +428,8 @@ export class Store {
     this.mcpServerStats = new McpServerStatsStore(this.db);
     this.pins = new PinStore(this.db);
     this.billableSwitch = new BillableSwitchStore(this.db);
+    this.billableTracking = new BillableTrackingStore(this.db);
+    this.billingCategories = new BillingCategoryStore(this.db);
   }
 
   /**
@@ -514,6 +556,27 @@ export class Store {
     this.migrateAddColumn("sessions", "billable", "INTEGER NOT NULL DEFAULT 0");
     this.migrateAddColumn("sessions", "billable_confirm", "TEXT");
     migrateBillableSwitchTables(this.db);
+    // Issue #6778 (3.4, DDL only): the four history columns and the three
+    // tracking tables, each statement in its own log-and-continue try, because
+    // `migrateAddColumn` throws outside any try on a type its pattern rejects.
+    for (const column of BILLABLE_TRACKING_EVENT_COLUMNS) {
+      try {
+        this.migrateAddColumn(
+          "billable_switch_events",
+          column,
+          column === "track_from" ? "INTEGER" : "TEXT"
+        );
+      } catch (error) {
+        console.error(
+          `[Store] Migration failed: billable_switch_events.${column} (#6778):`,
+          error
+        );
+      }
+    }
+    migrateBillableTrackingTables(this.db);
+    // Issue #6779: the billing-category tables, each in its own
+    // log-and-continue try, readiness checked apart from the switch's.
+    migrateBillingCategoryTables(this.db);
 
     // Issue #6647: the runner record (R2, R15), seven nullable columns read and
     // written only by getRunnerRecord / setRunnerRecord and never mapped into
@@ -727,6 +790,24 @@ export class Store {
     } catch (error) {
       console.error(
         `[Store] Migration failed: CREATE TABLE queued_messages:`,
+        error
+      );
+    }
+
+    // #6715 (R11): the caller origin recorded at enqueue and on edit (a JSON
+    // record only; the drain's mint rule does not read it). NULL on older rows.
+    try {
+      const queueCols = (
+        this.db.prepare("PRAGMA table_info(queued_messages)").all() as Array<{
+          name: string;
+        }>
+      ).map(col => col.name);
+      if (queueCols.length > 0 && !queueCols.includes("origin_json")) {
+        this.db.run("ALTER TABLE queued_messages ADD COLUMN origin_json TEXT");
+      }
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: queued_messages.origin_json:`,
         error
       );
     }
@@ -1049,6 +1130,18 @@ export class Store {
     } catch (error) {
       console.error(
         `[Store] Migration failed: CREATE TABLE usage_alert_state:`,
+        error
+      );
+    }
+
+    // Issue #6161 (R14): the sign-in deadline alert's de-dupe state — one row per
+    // account holding the deadline it was last alerted for. Additive and outside
+    // REQUIRED_TABLES, like usage_alert_state.
+    try {
+      this.db.run(SIGN_IN_DEADLINE_ALERTS_DDL);
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: CREATE TABLE sign_in_deadline_alerts:`,
         error
       );
     }

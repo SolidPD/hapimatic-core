@@ -167,6 +167,10 @@ const EVENT_KIND_ROWS: Record<
     label: "Model Reverted",
     description: "When a session falls back to a different model",
   },
+  signInEnding: {
+    label: "Sign-in Ending",
+    description: "When an account's sign-in on a node is about to end",
+  },
 };
 
 export type NotificationSettingsBodyProps = {

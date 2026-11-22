@@ -41,6 +41,19 @@ export interface AccountHealthReaderDeps {
   monogramStore?: Pick<MonogramStore, "get"> | null;
   usageService?: Pick<UsageService, "getLatest"> | null;
   now: () => number;
+  /**
+   * Issue #6161 (R8): the account folder file's deadline and the time in its
+   * sign-in marker, read live (`readFolderDeadline` / `readFolderSignInAt` in
+   * `isolatedCredentialsSync.ts`). Read only for an Anthropic `oauth` record;
+   * absent ⇒ null facts.
+   */
+  readFolderDeadline?: (accountUuid: string) => number | null;
+  readFolderSignInAt?: (accountUuid: string) => number | null;
+}
+
+/** A fact the envelope may carry: a finite number, else null. */
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 export function readNodeAccountHealth(
@@ -69,6 +82,29 @@ export function readNodeAccountHealth(
       !isNativeAnthropicAccount(raw)
         ? (raw as StoredAccount)
         : null;
+    // Issue #6161 (R8): the deadline facts, for an Anthropic `oauth` record only
+    // (`stored` also admits an env-token record). Facts, never the resolved
+    // deadline: consumers run the rule, so a rule fix needs no node redeploy.
+    // Only finite numbers pass: a JSON `1e999` is Infinity, which the entry
+    // schema rejects, and the parse below would then throw for the whole node.
+    const oauth = stored !== null && stored.authKind !== "env-token";
+    const deadlineFacts = oauth
+      ? {
+          signInDeadlineAt: finiteOrNull(stored.refreshTokenExpiresAt),
+          signInDeadlineSource: stored.refreshTokenExpiresAtSource ?? null,
+          folderDeadlineAt: finiteOrNull(
+            deps.readFolderDeadline?.(row.accountUuid)
+          ),
+          folderSignInAt: finiteOrNull(
+            deps.readFolderSignInAt?.(row.accountUuid)
+          ),
+        }
+      : {
+          signInDeadlineAt: null,
+          signInDeadlineSource: null,
+          folderDeadlineAt: null,
+          folderSignInAt: null,
+        };
     const entry = deriveAccountHealth(
       {
         provider: row.provider,
@@ -91,6 +127,7 @@ export function readNodeAccountHealth(
         // Already valid: the record schema reads a malformed history as absent,
         // so the hub never drops the entry for it on ingress.
         signInDeaths: stored?.signInDeaths,
+        ...deadlineFacts,
       },
       {
         nickname: deps.nicknameStore?.get(row.accountUuid) ?? null,

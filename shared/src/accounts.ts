@@ -33,6 +33,12 @@ export const SignInDeathSchema = z.object({
   signedInAt: z.number(),
   diedAt: z.number(),
   lastAliveAt: z.number(),
+  // Issue #6161 (R18, Task 3): the deadline {@link resolveSignInDeadline} gave
+  // the replaced login just before the sign-in that recorded this death, so each
+  // death can be checked against its prediction. The `.catch` matters: a plain
+  // `.optional()` would let one element holding `null` fail the element, and
+  // `signInDeaths`' own `.catch` would then drop the whole history.
+  predictedDeadlineAt: z.number().optional().catch(undefined),
 });
 
 export type SignInDeath = z.infer<typeof SignInDeathSchema>;
@@ -137,6 +143,19 @@ export const StoredAccountSchema = z
     // so a flag clear keeps it. A malformed history reads as absent, never as an
     // invalid record.
     signInDeaths: z.array(SignInDeathSchema).optional().catch(undefined),
+    // Issue #6161 (R1, R5): this instance's record of the login's sign-in
+    // deadline (epoch ms), the value Claude Code calls `refreshTokenExpiresAt`.
+    // Set only by the server sign-in (`accountLoginService.complete`, from
+    // {@link signInDeadline}) and the rotation merges (from
+    // {@link refreshDeadline}, which never moves it later). The folder file's
+    // own value is read live by the node reader, never copied here. A malformed
+    // value reads as absent and never invalidates the record.
+    refreshTokenExpiresAt: z.number().optional().catch(undefined),
+    // Issue #6161 (R1): where `refreshTokenExpiresAt` came from — `server` (the
+    // token response's `refresh_token_expires_in`) or `default` (the sign-in
+    // time plus {@link SIGN_IN_DEFAULT_LIFETIME_MS}). A plain string, so a later
+    // value never invalidates an older reader's record.
+    refreshTokenExpiresAtSource: z.string().optional().catch(undefined),
     // Issue #5020: the newest `expiresAt` this instance has observed on the
     // account's isolated `.credentials.json` (mirrored by the daemon each tick
     // and written by every Hapimatic rotation). Spawn-time recovery never seeds
@@ -246,9 +265,14 @@ export function trustedUnrefreshableAt(
  * death, and its last refresh as the last time known alive). Keeps the newest
  * {@link SIGN_IN_DEATHS_MAX}; undefined when there is nothing to carry. A
  * quarantine or a flag with no trusted time appends nothing.
+ *
+ * Issue #6161 (R18): `predictedDeadlineAt` is the deadline the rule gave the
+ * replaced login ({@link resolveSignInDeadline}); the appended death carries it
+ * only when it is a finite number, and omits the key otherwise.
  */
 export function carrySignInDeaths(
-  existing: StoredAccount | null
+  existing: StoredAccount | null,
+  predictedDeadlineAt?: number | null
 ): StoredAccount["signInDeaths"] {
   if (!existing) return undefined;
   const deaths: SignInDeath[] = [...(existing.signInDeaths ?? [])];
@@ -261,10 +285,261 @@ export function carrySignInDeaths(
         existing.lastRefreshedAt > 0
           ? existing.lastRefreshedAt
           : existing.capturedAt,
+      ...(typeof predictedDeadlineAt === "number" &&
+      Number.isFinite(predictedDeadlineAt)
+        ? { predictedDeadlineAt }
+        : {}),
     });
   }
   const kept = deaths.slice(-SIGN_IN_DEATHS_MAX);
   return kept.length > 0 ? kept : undefined;
+}
+
+/**
+ * Issue #6161 (R1): how long a sign-in lasts when the token response carries no
+ * `refresh_token_expires_in` — 30 days, Claude Code 2.1.321's own default (its
+ * constant `xU = 2592000000`). The three deaths measured before #6801 each came
+ * at the first refresh after a recorded deadline of this length (Matt G on ms1,
+ * 2026-11-02; Matt G on RP1, 2026-11-04; Mose on RP1, 2026-11-13).
+ */
+export const SIGN_IN_DEFAULT_LIFETIME_MS = 2_592_000_000;
+
+/** Claude Code 2.1.321's lower bound for a deadline (`sW`): 2025-01-01 UTC. */
+const DEADLINE_FLOOR_MS = Date.UTC(2025, 0, 1);
+/** Claude Code 2.1.321's upper bound for a deadline: now + 10 years. */
+const DEADLINE_HORIZON_MS = 315_360_000_000;
+/** Claude Code 2.1.321's stale guard in its 3-day notice: 3 days. */
+const DEADLINE_STALE_GUARD_MS = 3 * 86_400_000;
+/**
+ * A folder sign-in marker within this much of `capturedAt` names the same
+ * sign-in as the store record (the marker is written just after the record).
+ */
+const MARKER_SAME_SIGN_IN_MS = 60_000;
+
+/**
+ * Issue #6161 (R6): true when `value` may be used as a deadline — a finite number
+ * from 2025-01-01 UTC to `nowMs` + 10 years. This is Claude Code 2.1.321's `FNr`
+ * exactly. Anything else (a value in seconds, a string, NaN) reads as absent.
+ */
+export function isPlausibleDeadline(
+  value: unknown,
+  nowMs: number
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= DEADLINE_FLOOR_MS &&
+    value <= nowMs + DEADLINE_HORIZON_MS
+  );
+}
+
+/** A `refresh_token_expires_in` value Hapimatic uses: a finite positive number. */
+function isUsableExpiresIn(expiresIn: unknown): expiresIn is number {
+  return (
+    typeof expiresIn === "number" && Number.isFinite(expiresIn) && expiresIn > 0
+  );
+}
+
+/**
+ * Issue #6161 (R1): the deadline a sign-in at `nowMs` records — `nowMs` plus the
+ * response's `refresh_token_expires_in` seconds when it is a finite positive
+ * number (`server`), else `nowMs` plus {@link SIGN_IN_DEFAULT_LIFETIME_MS}
+ * (`default`), as Claude Code 2.1.321 does at its own sign-in. A server value
+ * whose deadline would fail {@link isPlausibleDeadline} (an overflow to
+ * Infinity, or more than 10 years ahead) is treated as absent (review CR-F6),
+ * so the store never holds a value every reader then ignores.
+ */
+export function signInDeadline(
+  nowMs: number,
+  expiresIn: unknown
+): { at: number; source: "server" | "default" } {
+  if (isUsableExpiresIn(expiresIn)) {
+    const at = nowMs + expiresIn * 1000;
+    if (isPlausibleDeadline(at, nowMs)) return { at, source: "server" };
+  }
+  return { at: nowMs + SIGN_IN_DEFAULT_LIFETIME_MS, source: "default" };
+}
+
+/**
+ * Issue #6161 (R2, R20): the non-secret tag a sign-in or rotation log line
+ * prints for a token response's raw `refresh_token_expires_in`: the number as
+ * text, `absent` when the key is missing, or `non-number:<typeof>` (so a string
+ * value is never logged as absent). It never holds the value of a non-number.
+ */
+export function describeExpiresIn(value: unknown): string {
+  if (value === undefined) return "absent";
+  if (typeof value === "number") return String(value);
+  return `non-number:${typeof value}`;
+}
+
+/**
+ * Issue #6161 (R1, R5): a response's `refresh_token_expires_in` as a finite
+ * number, or null for anything else (absent, a string, NaN).
+ */
+export function finiteExpiresIn(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Issue #6161 (R5): the deadline after a rotation at `nowMs`. Claude Code
+ * 2.1.321's refresh rule: a plausible old value and a usable response value give
+ * the earlier of the two; a plausible old value and no response value keep the
+ * old value; an absent or implausible old value stays absent (undefined). A
+ * rotation never moves a deadline later and never creates one.
+ */
+export function refreshDeadline(
+  old: unknown,
+  nowMs: number,
+  expiresIn: unknown
+): number | undefined {
+  if (!isPlausibleDeadline(old, nowMs)) return undefined;
+  return isUsableExpiresIn(expiresIn)
+    ? Math.min(old, nowMs + expiresIn * 1000)
+    : old;
+}
+
+/**
+ * Issue #6161 (R7): true when the login's own facts prove `value` is not its
+ * deadline — it refreshed successfully after `value` (`lastRefreshedAt > value`),
+ * or its access token outlives `value` by more than 3 days (Claude Code
+ * 2.1.321's own stale guard in its 3-day notice:
+ * `if(typeof e.expiresAt==="number"&&e.expiresAt>t+n)return null`). The ONE
+ * `disproved` test: {@link resolveSignInDeadline} and the folder seed use it.
+ */
+export function isDeadlineDisproved(
+  value: number,
+  lastRefreshedAt: number,
+  expiresAt: number
+): boolean {
+  return lastRefreshedAt > value || expiresAt > value + DEADLINE_STALE_GUARD_MS;
+}
+
+/** The facts {@link resolveSignInDeadline} reads, all epoch ms. */
+export interface SignInDeadlineFacts {
+  /** The store record's sign-in time. */
+  capturedAt: number;
+  /** The store record's last successful refresh (0 when never). */
+  lastRefreshedAt: number;
+  /** The store record's access-token expiry (0 when unknown). */
+  expiresAt: number;
+  /** The store record's own `refreshTokenExpiresAt` (a sign-in on a build with #6161). */
+  signInDeadline?: number | null;
+  /** The account folder file's `claudeAiOauth.refreshTokenExpiresAt`, read live. */
+  folderDeadline?: number | null;
+  /** The `writtenAt` of the account folder's sign-in marker, read live. */
+  folderSignInAt?: number | null;
+  nowMs: number;
+}
+
+/**
+ * Issue #6161 (R7): the ONE rule that resolves a login's sign-in deadline from
+ * its facts. Every consumer (the web, the CLI and the alert service) calls it, so
+ * a fix to the rule ships with the consumers' build, not with every node.
+ *
+ * Sources (a closed list, typed `string` so an older reader never rejects a new
+ * one): `folder`, `sign-in`, `folder-unconfirmed`, `estimated`,
+ * `marker-estimated`, `disproved`, `unknown` (and `unreported`, added by
+ * `resolveEntryDeadline` for a node that sends no facts). `folder-unconfirmed`,
+ * `estimated` and `marker-estimated` are estimates ("about").
+ *
+ * - A value the login has outlived is never the deadline ({@link isDeadlineDisproved}).
+ * - A folder value earlier than the sign-in is a stale carry and is ignored.
+ * - Signed in on a build with #6161 (a plausible `signInDeadline`): a folder value
+ *   at or after `capturedAt` that is not disproved wins (a later native or
+ *   sibling sign-in moved it); else the record's own deadline; else, when the
+ *   folder's marker names a later sign-in, the marker time plus 30 days.
+ * - Signed in before #6161: a folder value later than every estimate wins, because
+ *   only a later sign-in can produce it; a folder value no later than the
+ *   earliest live estimate is used, marked unconfirmed; else the earliest estimate
+ *   that is not disproved (`capturedAt` + 30 d, or the marker time + 30 d).
+ *
+ * The rule takes the EARLIEST candidate that is not disproved, never the latest.
+ * The marker is written whenever the account folder exists, but the tokens only
+ * when its credentials file exists, so a marker can name a sign-in whose chain is
+ * not in the folder; and nothing rewrites or deletes a marker, so it can be older
+ * than a later native sign-in. It can be stale in both directions: taking the
+ * latest candidate would then warn late or not at all, which is the outage #6161
+ * exists to prevent. Taking the earliest costs at most an early warning, and the
+ * first refresh after a wrong early candidate disproves it.
+ */
+export function resolveSignInDeadline(input: SignInDeadlineFacts): {
+  at: number | null;
+  source: string;
+} {
+  const { capturedAt, lastRefreshedAt, expiresAt, nowMs } = input;
+  if (!Number.isFinite(capturedAt) || capturedAt <= 0) {
+    return { at: null, source: "unknown" };
+  }
+  const disproved = (v: number): boolean =>
+    isDeadlineDisproved(v, lastRefreshedAt, expiresAt);
+  const folder = isPlausibleDeadline(input.folderDeadline, nowMs)
+    ? input.folderDeadline
+    : null;
+  const marker =
+    typeof input.folderSignInAt === "number" &&
+    Number.isFinite(input.folderSignInAt) &&
+    input.folderSignInAt > 0 &&
+    input.folderSignInAt <= nowMs
+      ? input.folderSignInAt
+      : null;
+  const est = capturedAt + SIGN_IN_DEFAULT_LIFETIME_MS;
+
+  // Signed in on a build with #6161: the record holds its own deadline.
+  if (isPlausibleDeadline(input.signInDeadline, nowMs)) {
+    const own = input.signInDeadline;
+    // A folder value equal to its own deadline is the sign-in's own
+    // write-through, not a confirmation (review CR-F2): it keeps the record's
+    // source, so a defaulted sign-in still reads as "about".
+    if (
+      folder !== null &&
+      folder !== own &&
+      folder >= capturedAt &&
+      !disproved(folder)
+    ) {
+      return { at: folder, source: "folder" };
+    }
+    if (!disproved(own)) return { at: own, source: "sign-in" };
+    if (marker !== null && marker > capturedAt + MARKER_SAME_SIGN_IN_MS) {
+      const markerEst = marker + SIGN_IN_DEFAULT_LIFETIME_MS;
+      if (!disproved(markerEst)) {
+        return { at: markerEst, source: "marker-estimated" };
+      }
+    }
+    return { at: null, source: "disproved" };
+  }
+
+  // Signed in before #6161, no marker.
+  if (marker === null) {
+    if (folder !== null && !disproved(folder)) {
+      if (folder > est) return { at: folder, source: "folder" };
+      if (folder >= capturedAt) {
+        return { at: folder, source: "folder-unconfirmed" };
+      }
+    }
+    if (!disproved(est)) return { at: est, source: "estimated" };
+    return { at: null, source: "disproved" };
+  }
+
+  // Signed in before #6161, with a marker.
+  const markerEst = marker + SIGN_IN_DEFAULT_LIFETIME_MS;
+  const later = Math.max(est, markerEst);
+  const lower = Math.min(capturedAt, marker);
+  const live = [est, markerEst]
+    .filter(v => !disproved(v))
+    .sort((a, b) => a - b);
+  if (folder !== null && !disproved(folder)) {
+    if (folder > later) return { at: folder, source: "folder" };
+    if (folder >= lower && (live.length === 0 || folder <= live[0])) {
+      return { at: folder, source: "folder-unconfirmed" };
+    }
+  }
+  if (live.length > 0) {
+    return {
+      at: live[0],
+      source: live[0] === est ? "estimated" : "marker-estimated",
+    };
+  }
+  return { at: null, source: "disproved" };
 }
 
 /**
@@ -298,6 +573,26 @@ export function parseSignInMarker(raw: string): string | null {
     if (marker.version !== 1) return null;
     const fp = marker.refreshFingerprint;
     return typeof fp === "string" && /^[0-9a-f]{64}$/.test(fp) ? fp : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Issue #6161 (DEC-1): the time a sign-in marker records (its `writtenAt`) as
+ * epoch ms, or null for anything that is not a version-1 marker with a parsable
+ * time. Never throws.
+ */
+export function parseSignInMarkerWrittenAt(raw: string): number | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const marker = parsed as Partial<SignInMarker>;
+    if (marker.version !== 1 || typeof marker.writtenAt !== "string") {
+      return null;
+    }
+    const at = Date.parse(marker.writtenAt);
+    return Number.isFinite(at) ? at : null;
   } catch {
     return null;
   }

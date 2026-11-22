@@ -8,6 +8,8 @@ import {
   StoredAccountSchema,
   carrySignInDeaths,
   isNativeAnthropicAccount,
+  resolveSignInDeadline,
+  signInDeadline,
 } from "@hapi/protocol";
 import { isTenantVm } from "@hapi/protocol/tenantMode";
 import {
@@ -24,6 +26,8 @@ import {
   type RedactedAccount,
 } from "./accountService";
 import {
+  readFolderDeadline,
+  readFolderSignInAt,
   syncIsolatedCredentials,
   writeSignInMarker,
   type FreshOauthToken,
@@ -200,6 +204,14 @@ export class AccountLoginService {
     opts: IsolatedCredentialsSyncOptions,
     now: () => number
   ) => string[];
+  private readonly readFolderDeadline: (
+    accountUuid: string,
+    opts: IsolatedCredentialsSyncOptions
+  ) => number | null;
+  private readonly readFolderSignInAt: (
+    accountUuid: string,
+    opts: IsolatedCredentialsSyncOptions
+  ) => number | null;
 
   constructor(
     private readonly accountService: AccountService,
@@ -225,6 +237,19 @@ export class AccountLoginService {
         opts: IsolatedCredentialsSyncOptions,
         now: () => number
       ) => string[];
+      /**
+       * #6161 (Task 3): the account folder's deadline and sign-in marker time,
+       * read to predict the replaced login's deadline (test seams; default to
+       * `readFolderDeadline` / `readFolderSignInAt`).
+       */
+      readFolderDeadline?: (
+        accountUuid: string,
+        opts: IsolatedCredentialsSyncOptions
+      ) => number | null;
+      readFolderSignInAt?: (
+        accountUuid: string,
+        opts: IsolatedCredentialsSyncOptions
+      ) => number | null;
       /** #4349: the tenant predicate (test seam; defaults to `isTenantVm`). */
       tenantVm?: () => boolean;
       /**
@@ -255,6 +280,8 @@ export class AccountLoginService {
     this.isolatedSyncOptions = opts.isolatedSyncOptions ?? {};
     this.syncIsolated = opts.syncIsolated ?? syncIsolatedCredentials;
     this.writeMarker = opts.writeSignInMarker ?? writeSignInMarker;
+    this.readFolderDeadline = opts.readFolderDeadline ?? readFolderDeadline;
+    this.readFolderSignInAt = opts.readFolderSignInAt ?? readFolderSignInAt;
   }
 
   /** Number of in-flight login attempts (test/diagnostic visibility). */
@@ -422,6 +449,14 @@ export class AccountLoginService {
     }
 
     const nowMs = this.now();
+    // Issue #6161 (R1, R2): this sign-in's deadline — the response's
+    // `refresh_token_expires_in` or the 30-day default, as Claude Code records
+    // it — and one log line naming the raw value as a non-secret tag (the
+    // number, `absent`, or `non-number:<typeof>`). Never a token, never an email.
+    const deadline = signInDeadline(nowMs, tokens.refreshTokenExpiresIn);
+    console.log(
+      `[accounts] sign-in ${accountUuid.slice(0, 8)}: refresh_token_expires_in=${tokens.refreshTokenExpiresInTag}`
+    );
     // Issue #6801 (R13, Task 15): the sign-in rebuilds the record, so carry the
     // existing death history over, plus the death of the record it replaces when
     // that record died with a trusted time. The new record itself is unflagged
@@ -436,7 +471,13 @@ export class AccountLoginService {
         `[accounts] sign-in for ${accountUuid}: could not read the existing record (${err instanceof Error ? err.message : String(err)}); its death history is not carried`
       );
     }
-    const signInDeaths = carrySignInDeaths(replaced);
+    // Issue #6161 (R18): the replaced login's predicted deadline, resolved
+    // BEFORE the write-through and the new marker change the folder, so each
+    // recorded death carries the prediction it can be checked against.
+    const signInDeaths = carrySignInDeaths(
+      replaced,
+      this.predictReplacedDeadline(replaced, accountUuid, nowMs)
+    );
     const candidate = {
       schema_version: 1 as const,
       accountUuid,
@@ -459,6 +500,8 @@ export class AccountLoginService {
       lastRefreshedAt: 0,
       unrefreshable: false,
       ...(signInDeaths ? { signInDeaths } : {}),
+      refreshTokenExpiresAt: deadline.at,
+      refreshTokenExpiresAtSource: deadline.source,
     };
 
     const parsed = StoredAccountSchema.safeParse(candidate);
@@ -487,6 +530,7 @@ export class AccountLoginService {
           refreshToken: tokens.refreshToken,
           expiresAt: tokens.expiresAt,
           scopes: tokens.scopes,
+          refreshTokenExpiresAt: deadline.at,
         },
         this.isolatedSyncOptions
       );
@@ -512,6 +556,43 @@ export class AccountLoginService {
       // A missing marker only keeps the flag on the other instances.
     }
     return { ok: true, account: toRedactedAccount(parsed.data) };
+  }
+
+  /**
+   * Issue #6161 (Task 3, R18): the deadline the shared rule gives the record a
+   * sign-in replaces, over its store facts and the folder's live deadline and
+   * marker time; null when there is no Anthropic oauth record or the rule
+   * cannot resolve one. Never throws: a failed read means no prediction.
+   */
+  private predictReplacedDeadline(
+    replaced: ReturnType<AccountService["getRaw"]>,
+    accountUuid: string,
+    nowMs: number
+  ): number | null {
+    if (!replaced || replaced.authKind === "env-token") return null;
+    try {
+      return resolveSignInDeadline({
+        capturedAt: replaced.capturedAt,
+        lastRefreshedAt: replaced.lastRefreshedAt ?? 0,
+        expiresAt: replaced.expiresAt ?? 0,
+        signInDeadline: replaced.refreshTokenExpiresAt ?? null,
+        folderDeadline: this.readFolderDeadline(
+          accountUuid,
+          this.isolatedSyncOptions
+        ),
+        folderSignInAt: this.readFolderSignInAt(
+          accountUuid,
+          this.isolatedSyncOptions
+        ),
+        nowMs,
+      }).at;
+    } catch (err) {
+      // Review F8: said, never silent, because the prediction is R18's evidence.
+      console.log(
+        `[accounts] sign-in ${accountUuid.slice(0, 8)}: replaced deadline not predicted: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return null;
+    }
   }
 
   /**

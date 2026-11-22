@@ -63,10 +63,15 @@ export function createBillableSwitchEventFeedRoutes(
         string,
         unknown
       > | null;
+      // #6778 PR-B (6.3): `schema` 2 asks for every kind, the four new fields
+      // and `cursorAt`; without it the page is the one a build before PR-B
+      // served. A receiver before PR-B reads only `cursor` and `limit`, so it
+      // ignores the key and answers its old page.
       return c.json(
         engine.getBillableSwitchEventFeedPage({
           cursor: typeof body?.cursor === "number" ? body.cursor : undefined,
           limit: typeof body?.limit === "number" ? body.limit : undefined,
+          schema: typeof body?.schema === "number" ? body.schema : undefined,
         })
       );
     }

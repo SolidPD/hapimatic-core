@@ -2,6 +2,7 @@
 import type { Database } from "bun:sqlite";
 import {
   BILLABLE_SWITCH_EVENT_KINDS,
+  BILLABLE_SWITCH_LEGACY_EVENT_KINDS,
   isBillableSwitchReasonForKind,
   type BillableConfirm,
   type BillableSwitchActorKind,
@@ -11,8 +12,19 @@ import {
   type BillableSwitchKeyKind,
   type BillableSwitchStartKind,
   type BillableSwitchVia,
+  type OldRouteAction,
+  type TrackingProject,
+  type TrackingRecord,
+  applyOldRoute,
+  partialBillableRecord,
 } from "@hapi/protocol";
 import { safeJsonParse } from "./json";
+import * as mirror from "./billableSwitchMirrorStore";
+import { writeTrackingState } from "./billableTrackingStore";
+import type {
+  BillableSwitchMirrorCursor,
+  BillableSwitchMirrorEvent,
+} from "./billableSwitchMirrorStore";
 
 // The billable switch's storage (issue #6646, Task 3). Two columns on each
 // node's own `sessions` row (`billable`, `billable_confirm`) and six tables:
@@ -222,6 +234,11 @@ export type BillableSwitchEventInsert = {
   loggedKnown?: boolean;
   label?: BillableSwitchLabel | null;
   at?: number;
+  /** #6778 (3.2): the whole record before and after, the origin, the tracking start. */
+  settingsBefore?: object | null;
+  settingsAfter?: object | null;
+  origin?: string | null;
+  trackFrom?: number | null;
 };
 
 const boolToInt = (v: boolean | null | undefined): number | null =>
@@ -271,12 +288,14 @@ export function insertBillableSwitchEvent(
          namespace, session_id, project_key, key_kind, kind, reason, start_kind,
          billable_before, billable_after, confirm_before, confirm_after,
          actor_kind, actor_session_id, actor_user_agent, via, entry_node_id,
-         timer_ms, unlogged_ms, logged_known, label_json, at
+         timer_ms, unlogged_ms, logged_known, label_json, at,
+         settings_before_json, settings_after_json, origin, track_from
        ) VALUES (
          @namespace, @session_id, @project_key, @key_kind, @kind, @reason, @start_kind,
          @billable_before, @billable_after, @confirm_before, @confirm_after,
          @actor_kind, @actor_session_id, @actor_user_agent, @via, @entry_node_id,
-         @timer_ms, @unlogged_ms, @logged_known, @label_json, @at
+         @timer_ms, @unlogged_ms, @logged_known, @label_json, @at,
+         @settings_before_json, @settings_after_json, @origin, @track_from
        )`
     )
     .run({
@@ -304,6 +323,14 @@ export function insertBillableSwitchEvent(
           ? null
           : JSON.stringify(ev.label),
       at: ev.at ?? Date.now(),
+      settings_before_json: ev.settingsBefore
+        ? JSON.stringify(ev.settingsBefore)
+        : null,
+      settings_after_json: ev.settingsAfter
+        ? JSON.stringify(ev.settingsAfter)
+        : null,
+      origin: ev.origin ?? null,
+      track_from: ev.trackFrom ?? null,
     });
   return Number(result.lastInsertRowid);
 }
@@ -331,7 +358,30 @@ type EventRow = {
   logged_known: number;
   label_json: string | null;
   at: number;
+  settings_before_json?: string | null;
+  settings_after_json?: string | null;
+  origin?: string | null;
+  track_from?: number | null;
 };
+
+const asObject = (json: string | null | undefined): object | null => {
+  const v = safeJsonParse(json ?? null);
+  return v !== null && typeof v === "object" && !Array.isArray(v) ? v : null;
+};
+
+/** #6778 (6.3): the kinds and fields a build before PR-B can parse. */
+export function toLegacyEvent(ev: BillableSwitchEvent): BillableSwitchEvent {
+  const {
+    settingsBefore: _b,
+    settingsAfter: _a,
+    origin: _o,
+    trackFrom: _t,
+    ...rest
+  } = ev;
+  return rest as BillableSwitchEvent;
+}
+
+const LEGACY_KIND_CLAUSE = ` AND kind IN (${BILLABLE_SWITCH_LEGACY_EVENT_KINDS.map(k => `'${k}'`).join(", ")})`;
 
 function rowToEvent(row: EventRow): BillableSwitchEvent {
   const label = safeJsonParse(row.label_json);
@@ -363,6 +413,16 @@ function rowToEvent(row: EventRow): BillableSwitchEvent {
       label !== null && typeof label === "object" && !Array.isArray(label)
         ? (label as Record<string, unknown>)
         : null,
+    settingsBefore: asObject(row.settings_before_json) as Record<
+      string,
+      unknown
+    > | null,
+    settingsAfter: asObject(row.settings_after_json) as Record<
+      string,
+      unknown
+    > | null,
+    origin: row.origin ?? null,
+    trackFrom: row.track_from ?? null,
   };
 }
 
@@ -449,7 +509,14 @@ export type BillableSwitchSetResult =
       before: BillableSwitchState;
       after: BillableSwitchState;
       eventId: number | null;
+      /** #6778: the record after the write (null: untracked). */
+      record?: TrackingRecord | null;
     };
+
+/** An old-route write (#6778): also `notWaiting` for a Keep or Reverse of a record that is not waiting. */
+export type BillableSwitchRouteResult =
+  | BillableSwitchSetResult
+  | { found: true; notWaiting: true };
 
 export type BillableSwitchPeerReport = {
   nodeId: string;
@@ -467,20 +534,10 @@ export type BillableSwitchListedSession = {
   lastEventAt: number | null;
 };
 
-export type BillableSwitchMirrorEvent = BillableSwitchEvent & {
-  originNodeId: string;
-  mirrorSeq: number;
-  mirroredAt: number;
-};
-
-export type BillableSwitchMirrorCursor = {
-  originIncarnation: string;
-  cursor: number;
-  feedState: string;
-  lastOriginMaxId: number | null;
-  lastSyncAt: number | null;
-  lastAttemptAt: number | null;
-};
+export type {
+  BillableSwitchMirrorCursor,
+  BillableSwitchMirrorEvent,
+} from "./billableSwitchMirrorStore";
 
 const sameHeaders = (
   a: ReadonlyArray<
@@ -537,12 +594,93 @@ export class BillableSwitchStore {
   }
 
   /**
-   * Set one session's switch and append its event, in one IMMEDIATE
-   * transaction. "Changed" is judged on the pair (switch, confirm state): a
-   * write that leaves both as they are writes no event. The event's own fields
-   * are decided by `event(before)` INSIDE the transaction, so the kind (`off`
-   * or `reverse`, `on` or `keep`) is judged on the value that is replaced. A
-   * row of another namespace is not found and changes nothing.
+   * #6646's switch routes as a shorthand on the tracking record (#6778, 3.3,
+   * C2 = a): one old-route action through the one writer
+   * (`writeTrackingState`), in one IMMEDIATE transaction. "Waiting" is judged
+   * on the record, any status; the kind (`on`, `off`, `keep`, `reverse`, or
+   * `tracking` for a write that leaves the projection alone) is chosen inside
+   * the transaction. A write that changes nothing writes nothing. A row of
+   * another namespace is not found. `requireWaiting` (Keep and Reverse)
+   * answers `notWaiting` for a record that is not waiting.
+   */
+  setByOldRoute(
+    sessionId: string,
+    namespace: string,
+    input: {
+      action: OldRouteAction;
+      reason: string;
+      requireWaiting?: boolean;
+      /** The session's project and start, for a partial record (switch-on of an untracked session). */
+      project: TrackingProject;
+      trackFrom: number;
+      event: Omit<BillableSwitchSessionEventFields, "kind" | "reason">;
+    }
+  ): BillableSwitchRouteResult {
+    const run = this.db.transaction((): BillableSwitchRouteResult => {
+      const exists = this.db
+        .prepare("SELECT 1 AS one FROM sessions WHERE id = ? AND namespace = ?")
+        .get(sessionId, namespace);
+      if (exists == null) return { found: false };
+      const { projectKey, keyKind, ...fields } = input.event;
+      const result = writeTrackingState(this.db, {
+        namespace,
+        sessionId,
+        next: prior =>
+          applyOldRoute(prior, input.action, {
+            project: input.project,
+            createdVia: "switch",
+            trackFrom: input.trackFrom,
+          }),
+        requireWaiting: input.requireWaiting,
+        // A Keep or Reverse that leaves the projection alone (a waiting copy
+        // that is not Billable) is `tracking` with its own reason (3.2).
+        reasonFor: (kind, prior) =>
+          kind !== "tracking"
+            ? input.reason
+            : prior?.confirm !== "pending"
+              ? "settings"
+              : input.action === "keep" || input.action === "switch-on"
+                ? "confirm-kept"
+                : "confirm-reversed",
+        origin: "switch",
+        event: {
+          ...fields,
+          projectKey: projectKey ?? null,
+          keyKind: keyKind ?? null,
+        },
+      });
+      if (!result.ok) {
+        return result.code === "not_waiting"
+          ? { found: true, notWaiting: true }
+          : { found: false };
+      }
+      const before: BillableSwitchState = {
+        billable: result.before.billable,
+        confirm: result.before.billableConfirm,
+      };
+      const after: BillableSwitchState = {
+        billable: result.after.billable,
+        confirm: result.after.billableConfirm,
+      };
+      return {
+        found: true,
+        changed: result.changed,
+        before,
+        after,
+        eventId: result.eventId,
+        record: result.record,
+      };
+    });
+    return run.immediate();
+  }
+
+  /**
+   * Set one session's switch to a pair (switch, confirm state), through the one
+   * writer: the record is derived from the pair (switched on with no record: a
+   * partial Billable record; switched off: a Billable record turns
+   * Non-billable and is kept). The event's fields are decided by
+   * `event(before)` on the pair the write replaces. A write that changes
+   * nothing records nothing. The switch routes go through `setByOldRoute`.
    */
   setSwitch(
     sessionId: string,
@@ -553,46 +691,64 @@ export class BillableSwitchStore {
     const run = this.db.transaction((): BillableSwitchSetResult => {
       const row = this.db
         .prepare(
-          "SELECT billable, billable_confirm FROM sessions WHERE id = ? AND namespace = ?"
+          "SELECT billable, billable_confirm, created_at FROM sessions WHERE id = ? AND namespace = ?"
         )
         .get(sessionId, namespace) as {
         billable: number | null;
         billable_confirm: string | null;
+        created_at: number;
       } | null;
       if (row == null) return { found: false };
       const before: BillableSwitchState = {
         billable: row.billable === 1,
         confirm: asConfirm(row.billable_confirm),
       };
-      const after: BillableSwitchState = {
-        billable: next.billable,
-        confirm: next.billable ? next.confirm : null,
-      };
-      if (
-        before.billable === after.billable &&
-        before.confirm === after.confirm
-      ) {
-        return { found: true, changed: false, before, after, eventId: null };
-      }
-      const fields = event(before);
-      this.db
-        .prepare(
-          `UPDATE sessions SET billable = ?, billable_confirm = ?, seq = seq + 1
-            WHERE id = ? AND namespace = ?`
-        )
-        .run(after.billable ? 1 : 0, after.confirm, sessionId, namespace);
-      const eventId = insertBillableSwitchEvent(this.db, {
-        ...fields,
+      const { kind, reason, projectKey, keyKind, ...fields } = event(before);
+      const key = projectKey ?? "Other";
+      const result = writeTrackingState(this.db, {
         namespace,
         sessionId,
-        projectKey: fields.projectKey ?? null,
-        keyKind: fields.keyKind ?? null,
-        billableBefore: before.billable,
-        billableAfter: after.billable,
-        confirmBefore: before.confirm,
-        confirmAfter: after.confirm,
+        next: prior => {
+          if (next.billable) {
+            const base =
+              prior ??
+              partialBillableRecord({
+                project: { kind: keyKind ?? "path", key, name: key },
+                createdVia: "switch",
+                trackFrom: row.created_at,
+              });
+            return {
+              ...base,
+              billingStatus: "billable",
+              confirm: next.confirm,
+            };
+          }
+          if (prior === null) return null;
+          return prior.billingStatus === "billable"
+            ? { ...prior, billingStatus: "non-billable", confirm: null }
+            : { ...prior, confirm: null };
+        },
+        kind,
+        reasonFor: () => reason,
+        origin: "switch",
+        event: {
+          ...fields,
+          projectKey: projectKey ?? null,
+          keyKind: keyKind ?? null,
+        },
       });
-      return { found: true, changed: true, before, after, eventId };
+      if (!result.ok) return { found: false };
+      return {
+        found: true,
+        changed: result.changed,
+        before,
+        after: {
+          billable: result.after.billable,
+          confirm: result.after.billableConfirm,
+        },
+        eventId: result.eventId,
+        record: result.record,
+      };
     });
     return run.immediate();
   }
@@ -626,22 +782,31 @@ export class BillableSwitchStore {
 
   // ---- events -------------------------------------------------------------
 
-  /** A session's events, oldest first; only `namespace`'s when given. */
-  listEvents(sessionId: string, namespace?: string): BillableSwitchEvent[] {
+  /**
+   * A session's events, oldest first; only `namespace`'s when given.
+   * `legacyOnly` (#6778, 6.3): the seven old kinds without the four new fields.
+   */
+  listEvents(
+    sessionId: string,
+    namespace?: string,
+    opts?: { legacyOnly?: boolean }
+  ): BillableSwitchEvent[] {
+    const only = opts?.legacyOnly ? LEGACY_KIND_CLAUSE : "";
     const rows = (
       namespace === undefined
         ? this.db
             .prepare(
-              "SELECT * FROM billable_switch_events WHERE session_id = ? ORDER BY at ASC, id ASC"
+              `SELECT * FROM billable_switch_events WHERE session_id = ?${only} ORDER BY at ASC, id ASC`
             )
             .all(sessionId)
         : this.db
             .prepare(
-              "SELECT * FROM billable_switch_events WHERE session_id = ? AND namespace = ? ORDER BY at ASC, id ASC"
+              `SELECT * FROM billable_switch_events WHERE session_id = ? AND namespace = ?${only} ORDER BY at ASC, id ASC`
             )
             .all(sessionId, namespace)
     ) as EventRow[];
-    return rows.map(rowToEvent);
+    const events = rows.map(rowToEvent);
+    return opts?.legacyOnly ? events.map(toLegacyEvent) : events;
   }
 
   /** A namespace's events after an id, ascending; optionally only some kinds. */
@@ -1004,21 +1169,46 @@ export class BillableSwitchStore {
 
   // ---- the feed (this node's events, read by other nodes) -----------------
 
-  /** Rows with `id > cursor`, ascending, `limit` clamped to 1..1000. */
+  /**
+   * Rows with `id > cursor`, ascending, `limit` clamped to 1..1000. Without
+   * `includeTracking` (a puller that did not ask with `schema=2`, #6778 6.3) the
+   * `tracking` rows are left out IN THE SQL, before the limit, so a page of
+   * filtered rows can never wedge an older puller, and the four new fields are
+   * left out of every row. With it, the page also carries `cursorAt`, the `at`
+   * of the row whose id is the cursor (null when there is none, and for cursor
+   * 0), so a puller can see an origin restored from a backup that re-issued
+   * ids at or below its cursor (review S14).
+   */
   getEventFeedPage(
     cursor: number,
-    limit: number
-  ): { events: BillableSwitchEvent[]; nextCursor: number } {
+    limit: number,
+    opts?: { includeTracking?: boolean }
+  ): {
+    events: BillableSwitchEvent[];
+    nextCursor: number;
+    cursorAt?: number | null;
+  } {
     const n = Math.max(1, Math.min(Math.floor(limit) || 500, 1000));
+    const from = Math.max(0, Math.floor(cursor) || 0);
+    const legacy = opts?.includeTracking !== true;
     const rows = this.db
       .prepare(
-        `SELECT * FROM billable_switch_events WHERE id > ? ORDER BY id ASC LIMIT ${n}`
+        `SELECT * FROM billable_switch_events WHERE id > ?${legacy ? LEGACY_KIND_CLAUSE : ""} ORDER BY id ASC LIMIT ${n}`
       )
-      .all(Math.max(0, Math.floor(cursor) || 0)) as EventRow[];
-    const events = rows.map(rowToEvent);
+      .all(from) as EventRow[];
+    const events = legacy
+      ? rows.map(rowToEvent).map(toLegacyEvent)
+      : rows.map(rowToEvent);
     const nextCursor =
       events.length > 0 ? events[events.length - 1].id : cursor;
-    return { events, nextCursor };
+    if (legacy) return { events, nextCursor };
+    const atRow =
+      from > 0
+        ? (this.db
+            .prepare("SELECT at FROM billable_switch_events WHERE id = ?")
+            .get(from) as { at: number } | null)
+        : null;
+    return { events, nextCursor, cursorAt: atRow?.at ?? null };
   }
 
   getMaxEventId(): number {
@@ -1028,128 +1218,62 @@ export class BillableSwitchStore {
     return row?.max_id ?? 0;
   }
 
-  // ---- the copy of other nodes' events -----------------------------------
+  // ---- the copy of other nodes' events (`billableSwitchMirrorStore.ts`) ---
 
-  /**
-   * Copy a page of another node's events. An event never changes, so a row
-   * already copied collides on (origin, incarnation, event id, time) and is
-   * skipped; an id a restored database issues again has another time and is
-   * kept as a second row. Returns how many rows were added.
-   */
   upsertMirrorEvents(
     originNodeId: string,
     incarnation: string,
     rows: readonly BillableSwitchEvent[],
     now: number
   ): number {
-    if (rows.length === 0) return 0;
-    const run = this.db.transaction((): number => {
-      const stmt = this.db.prepare(
-        `INSERT INTO billable_switch_events_mirror (
-           origin_node_id, origin_incarnation, event_id, namespace, session_id,
-           kind, at, row_json, mirrored_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (origin_node_id, origin_incarnation, event_id, at) DO NOTHING`
-      );
-      let added = 0;
-      for (const r of rows) {
-        const res = stmt.run(
-          originNodeId,
-          incarnation,
-          r.id,
-          r.namespace,
-          r.sessionId ?? null,
-          r.kind,
-          r.at,
-          JSON.stringify(r),
-          now
-        );
-        added += res.changes;
-      }
-      return added;
-    });
-    return run.immediate();
+    return mirror.upsertMirrorEvents(
+      this.db,
+      originNodeId,
+      incarnation,
+      rows,
+      now
+    );
   }
 
   getMirrorCursor(originNodeId: string): BillableSwitchMirrorCursor | null {
-    const row = this.db
-      .prepare(
-        `SELECT origin_incarnation, cursor, feed_state, last_origin_max_id,
-                last_sync_at, last_attempt_at
-           FROM billable_switch_event_mirror_cursor WHERE origin_node_id = ?`
-      )
-      .get(originNodeId) as {
-      origin_incarnation: string;
-      cursor: number;
-      feed_state: string;
-      last_origin_max_id: number | null;
-      last_sync_at: number | null;
-      last_attempt_at: number | null;
-    } | null;
-    if (row == null) return null;
-    return {
-      originIncarnation: row.origin_incarnation,
-      cursor: row.cursor,
-      feedState: row.feed_state,
-      lastOriginMaxId: row.last_origin_max_id,
-      lastSyncAt: row.last_sync_at,
-      lastAttemptAt: row.last_attempt_at,
-    };
+    return mirror.getMirrorCursor(this.db, originNodeId);
   }
 
   setMirrorCursor(
     originNodeId: string,
     cursor: BillableSwitchMirrorCursor
   ): void {
-    this.db
-      .prepare(
-        `INSERT INTO billable_switch_event_mirror_cursor (
-           origin_node_id, origin_incarnation, cursor, feed_state,
-           last_origin_max_id, last_sync_at, last_attempt_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (origin_node_id) DO UPDATE SET
-           origin_incarnation = excluded.origin_incarnation,
-           cursor = excluded.cursor,
-           feed_state = excluded.feed_state,
-           last_origin_max_id = excluded.last_origin_max_id,
-           last_sync_at = excluded.last_sync_at,
-           last_attempt_at = excluded.last_attempt_at`
-      )
-      .run(
-        originNodeId,
-        cursor.originIncarnation,
-        cursor.cursor,
-        cursor.feedState,
-        cursor.lastOriginMaxId,
-        cursor.lastSyncAt,
-        cursor.lastAttemptAt
-      );
+    mirror.setMirrorCursor(this.db, originNodeId, cursor);
   }
 
-  /** The copied events of a session id, oldest first; only `namespace`'s when given. */
+  /** `legacyOnly` (#6778, 6.3): the seven old kinds, for the old history read. */
   listMirrorEvents(
     sessionId: string,
-    namespace?: string
+    namespace?: string,
+    opts?: { legacyOnly?: boolean }
   ): BillableSwitchMirrorEvent[] {
-    const rows = (
-      namespace === undefined
-        ? this.db
-            .prepare(
-              "SELECT * FROM billable_switch_events_mirror WHERE session_id = ? ORDER BY at ASC, mirror_seq ASC"
-            )
-            .all(sessionId)
-        : this.db
-            .prepare(
-              "SELECT * FROM billable_switch_events_mirror WHERE session_id = ? AND namespace = ? ORDER BY at ASC, mirror_seq ASC"
-            )
-            .all(sessionId, namespace)
-    ) as MirrorRow[];
-    return rows
-      .map(mirrorRowToEvent)
-      .filter((e): e is BillableSwitchMirrorEvent => e !== null);
+    return mirror.listMirrorEvents(
+      this.db,
+      sessionId,
+      namespace,
+      opts?.legacyOnly ? LEGACY_KIND_CLAUSE : ""
+    );
   }
 
-  /** A namespace's copied events after a mirror sequence, by arrival. */
+  /** The `at` of each copied row with this origin, incarnation and event id (S14). */
+  getMirrorEventAts(
+    originNodeId: string,
+    incarnation: string,
+    eventId: number
+  ): number[] {
+    return mirror.getMirrorEventAts(
+      this.db,
+      originNodeId,
+      incarnation,
+      eventId
+    );
+  }
+
   listMirrorEventsSince(
     namespace: string,
     afterMirrorSeq: number,
@@ -1157,72 +1281,20 @@ export class BillableSwitchStore {
   ): BillableSwitchMirrorEvent[] {
     const filter = kindFilter(opts?.kinds);
     if (!filter) return [];
-    const limit = Math.max(1, Math.min(opts?.limit ?? 500, 1000));
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM billable_switch_events_mirror
-          WHERE namespace = ? AND mirror_seq > ?${filter.clause}
-          ORDER BY mirror_seq ASC LIMIT ${limit}`
-      )
-      .all(namespace, afterMirrorSeq, ...filter.kinds) as MirrorRow[];
-    return rows
-      .map(mirrorRowToEvent)
-      .filter((e): e is BillableSwitchMirrorEvent => e !== null);
+    return mirror.listMirrorEventsSince(
+      this.db,
+      namespace,
+      afterMirrorSeq,
+      filter,
+      opts?.limit
+    );
   }
 
-  /** The namespaces under which copied events exist for a session id. */
   mirrorNamespacesForSession(sessionId: string): string[] {
-    const rows = this.db
-      .prepare(
-        "SELECT DISTINCT namespace FROM billable_switch_events_mirror WHERE session_id = ?"
-      )
-      .all(sessionId) as Array<{ namespace: string }>;
-    return rows.map(r => r.namespace);
+    return mirror.mirrorNamespacesForSession(this.db, sessionId);
   }
 
-  /** The copied header events of a namespace, by arrival. */
   listMirrorHeaderEvents(namespace: string): BillableSwitchMirrorEvent[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM billable_switch_events_mirror
-          WHERE namespace = ? AND kind IN ('header-on', 'header-off')
-          ORDER BY mirror_seq ASC`
-      )
-      .all(namespace) as MirrorRow[];
-    return rows
-      .map(mirrorRowToEvent)
-      .filter((e): e is BillableSwitchMirrorEvent => e !== null);
+    return mirror.listMirrorHeaderEvents(this.db, namespace);
   }
-}
-
-type MirrorRow = {
-  mirror_seq: number;
-  origin_node_id: string;
-  origin_incarnation: string;
-  event_id: number;
-  namespace: string;
-  session_id: string | null;
-  kind: string;
-  at: number;
-  row_json: string;
-  mirrored_at: number;
-};
-
-function mirrorRowToEvent(row: MirrorRow): BillableSwitchMirrorEvent | null {
-  const parsed = safeJsonParse(row.row_json);
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return null;
-  }
-  return {
-    ...(parsed as BillableSwitchEvent),
-    // The columns win over the copied JSON for the keys the copy is indexed by.
-    id: row.event_id,
-    namespace: row.namespace,
-    sessionId: row.session_id,
-    kind: row.kind as BillableSwitchEventKind,
-    at: row.at,
-    originNodeId: row.origin_node_id,
-    mirrorSeq: row.mirror_seq,
-    mirroredAt: row.mirrored_at,
-  };
 }

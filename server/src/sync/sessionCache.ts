@@ -31,6 +31,12 @@ import { requestWaitRef } from "../billable/predicate";
 import { newUuidV7 } from "../store/turns/ids";
 import type { BillableSwitchInitial } from "../store/sessions";
 import type { BillableSwitchStartContext } from "@hapi/protocol";
+import {
+  sweepExpiredPendingStarts,
+  TRACKING_PENDING_START_MAX_AGE_MS,
+  TRACKING_START_ERROR_CATEGORY,
+  type TrackingRegistration,
+} from "../billableSwitch/trackingStart";
 import { clampAliveTime } from "./aliveTime";
 import { EventPublisher } from "./eventPublisher";
 import { buildSessionRecord } from "./sessionRecord";
@@ -83,19 +89,22 @@ const NO_ALIVE_EDGES: SessionAliveResult = {
 };
 
 /** Issue #6646: how long a tag-keyed spawn entry (start context or parent link) is kept. */
-export const PENDING_BY_TAG_MAX_AGE_MS = 30 * 60 * 1000;
+export const PENDING_BY_TAG_MAX_AGE_MS = TRACKING_PENDING_START_MAX_AGE_MS;
 
 /** Issue #6646 (PR-2 item E4): the error-log category of a failed billable start. */
-export const BILLABLE_SWITCH_START_FAILURE_CATEGORY = "billable-switch-start";
+export const BILLABLE_SWITCH_START_FAILURE_CATEGORY =
+  TRACKING_START_ERROR_CATEGORY;
 
-/** Issue #6646: the start hook's input; it returns the new row's start value, or null. */
-export type BillableSwitchStartHook = (input: {
-  tag: string;
-  metadata: unknown;
-  namespace: string;
-  /** The queued start context, or null when the registration had nothing queued. */
-  context: BillableSwitchStartContext | null;
-}) => BillableSwitchInitial | null;
+/**
+ * Issue #6646: the start hook; it returns the new row's start value, or null.
+ * Since #6778 PR-B it reads the queued start itself, from the durable table,
+ * inside the registration transaction. `failed` is set on its second call,
+ * after its first call or the insert threw: it then decides the lost start
+ * (row 12, `hook-failed`).
+ */
+export type BillableSwitchStartHook = (
+  input: TrackingRegistration
+) => BillableSwitchInitial | null;
 
 export class SessionCache {
   private readonly sessions: Map<string, Session> = new Map();
@@ -133,17 +142,12 @@ export class SessionCache {
   > = new Map();
   /** Issue #6646: when each tag-keyed parent entry was queued (the 30-minute sweep). */
   private readonly pendingParentQueuedAt: Map<string, number> = new Map();
-  /**
-   * Issue #6646: the start context of a spawn, queued by TAG before the daemon
-   * RPC (exactly as the parent link above, for the same timeout-after-success
-   * reason) and handed to the start hook when the child registers. Kept across
-   * an uncoded spawn error; dropped on registration, on a coded refusal, and by
-   * the 30-minute sweep.
-   */
-  private readonly pendingBillableSwitchStartByTag: Map<
-    string,
-    { context: BillableSwitchStartContext; queuedAt: number }
-  > = new Map();
+  // Issue #6646, #6778 PR-B (ruling 6): the start context of a spawn, queued by
+  // TAG before the daemon RPC (as the parent link above, for the same
+  // timeout-after-success reason), waits in the durable table
+  // `billable_tracking_pending_starts`, so a restart keeps it. The start hook
+  // reads and settles it inside the registration transaction
+  // (`billableSwitch/trackingStart.ts`).
   /** Issue #6646: decides a new row's start value (installed by index.ts while the gate is on). */
   private billableSwitchStartHook: BillableSwitchStartHook | null = null;
   private billableSwitchStartFailures = 0;
@@ -406,22 +410,36 @@ export class SessionCache {
     // Issue #6646 (the plan's ordering rule 1): the lookup and the insert with its
     // start value first, then the parent link and the refresh (#6586's process
     // tracker goes after the refresh).
-    this.sweepPendingByTag();
-    const queued = this.peekPendingBillableSwitchStart(tag, namespace);
+    this.sweepParentQueue(Date.now());
     const hook = this.billableSwitchStartHook;
     const initial = hook
       ? (): BillableSwitchInitial | null => {
           try {
-            return hook({ tag, metadata, namespace, context: queued });
+            return hook({ tag, metadata, namespace });
           } catch (error) {
+            // #6778 PR-B: a throw in the hook is a lost start (row 12),
+            // counted, with its `start-lost` row in this same insert.
             this.noteBillableSwitchStartFailure(tag, error);
-            return null;
+            try {
+              return hook({ tag, metadata, namespace, failed: true });
+            } catch (second) {
+              // Review finding M2: the second failure is logged too, on the
+              // console: the failed start already has its one error-log row
+              // (#6646 PR-2 item E4: one row per failed start).
+              this.logBillableStartProblem(
+                `The lost start of session ${tag} could not be decided either: it registers untracked, with no start row.`,
+                { tag, reason: errorText(second) },
+                { errorLog: false }
+              );
+              return null;
+            }
           }
         }
       : undefined;
     let stored: StoredSession;
-    if (!initial) {
-      // No hook (the gate is not on, or a test): exactly the call made before #6646.
+    if (!hook || !initial) {
+      // No hook (the gate is not on, or a test): exactly the call made before
+      // #6646. Nothing is queued while the gate is not on.
       stored = this.store.sessions.getOrCreateSession(
         tag,
         metadata,
@@ -430,28 +448,39 @@ export class SessionCache {
       );
     } else {
       try {
-        stored = this.store.sessions.getOrCreateSessionWithFlag(
+        const result = this.store.sessions.getOrCreateSessionWithFlag(
           tag,
           metadata,
           agentState,
           namespace,
           initial
-        ).session;
+        );
+        stored = result.session;
+        // Found, not created: the queued start is spent (a reattach never leaves one).
+        if (!result.created)
+          this.spendPendingBillableSwitchStart(tag, namespace);
       } catch (error) {
-        // The billing step failed inside the insert (its event or its header
-        // write); the transaction rolled the row back. A billing feature must
-        // not stop a session from starting: register it non-billable, no event.
+        // The billing step failed inside the insert (its event or the writer);
+        // the transaction rolled the row back, and the queued entry with it. A
+        // billing feature must not stop a session from starting: register it
+        // untracked, then record the lost start (row 12, `hook-failed`).
         this.noteBillableSwitchStartFailure(tag, error);
-        stored = this.store.sessions.getOrCreateSession(
+        const plain = this.store.sessions.getOrCreateSessionWithFlag(
           tag,
           metadata,
           agentState,
           namespace
         );
+        stored = plain.session;
+        if (plain.created) {
+          this.writeLostStartAfterFailure(hook, stored.id, {
+            tag,
+            metadata,
+            namespace,
+          });
+        }
       }
     }
-    // Created or found, the queued start is spent (a reattach never leaves one).
-    if (queued) this.pendingBillableSwitchStartByTag.delete(tag);
     const session =
       this.refreshSession(stored.id) ??
       (() => {
@@ -463,26 +492,89 @@ export class SessionCache {
   }
 
   /**
-   * Issue #6646: the queued start context for a tag, when it belongs to this
+   * Issue #6646: a reattach spends the tag's live queued start of its own
    * namespace (a registration from another namespace under the same tag does
-   * not consume it). Not removed here: the caller removes it after the insert.
+   * not consume it). Best-effort: a billing feature never stops a registration.
    */
-  private peekPendingBillableSwitchStart(
+  private spendPendingBillableSwitchStart(
     tag: string,
     namespace: string
-  ): BillableSwitchStartContext | null {
-    const entry = this.pendingBillableSwitchStartByTag.get(tag);
-    if (!entry) return null;
-    const ns = entry.context.namespace;
-    if (ns !== undefined && ns !== namespace) return null;
-    return entry.context;
+  ): void {
+    try {
+      const entry = this.store.billableTracking.getPendingStart(tag);
+      if (
+        entry &&
+        entry.lostAt === null &&
+        (entry.namespace === null || entry.namespace === namespace)
+      ) {
+        this.store.billableTracking.deletePendingStart(tag);
+      }
+    } catch {
+      // The sweep removes it later.
+    }
+  }
+
+  /**
+   * #6778 PR-B: the insert failed and the row was registered untracked, so the
+   * lost start (row 12, `hook-failed`) is written in its own transaction.
+   */
+  private writeLostStartAfterFailure(
+    hook: BillableSwitchStartHook,
+    sessionId: string,
+    input: { tag: string; metadata: unknown; namespace: string }
+  ): void {
+    try {
+      const lost = hook({ ...input, failed: true });
+      if (!lost) return;
+      this.store.billableTracking.write({
+        namespace: input.namespace,
+        sessionId,
+        start: true,
+        next: () => lost.record,
+        reasonFor: () => lost.reason,
+        origin: lost.origin,
+        event: lost.event,
+      });
+    } catch (error) {
+      // Review finding M2: say that the start-lost row was not written.
+      this.logBillableStartProblem(
+        `The start-lost row of session ${input.tag} could not be written after its failed start; it is registered untracked with no start row.`,
+        { tag: input.tag, reason: errorText(error) },
+        { errorLog: false }
+      );
+    }
+  }
+
+  /**
+   * One console line and, unless `errorLog` is false, one error-log row
+   * (best-effort) about a start. A follow-up of a failed start is console-only,
+   * because that start already has its one error-log row.
+   */
+  private logBillableStartProblem(
+    message: string,
+    context: Record<string, unknown>,
+    opts: { errorLog?: boolean } = {}
+  ): void {
+    console.error(`[SessionCache] ${message}`, context);
+    if (opts.errorLog === false) return;
+    try {
+      this.store.errorLogs.createEntry({
+        severity: "error",
+        category: BILLABLE_SWITCH_START_FAILURE_CATEGORY,
+        source: "server",
+        message,
+        context: JSON.stringify(context),
+      });
+    } catch {
+      // The console line above stands.
+    }
   }
 
   private noteBillableSwitchStartFailure(tag: string, error: unknown): void {
     this.billableSwitchStartFailures += 1;
     const reason = error instanceof Error ? error.message : String(error);
     console.error(
-      `[SessionCache] Billable switch start failed for ${tag}; the session registers non-billable with no event (#6646):`,
+      `[SessionCache] Billable switch start failed for ${tag}; the session registers untracked, and a start-lost row records it when one can still be written (#6778):`,
       reason
     );
     // PR-2 item E4: also one row in the error log (Settings → Error Log), so an
@@ -493,7 +585,7 @@ export class SessionCache {
         severity: "error",
         category: BILLABLE_SWITCH_START_FAILURE_CATEGORY,
         source: "server",
-        message: `Billable switch start failed for session ${tag}: it started non-billable with no event (${this.billableSwitchStartFailures} since this server started).`,
+        message: `Billable switch start failed for session ${tag}: it starts untracked, and a start-lost row records it when one can still be written (${this.billableSwitchStartFailures} since this server started).`,
         context: JSON.stringify({
           tag,
           reason,
@@ -518,22 +610,42 @@ export class SessionCache {
   /**
    * Issue #6646: queue a spawn's start context by TAG, before the daemon RPC.
    * Kept across an uncoded spawn error on purpose (the call can time out after
-   * the daemon started the session); the late registration finds it.
+   * the daemon started the session); the late registration finds it. #6778
+   * PR-B: it is written to the durable table, so a restart keeps it (ruling 6).
+   * Never throws: a billing feature must not stop a spawn (the start then
+   * registers with no context).
    */
   queuePendingBillableSwitchStartByTag(
     tag: string,
     context: BillableSwitchStartContext
   ): void {
     this.sweepPendingByTag();
-    this.pendingBillableSwitchStartByTag.set(tag, {
-      context,
-      queuedAt: Date.now(),
-    });
+    try {
+      this.store.billableTracking.putPendingStart({
+        tag,
+        namespace: context.namespace ?? null,
+        kind: context.kind,
+        contextJson: JSON.stringify(context),
+        entryNodeId: context.entryNodeId ?? null,
+        queuedAt: Date.now(),
+      });
+    } catch (error) {
+      // Review finding M1 (first half): a dropped start is in the error log
+      // too, not only on the console.
+      this.logBillableStartProblem(
+        `Could not queue the billable start of session ${tag}: it registers with no start context, untracked (#6778).`,
+        { tag, reason: errorText(error) }
+      );
+    }
   }
 
   /** Issue #6646: drop a tag's queued start (a coded refusal proves no child exists). */
   deletePendingBillableSwitchStartByTag(tag: string): void {
-    this.pendingBillableSwitchStartByTag.delete(tag);
+    try {
+      this.store.billableTracking.deletePendingStart(tag);
+    } catch {
+      // The sweep removes it later.
+    }
   }
 
   /** Issue #6646: drop a tag's queued parent link (a coded refusal proves no child exists). */
@@ -542,9 +654,13 @@ export class SessionCache {
     this.pendingParentQueuedAt.delete(tag);
   }
 
-  /** Issue #6646: true while a tag has a queued start context (tests and diagnostics). */
+  /** Issue #6646: true while a tag has a live queued start (tests and diagnostics); a lost one is not live. */
   hasPendingBillableSwitchStart(tag: string): boolean {
-    return this.pendingBillableSwitchStartByTag.has(tag);
+    try {
+      return this.store.billableTracking.hasPendingStart(tag);
+    } catch {
+      return false;
+    }
   }
 
   /** Issue #6646: true while a tag has a queued parent link (tests and diagnostics). */
@@ -559,15 +675,21 @@ export class SessionCache {
    * `unattended` rule. This is also what ends the parent queue's slow leak (an
    * entry whose child never registers). Runs whenever either queue is touched
    * and on a timer (BillableSwitchService). Returns how many were dropped.
+   * #6778 PR-B: an expired start that carried settings is not dropped but
+   * marked lost (row 12 for its late registration, kept seven days), and counts
+   * as swept; the durable table is swept only while its storage is ready.
    */
   sweepPendingByTag(now: number = Date.now()): number {
     let dropped = 0;
-    for (const [tag, entry] of this.pendingBillableSwitchStartByTag) {
-      if (now - entry.queuedAt > PENDING_BY_TAG_MAX_AGE_MS) {
-        this.pendingBillableSwitchStartByTag.delete(tag);
-        dropped += 1;
-      }
+    if (this.store.billableSwitchStorageReady) {
+      dropped += sweepExpiredPendingStarts(this.store, now);
     }
+    return dropped + this.sweepParentQueue(now);
+  }
+
+  /** The parent queue's half of the sweep (run on every registration). */
+  private sweepParentQueue(now: number): number {
+    let dropped = 0;
     for (const [tag, queuedAt] of this.pendingParentQueuedAt) {
       if (now - queuedAt > PENDING_BY_TAG_MAX_AGE_MS) {
         this.pendingParentQueuedAt.delete(tag);
@@ -2568,4 +2690,9 @@ function completedBackgroundAgents(
     }
   }
   return out;
+}
+
+/** An error's message, for a log line. */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

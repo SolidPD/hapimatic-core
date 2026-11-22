@@ -15,6 +15,8 @@ import {
   resolveNotificationSession,
 } from "@/lib/notificationInbox";
 import { getSessionTitle } from "@/lib/sessionHelpers";
+import { signInAgainTarget } from "@/lib/notificationToast";
+import { requestRelogin } from "@/lib/reloginLink";
 
 /**
  * The session line of a notification's detail (issue #4916 R8). It resolves the
@@ -116,6 +118,9 @@ export function NotificationDetail({ row }: { row: StoredNotification }) {
       ),
     })),
   ];
+  // #6161 (DEC-4): a sign-in-ending row offers the re-login it warns of, here
+  // as well as on the pop-up, which lasts 5 s.
+  const signInTarget = signInAgainTarget(row);
 
   return (
     <div className="flex flex-col gap-3 pt-1">
@@ -134,6 +139,20 @@ export function NotificationDetail({ row }: { row: StoredNotification }) {
           sessionId={row.sessionId}
           sessionTitle={row.sessionTitle}
         />
+      )}
+      {signInTarget && (
+        <div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            data-testid="notification-sign-in-again"
+            title="Sign in again on that node"
+            onClick={() => requestRelogin(signInTarget)}
+          >
+            Sign in again
+          </Button>
+        </div>
       )}
       <KVGrid items={items} />
     </div>

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { receiveForwardedOrigin } from "../../sync/callerOrigin";
 import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import {
@@ -678,16 +679,11 @@ export function pinSubmissionResponse(
 /**
  * The origin a hub forwarded with a proxied Submit, classed `federation` on the
  * owning node with the original uid or session id, as `sessionData.ts` does for a
- * federated send. Absent when the hub sent none.
+ * federated send. Absent when the hub sent none. #6715 (R3): the hub's verdict is
+ * kept as `via`, `browser` only at the `pins-submit` door.
  */
 export function forwardedOrigin(value: unknown): MessageOrigin | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const fwd = value as { uid?: unknown; sessionId?: unknown };
-  return {
-    class: "federation",
-    uid: typeof fwd.uid === "number" ? fwd.uid : undefined,
-    sessionId: typeof fwd.sessionId === "string" ? fwd.sessionId : undefined,
-  };
+  return receiveForwardedOrigin(value, "pins-submit");
 }
 
 // ── Reads by pin ID (#6574) ───────────────────────────────────────────────

@@ -12,10 +12,19 @@ import {
 } from "../../federation/proxyFetchSignal";
 import type { WebAppEnv } from "../middleware/auth";
 import type { MessageOrigin } from "../../sync/sentFrom";
+import {
+  ORIGIN_CLASSES,
+  deriveCallerOrigin,
+  readRequestFacts,
+} from "../../sync/callerOrigin";
 import { defineCapability } from "@hapi/protocol";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
-import { refuseAgentMessage } from "./agentEscalation";
+import {
+  refuseAgentMessage,
+  resolveCallerSession,
+  type CallerSessionLookup,
+} from "./agentEscalation";
 
 const querySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
@@ -29,7 +38,7 @@ const querySchema = z.object({
  *  (headers + JWT) so a client cannot forge it. `.passthrough()` forward-compat. */
 const messageOriginSchema = z
   .object({
-    class: z.enum(["web-user", "cli-api", "federation", "bare-terminal"]),
+    class: z.enum(ORIGIN_CLASSES),
     uid: z.number().optional(),
     sessionId: z.string().optional(),
   })
@@ -49,12 +58,31 @@ const sendMessageBodySchema = z.object({
  * discriminator). An omitted header degrades a CLI send to `web-user` — the
  * documented, NON-adversarial-proof limitation (registry §5.3).
  */
-function deriveClientOrigin(c: Context<WebAppEnv>): MessageOrigin {
-  const cliSessionId = c.req.header("X-Hapi-Session-Id");
-  if (cliSessionId) {
-    return { class: "cli-api", sessionId: cliSessionId };
-  }
-  return { class: "web-user", uid: c.get("userId") };
+function deriveClientOrigin(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null
+): MessageOrigin {
+  // #6715 (R1, R2): the one caller-origin module decides the class, evidence,
+  // door and raw facts. The class rule is today's; the resolved sender is
+  // recorded apart from the raw header and is UNVERIFIED.
+  return deriveCallerOrigin(
+    readRequestFacts(
+      name => c.req.header(name),
+      c.get("userId"),
+      resolveCallerSession(c, engine)?.id
+    )
+  );
+}
+
+/** #6715 (R3): the forwarding node's federation id, when the registry knows it. */
+function forwarderNodeOf(registry: NodeRegistry): { forwarderNode?: string } {
+  const nodeId =
+    typeof registry.getLocalNodeId === "function"
+      ? registry.getLocalNodeId()
+      : undefined;
+  return typeof nodeId === "string" && nodeId.length > 0
+    ? { forwarderNode: nodeId }
+    : {};
 }
 
 export function createMessagesRoutes(
@@ -221,7 +249,7 @@ export function createMessagesRoutes(
           // #3331 (Task 5): origin derived from the authenticated context, never
           // the client body. The hardcoded sentFrom stays "webapp"; the origin
           // field is what fixes the CLI-mislabel and carries provenance.
-          origin: deriveClientOrigin(c),
+          origin: deriveClientOrigin(c, engine),
         });
         // #3124: a gate-class message hook can DENY delivery. Surface the typed
         // denial instead of a bare {ok:true} — a silent {ok:true} would vanish the
@@ -266,20 +294,23 @@ export function createMessagesRoutes(
       const registry = options?.getNodeRegistry?.();
       if (registry) {
         const sessionId = c.req.param("id");
+        // #5291: validate the body before the registry lookup. The lookup is
+        // namespace-blind, so a 400 only for an id some node holds (and a 404
+        // for any other id) would tell another namespace the session exists.
+        const body = await c.req.json().catch(() => null);
+        const parsed = sendMessageBodySchema.safeParse(body);
+        if (!parsed.success) {
+          return c.json({ error: "Invalid body" }, 400);
+        }
         const node = registry.findNodeForSession(sessionId);
         if (node) {
           const headers: Record<string, string> = {
             "Content-Type": "application/json",
+            // #5291: the peer re-asserts the caller's namespace (#1097).
+            "X-Hapi-Caller-Namespace": c.get("namespace"),
           };
           if (options?.federationApiToken) {
             headers["Authorization"] = `Bearer ${options.federationApiToken}`;
-          }
-
-          // Read the body once for forwarding
-          const body = await c.req.json().catch(() => null);
-          const parsed = sendMessageBodySchema.safeParse(body);
-          if (!parsed.success) {
-            return c.json({ error: "Invalid body" }, 400);
           }
 
           try {
@@ -297,9 +328,16 @@ export function createMessagesRoutes(
                 // authenticated client — otherwise zod strips it and the owning
                 // node mints an empty approved_by. The receiver re-classes it
                 // `federation` while preserving the original uid/session id.
+                //
+                // #6715 (R3): the forwarded origin carries the evidence, door,
+                // raw facts and sender the hub derived, plus the hub's node id
+                // (the forwarder, for the observe log).
                 body: JSON.stringify({
                   ...parsed.data,
-                  origin: deriveClientOrigin(c),
+                  origin: {
+                    ...deriveClientOrigin(c, engine),
+                    ...forwarderNodeOf(registry),
+                  },
                 }),
               }
             );

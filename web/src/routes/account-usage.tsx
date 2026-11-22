@@ -54,6 +54,7 @@ import {
   geminiPeerRows,
 } from "@/components/AccountUsage/ProviderSectionBodies";
 import { useAccountHealth } from "@/hooks/queries/useAccountHealth";
+import { SignInEndingList } from "@/components/AccountUsage/SignInEndingList";
 import { useApiKeys } from "@/hooks/queries/useApiKeys";
 import { ApiKeyCard } from "@/components/AccountUsage/ApiKeyCard";
 import { OtherWaysToAddPopover } from "@/components/AccountUsage/OtherWaysToAddPopover";
@@ -1037,6 +1038,9 @@ export default function AccountUsagePage(props?: { onBack?: () => void }) {
                 : undefined
             }
           >
+            {/* #6161 (R11): every (node, account) whose sign-in is ending, with a
+                "Sign in again" button; nothing when none is. */}
+            <SignInEndingList nodes={healthNodes} />
             {error != null && (
               <div
                 className="mb-3 rounded-lg border border-[var(--app-border)] bg-[var(--app-secondary-bg)] px-3 py-2 text-[length:var(--text-body)] text-[var(--toast-warning,#fbbf24)]"

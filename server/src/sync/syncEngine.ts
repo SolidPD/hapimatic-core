@@ -1026,6 +1026,8 @@ export class SyncEngine {
     registerApprovalTokenGate({
       getSessionMetadata: sid =>
         this.sessionCache.getSession(sid)?.metadata ?? undefined,
+      // #6715 (R8): the gated session's record, for its tag (self-send check).
+      getSession: sid => this.sessionCache.getSession(sid),
       config: loadApprovalTokensConfig(),
       hygieneTtlDays: loadApprovalHygieneConfig().hygieneTtlDays,
       log: (message, context) => this.errorLogger?.info(message, context),
@@ -3194,6 +3196,11 @@ export class SyncEngine {
       // through to MessageService.sendMessage, which stamps it into
       // content.meta.origin and forwards it to the message-hook stage.
       origin?: MessageOrigin;
+      // #6715 (R7): the server-only Pins answers mark, passed through.
+      kind?: "pin-answers";
+      // #6715 (R11): a drained message's queue record (`meta.queuedOrigin`);
+      // never passed to the hook stage.
+      queuedOrigin?: MessageOrigin;
       // #6452: an in-transaction record step (pins answers commit with their
       // message); see MessageService.sendMessage.
       record?: MessageRecordStep;
@@ -3216,6 +3223,8 @@ export class SyncEngine {
     namespace: string;
     body: string;
     clientGeneratedId?: string | null;
+    /** #6715 (R11): who queued the message (a record only). */
+    origin?: MessageOrigin;
     // Issue #3235: distinguishes a genuine user enqueue (default) from the
     // #1362 send-failure re-enqueue. QueueDrainObserver level-triggers a drain
     // ONLY on reason "enqueue" — a "requeue" MUST NOT re-drain, else a failing
@@ -3243,13 +3252,15 @@ export class SyncEngine {
     sessionId: string,
     namespace: string,
     position: number,
-    body: string
+    body: string,
+    origin?: MessageOrigin
   ): StoredQueuedMessage | null {
     const row = this.store.queuedMessages.updateAt(
       sessionId,
       namespace,
       position,
-      body
+      body,
+      origin
     );
     if (row) {
       this.eventPublisher.emit({
@@ -3347,10 +3358,14 @@ export class SyncEngine {
       // `provenance-rejected` by the token gate and DROPPED below — never a
       // silent grant with an empty identity; the user re-approves live. Both
       // drain sites (here + queueDrainObserver.drainOnce) behave identically.
+      //
+      // #6715 (R11): the queue row's origin is written as a RECORD
+      // (`meta.queuedOrigin`); no `origin` is passed, so the mint rule is as before.
       const result = await this.sendMessage(sessionId, {
         text: row.body,
         localId: row.id,
         sentFrom: "webapp",
+        ...(row.origin ? { queuedOrigin: row.origin } : {}),
       });
       // #3124: a gate-class message hook DENIED this queued message. A denial is
       // NOT a send failure — the row was already popped, so DROP it (do NOT
@@ -3374,6 +3389,7 @@ export class SyncEngine {
           sessionId,
           namespace: row.namespace,
           body: row.body,
+          ...(row.origin ? { origin: row.origin } : {}),
           clientGeneratedId: row.clientGeneratedId,
           reason: "requeue", // Issue #3235: a re-enqueue MUST NOT re-drain.
         });
@@ -3826,19 +3842,28 @@ export class SyncEngine {
    * Issue #6646 (Task 7b): one page of this node's billable switch record for a
    * puller, the rows after `cursor`, whole. `limit` is clamped to 1..1000 (500
    * by default). The incarnation is the turn ledger's (one per database).
+   * #6778 PR-B (6.3): only a puller that asks with `schema` 2 gets the
+   * `tracking` rows, the four new fields and `cursorAt`; any other gets the
+   * page a build before PR-B served.
    */
   getBillableSwitchEventFeedPage(opts: {
     cursor?: number;
     limit?: number;
+    schema?: number;
   }): BillableSwitchEventFeedPage {
     const cursor = Math.max(0, Math.floor(opts.cursor ?? 0));
     const limit = Math.min(Math.max(Math.floor(opts.limit ?? 500), 1), 1000);
-    const page = this.store.billableSwitch.getEventFeedPage(cursor, limit);
+    // 2 is `BILLABLE_SWITCH_FEED_SCHEMA` (shared); written out so this method
+    // stays the only place in this file that #6778 PR-B changes.
+    const page = this.store.billableSwitch.getEventFeedPage(cursor, limit, {
+      includeTracking: opts.schema === 2,
+    });
     return {
       incarnation: this.store.turns.getLedgerIncarnation(),
       maxEventId: this.store.billableSwitch.getMaxEventId(),
       events: page.events,
       nextCursor: page.nextCursor,
+      ...(page.cursorAt !== undefined ? { cursorAt: page.cursorAt } : {}),
     };
   }
 

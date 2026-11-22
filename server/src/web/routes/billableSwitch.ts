@@ -4,10 +4,12 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import {
   BILLABLE_SWITCH_EVENT_KINDS,
+  BILLABLE_SWITCH_LEGACY_EVENT_KINDS,
   BillableConfirmSchema,
   BillableSwitchActorSchema,
   BillableSwitchViaSchema,
   defineCapability,
+  redactTrackingEventForAgent,
   type BillableSwitchActor,
   type BillableSwitchEvent,
   type BillableSwitchMode,
@@ -26,6 +28,7 @@ import { billableSwitchGate } from "../middleware/billableSwitchGate";
 import {
   billableSwitchActor,
   billableSwitchVia,
+  isAgentRequest,
   refuseAgentBillableWrite,
 } from "./agentEscalation";
 import {
@@ -166,6 +169,22 @@ export function describeIssue(error: z.ZodError): string {
   if (!issue) return "Invalid body";
   const path = issue.path.join(".");
   return path ? `${path}: ${issue.message}` : issue.message;
+}
+
+/**
+ * 409 `tracking_reconcile_pending` (#6778 PR-B, 3.4 step 6): the start-up
+ * reconcile has not settled this session yet; a retry runs before each write
+ * and on a five-minute timer.
+ */
+export function reconcilePendingRefusal(c: Context): Response {
+  return c.json(
+    {
+      error:
+        "This session's tracking record is not settled yet after the server started. Try again in a few minutes.",
+      code: "tracking_reconcile_pending",
+    },
+    409
+  );
 }
 
 /** 409 `billable_feature_closed`, naming the node. */
@@ -524,6 +543,7 @@ export function createBillableSwitchRoutes(
           loggedMs,
         });
         if (!result.found) {
+          if (result.reconcilePending) return reconcilePendingRefusal(c);
           return c.json({ error: "Session not found" }, 404);
         }
         return c.json(setAnswer(result));
@@ -609,7 +629,13 @@ export function createBillableSwitchRoutes(
         decision === "keep" ? "keep" : "reverse"
       );
       if (refused) return refused;
-      if (closed && decision === "keep") {
+      // #6778 PR-B (3.3; review G5): a Keep only clears the wait, so `closed`
+      // refuses it only when it would raise billing: a waiting Billable copy.
+      if (
+        closed &&
+        decision === "keep" &&
+        ready.service.keepRaisesBilling(sessionId, namespace)
+      ) {
         return closedRefusal(c, ready.service.localNodeLabel());
       }
       const actor = billableSwitchActor(c, ready.engine);
@@ -629,6 +655,9 @@ export function createBillableSwitchRoutes(
         });
         if (outcome.outcome === "not_found") {
           return c.json({ error: "Session not found" }, 404);
+        }
+        if (outcome.outcome === "reconcile_pending") {
+          return reconcilePendingRefusal(c);
         }
         if (outcome.outcome === "not_pending") {
           return c.json(
@@ -765,9 +794,9 @@ export function createBillableSwitchRoutes(
         domain: "session-lifecycle",
         surface: "rest",
         description:
-          "List every node's billable project headers for the caller's namespace, with each node's state and report time; ?history=1 adds the header changes.",
+          "List every node with its billable state and last report time. Header lists are empty since #6778 PR-A: no project header decides a start. ?history=1 adds the recorded header changes.",
         whenToUse:
-          "When showing which projects are billable on this node and on the other nodes.",
+          "When reading which nodes have billable sessions on, closed or off (the web's Create reads each node's on flag).",
         invocation: {
           kind: "rest",
           method: "GET",
@@ -884,15 +913,22 @@ export function createBillableSwitchRoutes(
       }
       const namespace = c.get("namespace");
       const localId = ready.service.localNodeId();
+      // #6778 PR-B (7.1): no `kinds` reads the seven old kinds, as before;
+      // `tracking` rows come only when `kinds` names them.
       const { local, mirror } = ready.service.eventsSince(
         namespace,
         after,
-        kinds
+        kinds.length > 0 ? kinds : BILLABLE_SWITCH_LEGACY_EVENT_KINDS
       );
+      // From PR-B the old kinds carry the record's snapshots too: an agent's
+      // request never reads a rate, a default rate or a note (C7 = a, S5).
+      const agent = isAgentRequest(c);
+      const shown = <T extends Record<string, unknown>>(e: T): T =>
+        agent ? redactTrackingEventForAgent(e) : e;
       return c.json({
         events: [
-          ...local.map(e => ({ ...e, originNodeId: localId })),
-          ...mirror.map(e => ({ ...e })),
+          ...local.map(e => shown({ ...e, originNodeId: localId })),
+          ...mirror.map(e => shown({ ...e })),
         ],
         next: {
           local: local.at(-1)?.id ?? after.local,
@@ -1007,7 +1043,11 @@ export async function runBillableKeepAll(params: {
         entryNodeId,
         loggedMs,
       });
-      return outcome.outcome;
+      // The bulk answer keeps its schema (3.3: #6646's screens see no new
+      // value), so a session the start-up reconcile has not settled is `failed`.
+      return outcome.outcome === "reconcile_pending"
+        ? "failed"
+        : outcome.outcome;
     }
     const view = registryView(registry, target.nodeId);
     if (!view || view.awaitingInitialPoll || view.status === "offline") {

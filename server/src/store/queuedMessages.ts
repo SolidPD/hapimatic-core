@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { MessageOrigin } from "../sync/sentFrom";
+import { ORIGIN_CLASSES } from "../sync/callerOrigin";
 import type { Database } from "bun:sqlite";
 import { randomUUID } from "node:crypto";
 
@@ -27,6 +29,8 @@ export interface StoredQueuedMessage {
   createdAt: number;
   updatedAt: number;
   clientGeneratedId: string | null;
+  /** #6715 (R11): who queued (or last edited) the message. A record only. */
+  origin?: MessageOrigin;
 }
 
 interface QueuedMessageRow {
@@ -38,6 +42,7 @@ interface QueuedMessageRow {
   created_at: number;
   updated_at: number;
   client_generated_id: string | null;
+  origin_json?: string | null;
 }
 
 function rowToStored(row: QueuedMessageRow): StoredQueuedMessage {
@@ -50,7 +55,31 @@ function rowToStored(row: QueuedMessageRow): StoredQueuedMessage {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     clientGeneratedId: row.client_generated_id,
+    ...readStoredOrigin(row.origin_json),
   };
+}
+
+/** #6715: a stored origin, or nothing when absent or unreadable (never a throw). */
+function readStoredOrigin(json: string | null | undefined): {
+  origin?: MessageOrigin;
+} {
+  if (!json) return {};
+  try {
+    const value = JSON.parse(json) as unknown;
+    if (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      (ORIGIN_CLASSES as readonly unknown[]).includes(
+        (value as { class?: unknown }).class
+      )
+    ) {
+      return { origin: value as MessageOrigin };
+    }
+  } catch {
+    // unreadable: no origin
+  }
+  return {};
 }
 
 export type EnqueueResult =
@@ -64,6 +93,7 @@ export function enqueueQueuedMessage(
     namespace: string;
     body: string;
     clientGeneratedId?: string | null;
+    origin?: MessageOrigin;
   }
 ): EnqueueResult {
   const txn = db.transaction((): EnqueueResult => {
@@ -92,8 +122,8 @@ export function enqueueQueuedMessage(
 
     db.prepare(
       `INSERT INTO queued_messages (
-        id, session_id, namespace, body, position, created_at, updated_at, client_generated_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        id, session_id, namespace, body, position, created_at, updated_at, client_generated_id, origin_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       args.sessionId,
@@ -102,7 +132,8 @@ export function enqueueQueuedMessage(
       position,
       now,
       now,
-      args.clientGeneratedId ?? null
+      args.clientGeneratedId ?? null,
+      args.origin ? JSON.stringify(args.origin) : null
     );
 
     const row = db
@@ -149,17 +180,26 @@ export function updateQueuedMessageAt(
   sessionId: string,
   namespace: string,
   position: number,
-  body: string
+  body: string,
+  origin?: MessageOrigin
 ): StoredQueuedMessage | null {
   const txn = db.transaction((): StoredQueuedMessage | null => {
     const now = Date.now();
+    // #6715 (R11): an edit records its caller origin; none keeps the old one.
     const result = db
       .prepare(
         `UPDATE queued_messages
-         SET body = ?, updated_at = ?
+         SET body = ?, updated_at = ?, origin_json = COALESCE(?, origin_json)
          WHERE session_id = ? AND namespace = ? AND position = ?`
       )
-      .run(body, now, sessionId, namespace, position);
+      .run(
+        body,
+        now,
+        origin ? JSON.stringify(origin) : null,
+        sessionId,
+        namespace,
+        position
+      );
     if (result.changes === 0) return null;
     const row = db
       .prepare(

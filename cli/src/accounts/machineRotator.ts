@@ -44,6 +44,7 @@ import { WORKTREE_PORT_MAX, WORKTREE_PORT_MIN } from "@hapi/protocol";
 import {
   HOST_CHAIN_SHARED_REASON,
   isNonDeathFlag,
+  refreshDeadline,
   trustedUnrefreshableAt,
   type StoredAccount,
 } from "@hapi/protocol/accounts";
@@ -514,6 +515,57 @@ export function fingerprintedFlagIsStale(
 }
 
 /**
+ * Issue #6161 (R5): `record` with its `refreshTokenExpiresAt` set by Claude Code
+ * 2.1.321's refresh rule over its own current value ({@link refreshDeadline}):
+ * a rotation never moves the deadline later and never creates one. The key is
+ * removed when the rule gives no deadline (an absent or implausible old value),
+ * so a spread never carries an implausible value forward. Used for the folder
+ * write-back and every store merge of a rotation's result.
+ */
+export function withRefreshDeadline<
+  T extends { refreshTokenExpiresAt?: number },
+>(record: T, nowMs: number, expiresIn: number | null): T {
+  const next = { ...record };
+  const deadline = refreshDeadline(
+    record.refreshTokenExpiresAt,
+    nowMs,
+    expiresIn
+  );
+  if (deadline === undefined) delete next.refreshTokenExpiresAt;
+  else next.refreshTokenExpiresAt = deadline;
+  return next;
+}
+
+/** Issue #6161 (R20): the UTC day each account's rotation was last logged on. */
+const rotationLogDays = new Map<string, string>();
+
+/**
+ * Issue #6161 (R20, DEC-5): log the server's raw `refresh_token_expires_in` for
+ * a rotation of `accountUuid` — `[accounts] rotation <uuid8>:
+ * refresh_token_expires_in=<tag>`, where the tag is the number, `absent`, or
+ * `non-number:<typeof>` — at most once per account per UTC day per process.
+ * Never a token, never an email. Called where a rotation's result is merged
+ * into the store.
+ */
+export function logRotationValue(
+  accountUuid: string,
+  tag: string,
+  nowMs: number
+): void {
+  const day = new Date(nowMs).toISOString().slice(0, 10);
+  if (rotationLogDays.get(accountUuid) === day) return;
+  rotationLogDays.set(accountUuid, day);
+  logger.info(
+    `[accounts] rotation ${accountUuid.slice(0, 8)}: refresh_token_expires_in=${tag}`
+  );
+}
+
+/** Test seam: forget which days {@link logRotationValue} has logged. */
+export function resetRotationLogDays(): void {
+  rotationLogDays.clear();
+}
+
+/**
  * `current` with its isolated-file lineage (`isolatedHeadExpiresAt`, #5020)
  * advanced to `expiresAt` — never moved back.
  */
@@ -633,6 +685,10 @@ export interface RotatedPair {
   refreshToken: string;
   /** Unix epoch ms. */
   expiresAt: number;
+  /** Issue #6161 (R5): the response's `refresh_token_expires_in`, finite or null. */
+  refreshTokenExpiresIn: number | null;
+  /** Issue #6161 (R20): its non-secret log tag. */
+  refreshTokenExpiresInTag: string;
 }
 
 export type IsolatedRotationOutcome =
@@ -797,18 +853,23 @@ async function rotateLocked(
       // independent chain, so keep it in the store (the file is left for the
       // detector to move aside; the next spawn re-seeds it from the store).
       await deps.mergeStore(current =>
-        withIsolatedLineage(
-          {
-            ...withoutFailedTokenFingerprint(current),
-            accessToken: rotated.accessToken,
-            refreshToken: rotated.refreshToken,
-            expiresAt: rotated.expiresAt,
-            lastRefreshedAt: deps.now(),
-            unrefreshable: false,
-          },
-          rotated.expiresAt
+        withRefreshDeadline(
+          withIsolatedLineage(
+            {
+              ...withoutFailedTokenFingerprint(current),
+              accessToken: rotated.accessToken,
+              refreshToken: rotated.refreshToken,
+              expiresAt: rotated.expiresAt,
+              lastRefreshedAt: deps.now(),
+              unrefreshable: false,
+            },
+            rotated.expiresAt
+          ),
+          deps.now(),
+          rotated.refreshTokenExpiresIn
         )
       );
+      logRotationValue(uuid, rotated.refreshTokenExpiresInTag, deps.now());
       logger.warn(
         `[TOKEN_REFRESH] isolated rotation for ${uuid}: a late writer put the ~/.claude login chain in the file (#6800); kept the rotated pair in the store only`
       );
@@ -821,26 +882,40 @@ async function rotateLocked(
   }
   // Write the rotated pair back FIRST (the source of truth native re-reads);
   // preserve subscriptionType / rateLimitTier / scopes.
-  await write(uuid, {
-    ...(onDiskNow ?? onDisk),
-    accessToken: rotated.accessToken,
-    refreshToken: rotated.refreshToken,
-    expiresAt: rotated.expiresAt,
-  });
-  // Mirror into the store and clear the flag (this token demonstrably works).
-  await deps.mergeStore(current =>
-    withIsolatedLineage(
+  // Issue #6161 (R5): the folder's deadline follows Claude Code's refresh rule
+  // over the file's own value; it never moves later.
+  await write(
+    uuid,
+    withRefreshDeadline(
       {
-        ...withoutFailedTokenFingerprint(current),
+        ...(onDiskNow ?? onDisk),
         accessToken: rotated.accessToken,
         refreshToken: rotated.refreshToken,
         expiresAt: rotated.expiresAt,
-        lastRefreshedAt: deps.now(),
-        unrefreshable: false,
       },
-      rotated.expiresAt
+      deps.now(),
+      rotated.refreshTokenExpiresIn
     )
   );
+  // Mirror into the store and clear the flag (this token demonstrably works).
+  await deps.mergeStore(current =>
+    withRefreshDeadline(
+      withIsolatedLineage(
+        {
+          ...withoutFailedTokenFingerprint(current),
+          accessToken: rotated.accessToken,
+          refreshToken: rotated.refreshToken,
+          expiresAt: rotated.expiresAt,
+          lastRefreshedAt: deps.now(),
+          unrefreshable: false,
+        },
+        rotated.expiresAt
+      ),
+      deps.now(),
+      rotated.refreshTokenExpiresIn
+    )
+  );
+  logRotationValue(uuid, rotated.refreshTokenExpiresInTag, deps.now());
   // Byte-stable: this line means a real OAuth rotation — the #4423 soak
   // attributes every one of them.
   logger.info(

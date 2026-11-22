@@ -59,6 +59,7 @@ import {
   BILLABLE_SWITCH_CAPABILITY,
   BILLABLE_SWITCH_CLOSED_CAPABILITY,
   BILLABLE_SWITCH_STORE_CAPABILITY,
+  BILLING_CATEGORIES_OWNER_CAPABILITY,
   BillableSwitchHeaderSchema,
   type BillableSwitchHeader,
   type BillableSwitchMode,
@@ -244,6 +245,14 @@ export type BillableSwitchRegistryHooks = {
   onNodeRemoved?: (nodeId: string) => void;
   /** Raised once per poll round in which a stored report changed. */
   onBillableSwitchReportsChanged?: () => void;
+};
+
+export type BillingCategoryOwnerView = {
+  nodeId: string;
+  nodeLabel: string;
+  status: FederationNodeState["status"];
+  owner: boolean;
+  awaitingInitialPoll: boolean;
 };
 
 /** Issue #6646: one tracked node as the billable switch sees it. */
@@ -2983,6 +2992,57 @@ export class NodeRegistry {
     });
   }
 
+  /** Issue #6779: one BillingCategoryOwnerView per tracked node, tag or not. */
+  getBillingCategoryOwnerViews(): BillingCategoryOwnerView[] {
+    const inFirstWindow =
+      Date.now() - this.constructedAt < HUB_RESTART_GRACE_MS;
+    return [...this.nodeStates.values()].map(({ config, ...state }) => ({
+      nodeId: config.id,
+      nodeLabel: config.label,
+      status: state.status,
+      owner: this.nodeSupports(config.id, BILLING_CATEGORIES_OWNER_CAPABILITY),
+      awaitingInitialPoll: inFirstWindow && state.lastSuccessfulPoll === null,
+    }));
+  }
+
+  /** The owner's list (P-4: one attempt, 3 s); the status and code kept (X4). */
+  async listBillingCategoriesOnNode(
+    nodeId: string,
+    namespace: string,
+    body: { includeRetired?: boolean }
+  ): Promise<PeerReadOutcome> {
+    return this.readPeerRoute(
+      nodeId,
+      "/api/federation/billing-categories/list",
+      "Billing categories",
+      {
+        namespace,
+        body,
+        timeoutMs: NOTIFICATION_PROXY_TIMEOUT_MS,
+        withStatus: true,
+      }
+    );
+  }
+
+  /** The owner's lookup (P-4: one attempt, 10 s); the status and code kept. */
+  async lookupBillingCategoryOnNode(
+    nodeId: string,
+    namespace: string,
+    ref: { source: string; id: string; connectionId?: string }
+  ): Promise<PeerReadOutcome> {
+    return this.readPeerRoute(
+      nodeId,
+      "/api/federation/billing-categories/lookup",
+      "Billing category lookup",
+      {
+        namespace,
+        body: { ref },
+        timeoutMs: FETCH_TIMEOUT_MS,
+        withStatus: true,
+      }
+    );
+  }
+
   /** The node ids a start prune keeps: configured static nodes and peer-store rows. */
   getBillableSwitchKeepNodeIds(): string[] {
     const ids = new Set<string>(this.staticNodeIds);
@@ -3255,13 +3315,21 @@ export class NodeRegistry {
    */
   getBillableSwitchEventFeedOnNode(
     nodeId: string,
-    opts: { cursor: number; limit: number }
+    opts: { cursor: number; limit: number; schema?: number }
   ): Promise<PeerReadOutcome> {
+    // #6778 PR-B (6.3): `schema` goes on the wire when given. A receiver
+    // before PR-B reads only `cursor` and `limit` and ignores it.
     return this.readPeerRoute(
       nodeId,
       "/api/federation/billable-switch/event-feed",
       "billable switch event feed",
-      { body: { cursor: opts.cursor, limit: opts.limit } }
+      {
+        body: {
+          cursor: opts.cursor,
+          limit: opts.limit,
+          ...(opts.schema !== undefined ? { schema: opts.schema } : {}),
+        },
+      }
     );
   }
 

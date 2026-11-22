@@ -121,13 +121,15 @@ export class GitTransientError extends Error {
 export async function runGit(
   args: string[],
   cwd: string,
-  options?: { timeoutMs?: number }
+  options?: { timeoutMs?: number; signal?: AbortSignal }
 ): Promise<{ stdout: string; stderr: string }> {
   const timeoutMs = options?.timeoutMs ?? getGitTimeoutMs();
   try {
     const result = await execFileAsync("git", args, {
       cwd,
       timeout: timeoutMs,
+      // #6715 (C2): the approval check's deadline kills git with killSignal.
+      ...(options?.signal ? { signal: options.signal } : {}),
       // SIGKILL (not SIGTERM): git can sit in an uninterruptible syscall (DNS,
       // TCP handshake) where SIGTERM is queued but not delivered until the
       // syscall returns. SIGKILL is kernel-delivered (#1327).
@@ -280,10 +282,15 @@ export interface GateRecord {
  */
 async function hashObjectOrAbsent(
   repoPath: string,
-  filePath: string
+  filePath: string,
+  signal?: AbortSignal
 ): Promise<string> {
   try {
-    const { stdout } = await runGit(["hash-object", "--", filePath], repoPath);
+    const { stdout } = await runGit(
+      ["hash-object", "--", filePath],
+      repoPath,
+      signal ? { signal } : undefined
+    );
     return stdout.trim();
   } catch (err) {
     if (err instanceof GitTransientError) throw err;
@@ -355,20 +362,24 @@ export async function mintFingerprint(
  */
 export async function checkLayer1(
   repoPath: string,
-  fingerprint: StateFingerprint
+  fingerprint: StateFingerprint,
+  opts: { signal?: AbortSignal } = {}
 ): Promise<StateCheckResult> {
   const approvedPaths = fingerprint.files.map(f => f.path);
+  // #6715 (C2): every git call shares the approval check's deadline.
+  const gitOpts = opts.signal ? { signal: opts.signal } : undefined;
   try {
     // Cleanliness-gated fast path.
     if (fingerprint.clean_at_mint) {
       const currentHead = (
-        await runGit(["rev-parse", "HEAD"], repoPath)
+        await runGit(["rev-parse", "HEAD"], repoPath, gitOpts)
       ).stdout.trim();
       if (currentHead === fingerprint.head_sha) {
         const statusNow = (
           await runGit(
             ["status", "--porcelain", "--", ...approvedPaths],
-            repoPath
+            repoPath,
+            gitOpts
           )
         ).stdout.trim();
         if (statusNow.length === 0) {
@@ -382,7 +393,11 @@ export async function checkLayer1(
     const changed: string[] = [];
     let sawAbsence = false;
     for (const f of fingerprint.files) {
-      const currentHash = await hashObjectOrAbsent(repoPath, f.path);
+      const currentHash = await hashObjectOrAbsent(
+        repoPath,
+        f.path,
+        opts.signal
+      );
       if (currentHash !== f.blob_hash) {
         changed.push(f.path);
         // An approved path that EXISTED at mint but is now absent.
@@ -428,6 +443,8 @@ export type TargetDriftResolver = (input: {
   repoPath: string;
   mergeBase: string;
   targetBranch: string;
+  /** #6715 (C2): the approval check's deadline; a resolver stops its I/O on it. */
+  signal?: AbortSignal;
 }) => Promise<
   { kind: "files"; files: string[] } | { kind: "indeterminate"; reason: string }
 >;
@@ -441,6 +458,11 @@ export interface CheckLayer2Options {
   runGh?: GhRunner;
   /** Injectable `fetch` for the default resolver's REST fallback. */
   fetchImpl?: FetchImpl;
+  /**
+   * #6715 (C2): the approval check's deadline. Passed to every git call, kills
+   * the default resolver's `gh` process and aborts its REST fallback.
+   */
+  signal?: AbortSignal;
 }
 
 /** GitHub compare payload fields this engine consumes (both transports). */
@@ -480,6 +502,29 @@ export function parseRepoSlug(remoteUrl: string): string | null {
 }
 
 /**
+ * #6715 (C2): the `gh` runner used when the approval check has a deadline: the
+ * process is killed (SIGKILL) when the signal aborts, so a hung compare call
+ * cannot outlive the gate budget.
+ */
+async function runGhUntil(
+  argv: string[],
+  signal: AbortSignal
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(argv, {
+    stdout: "pipe",
+    stderr: "pipe",
+    signal,
+    killSignal: "SIGKILL",
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { code, stdout, stderr };
+}
+
+/**
  * Default target-drift resolver: the authoritative remote tip of `targetBranch`
  * via the gh-then-REST transport (`server/src/utils/githubCli.ts` documents the
  * fixed order; `gh` is absent by design on provisioned cloud VMs, so the
@@ -493,7 +538,10 @@ export function parseRepoSlug(remoteUrl: string): string | null {
 function defaultTargetDriftResolver(
   opts: CheckLayer2Options
 ): TargetDriftResolver {
-  const runGh = opts.runGh ?? runGhWithBunSpawn;
+  const signal = opts.signal;
+  const runGh =
+    opts.runGh ??
+    (signal ? (argv: string[]) => runGhUntil(argv, signal) : runGhWithBunSpawn);
   const fetchImpl = opts.fetchImpl ?? fetch;
   const env = opts.env ?? process.env;
 
@@ -501,7 +549,11 @@ function defaultTargetDriftResolver(
     let slug: string | null = null;
     try {
       const url = (
-        await runGit(["remote", "get-url", "origin"], repoPath)
+        await runGit(
+          ["remote", "get-url", "origin"],
+          repoPath,
+          signal ? { signal } : undefined
+        )
       ).stdout.trim();
       slug = parseRepoSlug(url);
     } catch (err) {
@@ -565,6 +617,7 @@ function defaultTargetDriftResolver(
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "hapimatic",
           },
+          ...(signal ? { signal } : {}),
         }
       );
     } catch {
@@ -644,6 +697,7 @@ export async function checkLayer2(
     repoPath,
     mergeBase: fingerprint.merge_base,
     targetBranch: fingerprint.target_branch,
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
   if (drift.kind === "indeterminate") {
     return {
@@ -844,7 +898,9 @@ export async function isValid(
   opts: IsValidOptions = {}
 ): Promise<StateCheckResult> {
   if (gate.fingerprint) {
-    const l1 = await checkLayer1(repoPath, gate.fingerprint);
+    const l1 = await checkLayer1(repoPath, gate.fingerprint, {
+      signal: opts.signal,
+    });
     if (l1.kind !== "valid") return l1; // invalid / indeterminate short-circuits
     return checkLayer2(repoPath, gate.fingerprint, opts);
   }

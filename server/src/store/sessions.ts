@@ -7,11 +7,12 @@ import { MAX_RUNNER_KEYS_PER_LIST } from "@hapi/protocol";
 import type { StoredSession, VersionedUpdateResult } from "./types";
 import { safeJsonParse } from "./json";
 import { updateVersionedField } from "./versionedUpdates";
+import type { TrackingOrigin, TrackingRecordDraft } from "@hapi/protocol";
+import { isBillableSwitchStorageReady } from "./billableSwitchStore";
 import {
-  insertBillableSwitchEvent,
-  isBillableSwitchStorageReady,
-  type BillableSwitchEventInsert,
-} from "./billableSwitchStore";
+  writeTrackingState,
+  type TrackingEventFields,
+} from "./billableTrackingStore";
 
 type DbSessionRow = {
   id: string;
@@ -128,16 +129,17 @@ function toStoredSession(
 }
 
 /**
- * Issue #6646: the start value of a new session row (the plan's Task 3), applied
- * on the INSERT branch only, in the same transaction as the row: the switch and
- * its `start` event. Since #6778 PR-A (R12) no start writes a project header.
- * The caller computes it only when the gate is `on`; the store fills in the new
- * row's id.
+ * Issue #6646: the start value of a new session row, applied on the INSERT
+ * branch only, in the same transaction as the row. Since #6778 PR-B it is the
+ * tracking record (null: untracked) and its `start` row, written through the one
+ * writer (`writeTrackingState`), which sets the projection columns from it. The
+ * caller computes it only when the gate is `on`.
  */
 export type BillableSwitchInitial = {
-  billable: boolean;
-  confirm: "pending" | null;
-  event: Omit<BillableSwitchEventInsert, "sessionId">;
+  record: TrackingRecordDraft | null;
+  reason: string;
+  origin: TrackingOrigin;
+  event: TrackingEventFields;
 };
 
 /**
@@ -211,17 +213,15 @@ export function getOrCreateSessionWithFlag(
 
       const start = initial?.() ?? null;
       if (start) {
-        db.prepare(
-          "UPDATE sessions SET billable = ?, billable_confirm = ? WHERE id = ?"
-        ).run(
-          start.billable ? 1 : 0,
-          start.billable ? start.confirm : null,
-          id
-        );
-        insertBillableSwitchEvent(db, {
-          ...start.event,
+        writeTrackingState(db, {
           namespace,
           sessionId: id,
+          start: true,
+          next: () => start.record,
+          reasonFor: () => start.reason,
+          origin: start.origin,
+          event: start.event,
+          now,
         });
       }
 

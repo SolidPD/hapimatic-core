@@ -206,10 +206,14 @@ export class QueueDrainObserver {
         // `provenance-rejected` by the token gate and DROPPED below — never a
         // silent grant with an empty identity; the user re-approves live. Both
         // drain sites (here + syncEngine.drainQueueHead) behave identically.
+        //
+        // #6715 (R11): the queue row's origin is a RECORD (`meta.queuedOrigin`);
+        // no `origin` is passed, so the mint rule is as before.
         const result = await this.engine.sendMessage(sessionId, {
           text: row.body,
           localId: row.id,
           sentFrom: "webapp",
+          ...(row.origin ? { queuedOrigin: row.origin } : {}),
         });
         // Issue #3124: a gate-class message hook DENIED this queued message. A
         // denial is NOT a send failure — DROP it (the row was already popped) and
@@ -248,6 +252,7 @@ export class QueueDrainObserver {
             sessionId,
             namespace: row.namespace,
             body: row.body,
+            ...(row.origin ? { origin: row.origin } : {}),
             clientGeneratedId: row.clientGeneratedId,
             reason: "requeue",
           });

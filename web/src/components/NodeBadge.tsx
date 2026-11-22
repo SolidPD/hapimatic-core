@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { NodeHealthModal } from "@/components/NodeHealthModal";
 import { useAppContext } from "@/lib/app-context";
 import { getStorageKey } from "@/lib/storage-keys";
+import { attentionRingClass, type AttentionRing } from "@/lib/attentionRing";
 import { useFederationHealthNodes } from "@/hooks/queries/useFederationHealth";
 import { useFederationHealthAvailable } from "@/hooks/queries/useFederationHealthAvailable";
 import {
@@ -353,13 +354,16 @@ export function NodeBadge({
   labelAsReceived?: boolean;
   /**
    * #4466: an attention ring on the chip — `alert` (red: this node needs a
-   * re-login for the account the row is about) or `default` (mint: this node's
-   * default account). It REPLACES the #4538 identity ring (`tone.ringClass`) —
+   * re-login for the account the row is about), `warn` (amber, #6161: this
+   * node's sign-in for that account is ending) or `default` (mint: this node's
+   * default account), or `held` (#6161 NP-1, a grey 1 px ring with the chip at
+   * 75 % opacity: this node's record for the account is quarantined). It
+   * REPLACES the #4538 identity ring (`tone.ringClass`) —
    * two ring width/colour utilities on one element resolve by CSS order, and the
    * identity ring's `ring-inset` would draw the alert ring inside the chip.
    * Absent ⇒ the identity ring, unchanged.
    */
-  ring?: "alert" | "default";
+  ring?: AttentionRing;
   /**
    * #4466: when set, a tap calls this instead of opening Node Health (the
    * Accounts page's red-ring pill opens the "+ Add" modal on that node). The
@@ -488,12 +492,8 @@ export function NodeBadge({
   const ariaLabel = `${titleOverride ?? baseTitle}${healthSuffix}`;
   const stop = (e: React.SyntheticEvent) => e.stopPropagation();
   // #4466: an attention ring replaces the identity ring (never both — see `ring`).
-  const ringClass =
-    ring === "alert"
-      ? "ring-2 ring-[var(--status-hot)]"
-      : ring === "default"
-        ? "ring-2 ring-[var(--app-accent)]"
-        : tone.ringClass;
+  // The classes are the shared map an account chip draws too (#6884).
+  const ringClass = ring ? attentionRingClass(ring) : tone.ringClass;
 
   // Collapsed: a fixed tile (`h-3 w-3.5`, no padding) with the dot centered.
   // Uncollapsed, both class strings are byte-identical to the pre-#4468 ones.

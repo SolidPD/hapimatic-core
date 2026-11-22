@@ -84,6 +84,7 @@ export const TooltipContent = React.forwardRef<
 TooltipContent.displayName = TooltipPrimitive.Content.displayName;
 
 type TooltipSide = "top" | "right" | "bottom" | "left";
+type TooltipAlign = "start" | "center" | "end";
 
 export interface HoverTooltipProps {
   /** The bubble text/node — becomes the trigger's description while open. */
@@ -92,6 +93,12 @@ export interface HoverTooltipProps {
   children: React.ReactElement;
   /** Bubble placement relative to the trigger. */
   side?: TooltipSide;
+  /**
+   * The bubble's alignment along the trigger (#6779 TIP-1). Absent leaves the
+   * underlying content's own default, so a caller that passes none renders as
+   * before; `end` keeps a bubble on an edge-hugging trigger inside its column.
+   */
+  align?: TooltipAlign;
   /** Hover-open delay in ms (tooltip branch only). Tests pass `0`. */
   delayDuration?: number;
   /** Extra classes merged onto the bubble surface. */
@@ -154,11 +161,13 @@ const tapTriggerAriaOverrides = {
 /** The Popover-branch bubble: portaled, `role="tooltip"`, never takes focus. */
 function TapTooltipContent({
   side,
+  align,
   className,
   descriptionId,
   children,
 }: {
   side: TooltipSide;
+  align?: TooltipAlign;
   className?: string;
   descriptionId: string;
   children: React.ReactNode;
@@ -168,6 +177,7 @@ function TapTooltipContent({
       <PopoverPrimitive.Content
         role="tooltip"
         side={side}
+        align={align}
         sideOffset={4}
         onOpenAutoFocus={event => event.preventDefault()}
         onCloseAutoFocus={event => event.preventDefault()}
@@ -190,13 +200,19 @@ export function HoverTooltip({
   content,
   children,
   side = "top",
+  align,
   delayDuration = 300,
   className,
 }: HoverTooltipProps) {
   const isCoarsePointer = useIsCoarsePointer();
   if (isCoarsePointer) {
     return (
-      <TapTooltip content={content} side={side} className={className}>
+      <TapTooltip
+        content={content}
+        side={side}
+        align={align}
+        className={className}
+      >
         {children}
       </TapTooltip>
     );
@@ -205,7 +221,7 @@ export function HoverTooltip({
     <TooltipProvider delayDuration={delayDuration}>
       <TooltipRoot>
         <TooltipTrigger asChild>{children}</TooltipTrigger>
-        <TooltipContent side={side} className={className}>
+        <TooltipContent side={side} align={align} className={className}>
           {content}
         </TooltipContent>
       </TooltipRoot>
@@ -225,6 +241,7 @@ function TapTooltip({
   content,
   children,
   side = "top",
+  align,
   className,
 }: Omit<HoverTooltipProps, "delayDuration">) {
   const { open, setOpen, descriptionId } = useTapTooltipState();
@@ -239,6 +256,7 @@ function TapTooltip({
       </PopoverPrimitive.Trigger>
       <TapTooltipContent
         side={side}
+        align={align}
         className={className}
         descriptionId={descriptionId}
       >

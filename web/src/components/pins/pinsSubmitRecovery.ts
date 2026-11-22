@@ -16,6 +16,7 @@ import { ApiError } from "@/api/client";
 import type { BuiltSubmission } from "@/lib/pins/submission";
 import {
   clearSubmitted,
+  hasUpdates,
   type PendingSubmission,
   type StagedPin,
   type StagedPins,
@@ -40,6 +41,18 @@ export function refusalOf(error: unknown): Refusal | null {
 
 /** #6521 S2: the server's code for an entry a replayed Submit did not carry. */
 export const NOT_IN_SUBMISSION = "pin_not_in_submission";
+
+/** #6539: the server's code for a dismissal made on an older revision. */
+export const STALE_DISMISS = "pin_dismiss_stale";
+
+/**
+ * A dropped entry the Submit keeps staged, so it goes again with its note: a
+ * stale dismissal (#6539 R1) and a replay's entry not in the message already
+ * sent (#6521 S2/N). #6768: its row offers nothing to clear.
+ */
+export function keepsStaged(entry: Pick<PinSubmissionResult, "code">): boolean {
+  return entry.code === STALE_DISMISS || entry.code === NOT_IN_SUBMISSION;
+}
 
 /** #6521 S2: what the dialog says after a lost response or a 5xx. */
 export const UNCERTAIN_TEXT =
@@ -154,10 +167,35 @@ export function withoutDelivered(
   if (Object.keys(emptied).length > 0) clearSubmitted(sessionId, emptied);
   const kept = new Set(entries.map(e => e.key));
   return {
+    ...next,
     request: entries.length > 0 ? { ...next.request, entries } : null,
     submitted: Object.fromEntries(
       Object.entries(next.submitted).filter(([key]) => kept.has(key))
     ),
     stale: next.stale.filter(row => kept.has(row.key)),
   };
+}
+
+/** #6768 (R3): said when the dialog re-checked instead of sending. */
+export const STAGING_MOVED_TEXT = "Your answers changed, so check them again";
+
+/**
+ * #6768 (R3): staging moved on after this request was built, so sending it
+ * would send what the operator no longer has staged, or leave out what they
+ * added: an entry it sends changed or went, or an entry with something to send
+ * is not the one the build read. An entry the build left out and that has not
+ * changed (a held choice, ticks with no pin to send them to) is not a move, so
+ * it never turns every Send into another check.
+ */
+export function stagingMovedSince(
+  built: Pick<BuiltSubmission, "from" | "submitted">,
+  staged: StagedPins
+): boolean {
+  for (const [key, entry] of Object.entries(built.submitted)) {
+    if (staged[key]?.updatedAt !== entry.updatedAt) return true;
+  }
+  return Object.entries(staged).some(
+    ([key, entry]) =>
+      hasUpdates(entry) && built.from[key]?.updatedAt !== entry.updatedAt
+  );
 }

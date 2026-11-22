@@ -2,6 +2,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ApiError, type ApiClient } from "@/api/client";
 import type {
+  AccountLoginStartResponse,
   AccountsResponse,
   AccountUsageResponse,
   RedactedAccount,
@@ -564,7 +565,8 @@ export function useAccountLogin(
   api: ApiClient | null,
   opts?: { nodeId?: string }
 ): {
-  start: () => Promise<{ loginToken: string; authorizeUrl: string }>;
+  /** #6161 R19: the full answer, so the step reads `olderSiblingDaemons`. */
+  start: () => Promise<AccountLoginStartResponse>;
   complete: (args: {
     loginToken: string;
     code: string;

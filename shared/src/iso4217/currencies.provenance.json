@@ -1,0 +1,46 @@
+{
+  "publisher": "SIX Financial Information AG, the maintenance agency of ISO 4217",
+  "list": "ISO 4217 list one (current currency and funds)",
+  "fetchedFrom": "https://www.six-group.com/dam/download/financial-information/data-center/iso-currrency/lists/list-one.xml",
+  "published": "2026-09-17",
+  "sha256": "33139b438657d1cee116ba737807ea71d19d6de4b90f799a09c56f0cc6a1b0ff",
+  "entriesRead": 280,
+  "codeCount": 155,
+  "exponentCounts": {
+    "0": 16,
+    "2": 132,
+    "3": 7
+  },
+  "rawFileCommitted": false,
+  "rawFileNote": "The fetched file is not committed: the publisher's terms for redistributing it were not read (#6779, P-1 as refined 2026-11-19).",
+  "generator": "shared/scripts/generate-iso4217-currencies-v1.ts",
+  "dropRules": [
+    "funds: entries whose CcyNm carries IsFund=\"true\"",
+    "metals: XAU, XAG, XPD, XPT (minor unit N.A.)",
+    "the test code XTS and the no-currency code XXX (minor unit N.A.)",
+    "every other entry whose minor unit is not a number (N.A.)",
+    "entries with no code",
+    "withdrawn codes the table never held (list one carries current codes only; list three is not read)",
+    "a code the table already holds is never dropped; retainedNotInSource lists any the source no longer carries"
+  ],
+  "dropped": {
+    "funds": [
+      "BOV",
+      "CHE",
+      "CHW",
+      "CLF",
+      "COU",
+      "MXV",
+      "USN",
+      "UYI",
+      "UYW",
+      "XAD"
+    ],
+    "metals": ["XAG", "XAU", "XPD", "XPT"],
+    "testCode": ["XTS"],
+    "noCurrency": ["XXX"],
+    "otherNotApplicable": ["XBA", "XBB", "XBC", "XBD", "XDR", "XSU", "XUA"],
+    "entriesWithoutCode": 3
+  },
+  "retainedNotInSource": []
+}

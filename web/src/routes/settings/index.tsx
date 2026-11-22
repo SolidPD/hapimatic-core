@@ -28,6 +28,7 @@ import {
   Compass, // Onboarding (#6211, nested under Preferences)
   LifeBuoy, // Help (#4371)
   Plug, // Connectors (#4793)
+  Tags, // Billing Categories (#6779)
   type LucideIcon,
 } from "lucide-react";
 import { AccentChip } from "@/components/ui/AccentChip";
@@ -96,6 +97,7 @@ type AdminRoute =
   | "/settings/notifications"
   | "/settings/connectors"
   | "/settings/network"
+  | "/settings/billing-categories"
   | "/settings/about"
   | "/settings/extensions"
   | "/settings/configuration"
@@ -189,6 +191,15 @@ const ADMIN_SECTIONS: SectionGroup[] = [
         icon: History,
         accent: "var(--accent-purple-400)",
         to: "/settings/time-log",
+      },
+      {
+        // #6779: the billing category list and its default rates. Shown while
+        // billable sessions are on or closed (see the filter below).
+        key: "billing-categories",
+        label: "Billing Categories",
+        icon: Tags,
+        accent: "var(--accent-amber-300)",
+        to: "/settings/billing-categories",
       },
       {
         key: "preferences",
@@ -460,6 +471,10 @@ export default function SettingsLandingPage() {
   const connectorsVisible = useGitHubConnectionsVisible().visible;
   // #6211: only an answered `unavailable` hides the row, so a failed read cannot.
   const networkHidden = useTailscaleStatus(api).data?.state === "unavailable";
+  // #6779: shown while `/api/version` carries `billableSwitch` (on or closed), the
+  // version field alone: the row stays when the list's owner is down, and opening
+  // Settings reads no list (review W5, F10).
+  const billingCategoriesShown = versionInfo?.billableSwitch !== undefined;
 
   return (
     <div data-testid="settings-landing-root" className="flex flex-col pb-2">
@@ -481,7 +496,9 @@ export default function SettingsLandingPage() {
                   ? !networkHidden
                   : item.key === "connectors"
                     ? connectorsVisible
-                    : true
+                    : item.key === "billing-categories"
+                      ? billingCategoriesShown
+                      : true
         );
         if (visibleItems.length === 0) return null;
         const groupCollapsed = Boolean(collapse.groups[group.heading]);

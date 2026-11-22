@@ -7,6 +7,7 @@ import {
   Bell,
   CircleCheck,
   CircleX,
+  CalendarClock,
   Clock,
   Gauge,
   Hourglass,
@@ -43,6 +44,7 @@ export const NOTIFICATION_KIND_DISPLAY = {
   "waiting-for-slot": { icon: Clock, label: "Waiting for capacity" },
   "loops-resuming": { icon: Repeat, label: "Scheduled jobs resuming" },
   "model-reverted": { icon: Undo2, label: "Model reverted" },
+  "sign-in-ending": { icon: CalendarClock, label: "Sign-in ending" },
 } as const satisfies Record<NotificationKind, NotificationKindDisplay>;
 
 /**

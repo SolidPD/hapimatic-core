@@ -43,8 +43,9 @@
 #   --toolkit-source <git URL>         L1 core-tier source (install mode default:
 #                                      https://github.com/SolidPD/hapimatic-toolkit). `fetch` clones a
 #                                      toolkit only when this flag is passed; --toolkit-dir ignores it.
-#   --toolkit-tag <tag>                toolkit tag to install (default: v1.0.0, pinned to its commit;
-#                                      another tag is not verified)
+#   --toolkit-tag <tag>                toolkit tag to install (default: v1.2.0). v1.0.0, v1.1.0 and v1.2.0
+#                                      are pinned to their commits; another tag is not verified. v1.0.0 and
+#                                      v1.1.0 do not have the lint-on-write 2.0.0 change
 #   --toolkit-dir <local tree>         apply L1 from this already-fetched tree (offline; implies L1-only)
 #   --name <binary-name>               installed binary name (default: hapi; provision.sh passes
 #                                      hapimatic-private)
@@ -55,7 +56,7 @@
 #   -h | --help                        this help
 set -uo pipefail
 
-INSTALLER_VERSION="1.6.0"
+INSTALLER_VERSION="1.7.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MODE="install"                         # install | fetch | doctor | uninstall
@@ -64,7 +65,7 @@ RELEASE_TAG=""                         # empty = latest
 ASSET_OVERRIDE=""
 TOOLKIT_SOURCE=""                      # empty = not passed (see DEFAULT_TOOLKIT_SOURCE)
 DEFAULT_TOOLKIT_SOURCE="https://github.com/SolidPD/hapimatic-toolkit"   # install mode only (#5069): fetch and --toolkit-dir never use it
-TOOLKIT_TAG="v1.0.0"
+TOOLKIT_TAG="v1.2.0"
 TOOLKIT_DIR=""
 TOOLKIT_EXPECTED=""                    # the commit the toolkit tree must be at; "" = no pin (#5074)
 BIN_NAME="hapi"
@@ -219,7 +220,8 @@ install_binary() {
 }
 
 # ── Toolkit commit pin (#5074) ────────────────────────────────────────────────
-# The toolkit's install.sh links its hooks into ~/.claude, so every later Claude Code session runs
+# The toolkit's install.sh puts its hooks into ~/.claude (as copies from toolkit v1.1.0 on, as links
+# in v1.0.0), so every later Claude Code session runs
 # the code this installer fetches. A tag can be moved by anyone with write access to the toolkit
 # repo, so each publisher tag the installer knows is pinned to the commit it must resolve to, and the
 # fetched tree is checked against that commit before anything uses it. Everything between the
@@ -232,6 +234,8 @@ install_binary() {
 toolkit_pinned_commit() {
     case "$1" in
         v1.0.0) printf '%s' 31792ce6d6b11dde8f5f54bcf1c6bcfa49347782 ;;
+        v1.1.0) printf '%s' 623a5f69b4919f83fe03193c6c7c0f51a76afc55 ;;
+        v1.2.0) printf '%s' f2e7bedbb18012c61e98bc9611d8df94e3d49de9 ;;
         *) return 1 ;;
     esac
 }
@@ -309,12 +313,67 @@ clone_toolkit_verified() {
     mv "$tmp" "$dest" || { rm -rf "$tmp"; die "could not move the cloned toolkit into $dest"; }
 }
 
+# ── Deployed hooks vs the toolkit tree (#6886, DEC-7) ─────────────────────────
+# The pin proves which commit the tree is at, not what ended up in ~/.claude: the toolkit's install.sh
+# never replaces a file it did not write without asking (with no terminal it skips the file), and it
+# exits 0 either way, so an old hook can stay active while every record names the new release. These
+# helpers compare each file the tree ships under core/hooks (deployed to <target>/hooks, the toolkit's
+# map_category) with the deployed copy. Read-only and Bash 3.2-safe, and they never end the run: no die,
+# and every return to the caller is 0.
+toolkit_hook_check_tools() {
+    command -v find >/dev/null 2>&1 && command -v sort >/dev/null 2>&1 && command -v cmp >/dev/null 2>&1
+}
+# Prints "<missing|differs><TAB><path>" for each regular file under <tree>/core/hooks ($1), skipping
+# __pycache__ and *.pyc as the toolkit does, whose <target>/hooks/<path> ($2) is missing or differs.
+# Prints nothing for a tree with no core/hooks or when a tool is missing.
+toolkit_hook_drift() {
+    local tree="$1" target="$2" rel
+    [ -d "$tree/core/hooks" ] || return 0
+    toolkit_hook_check_tools || return 0
+    while IFS= read -r rel; do
+        rel="${rel#./}"
+        [ -n "$rel" ] || continue
+        if [ ! -e "$target/hooks/$rel" ]; then
+            printf 'missing\t%s\n' "$rel"
+        elif ! cmp -s "$tree/core/hooks/$rel" "$target/hooks/$rel"; then
+            printf 'differs\t%s\n' "$rel"
+        fi
+    done < <(cd "$tree/core/hooks" 2>/dev/null && find . -type f -not -path '*/__pycache__/*' -not -name '*.pyc' 2>/dev/null | LC_ALL=C sort)
+    return 0
+}
+# The finding for one file: $1 = the tree, $2 = missing|differs, $3 = the path under hooks/. Paths in
+# the printed command are quoted.
+toolkit_hook_drift_message() {
+    if [ "$2" = missing ]; then
+        printf '%s' "$TOOLKIT_TARGET/hooks/$3 is missing: the toolkit ships it as core/hooks/$3 in $1. To deploy it, run: (cd \"$1\" && ./install.sh --minimal)"
+        return 0
+    fi
+    printf '%s' "$TOOLKIT_TARGET/hooks/$3 is not the toolkit's version (core/hooks/$3 in $1), so its own content stays active, not the toolkit's. To replace it and every other such file, each backed up under $TOOLKIT_TARGET/.toolkit-state/conflicts/, run: (cd \"$1\" && ./install.sh --minimal --force). To keep an edit on purpose, leave the file as it is: the toolkit never replaces it without asking, and this warning repeats on each run and in the doctor."
+}
+# One [WARN] per hook file of the tree ($1) that is not deployed as the toolkit's version. Advisory: it
+# never changes the exit status, because a VM apply (scripts/apply-profile-v2.sh, the --toolkit-dir
+# path) treats a non-zero installer as a failed apply.
+warn_toolkit_hook_drift() {
+    local tree="$1" state rel
+    [ -d "$tree/core/hooks" ] || return 0
+    if ! toolkit_hook_check_tools; then
+        warn "the deployed hooks were not compared with the toolkit tree (find, sort or cmp is not on PATH)"
+        return 0
+    fi
+    while IFS=$'\t' read -r state rel; do
+        [ -n "$rel" ] || continue
+        warn "$(toolkit_hook_drift_message "$tree" "$state" "$rel")"
+    done < <(toolkit_hook_drift "$tree" "$TOOLKIT_TARGET")
+    return 0
+}
+
 # ── L1 toolkit core tier ──────────────────────────────────────────────────────
 # Resolves the toolkit tree (clone from --toolkit-source, or use --toolkit-dir), then runs its
-# install.sh --minimal. The clone target is PERSISTENT so the deployed symlinks never dangle. Because
-# ~/.claude links into that tree, a fetched commit is checked against the pin BEFORE it reaches the
-# tree (#5074): a re-run checks FETCH_HEAD before the checkout, and a fresh clone lands beside the
-# tree and is moved in only after the check.
+# install.sh --minimal, which copies the core tier into ~/.claude (toolkit v1.1.0 on) or links it
+# into the tree (v1.0.0; the clone target is PERSISTENT so those links never dangle). Because
+# install.sh runs from that tree and puts its files into ~/.claude, a fetched commit is checked
+# against the pin BEFORE it reaches the tree (#5074): a re-run checks FETCH_HEAD before the
+# checkout, and a fresh clone lands beside the tree and is moved in only after the check.
 install_toolkit() {
     local tree
     if [ -n "$TOOLKIT_DIR" ]; then
@@ -329,17 +388,37 @@ install_toolkit() {
         else
             mkdir -p "$HAPI_HOME_DIR"
             if [ -d "$tree/.git" ]; then
+                local upd_fail="" origin
+                origin="$(git -C "$tree" remote get-url origin 2>/dev/null || echo unknown)"
                 if ( cd "$tree" && git fetch --depth 1 origin "$TOOLKIT_TAG" >/dev/null 2>&1 ); then
                     require_toolkit_pin "$tree" FETCH_HEAD "the files in $tree were left unchanged"
-                    ( cd "$tree" && git -c advice.detachedHead=false checkout -q FETCH_HEAD ) \
-                        || warn "could not check out the fetched toolkit in $tree; using it as-is"
+                    ( cd "$tree" && git -c advice.detachedHead=false checkout -q FETCH_HEAD ) || upd_fail=checkout
                 else
-                    warn "could not update existing toolkit tree at $tree; using as-is"
+                    upd_fail=fetch
                 fi
-                # Second check, on what is checked out now. It also stops a tree an earlier install
-                # left at another commit, for example one cloned from a different source.
-                require_toolkit_pin "$tree" HEAD \
-                    "the tree at $tree (origin $(git -C "$tree" remote get-url origin 2>/dev/null || echo unknown)) was left as it is"
+                # The re-run could not move the tree (#6886): git refused the checkout, or the fetch
+                # failed. When the tree is not at the pin, stop here and name that cause, because the
+                # moved-tag message of the last check would be false (the fetched commit, when there was
+                # one, already passed the pin). A refused checkout is most often a file edited in the
+                # tree, for example through a link a toolkit v1.0.0 install made in ~/.claude. Bash
+                # 3.2-safe; the run goes on only when there is no pin or HEAD is at it.
+                if [ -n "$TOOLKIT_EXPECTED" ] && [ -n "$upd_fail" ] \
+                   && ! toolkit_verify_commit "$tree" HEAD "$TOOLKIT_EXPECTED" >/dev/null; then
+                    if [ "$upd_fail" = checkout ]; then
+                        die "git refused to check out the verified toolkit commit $TOOLKIT_EXPECTED ($TOOLKIT_TAG) in $tree (git's message is above), most often because a file there was edited, for example through a link in $TOOLKIT_TARGET; the toolkit's install.sh was not run and nothing in $TOOLKIT_TARGET was changed (the hapi binary step already ran; the toolkit is still the earlier release). See what is in the way: git -C \"$tree\" status --short ; save every edit: git -C \"$tree\" diff > <file> ; then discard them: git -C \"$tree\" checkout -- . (this discards every edit in the tree, not only the files git named) and re-run the installer"
+                    fi
+                    die "could not fetch toolkit $TOOLKIT_TAG from $origin (the repository is unreachable, or it has no tag $TOOLKIT_TAG), and the tree at $tree is not at its pinned commit $TOOLKIT_EXPECTED, so it was left as it is and nothing in $TOOLKIT_TARGET was changed (the hapi binary step already ran; the toolkit is still the earlier release); re-run when the toolkit repository is reachable and has that tag"
+                fi
+                # The run goes on: say what was not updated (never before a stop above).
+                case "$upd_fail" in
+                    checkout) warn "could not check out the fetched toolkit in $tree; using it as-is" ;;
+                    fetch)    warn "could not update existing toolkit tree at $tree; using as-is" ;;
+                esac
+                # Last check, on what is checked out now. The stop above names a failed fetch or
+                # checkout; this check stays the last guard on the tree install.sh runs from, and it
+                # also stops a tree an earlier install left at another commit, for example one cloned
+                # from a different source.
+                require_toolkit_pin "$tree" HEAD "the tree at $tree (origin $origin) was left as it is"
                 ok "toolkit tree already present at $tree (idempotent fetch)"
             else
                 [ ! -e "$tree" ] || die "toolkit tree path $tree exists but is not a git checkout — move it aside and re-run"
@@ -350,12 +429,14 @@ install_toolkit() {
     fi
     [ -f "$tree/install.sh" ] || { [ "$DRY_RUN" = 1 ] && plan "run $tree/install.sh --minimal" && return 0; die "toolkit tree has no install.sh: $tree"; }
     if [ "$DRY_RUN" = 1 ]; then
-        plan "run $tree/install.sh --minimal (core tier symlink deploy into $TOOLKIT_TARGET)"
+        plan "run $tree/install.sh --minimal (core tier deploy into $TOOLKIT_TARGET)"
         return 0
     fi
     ( cd "$tree" && ./install.sh --minimal ) || die "toolkit install.sh --minimal failed"
     ok "toolkit core tier applied (install.sh --minimal) from $tree"
     TOOLKIT_ROOT_RESOLVED="$tree"
+    # Both paths, the fetched tree and --toolkit-dir (a tenant VM's apply), reach this line (#6886).
+    warn_toolkit_hook_drift "$tree"
 }
 
 # ── Installer manifest (doctor reads this; source-agnostic, survives the repo swap) ──
@@ -676,17 +757,34 @@ cmd_doctor() {
     fi
 
     # toolkit core tier present + tag (#3984) — source-agnostic: prefer the ACTUAL deployed toolkit's
-    # identity (git tag of the tree, then its VERSION file — survives the eventual repo swap), and only
-    # fall back to the tag the installer recorded at install time.
+    # identity (survives the eventual repo swap): the tree's tag (`describe --tags`), then its VERSION
+    # file, then the tree's bare commit (`describe --tags --always`), and only then the tag the
+    # installer recorded at install time. VERSION comes before the bare commit because a re-run that
+    # moved the tree to another tag fetched it with `--depth 1`, which leaves no local tag at the new
+    # commit, so `describe --tags` finds none and `--always` would print only the commit (#6886).
     local tk_manifest="$TOOLKIT_TARGET/.toolkit-state/manifest.json" tag="" troot=""
     if [ -f "$tk_manifest" ]; then
         command -v jq >/dev/null 2>&1 && troot="$(jq -r '.toolkit_root // empty' "$tk_manifest" 2>/dev/null)"
-        if [ -n "$troot" ] && [ -d "$troot/.git" ]; then tag="$(git -C "$troot" describe --tags --always 2>/dev/null || true)"; fi
+        if [ -n "$troot" ] && [ -d "$troot/.git" ]; then tag="$(git -C "$troot" describe --tags 2>/dev/null || true)"; fi
         [ -z "$tag" ] && [ -n "$troot" ] && [ -f "$troot/VERSION" ] && tag="$(head -1 "$troot/VERSION" 2>/dev/null)"
+        if [ -z "$tag" ] && [ -n "$troot" ] && [ -d "$troot/.git" ]; then tag="$(git -C "$troot" describe --tags --always 2>/dev/null || true)"; fi
         if [ -z "$tag" ] && command -v jq >/dev/null 2>&1 && [ -f "$MANIFEST_PATH" ]; then
             tag="$(jq -r '.toolkit_tag // empty' "$MANIFEST_PATH" 2>/dev/null)"
         fi
         dr_ok "toolkit core tier" "present, tag ${tag:-unknown} ($tk_manifest)"
+        # Each hook the toolkit ships that is not deployed as the toolkit's version (#6886, DEC-7).
+        # Advisory: it never sets doctor_fatal.
+        if [ -n "$troot" ] && [ -d "$troot/core/hooks" ]; then
+            if toolkit_hook_check_tools; then
+                local hd_state hd_rel
+                while IFS=$'\t' read -r hd_state hd_rel; do
+                    [ -n "$hd_rel" ] || continue
+                    dr_warn "toolkit hooks" "$(toolkit_hook_drift_message "$troot" "$hd_state" "$hd_rel")"
+                done < <(toolkit_hook_drift "$troot" "$TOOLKIT_TARGET")
+            else
+                dr_info "toolkit hooks" "not compared with the toolkit tree (find, sort or cmp is not on PATH)"
+            fi
+        fi
     else
         dr_warn "toolkit core tier" "not applied yet (no $tk_manifest) — the install step applies it; if it is still missing after an install, re-run the installer"
     fi

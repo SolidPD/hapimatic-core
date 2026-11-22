@@ -37,7 +37,11 @@ import { ChevronIcon } from "@/components/icons";
 import { FadeTruncate } from "@/components/session";
 import { scoreLevel, LEVEL_COLOR } from "./UsageBar";
 import { API_KEY_STATUS_META } from "@/lib/apiKeyStatus";
-import { AccountAlertIcon, type AlertNodeEntry } from "./AccountAlertIcon";
+import {
+  AccountAlertIcon,
+  type AlertNodeEntry,
+  type EndingCandidate,
+} from "./AccountAlertIcon";
 import {
   MONO_CLASS_BY_ID,
   accountMonogramColor,
@@ -105,6 +109,12 @@ export type AccountCardRow1Props = {
   planLabel?: string;
   /** One entry per node needing re-login; absent or empty ⇒ no alert icon. */
   alertNodes?: AlertNodeEntry[];
+  /**
+   * Issue #6161 (R13): the card's node items, which the alert icon checks for
+   * an ending sign-in on the minute clock. The account switcher passes none, so
+   * its ending-only card shows no alert icon (R12: the token carries it).
+   */
+  endingCandidates?: EndingCandidate[];
   /** `undefined` ⇒ no score element (key cards); `null` ⇒ the muted "—". */
   score?: number | null;
   /** Issue #5879: the window holding the account at its cap (`null` = none).
@@ -235,6 +245,7 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
     secondaryMono = false,
     planLabel,
     alertNodes,
+    endingCandidates,
     score,
     statusPill,
     trailing,
@@ -387,8 +398,14 @@ export function AccountCardRow1(props: AccountCardRow1Props) {
           <span data-testid="account-row1-spacer" className="min-w-0 flex-1" />
         )}
         {trailing}
-        {alertNodes && alertNodes.length > 0 ? (
-          <AccountAlertIcon nodes={alertNodes} />
+        {/* #6161: the icon also mounts for ending candidates and decides by
+            itself, on the minute clock, whether to render. */}
+        {(alertNodes && alertNodes.length > 0) ||
+        (endingCandidates && endingCandidates.length > 0) ? (
+          <AccountAlertIcon
+            nodes={alertNodes ?? []}
+            endingCandidates={endingCandidates}
+          />
         ) : null}
         {score === undefined || props.hardLock === undefined ? null : (
           <ScoreMeaning score={score} hardLock={props.hardLock} />

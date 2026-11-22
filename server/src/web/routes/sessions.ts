@@ -27,12 +27,18 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { resolveLocalNodeIdentity } from "../../config/nodeLabel";
 import { z } from "zod";
 import type { SyncEngine, Session } from "../../sync/syncEngine";
+import type { MessageOrigin } from "../../sync/sentFrom";
+import { deriveCallerOrigin, readRequestFacts } from "../../sync/callerOrigin";
 import { reconcile, listForNamespace } from "../../sync/pendingSpawns";
 import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
 import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
-import { floorAgentMcpEnable, refuseAgentArchive } from "./agentEscalation";
+import {
+  floorAgentMcpEnable,
+  refuseAgentArchive,
+  resolveCallerSession,
+} from "./agentEscalation";
 import {
   archiveResponseBody,
   peerArchiveOpenPinCount,
@@ -253,6 +259,20 @@ function computeSessions(
   );
   const placeholders = listForNamespace(namespace);
   return placeholders.length > 0 ? [...placeholders, ...real] : real;
+}
+
+/** #6715 (R11): the caller origin of a queue enqueue or edit (a record only). */
+function queueCallerOrigin(
+  c: Context<WebAppEnv>,
+  engine: SyncEngine
+): MessageOrigin {
+  return deriveCallerOrigin(
+    readRequestFacts(
+      name => c.req.header(name),
+      c.get("userId"),
+      resolveCallerSession(c, engine)?.id
+    )
+  );
 }
 
 export function createSessionsRoutes(
@@ -3645,7 +3665,9 @@ export function createSessionsRoutes(
         sessionId,
         namespace,
         parsed.data.body,
-        parsed.data.clientGeneratedId ?? null
+        parsed.data.clientGeneratedId ?? null,
+        // #6715 (R11): who queued it, from the caller-origin module, never the body.
+        queueCallerOrigin(c, engine)
       );
       if (result.type === "success") {
         return c.json({ ok: true, result: result.result, row: result.row });
@@ -3719,7 +3741,9 @@ export function createSessionsRoutes(
         sessionId,
         namespace,
         position,
-        parsed.data.body
+        parsed.data.body,
+        // #6715 (R11): an edit records its caller origin too.
+        queueCallerOrigin(c, engine)
       );
       if (result.type === "success") {
         return c.json({ ok: true, row: result.row });

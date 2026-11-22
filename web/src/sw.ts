@@ -82,6 +82,7 @@ async function getNotificationPreferences(): Promise<NotificationPreferences> {
     waitingForSlot: true,
     loopsResuming: true,
     modelReverted: true,
+    signInEnding: true,
     mutedSessions: [],
     globalOptOut: false,
   };

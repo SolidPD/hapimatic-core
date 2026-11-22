@@ -153,6 +153,7 @@ import {
   CapabilitiesPanel,
   ClaudePtyPage,
   ConfigurationAdminPage,
+  BillingCategoriesPage,
   ConnectorsPage,
   DesktopPage,
   ErrorLogsPage,
@@ -1958,6 +1959,15 @@ const settingsNetworkRoute = createRoute({
   component: NetworkPage,
 });
 
+// Billing Categories (#6779): the billing category list and its default rates.
+// Registered here AND as a USER row (settings/index.tsx), shown while billable
+// sessions are on or closed (the version field alone).
+const settingsBillingCategoriesRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings/billing-categories",
+  component: BillingCategoriesPage,
+});
+
 const settingsAboutRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/about",
@@ -2059,6 +2069,7 @@ export const routeTree = rootRoute.addChildren([
   settingsNotificationsRoute,
   settingsConnectorsRoute,
   settingsNetworkRoute,
+  settingsBillingCategoriesRoute,
   settingsAboutRoute,
   settingsExtensionsRoute,
   settingsConfigurationRoute,

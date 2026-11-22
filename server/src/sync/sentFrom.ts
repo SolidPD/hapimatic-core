@@ -13,6 +13,14 @@
  * can never disagree about which senders count as "not real user input".
  */
 
+import type {
+  ForwardedVia,
+  OriginClass,
+  OriginDoor,
+  OriginEvidence,
+  OriginFacts,
+} from "./callerOrigin";
+
 /**
  * Genuine end-user input surfaces. A message stamped with one of these ABORTS a
  * pending auto-recovery (R4 — the user took control).
@@ -81,13 +89,24 @@ export const PROGRAMMATIC_SENT_FROM: ReadonlySet<string> = new Set<string>(
  * `meta.origin` avoids both.
  */
 export interface MessageOrigin {
-  /** Channel origin class (registry §4.1 vocabulary). */
-  class: "web-user" | "cli-api" | "federation" | "bare-terminal";
+  /** Channel origin class (registry §4.1 vocabulary, `callerOrigin.ts`). */
+  class: OriginClass;
   /** Numeric owner id (web-user path) — the JWT `uid`. */
   uid?: number;
   /** The SENDER's session id (cli-api path, from `X-Hapi-Session-Id`) — the R3
-   *  self-send discriminator. */
+   *  self-send discriminator. The raw header, as it arrived. */
   sessionId?: string;
+  /** #6715 R10: the resolved sender session, UNVERIFIED (the header is
+   *  self-declared). Stored apart from the raw `sessionId`. */
+  senderSessionId?: string;
+  /** #6715 R1: `browser` only on the browser's own headers; a hint, not a proof. */
+  evidence?: OriginEvidence;
+  /** #6715 R1: the way in, for the audit. */
+  door?: OriginDoor;
+  /** #6715 R1: the raw facts behind `evidence`, none of them a secret. */
+  facts?: OriginFacts;
+  /** #6715 R3: what the forwarding node derived (a `federation` origin only). */
+  via?: ForwardedVia;
 }
 
 /**

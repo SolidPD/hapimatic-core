@@ -12,6 +12,8 @@ import { useDocumentTitle } from "@/hooks/useDocumentTitle";
 import { useEmojiFavicon } from "@/hooks/useEmojiFavicon";
 import { useFederatedSessions } from "@/hooks/queries/useFederatedSessions";
 import { useHealthStatus } from "@/hooks/queries/useHealthStatus";
+import { useAccountHealth } from "@/hooks/queries/useAccountHealth";
+import { useAccountLabelsByUuid } from "@/hooks/queries/useAccountLabels";
 import {
   useFederationHealthAggregate,
   useFederationHealthNodes,
@@ -128,6 +130,16 @@ export default function FederationDashboard() {
   const { alerts, hasMoreAlerts, isLoadingMore, isLoading, loadMoreAlerts } =
     useFederationAlerts(api);
   const { localNode, remoteNodes } = useFederatedSessions(api);
+  // #6884: each card's accounts come from ONE account-health read (the query
+  // key the Accounts page shares) and ONE read of this host's account labels,
+  // passed down so the card and its row run no query of their own.
+  const accountHealth = useAccountHealth(api, true);
+  const accountLabels = useAccountLabelsByUuid(api);
+  // A card's row: the row naming its node, else (the local card only, e.g. the
+  // identity-only fallback's LOCAL_NODE_ID card) the read's local row.
+  const accountRowFor = (nodeId: string, isLocalNode: boolean | undefined) =>
+    accountHealth.nodes.find(r => r.nodeId === nodeId) ??
+    (isLocalNode ? accountHealth.nodes.find(r => r.isLocal) : undefined);
 
   // Health endpoints unavailable (a 503 from a server with no aggregator, built
   // before #6217, or any other failed read) → the dashboard renders
@@ -254,9 +266,11 @@ export default function FederationDashboard() {
           // the lg: query still fired on a >=1024px desktop and squeezed three cards
           // into ~230px each. Two columns now yield (1024 - 32 px-4 - 12 gap-3) / 2 = 490px
           // per card — wider than the 300px SettingsDrawer panel already accepted as usable.
+          // #6884 (V2 = 1): `items-start` keeps each card its own height, so
+          // opening one card's accounts does not stretch the card beside it.
           <div
             data-testid="federation-card-grid"
-            className="grid grid-cols-1 gap-3 px-4 py-3 sm:grid-cols-2"
+            className="grid grid-cols-1 items-start gap-3 px-4 py-3 sm:grid-cols-2"
           >
             {visibleCards.map(card => (
               <FederationNodeCard
@@ -270,6 +284,13 @@ export default function FederationDashboard() {
                 readings={card.readings}
                 isLocalNode={card.isLocalNode}
                 onOpen={onOpen}
+                accountRow={accountRowFor(card.nodeId, card.isLocalNode)}
+                // A failed read is a finished read: with no data, the row
+                // says "Accounts not read" instead of "Reading accounts…".
+                accountsRead={
+                  accountHealth.hasData || accountHealth.error !== null
+                }
+                accountLabels={accountLabels}
               />
             ))}
           </div>

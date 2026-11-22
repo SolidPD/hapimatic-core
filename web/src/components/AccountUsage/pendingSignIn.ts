@@ -16,6 +16,12 @@ export type PendingSignIn = {
   authorizeUrl: string;
   /** Unix epoch ms; past this the entry is dropped unread. */
   expiresAt: number;
+  /**
+   * #6161 R19: the older sibling daemons the `oauth` start named, so the
+   * warning row comes back after a reload. Optional: an entry an earlier build
+   * wrote has none, and still reads.
+   */
+  olderSiblingDaemons?: string[];
 };
 
 /** The server's hard limit on a sign-in child (`NATIVE_SIGN_IN_MAX_LIFETIME_MS`). */
@@ -66,6 +72,15 @@ export function readPendingSignIn(now = Date.now()): PendingSignIn | null {
   if (!isPendingSignIn(parsed) || parsed.expiresAt <= now) {
     clearPendingSignIn();
     return null;
+  }
+  // #6161 R19: the names are only a warning, so a malformed list is dropped,
+  // never the sign-in it rides on.
+  const names = parsed.olderSiblingDaemons;
+  if (
+    names !== undefined &&
+    !(Array.isArray(names) && names.every(n => typeof n === "string"))
+  ) {
+    return { ...parsed, olderSiblingDaemons: undefined };
   }
   return parsed;
 }

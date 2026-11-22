@@ -111,6 +111,16 @@ import {
   serializeNotes,
   type ParsedContextUsageDetail,
 } from "@hapi/protocol";
+import {
+  BillingCategoryHistorySchema,
+  BillingCategoryListSchema,
+  type BillingCategoryAddBody,
+  type BillingCategoryHistory,
+  type BillingCategoryList,
+  type BillingCategoryOrderBody,
+  type BillingCategorySettingsBody,
+  type BillingCategoryUpdateBody,
+} from "@hapi/protocol";
 import type {
   CapabilityCatalogResponse,
   CapabilityAuditResponse,
@@ -332,6 +342,31 @@ const TELEMETRY_REPORT_OPTS: RequestReportOptions = {
 const BILLABLE_REPORT_OPTS: RequestReportOptions = {
   expectedStatuses: [404, 409, 503],
 };
+
+/**
+ * Issue #6779: every billing category answer below 500 is designed (a refused
+ * field, an agent, the gate off, a stale token, the list kept on another node,
+ * an owner that cannot be read), so none is reported to `/api/error-reports`,
+ * whose report would carry the whole body. The hook maps each by `code`.
+ */
+const BILLING_CATEGORY_REPORT_OPTS: RequestReportOptions = {
+  expectedStatuses: [400, 403, 404, 409, 503],
+};
+
+/**
+ * Parse a billing category answer with its shared (stripping) schema. A body
+ * that fails it throws an error whose text names no value from the body.
+ */
+function parseBillingCategoryAnswer<T>(
+  schema: { safeParse: (raw: unknown) => { success: boolean; data?: T } },
+  raw: unknown
+): T {
+  const parsed = schema.safeParse(raw);
+  if (!parsed.success || parsed.data === undefined) {
+    throw new Error("The billing category answer could not be read.");
+  }
+  return parsed.data;
+}
 
 /**
  * Issue #6367: the five throughput reads under `/api/telemetry/throughput/*`
@@ -2919,6 +2954,105 @@ export class ApiClient {
       undefined,
       BILLABLE_REPORT_OPTS
     );
+  }
+
+  /**
+   * #6779: the billing category list, retired ones included when asked. Read
+   * through the owner on any other node. The answer is parsed with the shared
+   * schema, which strips keys a newer owner adds.
+   */
+  async getBillingCategories(
+    opts: { retired?: boolean } = {}
+  ): Promise<BillingCategoryList> {
+    const raw = await this.request<unknown>(
+      `/api/billing-categories${opts.retired ? "?retired=1" : ""}`,
+      undefined,
+      0,
+      undefined,
+      undefined,
+      BILLING_CATEGORY_REPORT_OPTS
+    );
+    return parseBillingCategoryAnswer(BillingCategoryListSchema, raw);
+  }
+
+  /** #6779: add a category (owner only). Answers the new list. */
+  async addBillingCategory(
+    body: BillingCategoryAddBody
+  ): Promise<BillingCategoryList> {
+    return await this.writeBillingCategories(
+      "/api/billing-categories",
+      "POST",
+      body
+    );
+  }
+
+  /** #6779: rename, re-rate, retire or restore one category (owner only). */
+  async updateBillingCategory(
+    id: string,
+    body: BillingCategoryUpdateBody
+  ): Promise<BillingCategoryList> {
+    return await this.writeBillingCategories(
+      `/api/billing-categories/${encodeURIComponent(id)}`,
+      "PATCH",
+      body
+    );
+  }
+
+  /** #6779: write the order of the offered categories (owner only). */
+  async reorderBillingCategories(
+    body: BillingCategoryOrderBody
+  ): Promise<BillingCategoryList> {
+    return await this.writeBillingCategories(
+      "/api/billing-categories/order",
+      "PUT",
+      body
+    );
+  }
+
+  /** #6779: the default category and the currency for a new rate (owner only). */
+  async setBillingCategorySettings(
+    body: BillingCategorySettingsBody
+  ): Promise<BillingCategoryList> {
+    return await this.writeBillingCategories(
+      "/api/billing-categories/settings",
+      "PUT",
+      body
+    );
+  }
+
+  /** #6779: the list's history, newest first (owner only). */
+  async getBillingCategoryHistory(
+    opts: { limit?: number; before?: number } = {}
+  ): Promise<BillingCategoryHistory> {
+    const params = new URLSearchParams();
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts.before !== undefined) params.set("before", String(opts.before));
+    const qs = params.toString();
+    const raw = await this.request<unknown>(
+      `/api/billing-categories/history${qs ? `?${qs}` : ""}`,
+      undefined,
+      0,
+      undefined,
+      undefined,
+      BILLING_CATEGORY_REPORT_OPTS
+    );
+    return parseBillingCategoryAnswer(BillingCategoryHistorySchema, raw);
+  }
+
+  private async writeBillingCategories(
+    path: string,
+    method: "POST" | "PATCH" | "PUT",
+    body: unknown
+  ): Promise<BillingCategoryList> {
+    const raw = await this.request<unknown>(
+      path,
+      { method, body: JSON.stringify(body) },
+      0,
+      undefined,
+      undefined,
+      BILLING_CATEGORY_REPORT_OPTS
+    );
+    return parseBillingCategoryAnswer(BillingCategoryListSchema, raw);
   }
 
   /** Switch events across sessions and nodes (`GET /api/billable-switch/events`). */

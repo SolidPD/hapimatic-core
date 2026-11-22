@@ -73,9 +73,24 @@ export const approvalTokenHookConfig: MessageHookConfig = {
   handler: { kind: "builtin", id: APPROVAL_TOKEN_HOOK_ID },
 };
 
+/**
+ * #6715 (C2): the token check's own I/O deadline: the gate budget less one
+ * second, so a slow check denies with a named reason inside the budget instead
+ * of timing the gate out (and never mints late).
+ */
+const APPROVAL_CHECK_DEADLINE_MS = approvalTokenHookConfig.timeoutMs - 1000;
+
 export interface ApprovalTokenHookDeps {
   /** The engine's session-metadata lookup (already built at syncEngine.ts:424). */
   getSessionMetadata: (sessionId: string) => Metadata | undefined;
+  /**
+   * #6715 (R8): the engine's session lookup, for the gated session's tag (the
+   * self-send check compares the sender with the id or the tag). Optional so a
+   * caller without it keeps the id-only check.
+   */
+  getSession?: (sessionId: string) => { tag?: string | null } | undefined;
+  /** #6715 (C2): override the check's deadline (tests only; default below). */
+  checkDeadlineMs?: number;
   /** Injected token-gate config (R7 allowlist flag). */
   config: ApprovalTokensConfig;
   /** Injected hygiene-TTL days for #3332's fingerprint-less path. */
@@ -126,7 +141,13 @@ export interface ApprovalTokenHookDeps {
 export function createApprovalTokenHook(
   deps: ApprovalTokenHookDeps
 ): MessageHookHandler {
-  return async (input): Promise<MessageHookResult> => {
+  return async (input, hookOpts): Promise<MessageHookResult> => {
+    // #6715 (R7, NOTE1 on the server): a Pins answers message the server
+    // composed is never gated. It is delivered; nothing is minted or consumed,
+    // and it is never denied, because a gate denial refuses the whole Submit.
+    // The composer already neutralizes every code (shared/src/pinAnswers.ts),
+    // so this guards only a field added later without cleaning.
+    if (input.kind === "pin-answers") return {};
     const token = extractToken(input.text);
     if (!token) {
       // No token in this message — the gate is a no-op (delivery proceeds).
@@ -147,8 +168,22 @@ export function createApprovalTokenHook(
       return { deny: { reason: "provenance-rejected" } };
     }
 
+    const gatedTag = deps.getSession?.(input.sessionId)?.tag;
+    // #6715 (R9, C2): the check's own deadline, under the gate budget, joined
+    // with the stage's signal (aborted inside the gate's timer). Every I/O of
+    // the check stops on it, and a check that ran out of time mints nothing.
+    const deadline = AbortSignal.timeout(
+      deps.checkDeadlineMs ?? APPROVAL_CHECK_DEADLINE_MS
+    );
+    const signal = hookOpts?.signal
+      ? AbortSignal.any([hookOpts.signal, deadline])
+      : deadline;
     const result = await verifyToken(repoPath, token, {
+      signal,
       gatedSessionId: input.sessionId,
+      ...(typeof gatedTag === "string" && gatedTag.length > 0
+        ? { gatedSessionTag: gatedTag }
+        : {}),
       origin: input.origin,
       config: deps.config,
       // #3538: the injected machine-global bypass-scope store base. A repo-local

@@ -45,6 +45,7 @@ export const STORAGE_KEYS = {
   waitingForSlot: getStorageKey("hapi:notify:waitingForSlot"),
   loopsResuming: getStorageKey("hapi:notify:loopsResuming"),
   modelReverted: getStorageKey("hapi:notify:modelReverted"),
+  signInEnding: getStorageKey("hapi:notify:signInEnding"),
 } as const satisfies Record<
   | "permissions"
   | "questions"

@@ -10,6 +10,7 @@
     ".": "./src/index.ts",
     "./accountConfigDims": "./src/accountConfigDims.ts",
     "./accounts": "./src/accounts.ts",
+    "./moneyTestVectors": "./src/moneyTestVectors.ts",
     "./deterministicJson": "./src/deterministicJson.ts",
     "./adminVms": "./src/adminVms.ts",
     "./apiKeyRef": "./src/apiKeyRef.ts",

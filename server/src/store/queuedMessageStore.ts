@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { MessageOrigin } from "../sync/sentFrom";
 import type { Database } from "bun:sqlite";
 
 import {
@@ -31,6 +32,7 @@ export class QueuedMessageStore {
     namespace: string;
     body: string;
     clientGeneratedId?: string | null;
+    origin?: MessageOrigin;
   }): EnqueueResult {
     return enqueueQueuedMessage(this.db, args);
   }
@@ -47,9 +49,17 @@ export class QueuedMessageStore {
     sessionId: string,
     namespace: string,
     position: number,
-    body: string
+    body: string,
+    origin?: MessageOrigin
   ): StoredQueuedMessage | null {
-    return updateQueuedMessageAt(this.db, sessionId, namespace, position, body);
+    return updateQueuedMessageAt(
+      this.db,
+      sessionId,
+      namespace,
+      position,
+      body,
+      origin
+    );
   }
 
   removeAt(sessionId: string, namespace: string, position: number): boolean {

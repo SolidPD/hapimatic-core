@@ -58,7 +58,7 @@ function OpenBillableSwitchDialog(
 
   const description = on
     ? `${billableAmountWords(amount)} becomes billable.`
-    : `${billableAmountWords(amount, "off")} will not be logged.`;
+    : `${billableAmountWords(amount, "off")} will be logged as non-billable.`;
 
   const body = on ? (
     <>

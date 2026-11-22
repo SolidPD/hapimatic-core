@@ -26,12 +26,17 @@ export const KIND_PREFERENCE_KEY = {
   "waiting-for-slot": "waitingForSlot",
   "loops-resuming": "loopsResuming",
   "model-reverted": "modelReverted",
+  "sign-in-ending": "signInEnding",
 } as const satisfies Record<NotificationKind, string>;
 
 export type KindPreferenceKey =
   (typeof KIND_PREFERENCE_KEY)[keyof typeof KIND_PREFERENCE_KEY];
 
-/** The keys added by #4915 (the non-push kinds), in Settings display order. */
+/**
+ * The keys added after the five push toggles (#4915 onward), in Settings
+ * display order, each on by default. Most are toast-only; `signInEnding`
+ * (#6161) also gates the push its producer sends.
+ */
 export const NEW_KIND_PREFERENCE_KEYS = [
   "toolErrors",
   "promptBlocked",
@@ -42,6 +47,7 @@ export const NEW_KIND_PREFERENCE_KEYS = [
   "waitingForSlot",
   "loopsResuming",
   "modelReverted",
+  "signInEnding",
 ] as const;
 
 export type NewKindPreferenceKey = (typeof NEW_KIND_PREFERENCE_KEYS)[number];

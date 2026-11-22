@@ -87,7 +87,30 @@ function table(header: string[], rows: string[][]): string[] {
 }
 
 /**
- * The human table: `NODE  ACCOUNT  AGE  STATE`, then "Past deaths", then every
+ * Issue #6161 (R16): the table's ENDS cell. `-` for a flagged row (dead or
+ * quarantined: #6801's states own it), `?` when the rule resolves no deadline
+ * (`unknown`, `disproved` or `unreported`), else `in N d` or `due`, with `~` in
+ * front when the deadline is an estimate.
+ */
+export function formatEndsCell(row: SignInAgeRow): string {
+  if (row.age.state !== "running") return "-";
+  if (row.deadlineAt === null || row.daysLeft === null) return "?";
+  const about = row.estimated ? "~" : "";
+  return row.ending === "due" ? `${about}due` : `${about}in ${row.daysLeft} d`;
+}
+
+/** Issue #6161 (R18): a past death's text, with its prediction when recorded. */
+function formatPastDeath(p: SignInDeathRow): string {
+  const alive = `alive at ${wholeSignInDays(p.signedInAt, p.lastAliveAt)} d`;
+  const predicted =
+    p.predictedDeadlineAt === null
+      ? ""
+      : `; predicted ${wholeSignInDays(p.signedInAt, p.predictedDeadlineAt)} d`;
+  return `died at ${p.days} d (${alive}${predicted})`;
+}
+
+/**
+ * The human table: `NODE  ACCOUNT  AGE  ENDS  STATE`, then "Past deaths", then every
  * coverage node on its own line. Days only, never an absolute time, so no time
  * zone applies.
  */
@@ -102,11 +125,12 @@ export function formatSignInAgesTable(
   } else {
     out.push(
       ...table(
-        ["NODE", "ACCOUNT", "AGE", "STATE"],
+        ["NODE", "ACCOUNT", "AGE", "ENDS", "STATE"],
         shown.rows.map(r => [
           r.nodeLabel,
           r.emailAddress,
           formatAgeCell(r),
+          formatEndsCell(r),
           r.age.state,
         ])
       )
@@ -117,11 +141,7 @@ export function formatSignInAgesTable(
     out.push(
       ...table(
         ["NODE", "ACCOUNT", "AGE"],
-        shown.past.map(p => [
-          p.nodeLabel,
-          p.emailAddress,
-          `died at ${p.days} d (alive at ${wholeSignInDays(p.signedInAt, p.lastAliveAt)} d)`,
-        ])
+        shown.past.map(p => [p.nodeLabel, p.emailAddress, formatPastDeath(p)])
       )
     );
   }
@@ -148,6 +168,17 @@ export type JsonAgeRow = {
   diedAtIso: string | null;
   lastAliveAt: number;
   lastAliveAtIso: string | null;
+  /**
+   * Issue #6161 (R16): the resolved deadline and its source (null source on a
+   * past row), the whole days left (null when flagged, unresolved or past), and
+   * the deadline predicted for a past death. Additive: #6801's keys stay.
+   */
+  deadlineAt: number | null;
+  deadlineAtIso: string | null;
+  deadlineSource: string | null;
+  daysLeft: number | null;
+  predictedDeadlineAt: number | null;
+  predictedDeadlineAtIso: string | null;
 };
 
 function jsonRow(row: SignInAgeRow): JsonAgeRow {
@@ -172,6 +203,12 @@ function jsonRow(row: SignInAgeRow): JsonAgeRow {
     diedAtIso: iso(diedAt),
     lastAliveAt: row.lastAliveAt,
     lastAliveAtIso: iso(row.lastAliveAt),
+    deadlineAt: row.deadlineAt,
+    deadlineAtIso: iso(row.deadlineAt),
+    deadlineSource: row.deadlineSource,
+    daysLeft: row.daysLeft,
+    predictedDeadlineAt: null,
+    predictedDeadlineAtIso: null,
   };
 }
 
@@ -189,6 +226,12 @@ function jsonPast(p: SignInDeathRow): JsonAgeRow {
     diedAtIso: iso(p.diedAt),
     lastAliveAt: p.lastAliveAt,
     lastAliveAtIso: iso(p.lastAliveAt),
+    deadlineAt: null,
+    deadlineAtIso: null,
+    deadlineSource: null,
+    daysLeft: null,
+    predictedDeadlineAt: p.predictedDeadlineAt,
+    predictedDeadlineAtIso: iso(p.predictedDeadlineAt),
   };
 }
 
@@ -197,6 +240,10 @@ function jsonPast(p: SignInDeathRow): JsonAgeRow {
  * are epoch-ms numbers, each with an `*Iso` sibling (`null` when the number is
  * `null`). `days` and `diedAt` are `null` for `stopped-unknown` and
  * `flagged-unreported`; `diedAt` is `null` for `running` and `quarantined`.
+ * Issue #6161: `deadlineAt` (with `deadlineAtIso`), `deadlineSource` and
+ * `daysLeft` describe a row's deadline (`deadlineAt: null` with its source when
+ * unresolved; a flagged row keeps both and has `daysLeft: null`);
+ * `predictedDeadlineAt` (with its `*Iso`) is a past death's prediction.
  * `past` rows use the same keys.
  */
 export type SignInAgesJson = {

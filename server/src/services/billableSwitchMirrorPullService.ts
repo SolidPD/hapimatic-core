@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
   BILLABLE_SWITCH_EVENT_KINDS,
+  BILLABLE_SWITCH_FEED_SCHEMA,
   BillableSwitchEventFeedPageSchema,
   SupervisedLoop,
   type BillableSwitchEventFeedPage,
@@ -32,15 +33,43 @@ import type { BillableSwitchStore } from "../store/billableSwitchStore";
  *    keeps its state. A row of a kind this node does not know (a newer
  *    origin's) is left out of its page, the cursor moves past it, and the
  *    origin is named in the log once (#6778 F1).
+ * Every request asks with `schema` 2 (#6778 PR-B, 6.3), whatever the origin
+ * advertises: an origin that knows it sends every kind with the four new
+ * fields and `cursorAt`, and one that does not ignores it.
  * Resync (the cursor back to 0 under the page's incarnation, every copied row
- * kept): no cursor row, another incarnation (a rebuilt node), or a highest id
+ * kept): no cursor row, another incarnation (a rebuilt node), a highest id
  * below the cursor (a database restored from a backup under the same
- * incarnation). Then pages are applied until drained or 20 were applied. This
- * service never deletes a copied row, so the copy outlives the session and the
- * node.
+ * incarnation), a cursor row whose `at` is not the copy's (a restore that
+ * re-issued ids at or below the cursor, review S14), or a cursor row that does
+ * not yet record the `schema` 2 reset. That reset happens once per origin
+ * (review H6): it is recorded in `feed_state` with the first page applied after
+ * it, kept by the `unsupported` branch, and erased only by a build before PR-B,
+ * whose pulls write a plain state, so a roll forward copies once more what that
+ * build copied without the new fields (section 12 step 4). Then pages are
+ * applied until drained or 20 were applied. This service never deletes a
+ * copied row, so the copy outlives the session and the node.
  */
 
 const PAGE_LIMIT = 500;
+/**
+ * The `feed_state` suffixes that record the once-per-origin reset (review H6),
+ * by what the origin served (review finding M7): `:schema-2` when its page
+ * carried `cursorAt` (it honoured `schema` 2), `:schema-1` when it did not (a
+ * build before PR-B, or one rolled back to it). A `:schema-1` origin that
+ * starts serving `cursorAt` is copied once more, which repairs the rows it
+ * served without the four new fields; an origin that stays older is not
+ * copied again on every tick.
+ */
+export const SCHEMA_RESET_MARK = `:schema-${BILLABLE_SWITCH_FEED_SCHEMA}`;
+export const OLD_ORIGIN_RESET_MARK = ":schema-1";
+const resetMarkOf = (state: string | undefined): string =>
+  state?.endsWith(SCHEMA_RESET_MARK)
+    ? SCHEMA_RESET_MARK
+    : state?.endsWith(OLD_ORIGIN_RESET_MARK)
+      ? OLD_ORIGIN_RESET_MARK
+      : "";
+const pageResetMark = (page: BillableSwitchEventFeedPage): string =>
+  page.cursorAt !== undefined ? SCHEMA_RESET_MARK : OLD_ORIGIN_RESET_MARK;
 /** One large origin cannot starve the rest within a tick. */
 const MAX_PAGES_PER_TICK = 20;
 
@@ -51,7 +80,7 @@ export interface BillableSwitchPullRegistry {
   getBillableSwitchNodeViews(): BillableSwitchNodeRegistryView[];
   getBillableSwitchEventFeedOnNode(
     nodeId: string,
-    opts: { cursor: number; limit: number }
+    opts: { cursor: number; limit: number; schema?: number }
   ): Promise<PeerReadOutcome>;
 }
 
@@ -128,8 +157,14 @@ export async function pullAllOnce(
   return outcomes;
 }
 
-/** Origins already named in the log for a kind this node does not know. */
+/**
+ * (origin, kind) pairs already named in the log for a kind this node does not
+ * know: keyed by both, so a second unknown kind from one origin is named too
+ * (review finding L4).
+ */
 const warnedUnknownKind = new Set<string>();
+/** Origins already named for a page that failed its schema, by field path (M5). */
+const warnedMalformed = new Set<string>();
 
 /**
  * Leaves out of a page, before it is parsed, every row whose `kind` this build
@@ -184,18 +219,54 @@ async function fetchPage(
   const outcome = await registry.getBillableSwitchEventFeedOnNode(nodeId, {
     cursor,
     limit: PAGE_LIMIT,
+    schema: BILLABLE_SWITCH_FEED_SCHEMA,
   });
   if (outcome.kind !== "ok") return { kind: "unreachable" };
   const { body, received, dropped } = dropUnknownKinds(outcome.body);
   const parsed = BillableSwitchEventFeedPageSchema.safeParse(body);
-  if (!parsed.success) return { kind: "malformed" };
-  if (dropped.length > 0 && !warnedUnknownKind.has(nodeId)) {
-    warnedUnknownKind.add(nodeId);
+  if (!parsed.success) {
+    // Review finding M5: a page that fails its schema stops this origin's copy
+    // until it parses; say so once per origin and failing field.
+    const issue = parsed.error.issues[0];
+    const where = issue ? issue.path.join(".") || "(root)" : "(unknown)";
+    if (!warnedMalformed.has(`${nodeId}|${where}`)) {
+      warnedMalformed.add(`${nodeId}|${where}`);
+      console.warn(
+        `[BillableSwitchMirrorPull] origin ${nodeId} sent a page this node cannot parse (at ${where}: ${issue?.message ?? "unknown"}); its copy waits until a page parses`
+      );
+    }
+    return { kind: "malformed" };
+  }
+  const fresh = [...new Set(dropped)].filter(
+    k => !warnedUnknownKind.has(`${nodeId}|${k}`)
+  );
+  if (fresh.length > 0) {
+    for (const k of fresh) warnedUnknownKind.add(`${nodeId}|${k}`);
     console.warn(
-      `[BillableSwitchMirrorPull] origin ${nodeId} sent switch events of a kind this node does not know (${[...new Set(dropped)].join(", ")}); they are not copied here, and the copy goes on past them`
+      `[BillableSwitchMirrorPull] origin ${nodeId} sent switch events of a kind this node does not know (${fresh.join(", ")}); they are not copied here, and the copy goes on past them`
     );
   }
   return { kind: "page", page: parsed.data, received };
+}
+
+/**
+ * Whether the origin's row at the cursor is not the one this node copied
+ * (review S14). Only a `schema` 2 page carries `cursorAt`; an older origin's
+ * page does not, and nothing is compared. Nothing is compared either when the
+ * copy holds no row with that id (a row of a kind this node left out). A
+ * re-issued id is copied as a second row, so any copied row with that `at`
+ * matches.
+ */
+function cursorRowMoved(
+  store: BillableSwitchStore,
+  nodeId: string,
+  page: BillableSwitchEventFeedPage,
+  cursor: number
+): boolean {
+  if (page.cursorAt === undefined || cursor === 0) return false;
+  const ats = store.getMirrorEventAts(nodeId, page.incarnation, cursor);
+  if (ats.length === 0) return false;
+  return page.cursorAt === null || !ats.includes(page.cursorAt);
 }
 
 /** One origin, one tick. */
@@ -208,11 +279,13 @@ export async function pullOriginOnce(
   const nodeId = view.nodeId;
   if (view.awaitingInitialPoll) return "skipped-unpolled";
   const stored = store.getMirrorCursor(nodeId);
+  const mark = resetMarkOf(stored?.feedState);
   if (!view.on && !view.closed) {
     store.setMirrorCursor(nodeId, {
       originIncarnation: stored?.originIncarnation ?? "",
       cursor: stored?.cursor ?? 0,
-      feedState: "unsupported",
+      // The reset mark survives a gate that leaves `on` or `closed` (H6).
+      feedState: `unsupported${mark}`,
       lastOriginMaxId: stored?.lastOriginMaxId ?? null,
       lastSyncAt: stored?.lastSyncAt ?? null,
       lastAttemptAt: now(),
@@ -225,11 +298,28 @@ export async function pullOriginOnce(
   if (fetched.kind === "unreachable") return "skipped-unreachable";
   if (fetched.kind === "malformed") return "skipped-malformed";
 
+  const moved = cursorRowMoved(store, nodeId, fetched.page, cursor);
+  const upgraded =
+    mark === OLD_ORIGIN_RESET_MARK && fetched.page.cursorAt !== undefined;
   const resync =
     !stored ||
+    mark === "" ||
+    upgraded ||
     stored.originIncarnation !== fetched.page.incarnation ||
-    fetched.page.maxEventId < cursor;
+    fetched.page.maxEventId < cursor ||
+    moved;
   if (resync && cursor !== 0) {
+    console.log(
+      `[BillableSwitchMirrorPull] origin ${nodeId}: copying its record again from the start (${
+        mark === ""
+          ? `once, to get every kind and field of feed schema ${BILLABLE_SWITCH_FEED_SCHEMA}`
+          : upgraded
+            ? `once more: it now serves feed schema ${BILLABLE_SWITCH_FEED_SCHEMA}, which repairs the rows it served without the new fields`
+            : moved
+              ? "the row at the cursor is not the copy's: a restored database"
+              : "another incarnation, or a highest id below the cursor"
+      }); rows already copied are kept`
+    );
     cursor = 0;
     fetched = await fetchPage(registry, nodeId, cursor);
     if (fetched.kind === "unreachable") return "skipped-unreachable";
@@ -245,7 +335,9 @@ export async function pullOriginOnce(
     store.setMirrorCursor(nodeId, {
       originIncarnation: page.incarnation,
       cursor: page.nextCursor,
-      feedState: "ok",
+      // Written with the first page applied: the reset is done for this
+      // origin, at the schema its page shows it served (M7).
+      feedState: `ok${pageResetMark(page)}`,
       lastOriginMaxId: page.maxEventId,
       lastSyncAt: at,
       lastAttemptAt: at,

@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { z } from "zod";
+import type { TrackingStartValues } from "./billableTracking";
 
 // The billable switch (issue #6646, epic #6585): whether a session's time is
 // billed. (#6586 says how much time there is; this module never measures time.)
 //
 // This module is the single cross-package contract: the store, the start rule,
-// the routes, the federation hop and the screens all validate against it. Every
-// rule that decides a session's start value lives in `resolveBillableSwitchStart`,
-// one pure function over the truth table of the plan (Task 1), so the server's
-// insert path and its tests read the same table.
+// the routes, the federation hop and the screens all validate against it. The
+// rule that decides a session's start value is `resolveTrackingStart`
+// (`./billableTracking`, #6778 PR-B), one pure function over the plan's table,
+// so the server's insert path and its tests read the same table.
 
 // ---------------------------------------------------------------------------
 // The gate
@@ -134,16 +135,23 @@ export type BillableSwitchHeader = z.infer<typeof BillableSwitchHeaderSchema>;
 
 /**
  * How old another node's header report may be before the push stops passing it
- * on: 7 days. Since #6778 PR-A no start reads a report and none is stored; the
- * push still sends this node's own, empty one (an older node replaces its
- * stored copy with it).
+ * on: 7 days. Since #6778 PR-A no start reads a report: the start-up step
+ * deletes the stored header rows (`billable_switch_peer_headers`), while each
+ * node's report row (`billable_switch_peer_reports`) stays and the push still
+ * sends an empty entry for it up to this age (an older node replaces its stored
+ * copy with it).
  */
 export const BILLABLE_SWITCH_REPORT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // The event record (section 6 item 3 of the plan, as data)
 
-export const BILLABLE_SWITCH_EVENT_KINDS = [
+/**
+ * The seven kinds a build before #6778 PR-B knows. Its history parse and its
+ * puller hold a strict kind enum, so they see only these (the feed and the old
+ * history routes leave `tracking` out unless asked, section 6.3).
+ */
+export const BILLABLE_SWITCH_LEGACY_EVENT_KINDS = [
   "start",
   "on",
   "off",
@@ -151,6 +159,16 @@ export const BILLABLE_SWITCH_EVENT_KINDS = [
   "reverse",
   "header-on",
   "header-off",
+] as const;
+
+/**
+ * Every kind. `tracking` (#6778 PR-B) is a write that leaves the projection
+ * alone: settings, the reconcile, a copy not sent, a Keep or Reverse of a
+ * waiting copy that is not Billable.
+ */
+export const BILLABLE_SWITCH_EVENT_KINDS = [
+  ...BILLABLE_SWITCH_LEGACY_EVENT_KINDS,
+  "tracking",
 ] as const;
 export type BillableSwitchEventKind =
   (typeof BILLABLE_SWITCH_EVENT_KINDS)[number];
@@ -174,6 +192,14 @@ export const BILLABLE_SWITCH_START_REASONS = [
   "cross-node",
   "cross-node-unasked",
   "default",
+  // #6778 PR-B (section 5): a person's start from the Create page's settings,
+  // an agent's copy, a copy that waits, a schedule start with carried settings,
+  // a start whose settings were lost (its label carries the cause only).
+  "create-page",
+  "agent-inherit",
+  "inherit-waiting",
+  "schedule-carried",
+  "start-lost",
 ] as const;
 export type BillableSwitchStartReason =
   (typeof BILLABLE_SWITCH_START_REASONS)[number];
@@ -181,13 +207,27 @@ export type BillableSwitchStartReason =
 /** Which reasons each kind may carry. The store and the service refuse any other pair. */
 export const BILLABLE_SWITCH_REASONS_BY_KIND = {
   start: BILLABLE_SWITCH_START_REASONS,
-  on: ["switch", "pick"],
-  off: ["switch", "switch-off-and-delete", "never-bill"],
+  on: ["switch", "pick", "tracking-on", "status-change"],
+  off: [
+    "switch",
+    "switch-off-and-delete",
+    "never-bill",
+    "tracking-off",
+    "status-change",
+  ],
   keep: ["confirm", "confirm-all", "switch"],
   reverse: ["confirm-reverse", "switch", "switch-off-and-delete", "never-bill"],
   "header-on": ["switch", "create-choice"],
   // `retired`: #6778 PR-A's start-up step switched a header off for good (R12).
   "header-off": ["switch", "retired"],
+  // #6778 PR-B (3.2): a write that leaves the projection alone.
+  tracking: [
+    "settings",
+    "reconciled",
+    "copy-not-sent",
+    "confirm-kept",
+    "confirm-reversed",
+  ],
 } as const satisfies Record<BillableSwitchEventKind, readonly string[]>;
 
 export type BillableSwitchReason =
@@ -251,6 +291,14 @@ export const BillableSwitchEventSchema = z
     unloggedMs: z.number().nullable(),
     loggedKnown: z.boolean(),
     label: z.record(z.string(), z.unknown()).nullable(),
+    // #6778 PR-B (3.2): the whole record before and after, the write's origin
+    // and the tracking start. Absent on a row a build before PR-B wrote, and
+    // left out of the feed for a puller that does not ask with `schema=2`.
+    // Loose, so a newer node's snapshot never fails a page here.
+    settingsBefore: z.record(z.string(), z.unknown()).nullable().optional(),
+    settingsAfter: z.record(z.string(), z.unknown()).nullable().optional(),
+    origin: z.string().nullable().optional(),
+    trackFrom: z.number().nullable().optional(),
   })
   .passthrough();
 export type BillableSwitchEvent = z.infer<typeof BillableSwitchEventSchema>;
@@ -266,7 +314,15 @@ export const BillableSwitchEventFeedPageSchema = z.object({
   maxEventId: z.number().int().nonnegative(),
   events: z.array(BillableSwitchEventSchema),
   nextCursor: z.number().int().nonnegative(),
+  // #6778 PR-B (S14): on a `schema=2` page only, the `at` of the row whose id is
+  // the request's cursor (null when this node holds no such row). Absent from
+  // an older origin's page and from a page without `schema=2`, so an older
+  // puller, which strips unknown keys here, never sees it.
+  cursorAt: z.number().nullable().optional(),
 });
+
+/** #6778 PR-B (6.3): the feed version a puller asks for to get every kind and field. */
+export const BILLABLE_SWITCH_FEED_SCHEMA = 2;
 export type BillableSwitchEventFeedPage = z.infer<
   typeof BillableSwitchEventFeedPageSchema
 >;
@@ -288,6 +344,20 @@ export const BillableSwitchStartWireSchema = z.object({
   actor: BillableSwitchActorSchema.optional().catch(undefined),
   entryNodeId: z.string().max(200).optional().catch(undefined),
   via: BillableSwitchViaSchema.optional().catch(undefined),
+  // #6778 (4.1): the validated settings and the claimed parent. The receiver
+  // parses `tracking` with the strict schema itself (a node before PR-C drops
+  // both fields, which is why the hub sends them only to a node that can take a
+  // tracked start).
+  tracking: z.unknown().optional(),
+  inheritedFrom: z
+    .object({
+      sessionId: z.string().min(1).max(200),
+      nodeId: z.string().max(200).nullable(),
+      claimed: z.literal(true),
+      headerBound: z.boolean(),
+    })
+    .optional()
+    .catch(undefined),
 });
 export type BillableSwitchStartWire = z.infer<
   typeof BillableSwitchStartWireSchema
@@ -310,6 +380,15 @@ export type BillableSwitchStartContext = {
   namespace?: string;
   /** Server-only: the schedule that started a `schedule` start (for the record's label). */
   scheduleId?: string;
+  /** #6778: validated settings (a person's start, row 2; a schedule's carried settings, row 8b). */
+  tracking?: TrackingStartValues;
+  /** #6778: the parent an agent start copies; always a claim (4.1). */
+  inheritedFrom?: {
+    sessionId: string;
+    nodeId: string | null;
+    claimed: true;
+    headerBound: boolean;
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -368,68 +447,6 @@ export type BillableSwitchNodeView = {
     >
   >;
 };
-
-// ---------------------------------------------------------------------------
-// The start rule (first matching row wins)
-
-export type BillableSwitchStartInput = {
-  mode: BillableSwitchMode;
-  context: Pick<BillableSwitchStartContext, "kind" | "choice">;
-  /** The parent row's switch, for kind `inherit`; null when it was not found. */
-  parent: { billable: boolean; confirm: BillableConfirm } | null;
-};
-
-export type BillableSwitchStartResult = {
-  billable: boolean;
-  confirm: BillableConfirm;
-  /** Null for row 1 (the gate is not `on`): no event is written. */
-  reason: BillableSwitchStartReason | null;
-};
-
-/**
- * The start value of a new session row. Rows, first match wins:
- *  1. gate not `on` → off, no event
- *  2. kind `person` answering `not-billable` → off
- *  3. kind `inherit`, parent found → the parent's switch and confirm state
- *  4. kind `system` (support, self-update, heartbeat) → off, whatever else (SYS-1)
- *  5. otherwise → off
- * A choice counts only for kind `person`; `follow-header` is no answer.
- *
- * Issue #6778 PR-A (R12): no project header and no other node's report decides
- * a start any more; their rows (#6646's 7 to 10) and the two answers that billed
- * through the header (`header-and-session`, `session-only`, #6646's rows 2 and
- * 3) are gone. The spawn routes refuse a retired answer (400
- * `billable_choice_retired`); one that still reaches this rule is no answer, so
- * the start is off. PR-B replaces this rule with the tracking record's.
- */
-export function resolveBillableSwitchStart(
-  input: BillableSwitchStartInput
-): BillableSwitchStartResult {
-  const { mode, context, parent } = input;
-  if (mode !== "on") return { billable: false, confirm: null, reason: null };
-
-  if (context.kind === "person" && context.choice === "not-billable") {
-    return {
-      billable: false,
-      confirm: null,
-      reason: "explicit-not-billable",
-    };
-  }
-
-  if (context.kind === "inherit" && parent) {
-    return {
-      billable: parent.billable,
-      confirm: parent.billable ? parent.confirm : null,
-      reason: "inherit",
-    };
-  }
-
-  if (context.kind === "system") {
-    return { billable: false, confirm: null, reason: "system" };
-  }
-
-  return { billable: false, confirm: null, reason: "default" };
-}
 
 // ---------------------------------------------------------------------------
 // The amount (the swap point, section 5; EARLY-1)

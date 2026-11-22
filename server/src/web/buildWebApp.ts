@@ -53,6 +53,9 @@ import { createBookmarksRoutes } from "./routes/bookmarks";
 import { createCliPinRoutes } from "./routes/cliPins";
 import { createPinsRoutes } from "./routes/pins";
 import { createBillableSwitchRoutes } from "./routes/billableSwitch";
+import { createBillingCategoryRoutes } from "./routes/billingCategories";
+import { BillingCategoryService } from "../billingCategories/billingCategoryService";
+import { getProcessBillingCategoriesState } from "../federation/capabilityDetector";
 import { createPinByIdRoutes } from "./routes/pinById";
 import { createPinDashboardsRoutes } from "./routes/pinDashboards";
 import { resolvePinsEnabled } from "../config/pinsConfig";
@@ -220,6 +223,10 @@ import {
 } from "./routes/scorecard";
 import { createFederationRoutes } from "./routes/federation";
 import { readNodeAccountHealth } from "../services/accountHealth";
+import {
+  readFolderDeadline,
+  readFolderSignInAt,
+} from "../services/isolatedCredentialsSync";
 import { resolveLocalNodeIdentity } from "../config/nodeLabel";
 import type { NodeRegistry } from "../federation/nodeRegistry";
 import type { NotificationService } from "../notifications/notificationService";
@@ -415,6 +422,25 @@ export function buildWebApp(options: {
   // built). `off` when there is no engine (a bare test app).
   const billableSwitchMode: BillableSwitchMode =
     options.getSyncEngine()?.getBillableSwitchMode?.() ?? "off";
+  // Issue #6779 (P-8): the billing-category service, built ONCE here because
+  // this composition root holds the Store (the SyncEngine keeps it private).
+  // The public routes and the federation receivers share it, and #6778's own
+  // pull request hands its lookup to the validating spawn routes. The owner
+  // state is the one index.ts set at boot (absent in a bare test app: a reader).
+  const billingCategoryService = new BillingCategoryService({
+    store: options.store,
+    getNodeRegistry: options.getNodeRegistry,
+    getOwner: () => getProcessBillingCategoriesState()?.owner ?? false,
+    self: options.federationConfig
+      ? {
+          nodeId: options.federationConfig.nodeId,
+          nodeLabel: options.federationConfig.nodeLabel,
+        }
+      : null,
+    errorLogger: options.errorLogger,
+  });
+  const getBillingCategoryService = (): BillingCategoryService =>
+    billingCategoryService;
   const availabilityContextFactory = (args: {
     session?: SessionLike;
     caller: Caller;
@@ -820,6 +846,12 @@ export function buildWebApp(options: {
       monogramStore,
       usageService,
       now: Date.now,
+      // Issue #6161 (R8): the folder's deadline and sign-in marker time, read
+      // live with the same options the sign-in's write-through uses.
+      readFolderDeadline: uuid =>
+        readFolderDeadline(uuid, { dataDir: configuration.dataDir }),
+      readFolderSignInAt: uuid =>
+        readFolderSignInAt(uuid, { dataDir: configuration.dataDir }),
     });
   // Issue #4461: THIS node's identity, the one stamped on an
   // account_unrefreshable 409 and on this node's own SSE refusal events.
@@ -847,6 +879,7 @@ export function buildWebApp(options: {
   app.route(
     "/api",
     createFederationRoutes({
+      getBillingCategoryService,
       pinsEnabled: resolvePinsEnabled(),
       getPinAnswersTimeZone: browserZone =>
         resolvePinAnswersTimeZone(configuration.dataDir, browserZone),
@@ -1148,6 +1181,16 @@ export function buildWebApp(options: {
       billableSwitchMode,
       getSessionService: getPinSessionService,
       getNodeRegistry: options.getNodeRegistry,
+    })
+  );
+
+  // Issue #6779: the billing-category routes, right after the #6646 mount (the
+  // JWT middleware above is their auth). Each route runs the gate itself.
+  app.route(
+    "/api",
+    createBillingCategoryRoutes({
+      getService: getBillingCategoryService,
+      billableSwitchMode,
     })
   );
 

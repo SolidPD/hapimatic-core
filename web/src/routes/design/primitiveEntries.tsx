@@ -72,6 +72,7 @@ import { FilterChip } from "@/components/ui/FilterChip";
 import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import { RadioRow } from "@/components/ui/RadioRow";
 import { StatusDot } from "@/components/ui/StatusDot";
+import { HealthStrip, type HealthTone } from "@/components/ui/HealthStrip";
 import { TouchButton } from "@/components/ui/TouchButton";
 import { SearchInput } from "@/components/ui/SearchInput";
 import { Input } from "@/components/ui/Input";
@@ -878,6 +879,44 @@ function RadioRowEntry() {
   );
 }
 
+// #6161 NP-1 (extension 5): one cell per member, worst first, fixed width.
+function HealthStripEntry() {
+  const fleet = (n: number, attention: HealthTone[]): HealthTone[] => [
+    ...attention,
+    ...Array<HealthTone>(Math.max(0, n - attention.length)).fill("ok"),
+  ];
+  const row = (tones: HealthTone[]) => (
+    <div className="flex w-80 items-center gap-1.5">
+      <HealthStrip
+        tones={tones}
+        tooltip={`${tones.length} members`}
+        aria-label={`${tones.length} members`}
+      />
+      <span className="truncate text-xs text-[var(--app-hint)]">
+        attention text
+      </span>
+    </div>
+  );
+  return (
+    <CatalogEntry id="health-strip" title="HealthStrip" kind="primitive">
+      <SpecimenRow label="member counts (the box keeps its width)">
+        <Specimen caption="1">{row(fleet(1, []))}</Specimen>
+        <Specimen caption="6">
+          {row(fleet(6, ["hot", "warn", "warn"]))}
+        </Specimen>
+        <Specimen caption="25">
+          {row(fleet(25, ["hot", "warn", "warn", "held", "unknown"]))}
+        </Specimen>
+      </SpecimenRow>
+      <SpecimenRow label="tones (hot / warn / held / ok / unknown)">
+        <Specimen caption="one of each">
+          {row(["unknown", "ok", "held", "warn", "hot"])}
+        </Specimen>
+      </SpecimenRow>
+    </CatalogEntry>
+  );
+}
+
 function StatusDotEntry() {
   return (
     <CatalogEntry id="status-dot" title="StatusDot" kind="primitive">
@@ -1105,6 +1144,7 @@ export function PrimitiveEntries() {
       <SegmentedToggleEntry />
       <RadioRowEntry />
       <StatusDotEntry />
+      <HealthStripEntry />
       <TouchButtonEntry />
       <SearchInputEntry />
       <InputEntry />

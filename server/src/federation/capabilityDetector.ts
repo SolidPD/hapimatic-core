@@ -27,6 +27,11 @@ import {
   billableSwitchCapabilityTags,
   type BillableSwitchGateState,
 } from "../config/billableSwitchConfig";
+import type { BillableSwitchMode } from "@hapi/protocol";
+import {
+  billingCategoriesCapabilityTags,
+  type BillingCategoriesOwnerState,
+} from "../config/billingCategoriesConfig";
 
 let cachedBaseCapabilities: string[] | null = null;
 
@@ -137,6 +142,33 @@ export function setProcessBillableSwitchGate(
 }
 
 /**
+ * Issue #6779: this process's billing-category owner state, set ONCE at boot by
+ * `server/src/index.ts` right after the federation config is loaded, before the
+ * announcer starts. The owner tag is appended per call beside the billable
+ * ones; `buildWebApp.ts` reads the same state to build the category service.
+ */
+export type ProcessBillingCategoriesState = {
+  ownerState: BillingCategoriesOwnerState;
+  owner: boolean;
+  storageReady: boolean;
+  mode: BillableSwitchMode;
+};
+
+let processBillingCategoriesState: ProcessBillingCategoriesState | undefined;
+
+export function setProcessBillingCategoriesState(
+  state: ProcessBillingCategoriesState | undefined
+): void {
+  processBillingCategoriesState = state;
+}
+
+export function getProcessBillingCategoriesState():
+  | ProcessBillingCategoriesState
+  | undefined {
+  return processBillingCategoriesState;
+}
+
+/**
  * Detect available capabilities for this node.
  * Includes base capabilities plus agent-specific ones.
  * Agent capabilities use the `agent:` prefix (e.g., `agent:claude`).
@@ -154,6 +186,8 @@ export function detectCapabilities(opts?: {
    * appended per call after the role tag, never cached with the base set.
    */
   billableSwitch?: Pick<BillableSwitchGateState, "mode" | "storageReady">;
+  /** Issue #6779: the owner state; its tag is appended beside the billable ones. */
+  billingCategories?: ProcessBillingCategoriesState;
 }): string[] {
   if (!cachedBaseCapabilities) {
     // #4462: ANTHROPIC_LOGIN_CAPABILITY is static (every binary since #4462 ships
@@ -209,6 +243,11 @@ export function detectCapabilities(opts?: {
   result.push(
     ...billableSwitchCapabilityTags(
       opts?.billableSwitch ?? processBillableSwitchGate
+    )
+  );
+  result.push(
+    ...billingCategoriesCapabilityTags(
+      opts?.billingCategories ?? processBillingCategoriesState
     )
   );
   return result;

@@ -218,6 +218,9 @@ export const queryKeys = {
   billableSwitchHeaders: ["billable-switch-headers"] as const,
   billableSwitchHistory: (sessionId: string) =>
     ["billable-switch-history", sessionId] as const,
+  // #6779: the billing category list (retired ones included) and its history.
+  billingCategories: ["billing-categories"] as const,
+  billingCategoryHistory: ["billing-category-history"] as const,
   // The version read (`useVersion`), which carries the billable gate's state.
   version: ["version"] as const,
   // File Conflict Monitor (#1971): per-repo live claims + umbrella recompute key.

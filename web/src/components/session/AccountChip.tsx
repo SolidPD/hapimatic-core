@@ -39,6 +39,7 @@ import {
   type AccountMonoColorId,
   type AccountMonogram,
 } from "@hapi/protocol";
+import { attentionRingClass, type AttentionRing } from "@/lib/attentionRing";
 
 // Per-account monogram colors — the E6 `--id-*` palette maps 1:1 to Tailwind
 // palette colors (NOT the runtime-swappable mint accent, so token-rule-safe).
@@ -101,6 +102,11 @@ export function AccountChip(props: {
    * `HoverTooltipButton` reveals the email, so desktop shows one bubble, not two.
    * Default `true` (byte-identical). */
   nativeTitle?: boolean;
+  /** #6884 (design README extensions 1 and 2): an attention ring, the same
+   * classes `NodeBadge` draws (`lib/attentionRing.ts`): `alert` red (re-login),
+   * `warn` amber (ending), `default` mint (the node's default account), `held`
+   * grey at 75 % (quarantined). Absent ⇒ byte-identical. */
+  ring?: AttentionRing;
 }) {
   const {
     email,
@@ -113,6 +119,7 @@ export function AccountChip(props: {
     className = "",
     labelClassName,
     nativeTitle = true,
+    ring,
   } = props;
   const fullLabel = (label ?? "").trim() || accountShortName(email);
   const name = truncateAccountLabel(fullLabel, maxChars);
@@ -140,7 +147,7 @@ export function AccountChip(props: {
       }
       className={`inline-flex min-w-0 max-w-full items-center gap-0.5 whitespace-nowrap rounded-md border border-[var(--app-border)] bg-[var(--app-subtle-bg)] py-0.5 pl-0.5 text-[length:var(--text-caption-xs)] font-semibold leading-none text-[var(--app-fg)] ${
         compact ? "pr-0.5" : "pr-1"
-      } ${dashed ? "border-dashed" : ""} ${className}`} /* gap-0.5 + pr-1 (was gap-1 + pr-1.5): the chip's fixed chrome drops 28→24px so the nickname gets 52px of the 76px cell — on-device (iOS SF Pro) "Matt [NF]" ellipsized at 48px (2026-09-06 review) */
+      } ${dashed ? "border-dashed" : ""} ${className}${ring ? ` ${attentionRingClass(ring)}` : ""}`} /* gap-0.5 + pr-1 (was gap-1 + pr-1.5): the chip's fixed chrome drops 28→24px so the nickname gets 52px of the 76px cell — on-device (iOS SF Pro) "Matt [NF]" ellipsized at 48px (2026-09-06 review) */
     >
       {/* min-w (not a fixed w) + px: one letter keeps the 14px circle (the
           padded glyph is narrower than the min-width); two letters widen it into

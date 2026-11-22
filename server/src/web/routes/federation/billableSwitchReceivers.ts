@@ -14,6 +14,7 @@ import { billableSwitchGate } from "../../middleware/billableSwitchGate";
 import {
   BillableSwitchSetResponseSchema,
   closedRefusal,
+  reconcilePendingRefusal,
   describeIssue,
   FederationBillableConfirmBodySchema,
   FederationBillableSetBodySchema,
@@ -169,7 +170,11 @@ export function createBillableSwitchReceiverRoutes(
           loggedMs: req.loggedMs,
         }
       );
-      if (!result.found) return c.json({ error: "Session not found" }, 404);
+      if (!result.found) {
+        // #6778 PR-B (3.4 step 6): the same 409 as the hub's own route.
+        if (result.reconcilePending) return reconcilePendingRefusal(c);
+        return c.json({ error: "Session not found" }, 404);
+      }
       return c.json({
         ok: true,
         changed: result.changed,
@@ -211,7 +216,16 @@ export function createBillableSwitchReceiverRoutes(
       const body = await readBody(c, FederationBillableConfirmBodySchema);
       if (!body.ok) return body.response;
       const req = body.data;
-      if (closed && req.decision === "keep") {
+      // #6778 PR-B (3.3; review G5): this node holds the record, so it decides
+      // whether a Keep raises billing; `closed` refuses only that Keep.
+      if (
+        closed &&
+        req.decision === "keep" &&
+        local.service.keepRaisesBilling(
+          local.session.id,
+          local.session.namespace
+        )
+      ) {
         return closedRefusal(c, local.service.localNodeLabel());
       }
       const outcome = local.service.confirm(
@@ -228,6 +242,9 @@ export function createBillableSwitchReceiverRoutes(
       );
       if (outcome.outcome === "not_found") {
         return c.json({ error: "Session not found" }, 404);
+      }
+      if (outcome.outcome === "reconcile_pending") {
+        return reconcilePendingRefusal(c);
       }
       if (outcome.outcome === "not_pending") {
         return c.json(
@@ -362,9 +379,9 @@ export function createBillableSwitchReceiverRoutes(
         domain: "session-lifecycle",
         surface: "rest",
         description:
-          "Receive every node's billable header reports on a node that has no view of the mesh; a node with a registry answers that its own polls are the truth.",
+          "Accept a push of other nodes' billable header reports and store nothing: since #6778 no header decides a start, so it answers applied with no nodes.",
         whenToUse:
-          "When the hub pushes the other nodes' billable headers to a node that does not poll the mesh itself.",
+          "When an older hub pushes the other nodes' billable headers to this node.",
         invocation: {
           kind: "rest",
           method: "POST",

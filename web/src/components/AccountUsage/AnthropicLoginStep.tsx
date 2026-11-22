@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle } from "lucide-react";
 import type { ApiClient } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import {
@@ -66,6 +67,17 @@ function leftNodeDoneError(err: unknown, nodeName: string): string {
 export type AnthropicStep = ReturnType<typeof useAnthropicLoginStep>;
 
 /**
+ * #6161 R19: the start answer's older sibling daemons, as names. The field
+ * crosses the federation from nodes of any build, so anything but an array of
+ * strings reads as none.
+ */
+function olderSiblingNames(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((n): n is string => typeof n === "string" && n.length > 0)
+    : [];
+}
+
+/**
  * The Anthropic sign-in on the selected node (B's node-targeted routes). The
  * login starts only when "Sign in to Claude Code" is tapped; changing the node
  * discards a started login (its PKCE state belongs to that node). On a tenant VM
@@ -97,6 +109,9 @@ export function useAnthropicLoginStep(
 
   const [loginToken, setLoginToken] = useState<string | null>(null);
   const [authorizeUrl, setAuthorizeUrl] = useState<string | null>(null);
+  // #6161 R19: the start answer's older sibling daemons on the node, kept beside
+  // the link. `clearLink` clears it, so a node change and a new start do too.
+  const [olderSiblings, setOlderSiblings] = useState<string[]>([]);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [hint, setHint] = useState<string | null>(null);
@@ -139,6 +154,7 @@ export function useAnthropicLoginStep(
   const clearLink = useCallback(() => {
     setLoginToken(null);
     setAuthorizeUrl(null);
+    setOlderSiblings([]);
     setCode("");
     setHint(null);
     setSigningIn(false);
@@ -211,6 +227,7 @@ export function useAnthropicLoginStep(
     if (pending.flow === "oauth") {
       setLoginToken(pending.loginToken);
       setAuthorizeUrl(pending.authorizeUrl);
+      setOlderSiblings(olderSiblingNames(pending.olderSiblingDaemons));
       return;
     }
     const attempt = ++attemptRef.current;
@@ -307,8 +324,10 @@ export function useAnthropicLoginStep(
     try {
       const res = await start();
       if (attempt !== attemptRef.current) return;
+      const older = olderSiblingNames(res.olderSiblingDaemons);
       setLoginToken(res.loginToken);
       setAuthorizeUrl(res.authorizeUrl);
+      setOlderSiblings(older);
       // A remote node's login is not stored: the modal reopens on the UI host.
       if (node?.isUiHost) {
         writePendingSignIn({
@@ -317,6 +336,7 @@ export function useAnthropicLoginStep(
           loginToken: res.loginToken,
           authorizeUrl: res.authorizeUrl,
           expiresAt: Date.now() + OAUTH_PENDING_TTL_MS,
+          ...(older.length > 0 ? { olderSiblingDaemons: older } : {}),
         });
       }
     } catch (err) {
@@ -620,6 +640,7 @@ export function useAnthropicLoginStep(
   return {
     loginToken,
     authorizeUrl,
+    olderSiblings,
     code,
     setCode,
     error,
@@ -653,6 +674,7 @@ export function AnthropicStepView(props: {
 }) {
   const { step, node, locked } = props;
   const canStart = Boolean(node && node.disabledReason === null);
+  const nodeName = node?.nodeLabel ?? "this node";
   // On a phone these lines land below the dialog's fold, under a banner that only
   // counts them, so the reason for a refused Done would be off screen.
   const messageRef = useRef<HTMLDivElement>(null);
@@ -781,6 +803,26 @@ export function AnthropicStepView(props: {
       </Button>
       {step.authorizeUrl && (
         <>
+          {step.olderSiblings.length > 0 && (
+            // #6161 R19: a warning, never a refusal. It wraps rather than
+            // truncates: a status row has no tap-open tooltip, so a cut line
+            // would hide its clauses on a phone.
+            <p
+              role="status"
+              className="flex items-start gap-1.5 text-[var(--status-warn)]"
+              data-testid="anthropic-older-siblings"
+            >
+              <AlertTriangle
+                aria-hidden="true"
+                className="mt-0.5 h-3.5 w-3.5 shrink-0"
+              />
+              <span className="min-w-0 break-words">
+                Older Hapimatic running on {nodeName}:{" "}
+                {step.olderSiblings.join(", ")} · it can copy the terminal login
+                back over this sign-in · the sign-in still goes ahead
+              </span>
+            </p>
+          )}
           <ol className="list-decimal space-y-2 pl-5 text-[var(--app-hint)]">
             <li>
               Open the Anthropic sign-in page:

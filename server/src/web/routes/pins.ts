@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { deriveCallerOrigin, readRequestFacts } from "../../sync/callerOrigin";
 import { Hono, type Context } from "hono";
 import {
   defineCapability,
@@ -89,10 +90,11 @@ export function createPinsRoutes(
   options: {
     pinsEnabled: boolean;
     getSessionService: () => Pick<SessionService, "proxyPinRequest"> | null;
-    getNodeRegistry: () => Pick<
-      NodeRegistry,
-      "updateCachedSessionOpenPinCount"
-    > | null;
+    getNodeRegistry: () =>
+      | (Pick<NodeRegistry, "updateCachedSessionOpenPinCount"> &
+          // #6715 (R3): the hub's node id, sent with a forwarded Submit.
+          Partial<Pick<NodeRegistry, "getLocalNodeId">>)
+      | null;
     errorLogger?: ErrorLogger | null;
     /**
      * The zone for a Submit's summary line (#6450): the operator's Time Log
@@ -110,6 +112,13 @@ export function createPinsRoutes(
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   const gate = pinsGate(options.pinsEnabled);
+  /** #6715 (R3): this node's federation id, when the registry knows it. */
+  const forwarderNodeOf = (): { forwarderNode?: string } => {
+    const nodeId = options.getNodeRegistry()?.getLocalNodeId?.();
+    return typeof nodeId === "string" && nodeId.length > 0
+      ? { forwarderNode: nodeId }
+      : {};
+  };
   const { errorLogger } = options;
   // Per session, like the CLI routes (R18). These take a server id, never a tag. A
   // person cannot reach this limit by opening or starring pins by hand.
@@ -612,8 +621,14 @@ export function createPinsRoutes(
         }
         const target = resolveTarget(c);
         if (target.kind === "response") return target.response;
-        // From the authenticated context, never the body (#3331).
-        const origin = { class: "web-user" as const, uid: c.get("userId") };
+        // From the authenticated context, never the body (#3331). #6715 (R1):
+        // the caller-origin module decides the evidence at the pins-submit door.
+        // An agent caller (one sending the session header) is refused above, so
+        // the class is web-user, as before.
+        const origin = deriveCallerOrigin(
+          readRequestFacts(name => c.req.header(name), c.get("userId")),
+          { door: "pins-submit" }
+        );
         if (target.kind === "local") {
           return pinSubmissionResponse(
             c,
@@ -629,7 +644,9 @@ export function createPinsRoutes(
           "/pin-answers",
           "POST",
           c.get("namespace"),
-          { ...body.data, origin }
+          // #6715 (R3): the forwarded origin carries the hub's verdict and its
+          // node id; the owning node keeps them as `via`.
+          { ...body.data, origin: { ...origin, ...forwarderNodeOf() } }
         );
         // A peer running A to C serves pins but not this route, so "does not
         // support pins" would be false; nothing was sent.

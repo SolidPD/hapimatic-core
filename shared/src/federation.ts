@@ -83,6 +83,20 @@ export const SHARED_API_KEYS_CAPABILITY = "api-keys:shared";
 export const BILLABLE_SWITCH_CAPABILITY = "billable:switch";
 export const BILLABLE_SWITCH_CLOSED_CAPABILITY = "billable:switch-closed";
 export const BILLABLE_SWITCH_STORE_CAPABILITY = "billable:switch-store";
+/**
+ * Issue #6778 (4.1): the node stores time-tracking records (its widened storage
+ * is ready), in every gate state. It says nothing about spawns: the carry tag
+ * (`billable:tracking-carry`, PR-C) says the node keeps a carried start.
+ */
+export const BILLABLE_TRACKING_CAPABILITY = "billable:tracking";
+
+/**
+ * Issue #6779: advertised by the node that keeps the billing-category list
+ * (the owner, the billing hub), only while its category storage is ready and
+ * its billable gate is `on` or `closed`. Every other node reads that node's
+ * list through, and fails closed when no single owner can be read.
+ */
+export const BILLING_CATEGORIES_OWNER_CAPABILITY = "billing:categories-owner";
 
 /**
  * The DNS suffix every cloud-provisioned Hapimatic VM lives under

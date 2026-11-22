@@ -17,32 +17,57 @@
  * ends above the "set default" caption under the pill instead of reaching into
  * it; the row leaves 8 px between wrapped lines for the part above (#6801 R9,
  * measured at 393 px). Elsewhere the hit area is centred on the text.
+ *
+ * Issue #6161 (R10, R12): inside the warning window the text is the countdown
+ * ("2d left" / "due") in `var(--status-warn)`, and the sentence says when the
+ * sign-in ends. `surface` picks the sentence: `node-row` adds "· tap the node to
+ * sign in again" (the pill beside it opens the re-login); `switcher`, the
+ * default, does not, because the switcher shows no node pill.
  */
 import {
   computeSignInAge,
+  computeSignInEnding,
+  isEstimatedDeadline,
   isSignInDeath,
+  resolveEntryDeadline,
   type SignInAgeInput,
 } from "@hapi/protocol";
 import { HoverTooltipButton } from "@/components/ui/tooltip";
 import { useMinuteNow } from "@/lib/pins/useMinuteNow";
-import { formatSignInAge } from "@/lib/signInAge";
+import { formatSignInAge, type SignInAgeSurface } from "@/lib/signInAge";
 
 export function SignInAgeToken(props: {
   entry: SignInAgeInput | undefined;
   nodeLabel: string;
   lift?: boolean;
+  surface?: SignInAgeSurface;
 }) {
-  const { entry, nodeLabel, lift = false } = props;
+  const { entry, nodeLabel, lift = false, surface = "switcher" } = props;
   const now = useMinuteNow();
   if (!entry) return null;
   const age = computeSignInAge(entry, now);
   if (!age) return null;
-  const label = formatSignInAge(age, nodeLabel);
+  const resolved = resolveEntryDeadline(entry, now);
+  const label = formatSignInAge(age, nodeLabel, {
+    deadline: {
+      at: resolved.at,
+      estimated: isEstimatedDeadline(
+        resolved.source,
+        entry.signInDeadlineSource
+      ),
+      ending: computeSignInEnding(entry, now),
+    },
+    surface,
+    nowMs: now,
+  });
   if (!label) return null;
   const stop = (e: React.SyntheticEvent) => e.stopPropagation();
-  const color = isSignInDeath(label.state)
-    ? "text-[var(--status-hot)]"
-    : "text-[var(--app-hint)]";
+  const color =
+    label.state === "ending" || label.state === "due"
+      ? "text-[var(--status-warn)]"
+      : label.state !== "running" && isSignInDeath(label.state)
+        ? "text-[var(--status-hot)]"
+        : "text-[var(--app-hint)]";
   // 24 px box, 12 px of layout height either way: centred (6 px above and
   // below) or lifted (10 px above, 2 px below). Lifted, the text sits at the
   // box's foot (2 px up), which is the 12 px slot the row centres on the pill,

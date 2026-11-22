@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { describeExpiresIn, finiteExpiresIn } from "@hapi/protocol";
 
 /**
  * Anthropic OAuth login client — PKCE authorization-code flow for issue #1263
@@ -121,12 +122,25 @@ export interface ExchangedTokens {
   /** Identity carried in the token response (`data.account`); may be null. */
   accountUuid: string | null;
   emailAddress: string | null;
+  /**
+   * Issue #6161 (R1): the response's `refresh_token_expires_in` (seconds) when
+   * it is a finite number, else null. Turned into the sign-in deadline by
+   * `signInDeadline` (`@hapi/protocol`).
+   */
+  refreshTokenExpiresIn: number | null;
+  /**
+   * Issue #6161 (R2): the non-secret tag the sign-in log line prints for the raw
+   * value — the number, `absent`, or `non-number:<typeof>`.
+   */
+  refreshTokenExpiresInTag: string;
 }
 
 interface TokenExchangeResponse {
   access_token: string;
   refresh_token?: string;
   expires_in: number;
+  /** Issue #6161: the refresh token's lifetime in seconds, when the server sends it. */
+  refresh_token_expires_in?: unknown;
   scope?: string;
   account?: { uuid?: string; email_address?: string };
 }
@@ -197,13 +211,25 @@ export async function exchangeCodeForTokens(
   }
 
   const data = (await res.json()) as TokenExchangeResponse;
+  // Issue #6161: guard the COMPUTED expiry, not `expires_in` itself, so a
+  // numeric string keeps working as it did; a missing value used to return a
+  // record with `expiresAt: NaN`. `complete` maps this to `exchange_failed`.
+  const expiresAt = now() + data.expires_in * 1000;
+  if (!Number.isFinite(expiresAt)) {
+    throw new OauthLoginError(
+      "token exchange response carries no usable expires_in",
+      "exchange_failed"
+    );
+  }
   return {
     accessToken: data.access_token,
     refreshToken: data.refresh_token ?? "",
-    expiresAt: now() + data.expires_in * 1000,
+    expiresAt,
     scopes: data.scope ? data.scope.split(" ").filter(Boolean) : [],
     accountUuid: data.account?.uuid ?? null,
     emailAddress: data.account?.email_address ?? null,
+    refreshTokenExpiresIn: finiteExpiresIn(data.refresh_token_expires_in),
+    refreshTokenExpiresInTag: describeExpiresIn(data.refresh_token_expires_in),
   };
 }
 

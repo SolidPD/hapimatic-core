@@ -704,7 +704,7 @@ export function billableSwitchToast(
       : `${sessionName} is billable`;
   }
   return amount.ms > 0
-    ? `${sessionName} is non-billable · ${billableAmountWords(amount, "off")} will not be logged`
+    ? `${sessionName} is non-billable · ${billableAmountWords(amount, "off")} will be logged as non-billable`
     : `${sessionName} is non-billable`;
 }
 

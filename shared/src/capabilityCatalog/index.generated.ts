@@ -10724,7 +10724,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
-    "description": "Receive every node's billable header reports on a node that has no view of the mesh; a node with a registry answers that its own polls are the truth.",
+    "description": "Accept a push of other nodes' billable header reports and store nothing: since #6778 no header decides a start, so it answers applied with no nodes.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.api-federation-billable-switch-peer-reports",
     "invocation": {
@@ -10737,7 +10737,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "When the hub pushes the other nodes' billable headers to a node that does not poll the mesh itself."
+    "whenToUse": "When an older hub pushes the other nodes' billable headers to this node."
   },
   {
     "auth": "federation-token",
@@ -11436,7 +11436,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "List every node's billable project headers for the caller's namespace, with each node's state and report time; ?history=1 adds the header changes.",
+    "description": "List every node with its billable state and last report time. Header lists are empty since #6778 PR-A: no project header decides a start. ?history=1 adds the recorded header changes.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.billable-switch-headers",
     "invocation": {
@@ -11449,7 +11449,127 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "When showing which projects are billable on this node and on the other nodes."
+    "whenToUse": "When reading which nodes have billable sessions on, closed or off (the web's Create reads each node's on flag)."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read the billing categories offered for tracked sessions, in order, with the default, each default hourly rate and the currency, from the billing hub.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billing-categories",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/billing-categories"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person's form needs the category list (the Create page, the session controls, Settings); never for an agent."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Add a billing category, with an optional default hourly rate, on the billing hub.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billing-category-add",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/billing-categories"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person adds a category for tracked sessions."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read the billing categories' change history on the billing hub, newest first.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billing-category-history",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/billing-categories/history"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person reviews who changed a category, a default rate or the currency."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Reorder the offered billing categories on the billing hub.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billing-category-order",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/billing-categories/order"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person drags the categories into a new order."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Choose the default billing category and the currency offered for a new rate, on the billing hub.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billing-category-settings",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/billing-categories/settings"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person changes the default category or the currency."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Rename, re-rate, retire or restore a billing category on the billing hub; a category is never deleted.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.billing-category-update",
+    "invocation": {
+      "kind": "rest",
+      "method": "PATCH",
+      "path": "/api/billing-categories/:id"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person edits a category."
   },
   {
     "auth": "jwt",
@@ -11906,6 +12026,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "off",
     "trusted": true,
     "whenToUse": "When another node's pull loop copies this node's billable switch record."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Return the billing-category list this node keeps as the billing hub, in the caller's namespace (POST because the node proxy only issues POST).",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.federation-billing-categories",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/billing-categories/list"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When another node reads the billing categories through from the billing hub."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Look one billing category up on the billing hub, in the caller's namespace; a hit and a miss both answer 200.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.federation-billing-category-lookup",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/billing-categories/lookup"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When another node validates a tracked session's category against the billing hub."
   },
   {
     "auth": "federation-token",

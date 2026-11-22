@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import { createFederationBillingCategoryRoutes } from "./billingCategoryReceivers";
 import { Hono } from "hono";
 import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
@@ -66,6 +67,8 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   app.route("/", createBillableSwitchReceiverRoutes(deps));
   // Issue #6646 (Task 7b): the record's replication feed for other nodes' pullers.
   app.route("/", createBillableSwitchEventFeedRoutes(deps));
+  // Issue #6779: the billing hub's two receivers (its list and its lookup).
+  app.route("/", createFederationBillingCategoryRoutes(deps));
   // Issue #1452 (Sub-Issue F): node-to-node active-account receivers.
   app.route("/", createFederationAccountRoutes(deps));
   // Issue #4461 (epic #4460 A): per-node account health — hub aggregator (JWT

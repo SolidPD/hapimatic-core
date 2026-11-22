@@ -182,6 +182,15 @@ export function makeLegacyAdminRedirects<TRoot extends AnyRoute>(
         throw redirect({ to: "/settings/network" });
       },
     }),
+    // #6779: the Billing Categories page. Never-shipped /admin/* alias, registered
+    // only to keep the 1:1 settings↔admin invariant.
+    createRoute({
+      getParentRoute: () => rootRoute,
+      path: "/admin/billing-categories",
+      beforeLoad: () => {
+        throw redirect({ to: "/settings/billing-categories" });
+      },
+    }),
     createRoute({
       getParentRoute: () => rootRoute,
       path: "/admin/extensions",

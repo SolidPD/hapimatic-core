@@ -50,6 +50,14 @@ export const SENSITIVE_FIELD_NAMES = new Set([
   "refreshtoken",
   "bearer",
   "sessiontoken",
+  // Issue #6779 (R12): a billing rate. Names are matched after normalising, so
+  // these also cover #6778's rateMinor, rate_minor, defaultRateMinor and
+  // rateNote. `defaultrate` is the list's wire shape `{ minor, currency }`,
+  // redacted whole (`minor` alone is too general a name).
+  "defaultrate",
+  "rateminor",
+  "defaultrateminor",
+  "ratenote",
 ]);
 
 /**

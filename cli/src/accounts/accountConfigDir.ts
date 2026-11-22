@@ -16,6 +16,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  isDeadlineDisproved,
+  isPlausibleDeadline,
   parseSignInMarker,
   SIGN_IN_MARKER_FILE,
   type StoredAccount,
@@ -72,6 +74,18 @@ export interface IsolatedClaudeAiOauth {
   scopes: string[];
   subscriptionType: string;
   rateLimitTier: string;
+  /**
+   * Issue #6161: the login's sign-in deadline (epoch ms), which native Claude
+   * Code writes at its own sign-in and keeps on a refresh. Hapimatic's seed
+   * writes it from the store record (when plausible and not disproved), its
+   * sign-in writes it, and a Hapimatic rotation never moves it later.
+   */
+  refreshTokenExpiresAt?: number;
+  /**
+   * Issue #6161: native's dead-login marker (`"time_limit"` for the server's
+   * "Refresh token expired"). Typed for readers; Hapimatic never writes it.
+   */
+  loginEnded?: string;
 }
 
 /** Shape of the isolated `.credentials.json` file native reads on Linux. */
@@ -619,6 +633,16 @@ export async function seedAccountConfigDir(
   const dir = accountConfigDirFor(account.accountUuid);
   await mkdir(dir, { recursive: true, mode: 0o700 });
 
+  // Issue #6161 (R4): the seed carries the record's deadline only when it is
+  // plausible and the record's own facts do not disprove it: the store's pair
+  // may be a mirrored later login whose record still holds the older login's
+  // deadline. Otherwise the key is omitted (the pre-#6161 file shape). This
+  // rule lives here so all three seed callers (the spawn bootstrap, the
+  // recovery last-resort seed and the legacy-folder migration) get it.
+  const deadline = account.refreshTokenExpiresAt;
+  const seedDeadline =
+    isPlausibleDeadline(deadline, Date.now()) &&
+    !isDeadlineDisproved(deadline, account.lastRefreshedAt, account.expiresAt);
   const credentials: IsolatedCredentialsFile = {
     claudeAiOauth: {
       accessToken: account.accessToken,
@@ -627,6 +651,7 @@ export async function seedAccountConfigDir(
       scopes: account.scopes,
       subscriptionType: account.subscriptionType,
       rateLimitTier: account.rateLimitTier,
+      ...(seedDeadline ? { refreshTokenExpiresAt: deadline } : {}),
     },
   };
 

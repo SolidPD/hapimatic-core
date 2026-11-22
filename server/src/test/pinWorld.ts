@@ -157,6 +157,8 @@ export type SentMessage = {
   origin?: MessageOrigin;
   /** #6452: `pin-deadline` for an automatic pick, else the operator's `webapp`. */
   sentFrom?: string;
+  /** #6715 (R7): the server-only mark on a Pins answers message. */
+  kind?: "pin-answers";
 };
 
 /**

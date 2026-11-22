@@ -30,6 +30,7 @@ export const NOTIFICATION_KINDS = [
   "waiting-for-slot",
   "loops-resuming",
   "model-reverted",
+  "sign-in-ending",
 ] as const;
 
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
@@ -91,6 +92,11 @@ export const NOTIFICATION_KIND_DEFAULTS: Record<
   "waiting-for-slot": { severity: "info", dedupe: "session", pushType: null },
   "loops-resuming": { severity: "info", dedupe: "session", pushType: null },
   "model-reverted": { severity: "warn", dedupe: "session", pushType: null },
+  // #6161 (R14): one row per (account, node), never coalesced. `pushType` is
+  // null because `notify()` would push once per row with a fixed tag and link;
+  // the producer sends its own push, gated by the kind's `signInEnding` toggle,
+  // that opens the re-login link.
+  "sign-in-ending": { severity: "warn", dedupe: "none", pushType: null },
 };
 
 /** A repeat within this window of an open row's `last_at` coalesces into it. */

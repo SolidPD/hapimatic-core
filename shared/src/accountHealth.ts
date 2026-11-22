@@ -5,6 +5,7 @@ import { AccountMonogramSchema, type AccountMonogram } from "./accountMonogram";
 import {
   SignInDeathSchema,
   isNonDeathFlag,
+  resolveSignInDeadline,
   type SignInDeath,
 } from "./accounts";
 import { ProviderIdSchema, type ProviderId } from "./providerAuthState";
@@ -89,6 +90,20 @@ export const AccountHealthEntrySchema = z.object({
    * whole entry (the #5420 rule).
    */
   quarantined: z.boolean().optional(),
+  // Issue #6161 (R8): the four sign-in deadline FACTS; consumers run the one rule
+  // (`resolveEntryDeadline`), never the node. A node with #6161 always sends all
+  // four (null where unknown, and null for any record that is not Anthropic
+  // `oauth`); an ABSENT key means an older node (`unreported`). Optional so an
+  // older peer's entry still parses; an older hub strips them. Epoch ms, finite
+  // numbers only.
+  /** This instance's store `refreshTokenExpiresAt` (a sign-in on a build with #6161). */
+  signInDeadlineAt: z.number().nullable().optional(),
+  /** Its source: `server` or `default`. A plain string, never an enum (#5420). */
+  signInDeadlineSource: z.string().nullable().optional(),
+  /** The account folder file's `claudeAiOauth.refreshTokenExpiresAt`, read live. */
+  folderDeadlineAt: z.number().nullable().optional(),
+  /** The `writtenAt` of the folder's sign-in marker, read live (DEC-1). */
+  folderSignInAt: z.number().nullable().optional(),
 });
 export type AccountHealthEntry = z.infer<typeof AccountHealthEntrySchema>;
 
@@ -281,7 +296,18 @@ export type AccountHealthRecordInput = {
   unrefreshableReason?: string | null;
   /** Issue #6801 (R13): the record's past deaths, already validated. */
   signInDeaths?: SignInDeath[];
+  /** Issue #6161 (R8): the store's sign-in deadline and its source. */
+  signInDeadlineAt?: number | null;
+  signInDeadlineSource?: string | null;
+  /** Issue #6161 (R8): the folder file's deadline and marker time, read live. */
+  folderDeadlineAt?: number | null;
+  folderSignInAt?: number | null;
 };
+
+/** A fact the envelope may carry: a finite number, else null. */
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
 
 /** Node-local display context for one record. */
 export type AccountHealthContext = {
@@ -348,6 +374,24 @@ export function deriveAccountHealth(
       ? { signInDeaths: record.signInDeaths }
       : {}),
     quarantined: isNonDeathFlag(record),
+    // Issue #6161 (R8): always emitted, so on the wire an absent key means an
+    // older node; facts only, never the resolved deadline.
+    ...(record.provider === "anthropic" && authKind === "oauth"
+      ? {
+          signInDeadlineAt: finiteOrNull(record.signInDeadlineAt),
+          signInDeadlineSource:
+            typeof record.signInDeadlineSource === "string"
+              ? record.signInDeadlineSource
+              : null,
+          folderDeadlineAt: finiteOrNull(record.folderDeadlineAt),
+          folderSignInAt: finiteOrNull(record.folderSignInAt),
+        }
+      : {
+          signInDeadlineAt: null,
+          signInDeadlineSource: null,
+          folderDeadlineAt: null,
+          folderSignInAt: null,
+        }),
   };
 }
 
@@ -367,7 +411,108 @@ export type SignInAgeInput = Pick<
   | "unrefreshable"
   | "unrefreshableAt"
   | "quarantined"
+  // Issue #6161 (R7): the facts the deadline rule reads.
+  | "lastRefreshedAt"
+  | "expiresAt"
+  | "signInDeadlineAt"
+  | "signInDeadlineSource"
+  | "folderDeadlineAt"
+  | "folderSignInAt"
 >;
+
+/**
+ * Issue #6161 (Q4): how long before a login's deadline it reads `ending` —
+ * 3 days, Claude Code's own notice and the acceptance criterion.
+ */
+export const SIGN_IN_WARNING_LEAD_MS = 3 * 86_400_000;
+
+/**
+ * Issue #6161 (R7, R8): the entry's resolved deadline. Not Anthropic, or not
+ * `oauth` (so a `native` or `env-token` entry never gets an estimate) →
+ * `unknown`; a node that sent none of the four facts (an older build) →
+ * `unreported`; else the one rule, `resolveSignInDeadline`, over the entry's
+ * facts, with a null `lastRefreshedAt` or `expiresAt` read as 0.
+ */
+export function resolveEntryDeadline(
+  entry: SignInAgeInput,
+  nowMs: number
+): { at: number | null; source: string } {
+  if (entry.provider !== "anthropic" || entry.authKind !== "oauth") {
+    return { at: null, source: "unknown" };
+  }
+  if (
+    entry.signInDeadlineAt === undefined &&
+    entry.signInDeadlineSource === undefined &&
+    entry.folderDeadlineAt === undefined &&
+    entry.folderSignInAt === undefined
+  ) {
+    return { at: null, source: "unreported" };
+  }
+  return resolveSignInDeadline({
+    capturedAt: entry.capturedAt,
+    lastRefreshedAt: entry.lastRefreshedAt ?? 0,
+    expiresAt: entry.expiresAt ?? 0,
+    signInDeadline: entry.signInDeadlineAt ?? null,
+    folderDeadline: entry.folderDeadlineAt ?? null,
+    folderSignInAt: entry.folderSignInAt ?? null,
+    nowMs,
+  });
+}
+
+/**
+ * Issue #6161 (R9): true when a resolved deadline is an estimate, shown as
+ * "about": the sources `estimated`, `marker-estimated` and `folder-unconfirmed`,
+ * and a `sign-in` deadline that came from the 30-day default rather than the
+ * server's number.
+ */
+export function isEstimatedDeadline(
+  source: string,
+  signInDeadlineSource: string | null | undefined
+): boolean {
+  return (
+    source === "estimated" ||
+    source === "marker-estimated" ||
+    source === "folder-unconfirmed" ||
+    (source === "sign-in" && signInDeadlineSource === "default")
+  );
+}
+
+/** Issue #6161: whole days left until `deadlineAt`, rounded up, floored at 0. */
+function daysUntil(deadlineAt: number, nowMs: number): number {
+  return Math.max(0, Math.ceil((deadlineAt - nowMs) / SIGN_IN_AGE_DAY_MS));
+}
+
+/** Issue #6161 (R9): an entry inside its warning window. */
+export type SignInEnding = {
+  state: "ending" | "due";
+  deadlineAt: number;
+  daysLeft: number;
+  estimated: boolean;
+};
+
+/**
+ * Issue #6161 (R9): the ONE place the warning window lives, used by the web, the
+ * CLI and the alert service. `ending` from `deadline - SIGN_IN_WARNING_LEAD_MS`,
+ * `due` from the deadline itself. Null for a non-`oauth` entry, a flagged or
+ * quarantined one (#6801's states own those), an entry with no resolved
+ * deadline, and one outside the window.
+ */
+export function computeSignInEnding(
+  entry: SignInAgeInput,
+  nowMs: number
+): SignInEnding | null {
+  if (entry.unrefreshable || entry.quarantined === true) return null;
+  const resolved = resolveEntryDeadline(entry, nowMs);
+  if (resolved.at === null) return null;
+  const deadlineAt = resolved.at;
+  if (nowMs < deadlineAt - SIGN_IN_WARNING_LEAD_MS) return null;
+  return {
+    state: nowMs >= deadlineAt ? "due" : "ending",
+    deadlineAt,
+    daysLeft: daysUntil(deadlineAt, nowMs),
+    estimated: isEstimatedDeadline(resolved.source, entry.signInDeadlineSource),
+  };
+}
 
 /**
  * Issue #6801: a record's sign-in age on one node.
@@ -465,6 +610,19 @@ export type SignInAgeRow = {
    * between this and `diedAt`.
    */
   lastAliveAt: number;
+  /**
+   * Issue #6161 (R16): the resolved deadline and its source, kept on a flagged
+   * row too (the evidence R18 reads); `null` with source `unknown`,
+   * `disproved` or `unreported` when the rule cannot resolve one.
+   */
+  deadlineAt: number | null;
+  deadlineSource: string;
+  /** Whole days left (floored at 0); null for a flagged row or no deadline. */
+  daysLeft: number | null;
+  /** The warning window's state; null outside it and for a flagged row. */
+  ending: "ending" | "due" | null;
+  /** The resolved deadline is an estimate ("about"). */
+  estimated: boolean;
 };
 
 /** Issue #6801 (R13): one past death a node carries for a record. */
@@ -478,6 +636,8 @@ export type SignInDeathRow = {
   lastAliveAt: number;
   /** Whole days from the sign-in to the death. */
   days: number;
+  /** Issue #6161 (R18): the deadline predicted for that login, or null. */
+  predictedDeadlineAt: number | null;
 };
 
 /** Issue #6801 (R10): a node the list did not read in full. */
@@ -529,6 +689,10 @@ export function listSignInAges(
       const age = computeSignInAge(entry, nowMs);
       if (!age) continue;
       if (age.state === "flagged-unreported") deathsNotReported = true;
+      // Issue #6161 (R16): the deadline, from the same clock as the age.
+      const deadline = resolveEntryDeadline(entry, nowMs);
+      const flagged = entry.unrefreshable || entry.quarantined === true;
+      const ending = flagged ? null : computeSignInEnding(entry, nowMs);
       nodeRows.push({
         ...ident,
         accountUuid: entry.accountUuid,
@@ -536,6 +700,17 @@ export function listSignInAges(
         nickname: entry.nickname,
         age,
         lastAliveAt: entry.lastRefreshedAt ?? entry.capturedAt,
+        deadlineAt: deadline.at,
+        deadlineSource: deadline.source,
+        daysLeft:
+          flagged || deadline.at === null
+            ? null
+            : daysUntil(deadline.at, nowMs),
+        ending: ending?.state ?? null,
+        estimated: isEstimatedDeadline(
+          deadline.source,
+          entry.signInDeadlineSource
+        ),
       });
       for (const death of entry.signInDeaths ?? []) {
         nodePast.push({
@@ -546,6 +721,10 @@ export function listSignInAges(
           diedAt: death.diedAt,
           lastAliveAt: death.lastAliveAt,
           days: wholeSignInDays(death.signedInAt, death.diedAt),
+          predictedDeadlineAt:
+            typeof death.predictedDeadlineAt === "number"
+              ? death.predictedDeadlineAt
+              : null,
         });
       }
     }

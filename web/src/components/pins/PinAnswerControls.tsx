@@ -27,6 +27,7 @@ import {
   type ActionCollapseRank,
 } from "@/lib/pins/actionRowFit";
 import { recommendedOption, type PinViewModel } from "@/lib/pins/ledger";
+import { registerNoteDraft } from "@/lib/pins/noteDrafts";
 import { cn } from "@/lib/utils";
 import {
   addQuestion,
@@ -250,7 +251,10 @@ export function PinAnswerButtons(props: {
 /**
  * The note field. Its text lives in local state and is staged about 300 ms
  * after typing stops, on blur, and when an iOS input method finishes composing,
- * so a keystroke never re-renders every copy of the pin.
+ * so a keystroke never re-renders every copy of the pin. #6768: it also stages
+ * what it holds when it closes, when a Submit opens, and when the page is
+ * hidden, because words typed inside a composition that has not ended are
+ * staged by none of the three, and React runs no blur for a field it removes.
  */
 function NoteField(props: {
   sessionId: string;
@@ -264,12 +268,17 @@ function NoteField(props: {
   const latest = useRef(text);
   const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
   const composing = useRef(false);
+  // #6768: typed here since this field last staged or adopted staging. Only such
+  // a field stages on close, so an idle second copy, or a field a Submit just
+  // emptied, never stages an old note again.
+  const dirty = useRef(false);
   const target = useRef({ sessionId, pin, via });
   target.current = { sessionId, pin, via };
 
   const commit = useCallback(() => {
     if (pending.current) clearTimeout(pending.current);
     pending.current = null;
+    dirty.current = false;
     const t = target.current;
     setNote(t.sessionId, t.pin, latest.current, t.via);
   }, []);
@@ -280,16 +289,22 @@ function NoteField(props: {
     if (pending.current || composing.current) return;
     if (latest.current.trim() === staged.trim()) return;
     latest.current = staged;
+    dirty.current = false;
     setText(staged);
   }, [staged]);
 
-  // Closing the field, or collapsing the pin, must not lose the last words.
-  useEffect(
-    () => () => {
-      if (pending.current) commit();
-    },
-    [commit]
-  );
+  // Closing the field, collapsing the pin, opening Submit or hiding the page
+  // must not lose the last words, a composition's included (#6768).
+  useEffect(() => {
+    const flush = () => {
+      if (dirty.current) commit();
+    };
+    const unregister = registerNoteDraft(flush);
+    return () => {
+      unregister();
+      flush();
+    };
+  }, [commit]);
 
   return (
     <Textarea
@@ -302,6 +317,7 @@ function NoteField(props: {
       onChange={event => {
         setText(event.target.value);
         latest.current = event.target.value;
+        dirty.current = true;
         if (composing.current) return;
         if (pending.current) clearTimeout(pending.current);
         pending.current = setTimeout(commit, NOTE_COMMIT_MS);

@@ -75,6 +75,18 @@ import { NotificationHub } from "./notifications/notificationHub";
 import { NotificationService } from "./notifications/notificationService";
 import { resolveLocalNodeIdentity } from "./config/nodeLabel";
 import { createNotificationPurgeLoop } from "./notifications/notificationPurge";
+import {
+  createSignInDeadlineAlertLoop,
+  describeSignInEndingAlertSwitch,
+  resolveSignInEndingAlertSwitch,
+} from "./notifications/signInDeadlineAlertLoop";
+import { SignInDeadlineAlertService } from "./accounts/signInDeadlineAlertService";
+import { readNodeAccountHealth } from "./services/accountHealth";
+import {
+  readFolderDeadline,
+  readFolderSignInAt,
+} from "./services/isolatedCredentialsSync";
+import { parseAccessToken } from "./utils/accessToken";
 import { NotifyPmNotifier } from "./notifications/notifier";
 import { loadSessionFatalConfig } from "./config/sessionFatalConfig";
 import { startWebServer } from "./web/server";
@@ -200,11 +212,20 @@ import {
   describeBillableSwitchGate,
   resolveBillableSwitchGate,
 } from "./config/billableSwitchConfig";
-import { setProcessBillableSwitchGate } from "./federation/capabilityDetector";
+import {
+  setProcessBillableSwitchGate,
+  setProcessBillingCategoriesState,
+} from "./federation/capabilityDetector";
+import {
+  describeBillingCategoriesOwner,
+  resolveBillingCategoriesOwner,
+} from "./config/billingCategoriesConfig";
 import { BillableSwitchService } from "./billableSwitch/billableSwitchService";
 import {
   describeBillableTrackingStartup,
   runBillableTrackingStartup,
+  startTrackingReconcileRetry,
+  trackingStartupGateFlag,
 } from "./billableSwitch/trackingStartup";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -291,6 +312,7 @@ let walCheckpointLoop: SupervisedLoop | null = null;
 let cpuSamplerLoop: SupervisedLoop | null = null; // #6156
 let pinDeadlineLoop: SupervisedLoop | null = null; // #6452
 let notificationPurgeLoop: SupervisedLoop | null = null; // #4913
+let signInDeadlineAlertLoop: SupervisedLoop | null = null; // #6161
 let feedbackSinkLoop: SupervisedLoop | null = null; // #2911
 let notificationService: NotificationService | null = null;
 
@@ -352,10 +374,14 @@ async function main() {
   // start-up, once, before the gate is resolved (the Store's migrations write
   // no row). The step catches its own failure; this `try` only keeps a throw
   // from ever stopping the boot.
+  let trackingStartup: ReturnType<typeof runBillableTrackingStartup> | null =
+    null;
   try {
-    console.log(
-      describeBillableTrackingStartup(runBillableTrackingStartup(store))
-    );
+    trackingStartup = runBillableTrackingStartup(store);
+    console.log(describeBillableTrackingStartup(trackingStartup));
+    // #6778 PR-B (3.4 step 6): a session the reconcile could not settle is
+    // retried every five minutes (and before each write to it).
+    startTrackingReconcileRetry(store);
   } catch (error) {
     console.error(
       "[Server] Billable tracking start-up step threw:",
@@ -369,6 +395,7 @@ async function main() {
   const billableSwitchGateState = resolveBillableSwitchGate({
     storageReady: store.billableSwitchStorageReady,
     hasEvents: () => store.billableSwitch.hasAnyEvent(),
+    startup: trackingStartupGateFlag(trackingStartup),
   });
   console.log(describeBillableSwitchGate(billableSwitchGateState));
   setProcessBillableSwitchGate(billableSwitchGateState);
@@ -981,6 +1008,27 @@ async function main() {
   );
   const federationConfig = loadFederationConfig(settings);
   const federationApiToken = getFederationApiToken(settings);
+  // Issue #6779 (P-3): which node keeps the billing-category list, resolved
+  // ONCE here, from this config's role and the settings' override, before the
+  // federation block starts the announcer (which advertises the owner tag).
+  const billingCategoriesOwnerState = resolveBillingCategoriesOwner({
+    federationRole: federationConfig?.role ?? null,
+    ownerSetting: (
+      settings.billingCategories as { owner?: unknown } | undefined
+    )?.owner,
+  });
+  console.log(
+    describeBillingCategoriesOwner(
+      billingCategoriesOwnerState,
+      billableSwitchGateState.mode
+    )
+  );
+  setProcessBillingCategoriesState({
+    ownerState: billingCategoriesOwnerState,
+    owner: billingCategoriesOwnerState.owner,
+    storageReady: store.billingCategoriesReady,
+    mode: billableSwitchGateState.mode,
+  });
 
   // #4914 (epic #4912): server producers raise user notifications through
   // syncEngine.notifyUser. Wired here, after federationConfig, so an
@@ -1760,6 +1808,49 @@ async function main() {
   });
   notificationPurgeLoop.start();
 
+  // #6161 (R14, DEC-2): the sign-in deadline producer — one notification per
+  // login per node when its sign-in enters the warning window, on one instance
+  // per node (off by default on the worktree ports and the dev port). Reads
+  // THIS node's accounts only, with the folder's live deadline and marker time.
+  {
+    const alertSwitch = resolveSignInEndingAlertSwitch(process.env, {
+      listenPort: config.webappPort,
+    });
+    console.log(describeSignInEndingAlertSwitch(alertSwitch));
+    const notifier = notificationService;
+    const alertService = new SignInDeadlineAlertService({
+      store: store.signInDeadlineAlerts,
+      notify: input => notifier.notify(input),
+      push: (namespace, payload) =>
+        pushService.sendToNamespace(namespace, payload),
+      namespace: parseAccessToken(config.cliApiToken)?.namespace ?? "default",
+    });
+    signInDeadlineAlertLoop = createSignInDeadlineAlertLoop({
+      service: alertService,
+      readEntries: () => {
+        const local = resolveLocalNodeIdentity(federationConfig);
+        return readNodeAccountHealth({
+          accountService: usageAccountService,
+          nicknameStore: usageNicknameStore,
+          usageService,
+          now: Date.now,
+          readFolderDeadline: uuid =>
+            readFolderDeadline(uuid, { dataDir: config.dataDir }),
+          readFolderSignInAt: uuid =>
+            readFolderSignInAt(uuid, { dataDir: config.dataDir }),
+        }).accounts.map(entry => ({
+          entry,
+          nodeId: local.nodeId,
+          nodeLabel: local.nodeLabel,
+        }));
+      },
+      node: jobNodeId,
+      registry: jobRegistry,
+      enabled: alertSwitch.enabled,
+    });
+    signInDeadlineAlertLoop.start();
+  }
+
   // WAL checkpoint loop — weekly passive checkpoint
   const WAL_CHECKPOINT_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
   walCheckpointLoop = new SupervisedLoop({
@@ -1955,6 +2046,7 @@ async function main() {
     cleanupLoop?.stop();
     feedbackSinkLoop?.stop();
     notificationPurgeLoop?.stop();
+    signInDeadlineAlertLoop?.stop();
     walCheckpointLoop?.stop();
     cpuSamplerLoop?.stop();
     pinDeadlineLoop?.stop();

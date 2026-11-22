@@ -40,6 +40,11 @@ export interface MessageHookInput {
    * read from the persisted message. Absent for programmatic / drained sends.
    */
   origin?: MessageOrigin;
+  /**
+   * #6715 (R7): a server-only mark for a message the server composed itself
+   * (the Pins answers message). Never part of `sentFrom` (see `sentFrom.ts`).
+   */
+  kind?: "pin-answers";
 }
 
 /** A hook's outcome: inject context, deny delivery, emit a non-blocking notice,
@@ -290,6 +295,8 @@ export interface RunMessageHooksInput {
   sentFrom: SentFrom;
   /** #3331: origin-class provenance forwarded to each hook (ruling D6(a)). */
   origin?: MessageOrigin;
+  /** #6715 (R7): the server-only message mark, forwarded to each hook. */
+  kind?: "pin-answers";
   harnessManifest?: HarnessManifest;
   coverage?: HookCoverageRecord[];
   hooks: RegisteredMessageHook[];
@@ -362,6 +369,7 @@ export async function runMessageHooks(
       sentFrom,
       event: config.event,
       origin: input.origin,
+      ...(input.kind ? { kind: input.kind } : {}),
     });
     if (outcome.denied) {
       return {
@@ -445,7 +453,18 @@ async function executeHook(
     (err: unknown) => ({ kind: "error" as const, error: err })
   );
   const timeoutPromise = new Promise<{ kind: "timeout" }>(resolve => {
-    timer = setTimeout(() => resolve({ kind: "timeout" }), config.timeoutMs);
+    timer = setTimeout(() => {
+      // #6715 (C2): abort INSIDE the timer callback, so the handler is told the
+      // moment its budget runs out (not after the race resolves). The reason is
+      // a TimeoutError naming the hook; the later abort below is then a no-op.
+      controller.abort(
+        new DOMException(
+          `hook "${config.id}" timed out after ${config.timeoutMs}ms`,
+          "TimeoutError"
+        )
+      );
+      resolve({ kind: "timeout" });
+    }, config.timeoutMs);
   });
 
   try {

@@ -3,7 +3,11 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { SIGN_IN_MARKER_FILE, type SignInMarker } from "@hapi/protocol";
+import {
+  SIGN_IN_MARKER_FILE,
+  parseSignInMarkerWrittenAt,
+  type SignInMarker,
+} from "@hapi/protocol";
 
 /**
  * Write-through of a freshly-obtained OAuth token into an account's EXISTING
@@ -40,6 +44,11 @@ import { SIGN_IN_MARKER_FILE, type SignInMarker } from "@hapi/protocol";
  * and `rateLimitTier` — which native Claude Code writes and Hapimatic's login
  * response does not carry — are PRESERVED, as is any unrecognized key, so this
  * write never degrades identity metadata that another writer owns.
+ *
+ * Issue #6161 (R3): the sign-in also writes its deadline,
+ * `claudeAiOauth.refreshTokenExpiresAt`, and removes `loginEnded`. Before #6161
+ * the spread kept the DEAD login's deadline and `loginEnded: "time_limit"`, so
+ * Claude Code and every other instance on the machine read a stale end date.
  */
 
 /**
@@ -58,6 +67,14 @@ export interface FreshOauthToken {
   /** Unix epoch ms. */
   expiresAt: number;
   scopes: string[];
+  /**
+   * Issue #6161 (R3): this sign-in's deadline (epoch ms, from `signInDeadline`).
+   * REQUIRED, so no caller can omit it and leave the old login's value in place
+   * through the spread below (the pre-#6161 bug). Written as a finite number,
+   * never `null` or `0`. Its source tag never goes into `claudeAiOauth`: Claude
+   * Code rebuilds that object from a fixed key list on every save.
+   */
+  refreshTokenExpiresAt: number;
 }
 
 export interface IsolatedCredentialsSyncOptions {
@@ -148,6 +165,64 @@ export function isolatedChainFingerprint(
 }
 
 /**
+ * Issue #6161 (Task 8, R8): the account folder's own deadline — the FIRST
+ * existing credentials file, in {@link resolveIsolatedCredentialPaths} order, and
+ * its `claudeAiOauth.refreshTokenExpiresAt` when that is a finite number. Claude
+ * Code writes this value at its own sign-in and keeps it on a refresh.
+ *
+ * Unlike {@link isolatedChainFingerprint} there is NO fall-through: when the
+ * first existing file is unreadable, malformed or holds no finite number, the
+ * answer is null, never another layout's value. Never throws; never returns or
+ * logs a token.
+ */
+export function readFolderDeadline(
+  accountUuid: string,
+  opts: IsolatedCredentialsSyncOptions = {}
+): number | null {
+  for (const path of resolveIsolatedCredentialPaths(accountUuid, opts)) {
+    if (!existsSync(path)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+      if (typeof parsed !== "object" || parsed === null) return null;
+      const oauth = (parsed as ClaudeAiOauthFile).claudeAiOauth;
+      if (typeof oauth !== "object" || oauth === null) return null;
+      const value = (oauth as { refreshTokenExpiresAt?: unknown })
+        .refreshTokenExpiresAt;
+      return typeof value === "number" && Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Issue #6161 (DEC-1, Task 8): the time in the account folder's sign-in marker
+ * ({@link SIGN_IN_MARKER_FILE}) as epoch ms — the first existing marker file in
+ * {@link resolveIsolatedCredentialPaths} order decides — or null when there is
+ * none or it does not parse. The credentials file need not exist: the marker is
+ * written whenever the folder exists. Never throws.
+ */
+export function readFolderSignInAt(
+  accountUuid: string,
+  opts: IsolatedCredentialsSyncOptions = {}
+): number | null {
+  for (const credentialsPath of resolveIsolatedCredentialPaths(
+    accountUuid,
+    opts
+  )) {
+    const path = join(dirname(credentialsPath), SIGN_IN_MARKER_FILE);
+    if (!existsSync(path)) continue;
+    try {
+      return parseSignInMarkerWrittenAt(readFileSync(path, "utf-8"));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
  * Merge `token` into every EXISTING isolated credentials file for `accountUuid`
  * and return the paths actually updated (empty when the account owns no
  * isolated dir — the normal, correct outcome for a store-only account).
@@ -185,16 +260,21 @@ export function syncIsolatedCredentials(
         !Array.isArray(parsed.claudeAiOauth)
           ? parsed.claudeAiOauth
           : {};
+      // Issue #6161 (R3): drop `loginEnded`, which a dead login's clear wrote;
+      // this sign-in is a live login.
+      const keptOauth: Record<string, unknown> = { ...existingOauth };
+      delete keptOauth.loginEnded;
       const next: ClaudeAiOauthFile = {
         ...parsed,
         claudeAiOauth: {
           // Preserve subscriptionType / rateLimitTier / any unknown key —
           // native Claude Code owns those and the login response has none.
-          ...existingOauth,
+          ...keptOauth,
           accessToken: token.accessToken,
           refreshToken: token.refreshToken,
           expiresAt: token.expiresAt,
           scopes: token.scopes,
+          refreshTokenExpiresAt: token.refreshTokenExpiresAt,
         },
       };
       atomicWrite600(path, JSON.stringify(next, null, 2));

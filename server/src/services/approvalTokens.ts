@@ -44,6 +44,12 @@ import {
   type StateFingerprint,
 } from "./stateBinding";
 import type { ApprovalTokensConfig } from "../config/approvalTokensConfig";
+import type {
+  ForwardedVia,
+  OriginClass,
+  OriginDoor,
+  OriginEvidence,
+} from "../sync/callerOrigin";
 
 // ── Registry grammar (token-conventions.md §1) ──────────────────────────────
 
@@ -120,17 +126,40 @@ export interface ApprovalGrant extends ApprovalChallenge {
   /** Grant flavor discriminator (registry §4.1). The server always mints
    *  `nonce`; the phrase branch is the hook-side legacy path. */
   mint_kind: "nonce" | "phrase";
+  /** #6715 (R10, C5): who sent the approving message. Audit only, UNVERIFIED;
+   *  `origin` and `approved_by` above are unchanged. */
+  sender?: GrantSender;
+}
+
+/** #6715 (R10): the grant's sender record. Every field is a hint, not a proof. */
+export interface GrantSender {
+  class: OriginClass;
+  evidence: OriginEvidence;
+  door?: OriginDoor;
+  /** The raw session header, as it arrived. */
+  senderRaw?: string;
+  /** The resolved sender session. */
+  senderSessionId?: string;
+  uid?: number;
+  /** The forwarding node, for a forwarded message. */
+  forwarderNode?: string;
+  unverified: true;
 }
 
 /** Origin passed IN to `verifyToken` from the message pipeline (the structured
  *  companion `meta.origin`, ruling D6(a)). The grant's flat `origin` string is
  *  derived from it. */
 export interface VerifyOrigin {
-  class: "web-user" | "cli-api" | "federation" | "bare-terminal";
+  class: OriginClass;
   /** Numeric owner id (web-user) — carried into the grant's `origin` string. */
   uid?: number;
   /** The SENDER's session id (cli-api) — the R3 self-send discriminator. */
   sessionId?: string;
+  /** #6715: the caller-origin fields (`callerOrigin.ts`), recorded in `sender`. */
+  senderSessionId?: string;
+  evidence?: OriginEvidence;
+  door?: OriginDoor;
+  via?: ForwardedVia;
 }
 
 /**
@@ -579,6 +608,67 @@ export async function writeChallenge(
   return challenge;
 }
 
+/** #6715 (R8): whether a send's raw sender names the gated session, by id or tag. */
+function isSelfSend(
+  origin: VerifyOrigin,
+  gatedSessionId: string,
+  gatedSessionTag: string | undefined
+): boolean {
+  if (origin.class !== "cli-api" && origin.class !== "federation") {
+    return false;
+  }
+  const sender = origin.sessionId;
+  if (typeof sender !== "string" || sender.length === 0) return false;
+  if (sender === gatedSessionId) return true;
+  return (
+    typeof gatedSessionTag === "string" &&
+    gatedSessionTag.length > 0 &&
+    sender === gatedSessionTag
+  );
+}
+
+/** #6715 (C2): what {@link untilAborted} returns when the deadline wins. */
+const CHECK_TIMED_OUT: unique symbol = Symbol("approval-check-timed-out");
+
+/** #6715 (R9): the denial for a check that ran out of time; the challenge is kept. */
+const CHECK_TIMED_OUT_RESULT: VerifyResult = {
+  ok: "denied",
+  reason: "state-indeterminate: the approval check ran out of time",
+};
+
+/**
+ * #6715 (C2): wait for `work`, or stop waiting when `signal` aborts. The work's
+ * own I/O also receives the signal; this race is what keeps a check that
+ * ignores it from minting after the deadline.
+ */
+function untilAborted<T>(
+  work: Promise<T>,
+  signal: AbortSignal | undefined
+): Promise<T | typeof CHECK_TIMED_OUT> {
+  if (!signal) return work;
+  if (signal.aborted) {
+    work.catch(() => {});
+    return Promise.resolve(CHECK_TIMED_OUT);
+  }
+  return new Promise<T | typeof CHECK_TIMED_OUT>((resolve, reject) => {
+    const onAbort = (): void => {
+      work.catch(() => {});
+      resolve(CHECK_TIMED_OUT);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      value => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    );
+  });
+}
+
 /** Format the flat grant `origin` string from the structured verify origin
  *  (registry §4.1 vocabulary). web-user carries its uid: `web-user(<uid>)`. */
 function formatOrigin(origin: VerifyOrigin): string {
@@ -586,6 +676,33 @@ function formatOrigin(origin: VerifyOrigin): string {
     return origin.uid != null ? `web-user(${origin.uid})` : "web-user";
   }
   return origin.class; // cli-api | federation | bare-terminal
+}
+
+/**
+ * #6715 (R10, C5): the grant's sender record, built from the verify origin.
+ * A forwarded message takes its evidence and resolved sender from `via`; a
+ * missing evidence reads `none`. `formatOrigin` and `resolveApprovedBy` are
+ * untouched (rp1-home#2920 owns any `approved_by` change).
+ */
+function buildSender(origin: VerifyOrigin): GrantSender {
+  const via = origin.class === "federation" ? origin.via : undefined;
+  const evidence: OriginEvidence =
+    (via ? via.evidence : origin.evidence) === "browser" ? "browser" : "none";
+  const door: OriginDoor | undefined =
+    origin.class === "federation" ? "federation" : origin.door;
+  const senderSessionId = origin.senderSessionId ?? via?.senderSessionId;
+  return {
+    class: origin.class,
+    evidence,
+    ...(door !== undefined ? { door } : {}),
+    ...(origin.sessionId !== undefined ? { senderRaw: origin.sessionId } : {}),
+    ...(senderSessionId !== undefined ? { senderSessionId } : {}),
+    ...(origin.uid !== undefined ? { uid: origin.uid } : {}),
+    ...(via?.forwarderNode !== undefined
+      ? { forwarderNode: via.forwarderNode }
+      : {}),
+    unverified: true,
+  };
 }
 
 /**
@@ -616,6 +733,7 @@ export async function mintGrant(
     approved_by: resolveApprovedBy(origin),
     origin: formatOrigin(origin),
     mint_kind: "nonce",
+    sender: buildSender(origin),
   };
   writeJsonAtomic(grantFile(repoPath, issueNumber), grant);
   // Consume the challenge at grant mint (registry §4.4 single-use).
@@ -661,6 +779,7 @@ export async function mintGlobalGrant(
     approved_by: resolveApprovedBy(origin),
     origin: formatOrigin(origin),
     mint_kind: "nonce",
+    sender: buildSender(origin),
   };
   // The producer creates approval-grants/ with mode 0o700; the server may be the
   // FIRST writer, and writeJsonAtomic's mkdirSync sets no mode — so pre-create
@@ -700,6 +819,8 @@ export function consumeGrant(repoPath: string, issueNumber: number): boolean {
 export type OriginTipResolver = (input: {
   repoPath: string;
   devBranch: string;
+  /** #6715 (C2): the approval check's deadline. */
+  signal?: AbortSignal;
 }) => Promise<{ tip: string } | { error: string }>;
 
 // #3619: prod-merge tip-fetch budget. Tighter than runGit's 30s default so the
@@ -718,19 +839,41 @@ const PROD_MERGE_TIP_TIMEOUT_MS = (() => {
  * e.g. missing credentials / unknown ref) maps to { error } so the caller denies
  * as indeterminate. Mirrors rp1-home prod_merge_binding.capture_origin_dev_tip.
  */
-export async function defaultProdMergeTipResolver(input: {
-  repoPath: string;
-  devBranch: string;
-}): Promise<{ tip: string } | { error: string }> {
-  const { repoPath, devBranch } = input;
+export async function defaultProdMergeTipResolver(
+  input: {
+    repoPath: string;
+    devBranch: string;
+    signal?: AbortSignal;
+  },
+  deps: {
+    runGit?: typeof runGit;
+    now?: () => number;
+    budgetMs?: number;
+  } = {}
+): Promise<{ tip: string } | { error: string }> {
+  const { repoPath, devBranch, signal } = input;
+  const git = deps.runGit ?? runGit;
+  const now = deps.now ?? Date.now;
+  // #6715 (C2): the fetch and the rev-parse share ONE budget (they were two
+  // sequential 4 s budgets, 8 s worst case against the 5 s gate).
+  const deadline = now() + (deps.budgetMs ?? PROD_MERGE_TIP_TIMEOUT_MS);
+  const remaining = (): number => deadline - now();
   try {
-    await runGit(["fetch", "origin", devBranch], repoPath, {
-      timeoutMs: PROD_MERGE_TIP_TIMEOUT_MS,
+    await git(["fetch", "origin", devBranch], repoPath, {
+      timeoutMs: remaining(),
+      ...(signal ? { signal } : {}),
     });
-    const { stdout } = await runGit(
+    const left = remaining();
+    if (left <= 0) {
+      return { error: `prod-merge tip check out of time for ${devBranch}` };
+    }
+    const { stdout } = await git(
       ["rev-parse", `origin/${devBranch}`],
       repoPath,
-      { timeoutMs: PROD_MERGE_TIP_TIMEOUT_MS }
+      {
+        timeoutMs: left,
+        ...(signal ? { signal } : {}),
+      }
     );
     const tip = stdout.trim();
     if (!/^[0-9a-f]{40}$/.test(tip)) {
@@ -761,7 +904,8 @@ type ProdMergeCheckResult =
 async function verifyProdMergeBinding(
   repoPath: string,
   binding: StateFingerprint,
-  resolver: OriginTipResolver = defaultProdMergeTipResolver
+  resolver: OriginTipResolver = defaultProdMergeTipResolver,
+  signal?: AbortSignal
 ): Promise<ProdMergeCheckResult> {
   const headAtMint = binding.head_sha;
   if (!headAtMint) {
@@ -778,7 +922,11 @@ async function verifyProdMergeBinding(
       reason: "prod-merge binding has no dev_branch hint",
     };
   }
-  const tip = await resolver({ repoPath, devBranch });
+  const tip = await resolver({
+    repoPath,
+    devBranch,
+    ...(signal ? { signal } : {}),
+  });
   if ("error" in tip) {
     return {
       kind: "indeterminate",
@@ -826,6 +974,13 @@ export async function verifyToken(
   opts: {
     /** The session RECEIVING the message (the gated session). */
     gatedSessionId: string;
+    /**
+     * #6715 (R8): the gated session's tag, from the session record. The CLI
+     * stamps the TAG (`hapi api sessions send`), so the self-send check compares
+     * the sender with the id OR this tag. No tag is resolved here: the check gets
+     * no request and no namespace.
+     */
+    gatedSessionTag?: string;
     /** The structured provenance of the send (absent for a drained token). */
     origin?: VerifyOrigin;
     config: ApprovalTokensConfig;
@@ -851,6 +1006,12 @@ export async function verifyToken(
      * (deny-on-timeout); tests inject a deterministic tip.
      */
     prodMergeTip?: OriginTipResolver;
+    /**
+     * #6715 (R9, C2): the check's deadline (the token hook derives it from the
+     * gate's own signal, under the gate budget). Every I/O of the check stops on
+     * it, and a check that runs out of time mints nothing and consumes nothing.
+     */
+    signal?: AbortSignal;
   }
 ): Promise<VerifyResult> {
   // 1. Locate the pending challenge by nonce — repo-local FIRST (R2).
@@ -981,14 +1142,14 @@ export async function verifyToken(
     return { ok: "denied", reason: "provenance-rejected" };
   }
 
-  // 4. Self-send (R3): a cli-api token arriving FROM the session it gates. The
-  //    header is self-reported, so this is accident / naive-injection proofing
-  //    only (registry §5, documented NON-adversarial-proof).
-  if (
-    opts.origin.class === "cli-api" &&
-    opts.origin.sessionId != null &&
-    opts.origin.sessionId === opts.gatedSessionId
-  ) {
+  // 4. Self-send (R3): a token arriving FROM the session it gates. The header is
+  //    self-reported, so this is accident / naive-injection proofing only
+  //    (registry §5, documented NON-adversarial-proof). #6715 (R8, C1): the raw
+  //    sender is compared with the gated session's id OR its tag (the form the
+  //    CLI stamps), for a local `cli-api` send and a forwarded `federation` send
+  //    alike, as `refuseForeignPinWrite` does. `origin.sessionId` is kept as it
+  //    arrived; an over-refusal when two namespaces share a tag fails safe.
+  if (isSelfSend(opts.origin, opts.gatedSessionId, opts.gatedSessionTag)) {
     return { ok: "denied", reason: "provenance-rejected" };
   }
 
@@ -1012,11 +1173,16 @@ export async function verifyToken(
   // head_sha). It must NOT use the generic engine: a files:[] binding is
   // vacuously valid from any cwd, which would defeat the drift check.
   if (isProdMerge) {
-    const pm = await verifyProdMergeBinding(
-      repoPath,
-      challenge.state_binding,
-      opts.prodMergeTip
+    const pm = await untilAborted(
+      verifyProdMergeBinding(
+        repoPath,
+        challenge.state_binding,
+        opts.prodMergeTip,
+        opts.signal
+      ),
+      opts.signal
     );
+    if (pm === CHECK_TIMED_OUT) return CHECK_TIMED_OUT_RESULT;
     if (pm.kind === "drift") {
       return { ok: "denied", reason: "state-drift" };
     }
@@ -1033,7 +1199,14 @@ export async function verifyToken(
           fingerprint: challenge.state_binding,
           minted_at: challenge.minted_at,
         };
-    const check = await isValid(repoPath, gate, opts.stateBinding ?? {});
+    const check = await untilAborted(
+      isValid(repoPath, gate, {
+        ...opts.stateBinding,
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      }),
+      opts.signal
+    );
+    if (check === CHECK_TIMED_OUT) return CHECK_TIMED_OUT_RESULT;
     switch (check.kind) {
       case "invalid":
         // All invalid reasons (content-changed / approved-path-absent /
@@ -1057,6 +1230,10 @@ export async function verifyToken(
   }
 
   // 7. Valid → mint the single-use grant (consumes the challenge).
+  // #6715 (R9): ONE signal check, immediately before the write, with no await
+  // between the check and the write (each writer writes synchronously inside
+  // the call). A check that ran out of time mints nothing and consumes nothing.
+  if (opts.signal?.aborted) return CHECK_TIMED_OUT_RESULT;
   if (key.kind === "issue") {
     const grant = await mintGrant(
       repoPath,

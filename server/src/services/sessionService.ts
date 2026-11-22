@@ -1322,7 +1322,8 @@ export class SessionService {
     sessionId: string,
     namespace: string,
     body: string,
-    clientGeneratedId?: string | null
+    clientGeneratedId?: string | null,
+    origin?: StoredQueuedMessage["origin"]
   ): Promise<QueueEnqueueServiceResult> {
     if (this.isLocalSession(sessionId)) {
       const enqueued: QueuedMessageEnqueueResult =
@@ -1331,12 +1332,9 @@ export class SessionService {
           namespace,
           body,
           clientGeneratedId,
+          ...(origin ? { origin } : {}),
         });
-      return {
-        type: "success",
-        result: enqueued.result,
-        row: enqueued.row,
-      };
+      return { type: "success", ...enqueued };
     }
 
     const result = await this.proxyToNode(
@@ -1344,7 +1342,7 @@ export class SessionService {
       "/queue/enqueue",
       "POST",
       namespace,
-      { body, clientGeneratedId }
+      { body, clientGeneratedId, ...(origin ? { origin } : {}) }
     );
     if (result.type === "success") {
       const data = result.data as {
@@ -1382,14 +1380,16 @@ export class SessionService {
     sessionId: string,
     namespace: string,
     position: number,
-    body: string
+    body: string,
+    origin?: StoredQueuedMessage["origin"]
   ): Promise<QueueUpdateServiceResult> {
     if (this.isLocalSession(sessionId)) {
       const row = this.engine.updateQueuedMessageAt(
         sessionId,
         namespace,
         position,
-        body
+        body,
+        ...(origin ? ([origin] as const) : [])
       );
       if (!row) {
         return { type: "not-found" };
@@ -1402,7 +1402,7 @@ export class SessionService {
       `/queue/${encodeURIComponent(String(position))}`,
       "PATCH",
       namespace,
-      { body }
+      { body, ...(origin ? { origin } : {}) }
     );
     if (result.type === "success") {
       const data = result.data as { row: StoredQueuedMessage };

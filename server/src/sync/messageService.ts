@@ -188,6 +188,12 @@ export class MessageService {
       // content.meta.origin and forwarded to the message-hook stage so the
       // token gate can verify provenance + self-send.
       origin?: MessageOrigin;
+      // #6715 (R7): a server-only mark for a message the server composed (the
+      // Pins answers message), forwarded to the hook stage. Not in `sentFrom`.
+      kind?: "pin-answers";
+      // #6715 (R11): a drained message's queue record, stamped as
+      // `meta.queuedOrigin`. Never forwarded to the hook stage.
+      queuedOrigin?: MessageOrigin;
       // #6452: run this in the SAME transaction as the message insert, after the
       // hook stage: the message and what `record` writes commit together or not
       // at all, and nothing is emitted until the commit. Returning false (or
@@ -223,6 +229,7 @@ export class MessageService {
           sessionId,
           sentFrom,
           origin,
+          ...(payload.kind ? { kind: payload.kind } : {}),
           harnessManifest,
           coverage,
           hooks,
@@ -316,6 +323,7 @@ export class MessageService {
         // #3331: origin-class provenance (R2). Stamped alongside sentFrom; absent
         // when the sender supplied none (programmatic / drained sends).
         ...(origin ? { origin } : {}),
+        ...(payload.queuedOrigin ? { queuedOrigin: payload.queuedOrigin } : {}),
       },
     };
 

@@ -4,6 +4,7 @@ import {
   BILLABLE_SWITCH_CLOSED_CAPABILITY,
   BILLABLE_SWITCH_DEFAULT_MODE,
   BILLABLE_SWITCH_STORE_CAPABILITY,
+  BILLABLE_TRACKING_CAPABILITY,
   type BillableSwitchMode,
 } from "@hapi/protocol";
 
@@ -71,6 +72,11 @@ export type BillableSwitchGateState = {
   /** Both columns and all six tables exist (Task 3's readiness check). */
   storageReady: boolean;
   source: BillableSwitchModeSource;
+  /**
+   * #6778 (3.4 step 6): the start-up reconcile, apart from "the schema is
+   * there". A session it could not settle is listed; the gate is unaffected.
+   */
+  startup?: { ok: boolean; reconciled: number; failedSessionIds: string[] };
 };
 
 /** The state a reader assumes when it was handed none (tests, a bare build). */
@@ -85,6 +91,7 @@ export function resolveBillableSwitchGate(input: {
   env?: Record<string, string | undefined>;
   storageReady: boolean;
   hasEvents: () => boolean;
+  startup?: BillableSwitchGateState["startup"];
 }): BillableSwitchGateState {
   const env = input.env ?? process.env;
   const fromVariable = env[BILLABLE_SWITCH_ENV] !== undefined;
@@ -98,7 +105,12 @@ export function resolveBillableSwitchGate(input: {
   if (!input.storageReady) source = "storage-not-ready";
   else if (envMode === "off" && mode === "closed") source = "events-exist";
   else source = fromVariable ? "variable" : "default";
-  return { mode, storageReady: input.storageReady, source };
+  return {
+    mode,
+    storageReady: input.storageReady,
+    source,
+    ...(input.startup ? { startup: input.startup } : {}),
+  };
 }
 
 /** The one boot log line: the effective state and where it came from. */
@@ -111,13 +123,20 @@ export function describeBillableSwitchGate(
     "storage-not-ready": "forced off: the switch storage is not ready",
     "events-exist": `closed because switch events exist (${BILLABLE_SWITCH_ENV} unset or not on)`,
   };
-  return `[Server] Billable sessions: ${state.mode} (${why[state.source]})`;
+  const failed = state.startup?.failedSessionIds.length ?? 0;
+  const tail =
+    failed > 0
+      ? `; tracking reconcile: ${failed} session(s) not settled, retried every 5 minutes`
+      : "";
+  return `[Server] Billable sessions: ${state.mode} (${why[state.source]})${tail}`;
 }
 
 /**
  * The capability tags this node advertises, appended per call by
  * `detectCapabilities`: `billable:switch-store` whenever the storage is ready
- * (in every state: it says the node's summaries carry the switch),
+ * (in every state: it says the node's summaries carry the switch) and
+ * `billable:tracking` with it (#6778: the widened storage is ready, so the node
+ * stores tracking records),
  * `billable:switch` when `on`, `billable:switch-closed` when `closed`.
  */
 export function billableSwitchCapabilityTags(
@@ -125,23 +144,30 @@ export function billableSwitchCapabilityTags(
 ): string[] {
   if (!state) return [];
   const tags: string[] = [];
-  if (state.storageReady) tags.push(BILLABLE_SWITCH_STORE_CAPABILITY);
+  if (state.storageReady) {
+    tags.push(BILLABLE_SWITCH_STORE_CAPABILITY);
+    // #6778 PR-B (4.1, Task 10): the node stores tracking records. It says
+    // nothing about spawns: the carry tag (`billable:tracking-carry`) is PR-C's,
+    // with the receiver that keeps a carried start.
+    tags.push(BILLABLE_TRACKING_CAPABILITY);
+  }
   if (state.mode === "on") tags.push(BILLABLE_SWITCH_CAPABILITY);
   if (state.mode === "closed") tags.push(BILLABLE_SWITCH_CLOSED_CAPABILITY);
   return tags;
 }
 
 /**
- * A path whose segments name a billable switch route. Whole segments only, so
- * #6586's `/api/billable-time/...` never matches.
+ * A path whose segments name a route behind the billable gate (#6646's switch,
+ * #6779's billing categories). Whole segments only, so #6586's
+ * `/api/billable-time/...` never matches.
  */
 export function isBillableSwitchRoutePath(path: string): boolean {
-  return path
-    .split("/")
-    .some(
-      seg =>
-        seg === "billable" ||
-        seg === "billable-switch" ||
-        seg === "bulk-billable-keep"
-    );
+  return path.split("/").some(
+    seg =>
+      seg === "billable" ||
+      seg === "billable-switch" ||
+      seg === "bulk-billable-keep" ||
+      // #6779: the billing-category routes and receivers, behind the same gate.
+      seg === "billing-categories"
+  );
 }

@@ -81,5 +81,8 @@ export * from "./capabilityCatalog";
 export * from "./publicCoreSource";
 export * from "./nodeDocs";
 export * from "./billableSwitch";
+export * from "./billableTracking";
+export * from "./money";
+export * from "./billingCategories";
 export * from "./repoRemote";
 export * from "./runnerIdentity";

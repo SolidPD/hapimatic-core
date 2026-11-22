@@ -25,7 +25,11 @@
 // coalescing turns a burst into one row with a rising `count`, and the budget
 // here caps pop-ups. `Toast.tsx` keeps its own MAX_VISIBLE cap and 2 s dedup.
 import type { NotificationSeverity } from "@hapi/protocol";
-import { buildReloginToast } from "@/lib/reloginLink";
+import {
+  buildReloginToast,
+  requestRelogin,
+  type ReloginRequest,
+} from "@/lib/reloginLink";
 import { preferenceKeyForKind } from "@/lib/notificationKindPrefs";
 import { isSpawnPlaceholderMounted } from "@/lib/mountedSpawnPlaceholders";
 import { remoteSpawnStubAnnouncesFailure } from "@/lib/pending-spawns";
@@ -99,6 +103,27 @@ function str(ctx: Context, key: string): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
+/**
+ * Issue #6161 (R14, DEC-4): the re-login a `sign-in-ending` row's "Sign in
+ * again" opens — the node and account its producer wrote into the context — or
+ * null for any other kind, or a row with no node in its context.
+ */
+export function signInAgainTarget(row: {
+  kind: string;
+  context?: string | null;
+}): ReloginRequest | null {
+  if (row.kind !== "sign-in-ending") return null;
+  const ctx = parseContext(row.context);
+  const nodeId = str(ctx, "nodeId");
+  if (!nodeId) return null;
+  const accountUuid = str(ctx, "accountUuid");
+  return {
+    provider: "anthropic",
+    nodeId,
+    ...(accountUuid ? { accountUuid } : {}),
+  };
+}
+
 function severityType(severity: string): NotificationToastType {
   if (severity === "error") return "error";
   if (severity === "warn") return "warning";
@@ -136,6 +161,16 @@ export function formatNotificationToast(
         nodeId,
         nodeLabel: str(ctx, "nodeLabel") ?? nodeId,
       }).action;
+    }
+  } else if (row.kind === "sign-in-ending") {
+    // #6161 (R14, DEC-4): "Sign in again" opens the re-login for the node and
+    // account the producer named in the row's context.
+    const target = signInAgainTarget(row);
+    if (target) {
+      action = {
+        label: "Sign in again",
+        onClick: () => requestRelogin(target),
+      };
     }
   } else if (
     row.kind === "spawn-failed" &&

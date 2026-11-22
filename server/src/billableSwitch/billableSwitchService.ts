@@ -4,19 +4,17 @@ import {
   BillableConfirmSchema,
   projectBaseKey,
   projectKeyKind,
-  resolveBillableSwitchStart,
   unloggedAmount,
   type BillableConfirm,
   type BillableSwitchActor,
   type BillableSwitchEvent,
   type BillableSwitchHeader,
-  type BillableSwitchKeyKind,
   type BillableSwitchMode,
   type BillableSwitchNodeView,
-  type BillableSwitchStartContext,
   type BillableSwitchVia,
   type BillableSwitchWriteReason,
   type ProjectKeyMetadata,
+  type OldRouteAction,
   type Session,
 } from "@hapi/protocol";
 import { z } from "zod";
@@ -24,9 +22,13 @@ import type { Store } from "../store";
 import type {
   BillableSwitchListedSession,
   BillableSwitchMirrorEvent,
-  BillableSwitchSessionEventFields,
 } from "../store/billableSwitchStore";
 import type { BillableSwitchInitial } from "../store/sessions";
+import {
+  resolveTrackingStartForInsert,
+  type TrackingRegistration,
+} from "./trackingStart";
+import { retryTrackingReconcileFor } from "./trackingStartup";
 import type {
   BillableSwitchNodeRegistryView,
   NodeRegistry,
@@ -37,7 +39,9 @@ import type {
 // a new session's start value, writes a switch and a confirm, answers the
 // history and the across-node list, and sends a node with no view of the mesh
 // its (empty) header reports. Since #6778 PR-A (R12) no header is written and no
-// other node's report is kept: no header decides a start.
+// other node's header list is kept (the start-up step deleted the peers' stored
+// header rows; their report rows stay, and a received report stores nothing):
+// no header decides a start.
 
 /** One node in the cross-node view (the join of the stored reports and the registry). */
 export type BillableSwitchCrossNodeEntry = Omit<
@@ -60,7 +64,8 @@ export type BillableSwitchWriteActor = {
 };
 
 export type BillableSwitchSetOutcome =
-  | { found: false }
+  /** `reconcilePending`: the start-up reconcile has not settled this session yet (409, 3.4 step 6). */
+  | { found: false; reconcilePending?: true }
   | {
       found: true;
       changed: boolean;
@@ -77,6 +82,7 @@ export type BillableSwitchConfirmOutcome =
       result: Extract<BillableSwitchSetOutcome, { found: true }>;
     }
   | { outcome: "not_found" }
+  | { outcome: "reconcile_pending" }
   | { outcome: "not_pending" };
 
 /** Section 6 item 4: the history response's event, built field by field. */
@@ -174,9 +180,6 @@ export const BillableSwitchPushBodySchema = z
 export type BillableSwitchPushBody = z.infer<
   typeof BillableSwitchPushBodySchema
 >;
-
-/** Thrown inside a confirm's transaction when the session is no longer waiting. */
-class NotPendingError extends Error {}
 
 const PUSH_INTERVAL_MS = 5 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -284,7 +287,9 @@ export class BillableSwitchService {
    * The node view of `GET /api/billable-switch/headers`, whose `on` flags the
    * web's Create reads. Since #6778 PR-A (R12) every entry's header list is
    * empty: no header decides a start, the start-up step switched this node's
-   * rows off and removed the stored reports, and no report is stored again.
+   * rows off and deleted the peers' stored header rows (their report rows stay,
+   * so a node still shows with its last report time), and no report is stored
+   * again.
    *
    * THE one definition of the join: this node as the local entry; one entry
    * per node with a stored report; one entry with no report (unknown) for every
@@ -334,8 +339,8 @@ export class BillableSwitchService {
         nodeLabel: view?.nodeLabel ?? label ?? nodeId,
         isLocal: false,
         reportedAt,
-        // #6778 PR-A: a stored report the start-up step has not removed yet
-        // shows no header either.
+        // #6778 PR-A: a stored report row (the start-up step deletes only its
+        // header rows) shows no header either.
         headers: [],
         status: view?.status ?? "not-tracked",
         on: view?.on ?? false,
@@ -366,91 +371,22 @@ export class BillableSwitchService {
 
   /**
    * The start value of a session row about to be inserted (the start hook).
-   * Null when the gate is not `on` (row 1: no event). `context` is the queued
-   * start context, or null for a registration that had nothing queued (a
-   * terminal start, the daemon's local spawn, a context lost to a hub restart
-   * or to the sweep): that start is `unattended`, and its label says
-   * `context: "none"` with the reported `startedBy`. No start value ever
-   * branches on `startedBy`, which is whatever the registering process sent.
+   * #6778 PR-B (Task 7): the rule lives in `trackingStart.ts`, which reads the
+   * queued start from the durable table inside the registration transaction;
+   * this method keeps the hook's name for its callers.
    */
-  resolveStartForInsert(input: {
-    tag: string;
-    metadata: unknown;
-    namespace: string;
-    context: BillableSwitchStartContext | null;
-  }): BillableSwitchInitial | null {
-    const mode = this.mode();
-    if (mode !== "on") return null;
-    const now = this.now();
-    const meta = (input.metadata ?? {}) as ProjectKeyMetadata & {
-      name?: unknown;
-      path?: unknown;
-      startedBy?: unknown;
-    };
-    const context = input.context;
-    const kind = context?.kind ?? "unattended";
-    const projectKey = projectBaseKey(meta);
-    const keyKind: BillableSwitchKeyKind = projectKeyKind(meta);
-
-    // #6778 PR-A (R12): no header and no other node's report is read here.
-    const parent =
-      kind === "inherit" && context?.fromSessionId
-        ? this.deps.store.billableSwitch.getSwitch(context.fromSessionId)
-        : null;
-    const result = resolveBillableSwitchStart({
-      mode,
-      context: { kind, choice: context?.choice },
-      parent,
-    });
-    if (result.reason === null) return null;
-
-    const label: Record<string, unknown> = {
-      name: typeof meta.name === "string" ? meta.name : null,
-      projectKey,
-      path: typeof meta.path === "string" ? meta.path : null,
-    };
-    if (!context) {
-      label.context = "none";
-      label.startedBy =
-        typeof meta.startedBy === "string" ? meta.startedBy : null;
-    }
-    if (result.reason === "inherit" && context?.fromSessionId) {
-      label.parentSessionId = context.fromSessionId;
-    }
-    if (kind === "schedule" && context?.scheduleId)
-      label.scheduleId = context.scheduleId;
-
-    const actorFields = {
-      actorKind: context?.actor?.kind ?? ("system" as const),
-      actorSessionId: context?.actor?.sessionId ?? null,
-      actorUserAgent: context?.actor?.userAgent ?? null,
-      via: context?.actor
-        ? (context.via ?? ("direct" as const))
-        : ("internal" as const),
-      entryNodeId: context?.entryNodeId ?? this.deps.getLocalNodeId(),
-    };
-    return {
-      billable: result.billable,
-      confirm: result.confirm,
-      event: {
-        ...actorFields,
-        namespace: input.namespace,
-        projectKey,
-        keyKind,
-        kind: "start",
-        reason: result.reason,
-        startKind: kind,
-        billableBefore: null,
-        billableAfter: result.billable,
-        confirmBefore: null,
-        confirmAfter: result.confirm,
-        timerMs: 0,
-        unloggedMs: 0,
-        loggedKnown: false,
-        label,
-        at: now,
+  resolveStartForInsert(
+    input: TrackingRegistration
+  ): BillableSwitchInitial | null {
+    return resolveTrackingStartForInsert(
+      {
+        store: this.deps.store,
+        getMode: () => this.mode(),
+        getLocalNodeId: this.deps.getLocalNodeId,
+        now: this.now,
       },
-    };
+      input
+    );
   }
 
   // ─── switch, confirm, header ──────────────────────────────────────────────
@@ -470,29 +406,21 @@ export class BillableSwitchService {
       loggedMs: number | null;
     }
   ): BillableSwitchSetOutcome {
-    return this.write(
-      sessionId,
-      namespace,
-      { billable: input.billable, confirm: null },
-      input,
-      before => {
-        if (input.billable) {
-          return {
-            kind: before.confirm === "pending" ? "keep" : "on",
-            reason: input.reason,
-          };
-        }
-        return {
-          kind: before.confirm === "pending" ? "reverse" : "off",
-          reason: input.reason,
-        };
-      }
-    );
+    const result = this.write(sessionId, namespace, input, {
+      action: input.billable ? "switch-on" : "switch-off",
+      reason: input.reason,
+    });
+    if (result === "reconcile-pending")
+      return { found: false, reconcilePending: true };
+    // `not-waiting` comes only with `requireWaiting`, which a switch never sets.
+    return result === "not-waiting" ? { found: false } : result;
   }
 
   /**
-   * Decide a waiting session: `keep` clears the confirm state (still billable),
-   * `reverse` switches it off. Not waiting → `not_pending`.
+   * Decide a waiting session (#6778, Matt Starfield's ruling 1): `keep` clears
+   * the confirm state and keeps the status; `reverse` makes the session
+   * Non-billable and keeps its record. "Waiting" is judged on the record, any
+   * status. Not waiting → `not_pending`.
    */
   confirm(
     sessionId: string,
@@ -509,67 +437,83 @@ export class BillableSwitchService {
         : input.reason === "confirm-reverse"
           ? "confirm"
           : input.reason;
-    try {
-      const result = this.write(
-        sessionId,
-        namespace,
-        input.decision === "keep"
-          ? { billable: true, confirm: null }
-          : { billable: false, confirm: null },
-        input,
-        before => {
-          if (before.confirm !== "pending") throw new NotPendingError();
-          return {
-            kind: input.decision === "keep" ? "keep" : "reverse",
-            reason,
-          };
-        }
-      );
-      if (!result.found) return { outcome: "not_found" };
-      if (!result.changed) return { outcome: "not_pending" };
-      return { outcome: "ok", result };
-    } catch (err) {
-      if (err instanceof NotPendingError) return { outcome: "not_pending" };
-      throw err;
-    }
+    const result = this.write(sessionId, namespace, input, {
+      action: input.decision,
+      reason,
+      requireWaiting: true,
+    });
+    if (result === "reconcile-pending") return { outcome: "reconcile_pending" };
+    if (result === "not-waiting") return { outcome: "not_pending" };
+    if (!result.found) return { outcome: "not_found" };
+    if (!result.changed) return { outcome: "not_pending" };
+    return { outcome: "ok", result };
+  }
+
+  /**
+   * Whether a Keep of this session would raise billing, which the `closed`
+   * gate refuses (3.3; review G5). A Keep only clears the wait, so it raises
+   * billing only for a waiting copy that is Billable. A session with no local
+   * record (one on another node, or none at all) counts as raising, as before.
+   */
+  keepRaisesBilling(sessionId: string, namespace: string): boolean {
+    const record = this.deps.store.billableTracking.get(
+      sessionId,
+      namespace
+    )?.record;
+    if (!record || record.confirm !== "pending") return true;
+    return record.billingStatus === "billable";
   }
 
   private write(
     sessionId: string,
     namespace: string,
-    next: { billable: boolean; confirm: BillableConfirm },
     input: BillableSwitchWriteActor & { loggedMs: number | null },
-    decide: (before: { billable: boolean; confirm: BillableConfirm }) => {
-      kind: BillableSwitchSessionEventFields["kind"];
+    route: {
+      action: OldRouteAction;
       reason: string;
+      requireWaiting?: boolean;
     }
-  ): BillableSwitchSetOutcome {
+  ): BillableSwitchSetOutcome | "not-waiting" | "reconcile-pending" {
+    // 3.4 step 6: a session the start-up reconcile could not settle is retried
+    // before the write, and refused while it stays unsettled.
+    if (!retryTrackingReconcileFor(this.deps.store, sessionId)) {
+      return "reconcile-pending";
+    }
     const now = this.now();
     const session = this.deps.getSession(sessionId);
     const timerMs = this.timerMsFor(session, now);
     const amount = unloggedAmount({ timerMs, loggedMs: input.loggedMs });
     const meta = session?.metadata as ProjectKeyMetadata | undefined;
-    const result = this.deps.store.billableSwitch.setSwitch(
+    const projectKey = projectBaseKey(meta);
+    const result = this.deps.store.billableSwitch.setByOldRoute(
       sessionId,
       namespace,
-      next,
-      before => ({
-        ...decide(before),
-        actorKind: input.actor.kind,
-        actorSessionId: input.actor.sessionId ?? null,
-        actorUserAgent: input.actor.userAgent ?? null,
-        via: input.via,
-        entryNodeId: input.entryNodeId,
-        projectKey: meta ? projectBaseKey(meta) : null,
-        keyKind: meta ? projectKeyKind(meta) : null,
-        timerMs,
-        unloggedMs: amount.ms,
-        loggedKnown: amount.loggedKnown,
-        label: this.labelFor(session),
-        at: now,
-      })
+      {
+        ...route,
+        project: {
+          kind: projectKeyKind(meta),
+          key: projectKey,
+          name: projectKey,
+        },
+        trackFrom: session?.createdAt ?? now,
+        event: {
+          actorKind: input.actor.kind,
+          actorSessionId: input.actor.sessionId ?? null,
+          actorUserAgent: input.actor.userAgent ?? null,
+          via: input.via,
+          entryNodeId: input.entryNodeId,
+          projectKey: meta ? projectKey : null,
+          keyKind: meta ? projectKeyKind(meta) : null,
+          timerMs,
+          unloggedMs: amount.ms,
+          loggedKnown: amount.loggedKnown,
+          label: this.labelFor(session),
+          at: now,
+        },
+      }
     );
     if (!result.found) return { found: false };
+    if ("notWaiting" in result) return "not-waiting";
     if (result.changed) this.deps.refreshSession(sessionId);
     return {
       found: true,
@@ -608,7 +552,8 @@ export class BillableSwitchService {
    * At start, on a node that has a registry only: drop every stored node that
    * is neither a configured static node nor a row of the peer store (removed
    * from the settings, or re-keyed). An instance without a registry keeps the
-   * reports it was sent or seeded.
+   * report rows it holds from before #6778 PR-A (since then a pushed report
+   * stores nothing, and the start-up step deleted their header rows).
    */
   pruneOnStart(): string[] {
     const registry = this.deps.getRegistry();
@@ -818,7 +763,9 @@ export class BillableSwitchService {
   /**
    * History steps 1 and 2 (the route owns step 3, the owning node): a live local
    * row in the caller's namespace, or local event rows of a deleted session in
-   * that namespace. Null when neither.
+   * that namespace. Null when neither. The seven old kinds only (#6778 PR-B,
+   * 6.3), because an older hub parses this answer with a strict kind enum:
+   * a `tracking` row is read through the tracking history route (PR-C).
    */
   localHistory(
     sessionId: string,
@@ -830,7 +777,8 @@ export class BillableSwitchService {
     );
     const events = this.deps.store.billableSwitch.listEvents(
       sessionId,
-      namespace
+      namespace,
+      { legacyOnly: true }
     );
     if (!live && events.length === 0) return null;
     return {
@@ -842,13 +790,18 @@ export class BillableSwitchService {
     };
   }
 
-  /** History step 4: the hub's copy of another node's events, in the caller's namespace. */
+  /**
+   * History step 4: the hub's copy of another node's events, in the caller's
+   * namespace, the seven old kinds only (#6778 PR-B, as `localHistory`).
+   */
   mirrorHistory(
     sessionId: string,
     namespace: string
   ): BillableSwitchHistory | null {
     const rows: BillableSwitchMirrorEvent[] =
-      this.deps.store.billableSwitch.listMirrorEvents(sessionId, namespace);
+      this.deps.store.billableSwitch.listMirrorEvents(sessionId, namespace, {
+        legacyOnly: true,
+      });
     if (rows.length === 0) return null;
     const origin = rows[rows.length - 1].originNodeId;
     return {

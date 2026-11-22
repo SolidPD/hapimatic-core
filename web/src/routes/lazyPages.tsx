@@ -101,6 +101,11 @@ export const NetworkPage = lazyRoutePage(
   () => import("@/routes/settings/network"),
   "Loading network..."
 );
+// #6779: the billing categories page (its row shows while billable sessions are on or closed).
+export const BillingCategoriesPage = lazyRoutePage(
+  () => import("@/routes/settings/billing-categories"),
+  "Loading billing categories..."
+);
 export const ExtensionsAdminPage = lazyRoutePage(
   () => import("@/routes/settings/extensions"),
   "Loading extensions..."
@@ -163,6 +168,7 @@ const SETTINGS_PAGES = [
   NotificationsPage,
   ConnectorsPage,
   NetworkPage,
+  BillingCategoriesPage,
   ExtensionsAdminPage,
   ConfigurationAdminPage,
   AdminVmsPage,

@@ -5,6 +5,7 @@ import type {
   PinSubmissionRequest,
 } from "@hapi/protocol";
 import { PIN_SORTS, stagedIsStale, stepsSent } from "@/lib/pins/ledger";
+import { optionPointsToNote } from "@/lib/pins/noteOption";
 import {
   hasUpdates,
   type StagedPin,
@@ -43,6 +44,12 @@ export function browserTimeZone(): string | undefined {
 /** A staged choice or tick made on an older revision than the pin's now. */
 export type StaleStaged = { key: string; staged: number; current: number };
 
+/**
+ * #6768 (R7): a staged choice left out of the request; it stays staged. Its
+ * option says the answer is in the note, and the note is empty.
+ */
+export type HeldStaged = { key: string; reason: "note_empty" };
+
 export type BuiltSubmission = {
   /** Null when nothing staged has anything to send. */
   request: PinSubmissionRequest | null;
@@ -50,7 +57,31 @@ export type BuiltSubmission = {
   submitted: Record<string, Readonly<StagedPin>>;
   /** Shown before the server's dry run answers. */
   stale: StaleStaged[];
+  /** #6768 (R7): staged choices held back until their note is written. */
+  held: HeldStaged[];
+  /**
+   * #6768 (R3): the whole staged set this request was read from, so the dialog
+   * can tell whether staging moved on before it sends.
+   */
+  from: StagedPins;
 };
+
+/**
+ * #6768 (R7, ruling 2A): a staged choice whose option points to the note, with
+ * the note empty. The pin's option decides, else the label staged with it (a
+ * pin the cache no longer holds). A dismissal carries no choice.
+ */
+function pointsToEmptyNote(
+  staged: Readonly<StagedPin>,
+  pin: Pin | undefined
+): boolean {
+  if (staged.choice === undefined || staged.note?.trim()) return false;
+  const option = pin?.options?.find(o => o.id === staged.choice) ?? {
+    id: staged.choice,
+    label: staged.label,
+  };
+  return optionPointsToNote(option);
+}
 
 /**
  * One request entry from a staged pin, or null when it has nothing new: a
@@ -157,9 +188,14 @@ export function buildSubmissionRequest(input: {
   const entries: PinSubmissionEntry[] = [];
   const submitted: Record<string, Readonly<StagedPin>> = {};
   const stale: StaleStaged[] = [];
+  const held: HeldStaged[] = [];
   for (const key of keys) {
     const staged = input.staged[key] as Readonly<StagedPin>;
     const pin = byKey.get(key);
+    if (pointsToEmptyNote(staged, pin)) {
+      held.push({ key, reason: "note_empty" });
+      continue;
+    }
     const entry = entryFor(key, staged, pin);
     if (!entry) continue;
     entries.push(entry);
@@ -170,10 +206,13 @@ export function buildSubmissionRequest(input: {
   }
   // #6452 (ruling D5): each pending automatic-pick change rides along. A pin
   // answered by choice settles, so its change no longer matters to the agent;
-  // a dismissed pin closes, so its entry is left alone too (#6539).
+  // a dismissed pin closes, so its entry is left alone too (#6539). A held
+  // choice (#6768) is not sent, so its pin's change goes alone, as the server
+  // would add it beside any other entry.
   const reports = pendingDeadlineReports(input.pins).sort((a, b) =>
     PIN_SORTS.priority(a, b)
   );
+  const heldKeys = new Set(held.map(item => item.key));
   for (const pin of reports) {
     const index = entries.findIndex(entry => entry.key === pin.key);
     const entry = entries[index];
@@ -183,7 +222,9 @@ export function buildSubmissionRequest(input: {
       }
       continue;
     }
-    if (input.staged[pin.key]?.choice !== undefined) continue;
+    if (input.staged[pin.key]?.choice !== undefined && !heldKeys.has(pin.key)) {
+      continue;
+    }
     entries.push({
       key: pin.key,
       rev: pin.revision,
@@ -202,5 +243,7 @@ export function buildSubmissionRequest(input: {
         : null,
     submitted,
     stale,
+    held,
+    from: input.staged,
   };
 }
