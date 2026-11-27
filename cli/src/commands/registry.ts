@@ -14,6 +14,7 @@ import { extCommand } from "./ext";
 import { opencodeCommand } from "./opencode";
 import { hookForwarderCommand } from "./hookForwarder";
 import { launcherCommand } from "./launcher";
+import { instanceKindCommand } from "./instanceKind";
 import { mcpCommand } from "./mcp";
 import { federationCommand } from "./federation";
 import { notifyCommand } from "./notify";
@@ -49,6 +50,7 @@ function ensureRegistry(): {
       federationCommand,
       opencodeCommand,
       launcherCommand,
+      instanceKindCommand,
       securityCommand,
       selftestCommand,
       mcpCommand,

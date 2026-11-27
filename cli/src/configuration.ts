@@ -365,6 +365,10 @@ class Configuration {
     // gated; flip ON only after the controlled cross-node validation. Truthy-
     // enable (mirror omniboxSandboxEnabled / rotationLeaseEnabled), NOT inverted
     // — an absent/unset env keeps it OFF (byte-identical to the pre-#3784 skip).
+    // Issue #6997 (PR 1, Matt's D1 = R1): the same switch also enables the
+    // REMOTE-ONLY case (held on another node, none here); the parse is
+    // unchanged, so it stays OFF wherever it is unset. PR 2 inverts it after the
+    // RP1 + MS1 canary soak.
     this.idleRotateWhenRemoteIndependentEnabled = [
       "true",
       "1",

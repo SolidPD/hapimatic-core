@@ -34,11 +34,56 @@ export type HandshakeDecision = "accept" | "accept-unknown" | "refuse";
 
 export type ReportDecision = "pass" | "drop";
 
-export type GatedReportKind =
-  | "session-alive"
-  | "update-state"
-  | "update-metadata"
-  | "session-end";
+/**
+ * The socket events the per-event backstop checks (R7; #6974 R1, R2). Each
+ * name is its socket event's name and holds no digit, because the route's
+ * shape tests assert that the counts' JSON holds no digit 1-9 (`cli.test.ts`).
+ * The four first are #6647's and keep the counts' key order. The counts are
+ * built from this list (`emptyReportKinds`), so a kind cannot lack its leaves;
+ * `socket/handlers/cli/socketEventClasses.ts` classifies every other event.
+ */
+export const GATED_REPORT_KINDS = [
+  "session-alive",
+  "update-state",
+  "update-metadata",
+  "session-end",
+  "message",
+  "turn:open",
+  "turn:finalize",
+  "provider-usage-snapshot",
+  "context-reset:arm",
+  "context-reset:disarm",
+  "context-reset:result",
+  "claude:pty-output",
+] as const;
+
+export type GatedReportKind = (typeof GATED_REPORT_KINDS)[number];
+
+/** One zero count per gated kind, in the list's order (#6974 R2). */
+export function emptyReportKinds(): Record<GatedReportKind, number> {
+  return Object.fromEntries(GATED_REPORT_KINDS.map(k => [k, 0])) as Record<
+    GatedReportKind,
+    number
+  >;
+}
+
+/** #6647's four kinds, which warn as before (#6974 O10, K3). */
+const WARN_ALWAYS_KINDS: ReadonlySet<GatedReportKind> = new Set(
+  GATED_REPORT_KINDS.slice(0, 4)
+);
+
+/**
+ * #6974 O10 (K3): whether a refused report writes its warning row. The four
+ * existing kinds warn as before; a kind #6974 added warns only when its event
+ * names a session other than the socket's own, which no CLI sends, so the
+ * category's rate limit stays the four kinds'. Pure.
+ */
+export function reportWarning(
+  kind: GatedReportKind,
+  sidMatches: boolean
+): "persist" | "none" {
+  return WARN_ALWAYS_KINDS.has(kind) || !sidMatches ? "persist" : "none";
+}
 
 export type AttachNewcomer = {
   key: string | null;

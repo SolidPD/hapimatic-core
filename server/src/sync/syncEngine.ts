@@ -101,6 +101,7 @@ import {
 import { isNewUserFacingAssistantContent } from "./needsReviewContent";
 import { PinService } from "./pinService";
 import { PinFenceIngest } from "./pinFenceIngest";
+import { PinFollow, type PinFollowLookup } from "./pinFollow";
 import { PinPromptMirror } from "./pinPromptMirror";
 import {
   managedPeerCheck,
@@ -117,6 +118,7 @@ import {
 import {
   checkOrphanGrant as runOrphanGrantCheck,
   OrphanGrantStore,
+  readIssueGrantMintsFromDisk,
 } from "./orphanGrantStep";
 import { loadApprovalTokensConfig } from "../config/approvalTokensConfig";
 import { loadApprovalHygieneConfig } from "../config/approvalHygieneConfig";
@@ -226,7 +228,31 @@ import {
   type SessionFatalReason,
 } from "../notifications/sessionFatalEscalation";
 
+import {
+  isManagerStampEnabled,
+  isManagerStampSuccessorEnabled,
+} from "../configuration";
+import type { ManagerStampWrite } from "../store/sessions";
+import { deriveManagerStamp } from "./managerStamp";
+import { createPmRoleHeadCheck } from "./pmRoleHead";
+
 export type { Session, SyncEvent } from "@hapi/protocol/types";
+
+/**
+ * #6559 (Task 10): the context-reset service's lifecycle hooks the engine calls.
+ * A narrow port (the engine does not import the service), wired at boot through
+ * {@link SyncEngine.setContextResetHooks}.
+ */
+export interface ContextResetEngineHooks {
+  /** An `armed` or `firing` request exists for the session (R13's hold). */
+  isPending(sessionId: string): boolean;
+  /** `abortSession`: drop a pending request with reason `aborted`. */
+  abort(sessionId: string): boolean;
+  /** A respawn end: keep the row, disallow the reset. Idempotent. */
+  onSessionRespawn(sessionId: string): void;
+  /** A terminal end, never a respawn. */
+  onSessionEnd(sessionId: string): void;
+}
 
 /** #5254 R4: breach actions that count as "already fired" for the de-dupe. */
 const CEILING_FIRED_ACTIONS = ["hard-stop", "notify"] as const;
@@ -302,6 +328,16 @@ export interface SpawnSessionOptions {
   parentSessionId?: string;
   /** #2479: relationship to the parent — "branch" (forked) or "spawn" (managed peer) */
   parentRelationship?: "branch" | "spawn";
+  /** Issue #6918: the request's caller header resolved to `parentSessionId`.
+   *  Server-side only (never on the daemon wire, never from a client body). */
+  spawnRequestedByParent?: boolean;
+  /** Issue #6918: the request carried a caller header at all (R10). */
+  spawnCallerHeaderPresent?: boolean;
+  /** Issue #6918 (R9): set on a watermark successor spawn: its predecessor. */
+  successorOf?: Session;
+  /** Issue #6918 (R7): a pair the sending node derived and forwarded; the
+   *  receiver stores it and never derives locally. */
+  forwardedManagerStamp?: ManagerStampWrite;
   originatingNodeId?: string;
   /** Multi-account (epic #1446, Sub-Issue J): bind the spawned process to this
    *  account by setting HAPI_ACCOUNT_UUID in its env (mirrors originatingNodeId).
@@ -569,6 +605,11 @@ export type LinkedIssueListener = (
 
 export class SyncEngine {
   private readonly store: Store;
+  /** Issue #6918 (R5): the project-manager check, positive answers cached. */
+  private readonly isProjectManagerSession = createPmRoleHeadCheck({
+    getMessagesAfter: (sessionId, afterSeq, limit) =>
+      this.store.messages.getMessagesAfter(sessionId, afterSeq, limit),
+  });
   private readonly eventPublisher: EventPublisher;
   private readonly sessionCache: SessionCache;
   private readonly machineCache: MachineCache;
@@ -582,10 +623,17 @@ export class SyncEngine {
   readonly pinFences: PinFenceIngest;
   /** #6455: mirrors each prompt a session is blocked on as a `prompt:` pin. */
   readonly pinPrompts: PinPromptMirror;
+  /**
+   * #6456: closes a pin settled elsewhere: a copy whose original closed, and a
+   * Detected pin whose linked pins are all settled. Its loop starts in index.ts.
+   */
+  readonly pinFollow: PinFollow;
   /** #6455: the Stop-hook turn check and Detected pins; Sub-Issue J (#6456) will reuse `detect`. */
   readonly pinTurns: PinTurnCheck;
   /** #3563: in-memory USER-APPROVAL mint records for orphaned-grant detection. */
   private readonly orphanGrantStore = new OrphanGrantStore();
+  /** #6559: the context-reset service's hooks; null until wired at boot. */
+  private contextResetHooks: ContextResetEngineHooks | null = null;
   private readonly rpcGateway: RpcGateway;
   private inactivityTimer: NodeJS.Timeout | null = null;
   private midnightResetTimer: NodeJS.Timeout | null = null;
@@ -1009,6 +1057,31 @@ export class SyncEngine {
       } catch (error) {
         this.errorLogger?.debug("pin prompt mirror: listener failed", {
           category: "pin-prompt",
+          context: {
+            error: error instanceof Error ? error.message : String(error),
+          },
+          persist: false,
+        });
+      }
+    });
+    // #6456: a third writer that bypasses the routes, so it reads the Pins gate
+    // once, like the mirror. It listens to `pin-changed`, which every close
+    // publishes after its commit (the Submit and the automatic pick included);
+    // its listener only queues, and its own guard keeps a fault away from the
+    // other listeners.
+    this.pinFollow = new PinFollow({
+      pins: this.pins,
+      getSessionNamespace: sid =>
+        this.sessionCache.getSession(sid)?.namespace ?? null,
+      pinsEnabled: resolvePinsEnabled(),
+      errorLogger: this.errorLogger,
+    });
+    this.eventPublisher.subscribe(event => {
+      try {
+        this.pinFollow.onEvent(event);
+      } catch (error) {
+        this.errorLogger?.debug("pin follow: listener failed", {
+          category: "pin-follow",
           context: {
             error: error instanceof Error ? error.message : String(error),
           },
@@ -1515,6 +1588,22 @@ export class SyncEngine {
     read: ((sessionId: string) => ParentSessionState | null) | null
   ): void {
     this.remoteParentState = read;
+  }
+
+  /** #6456: a session's newest stored messages (the retire route's typed-message proof). */
+  getRecentMessagesBounded(
+    sessionId: string,
+    options: { limit: number; sinceMs: number; maxChars: number }
+  ): Array<{ id: string; createdAt: number; content: unknown }> {
+    return this.store.messages.getRecentMessagesBounded(sessionId, options);
+  }
+
+  /**
+   * #6456: how the follow service reads an original on another node by its ID.
+   * Set from index.ts after the federation block; null reads this node only.
+   */
+  setPinFollowLookup(lookup: PinFollowLookup | null): void {
+    this.pinFollow.setLookup(lookup);
   }
 
   /** What this node knows of a parent session, in memory only; null when it finds none. */
@@ -2959,6 +3048,16 @@ export class SyncEngine {
       (!payload.archived && this.respawnMarks.consume(payload.sid));
     const endingAgents = this.runningBackgroundAgents(payload.sid);
     this.sessionCache.handleSessionEnd(payload);
+    // #6559 (Task 10 item 8): a respawn keeps a pending context reset (the lane
+    // still owes its next stage); only a terminal end goes to onSessionEnd. Reads
+    // the `respawn` resolved above and never consumes the mark again. Both
+    // respawn ends call it; onSessionRespawn is idempotent.
+    try {
+      if (respawn) this.contextResetHooks?.onSessionRespawn(payload.sid);
+      else this.contextResetHooks?.onSessionEnd(payload.sid);
+    } catch (err) {
+      this.warnContextReset("session-end hook failed", payload.sid, err);
+    }
     this.recordAgentsOfEndedSession(payload.sid, endingAgents);
     // #1968 (R2): auto-release this session's file claims. Covers end + archive
     // (archiveSession funnels through handleSessionEnd). Idempotent.
@@ -3204,6 +3303,9 @@ export class SyncEngine {
       // #6452: an in-transaction record step (pins answers commit with their
       // message); see MessageService.sendMessage.
       record?: MessageRecordStep;
+      // #6559: `content.meta.contextReset` — passed only by the context-reset
+      // service; see MessageService.sendMessage.
+      contextReset?: { armId: string };
     }
   ): Promise<SendMessageResult> {
     // #3124: forward the delivery result (a gate-class message hook can deny —
@@ -3347,7 +3449,17 @@ export class SyncEngine {
   async drainQueueHead(
     sessionId: string,
     namespace: string
-  ): Promise<{ sent: boolean; remaining: number }> {
+  ): Promise<{ sent: boolean; remaining: number; held?: true }> {
+    // #6559 (R13, one hold): a manual "send now" must not put a message into a
+    // session whose context reset is pending or firing. Nothing is popped; the
+    // queue drains after the request ends.
+    if (this.isContextResetPending(sessionId)) {
+      return {
+        sent: false,
+        remaining: this.store.queuedMessages.list(sessionId, namespace).length,
+        held: true,
+      };
+    }
     const row = this.popHeadQueuedMessage(sessionId);
     if (!row) {
       return { sent: false, remaining: 0 };
@@ -3463,7 +3575,70 @@ export class SyncEngine {
   }
 
   async abortSession(sessionId: string): Promise<void> {
+    // #6559 (R6): an abort drops a pending context reset (`dropped:aborted`)
+    // before the stop goes out, so the reason is the abort, not the interrupt
+    // finalize that follows it.
+    try {
+      this.contextResetHooks?.abort(sessionId);
+    } catch (err) {
+      this.warnContextReset("abort hook failed", sessionId, err);
+    }
     await this.rpcGateway.abortSession(sessionId);
+  }
+
+  /**
+   * #6559 (Task 10): wire the context-reset service's lifecycle hooks. Set once
+   * at boot from `server/src/index.ts`; until then every hook is a no-op.
+   */
+  setContextResetHooks(hooks: ContextResetEngineHooks | null): void {
+    this.contextResetHooks = hooks;
+  }
+
+  /** #6559 (R13): true while the session has an `armed` or `firing` reset. */
+  isContextResetPending(sessionId: string): boolean {
+    try {
+      return this.contextResetHooks?.isPending(sessionId) ?? false;
+    } catch (err) {
+      this.warnContextReset("isPending hook failed", sessionId, err);
+      return false;
+    }
+  }
+
+  /**
+   * #6559 (R12, Task 10 item 9): zero and persist the session's context figures
+   * after a `delivered_reset`, because the alive handler keeps the old figure
+   * whenever a tick omits the field.
+   */
+  zeroContextUsage(sessionId: string): void {
+    this.sessionCache.zeroContextUsage(sessionId);
+  }
+
+  /**
+   * #6559 (Task 10 item 9): after a reset, re-record each unconsumed issue grant
+   * found in the session's working tree, so the orphaned-grant check still sees a
+   * grant minted before the reset (its clean-end drop ran when the arming turn
+   * ended). Global scope grants carry no session and are left alone.
+   */
+  rerecordGrantMintsFromDisk(sessionId: string): number {
+    const repoPath = this.getSession(sessionId)?.metadata?.path;
+    if (typeof repoPath !== "string" || repoPath === "") return 0;
+    // ROUND RV10 item 8: each skipped grant file is one warning line.
+    const records = readIssueGrantMintsFromDisk(repoPath, (path, why) =>
+      this.warnContextReset(`skipped grant file ${path}`, sessionId, why)
+    );
+    for (const rec of records) this.orphanGrantStore.record(sessionId, rec);
+    return records.length;
+  }
+
+  private warnContextReset(
+    message: string,
+    sessionId: string,
+    err: unknown
+  ): void {
+    this.errorLogger?.warn(
+      `context-reset ${message} for ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+      { category: "context-reset", sessionId }
+    );
   }
 
   /**
@@ -4271,7 +4446,7 @@ export class SyncEngine {
         placedBy,
         refusal: {
           code: "api_key_not_shared",
-          message: `The API key ${name} is no longer shared with other nodes. This session was started from another node, so it cannot restart on that key — switch it to an account, or start a new session on this node with the key.`,
+          message: `The API key ${name} is no longer shared with other nodes. This session was put on that key from another node, so it cannot restart on it — switch it to an account, or start a new session on this node with the key.`,
         },
       };
     }
@@ -4399,7 +4574,12 @@ export class SyncEngine {
     // (the store uuid is minted at first registration), so we generate one if the
     // caller did not (the daemon honours a provided hapiSessionId) and queue by
     // tag; `sessionCache.getOrCreateSession` applies it when the child registers.
-    // Idempotent with the post-success fallback (that write skips if already set).
+    // The post-success write below does NOT skip an existing parent: the store
+    // UPDATE is unconditional, so it rewrites the same link (harmless, same
+    // value). Only the TAG apply skips a row whose parent is already set (#6918).
+    // Issue #6918: the manager stamp is derived ONCE, here, and the same value
+    // rides the tag queue and the post-success write below.
+    const managerStamp = this.deriveSpawnManagerStamp(opts);
     if (opts.parentRelationship === "spawn" && opts.parentSessionId) {
       if (!opts.hapiSessionId) {
         opts.hapiSessionId = generateSessionId();
@@ -4407,7 +4587,18 @@ export class SyncEngine {
       this.sessionCache.queuePendingParentByTag(
         opts.hapiSessionId,
         opts.parentSessionId,
-        "spawn"
+        "spawn",
+        managerStamp
+      );
+    } else if (managerStamp) {
+      // A watermark successor (R9, behind its own switch): a stamp with no
+      // parent link.
+      if (!opts.hapiSessionId) {
+        opts.hapiSessionId = generateSessionId();
+      }
+      this.sessionCache.queuePendingManagerStampByTag(
+        opts.hapiSessionId,
+        managerStamp
       );
     }
 
@@ -4615,11 +4806,93 @@ export class SyncEngine {
       this.sessionCache.updateSessionParentRelationship(
         result.sessionId,
         opts.parentSessionId,
-        "spawn"
+        "spawn",
+        managerStamp
+      );
+    } else if (result.type === "success" && managerStamp) {
+      this.sessionCache.updateSessionManagerStamp(
+        result.sessionId,
+        managerStamp
       );
     }
 
     return result;
+  }
+
+  /**
+   * Issue #6918 (R7): the hub's own pair for a cross-node spawn, derived from
+   * the resolved LOCAL parent and the caller facts, then forwarded to the
+   * receiving node (which never derives one itself).
+   */
+  deriveManagerStampForSpawn(
+    opts: Pick<
+      SpawnSessionOptions,
+      | "parentSessionId"
+      | "parentRelationship"
+      | "spawnRequestedByParent"
+      | "spawnCallerHeaderPresent"
+    >
+  ): ManagerStampWrite | undefined {
+    return this.deriveSpawnManagerStamp({
+      machineId: "",
+      directory: "",
+      ...opts,
+    } as SpawnSessionOptions);
+  }
+
+  /**
+   * Issue #6918: the spawn's manager stamp (see `managerStamp.ts` for the
+   * order), or undefined for no decision. Skipped for a resume and for a tag
+   * that already names a row (a reattach is not a new session).
+   */
+  private deriveSpawnManagerStamp(
+    opts: SpawnSessionOptions
+  ): ManagerStampWrite | undefined {
+    if (!isManagerStampEnabled()) return undefined;
+    if (opts.resumeSessionId) return undefined;
+    const parent = opts.parentSessionId
+      ? (this.sessionCache.getSession(opts.parentSessionId) ?? null)
+      : null;
+    const namespace = parent?.namespace ?? opts.successorOf?.namespace;
+    if (opts.hapiSessionId && namespace) {
+      try {
+        if (
+          this.store.sessions.findSessionIdByTag(
+            opts.hapiSessionId,
+            namespace
+          ) !== null
+        ) {
+          return undefined;
+        }
+      } catch {
+        return undefined;
+      }
+    }
+    return deriveManagerStamp({
+      enabled: true,
+      successorEnabled: isManagerStampSuccessorEnabled(),
+      successorOf: opts.successorOf ?? null,
+      relationship: opts.parentRelationship,
+      parentSessionId: opts.parentSessionId,
+      parent,
+      requestedByParent: opts.spawnRequestedByParent,
+      callerHeaderPresent: opts.spawnCallerHeaderPresent,
+      forwarded: opts.forwardedManagerStamp,
+      isManager: candidate => {
+        const session = this.sessionCache.getSession(candidate.id);
+        return session ? this.isProjectManagerSession(session) : false;
+      },
+      parentHasOperatorMessage: candidate => {
+        try {
+          return (
+            this.store.sessions.getLastOperatorMessageAt(candidate.id) !== null
+          );
+        } catch {
+          // Unreadable: treat as messaged, so nothing is inherited (kept).
+          return true;
+        }
+      },
+    });
   }
 
   /**
@@ -4954,12 +5227,13 @@ export class SyncEngine {
    */
   async branchSession(
     sessionId: string,
-    branchLabel?: string
+    branchLabel?: string,
+    claim?: Parameters<SessionRespawn["branchSession"]>[2]
   ): Promise<
     | { type: "success"; newSessionId: string }
     | { type: "error"; message: string; code?: string }
   > {
-    return this.sessionRespawn.branchSession(sessionId, branchLabel);
+    return this.sessionRespawn.branchSession(sessionId, branchLabel, claim);
   }
 
   async checkPathsExist(

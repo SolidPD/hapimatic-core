@@ -5,6 +5,7 @@ import {
   BILLABLE_SWITCH_DEFAULT_MODE,
   BILLABLE_SWITCH_STORE_CAPABILITY,
   BILLABLE_TRACKING_CAPABILITY,
+  BILLABLE_TRACKING_CARRY_CAPABILITY,
   type BillableSwitchMode,
 } from "@hapi/protocol";
 
@@ -146,10 +147,13 @@ export function billableSwitchCapabilityTags(
   const tags: string[] = [];
   if (state.storageReady) {
     tags.push(BILLABLE_SWITCH_STORE_CAPABILITY);
-    // #6778 PR-B (4.1, Task 10): the node stores tracking records. It says
-    // nothing about spawns: the carry tag (`billable:tracking-carry`) is PR-C's,
-    // with the receiver that keeps a carried start.
+    // #6778 PR-B (4.1, Task 10): the node stores tracking records.
     tags.push(BILLABLE_TRACKING_CAPABILITY);
+    // #6778 PR-C (4.1, Task 15): it keeps and re-checks a carried start
+    // (`spawnForPeer`), serves the tracking receivers and answers whether a
+    // carried start was applied, in every gate state; the gate itself is what
+    // `billable:switch` says.
+    tags.push(BILLABLE_TRACKING_CARRY_CAPABILITY);
   }
   if (state.mode === "on") tags.push(BILLABLE_SWITCH_CAPABILITY);
   if (state.mode === "closed") tags.push(BILLABLE_SWITCH_CLOSED_CAPABILITY);
@@ -158,8 +162,8 @@ export function billableSwitchCapabilityTags(
 
 /**
  * A path whose segments name a route behind the billable gate (#6646's switch,
- * #6779's billing categories). Whole segments only, so #6586's
- * `/api/billable-time/...` never matches.
+ * #6779's billing categories, #6778's tracking record). Whole segments only, so
+ * #6586's `/api/billable-time/...` never matches.
  */
 export function isBillableSwitchRoutePath(path: string): boolean {
   return path.split("/").some(
@@ -168,6 +172,8 @@ export function isBillableSwitchRoutePath(path: string): boolean {
       seg === "billable-switch" ||
       seg === "bulk-billable-keep" ||
       // #6779: the billing-category routes and receivers, behind the same gate.
-      seg === "billing-categories"
+      seg === "billing-categories" ||
+      // #6778 PR-C: the tracking record's routes and receivers (7.2).
+      seg === "tracking"
   );
 }

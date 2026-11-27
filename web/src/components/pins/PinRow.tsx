@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { memo, useCallback, type CSSProperties, type ReactNode } from "react";
-import { Check, Star, X } from "lucide-react";
+import { Check, PenLine, Star, X } from "lucide-react";
 import { isReservedPinKey } from "@hapi/protocol";
 import { tokens } from "@/design/tokens";
 import { FadeTruncate } from "@/components/session/FadeTruncate";
@@ -33,7 +33,11 @@ import {
   stepsSent,
   type PinViewModel,
 } from "@/lib/pins/ledger";
-import { useStagedPin, useStepTicks } from "@/lib/pins/staging";
+import {
+  hasChosenWriteIn,
+  useStagedPin,
+  useStepTicks,
+} from "@/lib/pins/staging";
 
 // Mockup v6 :144-169, with the session list's 32px chevron box (the issue
 // names it; the mockup drew 26px). #6555: 32px, because the pin's box adds a
@@ -52,6 +56,17 @@ const NEW_DOT: CSSProperties = {
   backgroundColor: "var(--view-accent-pins)",
 };
 const CHECK_ICON: CSSProperties = { width: "10px", height: "10px" };
+/** #6803: how much of a write-in the row's tooltip shows. */
+const WORDS_TOOLTIP_MAX = 80;
+
+/** #6803: the first line of `text`, cut with an ellipsis when it goes on. */
+function oneLine(text: string): string {
+  const trimmed = text.trim();
+  const first = trimmed.split(/\r?\n/, 1)[0] ?? "";
+  const cut = first.length > WORDS_TOOLTIP_MAX;
+  const shown = cut ? first.slice(0, WORDS_TOOLTIP_MAX - 1) : first;
+  return cut || shown.length < trimmed.length ? `${shown.trimEnd()}…` : shown;
+}
 const STALE_STYLE: CSSProperties = {
   ...PILL_STYLE,
   boxShadow: "0 0 0 1.5px var(--status-warn)",
@@ -135,6 +150,24 @@ function AnswerPill(props: { model: PinViewModel; armed: boolean }) {
         style={stale ? STALE_STYLE : PILL_STYLE}
       >
         <OptionIdText id={staged.choice} />
+        <Check style={CHECK_ICON} aria-hidden />
+      </PinIndicator>
+    );
+  }
+  if (staged && hasChosenWriteIn(staged)) {
+    // #6803: the operator's own answer, cut to one line in the tooltip.
+    return (
+      <PinIndicator
+        armed={armed}
+        label={
+          stale
+            ? `You wrote your own answer on revision ${staged.rev}; this pin is now revision ${pin.revision}`
+            : `Your answer: ${oneLine(staged.writeIn ?? "")}`
+        }
+        className={`${PILL_CLASS} ${FILLED}`}
+        style={stale ? STALE_STYLE : PILL_STYLE}
+      >
+        <PenLine style={CHECK_ICON} aria-hidden />
         <Check style={CHECK_ICON} aria-hidden />
       </PinIndicator>
     );

@@ -33,6 +33,8 @@ import {
   updateSessionUiCollapseState,
   updateSessionBranchInfo,
   updateSessionParentRelationship,
+  setManagerStamp,
+  type ManagerStampWrite,
   getChildBranchCount,
   getChildBranchCounts,
   dissolveChildSessions,
@@ -311,6 +313,15 @@ export class SessionStore {
       parentRelationship,
       namespace
     );
+  }
+
+  /** Issue #6918: write the set-once manager stamp. See store fn docs. */
+  setManagerStamp(
+    id: string,
+    stamp: ManagerStampWrite,
+    namespace: string
+  ): boolean {
+    return setManagerStamp(this.db, id, stamp, namespace);
   }
 
   getChildBranchCount(parentSessionId: string): number {

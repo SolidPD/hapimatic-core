@@ -10,9 +10,12 @@ import {
   PinDeadlineRequestSchema,
   PinMutationResponseSchema,
   PinStarRequestSchema,
+  PIN_LEGACY_NOTE_MAX_CHARS,
+  PIN_SUBMISSION_NOTE_MAX_CHARS,
   PIN_SUBMISSION_REQUEST_MAX_BYTES,
   PinSubmissionRequestSchema,
   PinSubmissionResponseSchema,
+  type PinSubmissionRequest,
 } from "@hapi/protocol";
 
 import { cataloged } from "../../capabilities/cataloged";
@@ -20,6 +23,7 @@ import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { SessionService } from "../../services/sessionService";
 import type { PinSessionRef, PinService } from "../../sync/pinService";
+import { hubNoteMax } from "../../sync/pinById";
 import {
   browserOrHostTimeZone,
   submitPinAnswers,
@@ -41,27 +45,120 @@ import {
   pinWriteResponse,
   proxiedPinResponse,
   readPinBody,
+  PIN_SUPERSEDE_MISSING_ROUTE,
+  pinActionResponse,
   refuseAgentPinAnswers,
+  refuseAgentPinReopen,
+  refuseAgentPinStar,
+  reopenPin,
   refuseAgentPinDeadline,
   refuseSelfPinAction,
   withPinErrors,
 } from "./pinRouteHelpers";
 
 /**
- * #6539: the peer's Submit schema predates dismissals. Its strict entry schema
- * refuses the unknown field before its own rules run, so the 400 reads
- * `entries.0: Unrecognized key: "dismiss"`; nothing was sent. Matched on that
- * text and nothing looser, so any other 400 passes through unchanged.
+ * The Submit request's fields a peer may predate, each added as its own
+ * optional extension: `dismiss` (#6539) and `writeIn` (#6803). Ruling 1A's
+ * follow-up (#6889) adds one name here.
  */
-function isPeerWithoutDismiss(result: {
-  status: number;
-  message: string;
-}): boolean {
-  return (
-    result.status === 400 &&
-    result.message.includes("Unrecognized key") &&
-    result.message.includes('"dismiss"')
-  );
+const PEER_OPTIONAL_FIELDS = ["dismiss", "writeIn"] as const;
+type PeerOptionalField = (typeof PEER_OPTIONAL_FIELDS)[number];
+/** #6969 (D2): a peer's refusal, a field it predates or a note past its 2,048. */
+type PeerRefusal = PeerOptionalField | "longNote";
+
+/**
+ * #6539, #6803: the fields of this request a peer refused because it predates
+ * them. Its strict entry schema refuses an unknown field before its own rules
+ * run, so the 400 reads `entries.0: Unrecognized key: "writeIn"`, and
+ * `describePinIssues` joins every entry's issue; nothing was sent. Matched on
+ * that text and on fields the request carries, nothing looser, so any other
+ * 400 passes through unchanged. A node older than both is stripped in one round.
+ * #6969 (D2): a node before #6969 refuses a note over 2,048 on its path
+ * (`entries.0.note: …`), matched by that path, not its wording, and only when
+ * the request carries such a note.
+ */
+function peerRefusedFields(
+  result: { status: number; message: string },
+  request: PinSubmissionRequest
+): PeerRefusal[] {
+  if (result.status !== 400) return [];
+  const refused: PeerRefusal[] = result.message.includes("Unrecognized key")
+    ? PEER_OPTIONAL_FIELDS.filter(
+        field =>
+          result.message.includes(`"${field}"`) &&
+          request.entries.some(entry => entry[field] !== undefined)
+      )
+    : [];
+  if (
+    /(^|; )entries\.\d+\.note: /.test(result.message) &&
+    request.entries.some(
+      entry => (entry.note?.length ?? 0) > PIN_LEGACY_NOTE_MAX_CHARS
+    )
+  ) {
+    refused.push("longNote");
+  }
+  return refused;
+}
+
+/**
+ * #6969 (review F1): a proxied list or pin read states the peer's note limit
+ * capped at this hub's own (`hubNoteMax`). The parsed body is a fresh object,
+ * so it is changed in place before it is sent.
+ */
+function capStatedNoteMax(data: { noteMaxChars?: number }): void {
+  if (data.noteMaxChars !== undefined) {
+    data.noteMaxChars = hubNoteMax(data.noteMaxChars);
+  }
+}
+
+const REFUSAL_WORDS: Record<PeerRefusal, string> = {
+  dismiss: "dismissals",
+  writeIn: "your own answers",
+  longNote: `notes over ${PIN_LEGACY_NOTE_MAX_CHARS.toLocaleString("en-US")} characters`,
+};
+
+/** "a", "a or b", "a, b, or c" (Oxford comma). */
+function eitherOf(words: readonly string[]): string {
+  if (words.length < 3) return words.join(" or ");
+  return `${words.slice(0, -1).join(", ")}, or ${words.at(-1)}`;
+}
+
+/**
+ * The 501 for a peer that refused `fields`. A refusal of dismissals alone keeps
+ * #6539's body byte for byte, so an older web client still reads it; any other
+ * lists what was refused, so the dialog holds back every entry that carries one.
+ * #6969: a refusal holding long notes says the limit they passed.
+ */
+function refusedFieldsBody(fields: readonly PeerRefusal[]): {
+  error: string;
+  code:
+    | "pin_dismiss_unsupported"
+    | "pin_writein_unsupported"
+    | "pin_long_note_unsupported";
+  unsupported?: PeerRefusal[];
+  maxNoteChars?: number;
+} {
+  const dismiss = fields.includes("dismiss");
+  const writeIn = fields.includes("writeIn");
+  const longNote = fields.includes("longNote");
+  if (dismiss && !writeIn && !longNote) {
+    return {
+      error: "The session's node cannot receive dismissals yet",
+      code: "pin_dismiss_unsupported",
+    };
+  }
+  return {
+    error: `The session's node cannot receive ${eitherOf(
+      fields.map(field => REFUSAL_WORDS[field])
+    )} yet`,
+    code: dismiss
+      ? "pin_dismiss_unsupported"
+      : writeIn
+        ? "pin_writein_unsupported"
+        : "pin_long_note_unsupported",
+    unsupported: [...fields],
+    ...(longNote ? { maxNoteChars: PIN_LEGACY_NOTE_MAX_CHARS } : {}),
+  };
 }
 
 /**
@@ -261,6 +358,8 @@ export function createPinsRoutes(
               target.pins.list(target.session.id, query.data)
             ),
             timeZone: await getPreferenceTimeZone(),
+            // #6969 (D2): this node owns the session, so its limit is the one.
+            noteMaxChars: PIN_SUBMISSION_NOTE_MAX_CHARS,
           });
         }
         const params = new URLSearchParams({
@@ -283,7 +382,12 @@ export function createPinsRoutes(
             peerUnsupported: true,
           });
         }
-        return proxiedPinResponse(c, result, PinListResponseSchema);
+        return proxiedPinResponse(
+          c,
+          result,
+          PinListResponseSchema,
+          capStatedNoteMax
+        );
       })
   );
 
@@ -319,6 +423,7 @@ export function createPinsRoutes(
             ? c.json({
                 ...withRequestLive(target.record, found),
                 timeZone: await getPreferenceTimeZone(),
+                noteMaxChars: PIN_SUBMISSION_NOTE_MAX_CHARS,
               })
             : c.json({ error: "Pin not found" }, 404);
         }
@@ -328,7 +433,12 @@ export function createPinsRoutes(
           "GET",
           c.get("namespace")
         );
-        return proxiedPinResponse(c, result, PinGetResponseSchema);
+        return proxiedPinResponse(
+          c,
+          result,
+          PinGetResponseSchema,
+          capStatedNoteMax
+        );
       })
   );
 
@@ -356,6 +466,9 @@ export function createPinsRoutes(
     writeLimiter,
     c =>
       withPinErrors(c, errorLogger, "pins-star", async () => {
+        // #6456 (R8): only the operator stars, before any proxy.
+        const agentStar = refuseAgentPinStar(c);
+        if (agentStar) return agentStar;
         const read = await readPinBody(c);
         if (!read.ok) return read.response;
         const body = PinStarRequestSchema.safeParse(read.body);
@@ -543,6 +656,53 @@ export function createPinsRoutes(
   );
 
   app.post(
+    "/sessions/:id/pins/:key/reopen",
+    cataloged(
+      defineCapability({
+        id: "session-introspection.reopen-pin",
+        domain: "session-introspection",
+        surface: "rest",
+        description:
+          "Put a pin closed as superseded back in Action Items, so it is open again and no agent or Project Manager can close it as superseded again. Only the operator reopens; a session cannot.",
+        whenToUse:
+          "When the user taps Reopen on a superseded pin in the Completed list.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/sessions/:id/pins/:key/reopen",
+        },
+        auth: "jwt",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    gate,
+    writeLimiter,
+    c =>
+      withPinErrors(c, errorLogger, "pins-reopen", async () => {
+        const agentReopen = refuseAgentPinReopen(c);
+        if (agentReopen) return agentReopen;
+        const target = resolveTarget(c);
+        if (target.kind === "response") return target.response;
+        const key = c.req.param("key");
+        if (target.kind === "local") {
+          return pinActionResponse(
+            c,
+            reopenPin(target.pins, target.session, key)
+          );
+        }
+        return proxyWrite(
+          c,
+          target.service,
+          pinPath(key, "/reopen"),
+          "POST",
+          undefined,
+          PIN_SUPERSEDE_MISSING_ROUTE
+        );
+      })
+  );
+
+  app.post(
     "/sessions/:id/pins/:key/save",
     cataloged(
       defineCapability({
@@ -659,21 +819,14 @@ export function createPinsRoutes(
             501
           );
         }
-        // #6539: a peer that predates dismissals refuses the field, so nothing
-        // was sent. Say so plainly: the dialog then offers to send the other
-        // answers and keeps the dismissals staged.
-        if (
-          result.type === "error" &&
-          body.data.entries.some(entry => entry.dismiss === true) &&
-          isPeerWithoutDismiss(result)
-        ) {
-          return c.json(
-            {
-              error: "The session's node cannot receive dismissals yet",
-              code: "pin_dismiss_unsupported",
-            },
-            501
-          );
+        // #6539, #6803, #6969: a peer that predates dismissals, write-ins, or
+        // long notes refuses them, so nothing was sent. Say so plainly, in one 501: the
+        // dialog then offers to send the other answers and keeps the refused
+        // ones staged.
+        const refused =
+          result.type === "error" ? peerRefusedFields(result, body.data) : [];
+        if (refused.length > 0) {
+          return c.json(refusedFieldsBody(refused), 501);
         }
         return proxiedPinResponse(
           c,

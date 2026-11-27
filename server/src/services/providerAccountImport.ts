@@ -122,10 +122,14 @@ export interface GeminiVaultEntry {
 }
 
 export interface ProviderAccountImportDeps {
-  /** Machine-global account-configs dir (parent of `<pk>/codex/`). */
-  accountConfigsDir: string;
-  /** Host codex home (`$CODEX_HOME` || `~/.codex`). */
-  hostCodexHome: string;
+  /**
+   * Machine-global account-configs dir (parent of `<pk>/codex/`). `null` skips the
+   * per-account codex dirs: a test instance imports nothing from the shared folders
+   * (#6756, R4).
+   */
+  accountConfigsDir: string | null;
+  /** Host codex home (`$CODEX_HOME` || `~/.codex`); `null` skips the host login (#6756). */
+  hostCodexHome: string | null;
   /** True when a stored record already exists for this PK (idempotency gate). */
   hasRecord: (pk: string) => boolean;
   /** Persist one new record (writes the per-account file + index). */
@@ -160,10 +164,11 @@ export function importProviderAccounts(
   };
 
   // ── OpenAI: per-account codex dirs (source:"account") ──────────────────────
-  if (existsSync(deps.accountConfigsDir)) {
+  if (deps.accountConfigsDir !== null && existsSync(deps.accountConfigsDir)) {
+    const accountConfigsDir = deps.accountConfigsDir;
     let pks: string[] = [];
     try {
-      pks = readdirSync(deps.accountConfigsDir, { withFileTypes: true })
+      pks = readdirSync(accountConfigsDir, { withFileTypes: true })
         .filter(d => d.isDirectory())
         .map(d => d.name);
     } catch {
@@ -172,13 +177,13 @@ export function importProviderAccounts(
     for (const pk of pks) {
       // PK is the dir name #3807 created — must be a canonical UUID (path gate).
       if (!UUID_REGEX.test(pk)) continue;
-      const codexHome = join(deps.accountConfigsDir, pk, "codex");
+      const codexHome = join(accountConfigsDir, pk, "codex");
       if (!existsSync(codexHome)) continue;
       if (deps.hasRecord(pk)) {
         result.skipped++;
         continue;
       }
-      const sidecar = readSidecar(deps.accountConfigsDir, pk);
+      const sidecar = readSidecar(accountConfigsDir, pk);
       // authMode: sidecar first (#3807's authoritative record), else codex auth.json.
       const auth = readCodexAuth(codexHome);
       const authMode =
@@ -208,10 +213,11 @@ export function importProviderAccounts(
   // ── OpenAI: the host ~/.codex login (source:"host") ────────────────────────
   // A REFERENCE to the host dir — no credential copied. Skipped when auth.json is
   // absent (keyring storage → a synthetic non-store row) or carries no account id.
-  const hostAuth = readCodexAuth(deps.hostCodexHome);
+  const hostCodexHome = deps.hostCodexHome;
+  const hostAuth = hostCodexHome === null ? null : readCodexAuth(hostCodexHome);
   const hostAuthMode = toStoredAuthMode(hostAuth?.auth_mode);
   const hostAccountId = hostAuth?.tokens?.account_id;
-  if (hostAuth && hostAuthMode && hostAccountId) {
+  if (hostCodexHome !== null && hostAuth && hostAuthMode && hostAccountId) {
     const pk = openAiPk(hostAccountId);
     if (!deps.hasRecord(pk)) {
       const record: OpenAiStoredAccount = {
@@ -220,7 +226,7 @@ export function importProviderAccounts(
         accountUuid: pk,
         label: "Host ChatGPT login",
         authMode: hostAuthMode,
-        codexHome: deps.hostCodexHome,
+        codexHome: hostCodexHome,
         capturedAt: now(),
         lastUsedAt: 0,
       };

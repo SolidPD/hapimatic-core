@@ -17,6 +17,10 @@ import { createQueueMutationRoutes } from "./queueMutations";
 import { createPinMutationRoutes } from "./pinMutations";
 import { createBillableSwitchReceiverRoutes } from "./billableSwitchReceivers";
 import { createBillableSwitchEventFeedRoutes } from "./billableSwitchEventFeed";
+import {
+  createBillableTrackingReceiverRoutes,
+  type TrackingReceiverDeps,
+} from "./billableTrackingReceivers";
 import { createFederationAccountRoutes } from "./accounts";
 import { createFederationAccountHealthRoutes } from "./accountHealth";
 import { createFederationAnthropicLoginRoutes } from "./anthropicLogin";
@@ -38,7 +42,10 @@ import { createFederationPinDashboardRoutes } from "./pinDashboards";
 
 export type { FederationDeps } from "./shared";
 
-export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
+/** `getStore` (#6778 PR-C): the tracking receivers read the record from it. */
+export function createFederationRoutes(
+  deps: FederationDeps & TrackingReceiverDeps
+): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   app.route("/", createInfrastructureRoutes(deps));
   app.route("/", createSessionMutationRoutes(deps));
@@ -65,6 +72,9 @@ export function createFederationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
   // Issue #6646: billable switch receivers, the owning node's half of a proxied
   // switch, confirm, history or header write, the list read and the report push.
   app.route("/", createBillableSwitchReceiverRoutes(deps));
+  // Issue #6778 PR-C (Task 14): the tracking record's receivers, the owning
+  // node's half of a proxied tracking read, write or history read.
+  app.route("/", createBillableTrackingReceiverRoutes(deps));
   // Issue #6646 (Task 7b): the record's replication feed for other nodes' pullers.
   app.route("/", createBillableSwitchEventFeedRoutes(deps));
   // Issue #6779: the billing hub's two receivers (its list and its lookup).

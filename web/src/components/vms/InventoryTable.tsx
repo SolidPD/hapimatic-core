@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { Fragment, type ReactNode, useState } from "react";
 import type {
+  FleetParityVerdict,
   VmInventoryEntry,
   VmInventoryVerdict,
   VmParityHub,
@@ -8,7 +9,12 @@ import type {
 } from "@hapi/protocol/adminVms";
 import type { ApiClient } from "@/api/client";
 import { DeprovisionDialog } from "@/components/vms/DeprovisionDialog";
+import {
+  FleetParityChip,
+  FleetParityStaleChip,
+} from "@/components/vms/FleetParityTable";
 import { Button } from "@/components/ui/button";
+import { HoverTooltip } from "@/components/ui/tooltip";
 import { formatRelativeTime } from "@/lib/sessionHelpers";
 
 const VM_PARITY_BADGE_BASE =
@@ -16,8 +22,6 @@ const VM_PARITY_BADGE_BASE =
 const VM_PARITY_OK = "border-emerald-500/40 bg-emerald-500/10 text-emerald-300";
 const VM_PARITY_BAD = "border-red-500/40 bg-red-500/10 text-red-300";
 const VM_PARITY_WARN = "border-amber-500/40 bg-amber-500/10 text-amber-300";
-const VM_PARITY_NEUTRAL =
-  "border-[var(--app-border)] bg-[var(--app-secondary-bg)] text-[var(--app-hint)]";
 
 /**
  * The verdict badge for a recorded parity status. Exhaustive over Sub F's
@@ -29,11 +33,7 @@ function vmParityBadge(
 ): { label: string; className: string } {
   switch (vmParity.verdict) {
     case "pass":
-      // A stale pass is not current evidence of parity — never green.
-      return {
-        label: "Pass",
-        className: vmParity.stale ? VM_PARITY_NEUTRAL : VM_PARITY_OK,
-      };
+      return { label: "Pass", className: VM_PARITY_OK };
     case "drift":
       return { label: `Drift (${vmParity.drift})`, className: VM_PARITY_BAD };
     case "error":
@@ -44,26 +44,33 @@ function vmParityBadge(
 }
 
 /**
- * The parity cell (#3557, epic #3550 Sub G1): one VM's Sub F parity status as
- * the server projected it. `data-vm-parity-state` names the state the operator
- * should act on — `stale` outranks the verdict, because a stale pass is not
- * evidence of parity. A VM with no `vmParity` has no status file: never checked.
+ * The file-manifest cell for RP1's own record (#3996). RP1's file-manifest check
+ * runs by hand only (#6300 F39), so most of the time there is no record or an old
+ * one: both read "Not run", with no amber chip. A fresh record shows its verdict.
  */
-function VmParityCell(props: {
+function HubParityCell(props: {
   name: string;
   vmParity: VmParitySummary | undefined;
 }) {
   const { name, vmParity } = props;
   const testId = `inventory-vm-parity-${name}`;
 
-  if (!vmParity) {
+  if (!vmParity || (vmParity.state === "recorded" && vmParity.stale)) {
     return (
       <td
         className="py-2 pr-3 text-[var(--app-hint)]"
         data-testid={testId}
-        data-vm-parity-state="never-checked"
+        data-vm-parity-state="not-run"
       >
-        Never checked
+        <HoverTooltip
+          content={
+            vmParity?.state === "recorded"
+              ? `Last run ${vmParity.checkedAt}; it runs by hand only`
+              : "It runs by hand only"
+          }
+        >
+          <span>Not run</span>
+        </HoverTooltip>
       </td>
     );
   }
@@ -92,7 +99,7 @@ function VmParityCell(props: {
     <td
       className="py-2 pr-3"
       data-testid={testId}
-      data-vm-parity-state={vmParity.stale ? "stale" : vmParity.verdict}
+      data-vm-parity-state={vmParity.verdict}
     >
       <div className="flex flex-wrap items-center gap-1">
         <span
@@ -101,11 +108,6 @@ function VmParityCell(props: {
         >
           {badge.label}
         </span>
-        {vmParity.stale && (
-          <span className={`${VM_PARITY_BADGE_BASE} ${VM_PARITY_WARN}`}>
-            Stale
-          </span>
-        )}
       </div>
       {checkedAgo && (
         <div
@@ -115,6 +117,62 @@ function VmParityCell(props: {
           {checkedAgo}
         </div>
       )}
+    </td>
+  );
+}
+
+/**
+ * The fleet row's parity cell (#6300 PR-4): the VM's state chip from RP1's
+ * nightly fleet parity verdict. The file manifest's "Drift (N)" is gone from the
+ * fleet rows; `data-fleet-parity-state` names what the cell shows. A stale
+ * verdict keeps the state and adds the "Stale" chip, and a stale pass is
+ * never green: it is not current evidence of parity.
+ */
+function FleetParityCell(props: {
+  name: string;
+  verdict: FleetParityVerdict | undefined;
+}) {
+  const { name, verdict } = props;
+  const testId = `inventory-vm-parity-${name}`;
+  const node =
+    verdict?.state === "ok"
+      ? verdict.nodes.find(n => n.name === name)
+      : undefined;
+  if (node) {
+    const stale = verdict?.state === "ok" && verdict.stale;
+    return (
+      <td
+        className="py-2 pr-3"
+        data-testid={testId}
+        data-fleet-parity-state={node.state}
+        data-fleet-parity-stale={stale ? "true" : undefined}
+      >
+        <div className="flex flex-wrap items-center gap-1">
+          <FleetParityChip state={node.state} stale={stale} />
+          {stale && <FleetParityStaleChip />}
+        </div>
+      </td>
+    );
+  }
+  const [label, title, state] =
+    verdict?.state === "ok"
+      ? [
+          "Not in verdict",
+          "RP1's last fleet parity verdict does not list this VM",
+          "not-in-verdict",
+        ]
+      : verdict?.state === "unreadable"
+        ? ["Unreadable", "The fleet parity verdict is unreadable", "unreadable"]
+        : ["—", "No fleet parity verdict on this instance", "none"];
+  return (
+    <td
+      className="py-2 pr-3 text-[var(--app-hint)]"
+      data-testid={testId}
+      data-fleet-parity-state={state}
+    >
+      <HoverTooltip content={title}>
+        <span>{label}</span>
+      </HoverTooltip>
     </td>
   );
 }
@@ -136,7 +194,7 @@ export function ParityHubTable(props: {
   return (
     <div data-testid="parity-hub" className="pb-3">
       <h2 className="flex items-center gap-2 pb-1 text-xs font-semibold uppercase tracking-wide text-[var(--app-hint)]">
-        RP1 (hub)
+        File manifest: RP1 against the declared profile
       </h2>
       {isError && (
         <p
@@ -176,7 +234,7 @@ export function ParityHubTable(props: {
                   Profile source node, checked against the declared profile
                   (never repaired)
                 </td>
-                <VmParityCell
+                <HubParityCell
                   name={`hub-${hub.name}`}
                   vmParity={hub.vmParity}
                 />
@@ -215,6 +273,8 @@ export function InventoryTable(props: {
    * non-empty `entries` — rendered as its own DISTINCT state, never a blank panel.
    */
   verdict?: VmInventoryVerdict | null;
+  /** #6300 PR-4: RP1's fleet parity verdict, for each VM's parity chip. */
+  fleetParity?: FleetParityVerdict;
   renderRowExtra?: (entry: VmInventoryEntry) => ReactNode;
   onDeprovisionApplied?: (jobId: string) => void;
 }) {
@@ -224,6 +284,7 @@ export function InventoryTable(props: {
     isLoading,
     isError,
     verdict,
+    fleetParity,
     renderRowExtra,
     onDeprovisionApplied,
   } = props;
@@ -336,9 +397,9 @@ export function InventoryTable(props: {
                       >
                         —
                       </td>
-                      <VmParityCell
+                      <FleetParityCell
                         name={entry.name}
-                        vmParity={entry.vmParity}
+                        verdict={fleetParity}
                       />
                       <td className="py-2 text-right">
                         <div className="flex items-center justify-end gap-1.5">

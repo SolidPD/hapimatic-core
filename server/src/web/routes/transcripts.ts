@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { buildBillableSwitchStart } from "./agentEscalation";
+import { buildBillableSwitchStart, inheritStartClaim } from "./agentEscalation";
 import type { BillableSwitchStartContext } from "@hapi/protocol";
 import { Hono, type Context } from "hono";
 import {
@@ -654,19 +654,26 @@ export function createTranscriptRoutes(
         );
       }
 
+      const localNodeId = engine.getBillableSwitchService?.()?.localNodeId();
       const result = await resumeTranscript(
         engine,
         namespace,
         row,
         body.data.directory,
-        // Issue #6646: a person resuming from the Transcripts page is asked
-        // nothing and sends no choice, so the start is `unattended` (CLI-1).
-        buildBillableSwitchStart(
-          c,
-          engine,
-          {},
-          engine.getBillableSwitchService?.()?.localNodeId()
-        )
+        // #6778 PR-C (Task 15b; section 5 rows 11a and 11b): a resume of a
+        // transcript that names a session starts `inherit` from it by the branch
+        // rule (a person's in the app keeps its confirm state, any other waits);
+        // a deleted session copies nothing (row 7). A reconnect keeps the tag,
+        // so only a resume that spawns a new row applies it. A transcript that
+        // names no session keeps the request's kind (#6646: `unattended` for a
+        // person, who is asked nothing).
+        row.hapiSessionId
+          ? {
+              ...inheritStartClaim(c, engine, localNodeId),
+              kind: "inherit",
+              fromSessionId: row.hapiSessionId,
+            }
+          : buildBillableSwitchStart(c, engine, {}, localNodeId)
       );
       if ("status" in result) {
         return c.json(

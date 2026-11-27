@@ -33,6 +33,7 @@ import {
   useMarkPinSeen,
   usePinByIdLookup,
   usePins,
+  useReopenPin,
   useStarPin,
 } from "@/hooks/queries/usePins";
 import { usePinsViewDefaults } from "@/hooks/usePinsViewDefaults";
@@ -80,6 +81,10 @@ export const PinsList = memo(function PinsList(props: {
   expandedKeys: ReadonlySet<string>;
   onExpandedChange: (key: string, expanded: boolean) => void;
   onStar: (key: string, starred: boolean) => void;
+  /** #6456 (R8): the operator's Reopen on a superseded pin. */
+  onReopen?: (key: string) => Promise<unknown>;
+  /** #6456 (R10): find the settling pin by its ID in the search. */
+  onFindPin?: (pinId: string) => void;
   openSections: Readonly<Record<string, boolean>>;
   onToggleSection: (id: string) => void;
   now: number;
@@ -140,6 +145,8 @@ export const PinsList = memo(function PinsList(props: {
                     armed={armed.has(model.pin.key)}
                     onToggle={toggleRow}
                     observe={observe}
+                    onReopen={props.onReopen}
+                    onFindPin={props.onFindPin}
                   />
                 ))
               ) : (
@@ -191,12 +198,17 @@ export function PinsView(props: {
   const { api, sessionId, scrollRoot, revealKey, onRevealConsumed } = props;
   const query = usePins(api, sessionId, props.enabled);
   const starPin = useStarPin(api, sessionId);
+  // #6456: Reopen, and the settling pin's ID as a link into the search.
+  const { reopen: reopenPin } = useReopenPin(api, sessionId);
   const markSeen = useMarkPinSeen(api, sessionId);
   const now = useMinuteClock();
   const deadlineOf = usePinDeadlineOf();
   const listZone =
     query.data?.kind === "ready" ? (query.data.timeZone ?? null) : null;
   const zone = useMemo(() => resolvePinZone(listZone), [listZone]);
+  // #6969 (D2): the session's note limit, from the same list.
+  const noteMaxChars =
+    query.data?.kind === "ready" ? query.data.noteMaxChars : undefined;
   const { defaults } = usePinsViewDefaults(api);
   const { view, actions } = usePinsViewState(sessionId, defaults);
   // D's staging is read unconditionally (hooks), but it feeds the view only
@@ -374,8 +386,9 @@ export function PinsView(props: {
       markSeen,
       via: "pins",
       timeZone: zone,
+      noteMaxChars,
     }),
-    [api, sessionId, props.sessionActive, markSeen, zone]
+    [api, sessionId, props.sessionActive, markSeen, zone, noteMaxChars]
   );
 
   const clearAll = useCallback(() => {
@@ -472,6 +485,8 @@ export function PinsView(props: {
             expandedKeys={expanded}
             onExpandedChange={onExpandedChange}
             onStar={starPin}
+            onReopen={reopenPin}
+            onFindPin={setSearch}
             openSections={openSections}
             onToggleSection={onToggleSection}
             now={now}

@@ -2,6 +2,7 @@
 import type {
   Pin,
   PinChange,
+  PinClosure,
   PinContent,
   PinNotSavedFile,
   PinStatus,
@@ -22,6 +23,15 @@ import type {
   PinTurnCandidate,
   PinUpsertOptions,
 } from "../store/pinStore";
+import type { OpenDetectedPin, PinDetectedLink } from "../store/pinClosures";
+
+/** #6456: the Detected key prefix (`DETECTED_PIN_PREFIX`, pinTurnCheck.ts). */
+const DETECTED_PREFIX = "detected:";
+
+/** #6456: a reserved key, which only the server writes. */
+function isServerKey(key: string): boolean {
+  return key.startsWith(DETECTED_PREFIX) || key.startsWith("prompt:");
+}
 
 /** What a write needs of the session: the row key and the event's audience. */
 export type PinSessionRef = { id: string; namespace: string };
@@ -37,7 +47,10 @@ export type PinWriteResult = {
 };
 
 export type PinUpsertResult =
-  | PinWriteResult
+  | (PinWriteResult & {
+      /** #6456 (R9): the session's open pins this create replaced. */
+      superseded?: Pin[];
+    })
   | { closed: Pin; openPinCount: number }
   | { missing: true }
   | { capped: "open" | "total" };
@@ -168,11 +181,13 @@ export class PinService {
     content: PinContent,
     options: Pick<
       PinUpsertOptions,
-      "reopen" | "mustExist" | "anchor" | "now"
+      "reopen" | "mustExist" | "anchor" | "detectedCodes" | "now"
     > = {}
   ): PinUpsertResult {
     const outcome = this.store.upsert(session.id, content, {
       ...options,
+      // #6456: codes belong to a Detected pin only; an agent's write never sets them.
+      ...(isServerKey(content.key) ? {} : { detectedCodes: undefined }),
       postedSeq: this.getMaxSeq(session.id),
     });
     if ("missing" in outcome || "capped" in outcome) return outcome;
@@ -182,11 +197,165 @@ export class PinService {
         openPinCount: this.store.countOpen(session.id),
       };
     }
-    return this.settle(
+    const result = this.settle(
       session,
       { pin: outcome.pin, changed: outcome.change !== null },
       outcome.change ?? "updated"
     ) as PinWriteResult;
+    // #6456 (R9): each pin this create replaced closed in its transaction; it is
+    // published here, after the new pin, so a client sees the replacement first.
+    const superseded = outcome.superseded ?? [];
+    let openPinCount = result.openPinCount;
+    for (const pin of superseded) {
+      openPinCount = this.publish(session, pin, "withdrawn");
+    }
+    // #6456 (R4): an agent's create or revise may link the session's open
+    // Detected pins. A link closes nothing now; the follow service closes a
+    // Detected pin once every pin linked to it is settled.
+    if (outcome.change !== null && !isServerKey(content.key)) {
+      this.linkDetected(session, outcome.pin, options.now ?? Date.now());
+    }
+    return superseded.length > 0
+      ? { ...result, openPinCount, superseded }
+      : { ...result, openPinCount };
+  }
+
+  /**
+   * #6456 (R4): record the links an agent pin makes to the session's open
+   * Detected pins: the agent's own, for each such pin its `repeats` names; and the
+   * server's, for each Detected pin whose every stored answer-key code is an option
+   * ID of the session's open agent pins. Runs only when the session has an open
+   * Detected pin. A pin ID naming the pin itself, or a pin of another session, is
+   * ignored. Never compares titles or text.
+   */
+  private linkDetected(session: PinSessionRef, pin: Pin, now: number): void {
+    if (
+      this.store.listKeysByPrefix(session.id, DETECTED_PREFIX, "open")
+        .length === 0
+    ) {
+      return;
+    }
+    const at = new Date(now).toISOString();
+    if (pin.pinId) {
+      for (const named of pin.repeats ?? []) {
+        if (named === pin.pinId) continue;
+        const target = this.store.getByPinId(named);
+        if (
+          !target ||
+          target.sessionId !== session.id ||
+          !target.key.startsWith(DETECTED_PREFIX) ||
+          target.status !== "open"
+        ) {
+          continue;
+        }
+        this.store.closures.addDetectedLinks(session.id, target.key, [
+          { pinId: pin.pinId, by: "agent", at },
+        ]);
+      }
+    }
+    this.linkCoveredDetected(session, at);
+  }
+
+  /** #6456 (R4, ER6): the server's links from exact answer-key coverage. */
+  private linkCoveredDetected(session: PinSessionRef, at: string): void {
+    const detected = this.store.closures
+      .listOpenDetected(session.id)
+      .filter(d => d.state.codes !== null);
+    if (detected.length === 0) return;
+    const offering = new Map<string, string[]>();
+    for (const candidate of this.store.listTurnCandidates(session.id)) {
+      const agentPin = this.store.get(session.id, candidate.key);
+      if (!agentPin?.pinId) continue;
+      for (const option of agentPin.options ?? []) {
+        const list = offering.get(option.id) ?? [];
+        list.push(agentPin.pinId);
+        offering.set(option.id, list);
+      }
+    }
+    for (const d of detected) {
+      const codes = d.state.codes ?? [];
+      if (codes.length === 0 || !codes.every(code => offering.has(code))) {
+        continue;
+      }
+      const pinIds = [
+        ...new Set(codes.flatMap(code => offering.get(code) ?? [])),
+      ];
+      const links: PinDetectedLink[] = pinIds.map(pinId => ({
+        pinId,
+        by: "server",
+        at,
+      }));
+      this.store.closures.addDetectedLinks(session.id, d.key, links);
+    }
+  }
+
+  /**
+   * #6456 (R1): close an open pin because its ask was settled elsewhere,
+   * published as `withdrawn`. Null for an absent key; no change once closed or
+   * once the operator reopened it.
+   */
+  supersede(
+    session: PinSessionRef,
+    key: string,
+    closure: PinClosure,
+    now?: number
+  ): PinWriteResult | null {
+    return this.settle(
+      session,
+      this.store.closures.supersede(session.id, key, closure, now),
+      "withdrawn"
+    );
+  }
+
+  /**
+   * #6456 (R8): the operator reopens a superseded pin, published as `updated`.
+   * Null for an absent key.
+   */
+  reopen(
+    session: PinSessionRef,
+    key: string,
+    now?: number
+  ):
+    | PinWriteResult
+    | { capped: "open" }
+    | { refused: "not_superseded" }
+    | null {
+    const outcome = this.store.closures.reopen(session.id, key, now);
+    if (!outcome || "capped" in outcome || "refused" in outcome) {
+      return outcome;
+    }
+    return this.settle(session, outcome, "updated") as PinWriteResult;
+  }
+
+  /** #6456: a session's open Detected pins with codes or links. */
+  listOpenDetected(sessionId: string): OpenDetectedPin[] {
+    return this.store.closures.listOpenDetected(sessionId);
+  }
+
+  /** #6456: open copies in other sessions that name one of `pinIds`. */
+  listOpenCopiesNaming(
+    pinIds: readonly string[],
+    excludeSessionId: string
+  ): Array<{ sessionId: string; key: string }> {
+    return this.store.closures.listOpenCopiesNaming(pinIds, excludeSessionId);
+  }
+
+  /** #6456: the pin IDs `pinId` replaced in its session. */
+  listReplacedBy(sessionId: string, pinId: string): string[] {
+    return this.store.closures.listReplacedBy(sessionId, pinId);
+  }
+
+  /** #6456: a page of open pins that carry `repeats`. */
+  listOpenWithRepeats(
+    after: { sessionId: string; key: string } | null,
+    limit: number
+  ): Array<{ sessionId: string; key: string }> {
+    return this.store.closures.listOpenWithRepeats(after, limit);
+  }
+
+  /** #6456: the sessions holding an open Detected pin with codes or links. */
+  listSessionsWithOpenDetected(): string[] {
+    return this.store.closures.listSessionsWithOpenDetected();
   }
 
   /** The agent takes its question back. Null for an absent key. */
@@ -245,9 +414,10 @@ export class PinService {
   listKeysByPrefix(
     sessionId: string,
     prefix: string,
-    status?: PinStatus
+    status?: PinStatus,
+    options?: { notReopened?: boolean }
   ): string[] {
-    return this.store.listKeysByPrefix(sessionId, prefix, status);
+    return this.store.listKeysByPrefix(sessionId, prefix, status, options);
   }
 
   /** Every open pin the agent owns, with its timestamps (#6455). */

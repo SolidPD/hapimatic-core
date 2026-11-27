@@ -11,6 +11,11 @@ import type {
   BackgroundAgentsSnapshot,
   ProviderUsageSnapshotMessage,
 } from "@hapi/protocol/schemas";
+import type {
+  ContextResetArmRequest,
+  ContextResetArmResult,
+  ContextResetResult,
+} from "@hapi/protocol";
 import { z } from "zod";
 import { UsageSchema } from "@/claude/types";
 import type {
@@ -236,6 +241,9 @@ export type CreateMachineResponse = z.infer<typeof CreateMachineResponseSchema>;
 export const MessageMetaSchema = z
   .object({
     sentFrom: z.string().optional(),
+    // Issue #6559 (Task 4): the server's reset flag; read by the context-reset
+    // actuator, which parses it itself (tolerant of any shape here).
+    contextReset: z.unknown().optional(),
     fallbackModel: z.string().nullable().optional(),
     customSystemPrompt: z.string().nullable().optional(),
     appendSystemPrompt: z.string().nullable().optional(),
@@ -341,6 +349,16 @@ export interface ClientToServerEvents {
   // dedup replays (R7). The server allocates the persisted `seq`.
   "turn:open": (data: { sid: string } & TurnOpenPayload) => void;
   "turn:finalize": (data: { sid: string } & TurnFinalizePayload) => void;
+  // Issue #6559 (Task 4): what happened to a flagged message, reported on
+  // confirmation (the server accepts it only from the session's own socket).
+  "context-reset:result": (data: { sid: string } & ContextResetResult) => void;
+  // Issue #6559 (Task 5): the arm tool's request (answered by the ack) and its
+  // withdrawal when no answer came in time.
+  "context-reset:arm": (
+    data: { sid: string } & ContextResetArmRequest,
+    cb: (answer: ContextResetArmResult) => void
+  ) => void;
+  "context-reset:disarm": (data: { sid: string; armId: string }) => void;
   // Issue #3809: OpenAI/codex pacing snapshot carrier (a distinct event on the
   // SAME /cli socket the turn reporter uses — not a parallel channel). The server
   // attributes it to the session's bound account.

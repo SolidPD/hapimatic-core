@@ -40,6 +40,7 @@ import { ThreadFullscreenProvider } from "@/lib/thread-fullscreen-context";
 import { ToastProvider, useToast } from "@/components/Toast";
 import { NotificationListener } from "@/components/NotificationListener";
 import { RemoteSpawnFailedToastListener } from "@/components/RemoteSpawnFailedToastListener";
+import { TrackedStartListener } from "@/components/TrackedStartListener";
 import { ReloginLinkListener } from "@/components/ReloginLinkListener";
 import { SettingsDrawer } from "@/components/SettingsDrawer";
 import { OnboardingHost } from "@/components/onboarding/OnboardingHost";
@@ -579,6 +580,9 @@ export function App() {
           user,
         }}
       >
+        {/* #6780: the read-back after a tracked Create; inside the context
+            because it reads the session's record with `api`. */}
+        <TrackedStartListener />
         <ExtensionHostProvider>
           {/* #3638: lifts SessionChat's full-screen flag up to BrandedFrame so
               the app bar can hide in single-view page mode. */}

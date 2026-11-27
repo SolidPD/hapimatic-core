@@ -46,8 +46,14 @@ import { logger } from "@/ui/logger";
  * - CronCreate (#1460): recurring in-session cron.
  * - ScheduleWakeup (#1256): the /loop dynamic-pacing one-shot wakeup. Same
  *   session-cron machinery (`kind: "loop"`), same failure mode.
+ *
+ * Issue #6559 (Task 4): the context-reset actuator reads the same set to know
+ * whether a conversation has a timer pending, because a reset would cut it.
  */
-const WATCHED_CRON_TOOLS = new Set<string>(["CronCreate", "ScheduleWakeup"]);
+export const WATCHED_CRON_TOOLS: ReadonlySet<string> = new Set<string>([
+  "CronCreate",
+  "ScheduleWakeup",
+]);
 
 /**
  * Per-tool caveat shown as the toast body. Kept <= 120 chars because the web

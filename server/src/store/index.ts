@@ -26,10 +26,12 @@ import { LeaseStore } from "./leaseStore";
 import {
   API_KEY_SHARE_AUDIT_DDL,
   ApiKeyShareAuditStore,
+  widenApiKeySharePurposeCheck,
 } from "./apiKeyShareAuditStore";
 import { FileClaimsStore } from "./fileClaimsStore";
 import { InitiativeStore } from "./initiativeStore";
 import { WatermarkStore } from "./watermarkStore";
+import { ContextResetStore } from "./contextResetStore";
 import { PredictionAccuracyStore } from "./predictionAccuracyStore";
 import { UserStore } from "./userStore";
 import { MidnightResetStateStore } from "./midnightResetStateStore";
@@ -88,6 +90,10 @@ import {
   hasBillingCategoryStorage,
   migrateBillingCategoryTables,
 } from "./billingCategoryStore";
+import {
+  hasTimeEntryStorage,
+  migrateTimeEntryTables,
+} from "./timeEntries/schema";
 import { getConfiguration } from "../configuration";
 import { migrateRunnerIdentityDailyTable } from "./runnerIdentityDaily";
 
@@ -161,6 +167,11 @@ export type {
 export { InitiativeStore } from "./initiativeStore";
 export { WatermarkStore } from "./watermarkStore";
 export type { PersistedWatermarkRow } from "./watermarkStore";
+export { ContextResetStore } from "./contextResetStore";
+export type {
+  ContextResetRequestRow,
+  NewContextResetRequest,
+} from "./contextResetStore";
 export type {
   CreateInitiativeInput,
   ListInitiativesFilter,
@@ -248,6 +259,7 @@ export class Store {
   readonly fileClaims: FileClaimsStore;
   readonly initiatives: InitiativeStore;
   readonly watermark: WatermarkStore;
+  readonly contextReset: ContextResetStore;
   readonly predictionAccuracy: PredictionAccuracyStore;
   readonly midnightResetState: MidnightResetStateStore;
   readonly queuedMessages: QueuedMessageStore;
@@ -305,6 +317,12 @@ export class Store {
    * switch running.
    */
   readonly billingCategoriesReady: boolean;
+  /**
+   * Issue #6204 (3.2): every column of all eleven `time_entr*` tables exists.
+   * Separate from the switch's and the categories' flags: when false this node
+   * keeps no time-entry record and the switch and the categories run on.
+   */
+  readonly timeEntriesReady: boolean;
 
   constructor(dbPath: string) {
     this.dbPath = dbPath;
@@ -359,6 +377,12 @@ export class Store {
         "[Store] Billing categories storage is NOT ready (a billing_categor* table is missing): this node cannot keep the category list; the billable switch is unaffected (#6779)"
       );
     }
+    this.timeEntriesReady = hasTimeEntryStorage(this.db);
+    if (!this.timeEntriesReady) {
+      console.error(
+        "[Store] Time entry storage is NOT ready (a time_entr* table or column is missing): this node keeps no time-entry record; the billable switch and the categories are unaffected (#6204)"
+      );
+    }
 
     // #2447: long-lived-connection first-open form for SQLite's optimize pragma.
     // 0x10002 = run ANALYZE on tables that might benefit (0x00002) + check all
@@ -402,6 +426,7 @@ export class Store {
     this.fileClaims = new FileClaimsStore(this.db);
     this.initiatives = new InitiativeStore(this.db);
     this.watermark = new WatermarkStore(this.db);
+    this.contextReset = new ContextResetStore(this.db);
     this.predictionAccuracy = new PredictionAccuracyStore(this.db);
     this.midnightResetState = new MidnightResetStateStore(this.db);
     this.queuedMessages = new QueuedMessageStore(this.db);
@@ -512,6 +537,11 @@ export class Store {
     this.migrateAddColumn("sessions", "parent_relationship", "TEXT");
     this.migrateAddColumn("sessions", "branch_label", "TEXT");
     this.migrateAddColumn("sessions", "branch_created_at", "INTEGER");
+    // Manager stamp (#6918): set once at spawn by the node holding the parent.
+    // manager_session_id = the nearest project manager above (store uuid) or
+    // NULL; manager_stamp_reason = the decision marker (NULL = undecided).
+    this.migrateAddColumn("sessions", "manager_session_id", "TEXT");
+    this.migrateAddColumn("sessions", "manager_stamp_reason", "TEXT");
 
     // Denormalized user-message counter (#1032): removes the O(messages)
     // json_extract scan from /api/sessions. Maintained by MessageStore.addMessage.
@@ -577,6 +607,9 @@ export class Store {
     // Issue #6779: the billing-category tables, each in its own
     // log-and-continue try, readiness checked apart from the switch's.
     migrateBillingCategoryTables(this.db);
+    // Issue #6204 (3.2): the eleven time-entry tables, each in its own
+    // log-and-continue try, readiness checked apart from both above.
+    migrateTimeEntryTables(this.db);
 
     // Issue #6647: the runner record (R2, R15), seven nullable columns read and
     // written only by getRunnerRecord / setRunnerRecord and never mapped into
@@ -1071,6 +1104,23 @@ export class Store {
       );
     }
 
+    // Issue #6978: widen the table's `purpose` CHECK to accept `out-of-credit`
+    // with a one-time rebuild (a CHECK cannot be altered, and the DDL above does
+    // nothing on an existing table). Keep this AFTER every other
+    // api_key_share_audit migration (an added column, such as #5807's planned
+    // `suppressed_count`, is carried over either way). A failure leaves the old
+    // table and its rows in place; the out-of-credit receiver then refuses as
+    // `api_key_audit_unavailable` before any stamp (fail-closed). SCHEMA_VERSION
+    // stays 1; the table stays out of REQUIRED_TABLES.
+    try {
+      widenApiKeySharePurposeCheck(this.db);
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: widen api_key_share_audit purpose:`,
+        error
+      );
+    }
+
     // Epic #1855, Sub-Issue I (#1864): per-account usage snapshots — one row per
     // (account_uuid, limit_key, sampled_at). Backs the history sparkline +
     // projected-exhaustion estimate. Bounded retention via UsageHistoryStore.
@@ -1390,6 +1440,43 @@ export class Store {
       console.error(`[Store] Migration failed: pin IDs (#6574):`, error);
     }
 
+    // Issue #6456 (epic #6446): a pin settled elsewhere. `closure_json` says how a
+    // pin was closed as superseded (its status stays `withdrawn`, because a client
+    // drops a status it does not know); `repeats_json` is the content's `repeats`
+    // list, kept as a column so the follow service finds copies through the index
+    // below; `reopened_at` is set once when the operator reopens a superseded pin
+    // and never cleared; `detected_json` holds a Detected pin's answer-key codes
+    // and the pins linked to it. All nullable and unread by older code, so
+    // SCHEMA_VERSION stays 1 and a reverted binary reads a superseded pin as
+    // withdrawn.
+    for (const [column, type] of [
+      ["closure_json", "TEXT"],
+      ["repeats_json", "TEXT"],
+      ["reopened_at", "INTEGER"],
+      ["detected_json", "TEXT"],
+    ] as const) {
+      this.migrateAddColumn("session_pins", column, type);
+    }
+    try {
+      // Every query must write `status = 'open'` and the `IS NOT NULL` as
+      // literals, as for idx_session_pins_deadline, or the planner cannot use them.
+      this.db.run(
+        "CREATE INDEX IF NOT EXISTS idx_session_pins_repeats " +
+          "ON session_pins(session_id) " +
+          "WHERE status = 'open' AND repeats_json IS NOT NULL"
+      );
+      this.db.run(
+        "CREATE INDEX IF NOT EXISTS idx_session_pins_detected " +
+          "ON session_pins(session_id) " +
+          "WHERE status = 'open' AND detected_json IS NOT NULL"
+      );
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: CREATE INDEX idx_session_pins_repeats / _detected (#6456):`,
+        error
+      );
+    }
+
     // Epic #1965, Sub G (#1972): prediction-accuracy dataset for the File
     // Conflict Monitor. Persists the predicted-vs-actual file footprint of each
     // closed issue + computed precision/recall — the ground-truth dataset that
@@ -1527,6 +1614,43 @@ export class Store {
     } catch (error) {
       console.error(
         `[Store] Migration failed: CREATE TABLE context_watermark_state:`,
+        error
+      );
+    }
+
+    // #6559 (epic #6163): a lane's same-session context reset. ONE row per
+    // session holds its pending request, so a request survives a hub restart
+    // (R7). Additive, node-local, no FK to `sessions`; NOT in REQUIRED_TABLES and
+    // SCHEMA_VERSION stays put (a reverted binary simply stops touching it).
+    try {
+      this.db.run(
+        "CREATE TABLE IF NOT EXISTS context_reset_requests (" +
+          "session_id TEXT PRIMARY KEY, " +
+          "arm_id TEXT NOT NULL, " +
+          "turn_seq INTEGER, " +
+          "resume_text TEXT NOT NULL, " +
+          "trigger TEXT NOT NULL DEFAULT 'stage', " +
+          "checkpoint_path TEXT, " +
+          "from_stage TEXT, " +
+          "to_stage TEXT, " +
+          "state TEXT NOT NULL, " +
+          "reset_allowed INTEGER NOT NULL DEFAULT 1, " +
+          "defer_reason TEXT, " +
+          "armed_at_ms INTEGER NOT NULL, " +
+          "deadline_at_ms INTEGER NOT NULL, " +
+          "fired_at_ms INTEGER, " +
+          "outcome TEXT, " +
+          "outcome_reason TEXT, " +
+          "context_before INTEGER, " +
+          "delivery_id TEXT, " +
+          "fire_attempts INTEGER NOT NULL DEFAULT 0, " +
+          "new_conversation_id TEXT, " +
+          "stage_args TEXT, " +
+          "issue_ref TEXT)"
+      );
+    } catch (error) {
+      console.error(
+        `[Store] Migration failed: CREATE TABLE context_reset_requests:`,
         error
       );
     }
@@ -2428,6 +2552,8 @@ export class Store {
                 parent_relationship TEXT,
                 branch_label TEXT,
                 branch_created_at INTEGER,
+                manager_session_id TEXT,
+                manager_stamp_reason TEXT,
                 user_message_count INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_tag ON sessions(tag);

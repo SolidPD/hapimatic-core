@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import type { SpawnInput } from "@/hooks/mutations/useSpawnSession";
+import {
+  billableStartBody,
+  type SpawnInput,
+} from "@/hooks/mutations/useSpawnSession";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import {
   isYoloEquivalentMode,
@@ -9,9 +12,10 @@ import {
 import { DEFAULT_OUTPUT_STYLE_DEFAULT } from "@hapi/protocol/schemas";
 import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import type {
-  BillableSwitchStartChoice,
+  BillableSwitchStartBody,
   EffortLevel,
   McpSet,
+  TrackingBillingStatus,
 } from "@hapi/protocol";
 import type { ExistingBranch } from "@hapi/protocol/gitBranches";
 import type { AgentType, SessionType } from "./types";
@@ -141,8 +145,12 @@ export type SpawnSelections = {
    * Issue #6646 (ruling T-1): the Create form's billable start. Set by the
    * spawn site from `billableStartForCreate`, never by the form, so the preview
    * never shows it. Absent ⇒ no field (the gate-off, closed and unsupported Create).
+   * #6778 (4.2 row 1): `{ tracking }` passes through too. #6780: the Create
+   * page's Time Tracking settings are merged at the spawn site the same way,
+   * because they hold a rate; the preview shows only their status, from
+   * `SpawnDisplayContext.trackingStatus`.
    */
-  billableSwitchStart?: { choice: BillableSwitchStartChoice };
+  billableSwitchStart?: BillableSwitchStartBody;
 };
 
 /**
@@ -255,9 +263,9 @@ export function buildSpawnInput(sel: SpawnSelections): SpawnInput {
         : undefined,
     // #6171: Claude-only (the server refuses a set for another agent).
     mcpSet: sel.agent === "claude" ? sel.mcpSet : undefined,
-    // #6646: only `{ choice }`; absent ⇒ no field.
+    // #6646 / #6778: `{ choice }` or `{ tracking }`, one key; absent ⇒ no field.
     billableSwitchStart: sel.billableSwitchStart
-      ? { choice: sel.billableSwitchStart.choice }
+      ? billableStartBody(sel.billableSwitchStart)
       : undefined,
   };
 }
@@ -273,6 +281,13 @@ export type SpawnDisplayContext = {
   accountEmail?: string;
   /** #4568: the bound key's label (else its masked form) — never the key. */
   apiKeyLabel?: string;
+  /**
+   * #6780 (ruling OC-5): the Time Tracking status of a tracked start, rendered
+   * as `--time-tracking <status>`. The one flag the display adds: the payload's
+   * settings hold a rate, so `SpawnSelections` never holds them, and the rate,
+   * category and note cannot reach the preview by construction.
+   */
+  trackingStatus?: TrackingBillingStatus;
 };
 
 /** Quote a shell argument only when it contains characters that need it. */
@@ -285,7 +300,9 @@ function shellQuote(value: string): string {
  * Render the live terminal-command preview from the EXACT {@link SpawnInput}
  * payload that will be POSTed (#1949 R4 — structural no-divergence). Each flag's
  * PRESENCE tracks the payload (an omitted field produces no flag); opaque IDs are
- * humanized via `display`. Internal/runtime fields (`claimPort`,
+ * humanized via `display`. One documented exception: `--time-tracking <status>`
+ * comes from `display.trackingStatus` (#6780), because the tracked start is
+ * merged at the spawn site and holds a rate the preview must never show. Internal/runtime fields (`claimPort`,
  * `spawnCorrelationId`, `emoji`) are never rendered.
  *
  * PROPOSED surface format (#1949 researcher proposal — the V6 mockup is absent from
@@ -369,6 +386,9 @@ export function assembleSpawnCommand(
   if (input.permissionMode)
     lines.push(`--permission-mode ${input.permissionMode}`);
   if (input.safeMode) lines.push("--safe-mode");
+  if (display.trackingStatus) {
+    lines.push(`--time-tracking ${display.trackingStatus}`);
+  }
   // #6171: the spawn's MCP set (`hapi api sessions spawn` flags) — one `--mcp`
   // line per server, `--mcp-none` for an empty set, `--mcp-all` for every one.
   // #2149: without one, the Edit modal's copy passes the session's enabled

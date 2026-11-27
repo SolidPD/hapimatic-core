@@ -11,12 +11,18 @@ import {
   accountConfigDirFor,
   isolatedConfigPath,
 } from "@/accounts/accountConfigDir";
+import { processInstanceKind } from "@/utils/testInstanceProcess";
 import {
   parseMcpList,
   classifyHostedServers,
   type McpStatusUpdate,
   type McpServerStatus,
 } from "@hapi/protocol";
+import {
+  describeInstanceKind,
+  type InstanceKind,
+  type InstanceKindSignal,
+} from "@hapi/protocol/instanceKind";
 
 const MCP_POLL_TIMEOUT_MS = parseInt(
   process.env.HAPI_MCP_POLL_TIMEOUT || "180000",
@@ -258,9 +264,52 @@ function buildMcpStatus(
   return { servers, disabledServers, unparsedLineCount: unparsedLines.length };
 }
 
+/** The part of an instance-kind reading the poll needs; a daemon passes `ctx.instanceKind`. */
+interface PollInstanceKind {
+  kind: InstanceKind;
+  signals?: InstanceKindSignal[];
+}
+
+let testInstanceLogged = false;
+
+/**
+ * One line per process (#6977). Its fixed text stays one literal: a per-node check greps for
+ * it. `debug` when the process read its own kind, because a session wrapper's terminal is
+ * not the poller's and `logger.info` prints to the console.
+ */
+function logOffOnTestInstance(
+  reading: PollInstanceKind,
+  level: "info" | "debug"
+): void {
+  if (testInstanceLogged) return;
+  testInstanceLogged = true;
+  const kind = describeInstanceKind({
+    kind: reading.kind,
+    signals: reading.signals ?? [],
+  });
+  logger[level](
+    `[MCP STATUS] claude mcp list is off on a test instance (#6977): ${kind}. If this is a real instance, write "real" in <data dir>/instance-kind.`
+  );
+}
+
+/**
+ * Run `claude mcp list` and parse it; `null` when there is nothing to report.
+ *
+ * Issue #6977: on a TEST instance it starts nothing and returns `null`. The child would run
+ * on the node's own `~/.claude` login, and the poll itself reads and prunes host files, so
+ * the gate comes before any of them. The daemon passes its boot reading, which includes its
+ * systemd unit; a session wrapper passes none and the process's own reading decides.
+ */
 export async function pollMcpStatus(
-  cwd?: string
+  cwd?: string,
+  opts: { instanceKind?: PollInstanceKind } = {}
 ): Promise<McpStatusUpdate | null> {
+  const reading = opts.instanceKind ?? processInstanceKind();
+  if (reading.kind === "test") {
+    logOffOnTestInstance(reading, opts.instanceKind ? "info" : "debug");
+    return null;
+  }
+
   let claudePath: string;
   try {
     claudePath = getDefaultClaudeCodePath();

@@ -51,6 +51,13 @@ export const SpawnWarningSchema = z.object({
     "forced_exhausted_account",
     // Issue #6171: a project default names a server that is off for the project.
     "mcp_default_server_disabled",
+    // Issue #6778 (C3, C9): an agent's start went ahead without its parent's
+    // tracking settings. An older hub drops an unknown code one warning at a
+    // time (`nodeRegistry.ts`, `spawnOnNode`), never the whole answer.
+    "tracking_copy_not_sent",
+    // Issue #6778 (4.2 row 8): this node's gate is not `on`, so the carried
+    // tracking settings were not applied; the hub records it (`not-applied`).
+    "tracking_not_applied",
   ]),
   message: z.string(),
 });

@@ -5,6 +5,7 @@ import {
   readdir,
   readFile,
   rename,
+  stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -12,6 +13,10 @@ import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { FileLockTimeoutError, withFileLock } from "@/utils/fileLock";
 import { isTenantVm } from "@hapi/protocol/tenantMode";
+import {
+  TEST_STORE_BOOKKEEPING_FILES,
+  TEST_STORE_MARKER,
+} from "@hapi/protocol/instanceKind";
 import { configuration } from "@/configuration";
 import { logger } from "@/ui/logger";
 import {
@@ -603,11 +608,19 @@ export class AccountStore {
     sources: Pick<
       AccountStoreAdoptionSources,
       "readHostRefreshFingerprint" | "readHostNamedUuid"
-    > = {}
+    > & {
+      /**
+       * Issue #6756 (TC1): adopt nothing, silently, on a test instance. The daemon
+       * passes it from its one instance-kind reading; the store never reads the kind
+       * itself, because its adoption tests run on `/tmp` homes, which the classifier
+       * reads as test.
+       */
+      skipAdoption?: boolean;
+    } = {}
   ): Promise<string[]> {
     const adopted: string[] = [];
     try {
-      if (this.tenantVm()) return adopted;
+      if (this.tenantVm() || sources.skipAdoption === true) return adopted;
       if (await this.hasUsableAnthropicAccount()) return adopted;
       const readHostFp =
         sources.readHostRefreshFingerprint ??
@@ -854,6 +867,114 @@ export class AccountStore {
   /** Drop all cached utilization snapshots (test seam / shutdown hygiene). */
   clearUtilizationSnapshots(): void {
     this.utilizationSnapshots.clear();
+  }
+}
+
+/**
+ * Issue #6756 (TC1, R7, ER-D1): what a test instance's account store holds, read from
+ * a DIRECTORY LISTING of `<HAPI_HOME>/accounts/` — never from `list()`, which returns
+ * `[]` for a missing or malformed `index.json`, and never from an Anthropic-only test
+ * (the server keeps OpenAI and Gemini records in the same folder).
+ *
+ *  - `marked`: the store carries {@link TEST_STORE_MARKER}, so a TC1 build created it
+ *    empty and every record in it was signed in on this instance;
+ *  - `empty`: no `*.json` file at all and no `<HAPI_HOME>/account-configs/`, so the
+ *    marker may be written;
+ *  - `unmarked-configs`: no evidence file, but `<HAPI_HOME>/account-configs/` exists
+ *    (legacy per-instance login folders); never marked, so never deleted by this work;
+ *  - `unmarked-bookkeeping`: only a daemon's own bookkeeping file
+ *    ({@link TEST_STORE_BOOKKEEPING_FILES}); it blocks the marker (R7) but is no login;
+ *  - `inherited`: some `*.json` file other than a bookkeeping file, and no marker. The
+ *    store predates this work (a port's data dir outlives its worktree), even when it
+ *    holds only `index.json`, `active.json` or `removed.json` (row SR, finding 28).
+ *    `records` counts its `<uuid>.json` files only;
+ *  - `unreadable`: the listing failed with anything but ENOENT; the caller treats it as
+ *    inherited (nothing proves the store empty).
+ */
+export type TestStoreState =
+  | { state: "marked" }
+  | { state: "empty" }
+  | { state: "unmarked-configs" }
+  | { state: "unmarked-bookkeeping" }
+  | { state: "inherited"; records: number }
+  | { state: "unreadable"; code: string };
+
+/** The legacy per-instance login folder (pre-#1643), `<HAPI_HOME>/account-configs/`. */
+export const LEGACY_INSTANCE_ACCOUNT_CONFIGS = "account-configs";
+
+function fsErrorCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : "error";
+}
+
+export async function readTestStoreState(
+  accountsDir: string,
+  dataDir: string
+): Promise<TestStoreState> {
+  let names: string[];
+  try {
+    names = await readdir(accountsDir);
+  } catch (error) {
+    const code = fsErrorCode(error);
+    if (code !== "ENOENT") return { state: "unreadable", code };
+    names = [];
+  }
+  if (names.includes(TEST_STORE_MARKER)) return { state: "marked" };
+  const jsonFiles = names.filter(name => name.endsWith(".json"));
+  // A daemon's own bookkeeping file is never evidence of an older store.
+  const evidence = jsonFiles.filter(
+    name => !TEST_STORE_BOOKKEEPING_FILES.includes(name)
+  );
+  if (evidence.length > 0) {
+    const records = evidence.filter(name =>
+      UUID_REGEX.test(name.slice(0, -".json".length))
+    ).length;
+    return { state: "inherited", records };
+  }
+  try {
+    await stat(join(dataDir, LEGACY_INSTANCE_ACCOUNT_CONFIGS));
+    return { state: "unmarked-configs" };
+  } catch (error) {
+    // Only a clean ENOENT proves the folder absent; any other error fails closed
+    // (no marker), so a store this work cannot prove it created is never marked.
+    if (fsErrorCode(error) !== "ENOENT") return { state: "unmarked-configs" };
+    // R7: a bookkeeping file still blocks the marker (no `*.json` file at all).
+    return jsonFiles.length > 0
+      ? { state: "unmarked-bookkeeping" }
+      : { state: "empty" };
+  }
+}
+
+/**
+ * Write {@link TEST_STORE_MARKER} into `accountsDir` (temp file + rename, mode 0600,
+ * the dir 0700 as the store creates it). The marker holds the kind, the build and the
+ * time; no account data. Never throws: on failure it returns the error code, and the
+ * store simply stays unmarked (so nothing will ever delete it).
+ */
+export async function writeTestStoreMarker(
+  accountsDir: string,
+  build: string,
+  now: Date = new Date()
+): Promise<{ ok: true } | { ok: false; code: string }> {
+  try {
+    await mkdir(accountsDir, { recursive: true, mode: 0o700 });
+    const target = join(accountsDir, TEST_STORE_MARKER);
+    const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    const body = JSON.stringify(
+      { kind: "test", build, writtenAt: now.toISOString(), issue: 6756 },
+      null,
+      2
+    );
+    await writeFile(tmp, body + "\n", { mode: 0o600, flag: "wx" });
+    try {
+      await rename(tmp, target);
+    } catch (error) {
+      await unlink(tmp).catch(() => undefined);
+      throw error;
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, code: fsErrorCode(error) };
   }
 }
 

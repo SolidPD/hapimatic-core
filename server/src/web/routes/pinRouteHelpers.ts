@@ -4,14 +4,19 @@ import type { Context, MiddlewareHandler } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import {
   answerOnRecord,
+  countedClosure,
   isReservedPinKey,
+  PIN_CLOSURE_REASON_MAX_CHARS,
   PIN_DEADLINE_MAX_AHEAD_MS,
   PIN_DEADLINE_MIN_LEAD_MS,
   PIN_REQUEST_MAX_BYTES,
   pinSaveSources,
   pinSessionDir,
   type Pin,
+  type PinClosure,
   type PinDeadlineRequest,
+  type PinRetireRequest,
+  type PinRuleRequest,
 } from "@hapi/protocol";
 import type { z } from "zod";
 
@@ -26,15 +31,19 @@ import type {
   PinWriteResult,
 } from "../../sync/pinService";
 import { neutralizePinText, type PinByIdOutcome } from "../../sync/pinById";
+import { capPinText, cleanPinText } from "../../sync/pinText";
 import type { PinSubmissionOutcome } from "../../sync/pinSubmission";
-import type { MessageOrigin } from "../../sync/sentFrom";
+import { isOperatorUserMessage, type MessageOrigin } from "../../sync/sentFrom";
+import type { Session, SyncEngine } from "../../sync/syncEngine";
 import { limitRequestBody } from "../../utils/limitRequestBody";
 import type { WebAppEnv } from "../middleware/auth";
 import { createRateLimiter } from "../middleware/rateLimit";
 import {
   CALLER_SESSION_HEADER,
   resolveCallerSession,
+  resolveRemoteCaller,
   type CallerSessionLookup,
+  type FederationLookup,
 } from "./agentEscalation";
 import { logAndJson } from "./routeErrorHelper";
 import type { ProxyResult } from "./sessionMutationHandlers";
@@ -291,15 +300,31 @@ export async function readPinBody(
   }
 }
 
+/** #6803: how much of a settling answer a closed pin's refusal quotes. */
+const CLOSED_PIN_QUOTE_MAX_CHARS = 200;
+
 function describeClosedPin(pin: Pin): string {
   // The settling answer, not the newest: a later moot entry must never read as
   // what the operator decided, and this text is all an agent gets through a proxy.
   // Only an answered pin quotes one, and only an answer to its current revision:
   // a pin answered, re-opened and then dismissed has no answer on record. The
   // agent tools quote through the same `answerOnRecord` (#6448).
+  // #6803: a write-in can be 2,048 characters with line breaks, and `pin_get`
+  // holds the whole, so the quote is cut (pinFenceIngest.ts cuts its own).
+  // #6456 (R2): a superseded pin names the pin that settled it; only changed
+  // content raises it again, so the text never offers `reopen: true` for it.
+  const by = supersededBy(pin);
+  if (by) {
+    return `Pin "${pin.key}" was closed as superseded by ${by}, which settled its ask elsewhere, so it was not changed. Read ${by} for the decision; post changed content only to ask something new.`;
+  }
   const settled = answerOnRecord(pin);
+  // #6456 (R7): a Project Manager's ruling is quoted as the PM's, never the operator's.
+  const label =
+    settled?.via === "pm"
+      ? "The Project Manager's ruling on record"
+      : "Answer on record";
   const answer = settled
-    ? ` Answer on record: ${[settled.option, settled.label ?? settled.text].filter(Boolean).join(". ")}.`
+    ? ` ${label}: ${capPinText([settled.option, settled.label ?? settled.text].filter(Boolean).join(". "), CLOSED_PIN_QUOTE_MAX_CHARS)}.`
     : "";
   return `Pin "${pin.key}" is already ${pin.status}, so it was not changed.${answer} Pass reopen: true to ask again.`;
 }
@@ -308,10 +333,36 @@ function pinNotFound(c: Context): Response {
   return c.json({ error: "Pin not found" }, 404);
 }
 
+/**
+ * #6456: up to 3 open Detected pins of a session, newest first, by ID and title,
+ * so an agent's post can name one in `repeats`: the newest is the one its last
+ * message made (PR-2, 05b08046). Reads no JSON for the keys, three rows at most.
+ */
+export function openDetectedSummary(
+  pins: Pick<PinService, "listKeysByPrefix" | "get">,
+  sessionId: string,
+  exceptKey?: string
+): Array<{ pinId: string; title: string }> {
+  const out: Array<{ pinId: string; title: string }> = [];
+  // The store lists oldest first.
+  const keys = pins.listKeysByPrefix(sessionId, "detected:", "open").reverse();
+  for (const key of keys) {
+    if (out.length >= 3) break;
+    if (key === exceptKey) continue;
+    const pin = pins.get(sessionId, key)?.pin;
+    if (pin?.pinId) {
+      out.push({ pinId: pin.pinId, title: capPinText(pin.title, 200) });
+    }
+  }
+  return out;
+}
+
 /** The one mapping of a post or update's outcome, shared by both surfaces that write. */
 export function pinUpsertResponse(
   c: Context,
-  result: PinUpsertResult
+  result: PinUpsertResult,
+  /** #6456: extra fields for a successful write's answer (`detectedOpen`). */
+  extra?: (written: { pin: Pin }) => Record<string, unknown>
 ): Response {
   if ("missing" in result) return pinNotFound(c);
   if ("capped" in result) {
@@ -338,7 +389,7 @@ export function pinUpsertResponse(
       409
     );
   }
-  return c.json(result);
+  return c.json(extra ? { ...result, ...extra(result) } : result);
 }
 
 export function pinWriteResponse(
@@ -601,6 +652,41 @@ export function refuseAgentPinAnswers(c: Context): Response | null {
 }
 
 /**
+ * #6456 (R8): refuse a star or an unstar from any session's agent, because only
+ * the operator stars a pin, and an agent that could unstar a pin could then
+ * retire it. Checked before any proxy. A floor, like `refuseAgentPinAnswers`.
+ */
+export function refuseAgentPinStar(c: Context): Response | null {
+  if (!c.req.header(CALLER_SESSION_HEADER)) return null;
+  return c.json(
+    {
+      error: "A session cannot star or unstar a pin; only the operator can",
+      code: "agent_pin_star_refused",
+    },
+    403
+  );
+}
+
+/** #6456 (R8): refuse a reopen from any session's agent; only the operator reopens. */
+export function refuseAgentPinReopen(c: Context): Response | null {
+  if (!c.req.header(CALLER_SESSION_HEADER)) return null;
+  return c.json(
+    {
+      error: "A session cannot reopen a pin; only the operator can",
+      code: "agent_pin_reopen_refused",
+    },
+    403
+  );
+}
+
+/** #6456: the 501 for a peer that predates retire, rulings and reopen. */
+export const PIN_SUPERSEDE_MISSING_ROUTE = {
+  error:
+    "That node runs an older Hapimatic that cannot retire, rule on, or reopen a pin",
+  code: "peer_without_pin_supersede",
+} as const;
+
+/**
  * Refuse an automatic-pick change from any session's agent (#6452), because only
  * the operator moves or stops a pick: a session can mint a JWT from its CLI token,
  * and without this an agent could move its own pick to a minute from now. A floor
@@ -752,6 +838,10 @@ export function pinByIdResponse(c: Context, outcome: PinByIdOutcome): Response {
         pin: neutralizePinText(outcome.pin),
         openPinCount: outcome.openPinCount,
         timeZone: outcome.timeZone,
+        // #6969 (D2): the owning node's, absent when an older peer sent none.
+        ...(outcome.noteMaxChars !== undefined
+          ? { noteMaxChars: outcome.noteMaxChars }
+          : {}),
         session: outcome.session,
       });
     case "not_found":
@@ -801,4 +891,517 @@ export function pinByIdResponse(c: Context, outcome: PinByIdOutcome): Response {
         409
       );
   }
+}
+
+// #6456: a pin decided elsewhere goes away. The retire route (R6, Matt's FL1)
+// and a Project Manager's ruling (R7, Matt's FR1), shared by the CLI routes and
+// their federation receivers. Who a caller is rests on `X-Hapi-Session-Id`, a
+// floor and not a boundary (FLOOR1): a session that omits or forges the header
+// is FLOOR1's recorded limit, and #6633 is the root fix. "Its PM" is the
+// target's own stamp (`parentRelationship: "spawn"` naming the caller), never
+// `managesSession`, whose dashboards any session can post; the stamp is a
+// recorded floor too, because any session holding the CLI token can set a
+// session's parent link (`PUT /cli/sessions/:id/parent`, ER2).
+
+/** The caller's session as the hub resolved it, forwarded to the owning node. */
+export const PIN_CALLER_SESSION_HEADER = "X-Hapi-Caller-Session";
+/** That session's name, URI-encoded, for the closure's and the ruling's record. */
+export const PIN_CALLER_NAME_HEADER = "X-Hapi-Caller-Name";
+
+/** The caller of a retire or a ruling: always a session id, never a tag. */
+export type PinCaller = { id: string; name: string | null };
+
+/** A refused retire, ruling or reopen, with its status and code. */
+export type PinActionRefusal = {
+  refused: true;
+  /** 503 only for a lookup the server could not finish; it carries `Retry-After`. */
+  status: 403 | 404 | 409 | 503;
+  code: string;
+  error: string;
+};
+
+function refuseAction(
+  status: PinActionRefusal["status"],
+  code: string,
+  error: string
+): PinActionRefusal {
+  return { refused: true, status, code, error };
+}
+
+/**
+ * A pin the operator's Submit (or an automatic pick) is delivering an answer to
+ * right now: a retire or ruling then would make that answer moot (409, retry).
+ */
+function answerInFlight(
+  pins: Pick<PinService, "claimedBy">,
+  sessionId: string,
+  key: string
+): PinActionRefusal | null {
+  return pins.claimedBy(sessionId, key)
+    ? refuseAction(
+        409,
+        "pin_answer_in_flight",
+        "An answer to this pin is being delivered now; read the pin again in a moment"
+      )
+    : null;
+}
+
+export function pinActionRefusalResponse(
+  c: Context,
+  refusal: PinActionRefusal
+): Response {
+  if (refusal.status === 503) {
+    c.header("Retry-After", String(PIN_BY_ID_RETRY_AFTER_SECONDS));
+  }
+  return c.json({ error: refusal.error, code: refusal.code }, refusal.status);
+}
+
+/**
+ * The caller from `X-Hapi-Session-Id`: the local session in the request's
+ * namespace, by id then tag, else the federation cache's (`resolveRemoteCaller`).
+ * Null when the header is absent or names no session. A local id in another
+ * namespace stays unresolved and is never re-read remotely.
+ */
+export function resolvePinCaller(
+  c: Context,
+  engine: CallerSessionLookup | null,
+  registry: FederationLookup | null
+): PinCaller | null {
+  const header = c.req.header(CALLER_SESSION_HEADER);
+  if (!header) return null;
+  const local = resolveCallerSession(c, engine);
+  if (local) return { id: local.id, name: local.metadata?.name ?? null };
+  if (engine?.getSession(header)) return null;
+  const remote = resolveRemoteCaller(header, registry);
+  if (!remote) return null;
+  const summary = registry?.locateSession(remote.id)?.session;
+  return { id: remote.id, name: summary?.metadata?.name ?? null };
+}
+
+/**
+ * The headers a hub sends the owning node: only what it resolved itself, so an
+ * inbound `X-Hapi-Caller-Session` from a client never reaches the owner.
+ */
+export function pinCallerHeaders(caller: PinCaller): Record<string, string> {
+  return {
+    [PIN_CALLER_SESSION_HEADER]: caller.id,
+    ...(caller.name
+      ? {
+          [PIN_CALLER_NAME_HEADER]: encodeURIComponent(
+            caller.name.slice(0, 200)
+          ),
+        }
+      : {}),
+  };
+}
+
+/** The owning node's read of the caller its hub forwarded, or null. */
+export function forwardedPinCaller(c: Context): PinCaller | null {
+  const id = c.req.header(PIN_CALLER_SESSION_HEADER);
+  if (!id || id.length > 200) return null;
+  const raw = c.req.header(PIN_CALLER_NAME_HEADER);
+  let name: string | null = null;
+  if (raw) {
+    try {
+      name = decodeURIComponent(raw).slice(0, 200);
+    } catch {
+      name = null;
+    }
+  }
+  return { id, name };
+}
+
+/** Whether `caller` is the session that started `session` (its stamp). */
+function isStartingPm(session: Session, caller: PinCaller): boolean {
+  return (
+    session.parentRelationship === "spawn" &&
+    typeof session.parentSessionId === "string" &&
+    session.parentSessionId === caller.id
+  );
+}
+
+/** A pin the operator starred, wrote on, or reopened: his alone. */
+function operatorHeld(pin: Pin): boolean {
+  return (
+    pin.starred ||
+    Boolean(pin.reopenedAt) ||
+    pin.answers.some(answer => answer.by === "operator")
+  );
+}
+
+/**
+ * A stored message the operator typed in the web app (R4, the Pins PM's
+ * stricter reading): an operator message whose door and evidence both read
+ * `browser`, on its own origin or, forwarded, on the origin's `via`. A Pins
+ * Submit (`pins-submit`), a shell send (`unattributed`), a capability-invoker
+ * send, a Telegram or terminal message, and a row with no origin are none.
+ */
+export function isTypedInWebApp(content: unknown): boolean {
+  if (!isOperatorUserMessage(content)) return false;
+  const meta = (content as { meta?: { origin?: unknown } }).meta;
+  const origin = meta?.origin as
+    | {
+        door?: unknown;
+        evidence?: unknown;
+        via?: { door?: unknown; evidence?: unknown };
+      }
+    | undefined;
+  if (!origin || typeof origin !== "object") return false;
+  if (origin.door === "browser" && origin.evidence === "browser") return true;
+  const via = origin.via;
+  return (
+    !!via &&
+    typeof via === "object" &&
+    via.door === "browser" &&
+    via.evidence === "browser"
+  );
+}
+
+/** What a retire reads of this node. */
+export type PinRetireEngine = Pick<
+  SyncEngine,
+  "pins" | "pinFollow" | "getRecentMessagesBounded"
+>;
+
+/** The stored messages a typed-message proof reads, newest first. */
+const RETIRE_PROOF_MESSAGE_WINDOW = 200;
+
+/** Why `retireProof` found no proof: the status, code and sentence of the refusal. */
+type RetireProofMiss = {
+  status: 403 | 409 | 503;
+  code: string;
+  why: string;
+};
+
+/**
+ * The own-session proof (FL1, "the build ties the proof to this pin"), or why
+ * there is none. (1) `ref`: a closed pin, read by ID in this namespace, settled
+ * after this pin was made by the operator's answer or dismissal or a Project
+ * Manager's ruling, that belongs to this session or lists this pin in `repeats`.
+ * An automatic pick, a dismissal with no entry, and a `prompt:` pin are no proof.
+ * The server cannot check that two texts ask the same thing; the named pin and
+ * the agent's reason are stored and shown beside Reopen. (2) No `ref`: a message
+ * the operator typed in the web app in this session after this pin was made.
+ *
+ * A miss says what was read (PR-2): a `ref` the federation could not read for
+ * certain (a node offline, an incomplete lookup) is retryable, not "not found";
+ * one more than one node holds is ambiguous; and the typed-message read, which
+ * holds the newest `RETIRE_PROOF_MESSAGE_WINDOW` rows, says so when they were
+ * all newer than this pin.
+ */
+async function retireProof(
+  engine: PinRetireEngine,
+  session: Session,
+  detected: Pin,
+  ref: string | undefined
+): Promise<RetireProofMiss | null> {
+  const made = Date.parse(detected.createdAt);
+  const noProof = (why: string): RetireProofMiss => ({
+    status: 403,
+    code: "pin_retire_no_proof",
+    why,
+  });
+  if (ref) {
+    const read = await engine.pinFollow.lookupById(ref, session.namespace);
+    if (read.kind === "missing") return noProof(`${ref} was not found`);
+    if (read.kind === "local_only") {
+      return noProof(
+        `${ref} is not on this node, which cannot search the other nodes`
+      );
+    }
+    if (read.kind === "unread") {
+      if (read.reason === "ambiguous") {
+        return {
+          status: 409,
+          code: "pin_id_ambiguous",
+          why: `more than one node holds a pin with the ID ${ref}, so it cannot stand as proof`,
+        };
+      }
+      return {
+        status: 503,
+        code: "pin_lookup_incomplete",
+        why:
+          read.reason === "offline" && read.nodes.length > 0
+            ? `${ref} could not be read: ${offlineSentence(read.nodes.map(nodeLabel => ({ nodeLabel })))}, so it was not searched; try again`
+            : `${ref} could not be read: some nodes could not be asked; try again`,
+      };
+    }
+    const named = read.pin;
+    if (named.key.startsWith("prompt:")) {
+      return noProof(`${ref} mirrors a prompt, which is no proof`);
+    }
+    if (named.status === "open" || named.status === "live") {
+      return noProof(`${ref} is still open`);
+    }
+    const belongs =
+      named.sessionId === detected.sessionId ||
+      (!!detected.pinId && (named.repeats ?? []).includes(detected.pinId));
+    if (!belongs) {
+      return noProof(
+        `${ref} is neither this session's nor lists this pin in repeats`
+      );
+    }
+    const settled = named.answers.some(
+      answer =>
+        !answer.moot &&
+        Date.parse(answer.at) > made &&
+        ((answer.by === "operator" &&
+          (answer.resolves || answer.dismissed === true)) ||
+          (answer.via === "pm" && answer.resolves))
+    );
+    return settled
+      ? null
+      : noProof(
+          `${ref} was not settled by the operator or a Project Manager's ruling after this pin was made`
+        );
+  }
+  const rows = engine.getRecentMessagesBounded(session.id, {
+    limit: RETIRE_PROOF_MESSAGE_WINDOW,
+    sinceMs: made,
+    maxChars: 64 * 1024,
+  });
+  const typed = rows.some(
+    row =>
+      row.createdAt > made &&
+      row.content !== null &&
+      isTypedInWebApp(row.content)
+  );
+  if (typed) return null;
+  // The read holds the session's newest rows; when all of them are newer than
+  // this pin, older ones since it was made were not read (d7d282fb).
+  return noProof(
+    rows.length >= RETIRE_PROOF_MESSAGE_WINDOW
+      ? `no message the operator typed in the web app among this session's newest ${RETIRE_PROOF_MESSAGE_WINDOW} messages; older ones since this pin was made are not read, so name a settled pin as ref instead`
+      : "no message the operator typed in the web app since this pin was made"
+  );
+}
+
+/**
+ * #6456 (R6, Matt's FL1): retire an open Detected pin as superseded, never as
+ * his answer. The PM that started the session may, with a reason; the session
+ * itself only with proof (`retireProof`). Refused: any key but `detected:`
+ * (403 `pin_reserved_key`), a pin not open (409), and a pin the operator
+ * starred, wrote on or reopened (409 `pin_operator_held`). The reason passes
+ * `cleanPinText`, so no approval token is kept. Runs on the node that owns the
+ * session, which checks its own stamp.
+ */
+export async function retireDetectedPin(input: {
+  engine: PinRetireEngine;
+  session: Session;
+  key: string;
+  request: PinRetireRequest;
+  caller: PinCaller;
+  now?: number;
+}): Promise<PinWriteResult | PinActionRefusal> {
+  const { engine, session, key, request, caller } = input;
+  if (!key.startsWith("detected:")) {
+    return refuseAction(
+      403,
+      "pin_reserved_key",
+      "Only a Detected pin can be retired"
+    );
+  }
+  const pin = engine.pins.get(session.id, key)?.pin;
+  if (!pin) return refuseAction(404, "pin_not_found", "Pin not found");
+  if (pin.status !== "open") {
+    return refuseAction(409, "pin_not_open", `Pin "${key}" is not open`);
+  }
+  if (operatorHeld(pin)) {
+    return refuseAction(
+      409,
+      "pin_operator_held",
+      "The operator starred, wrote on, or reopened this pin, so only the operator can close it"
+    );
+  }
+  const inFlight = answerInFlight(engine.pins, session.id, key);
+  if (inFlight) return inFlight;
+  const pm = isStartingPm(session, caller);
+  if (!pm) {
+    if (caller.id !== session.id) {
+      return refuseAction(
+        403,
+        "pin_retire_refused",
+        "Only the Project Manager that started this session, or the session itself with proof, can retire this pin"
+      );
+    }
+    const missing = await retireProof(engine, session, pin, request.ref);
+    if (missing) {
+      return refuseAction(
+        missing.status,
+        missing.code,
+        `This session can retire its own Detected pin only with proof: ${missing.why}`
+      );
+    }
+    // The proof read can wait on another node (a `ref` held there), and the
+    // operator may star, write on or submit this pin meanwhile: check again.
+    const now = engine.pins.get(session.id, key)?.pin;
+    if (!now || now.status !== "open") {
+      return refuseAction(409, "pin_not_open", `Pin "${key}" is not open`);
+    }
+    if (operatorHeld(now)) {
+      return refuseAction(
+        409,
+        "pin_operator_held",
+        "The operator starred, wrote on, or reopened this pin, so only the operator can close it"
+      );
+    }
+    const busy = answerInFlight(engine.pins, session.id, key);
+    if (busy) return busy;
+  }
+  const reason = capPinText(
+    cleanPinText(request.reason).trim(),
+    PIN_CLOSURE_REASON_MAX_CHARS
+  );
+  const closure: PinClosure = {
+    how: "superseded",
+    by: "agent",
+    rule: "retired",
+    at: new Date(input.now ?? Date.now()).toISOString(),
+    bySession: caller.id,
+    ...(caller.name ? { byName: caller.name } : {}),
+    ...(request.ref ? { ref: request.ref } : {}),
+    ...(reason ? { reason } : {}),
+  };
+  const written = engine.pins.supersede(
+    { id: session.id, namespace: session.namespace },
+    key,
+    closure,
+    input.now
+  );
+  if (!written) return refuseAction(404, "pin_not_found", "Pin not found");
+  return written;
+}
+
+/**
+ * #6456 (R7, Matt's FR1): the PM that started a lane records its ruling on the
+ * lane's own open pin, at the revision it read. Recorded `by: "agent"`,
+ * `via: "pm"`, with the PM's session and name, so it reads as the Project
+ * Manager's and never as the operator's. Refused: a server-owned key, a caller
+ * that is not the lane's starting PM, a pin the operator reopened, a pin not
+ * open, and another revision (409). The route sends the lane no message; its
+ * result says whether the lane is running, so the PM can tell it.
+ */
+export function rulePin(input: {
+  engine: Pick<SyncEngine, "pins">;
+  session: Session;
+  key: string;
+  request: PinRuleRequest;
+  caller: PinCaller;
+  now?: number;
+}): (PinAnswerResult & { laneRunning: boolean }) | PinActionRefusal {
+  const { engine, session, key, request, caller } = input;
+  if (isReservedPinKey(key)) {
+    return refuseAction(
+      403,
+      "pin_reserved_key",
+      `Pin "${key}" belongs to the server, so a Project Manager cannot rule on it`
+    );
+  }
+  if (!isStartingPm(session, caller)) {
+    return refuseAction(
+      403,
+      "pin_rule_refused",
+      "Only the Project Manager that started this session can rule on its pins"
+    );
+  }
+  const pin = engine.pins.get(session.id, key)?.pin;
+  if (!pin) return refuseAction(404, "pin_not_found", "Pin not found");
+  if (pin.reopenedAt) {
+    return refuseAction(
+      409,
+      "pin_operator_held",
+      "The operator reopened this pin, so only the operator can answer it"
+    );
+  }
+  if (pin.status !== "open") {
+    return refuseAction(409, "pin_not_open", `Pin "${key}" is not open`);
+  }
+  if (pin.revision !== request.revision) {
+    return refuseAction(
+      409,
+      "pin_revision_stale",
+      `Pin "${key}" is at revision ${pin.revision}, not ${request.revision}: read it again before ruling`
+    );
+  }
+  const inFlight = answerInFlight(engine.pins, session.id, key);
+  if (inFlight) return inFlight;
+  const result = engine.pins.answer(
+    { id: session.id, namespace: session.namespace },
+    key,
+    {
+      revision: request.revision,
+      ...(request.option !== undefined ? { option: request.option } : {}),
+      ...(request.text !== undefined
+        ? { text: cleanPinText(request.text) }
+        : {}),
+      ...(request.note !== undefined
+        ? { note: cleanPinText(request.note) }
+        : {}),
+      by: "agent",
+      via: "pm",
+      bySession: caller.id,
+      ...(caller.name ? { byName: caller.name } : {}),
+      ...(input.now !== undefined ? { now: input.now } : {}),
+    }
+  );
+  if (!result) return refuseAction(404, "pin_not_found", "Pin not found");
+  return { ...result, laneRunning: session.active };
+}
+
+/**
+ * #6456 (R8): the operator reopens a superseded pin. Refused for a pin that is
+ * not superseded (409 `pin_not_superseded`) and at the open cap (409).
+ */
+export function reopenPin(
+  pins: Pick<PinService, "reopen">,
+  session: { id: string; namespace: string },
+  key: string
+): PinWriteResult | PinActionRefusal {
+  const result = pins.reopen(session, key);
+  if (!result) return refuseAction(404, "pin_not_found", "Pin not found");
+  if ("refused" in result) {
+    return refuseAction(
+      409,
+      "pin_not_superseded",
+      "Only a pin closed as superseded can be reopened"
+    );
+  }
+  if ("capped" in result) {
+    return refuseAction(
+      409,
+      "pin_cap_reached",
+      "This session has too many open pins to reopen this one"
+    );
+  }
+  return result;
+}
+
+/** The answer to a retire, ruling or reopen: the result, or its refusal. */
+export function pinActionResponse(
+  c: Context,
+  result:
+    | PinWriteResult
+    | (PinAnswerResult & { laneRunning: boolean })
+    | PinActionRefusal
+): Response {
+  if ("refused" in result && result.refused === true) {
+    return pinActionRefusalResponse(c, result);
+  }
+  if ("unknownOption" in result) {
+    return c.json(
+      {
+        error: `This pin has no option "${result.unknownOption}"`,
+        code: "pin_unknown_option",
+      },
+      400
+    );
+  }
+  return c.json(result);
+}
+
+/** #6456: a superseded pin's closure, for the closed-pin texts. */
+export function supersededBy(pin: Pin): string | null {
+  const closure = countedClosure(pin);
+  if (!closure) return null;
+  return closure.ref ?? "a pin settled elsewhere";
 }

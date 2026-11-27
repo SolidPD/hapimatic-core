@@ -2,12 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { TriangleAlert } from "lucide-react";
 import {
-  effectiveSavedTo,
-  formatPinAnswersMessage,
-  hasPinAnswer,
   resolveDenialOutcome,
-  type Pin,
-  type PinSubmissionEntry,
   type PinSubmissionRequest,
   type PinSubmissionResponse,
   type PinSubmissionResult,
@@ -31,7 +26,6 @@ import {
 import { restoredPickAt } from "./PinDismissAction";
 import { useSessionProjectManager } from "@/hooks/queries/usePinDashboards";
 import {
-  browserTimeZone,
   buildSubmissionRequest,
   makeSubmissionId,
   type BuiltSubmission,
@@ -40,8 +34,10 @@ import { flushNoteDrafts } from "@/lib/pins/noteDrafts";
 import {
   clearPendingSubmission,
   clearSubmitted,
+  clearWords,
   dropPins,
   getStagedPins,
+  hasOwnWords,
   loadPendingSubmission,
   pendingStillStaged,
   savePendingSubmission,
@@ -49,9 +45,14 @@ import {
   type StagedPins,
 } from "@/lib/pins/staging";
 import {
+  carriesAny,
   keepsStaged,
   provesUndelivered,
   refusalOf,
+  refusedFieldsOf,
+  refusedNoteMaxOf,
+  refusedWordKeys,
+  type RefusableField,
   stagingMovedSince,
   STAGING_MOVED_TEXT,
   STALE_DISMISS,
@@ -60,8 +61,19 @@ import {
   UNCERTAIN_TEXT,
   uncertainOf,
   withoutDelivered,
+  withoutDismissals,
+  withoutFields,
 } from "./pinsSubmitRecovery";
-import { DroppedRows, UnsentNote } from "./PinsSubmitNotes";
+import { DroppedRows, SentDraftQuestion, UnsentNote } from "./PinsSubmitNotes";
+import {
+  dialogAnswer,
+  DISMISSALS_STAY,
+  fallbackText,
+  refusedFieldsButton,
+  refusedFieldsText,
+  refusedFieldsTitle,
+  sentToastText,
+} from "./pinsSubmitText";
 
 type Phase =
   | { kind: "checking" }
@@ -80,8 +92,12 @@ type Phase =
   /** #6454: waiting for a resumed session to come back, then sending. */
   | { kind: "resuming"; preview: PinSubmissionResponse }
   | { kind: "unsupported" }
-  /** #6539: the session's node predates dismissals; nothing was sent. */
-  | { kind: "dismissUnsupported" }
+  /**
+   * #6539, #6803, #6969: the session's node predates dismissals, write-ins, or
+   * long notes (the fields it refused, and the longest note it takes);
+   * nothing was sent.
+   */
+  | { kind: "refusedFields"; fields: RefusableField[]; maxNoteChars: number }
   | {
       kind: "error";
       message: string;
@@ -139,111 +155,12 @@ function isRelayRefusal(code: string | undefined): boolean {
   );
 }
 
-/**
- * #6539: the same Submit without its dismissals, under a new id, because the
- * entry set changed and the old id may be on record somewhere. Its `submitted`
- * holds only the pins it still sends, so the dismissals stay staged.
- */
-function withoutDismissals(built: BuiltSubmission): BuiltSubmission {
-  const entries = (built.request?.entries ?? []).filter(
-    entry => entry.dismiss !== true
-  );
-  const kept = new Set(entries.map(entry => entry.key));
-  return {
-    ...built,
-    request:
-      built.request && entries.length > 0
-        ? { ...built.request, submissionId: makeSubmissionId(), entries }
-        : null,
-    submitted: Object.fromEntries(
-      Object.entries(built.submitted).filter(([key]) => kept.has(key))
-    ),
-    stale: built.stale.filter(row => kept.has(row.key)),
-  };
-}
-
 /** #6539: dropped keys. A sent row under one is the pin's save (#6453), not its
  *  dismissal or answer. */
 function droppedKeysOf(
   entries: readonly { key: string; outcome: string }[]
 ): Set<string> {
   return new Set(entries.filter(e => e.outcome === "dropped").map(e => e.key));
-}
-
-/** "Sent 2 answers and 1 dismissal": dismissals are counted apart (#6539). */
-function sentToast(answers: number, dismissals: number): string {
-  const many = (n: number, one: string) => `${n} ${one}${n === 1 ? "" : "s"}`;
-  const parts = [
-    answers > 0 || dismissals === 0 ? many(answers, "answer") : null,
-    dismissals > 0 ? many(dismissals, "dismissal") : null,
-  ].filter(Boolean);
-  return `Sent ${parts.join(" and ")}`;
-}
-
-/**
- * One entry's answer, as the dialog lists it: "B. Wait", "B. Wait · Note"
- * (#6768 R8), or "Steps 2/3 · Note".
- * #6453: a save reads "Saved", also for one the server added from another
- * device's Save (no request entry, but the result's pin has a saved folder).
- * #6539: a dismissal reads "Dismiss", ahead of everything else.
- */
-function answerText(
-  entry: PinSubmissionEntry | undefined,
-  pin?: Parameters<typeof effectiveSavedTo>[0]
-): string {
-  if (!entry) return pin && effectiveSavedTo(pin) ? "Saved" : "";
-  if (entry.dismiss === true) return entry.note ? "Dismiss · Note" : "Dismiss";
-  if (entry.choice !== undefined) {
-    const choice = `${entry.choice}${entry.label ? `. ${entry.label}` : ""}`;
-    return entry.note ? `${choice} · Note` : choice;
-  }
-  const parts: string[] = [];
-  if (entry.steps) parts.push(`Steps ${entry.steps.done}/${entry.steps.total}`);
-  if (entry.questions?.length) {
-    const n = entry.questions.length;
-    parts.push(`${n} question${n === 1 ? "" : "s"}`);
-  }
-  if (entry.note) parts.push("Note");
-  // #6452 (ruling D5): an automatic-pick move or off the agent has not heard.
-  if (entry.automaticPick) parts.push("Automatic pick change");
-  if (entry.saved) parts.push("Saved");
-  return parts.join(" · ");
-}
-
-/**
- * The message an older node cannot compose: the same `hapi_pin_answers/1`
- * text, built here in the device's zone, to send as a plain message that
- * records nothing. A save-only entry (#6453) is left out: an older node has no
- * saved folder to report, and an entry with nothing to send would not compose.
- */
-function fallbackText(
-  request: PinSubmissionRequest,
-  pins: readonly Pin[],
-  session: string
-): string | null {
-  const byKey = new Map(pins.map(pin => [pin.key, pin]));
-  const message = formatPinAnswersMessage({
-    session,
-    now: Date.now(),
-    timeZone: request.timeZone ?? browserTimeZone() ?? "UTC",
-    entries: request.entries.filter(hasPinAnswer).map(entry => ({
-      pin: entry.key,
-      rev: entry.rev,
-      kind: byKey.get(entry.key)?.kind ?? "decision",
-      ...(entry.choice !== undefined
-        ? {
-            answer: {
-              choice: entry.choice,
-              label: entry.label ?? entry.choice,
-            },
-          }
-        : {}),
-      ...(entry.note ? { note: entry.note } : {}),
-      ...(entry.questions ? { questions: entry.questions } : {}),
-      ...(entry.steps ? { steps: entry.steps } : {}),
-    })),
-  });
-  return message.ok ? message.text : null;
 }
 
 /**
@@ -341,6 +258,9 @@ export function PinsSubmitDialog(props: {
     [pinsQuery.data]
   );
   const pinsSettled = pinsQuery.data !== undefined || pinsQuery.isError;
+  // #6969 (R-4): the limit the session's note counter shows, null when unread.
+  const noteMaxChars =
+    pinsQuery.data?.kind === "ready" ? pinsQuery.data.noteMaxChars : null;
 
   // One request per opening, built once the list has answered; every retry in
   // this opening reuses it and its id.
@@ -374,6 +294,7 @@ export function PinsSubmitDialog(props: {
       buildSubmissionRequest({
         staged: set,
         pins,
+        noteMaxChars,
         submissionId: makeSubmissionId(),
       });
     if (pending && !pendingStillStaged(pending, staged)) {
@@ -400,7 +321,9 @@ export function PinsSubmitDialog(props: {
               ...buildSubmissionRequest({
                 staged: subsetOf(current, pending),
                 pins,
+                noteMaxChars,
                 submissionId: pending.submissionId,
+                frozen: true,
               }),
               request: pending.request,
             });
@@ -466,7 +389,9 @@ export function PinsSubmitDialog(props: {
         ...buildSubmissionRequest({
           staged: subset,
           pins,
+          noteMaxChars,
           submissionId: pending.submissionId,
+          frozen: true,
         }),
         request: pending.request,
       };
@@ -477,7 +402,16 @@ export function PinsSubmitDialog(props: {
     // previewFresh is recreated each render and reads only state setters and
     // the deps listed here; listing it would re-run this effect every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, built, pinsSettled, pins, sessionId, submit, recheck]);
+  }, [
+    open,
+    built,
+    pinsSettled,
+    pins,
+    noteMaxChars,
+    sessionId,
+    submit,
+    recheck,
+  ]);
 
   /** Show `next` and dry-run it for its first target. */
   function previewFresh(
@@ -526,6 +460,29 @@ export function PinsSubmitDialog(props: {
       }
     );
   }
+
+  /**
+   * #6969 (closer review F1): a held row's Clear changes what can go, so the
+   * dialog checks again at once, keeping the target; otherwise the row kept a
+   * reason for words now gone, and an empty Submit offered no Send. As Send's
+   * own check: only while nothing is pending, because a saved id keeps its
+   * frozen request (#6521), and never while sending.
+   */
+  const clearHeld = (key: string) => {
+    clearWords(sessionId, key);
+    if (busy.current || pinnedTarget !== undefined) return;
+    if (uncertainRef.current) return;
+    setPhase({ kind: "checking" });
+    previewFresh(
+      buildSubmissionRequest({
+        staged: getStagedPins(sessionId),
+        pins,
+        noteMaxChars,
+        submissionId: makeSubmissionId(),
+      }),
+      target
+    );
+  };
 
   const preview =
     "preview" in phase && phase.preview ? phase.preview : undefined;
@@ -615,14 +572,18 @@ export function PinsSubmitDialog(props: {
   const currentPreview = preview;
 
   /**
-   * #6539 (ruling D2): the session's node cannot take dismissals, so send the
-   * other answers through the normal Submit, which records them, and leave
-   * every dismissal staged with its note and its held pick. One press: the dry
-   * run for the smaller request, then the send under the same new id.
+   * #6539 (ruling D2), #6803 (R7): the session's node cannot take dismissals or
+   * write-ins, so send the other answers through the normal Submit, which
+   * records them, and leave every entry carrying a refused field staged, whole,
+   * with its note and its held pick. One press: the dry run for the smaller
+   * request, then the send under the same new id.
    */
-  const sendWithoutDismissals = async () => {
+  const sendWithoutRefused = async (
+    fields: readonly RefusableField[],
+    maxNoteChars: number
+  ) => {
     if (!built || busy.current) return;
-    const next = withoutDismissals(built);
+    const next = withoutFields(built, fields, maxNoteChars);
     const request = requestFor(next.request, target);
     if (!request) return;
     // A new id (#6458 review): the node refused the dismissals outright, so
@@ -654,7 +615,7 @@ export function PinsSubmitDialog(props: {
 
   const send = async (
     to: string | null = target,
-    // #6539: a request built in this same turn (Send without the dismissals),
+    // #6539: a request built in this same turn (Send without the refused fields),
     // which the state this closure read does not hold yet.
     override?: { built: BuiltSubmission; preview: PinSubmissionResponse }
   ) => {
@@ -676,6 +637,7 @@ export function PinsSubmitDialog(props: {
           buildSubmissionRequest({
             staged: now,
             pins,
+            noteMaxChars,
             submissionId: makeSubmissionId(),
           }),
           to
@@ -746,17 +708,8 @@ export function PinsSubmitDialog(props: {
         setPhase({ kind: "result", result });
         return;
       }
-      const sentKeys = new Set(
-        result.entries.filter(e => e.outcome === "sent").map(e => e.key)
-      );
-      const droppedKeys = droppedKeysOf(result.entries);
-      const dismissals = request.entries.filter(
-        e =>
-          e.dismiss === true && sentKeys.has(e.key) && !droppedKeys.has(e.key)
-      ).length;
-      showToast(sentToast(sentKeys.size - dismissals, dismissals), {
-        type: "success",
-      });
+      // #6803 (R8): the toast names what went, by what it did to each pin.
+      showToast(sentToastText(request, result), { type: "success" });
       onOpenChange(false);
     } catch (error) {
       // #6521 S2/S3: a lost response or a 5xx may have delivered; the pending
@@ -907,6 +860,22 @@ export function PinsSubmitDialog(props: {
     built?.request?.entries.some(e => e.dismiss === true) ?? false;
   const hasOthers =
     built?.request?.entries.some(e => e.dismiss !== true) ?? false;
+  // #6803 (R7): what a node that refused some fields can still be sent.
+  const refusedFields = phase.kind === "refusedFields" ? phase.fields : null;
+  const refusedMax = phase.kind === "refusedFields" ? phase.maxNoteChars : 0;
+  const hasUnrefused =
+    refusedFields !== null &&
+    (built?.request?.entries.some(
+      e => !carriesAny(e, refusedFields, refusedMax)
+    ) ??
+      false);
+  // Listed when nothing else can go: the write-ins and long notes, with their
+  // words at hand. A dismissal has no words to keep, so it is never a row.
+  const refusedWriteInKeys = refusedWordKeys(
+    built?.request?.entries ?? [],
+    refusedFields ?? [],
+    refusedMax
+  );
   // Named wherever the dialog says which session it means: opened from a
   // Project Manager's page, "the session" would read as the page's own.
   const sessionName = session.name?.trim() || session.tag || null;
@@ -965,6 +934,7 @@ export function PinsSubmitDialog(props: {
                 held={built?.held}
                 titleOf={titleOf}
                 onClear={clearOne}
+                onClearHeld={clearHeld}
                 forgetsKept
               />
             </>
@@ -972,42 +942,59 @@ export function PinsSubmitDialog(props: {
           {preview && phase.kind !== "result" ? (
             <>
               <ul className="border-t border-[var(--app-divider)]">
-                {sent.map(entry => (
-                  <li
-                    key={entry.key}
-                    className="flex min-h-8 items-center gap-1.5 border-b border-[var(--app-divider)] py-1"
-                  >
-                    <PinKindBadge kind={kindOf(entry.key)} armed={false} />
-                    {/* #6458 (TITLE-D): a pin title fades, never an ellipsis. */}
-                    <FadeTruncate className="flex-1 font-semibold">
-                      {titleOf(entry.key)}
-                    </FadeTruncate>
-                    {entry.stale ? (
-                      <span
-                        className="shrink-0 rounded-full border px-1.5 text-[length:var(--text-caption)] text-[var(--status-warn)]"
-                        style={{ borderColor: "var(--status-warn)" }}
-                      >
-                        Changed since you chose
-                      </span>
-                    ) : null}
-                    <span
-                      className={`max-w-[40%] shrink-0 truncate ${
-                        isDismissal(entry.key) && !droppedKeys.has(entry.key)
-                          ? "text-[var(--app-badge-error-text)]"
-                          : "text-[var(--app-hint)]"
-                      }`}
+                {sent.map(entry => {
+                  const answer = dialogAnswer(
+                    droppedKeys.has(entry.key)
+                      ? undefined
+                      : built?.request?.entries.find(e => e.key === entry.key),
+                    entry.pin,
+                    pins.find(pin => pin.key === entry.key)
+                  );
+                  return (
+                    <li
+                      key={entry.key}
+                      className="border-b border-[var(--app-divider)] py-1"
                     >
-                      {answerText(
-                        droppedKeys.has(entry.key)
-                          ? undefined
-                          : built?.request?.entries.find(
-                              e => e.key === entry.key
-                            ),
-                        entry.pin
-                      )}
-                    </span>
-                  </li>
-                ))}
+                      <div className="flex min-h-6 items-center gap-1.5">
+                        <PinKindBadge kind={kindOf(entry.key)} armed={false} />
+                        {/* #6458 (TITLE-D): a pin title fades, never an ellipsis. */}
+                        <FadeTruncate className="flex-1 font-semibold">
+                          {titleOf(entry.key)}
+                        </FadeTruncate>
+                        {entry.stale ? (
+                          <span
+                            className="shrink-0 rounded-full border px-1.5 text-[length:var(--text-caption)] text-[var(--status-warn)]"
+                            style={{ borderColor: "var(--status-warn)" }}
+                          >
+                            Changed since you chose
+                          </span>
+                        ) : null}
+                        {answer.cell ? (
+                          <span
+                            className={`max-w-[40%] shrink-0 truncate ${
+                              isDismissal(entry.key) &&
+                              !droppedKeys.has(entry.key)
+                                ? "text-[var(--app-badge-error-text)]"
+                                : "text-[var(--app-hint)]"
+                            }`}
+                          >
+                            {answer.cell}
+                          </span>
+                        ) : null}
+                      </div>
+                      {/* #6803 (R8): its own line, so 393 px never cuts it. */}
+                      {answer.caption ? (
+                        <span className="block text-[length:var(--text-caption)] text-[var(--app-hint)]">
+                          {answer.caption}
+                        </span>
+                      ) : null}
+                      <SentDraftQuestion
+                        sessionId={sessionId}
+                        pinKey={entry.key}
+                      />
+                    </li>
+                  );
+                })}
               </ul>
               <DroppedRows
                 sessionId={sessionId}
@@ -1015,6 +1002,7 @@ export function PinsSubmitDialog(props: {
                 held={built?.held}
                 titleOf={titleOf}
                 onClear={clearOne}
+                onClearHeld={clearHeld}
               />
               <details className="mt-2">
                 <summary className="cursor-pointer text-[var(--app-hint)]">
@@ -1056,26 +1044,59 @@ export function PinsSubmitDialog(props: {
             />
           ) : null}
           {phase.kind === "unsupported" ? (
-            <Notice
-              title="This session's node is older and cannot receive pin answers"
-              text={
-                !hasOthers
-                  ? DISMISSALS_STAY
-                  : hasDismissals
-                    ? `Send your other answers as a plain message instead? Pins will stay open. ${DISMISSALS_STAY}`
-                    : "Send them as a plain message instead? Pins will stay open."
-              }
-            />
+            <>
+              <Notice
+                title="This session's node is older and cannot receive pin answers"
+                text={
+                  !hasOthers
+                    ? DISMISSALS_STAY
+                    : hasDismissals
+                      ? `Send your other answers as a plain message instead? Pins will stay open. ${DISMISSALS_STAY}`
+                      : "Send them as a plain message instead? Pins will stay open."
+                }
+              />
+              {/* #6880 item 5: the choices held back are listed too. */}
+              <DroppedRows
+                sessionId={sessionId}
+                rows={[]}
+                held={built?.held}
+                titleOf={titleOf}
+                onClear={clearOne}
+                onClearHeld={clearHeld}
+              />
+            </>
           ) : null}
-          {phase.kind === "dismissUnsupported" ? (
-            <Notice
-              title="This session's node is older and cannot receive dismissals"
-              text={
-                hasOthers
-                  ? "Send your other answers now? The dismissals stay staged here."
-                  : DISMISSALS_STAY
-              }
-            />
+          {refusedFields !== null ? (
+            <>
+              <Notice
+                title={refusedFieldsTitle(refusedFields, refusedMax)}
+                text={refusedFieldsText(refusedFields, hasUnrefused)}
+              />
+              {/* #6803 (R7): nothing else can go, so the words are at hand. */}
+              {!hasUnrefused
+                ? refusedWriteInKeys.map(key => (
+                    <div key={key} className="mt-2">
+                      <FadeTruncate className="block font-semibold">
+                        {titleOf(key)}
+                      </FadeTruncate>
+                      <UnsentNote
+                        sessionId={sessionId}
+                        pinKey={key}
+                        onClear={clearOne}
+                      />
+                    </div>
+                  ))
+                : null}
+              {/* #6880 item 5: the choices held back are listed too. */}
+              <DroppedRows
+                sessionId={sessionId}
+                rows={[]}
+                held={built?.held}
+                titleOf={titleOf}
+                onClear={clearOne}
+                onClearHeld={clearHeld}
+              />
+            </>
           ) : null}
           {phase.kind === "error" ? (
             <Notice
@@ -1126,15 +1147,17 @@ export function PinsSubmitDialog(props: {
                 Send as a message
               </Button>
             ) : null
-          ) : phase.kind === "dismissUnsupported" ? (
-            // Only dismissals staged: nothing this node can take, so no send.
-            hasOthers ? (
+          ) : refusedFields !== null ? (
+            // Only refused entries staged: nothing this node can take, so no send.
+            hasUnrefused ? (
               <Button
                 type="button"
                 disabled={working}
-                onClick={() => void sendWithoutDismissals()}
+                onClick={() =>
+                  void sendWithoutRefused(refusedFields, refusedMax)
+                }
               >
-                Send without the dismissals
+                {refusedFieldsButton(refusedFields)}
               </Button>
             ) : null
           ) : phase.kind === "empty" && staleKeys(phase, built).length > 0 ? (
@@ -1262,12 +1285,10 @@ function settleStaging(
     (stamps ? stamps[key] : submitted[key]?.updatedAt);
   // #6768 R5: a dropped pin's note and questions never reached the agent, so
   // they stay, even when its save went as a sent row under the same key.
+  // #6803 (R11): so do its write-in words, chosen or a draft, and #6969
+  // (R-2) a question draft.
   for (const e of result.entries) {
-    const entry = current[e.key];
-    if (
-      e.outcome === "dropped" &&
-      (Boolean(entry?.note?.trim()) || (entry?.questions?.length ?? 0) > 0)
-    ) {
+    if (e.outcome === "dropped" && hasOwnWords(current[e.key])) {
       keep.add(e.key);
     }
   }
@@ -1299,8 +1320,15 @@ function phaseForError(error: unknown): Phase {
   if (refusal?.code === "session_inactive") return { kind: "inactive" };
   if (refusal?.code === "pin_answers_unsupported")
     return { kind: "unsupported" };
-  if (refusal?.code === "pin_dismiss_unsupported")
-    return { kind: "dismissUnsupported" };
+  // #6539, #6803 (R7): the fields an older node refused, in one phase.
+  const fields = refusedFieldsOf(refusal);
+  if (fields) {
+    return {
+      kind: "refusedFields",
+      fields,
+      maxNoteChars: refusedNoteMaxOf(refusal),
+    };
+  }
   if (refusal?.code === "pin_submission_empty") {
     return { kind: "empty", dropped: refusal.entries ?? [] };
   }
@@ -1323,10 +1351,6 @@ function droppedText(entry: PinSubmissionResult): string {
   if (entry.code === STALE_DISMISS) return STALE_DISMISS_TEXT;
   return entry.reason ? `Not sent: ${entry.reason}` : "Not sent";
 }
-
-/** #6539: what happens to dismissals a node cannot take. */
-const DISMISSALS_STAY =
-  "The dismissals stay staged here. Undo on a pin releases it.";
 
 function Line(props: { text: string }) {
   return <div className="py-2 text-[var(--app-hint)]">{props.text}</div>;

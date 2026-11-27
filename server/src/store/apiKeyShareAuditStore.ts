@@ -18,8 +18,13 @@ import type { Database } from "bun:sqlite";
  * refusal code or a short fixed note, never a request body or an error message.
  */
 
-/** What the requester asked for. */
-export type ApiKeySharePurpose = "list" | "resolve" | "secret";
+/** What the requester asked for. `out-of-credit` (#6978) is a peer's report
+ *  that a session there was refused for lack of credit on this home's key. */
+export type ApiKeySharePurpose =
+  | "list"
+  | "resolve"
+  | "secret"
+  | "out-of-credit";
 
 /** One row to append. */
 export interface ApiKeyShareAuditRow {
@@ -108,6 +113,7 @@ export class ApiKeyShareAuditStore {
   >();
   private readonly refusalCoalesceMs: number;
   private lastPruneAt = 0;
+  private creditPurposeReady = false;
 
   constructor(
     db: Database,
@@ -117,6 +123,19 @@ export class ApiKeyShareAuditStore {
     this.now = opts.now ?? Date.now;
     this.refusalCoalesceMs =
       opts.refusalCoalesceMs ?? API_KEY_SHARE_AUDIT_REFUSAL_COALESCE_MS;
+  }
+
+  /**
+   * #6978: true when the table's CHECK accepts `purpose`. Only `out-of-credit`
+   * can be missing: on a database whose one-time widen failed, the old table
+   * stays and refuses it, so the out-of-credit receiver must refuse BEFORE it
+   * stamps rather than stamp and then fail to record it. A true answer is
+   * cached (the table is only ever widened); a false one is re-read each time.
+   */
+  acceptsPurpose(purpose: ApiKeySharePurpose): boolean {
+    if (purpose !== "out-of-credit" || this.creditPurposeReady) return true;
+    this.creditPurposeReady = creditPurposeCheck(this.db) === "wide";
+    return this.creditPurposeReady;
   }
 
   /**
@@ -258,22 +277,141 @@ export class ApiKeyShareAuditStore {
   }
 }
 
-/** The table's DDL, shared by `Store.runMigrations()` and the tests. */
-export const API_KEY_SHARE_AUDIT_DDL = [
-  "CREATE TABLE IF NOT EXISTS api_key_share_audit (" +
-    "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
-    "timestamp INTEGER NOT NULL, " +
-    "key_id TEXT NOT NULL, " +
-    "key_label TEXT, " +
-    "masked_key TEXT, " +
-    "requesting_node_id TEXT NOT NULL, " +
-    "peer_address TEXT, " +
-    "session_id TEXT, " +
-    "purpose TEXT NOT NULL CHECK(purpose IN ('list','resolve','secret')), " +
-    "outcome TEXT NOT NULL, " +
-    "detail TEXT)",
+/** The table's columns: ONE source for the DDL and the #6978 rebuild. */
+const API_KEY_SHARE_AUDIT_COLUMNS =
+  "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+  "timestamp INTEGER NOT NULL, " +
+  "key_id TEXT NOT NULL, " +
+  "key_label TEXT, " +
+  "masked_key TEXT, " +
+  "requesting_node_id TEXT NOT NULL, " +
+  "peer_address TEXT, " +
+  "session_id TEXT, " +
+  "purpose TEXT NOT NULL CHECK(purpose IN ('list','resolve','secret','out-of-credit')), " +
+  "outcome TEXT NOT NULL, " +
+  "detail TEXT";
+
+const API_KEY_SHARE_AUDIT_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_api_key_share_audit_timestamp " +
     "ON api_key_share_audit(timestamp)",
   "CREATE INDEX IF NOT EXISTS idx_api_key_share_audit_key " +
     "ON api_key_share_audit(key_id, timestamp)",
 ] as const;
+
+/** The table's DDL, shared by `Store.runMigrations()` and the tests. */
+export const API_KEY_SHARE_AUDIT_DDL = [
+  `CREATE TABLE IF NOT EXISTS api_key_share_audit (${API_KEY_SHARE_AUDIT_COLUMNS})`,
+  ...API_KEY_SHARE_AUDIT_INDEXES,
+] as const;
+
+type TableColumn = {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+};
+
+const quoteIdent = (name: string): string => `"${name.replace(/"/g, '""')}"`;
+
+/**
+ * Issue #6978: the audit table's `purpose` CHECK as SQLite stores it: `absent`
+ * when there is no table, `wide` when it accepts `out-of-credit`, `narrow` when
+ * it does not. The ONE reading for the boot-time widen and the receiver's
+ * pre-stamp check ({@link ApiKeyShareAuditStore.acceptsPurpose}), so the two can
+ * never disagree about whether a stamp can be recorded.
+ */
+function creditPurposeCheck(db: Database): "absent" | "narrow" | "wide" {
+  const row = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_key_share_audit'"
+    )
+    .get() as { sql: string | null } | null | undefined;
+  const sql = row?.sql;
+  if (!sql) return "absent";
+  return sql.includes("'out-of-credit'") ? "wide" : "narrow";
+}
+
+/**
+ * Issue #6978: widen the `purpose` CHECK of an existing `api_key_share_audit`
+ * table to accept `out-of-credit`. A CHECK cannot be altered in SQLite and the
+ * DDL's `CREATE TABLE IF NOT EXISTS` does nothing on an existing table, so the
+ * table is rebuilt once, in ONE immediate transaction:
+ *
+ * - every column the old table holds is kept, with its values: a column another
+ *   migration added (for example #5807's planned `suppressed_count`) is added to
+ *   the new table with its declared type, NOT NULL and default, and the copy's
+ *   column list comes from the old table itself;
+ * - every row keeps its id, and the AUTOINCREMENT high-water mark
+ *   (`sqlite_sequence`) never goes down, so a pruned id is never handed out again;
+ * - both indexes are recreated.
+ *
+ * Returns true when it rebuilt the table, false when there is no table or the
+ * CHECK already accepts the purpose (so a second run changes nothing). A failure
+ * throws and the transaction leaves the old table and its rows in place; the
+ * caller logs it, and the receiver then refuses as `api_key_audit_unavailable`
+ * before any stamp ({@link ApiKeyShareAuditStore.acceptsPurpose}; fail-closed).
+ *
+ * Rollback-safe: an older binary on the rebuilt table only runs its
+ * `CREATE TABLE IF NOT EXISTS`, which does nothing, and the wider CHECK still
+ * accepts its three purposes.
+ */
+export function widenApiKeySharePurposeCheck(db: Database): boolean {
+  if (creditPurposeCheck(db) !== "narrow") return false;
+
+  const rebuild = db.transaction(() => {
+    db.run("DROP TABLE IF EXISTS api_key_share_audit_next");
+    db.run(
+      `CREATE TABLE api_key_share_audit_next (${API_KEY_SHARE_AUDIT_COLUMNS})`
+    );
+
+    const columnsOf = (table: string): TableColumn[] =>
+      db.prepare(`PRAGMA table_info(${table})`).all() as TableColumn[];
+    const oldColumns = columnsOf("api_key_share_audit");
+    const newNames = new Set(
+      columnsOf("api_key_share_audit_next").map(c => c.name)
+    );
+    for (const col of oldColumns) {
+      if (newNames.has(col.name)) continue;
+      db.run(
+        `ALTER TABLE api_key_share_audit_next ADD COLUMN ${quoteIdent(col.name)}` +
+          (col.type ? ` ${col.type}` : "") +
+          (col.notnull ? " NOT NULL" : "") +
+          (col.dflt_value !== null ? ` DEFAULT ${col.dflt_value}` : "")
+      );
+    }
+
+    const list = oldColumns.map(c => quoteIdent(c.name)).join(", ");
+    db.run(
+      `INSERT INTO api_key_share_audit_next (${list}) SELECT ${list} FROM api_key_share_audit`
+    );
+
+    // The table's AUTOINCREMENT mark, read before the drop and after the rename.
+    const readSeqRow = (): { seq: number } | undefined =>
+      db
+        .prepare(
+          "SELECT seq FROM sqlite_sequence WHERE name = 'api_key_share_audit'"
+        )
+        .get() as { seq: number } | undefined;
+    const oldSeq = readSeqRow()?.seq ?? 0;
+
+    db.run("DROP TABLE api_key_share_audit");
+    db.run(
+      "ALTER TABLE api_key_share_audit_next RENAME TO api_key_share_audit"
+    );
+
+    const seqRow = readSeqRow();
+    if (seqRow) {
+      db.prepare(
+        "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'api_key_share_audit'"
+      ).run(oldSeq);
+    } else if (oldSeq > 0) {
+      db.prepare(
+        "INSERT INTO sqlite_sequence (name, seq) VALUES ('api_key_share_audit', ?)"
+      ).run(oldSeq);
+    }
+
+    for (const ddl of API_KEY_SHARE_AUDIT_INDEXES) db.run(ddl);
+  });
+  rebuild.immediate();
+  return true;
+}

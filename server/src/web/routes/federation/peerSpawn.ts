@@ -23,7 +23,11 @@ import { validateApiKeySpawn } from "../machines";
 import { refuseRetiredBillableAnswer } from "../agentEscalation";
 import { resolveSpawnMcpSet } from "../../../services/mcpSetResolver";
 import {
+  checkCarriedCopy,
+  checkTrackingStartValues,
   resolveModelFamily,
+  TrackingCarriedCopySchema,
+  TrackingStartValuesSchema,
   type BillableSwitchStartContext,
   type BillableSwitchStartWire,
   type SpawnWarning,
@@ -36,12 +40,40 @@ import {
 } from "../../../accounts/accountHeadroom";
 import type { FederationDeps } from "./shared";
 import { checkFederationToken, notifyOriginatingHub } from "./shared";
+import type { TrackingReceiverDeps } from "./billableTrackingReceivers";
+import { observedTrackingStart } from "../../../billableSwitch/trackingStart";
+import { isManagerStampEnabled } from "../../../configuration";
+import { acceptForwardedManagerStamp } from "../../../sync/managerStamp";
+import type { ManagerStampWrite } from "../../../store/sessions";
+
+/** Issue #6918 (R7, V15): keep a forwarded pair, or drop it with one warning. */
+function acceptForwardedStampOrWarn(
+  pair: ManagerStampWrite | undefined,
+  parentRelationship: "branch" | "spawn" | undefined,
+  parentSessionId: string | undefined
+): ManagerStampWrite | undefined {
+  if (!pair) return undefined;
+  const enabled = isManagerStampEnabled();
+  const kept = acceptForwardedManagerStamp({
+    enabled,
+    parentRelationship,
+    parentSessionId,
+    pair,
+  });
+  if (!kept && enabled) {
+    console.warn(
+      `[manager-stamp] dropped an inconsistent forwarded pair (reason ${pair.reason}); the session stays undecided`
+    );
+  }
+  return kept;
+}
 
 /**
  * Issue #6646: the start context a peer receiver passes to its engine. Only the
- * kinds that can cross a hop (`person`, `agent`, `unattended`) are kept; any
- * other or unknown kind, and a missing context (an older hub), read as
- * `unattended`. The actor, channel and entry node are the forwarding node's
+ * kinds that can cross a hop (`person`, `agent`, `unattended`, and from #6778
+ * ruling 11 `schedule`) are kept; any other or unknown kind, and a missing
+ * context (an older hub), read as `unattended`. The carried settings are
+ * `receivedTracking`'s. The actor, channel and entry node are the forwarding node's
  * claims (one shared mesh token); `fromSessionId` never crosses (the wire
  * schema strips it). The caller's namespace is kept, so a registration from
  * another namespace under the same tag does not consume it.
@@ -54,6 +86,7 @@ export function receivedBillableSwitchStart(
     wire &&
     (wire.kind === "person" ||
       wire.kind === "agent" ||
+      wire.kind === "schedule" ||
       wire.kind === "unattended")
       ? wire.kind
       : "unattended";
@@ -67,9 +100,81 @@ export function receivedBillableSwitchStart(
   };
 }
 
+/** What a peer keeps of a carried start, or why it refuses it (400). */
+export type ReceivedTracking =
+  | Pick<
+      BillableSwitchStartContext,
+      "tracking" | "inheritedFrom" | "inheritedCopy"
+    >
+  | { refused: { code: string; message: string; field?: string } };
+
+/**
+ * Issue #6778 (4.2 row 8; ruling 11; Task 15): the carried settings a peer
+ * keeps, re-checked here, before the background spawn, never in the start hook,
+ * where a failure would be a silent lost start (reviewer 2, question H). A
+ * person's or a schedule's `tracking` is parsed strictly and checked with R5's
+ * structural rules, which the carried category and default make checkable
+ * without a lookup; an agent's claimed parent keeps its carried copy, checked
+ * the same way. A malformed or refused value answers 400 with a code, never
+ * dropped. A category the owner retired after the entry node validated it is
+ * still accepted: the entry node's lookup decided.
+ */
+export function receivedTracking(
+  wire: BillableSwitchStartWire | undefined,
+  kind: BillableSwitchStartContext["kind"]
+): ReceivedTracking {
+  const refused = (field?: string, reason?: string): ReceivedTracking => ({
+    refused: {
+      code: field ? "invalid_field" : "invalid_tracking",
+      message: field
+        ? `The carried tracking settings were refused: ${field} (${reason}).`
+        : "The carried tracking settings are not in a form this node reads.",
+      ...(field ? { field } : {}),
+    },
+  });
+  // #6778 FND-2: a carried value is never dropped in silence. Tracking beside a
+  // kind that cannot carry it, and a copy beside one or without a usable claimed
+  // parent (the wire's `inheritedFrom` is `.catch(undefined)`), are refused.
+  const carriesTracking = wire?.tracking !== undefined;
+  if (carriesTracking && kind !== "person" && kind !== "schedule") {
+    return refused();
+  }
+  if (
+    wire?.inheritedCopy !== undefined &&
+    (kind !== "agent" || !wire.inheritedFrom)
+  ) {
+    return refused();
+  }
+  if ((kind === "person" || kind === "schedule") && carriesTracking) {
+    const parsed = TrackingStartValuesSchema.safeParse(wire.tracking);
+    if (!parsed.success) return refused();
+    const bad = checkTrackingStartValues(parsed.data);
+    if (bad) return refused(bad.field, bad.reason);
+    return { tracking: parsed.data };
+  }
+  if (kind === "agent" && wire?.inheritedFrom) {
+    if (wire.inheritedCopy === undefined) {
+      return { inheritedFrom: wire.inheritedFrom };
+    }
+    const parsed = TrackingCarriedCopySchema.safeParse(wire.inheritedCopy);
+    if (!parsed.success) return refused();
+    const bad = checkCarriedCopy(parsed.data);
+    if (bad) return refused(bad.field, bad.reason);
+    return { inheritedFrom: wire.inheritedFrom, inheritedCopy: parsed.data };
+  }
+  return {};
+}
+
+/** The accept's warning when this node's gate is not `on`: nothing carried was applied (4.2 row 8). */
+export const TRACKING_NOT_APPLIED: SpawnWarning = {
+  code: "tracking_not_applied",
+  message:
+    "Billable sessions are not on for this node, so the session started untracked: its tracking settings were not applied.",
+};
+
 export async function spawnForPeer(
   c: Context<WebAppEnv>,
-  deps: FederationDeps,
+  deps: FederationDeps & TrackingReceiverDeps,
   mode: "plain" | "api-key"
 ): Promise<Response> {
   if (!checkFederationToken(deps, c.req.header("authorization"))) {
@@ -92,8 +197,42 @@ export async function spawnForPeer(
     return c.json({ type: "error", message }, 400);
   }
 
-  // Pick the first online machine (nodes typically have one daemon)
-  const machines = engine.getOnlineMachines();
+  // #6778 (4.2 rows 8 and 9): the carried settings, re-checked before the
+  // spawn. Applied only while this node's gate is `on`; otherwise the spawn is
+  // accepted untracked and the accept says so. A start that carries settings
+  // takes a machine of the caller's namespace, so its queued start can be
+  // consumed; with none online there, 409 namespace_mismatch before the accept.
+  const callerNamespace = c.req.header("x-hapi-caller-namespace") ?? undefined;
+  const wireStart = parsed.data.billableSwitchStart;
+  const kept = receivedTracking(
+    wireStart,
+    receivedBillableSwitchStart(wireStart, callerNamespace).kind
+  );
+  if ("refused" in kept) {
+    return c.json({ type: "error", ...kept.refused }, 400);
+  }
+  const carried =
+    kept.tracking !== undefined || kept.inheritedCopy !== undefined;
+  const carriedApplies =
+    carried && (engine.getBillableSwitchMode?.() ?? "off") === "on";
+
+  // Pick the first online machine (nodes typically have one daemon); a start
+  // that carries settings, one of the caller's namespace.
+  const machines =
+    carriedApplies && callerNamespace
+      ? engine.getOnlineMachinesByNamespace(callerNamespace)
+      : engine.getOnlineMachines();
+  if (machines.length === 0 && carriedApplies && callerNamespace) {
+    return c.json(
+      {
+        type: "error",
+        message:
+          "No machine of the caller's namespace is online on this node, so a session with tracking settings cannot start here.",
+        code: "namespace_mismatch",
+      },
+      409
+    );
+  }
   if (machines.length === 0) {
     return c.json(
       { type: "error", message: "No machines available on this node" },
@@ -119,6 +258,7 @@ export async function spawnForPeer(
     forceAccount,
     parentSessionId,
     parentRelationship,
+    managerStamp: forwardedManagerStampRaw,
     safeMode,
     launcher,
     model,
@@ -135,14 +275,15 @@ export async function spawnForPeer(
     billableSwitchStart: wireBillableSwitchStart,
   } = parsed.data;
 
-  // Issue #6646: only the kinds that can cross a hop (person, agent, unattended);
-  // any other or unknown kind reads as `unattended`, and a missing context (an
-  // older hub) too. The actor, the channel and the entry node are taken as
-  // claimed by the federation-token caller; `fromSessionId` is never accepted.
-  const billableSwitchStart = receivedBillableSwitchStart(
-    wireBillableSwitchStart,
-    c.req.header("x-hapi-caller-namespace") ?? undefined
-  );
+  // Issue #6646: only the kinds that can cross a hop (person, agent, unattended,
+  // and from #6778 schedule); any other or unknown kind reads as `unattended`,
+  // and a missing context (an older hub) too. The actor, the channel and the
+  // entry node are taken as claimed by the federation-token caller;
+  // `fromSessionId` is never accepted.
+  const billableSwitchStart: BillableSwitchStartContext = {
+    ...receivedBillableSwitchStart(wireBillableSwitchStart, callerNamespace),
+    ...(carriedApplies ? kept : {}),
+  };
   // #6778 PR-A (R12; review C9): a person's retired billable answer, which an
   // older hub can still send, is refused with 400 billable_choice_retired in
   // every gate state, never dropped (it would start the session non-billable
@@ -251,6 +392,7 @@ export async function spawnForPeer(
   // shape as the #5127 key check above; no background report is sent for it).
   // The read is deadline-bounded (2.5 s), well under the hub's 10 s timeout.
   const spawnWarnings: SpawnWarning[] = [...mcpResolution.warnings];
+  if (carried && !carriedApplies) spawnWarnings.push(TRACKING_NOT_APPLIED);
   let pinnedAccount:
     | {
         accountUuid: string;
@@ -346,6 +488,14 @@ export async function spawnForPeer(
       // options — NOT a post-spawn `.then()` apply like name/emoji.
       parentSessionId,
       parentRelationship,
+      // Issue #6918 (R7): the sending node's pair, kept only when consistent
+      // and with this node's own switch on; never derived here (the parent
+      // is not local).
+      forwardedManagerStamp: acceptForwardedStampOrWarn(
+        forwardedManagerStampRaw,
+        parentRelationship,
+        parentSessionId
+      ),
       safeMode,
       launcher,
       // Issue #1733: forward the OpenRouter model on the peer-incoming hop.
@@ -446,7 +596,18 @@ export async function spawnForPeer(
         });
       }
 
-      // Notify the originating hub of success
+      // Notify the originating hub of success. #6778 PRC-R9: with whether a
+      // start that carried settings or a copy was applied, the cause only.
+      const trackingStart = !carried
+        ? undefined
+        : carriedApplies
+          ? observedTrackingStart(
+              deps.getStore?.() ?? null,
+              result.sessionId,
+              engine.getSession?.(result.sessionId)?.namespace ??
+                callerNamespace
+            )
+          : ({ applied: false, cause: "gate-off" } as const);
       void notifyOriginatingHub({
         originatingNodeId,
         nodeId: deps.federationConfig?.nodeId ?? "",
@@ -454,6 +615,7 @@ export async function spawnForPeer(
         spawnCorrelationId,
         success: true,
         sessionId: result.sessionId,
+        ...(trackingStart ? { trackingStart } : {}),
         deps,
       });
     });

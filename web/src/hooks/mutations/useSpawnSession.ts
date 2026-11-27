@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { ExistingBranch } from "@hapi/protocol/gitBranches";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import type { ApiClient } from "@/api/client";
-import type { SpawnResponse } from "@/types/api";
+import { useToast } from "@/components/Toast";
+import type { FederationNodesResponse, SpawnResponse } from "@/types/api";
 import { queryKeys } from "@/lib/query-keys";
+import { claimTrackingPopup, trackingPopupKeys } from "@/lib/trackingPopups";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type { ModelMode, PermissionMode } from "@hapi/protocol/modes";
 import type {
-  BillableSwitchStartChoice,
+  BillableSwitchStartBody,
   EffortLevel,
   McpSet,
 } from "@hapi/protocol";
@@ -112,10 +118,60 @@ export type SpawnInput = {
    *  ⇒ the target's project default, else every server. */
   mcpSet?: McpSet;
   /** Issue #6646 (ruling T-1): the Create form's `not-billable` where the
-   *  target takes the switch. Rides the trailing object on both branches; the
-   *  body carries only `{ choice }`. Absent ⇒ no field. */
-  billableSwitchStart?: { choice: BillableSwitchStartChoice };
+   *  target takes the switch; #6778 (4.1): or a person's `{ tracking }`
+   *  settings. Rides the trailing object on both branches, one key exactly.
+   *  Absent ⇒ no field. */
+  billableSwitchStart?: BillableSwitchStartBody;
 };
+
+/**
+ * Issue #6778 (4.2 rows 1 and 2; review C5): the start field rebuilt with its
+ * one key, so a `{ tracking }` start reaches the wire and nothing else does.
+ */
+export function billableStartBody(
+  start: BillableSwitchStartBody
+): BillableSwitchStartBody {
+  return "tracking" in start
+    ? { tracking: start.tracking }
+    : { choice: start.choice };
+}
+
+/**
+ * Issue #6778 (ruling C3 = a): the toast for a start that went ahead without
+ * its parent's tracking settings. The web's own words, naming the node: never
+ * the server's text, so no rate or note can reach it.
+ */
+export function trackingCopyNotSentText(nodeLabel: string | null): string {
+  return nodeLabel
+    ? `The new session on ${nodeLabel} started untracked: its parent's tracking settings were not sent to ${nodeLabel}.`
+    : "The new session on this node started untracked: its parent's tracking settings were not copied.";
+}
+
+/**
+ * #6780 (Task 8, S12 of #6778): the toast for a start the target node did not
+ * apply. The web's own words, naming the node only.
+ */
+export function trackingNotAppliedText(
+  nodeLabel: string | null,
+  ownStart: boolean
+): string {
+  const node = nodeLabel ?? "this node";
+  return ownStart
+    ? `The new session on ${node} started untracked: ${node} did not apply its tracking settings.`
+    : `The new session on ${node} started untracked: its parent's tracking settings were not applied.`;
+}
+
+/** The target node's label from the federation nodes cache; its id when unknown. */
+function spawnTargetLabel(
+  queryClient: QueryClient,
+  nodeId: string | undefined
+): string | null {
+  if (!nodeId) return null;
+  const nodes = queryClient.getQueryData<FederationNodesResponse>(
+    queryKeys.federationNodes
+  )?.nodes;
+  return nodes?.find(n => n.config.id === nodeId)?.config.label ?? nodeId;
+}
 
 export function useSpawnSession(api: ApiClient | null): {
   spawnSession: (input: SpawnInput) => Promise<SpawnResponse>;
@@ -123,6 +179,7 @@ export function useSpawnSession(api: ApiClient | null): {
   error: string | null;
 } {
   const queryClient = useQueryClient();
+  const { showToast } = useToast();
 
   const mutation = useMutation({
     mutationFn: async (input: SpawnInput) => {
@@ -151,12 +208,13 @@ export function useSpawnSession(api: ApiClient | null): {
                 : {}),
               // #6171: the MCP set rides the same trailing object.
               ...(input.mcpSet ? { mcpSet: input.mcpSet } : {}),
-              // #6646: the Create form's billable start (only `{ choice }`).
+              // #6646 / #6778: the Create form's start (`{ choice }` or
+              // `{ tracking }`, one key).
               ...(input.billableSwitchStart
                 ? {
-                    billableSwitchStart: {
-                      choice: input.billableSwitchStart.choice,
-                    },
+                    billableSwitchStart: billableStartBody(
+                      input.billableSwitchStart
+                    ),
                   }
                 : {}),
             }
@@ -259,6 +317,29 @@ export function useSpawnSession(api: ApiClient | null): {
       // wait for the `session-added` SSE. It is LOCAL-only (ruling D4), so it
       // never invalidates the federation list.
       if (data.type !== "success" && data.type !== "accepted") return;
+      // #6778 (ruling C3 = a): one toast for a start whose parent's tracking
+      // settings were not sent (the Create page and Fan-out both spawn here).
+      // #6780 (Task 8, S12): and for one the target did not apply. With a
+      // correlation id the toast claims this start's one pop-up first and
+      // stays silent when another source in this tab already showed it; a
+      // start without one behaves as before.
+      const warned = (code: string) =>
+        data.warnings?.some(w => w.code === code) ?? false;
+      const copyNotSent = warned("tracking_copy_not_sent");
+      const notApplied = warned("tracking_not_applied");
+      if (copyNotSent || (notApplied && input.spawnCorrelationId)) {
+        const label = spawnTargetLabel(queryClient, input.nodeId);
+        const ownStart =
+          input.billableSwitchStart !== undefined &&
+          "tracking" in input.billableSwitchStart;
+        const text = copyNotSent
+          ? trackingCopyNotSentText(label)
+          : trackingNotAppliedText(label, ownStart);
+        const keys = trackingPopupKeys({
+          spawnCorrelationId: input.spawnCorrelationId,
+        });
+        if (claimTrackingPopup(keys)) showToast(text, { type: "warning" });
+      }
       void queryClient.invalidateQueries({ queryKey: queryKeys.sessions });
       if (data.type === "success" && input.nodeId) {
         void queryClient.invalidateQueries({

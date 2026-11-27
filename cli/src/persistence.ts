@@ -219,32 +219,92 @@ export const DAEMON_STATE_DISPLAY = {
  */
 export type { AmbientOnboardingTokenState };
 
-export async function readSettings(): Promise<Settings> {
-  if (!existsSync(configuration.settingsFile)) {
+/**
+ * settings.json exists but cannot be read or parsed (issue #4056 R3, R8). The
+ * message is the path and the error kind only, never file content: a parse
+ * message can quote the file, which holds tokens and keys (#4155 R10).
+ */
+export class SettingsUnreadableError extends Error {
+  readonly settingsFile: string;
+  readonly errorKind: string;
+
+  constructor(settingsFile: string, errorKind: string) {
+    super(
+      `Cannot read ${settingsFile}: ${errorKind}. Fix or remove that file.`
+    );
+    this.name = "SettingsUnreadableError";
+    this.settingsFile = settingsFile;
+    this.errorKind = errorKind;
+  }
+}
+
+/** A parsed settings.json value that is a plain object (#4056 R7). */
+function isSettingsObject(value: unknown): value is Settings {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * The strict settings read (issue #4056). A missing file reads as the defaults,
+ * and so does a file that parses to anything but a plain object (`null`, an
+ * array, a string, a number: R7), because it holds no settings. A file that
+ * exists but cannot be read or parsed throws {@link SettingsUnreadableError},
+ * so a writer never mistakes it for an empty file and overwrites it (R3).
+ */
+export async function readSettingsStrict(): Promise<Settings> {
+  const file = configuration.settingsFile;
+  if (!existsSync(file)) {
     return { ...defaultSettings };
   }
-
+  let content: string;
   try {
-    const content = await readFile(configuration.settingsFile, "utf8");
-    return JSON.parse(content);
-  } catch {
-    return { ...defaultSettings };
+    content = await readFile(file, "utf8");
+  } catch (error) {
+    // Removed between the existence check and the read: still a missing file.
+    if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") {
+      return { ...defaultSettings };
+    }
+    throw new SettingsUnreadableError(file, describeErrorKind(error));
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    throw new SettingsUnreadableError(file, describeErrorKind(error));
+  }
+  return isSettingsObject(parsed) ? parsed : { ...defaultSettings };
+}
+
+/**
+ * The lenient settings read for read-only callers: {@link readSettingsStrict},
+ * with an unreadable file read as the defaults. A writer must use
+ * {@link updateSettings}, which reads strictly.
+ */
+export async function readSettings(): Promise<Settings> {
+  try {
+    return await readSettingsStrict();
+  } catch (error) {
+    if (error instanceof SettingsUnreadableError) {
+      return { ...defaultSettings };
+    }
+    throw error;
   }
 }
 
 /**
  * Synchronous settings read (issue #1733). The capability detector
  * (agentCapabilities.ts) runs synchronously + cached, so it cannot await the
- * async readSettings(). Mirrors its fall-back-to-defaults-on-error semantics.
+ * async readSettings(). Mirrors its fall-back-to-defaults-on-error semantics,
+ * including the defaults for a non-object file (#4056 R7).
  */
 export function readSettingsSync(): Settings {
   if (!existsSync(configuration.settingsFile)) {
     return { ...defaultSettings };
   }
   try {
-    return JSON.parse(
+    const parsed: unknown = JSON.parse(
       readFileSync(configuration.settingsFile, "utf8")
-    ) as Settings;
+    );
+    return isSettingsObject(parsed) ? parsed : { ...defaultSettings };
   } catch {
     return { ...defaultSettings };
   }
@@ -325,8 +385,10 @@ export async function updateSettings(
   }
 
   try {
-    // Read current settings with defaults
-    const current = (await readSettings()) || { ...defaultSettings };
+    // #4056 R3: a strict read. A file that exists but cannot be read or parsed
+    // throws SettingsUnreadableError and nothing is written (the lock is still
+    // released below); it used to read as the defaults and be renamed over.
+    const current = await readSettingsStrict();
     // #4510 (D-4510-2): snapshot BEFORE the updater — an updater may mutate
     // `current` in place, so a later comparison would miss its change.
     const before = JSON.stringify(current, null, 2);
@@ -339,8 +401,8 @@ export async function updateSettings(
     // steady-state daemon start no longer rewrites settings.json. 0600 is still
     // enforced on the existing file; when that chmod fails (e.g. a file owned
     // by another user), fall through to the write below, whose rename installs
-    // a fresh 0600 file. A corrupt file reads as defaults, so a no-op update
-    // now leaves it in place rather than overwriting it with defaults.
+    // a fresh 0600 file. (An unreadable file never gets here: the strict read
+    // above refuses it, #4056.)
     if (after === before && existsSync(configuration.settingsFile)) {
       try {
         await chmod(configuration.settingsFile, 0o600);

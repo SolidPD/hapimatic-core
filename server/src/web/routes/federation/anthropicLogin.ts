@@ -8,6 +8,13 @@ import { RedactedAccountSchema } from "../../../services/accountService";
 import { IN_VM_SIGN_IN_REQUIRED } from "../../../services/accountLoginService";
 import { checkFederationToken, type FederationDeps } from "./shared";
 import { listOlderLiveSiblingDaemons } from "../../../services/siblingDaemonVersions";
+import type { InstanceKind } from "@hapi/protocol/instanceKind";
+import {
+  ANTHROPIC_LOGIN_INHERITED_STORE_CODE,
+  ANTHROPIC_LOGIN_INHERITED_STORE_MESSAGE,
+  getServerInstanceKind,
+  isInheritedStoreOn,
+} from "../../../services/serverInstanceKind";
 
 /**
  * Node-targeted Anthropic login, peer side (issue #4462, epic #4460 B).
@@ -40,9 +47,12 @@ const IN_VM_REFUSAL =
   "This node is a hosted VM: sign in there with Claude Code's own /login.";
 
 export function createFederationAnthropicLoginRoutes(
-  deps: FederationDeps
+  deps: FederationDeps,
+  // Issue #6756 (round 3, E1): this instance's kind (defaults to the boot reading).
+  routeOpts: { getInstanceKind?: () => InstanceKind } = {}
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
+  const instanceKind = routeOpts.getInstanceKind ?? getServerInstanceKind;
 
   app.post(
     "/federation/anthropic-login/start",
@@ -69,6 +79,18 @@ export function createFederationAnthropicLoginRoutes(
     async c => {
       if (!checkFederationToken(deps, c.req.header("authorization"))) {
         return c.json({ error: "Unauthorized" }, 401);
+      }
+      // #6756 (round 3, E1): on a test instance whose store predates this work, a sign-in
+      // would be saved and then hidden by every reader, so refuse it before any login work.
+      const accounts = deps.getAccountService();
+      if (accounts && isInheritedStoreOn(instanceKind(), accounts.storeDir)) {
+        return c.json(
+          {
+            error: ANTHROPIC_LOGIN_INHERITED_STORE_MESSAGE,
+            code: ANTHROPIC_LOGIN_INHERITED_STORE_CODE,
+          },
+          409
+        );
       }
       const svc = deps.getAccountLoginService?.();
       if (!svc) {

@@ -74,6 +74,7 @@ import {
   getTmuxSessionPid,
 } from "./tmuxSpawnAdapter";
 import { isEnvTokenAccount } from "@hapi/protocol/accounts";
+import { HAPI_INSTANCE_KIND_ENV } from "@hapi/protocol/instanceKind";
 import { accountStore } from "@/accounts/accountStore";
 import { resolveUnpinnedSpawnAccount } from "@/accounts/selectHealthyAccount";
 import { generateSessionId } from "@/utils/id";
@@ -134,6 +135,17 @@ import { getSpawnPaused } from "./spawnPauseState";
 const DEPS_TEARDOWN_SETTLE_MS = 30_000;
 
 type GitRepoProbeFailure = Exclude<GitRepoProbe, { state: "repo" }>;
+
+/**
+ * Issue #6980 (R7): the kind a wrapper on a TEST instance is handed, on both spawn arms.
+ * Its own reading has no systemd unit signal, and a tmux-persisted one inherits the tmux
+ * server's environment. Only ever `test`: no other value could lift a test signal.
+ */
+function testInstanceKindEnv(ctx: DaemonContext): Record<string, string> {
+  return ctx.instanceKind?.kind === "test"
+    ? { [HAPI_INSTANCE_KIND_ENV]: "test" }
+    : {};
+}
 
 /** Issue #5106 (R6): the cause of a failed git-ness probe, for the daemon log. */
 function describeGitRepoProbeFailure(probe: GitRepoProbeFailure): string {
@@ -494,6 +506,27 @@ export function createSessionSpawner(
     // A claude respawn or successor of an unbound session (ruling D1 = (a)):
     // warned about below once it is known whether the instance token serves it.
     let unboundCarryOver: "respawn" | "successor" | null = null;
+    // Issue #6756 (ER-D1, R13): a test instance whose account store predates this work
+    // (a port's data dir outlives its worktree) binds nothing from it. Every spawn that
+    // would bind a store account (pinned, the active.json default, a respawn or a
+    // successor; claude, codex or gemini) is refused here, before any store read or tmux
+    // work. An explicit-token spawn, an API-key session and an un-pinned opencode spawn
+    // bind no store record, so they keep their paths, as for no_bindable_account; a PINNED
+    // opencode spawn binds its account (below), so it is refused too. Nothing in the store
+    // is read, deleted or moved; Matt's existing-copies decision (Q5) settles it.
+    const inheritedStore = ctx.instanceKind?.inheritedStore;
+    if (
+      inheritedStore &&
+      (agent !== "opencode" || requestedAccountUuid) &&
+      !options.token &&
+      !apiKeyBinding
+    ) {
+      const errorMessage = `This test instance's account store on ${os.hostname()} predates #6756 (${inheritedStore.records} records), so none of it is used: sign-ins on this port wait until the existing-copies decision is carried out, or use another worktree port`;
+      logger.warn(
+        `[DAEMON RUN] spawn refused (inherited_store): ${errorMessage}`
+      );
+      return { type: "error", code: "inherited_store", errorMessage };
+    }
     if (apiKeyBinding) {
       // Issue #4568 (R3/R6): an API-key session binds NO account — it skips the
       // #3023 un-pinned veto and the #3611 optimal pick entirely (treated as
@@ -2080,6 +2113,7 @@ export function createSessionSpawner(
           // CLI child (stamped in buildSessionMetadata). Merged last so it is
           // never shadowed; label-only, never a secret (R4).
           HAPI_AUTH_BINDING: tmuxAuthBindingJson,
+          ...testInstanceKindEnv(ctx),
         },
         // Issue #1661: reconnect kill-vs-reattach intent + the daemon-local
         // liveness checker the adapter calls when killLivePane===false. The
@@ -2946,6 +2980,7 @@ export function createSessionSpawner(
         extraEnv = {
           ...extraEnv,
           HAPI_AUTH_BINDING: JSON.stringify(authBinding),
+          ...testInstanceKindEnv(ctx),
         };
       }
 

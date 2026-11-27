@@ -31,6 +31,8 @@ import type { McpSet } from "@hapi/protocol";
 import type { GitHubRepo } from "@hapi/protocol/githubRepo";
 import {
   ANTHROPIC_LOGIN_CAPABILITY,
+  API_KEY_CREDIT_REPORT_CAPABILITY,
+  FederationApiKeyOutOfCreditSchema,
   FederationApiKeyRefusalSchema,
   FederationApiKeyResolvedSchema,
   FederationApiKeySecretSchema,
@@ -40,6 +42,7 @@ import {
   type FederationApiKeySpawnBody,
   type FederationApiKeyResolved,
   type FederationSharedApiKeys,
+  normalizeMcpSet,
   parseNodeAccountHealthPerEntry,
   SupervisedLoop,
   displayNodeLabel,
@@ -52,6 +55,7 @@ import type {
   ClaudeAccountInfo,
   DaemonCapSource,
 } from "@hapi/protocol/schemas";
+import { parseManagerStampReason } from "@hapi/protocol/schemas";
 import { isEffortLevel, type EffortLevel } from "@hapi/protocol/effort";
 import type { SSEManager } from "../sse/sseManager";
 import { resolvePinsEnabled } from "../config/pinsConfig";
@@ -61,6 +65,7 @@ import {
   BILLABLE_SWITCH_STORE_CAPABILITY,
   BILLING_CATEGORIES_OWNER_CAPABILITY,
   BillableSwitchHeaderSchema,
+  type BillableSwitchBranchClaim,
   type BillableSwitchHeader,
   type BillableSwitchMode,
 } from "@hapi/protocol";
@@ -509,6 +514,20 @@ function isInvalidTokenBody(text: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The warnings of a peer's spawn accept, each one that `SpawnWarningSchema`
+ * knows (a closed enum), the rest dropped. Both spawn paths read them, so an
+ * API-key spawn's `tracking_not_applied` reaches the hub too (#6778 FND-1).
+ */
+function acceptWarnings(accept: unknown): SpawnWarning[] {
+  const warnings = (accept as { warnings?: unknown } | null)?.warnings;
+  if (!Array.isArray(warnings)) return [];
+  return warnings.flatMap(w => {
+    const p = SpawnWarningSchema.safeParse(w);
+    return p.success ? [p.data] : [];
+  });
 }
 
 /**
@@ -1634,6 +1653,39 @@ export class NodeRegistry {
     }
   }
 
+  /** Issue #6740: the key counterpart of {@link updateCachedSessionAccount} — a
+   *  peer-owned session now bills an API key, so the account fields go, as on the
+   *  owner's record. Only the key's reference is cached, never its mask (the
+   *  summary projects `apiKeyId` alone). No-ops if metadata is null. */
+  updateCachedSessionApiKeyBinding(
+    sessionId: string,
+    apiKeyId: string,
+    authBinding: AuthBinding
+  ): void {
+    for (const cached of this.sessionCache.values()) {
+      const session = cached.sessions.find(s => s.id === sessionId);
+      if (session?.metadata) {
+        session.metadata.apiKeyId = apiKeyId;
+        session.metadata.authBinding = authBinding;
+        delete session.metadata.accountUuid;
+        delete session.metadata.claudeAccount;
+        return;
+      }
+    }
+  }
+
+  /** Issue #6740: a set the owner saved for a peer-owned session's next start, in
+   *  the form its record holds it (the owner normalizes the same way). */
+  updateCachedSessionMcpSet(sessionId: string, mcpSet: McpSet): void {
+    for (const cached of this.sessionCache.values()) {
+      const session = cached.sessions.find(s => s.id === sessionId);
+      if (session?.metadata) {
+        session.metadata.mcpSet = normalizeMcpSet(mcpSet);
+        return;
+      }
+    }
+  }
+
   /**
    * Update a cached session's live-control fields after a successful federation
    * proxy mutation (#3083). Guards on `if (session)` — NOT `if (session?.metadata)`
@@ -1809,6 +1861,19 @@ export class NodeRegistry {
       session.needsReviewOverride =
         (data.needsReviewOverride as "read" | "unread" | null) ?? null;
     }
+    // Issue #6918: the manager stamp, by the same `in` guard. The owning node is
+    // the only writer (set once at spawn); an unknown reason reads as undecided.
+    if ("managerSessionId" in data) {
+      session.managerSessionId =
+        typeof data.managerSessionId === "string"
+          ? data.managerSessionId
+          : null;
+    }
+    if ("managerStampReason" in data) {
+      const reason = parseManagerStampReason(data.managerStampReason);
+      if (reason) session.managerStampReason = reason;
+      else delete session.managerStampReason;
+    }
     // Issue #6646: the billable switch, by the same `in` guard. A malformed value
     // drops the field to "unknown", never to "off"; a change stamps the session so
     // an older poll in flight cannot undo it.
@@ -1868,7 +1933,9 @@ export class NodeRegistry {
    */
   async spawnOnNode(
     nodeId: string,
-    body: FederationSpawnBody
+    body: FederationSpawnBody,
+    /** #6778 (4.2 row 9): the caller's namespace, forwarded so the peer's guard on a queued start applies. */
+    namespace?: string
   ): Promise<
     | {
         type: "success";
@@ -1896,7 +1963,13 @@ export class NodeRegistry {
       // in the background on the node). Additive log; grep `[perf][spawn]`.
       const perfDispatchT0 = Date.now();
       // Default timeout is fine — node responds immediately (fire-and-forget).
-      const res = await this.fetchWithAuth(url, "POST", body);
+      const res = await this.fetchWithAuth(
+        url,
+        "POST",
+        body,
+        undefined,
+        namespace ? { "X-Hapi-Caller-Namespace": namespace } : undefined
+      );
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         // Issue #5879: keep a peer's coded refusal (e.g. 409 account_exhausted)
@@ -1932,12 +2005,7 @@ export class NodeRegistry {
 
       // Node returns { type: "accepted" } — translate to success with empty
       // sessionId so the client knows to navigate to the session list.
-      const warnings = Array.isArray(accept?.warnings)
-        ? accept.warnings.flatMap(w => {
-            const p = SpawnWarningSchema.safeParse(w);
-            return p.success ? [p.data] : [];
-          })
-        : [];
+      const warnings = acceptWarnings(accept);
       const account = SpawnAccountSchema.safeParse(accept?.account);
       return {
         type: "success",
@@ -1965,9 +2033,11 @@ export class NodeRegistry {
    */
   async spawnApiKeyOnNode(
     nodeId: string,
-    body: FederationApiKeySpawnBody
+    body: FederationApiKeySpawnBody,
+    /** #6778 (4.2 row 9): as `spawnOnNode`. */
+    namespace?: string
   ): Promise<
-    | { type: "success"; sessionId: string }
+    | { type: "success"; sessionId: string; warnings?: SpawnWarning[] }
     | { type: "error"; message: string; code?: string; status?: number }
   > {
     const state = this.nodeStates.get(nodeId);
@@ -1992,7 +2062,7 @@ export class NodeRegistry {
         "POST",
         body,
         SPAWN_TIMEOUT_MS,
-        undefined,
+        namespace ? { "X-Hapi-Caller-Namespace": namespace } : undefined,
         "error"
       );
     } catch (err) {
@@ -2044,7 +2114,13 @@ export class NodeRegistry {
         err
       );
     });
-    return { type: "success", sessionId: "" };
+    // #6778 FND-1: the accept's warnings, as spawnOnNode keeps them.
+    const warnings = acceptWarnings(json);
+    return {
+      type: "success",
+      sessionId: "",
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
   }
 
   /** Reconnect a session on a remote node via its federation API.
@@ -2122,7 +2198,8 @@ export class NodeRegistry {
     nodeId: string,
     sessionId: string,
     namespace: string,
-    branchLabel?: string
+    branchLabel?: string,
+    claim?: BillableSwitchBranchClaim
   ): Promise<
     | { type: "success"; newSessionId: string }
     | { type: "error"; message: string; code?: string }
@@ -2137,7 +2214,20 @@ export class NodeRegistry {
       const res = await this.fetchWithAuth(
         url,
         "POST",
-        { branchLabel },
+        // #6778 PR-C (Task 15b): the hub's claim, never its `inheritClaim`, so a
+        // branch that arrives over the hop always waits (ruling 5).
+        {
+          branchLabel,
+          ...(claim
+            ? {
+                claim: {
+                  actor: claim.actor,
+                  via: claim.via,
+                  entryNodeId: claim.entryNodeId,
+                },
+              }
+            : {}),
+        },
         undefined,
         { "X-Hapi-Caller-Namespace": namespace }
       );
@@ -2484,12 +2574,24 @@ export class NodeRegistry {
    * node. Returns the node's sha256-hex fingerprint (or null when it owns no
    * isolated dir for the account). NEVER carries a raw refresh token across the
    * federation boundary — only its fingerprint.
+   *
+   * Issue #6997: the reply may also carry every layout's fingerprint, the
+   * sign-in deadlines and the sign-in markers (hashes and times only); they are
+   * optional because an older peer omits them, and untyped beyond that because
+   * the aggregator normalizes them.
    */
   async getAccountChainFingerprintOnNode(
     nodeId: string,
     accountUuid: string
   ): Promise<
-    | { type: "success"; fingerprint: string | null }
+    | {
+        type: "success";
+        fingerprint: string | null;
+        layoutFingerprints?: unknown;
+        deadlineAt?: unknown;
+        layouts?: unknown;
+        markers?: unknown;
+      }
     | { type: "error"; message: string }
   > {
     return this.proxyToNode(nodeId, "/api/federation/chain-fingerprint", {
@@ -2871,13 +2973,47 @@ export class NodeRegistry {
   }
 
   /**
+   * #6978: report to its home that the provider refused a session on this node
+   * for lack of credit on a shared key, so the home stamps it out of credit.
+   * Sent only to a home that advertises `api-keys:credit-report`; an older home
+   * answers `unsupported` with no request made.
+   */
+  async reportApiKeyOutOfCreditOnNode(
+    homeNodeId: string,
+    body: { id: string; expectedMasked: string; sessionId?: string }
+  ): Promise<ApiKeyCallOutcome<{ stampedAt?: string; changed?: boolean }>> {
+    const outcome = await this.apiKeyCall(
+      homeNodeId,
+      "/api/federation/api-keys/out-of-credit",
+      { ...body, homeNodeId, requestingNodeId: this.config.nodeId },
+      FederationApiKeyOutOfCreditSchema,
+      FETCH_TIMEOUT_MS,
+      API_KEY_CREDIT_REPORT_CAPABILITY
+    );
+    return outcome.kind === "ok"
+      ? {
+          kind: "ok",
+          value: {
+            ...(outcome.value.stampedAt !== undefined
+              ? { stampedAt: outcome.value.stampedAt }
+              : {}),
+            ...(outcome.value.changed !== undefined
+              ? { changed: outcome.value.changed }
+              : {}),
+          },
+        }
+      : outcome;
+  }
+
+  /**
    * #5127: one structured shared-API-key call. Never `proxyToNode`, which
    * folds a peer's response text into its error message: here a response is
    * read only through the schema the caller names, an unexpected answer becomes
    * a fixed message, and no response text, request body or key reaches an error
    * or a log. The home is found by its self-reported node id; a node without the
    * capability, offline, or reached at a non-tailnet URL is refused before any
-   * request is sent. Redirects fail rather than follow.
+   * request is sent. Redirects fail rather than follow. `capability` is the tag
+   * the home must advertise (#6978: the out-of-credit report needs its own).
    */
   private async apiKeyCall<T>(
     homeNodeId: string,
@@ -2886,12 +3022,13 @@ export class NodeRegistry {
     schema: {
       safeParse(v: unknown): { success: true; data: T } | { success: false };
     },
-    timeoutMs: number = FETCH_TIMEOUT_MS
+    timeoutMs: number = FETCH_TIMEOUT_MS,
+    capability: string = SHARED_API_KEYS_CAPABILITY
   ): Promise<ApiKeyCallOutcome<T>> {
     const state = this.findNodeStateByIdentity(homeNodeId);
     if (!state) return { kind: "unknown_node" };
     if (state.status === "offline") return { kind: "offline" };
-    if (!this.nodeSupports(state.config.id, SHARED_API_KEYS_CAPABILITY)) {
+    if (!this.nodeSupports(state.config.id, capability)) {
       return { kind: "unsupported" };
     }
     if (!(await this.homeUrlGuard(state.config.url))) {

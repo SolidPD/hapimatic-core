@@ -53,8 +53,12 @@ import { createBookmarksRoutes } from "./routes/bookmarks";
 import { createCliPinRoutes } from "./routes/cliPins";
 import { createPinsRoutes } from "./routes/pins";
 import { createBillableSwitchRoutes } from "./routes/billableSwitch";
+import { createBillableTrackingRoutes } from "./routes/billableTracking";
 import { createBillingCategoryRoutes } from "./routes/billingCategories";
-import { BillingCategoryService } from "../billingCategories/billingCategoryService";
+import {
+  BillingCategoryService,
+  createTrackingCategoryLookupGetter,
+} from "../billingCategories/billingCategoryService";
 import { getProcessBillingCategoriesState } from "../federation/capabilityDetector";
 import { createPinByIdRoutes } from "./routes/pinById";
 import { createPinDashboardsRoutes } from "./routes/pinDashboards";
@@ -91,7 +95,11 @@ import { createNetworkRoutes } from "./routes/network";
 import { TailscaleJoinService } from "../services/tailscaleJoinService";
 import { readProviderAuthState } from "../services/providerAuthState";
 import { CodexLoginService } from "../services/codexLoginService";
-import { readSettings } from "../config/settings";
+import {
+  readSettings,
+  SETTINGS_UNREADABLE_MESSAGE,
+  SettingsUnreadableError,
+} from "../config/settings";
 import { createNodesRoutes } from "./routes/nodes";
 import { createAboutRoutes } from "./routes/about";
 import { createNodeCapacityRoutes } from "./routes/nodeCapacity";
@@ -133,6 +141,7 @@ import { createHealthReadTokenVerifier } from "../config/healthReadToken";
 import { createUpdateRoutes } from "./routes/update";
 import { createUploadRoutes } from "./routes/upload";
 import { createWatermarkRoutes } from "./routes/watermark";
+import { createContextResetRoutes } from "./routes/contextReset";
 import { createJobsRoutes } from "./routes/jobs";
 import { createImpactArtifactRoutes } from "./routes/impactArtifact";
 import { createHarnessAnalysisRoutes } from "./routes/harnessAnalysis";
@@ -238,6 +247,7 @@ import type { FederationConfig } from "@hapi/protocol";
 import type { HeartbeatService } from "../extensions/heartbeat/heartbeatService";
 import type { SchedulerService } from "../extensions/scheduler/scheduler/schedulerService";
 import type { ContextWatermarkService } from "../watermark/contextWatermarkService";
+import type { ContextResetService } from "../contextReset/service";
 import type { SSEManager } from "../sse/sseManager";
 import type { EmbeddedWebAsset } from "./embeddedAssets";
 import { pollMcpStatusOnDemand } from "../utils/mcpPoller";
@@ -246,6 +256,8 @@ import type { Store } from "../store";
 import type { ErrorLogger } from "../logging/errorLogger";
 import { HTTPException } from "hono/http-exception";
 import { devManifestResponse, MANIFEST_PATH } from "./instanceManifest";
+import { describeInstanceKind } from "@hapi/protocol/instanceKind";
+import { initServerInstanceKind } from "../services/serverInstanceKind";
 import {
   createCompanionHelperRoutes,
   createCompanionRoutes,
@@ -312,6 +324,11 @@ export function buildWebApp(options: {
   getSchedulerService: () => SchedulerService | null;
   /** Issue #2158: context-watermark successor-handoff status/override service. */
   getContextWatermarkService: () => ContextWatermarkService | null;
+  /**
+   * Issue #6559: the context-reset service behind the read and cancel routes;
+   * wired in `index.ts`. Absent or null, those routes answer 503.
+   */
+  getContextResetService?: () => ContextResetService | null;
   getNodeRegistry: () => NodeRegistry | null;
   /** Issue #4913: the notify() service behind /api/notifications. */
   getNotificationService?: () => NotificationService | null;
@@ -477,6 +494,23 @@ export function buildWebApp(options: {
         });
       }
       return err.getResponse();
+    }
+
+    // #4056 R1: a settings.json writer reached with no try (PUT
+    // /preferences/ceiling-guard, the heartbeat PUT/DELETE, the watchdog PUT)
+    // refused an unreadable file and wrote nothing. Answer the fixed message; the
+    // path goes to the log only, and no file content reaches either (R4).
+    if (err instanceof SettingsUnreadableError) {
+      options.errorLogger?.warn(
+        `${SETTINGS_UNREADABLE_MESSAGE}: ${err.settingsFile}`,
+        {
+          category: "http",
+          statusCode: 500,
+          requestPath: c.req.path,
+          requestMethod: c.req.method,
+        }
+      );
+      return c.json({ error: SETTINGS_UNREADABLE_MESSAGE }, 500);
     }
 
     // NOTE: Sentry capture is handled via options.errorLogger.error() below,
@@ -676,6 +710,17 @@ export function buildWebApp(options: {
     })
   );
 
+  // Issue #6756 (TC1): the instance kind, read ONCE here; the provider import, the
+  // Provider Accounts OpenAI rows, the account list and the OpenAI login start read it.
+  const instanceKindReading = initServerInstanceKind({
+    dataDir: configuration.dataDir,
+    serverPort: configuration.webappPort,
+  });
+  console.log(`[INSTANCE] ${describeInstanceKind(instanceKindReading)}`);
+  for (const what of instanceKindReading.unreadable) {
+    console.warn(`[INSTANCE] could not read the ${what}; counted as absent`);
+  }
+
   // Account store access for issue #1451 (Sub-Issue E). One instance per
   // server; reads/writes <dataDir>/accounts — the same directory the cli
   // AccountStore writes (both HAPI_HOME-rooted). Shared by the accounts,
@@ -783,8 +828,9 @@ export function buildWebApp(options: {
 
   // Issue #6542: let the payment-method switch resolve a key another node shares
   // (`<uuid>@<home>`) through the same service the spawn, launcher and picker use.
-  // No `requireShared`: a switch picked on the session's own node may bill any of
-  // its keys, and the home itself refuses a foreign key it does not share.
+  // A switch picked on the session's own node may bill any of its keys; one a peer
+  // places here passes `requireShared` (#6740), which must reach the service. The
+  // home itself refuses a foreign key it does not share.
   options
     .getSyncEngine()
     ?.setApiKeyRefResolver((ref, o) =>
@@ -880,12 +926,16 @@ export function buildWebApp(options: {
     "/api",
     createFederationRoutes({
       getBillingCategoryService,
+      // #6997 (M10): read every account-folder layout, as account-health does.
+      chainFactsOptions: { dataDir: configuration.dataDir },
       pinsEnabled: resolvePinsEnabled(),
       getPinAnswersTimeZone: browserZone =>
         resolvePinAnswersTimeZone(configuration.dataDir, browserZone),
       getPinPreferenceTimeZone: () =>
         resolvePinPreferenceTimeZone(configuration.dataDir),
       getSyncEngine: options.getSyncEngine,
+      // #6778 PR-C (Task 14): the tracking receivers read the record here.
+      getStore: () => options.store,
       getSseManager: options.getSseManager,
       getNodeRegistry: options.getNodeRegistry,
       getHealthAggregator: options.getHealthAggregator,
@@ -1181,6 +1231,22 @@ export function buildWebApp(options: {
       billableSwitchMode,
       getSessionService: getPinSessionService,
       getNodeRegistry: options.getNodeRegistry,
+    })
+  );
+
+  // Issue #6778 PR-C (Task 13): the tracking record's routes, beside the
+  // switch's (the JWT middleware above is their auth; each route runs the gate).
+  // #6779's lookup reaches the PUT through the one getter (ruling P-8).
+  app.route(
+    "/api",
+    createBillableTrackingRoutes(options.getSyncEngine, {
+      billableSwitchMode,
+      store: options.store,
+      getSessionService: getPinSessionService,
+      getNodeRegistry: options.getNodeRegistry,
+      getTrackingCategoryLookup: createTrackingCategoryLookupGetter(
+        getBillingCategoryService
+      ),
     })
   );
 
@@ -1564,6 +1630,12 @@ export function buildWebApp(options: {
       getAccountService: () => accountService,
       // Issue #6171: a project's default MCP set and the project-disabled check.
       getMcpCatalog: () => options.getSyncEngine()?.getMcpCatalog() ?? null,
+      // Issue #6778 (Task 15; #6779 P-8): an agent's parent record, and the
+      // category lookup for a person's tracked start.
+      getStore: () => options.store,
+      getTrackingCategoryLookup: createTrackingCategoryLookupGetter(
+        getBillingCategoryService
+      ),
     })
   );
   // hapimatic-private#4481: Create-page Branch control listing (local + federated).
@@ -1647,6 +1719,16 @@ export function buildWebApp(options: {
       // #2587: settings.json persistence for the enable/disable toggle.
       dataDir: configuration.dataDir,
     })
+  );
+  // #6559: the context-reset read and cancel routes (no PUT, no arm route:
+  // ruling Q7a; the wrapper arms over its own socket).
+  app.route(
+    "/api",
+    createContextResetRoutes(
+      options.getSyncEngine,
+      options.getContextResetService ?? (() => null),
+      { errorLogger: options.errorLogger, dataDir: configuration.dataDir }
+    )
   );
   app.route(
     "/api",

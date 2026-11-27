@@ -36,6 +36,7 @@ import { requireSessionFromParam, requireSyncEngine } from "./guards";
 import { cataloged } from "../../capabilities/cataloged";
 import {
   floorAgentMcpEnable,
+  inheritStartClaim,
   refuseAgentArchive,
   resolveCallerSession,
 } from "./agentEscalation";
@@ -940,12 +941,21 @@ export function createSessionsRoutes(
         // Empty body is fine — branchLabel is optional
       }
 
+      // #6778 PR-C (Task 15b, ruling 5): who asked. A person's branch in the
+      // app does not wait; the CLI's verb, a tool and the hop do (row 6a or 6b).
+      const claim = inheritStartClaim(
+        c,
+        engine,
+        engine.getBillableSwitchService?.()?.localNodeId()
+      );
+
       // Session must exist (can be active or inactive — branching forks history)
       const sessionResult = requireSessionFromParam(c, engine);
       if (!(sessionResult instanceof Response)) {
         const result = await engine.branchSession(
           sessionResult.sessionId,
-          branchLabel
+          branchLabel,
+          claim
         );
         if (result.type === "success") {
           return c.json({ ok: true, newSessionId: result.newSessionId });
@@ -968,7 +978,8 @@ export function createSessionsRoutes(
             node.nodeId,
             sessionId,
             c.get("namespace"),
-            branchLabel
+            branchLabel,
+            claim
           );
           if (result.type === "success") {
             return c.json({ ok: true, newSessionId: result.newSessionId });
@@ -1496,8 +1507,9 @@ export function createSessionsRoutes(
       // Account existence + refreshability (and, issue #4823, an API-key target's
       // launcher / local-mode / agent fitness and its key: a bare id in the vault,
       // or a shared key's home check, #6542) are validated inside the engine on
-      // the OWNING node — where the session runs. A key target for a peer-owned
-      // session is refused by the service before any proxy, naming the owner.
+      // the OWNING node — where the session runs. For a peer-owned session the
+      // service proxies the target; a key goes by qualified ref only, and only to
+      // an owner that takes one (#6740).
       const target: PaymentMethodTarget =
         parsed.data.apiKeyId !== undefined
           ? { kind: "api-key", apiKeyId: parsed.data.apiKeyId }

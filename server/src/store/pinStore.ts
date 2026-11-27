@@ -22,6 +22,7 @@ import {
   PIN_SAVE_NOT_SAVED_PATH_MAX,
   type PinNotSavedFile,
   settlingAnswer,
+  shortenStoredNote,
 } from "@hapi/protocol";
 import {
   deadlineOffForQuestion,
@@ -33,10 +34,17 @@ import {
   type DeadlineState,
   type DeadlineTransition,
 } from "./pinDeadlineRules";
+import {
+  detectedJsonFor,
+  parseClosure,
+  PinClosureStore,
+  repeatsJson,
+  rowClosure,
+} from "./pinClosures";
 import { mintPinId } from "./pinIds";
 
 /** Raw `session_pins` row as stored (epoch-ms timestamps, JSON text columns). */
-type PinRow = {
+export type PinRow = {
   session_id: string;
   key: string;
   status: PinStatus;
@@ -70,6 +78,11 @@ type PinRow = {
   // #6574, added by `migrateAddColumn` (store/index.ts); null only on a row an
   // older binary inserted, until the next start's backfill.
   pin_id?: string | null;
+  // #6456, added by `migrateAddColumn` (store/index.ts); null until used.
+  closure_json?: string | null;
+  repeats_json?: string | null;
+  reopened_at?: number | null;
+  detected_json?: string | null;
 };
 
 /** A pin's deadline as the scheduler reads it, with the content it must re-check (#6452). */
@@ -126,12 +139,15 @@ export type PinUpsertOptions = {
   /** Set on creation only: jump-to-chat means where the pin was first raised. */
   postedSeq?: number | null;
   anchor?: PinAnchor | null;
+  /** #6456: a Detected pin's answer-key codes; an update keeps its links. */
+  detectedCodes?: string[] | null;
   now?: number;
 };
 
 export type PinUpsertOutcome =
-  | { pin: Pin; change: "created" | "updated" | null }
-  /** Changed content on an answered or dismissed pin, with no `reopen`. */
+  /** `superseded` (#6456, R9): the session's open pins this create replaced. */
+  | { pin: Pin; change: "created" | "updated" | null; superseded?: Pin[] }
+  /** Changed content on an answered or dismissed pin, with no `reopen` (or #6456). */
   | { closed: Pin }
   | { missing: true }
   | { capped: "open" | "total" };
@@ -161,6 +177,8 @@ export type PinAnswerInput = {
    * session's Project Manager (#6454).
    */
   deliveredTo?: string;
+  /** #6969 (E2): the message holding the whole note; named by a shortened stored copy, never stored itself. */
+  noteWhere?: string;
   /**
    * The operator dismissed the pin in a Submit (#6539). The entry is recorded
    * with `dismissed: true` and `resolves: false`, so it is never read as an
@@ -168,6 +186,9 @@ export type PinAnswerInput = {
    * `dismissed`. A moot one changes nothing.
    */
   dismisses?: true;
+  /** #6456 (R7): a Project Manager's ruling: its session and name. */
+  bySession?: string;
+  byName?: string;
   now?: number;
 };
 
@@ -317,17 +338,12 @@ function parseNotSaved(
 }
 
 /**
- * A note as stored: within the read schema's cap. Cleaning can lengthen a note
- * that arrived at the cap (an approval token becomes a longer placeholder), and
- * one oversized note would make every read of the session's pins fail (#6450).
- * Never splits a surrogate pair.
+ * A note as stored, within the read schema's cap (#6450): cleaning can lengthen
+ * a note at the cap (a token's placeholder is longer), and one oversized note
+ * fails every read. #6969: a longer note keeps its start and a `where` marker.
  */
-function clampNote(note: string): string {
-  if (note.length <= PIN_ANSWER_NOTE_MAX_CHARS) return note;
-  let end = PIN_ANSWER_NOTE_MAX_CHARS;
-  const last = note.charCodeAt(end - 1);
-  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
-  return note.slice(0, end);
+function clampNote(note: string, where?: string): string {
+  return shortenStoredNote(note, PIN_ANSWER_NOTE_MAX_CHARS, where);
 }
 
 /**
@@ -345,9 +361,16 @@ function clampNote(note: string): string {
  */
 export class PinStore {
   private readonly db: Database;
+  /** #6456: a pin settled elsewhere (pinClosures.ts). */
+  readonly closures: PinClosureStore;
 
   constructor(db: Database) {
     this.db = db;
+    this.closures = new PinClosureStore(db, {
+      getRow: (sessionId, key) => this.getRow(sessionId, key),
+      toPin: row => this.rowToPin(row),
+      countOpen: sessionId => this.countOpen(sessionId),
+    });
   }
 
   private rowToPin(row: PinRow): Pin {
@@ -383,6 +406,9 @@ export class PinStore {
       savedSkippedFiles: parseNotSaved(row.saved_skipped_json, row.saved_at),
       // #6574: after the content spread, so content can never shadow the ID.
       pinId: row.pin_id ?? null,
+      // #6456: server-owned, after the spread for the same reason.
+      closure: parseClosure(row.closure_json),
+      reopenedAt: row.reopened_at ? iso(row.reopened_at) : null,
       createdAt: iso(row.created_at),
       updatedAt: iso(row.updated_at),
       deadlineAt: running ? iso(row.deadline_at as number) : null,
@@ -463,11 +489,15 @@ export class PinStore {
    * | open, live                         | no-op             | revision +1                     |
    * | answered, auto-answered, dismissed | no-op             | refused; `reopen` re-opens, +1  |
    * | withdrawn                          | re-opens, same rev | re-opens, revision +1          |
+   * | withdrawn, superseded (#6456)      | `closed`          | re-opens, +1, closure cleared   |
+   * | withdrawn, superseded `detected:`  | `closed`          | `closed`                        |
    *
    * A closed pin refuses changed content because agents regenerate their text
    * after a compaction, and a tick carrying a timestamp would otherwise re-ask the
-   * operator forever. A withdrawn pin re-opens because only the agent withdraws, so
-   * a re-post is a deliberate re-raise.
+   * operator forever. A plain withdrawn pin re-opens: only its agent withdrew it,
+   * so a re-post is a deliberate re-raise. A superseded pin was settled elsewhere
+   * (#6456, R2), so only changed content raises it, and a Detected one stays
+   * closed; once the operator reopens it, it is a plain pin (`countedClosure`).
    */
   upsert(
     sessionId: string,
@@ -488,7 +518,7 @@ export class PinStore {
       if (settled) return settled;
       const now = options.now ?? Date.now();
       return row
-        ? this.applyUpdate(row, content, canonical, now)
+        ? this.applyUpdate(row, content, canonical, options, now)
         : this.applyCreate(sessionId, content, canonical, options, now);
     });
     return run.immediate();
@@ -502,6 +532,10 @@ export class PinStore {
   ): PinUpsertOutcome | null {
     if (!row) return options.mustExist ? { missing: true } : null;
     const same = row.content_json === canonical;
+    // #6456 (R2): superseded stays closed (the table above).
+    if (rowClosure(row) && (same || row.key.startsWith("detected:"))) {
+      return { closed: this.rowToPin(row) };
+    }
     // `reopen` only re-asks with changed content, so a loop that keeps passing it
     // cannot re-ask a question the operator already answered.
     if (same && (STICKY_STATUSES.has(row.status) || isActive(row.status))) {
@@ -548,8 +582,8 @@ export class PinStore {
            (session_id, key, status, revision, posted_seq, anchor_json,
             content_json, created_at, updated_at,
             deadline_at, deadline_by, deadline_revision, deadline_id, deadline_changed_at,
-            pin_id)
-         VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            pin_id, repeats_json, detected_json)
+         VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         sessionId,
@@ -561,11 +595,16 @@ export class PinStore {
         now,
         now,
         ...deadlineParams(deadline),
-        pinId
+        pinId,
+        repeatsJson(content),
+        detectedJsonFor(content.key, options.detectedCodes, null)
       );
+    // #6456 (R9): past the caps and insert, so a capped create replaces none.
+    const superseded = this.closures.replace(sessionId, content, pinId, now);
     return {
       pin: this.rowToPin(this.getRow(sessionId, content.key) as PinRow),
       change: "created",
+      ...(superseded.length > 0 ? { superseded } : {}),
     };
   }
 
@@ -573,6 +612,7 @@ export class PinStore {
     row: PinRow,
     content: PinContent,
     canonical: string,
+    options: PinUpsertOptions,
     now: number
   ): PinUpsertOutcome {
     const status = activeStatusFor(content);
@@ -606,11 +646,13 @@ export class PinStore {
       now,
       newId: newDeadlineId,
     });
+    // #6456: a re-raise clears the closure (R2); `reopened_at` stays (R8).
     this.db
       .prepare(
         `UPDATE session_pins
          SET ${seen}status = ?, revision = ?, content_json = ?, updated_at = ?,
-             ${DEADLINE_ASSIGN}
+             ${DEADLINE_ASSIGN},
+             closure_json = NULL, repeats_json = ?, detected_json = ?
          WHERE session_id = ? AND key = ?`
       )
       .run(
@@ -619,6 +661,8 @@ export class PinStore {
         canonical,
         now,
         ...deadlineParams(deadline),
+        repeatsJson(content),
+        detectedJsonFor(row.key, options.detectedCodes, row.detected_json),
         row.session_id,
         row.key
       );
@@ -820,7 +864,9 @@ export class PinStore {
       ...(input.option !== undefined ? { option: input.option } : {}),
       ...(label !== undefined ? { label } : {}),
       ...(input.text !== undefined ? { text: input.text } : {}),
-      ...(input.note !== undefined ? { note: clampNote(input.note) } : {}),
+      ...(input.note !== undefined
+        ? { note: clampNote(input.note, input.noteWhere) }
+        : {}),
       ...(input.steps ? { steps: input.steps } : {}),
       ...(input.submission !== undefined
         ? { submission: input.submission }
@@ -829,6 +875,8 @@ export class PinStore {
         ? { deliveredTo: input.deliveredTo }
         : {}),
       ...(input.dismisses === true ? { dismissed: true as const } : {}),
+      ...(input.bySession ? { bySession: input.bySession } : {}),
+      ...(input.byName ? { byName: input.byName.slice(0, 200) } : {}),
       // A dismissal never resolves, whatever the caller passed: `settlingAnswer`
       // and `answerOnRecord` must not read it as an answer (#6539).
       resolves: input.dismisses === true ? false : resolves,
@@ -1354,19 +1402,21 @@ export class PinStore {
     }));
   }
 
-  /** Keys starting `prefix`, optionally in one status (#6455). Reads no JSON. */
+  /** Keys starting `prefix` (#6455; `notReopened`, #6456). Reads no JSON. */
   listKeysByPrefix(
     sessionId: string,
     prefix: string,
-    status?: PinStatus
+    status?: PinStatus,
+    options: { notReopened?: boolean } = {}
   ): string[] {
     const statusClause = status ? "AND status = ?" : "";
+    const reopened = options.notReopened ? "AND reopened_at IS NULL" : "";
     const params: string[] = [sessionId, prefix, prefixEnd(prefix)];
     if (status) params.push(status);
     const rows = this.db
       .prepare(
         `SELECT key FROM session_pins
-         WHERE session_id = ? AND key >= ? AND key < ? ${statusClause}
+         WHERE session_id = ? AND key >= ? AND key < ? ${statusClause} ${reopened}
          ORDER BY created_at ASC, key ASC`
       )
       .all(...params) as Array<{ key: string }>;

@@ -51,6 +51,11 @@ export const PROGRAMMATIC_SENT_FROM_VALUES = [
   // the operator: it must not reset the runaway ceiling guard (#5254), abort an
   // auto-recovery, or run user-prompt hooks.
   "pin-deadline",
+  // #6559: the context-reset service's resume message, sent at a lane's stage
+  // boundary (`CONTEXT_RESET_SENT_FROM`). Server-built text, not the operator:
+  // it must not reset the ceiling guard, abort an auto-recovery, or run
+  // user-prompt hooks (so the approval-token gate never sees it).
+  "stage-reset",
 ] as const;
 
 /** The `sentFrom` union both `sendMessage` signatures accept. */

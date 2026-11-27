@@ -12,6 +12,7 @@ import { buildSystemPrompt } from "./utils/systemPrompt";
 import { withBunRuntimeEnv } from "@/utils/bunRuntime";
 import { getDefaultClaudeCodePath } from "./sdk/utils";
 import { FORBIDDEN_CLAUDE_ARGS, buildLauncherEnv } from "./launcherShared";
+import { sessionConfigDirOverride } from "./testInstanceConfigDir";
 
 export interface ClaudePtyOptions {
   path: string;
@@ -47,7 +48,9 @@ export async function claudePty(
     );
   }
 
-  const projectDir = getProjectPath(opts.path);
+  // Issue #6980: where this child's transcripts are, on a test instance; else undefined.
+  const configDir = sessionConfigDirOverride(opts.claudeEnvVars);
+  const projectDir = getProjectPath(opts.path, configDir);
   mkdirSync(projectDir, { recursive: true });
 
   if (opts.claudeArgs) {
@@ -87,7 +90,10 @@ export async function claudePty(
   const hasResumeFlag = opts.claudeArgs?.includes("--resume");
   const hasUserSessionControl = Boolean(hasContinueFlag || hasResumeFlag);
   let startFrom = opts.sessionId;
-  if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
+  if (
+    opts.sessionId &&
+    !claudeCheckSession(opts.sessionId, opts.path, configDir)
+  ) {
     startFrom = null;
   }
   if (startFrom && !hasUserSessionControl) {
@@ -109,6 +115,9 @@ export async function claudePty(
     );
   }
 
+  // Before the MCP config: its test-instance guard throws before a file is written (#6980).
+  const baseEnv = buildLauncherEnv(opts.claudeEnvVars);
+
   const cleanupMcpConfig = safeMode
     ? null
     : appendMcpConfigArg(args, opts.mcpServers, {
@@ -127,7 +136,6 @@ export async function claudePty(
     args.push("--settings", opts.hookSettingsPath);
   }
 
-  const baseEnv = buildLauncherEnv(opts.claudeEnvVars);
   const finalEnv = withBunRuntimeEnv(baseEnv, { allowBunBeBun: false });
   const claudePath = getDefaultClaudeCodePath();
 

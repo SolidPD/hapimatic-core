@@ -91,9 +91,11 @@ kind. Every pin has an ID (`pin-` and ten characters) that `pin_get({id})` reads
 so a lane names a pin by its ID when it reports to its project manager. Use a `hapi_pin` fenced
 block only when the pin tools are absent. The operator's answers arrive as one `hapi_pin_answers/1`
 message whose entries each carry a `pinId`; a `dismissed` entry means the operator dismissed that
-pin, so treat it as closed and do not ask it again. Put a pin's files in the folders `pin_folder`
-returns (the saved one under `GeneratedFiles/pins/` for a file you keep building on), never loose
-in `GeneratedFiles/`. End a status report that has open pins with one count line,
+pin, so treat it as closed and do not ask it again. An entry with `writeIn` is the operator's own
+answer in their own words and settles the pin like a choice; every decision and variants pin offers
+one, so add no option that points to the note. Put a pin's files in the folders `pin_folder` returns
+(the saved one under `GeneratedFiles/pins/` for a file you keep building on), never loose in
+`GeneratedFiles/`. End a status report that has open pins with one count line,
 `📌 N open (M new: <titles>)`.
 
 Without Pins there is no tab and no pin tools, and a `hapi_pin` block is dropped with no notice, so

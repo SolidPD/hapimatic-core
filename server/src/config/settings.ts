@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { StoredApiKey } from "@hapi/protocol/schemas";
 import type { CompactAtStored } from "@hapi/protocol";
+import { describeErrorKind } from "../utils/errorKind";
 
 export interface Settings {
   machineId?: string;
@@ -181,8 +182,13 @@ export async function readSettings(
     const content = await readFile(settingsFile, "utf8");
     return JSON.parse(content);
   } catch (error) {
-    // Return null to signal parse error - caller should not overwrite
-    console.error(`[WARN] Failed to parse ${settingsFile}: ${error}`);
+    // Return null to signal a read or parse error - caller should not overwrite.
+    // #4168 (folded into #4056, R4): log the path and the error kind only. A
+    // JSON.parse message can quote the file (Bun echoes an unquoted identifier
+    // in full), and this file holds tokens and provider keys.
+    console.error(
+      `[WARN] Failed to read or parse ${settingsFile} (${describeErrorKind(error)})`
+    );
     return null;
   }
 }

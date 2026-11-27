@@ -9,6 +9,7 @@ import { parse as parseYaml } from "yaml";
 // accepted v0.1 coupling (Open Risk R-3). The imported module is a type-only
 // leaf, so this adds no runtime dependency.
 import { geminiSlashCommands } from "@/extensions/agent-gemini/slashCommands";
+import { wrapperClaudeDir } from "@/claude/testInstanceConfigDir";
 
 export interface SlashCommand {
   name: string;
@@ -97,8 +98,7 @@ function parseFrontmatter(fileContent: string): {
 function getUserCommandsDir(agent: string): string | null {
   switch (agent) {
     case "claude": {
-      const configDir =
-        process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+      const configDir = process.env.CLAUDE_CONFIG_DIR ?? wrapperClaudeDir();
       return join(configDir, "commands");
     }
     case "codex": {
@@ -202,7 +202,7 @@ async function scanUserCommands(agent: string): Promise<SlashCommand[]> {
  * Each skill is a directory containing a SKILL.md with YAML frontmatter.
  */
 async function scanSkills(): Promise<SlashCommand[]> {
-  const configDir = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
+  const configDir = process.env.CLAUDE_CONFIG_DIR ?? wrapperClaudeDir();
   const skillsDir = join(configDir, "skills");
 
   try {

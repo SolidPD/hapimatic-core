@@ -91,6 +91,8 @@ export function registerTerminalHandlers(
     terminalSocket.emit(event, payload);
   };
 
+  // #6974: exempt from the runner identity gate (socket-bound), see
+  // socketEventClasses.ts. D-T2: markActivity below runs before the owner test.
   socket.on("terminal:ready", (data: unknown) => {
     const parsed = terminalReadySchema.safeParse(data);
     if (!parsed.success) {
@@ -116,6 +118,7 @@ export function registerTerminalHandlers(
     });
   });
 
+  // #6974: exempt (socket-bound), socketEventClasses.ts; D-T2 as above.
   socket.on("terminal:output", (data: unknown) => {
     const parsed = terminalOutputSchema.safeParse(data);
     if (!parsed.success) {
@@ -125,6 +128,7 @@ export function registerTerminalHandlers(
     forwardTerminalEvent("terminal:output", parsed.data);
   });
 
+  // #6974: exempt (socket-bound), see socketEventClasses.ts.
   socket.on("terminal:exit", (data: unknown) => {
     const parsed = terminalExitSchema.safeParse(data);
     if (!parsed.success) {
@@ -146,6 +150,7 @@ export function registerTerminalHandlers(
     terminalSocket.emit("terminal:exit", parsed.data);
   });
 
+  // #6974: exempt (socket-bound), see socketEventClasses.ts.
   socket.on("terminal:error", (data: unknown) => {
     const parsed = terminalErrorSchema.safeParse(data);
     if (!parsed.success) {

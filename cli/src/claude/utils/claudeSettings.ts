@@ -8,8 +8,8 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { logger } from "@/ui/logger";
+import { wrapperClaudeDir } from "../testInstanceConfigDir";
 
 export interface ClaudeSettings {
   includeCoAuthoredBy?: boolean;
@@ -20,8 +20,7 @@ export interface ClaudeSettings {
  * Get the path to Claude's settings.json file
  */
 function getClaudeSettingsPath(): string {
-  const claudeConfigDir =
-    process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const claudeConfigDir = process.env.CLAUDE_CONFIG_DIR || wrapperClaudeDir();
   return join(claudeConfigDir, "settings.json");
 }
 

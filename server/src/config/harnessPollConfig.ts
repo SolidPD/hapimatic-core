@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { getSettingsFile, readSettings, writeSettings } from "./settings";
+import {
+  getSettingsFile,
+  readSettings,
+  updateSettings,
+  type Settings,
+} from "./settings";
 
 /**
  * Harness-poll config loader (issue #1770). Reads the `"harnessPoll"` key of
@@ -76,29 +81,30 @@ export async function loadHarnessPollConfig(
  * clamp the interval to the minimum (R2/KD-7) → atomic write → return the
  * reloaded config (save-then-read-back, so the caller sees exactly what will
  * run). No env-var tier (KD-8) — settings.json is the single source of truth.
+ * #4056: through `updateSettings`, so an unreadable file is refused with
+ * `SettingsUnreadableError` and left byte-identical.
  */
 export async function saveHarnessPollConfig(
   dataDir: string,
   updates: Partial<HarnessPollConfig>
 ): Promise<HarnessPollConfig> {
   const settingsFile = getSettingsFile(dataDir);
-  const settings = (await readSettings(settingsFile)) ?? {};
-  const raw = (settings as Record<string, unknown>).harnessPoll;
-  const existing = raw && typeof raw === "object" ? raw : {};
+  await updateSettings(settingsFile, current => {
+    const raw = (current as Record<string, unknown>).harnessPoll;
+    const existing = raw && typeof raw === "object" ? raw : {};
 
-  const merged: Record<string, unknown> = { ...existing, ...updates };
-  // R2/KD-7: clamp the interval to the floor BEFORE persisting so a 0/negative/
-  // sub-minimum value can never reach the poll loop. Defense-in-depth — the PUT
-  // route's Zod is the primary type gate (a bare Math.max is NOT a type gate:
-  // Math.max(MIN, NaN) is NaN, which would persist as null).
-  if (typeof merged.pollIntervalMs === "number") {
-    merged.pollIntervalMs = Math.max(
-      MIN_HARNESS_POLL_INTERVAL_MS,
-      merged.pollIntervalMs
-    );
-  }
-  (settings as Record<string, unknown>).harnessPoll = merged;
-
-  await writeSettings(settingsFile, settings);
+    const merged: Record<string, unknown> = { ...existing, ...updates };
+    // R2/KD-7: clamp the interval to the floor BEFORE persisting so a 0/negative/
+    // sub-minimum value can never reach the poll loop. Defense-in-depth — the PUT
+    // route's Zod is the primary type gate (a bare Math.max is NOT a type gate:
+    // Math.max(MIN, NaN) is NaN, which would persist as null).
+    if (typeof merged.pollIntervalMs === "number") {
+      merged.pollIntervalMs = Math.max(
+        MIN_HARNESS_POLL_INTERVAL_MS,
+        merged.pollIntervalMs
+      );
+    }
+    return { ...current, harnessPoll: merged } as Settings;
+  });
   return loadHarnessPollConfig(dataDir);
 }

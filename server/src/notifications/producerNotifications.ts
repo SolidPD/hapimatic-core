@@ -2,6 +2,7 @@
 import {
   ACCOUNT_UNREFRESHABLE_MESSAGE,
   type NotifyInput,
+  type TrackingLostCause,
 } from "@hapi/protocol";
 
 // Per-kind notification inputs for the server producers (issue #4914, epic
@@ -443,6 +444,91 @@ export function spawnFailedNotification(args: {
       spawnCorrelationId: args.spawnCorrelationId,
       nodeId: args.nodeId,
       nodeLabel: args.nodeLabel,
+    }),
+  };
+}
+
+/** #6778 PR-C: a lost start's cause, in the words a person reads. */
+const LOST_CAUSE_WORDS: Record<TrackingLostCause, string> = {
+  expired: "they expired before the session registered",
+  namespace: "the session that registered for them is in another namespace",
+  "hook-failed": "applying them failed",
+  unreadable: "they could not be read",
+  "queue-failed": "they could not be saved",
+};
+
+/**
+ * #6778 PR-C (moved item 3; plan section 5 row 12, 4.2 row 10): a start with
+ * tracking settings was lost. At registration it names the new session; at
+ * the sweep (an expired entry, raised at expiry) and when the queue write
+ * itself failed (moved item 6) no session exists yet. An
+ * `error`, because it is raised once and never again; not mirrored, because
+ * the lost start writes its own error-log row. The cause only: the requested
+ * values (a rate, a note) never go into a notice.
+ */
+export function trackingStartLostNotification(args: {
+  tag: string;
+  lostCause: TrackingLostCause;
+  sessionId: string | null;
+  when: "registration" | "sweep" | "queue";
+  namespace: string | null;
+}): ProducerNotification {
+  const why = LOST_CAUSE_WORDS[args.lostCause];
+  const beforeRegistration = args.when !== "registration";
+  return {
+    kind: "tracking-not-applied",
+    severity: "error",
+    mirror: false,
+    namespace: args.namespace,
+    title: beforeRegistration
+      ? `Tracking settings ${args.when === "sweep" ? "queued " : ""}for a new session were lost (${why}): a session that starts under them starts untracked.`
+      : `A new session started untracked: its tracking settings were lost (${why}).`,
+    body: beforeRegistration
+      ? null
+      : "Its time is not tracked until its tracking is set by hand.",
+    sessionId: args.sessionId,
+    context: { tag: args.tag, lostCause: args.lostCause, when: args.when },
+  };
+}
+
+/**
+ * #6778 PR-C (moved item 3; plan 4.2 rows 6 and 10, 6.3): a session started on
+ * another node without the tracking it was given. An agent's copy the target
+ * cannot take (`tracking-unsupported`, ruling C3) or did not apply
+ * (`not-applied`) names the parent, whose history row records it; a person's
+ * carried start the target did not apply names no session. The node only.
+ * #6780 (Task 8): the spawn's `spawnCorrelationId` rides the context, so the
+ * tab that started the spawn shows one tracking pop-up for it (the hook's, the
+ * read-back's or this notice's); a random id, not a C7 value.
+ */
+export function trackingCopyNotSentNotification(args: {
+  reason: "tracking-unsupported" | "not-applied";
+  nodeId: string;
+  nodeLabel: string;
+  parentSessionId: string | null;
+  namespace: string;
+  spawnCorrelationId?: string;
+}): ProducerNotification {
+  const node = args.nodeLabel;
+  let title: string;
+  if (args.parentSessionId === null) {
+    title = `A new session on ${node} started untracked: ${node} did not apply its tracking settings.`;
+  } else if (args.reason === "tracking-unsupported") {
+    title = `A session started on ${node} without its parent's tracking: ${node} cannot take tracking settings.`;
+  } else {
+    title = `A session started on ${node} without its parent's tracking: ${node} did not apply it.`;
+  }
+  return {
+    kind: "tracking-not-applied",
+    namespace: args.namespace,
+    title,
+    body: null,
+    sessionId: args.parentSessionId,
+    context: defined({
+      nodeId: args.nodeId,
+      nodeLabel: node,
+      reason: args.reason,
+      spawnCorrelationId: args.spawnCorrelationId,
     }),
   };
 }

@@ -105,7 +105,12 @@ export const SELF_KNOWLEDGE_CEILING: Record<SelfKnowledgeScope, number> = {
   // 12,289 B; re-measured on top of #6570's bullet at 14,878 B, so this keeps
   // the larger ceiling. The 122 B margin holds #6224's 75 B but not #6559's
   // 100 B as well: whichever of those lands second raises again, in review.
-  user: 15000,
+  // RAISED to 15,300 B by #6803 (the Pins PM's ruling of 2026-11-21, ruled
+  // with the expert review): the Pins paragraph gains the 192 B write-in
+  // sentence. Measured render 14,878 B before and 15,071 B after. The
+  // raise keeps the budgets of #6224 (75 B) and #6559 (100 B), with about
+  // 54 B spare.
+  user: 15300,
   // Greenfield: no replaced-doc anchor. Fits the current full user∪operator
   // render (~16 KB) with headroom for the catalog to fill as #3745 lands more
   // RPC entries, and catches the ~64–80 KB REST-inclusion runaway (R3). A

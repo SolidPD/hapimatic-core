@@ -1,11 +1,29 @@
 // SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { logger } from "@/ui/logger";
 
+/**
+ * Issue #6559 (Task 2): what a queue item asks of the launcher besides its text.
+ * `"reset"` ends the conversation and starts a fresh one with the item's text as
+ * its first prompt (one item, so a reset can never arrive without its text).
+ */
+export type QueueControl = "reset";
+
 interface QueueItem<T> {
   message: string;
   mode: T;
   modeHash: string;
   isolate?: boolean; // If true, this message must be processed alone
+  control?: QueueControl;
+}
+
+/** One message as {@link MessageQueue2.waitForSingleMessage} hands it out. */
+export interface QueuedMessage<T> {
+  message: string;
+  mode: T;
+  hash: string;
+  isolate: boolean;
+  /** Present only on an item pushed or put back with a control (#6559). */
+  control?: QueueControl;
 }
 
 /**
@@ -125,8 +143,10 @@ export class MessageQueue2<T> {
       `[MessageQueue2] pushIsolateAndClear() called with mode hash: ${modeHash} - clearing ${this.queue.length} pending messages`
     );
 
-    // Clear any pending messages to ensure this message is processed in complete isolation
-    this.queue = [];
+    // Clear any pending messages to ensure this message is processed in complete isolation.
+    // Issue #6559: an item with a control (a reset and its text) stays, ahead of
+    // this one, so a typed /clear or /compact never discards the resume text.
+    this.queue = this.queue.filter(item => item.control !== undefined);
 
     this.queue.push({
       message,
@@ -154,6 +174,45 @@ export class MessageQueue2<T> {
   }
 
   /**
+   * Issue #6559 (Task 2): push one isolated item WITHOUT clearing the queue, so
+   * the messages queued before it keep their place. With `control: "reset"` the
+   * launcher ends the conversation and starts a fresh one with this text.
+   */
+  pushIsolate(
+    message: string,
+    mode: T,
+    opts: { control?: QueueControl } = {}
+  ): void {
+    if (this.closed) {
+      throw new Error("Cannot push to closed queue");
+    }
+
+    const modeHash = this.modeHasher(mode);
+    logger.debug(
+      `[MessageQueue2] pushIsolate() called with mode hash: ${modeHash}, control: ${opts.control ?? "none"}`
+    );
+
+    this.queue.push({
+      message,
+      mode,
+      modeHash,
+      isolate: true,
+      ...(opts.control ? { control: opts.control } : {}),
+    });
+
+    if (this.onMessageHandler) {
+      this.onMessageHandler(message, mode);
+    }
+
+    if (this.waiter) {
+      logger.debug(`[MessageQueue2] Notifying waiter for isolated message`);
+      const waiter = this.waiter;
+      this.waiter = null;
+      waiter(true);
+    }
+  }
+
+  /**
    * Push a message to the beginning of the queue with a mode.
    *
    * Issue #2346: `opts.isolate` (default false) marks the message as an isolate
@@ -162,8 +221,14 @@ export class MessageQueue2<T> {
    * mode hash. PLAN_FAKE_RESTART uses this so the ExitPlanMode approve→execute
    * flow keeps relaunching out of plan mode after `isPlan` was dropped from the
    * mode hasher (removing the hasher's isPlan flip that previously forced it).
+   * Issue #6559: `opts.control` goes back with the item, so a reset handed back
+   * to the queue still resets.
    */
-  unshift(message: string, mode: T, opts?: { isolate?: boolean }): void {
+  unshift(
+    message: string,
+    mode: T,
+    opts?: { isolate?: boolean; control?: QueueControl }
+  ): void {
     if (this.closed) {
       throw new Error("Cannot unshift to closed queue");
     }
@@ -178,6 +243,7 @@ export class MessageQueue2<T> {
       mode,
       modeHash,
       isolate: opts?.isolate ?? false,
+      ...(opts?.control ? { control: opts.control } : {}),
     });
 
     // Trigger message handler if set
@@ -298,12 +364,7 @@ export class MessageQueue2<T> {
   async waitForSingleMessage(
     abortSignal?: AbortSignal,
     onWaitStarted?: () => void
-  ): Promise<{
-    message: string;
-    mode: T;
-    isolate: boolean;
-    hash: string;
-  } | null> {
+  ): Promise<QueuedMessage<T> | null> {
     // If we have messages, return the first one immediately
     if (this.queue.length > 0) {
       return this.shiftOne();
@@ -332,12 +393,7 @@ export class MessageQueue2<T> {
   /**
    * Shift exactly one message from the front of the queue
    */
-  private shiftOne(): {
-    message: string;
-    mode: T;
-    hash: string;
-    isolate: boolean;
-  } | null {
+  private shiftOne(): QueuedMessage<T> | null {
     if (this.queue.length === 0) {
       return null;
     }
@@ -352,6 +408,7 @@ export class MessageQueue2<T> {
       mode: item.mode,
       hash: item.modeHash,
       isolate: item.isolate ?? false,
+      ...(item.control ? { control: item.control } : {}),
     };
   }
 

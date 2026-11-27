@@ -72,7 +72,52 @@ export type ProxyResult =
       exhaustion?: AccountExhaustion;
       // Issue #6171: the servers a peer's `mcp_server_project_disabled` names.
       servers?: string[];
+      // Issue #6778 PR-C (PRC-R4a): a peer's tracking refusal detail, typed
+      // and whitelisted by `trackingProxyDetail` (never the peer's whole body).
+      trackingDetail?: TrackingProxyDetail;
     };
+
+/**
+ * Issue #6778 PR-C (ruling PRC-R4a): the detail of a peer's tracking refusal
+ * that may ride on a proxied error: `earlierMs` and `token` as non-negative
+ * safe integers, `basis`, `field` and `reason` as strings of at most 200
+ * characters. Every other key of the peer's body is dropped, a value of the
+ * wrong type is dropped, and a body with none of the five gives `{}`, so a
+ * plain `{ error }` adds no key. The tracking routes check each value again,
+ * per code, before they forward it (`forwardedDetail`, `billableTrackingRemote.ts`).
+ */
+export type TrackingProxyDetail = {
+  earlierMs?: number;
+  basis?: string;
+  field?: string;
+  reason?: string;
+  token?: number;
+};
+
+export function trackingProxyDetail(body: unknown): {
+  trackingDetail?: TrackingProxyDetail;
+} {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return {};
+  }
+  const peer = body as Record<string, unknown>;
+  const detail: TrackingProxyDetail = {};
+  for (const key of ["earlierMs", "token"] as const) {
+    const value = peer[key];
+    if (
+      typeof value === "number" &&
+      Number.isSafeInteger(value) &&
+      value >= 0
+    ) {
+      detail[key] = value;
+    }
+  }
+  for (const key of ["basis", "field", "reason"] as const) {
+    const value = peer[key];
+    if (typeof value === "string" && value.length <= 200) detail[key] = value;
+  }
+  return Object.keys(detail).length > 0 ? { trackingDetail: detail } : {};
+}
 
 /**
  * The client-side proxy primitive. `SessionService.proxyToNode` matches this

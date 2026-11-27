@@ -29,9 +29,15 @@ import type {
 import type { BillableMode } from "../billable/mode";
 import { requestWaitRef } from "../billable/predicate";
 import { newUuidV7 } from "../store/turns/ids";
-import type { BillableSwitchInitial } from "../store/sessions";
+import type {
+  BillableSwitchInitial,
+  ManagerStampWrite,
+} from "../store/sessions";
 import type { BillableSwitchStartContext } from "@hapi/protocol";
 import {
+  deleteSpentPendingStart,
+  noteQueuedPendingStart,
+  recordUnqueuedStart,
   sweepExpiredPendingStarts,
   TRACKING_PENDING_START_MAX_AGE_MS,
   TRACKING_START_ERROR_CATEGORY,
@@ -106,6 +112,17 @@ export type BillableSwitchStartHook = (
   input: TrackingRegistration
 ) => BillableSwitchInitial | null;
 
+/**
+ * A queued spawn-parent link (#2479 / #2862) and, since #6918, the spawn's
+ * manager stamp, decided once at the spawn and applied with the link.
+ */
+type PendingParentLink = {
+  /** Absent on a stamp-only entry (a watermark successor, #6918 R9). */
+  parentSessionId?: string;
+  parentRelationship?: "branch" | "spawn";
+  stamp?: ManagerStampWrite;
+};
+
 export class SessionCache {
   private readonly sessions: Map<string, Session> = new Map();
   private readonly lastBroadcastAtBySessionId: Map<string, number> = new Map();
@@ -121,10 +138,14 @@ export class SessionCache {
    * branch label). Keyed by the daemon's result.sessionId, applied when the
    * session first appears in refreshSession — mirroring the branch race handling.
    */
-  private readonly pendingParentInfo: Map<
-    string,
-    { parentSessionId: string; parentRelationship: "branch" | "spawn" }
-  > = new Map();
+  private readonly pendingParentInfo: Map<string, PendingParentLink> =
+    new Map();
+  /**
+   * Issue #6918: when each uuid-keyed parent entry was queued, so the 30-minute
+   * sweep that ends the tag queue's slow leak ends this one's too (it was never
+   * swept: an entry whose child never registered stayed for the process's life).
+   */
+  private readonly pendingParentInfoQueuedAt: Map<string, number> = new Map();
   /**
    * #2862 (Fix 2): pending spawn-parent link keyed by the pre-generated session
    * TAG (hapiSessionId), NOT the store uuid. The uuid-keyed post-success stamp
@@ -136,10 +157,8 @@ export class SessionCache {
    * here and `getOrCreateSession` applies it when the child registers. Idempotent
    * with the uuid-keyed `pendingParentInfo` fallback (skips if already stamped).
    */
-  private readonly pendingParentInfoByTag: Map<
-    string,
-    { parentSessionId: string; parentRelationship: "branch" | "spawn" }
-  > = new Map();
+  private readonly pendingParentInfoByTag: Map<string, PendingParentLink> =
+    new Map();
   /** Issue #6646: when each tag-keyed parent entry was queued (the 30-minute sweep). */
   private readonly pendingParentQueuedAt: Map<string, number> = new Map();
   // Issue #6646, #6778 PR-B (ruling 6): the start context of a spawn, queued by
@@ -411,6 +430,18 @@ export class SessionCache {
     // start value first, then the parent link and the refresh (#6586's process
     // tracker goes after the refresh).
     this.sweepParentQueue(Date.now());
+    // Issue #6918: a queued stamp applies only when this registration creates
+    // the row, so learn whether the tag already names one (only when a stamp is
+    // queued for it; a failed lookup reads as "existed": no stamp, undecided).
+    let rowExisted = true;
+    if (this.pendingParentInfoByTag.get(tag)?.stamp) {
+      try {
+        rowExisted =
+          this.store.sessions.findSessionIdByTag(tag, namespace) !== null;
+      } catch {
+        rowExisted = true;
+      }
+    }
     const hook = this.billableSwitchStartHook;
     const initial = hook
       ? (): BillableSwitchInitial | null => {
@@ -486,7 +517,7 @@ export class SessionCache {
       (() => {
         throw new Error("Failed to load session");
       })();
-    this.applyPendingParentByTag(tag, session);
+    this.applyPendingParentByTag(tag, session, !rowExisted);
     this.noteBillableAttach(session);
     return session;
   }
@@ -507,10 +538,15 @@ export class SessionCache {
         entry.lostAt === null &&
         (entry.namespace === null || entry.namespace === namespace)
       ) {
-        this.store.billableTracking.deletePendingStart(tag);
+        // #6778 PR-C, moved item 8: a failed delete is logged and held as
+        // spent, never left to turn into a lost start.
+        deleteSpentPendingStart(this.store, tag, "reattach");
       }
-    } catch {
-      // The sweep removes it later.
+    } catch (error) {
+      this.logBillableStartProblem(
+        `Could not read the queued billable start of session ${tag} at its reattach (#6778).`,
+        { tag, reason: errorText(error) }
+      );
     }
   }
 
@@ -629,6 +665,7 @@ export class SessionCache {
         entryNodeId: context.entryNodeId ?? null,
         queuedAt: Date.now(),
       });
+      noteQueuedPendingStart(tag);
     } catch (error) {
       // Review finding M1 (first half): a dropped start is in the error log
       // too, not only on the console.
@@ -636,16 +673,27 @@ export class SessionCache {
         `Could not queue the billable start of session ${tag}: it registers with no start context, untracked (#6778).`,
         { tag, reason: errorText(error) }
       );
+      // Moved item 6 (M1, its second half): a start with settings is lost now,
+      // so its registration still writes the start-lost row.
+      recordUnqueuedStart(this.store, tag, context, Date.now());
     }
   }
 
   /** Issue #6646: drop a tag's queued start (a coded refusal proves no child exists). */
   deletePendingBillableSwitchStartByTag(tag: string): void {
-    try {
-      this.store.billableTracking.deletePendingStart(tag);
-    } catch {
-      // The sweep removes it later.
+    if (!this.billableSwitchStartHook) {
+      // No hook (the gate is not on): this process queues no start, so a delete
+      // that fails here is no news, as before PR-C.
+      try {
+        this.store.billableTracking.deletePendingStart(tag);
+      } catch {
+        // The sweep removes it later.
+      }
+      return;
     }
+    // #6778 PR-C, moved item 8: never swallowed (deleteSpentPendingStart logs
+    // a failure and holds the tag as spent, so it never turns into a lost start).
+    deleteSpentPendingStart(this.store, tag, "refused");
   }
 
   /** Issue #6646: drop a tag's queued parent link (a coded refusal proves no child exists). */
@@ -696,6 +744,13 @@ export class SessionCache {
         if (this.pendingParentInfoByTag.delete(tag)) dropped += 1;
       }
     }
+    // Issue #6918: the uuid-keyed queue by the same 30-minute rule.
+    for (const [id, queuedAt] of this.pendingParentInfoQueuedAt) {
+      if (now - queuedAt > PENDING_BY_TAG_MAX_AGE_MS) {
+        this.pendingParentInfoQueuedAt.delete(id);
+        if (this.pendingParentInfo.delete(id)) dropped += 1;
+      }
+    }
     return dropped;
   }
 
@@ -708,27 +763,66 @@ export class SessionCache {
    * successful daemon spawn. Idempotent with that uuid-keyed fallback — skips when
    * a parent is already set so a late post-success stamp can't be clobbered.
    */
-  private applyPendingParentByTag(tag: string, session: Session): void {
+  private applyPendingParentByTag(
+    tag: string,
+    session: Session,
+    rowCreated: boolean
+  ): void {
     const pending = this.pendingParentInfoByTag.get(tag);
     if (!pending) return;
     this.pendingParentInfoByTag.delete(tag);
     this.pendingParentQueuedAt.delete(tag);
-    if (session.parentSessionId) return;
-    const applied = this.store.sessions.updateSessionParentRelationship(
-      session.id,
-      pending.parentSessionId,
-      pending.parentRelationship,
-      session.namespace
-    );
-    if (applied) {
-      session.parentSessionId = pending.parentSessionId;
-      session.parentRelationship = pending.parentRelationship;
+    let changed = false;
+    if (
+      !session.parentSessionId &&
+      pending.parentSessionId &&
+      pending.parentRelationship
+    ) {
+      const applied = this.store.sessions.updateSessionParentRelationship(
+        session.id,
+        pending.parentSessionId,
+        pending.parentRelationship,
+        session.namespace
+      );
+      if (applied) {
+        session.parentSessionId = pending.parentSessionId;
+        session.parentRelationship = pending.parentRelationship;
+        changed = true;
+      }
+    }
+    // Issue #6918: the stamp only on the registration that created the row,
+    // because this apply also runs for a tag that already named a row.
+    if (pending.stamp && rowCreated) {
+      changed = this.applyManagerStamp(session, pending.stamp) || changed;
+    }
+    if (changed) {
       this.publisher.emit({
         type: "session-updated",
         sessionId: session.id,
         data: session,
       });
     }
+  }
+
+  /**
+   * Issue #6918: write a manager stamp through the set-once store writer and
+   * mirror it on the cached record. Never throws (the store writer is guarded),
+   * so a failed column migration costs neither the link nor the registration.
+   */
+  private applyManagerStamp(
+    session: Session,
+    stamp: ManagerStampWrite
+  ): boolean {
+    const written = this.store.sessions.setManagerStamp(
+      session.id,
+      stamp,
+      session.namespace
+    );
+    if (written) {
+      session.managerSessionId = stamp.managerSessionId;
+      session.managerStampReason = stamp.reason;
+    }
+    return written;
   }
 
   refreshSession(
@@ -838,15 +932,23 @@ export class SessionCache {
     const pendingParent = this.pendingParentInfo.get(sessionId);
     if (pendingParent) {
       this.pendingParentInfo.delete(sessionId);
-      const applied = this.store.sessions.updateSessionParentRelationship(
-        session.id,
-        pendingParent.parentSessionId,
-        pendingParent.parentRelationship,
-        session.namespace
-      );
+      this.pendingParentInfoQueuedAt.delete(sessionId);
+      const applied =
+        !!pendingParent.parentSessionId &&
+        !!pendingParent.parentRelationship &&
+        this.store.sessions.updateSessionParentRelationship(
+          session.id,
+          pendingParent.parentSessionId,
+          pendingParent.parentRelationship,
+          session.namespace
+        );
       if (applied) {
         session.parentSessionId = pendingParent.parentSessionId;
         session.parentRelationship = pendingParent.parentRelationship;
+      }
+      // Issue #6918: the stamp in its own guarded statement (set once).
+      if (pendingParent.stamp) {
+        this.applyManagerStamp(session, pendingParent.stamp);
       }
     }
 
@@ -1300,6 +1402,35 @@ export class SessionCache {
     return true;
   }
 
+  /**
+   * #6559 (R12, Task 10 item 9): a context reset gave the session a fresh
+   * conversation, so its last context figures are stale. Zero the used tokens and
+   * percentage (the window is unchanged), persist them through the same store
+   * call the alive handler uses, and broadcast. The alive handler keeps a figure
+   * whenever a tick omits the field, so without this the old value would stand
+   * until the fresh conversation's first report. Returns false for an unknown
+   * session.
+   */
+  zeroContextUsage(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    session.contextUsedTokens = 0;
+    session.contextPercentage = 0;
+    this.store.sessions.updateSessionContextUsage(
+      session.id,
+      session.contextWindowTokens ?? null,
+      0,
+      0,
+      session.namespace
+    );
+    this.publisher.emit({
+      type: "session-updated",
+      sessionId,
+      data: { contextUsedTokens: 0, contextPercentage: 0 },
+    });
+    return true;
+  }
+
   handleSessionEnd(payload: {
     sid: string;
     time: number;
@@ -1734,11 +1865,17 @@ export class SessionCache {
    * key), the same value the daemon's `computeAuthBinding` stamps at spawn.
    *
    * Issue #5819: also drops `apiKeyPlacedBy` — a key chosen on this node is a
-   * local binding, so a later unshare no longer blocks its relaunch.
+   * local binding, so a later unshare no longer blocks its relaunch — and writes
+   * the binding's own marker when another node placed the key here (#6740).
    */
   async updateSessionApiKeyBinding(
     sessionId: string,
-    binding: { apiKeyId: string; apiKeyMasked: string; displayIdentity: string }
+    binding: {
+      apiKeyId: string;
+      apiKeyMasked: string;
+      displayIdentity: string;
+      apiKeyPlacedBy?: string;
+    }
   ): Promise<boolean> {
     const authBinding: AuthBinding = {
       kind: "api-key",
@@ -1756,6 +1893,9 @@ export class SessionCache {
         ...rest,
         apiKeyId: binding.apiKeyId,
         apiKeyMasked: binding.apiKeyMasked,
+        ...(binding.apiKeyPlacedBy !== undefined
+          ? { apiKeyPlacedBy: binding.apiKeyPlacedBy }
+          : {}),
         authBinding,
       };
     });
@@ -2320,14 +2460,38 @@ export class SessionCache {
   queuePendingParentByTag(
     tag: string,
     parentSessionId: string,
-    parentRelationship: "branch" | "spawn"
+    parentRelationship: "branch" | "spawn",
+    stamp?: ManagerStampWrite
   ): void {
-    this.sweepPendingByTag();
-    this.pendingParentInfoByTag.set(tag, {
+    this.queuePendingByTag(tag, {
       parentSessionId,
       parentRelationship,
+      ...(stamp ? { stamp } : {}),
     });
+  }
+
+  /**
+   * Issue #6918: the one writer of the TAG-keyed queue. The entry and its
+   * queued-at time are always set together, so the 30-minute sweep sees every
+   * entry.
+   */
+  private queuePendingByTag(tag: string, entry: PendingParentLink): void {
+    this.sweepPendingByTag();
+    this.pendingParentInfoByTag.set(tag, entry);
     this.pendingParentQueuedAt.set(tag, Date.now());
+  }
+
+  /**
+   * Issue #6918: the one writer of the uuid-keyed queue. The entry and its
+   * queued-at time are always set together, so the 30-minute sweep sees every
+   * entry (before #6918 this queue kept no time and was never swept).
+   */
+  private queuePendingParentInfo(
+    sessionId: string,
+    entry: PendingParentLink
+  ): void {
+    this.pendingParentInfo.set(sessionId, entry);
+    this.pendingParentInfoQueuedAt.set(sessionId, Date.now());
   }
 
   /**
@@ -2343,15 +2507,17 @@ export class SessionCache {
   updateSessionParentRelationship(
     sessionId: string,
     parentSessionId: string,
-    parentRelationship: "branch" | "spawn"
+    parentRelationship: "branch" | "spawn",
+    stamp?: ManagerStampWrite
   ): void {
     const session =
       this.sessions.get(sessionId) ?? this.refreshSession(sessionId);
     if (!session) {
       // Child not registered yet — apply when it first appears (refreshSession).
-      this.pendingParentInfo.set(sessionId, {
+      this.queuePendingParentInfo(sessionId, {
         parentSessionId,
         parentRelationship,
+        ...(stamp ? { stamp } : {}),
       });
       return;
     }
@@ -2362,9 +2528,44 @@ export class SessionCache {
       parentRelationship,
       session.namespace
     );
-    if (updated) {
-      session.parentSessionId = parentSessionId;
-      session.parentRelationship = parentRelationship;
+    // Issue #6918: a spawn's stamp, set once, in its own guarded statement. The
+    // retroactive parent routes pass none (D5), so they never stamp.
+    const stamped = stamp ? this.applyManagerStamp(session, stamp) : false;
+    if (updated || stamped) {
+      if (updated) {
+        session.parentSessionId = parentSessionId;
+        session.parentRelationship = parentRelationship;
+      }
+      this.publisher.emit({
+        type: "session-updated",
+        sessionId: session.id,
+        data: session,
+      });
+    }
+  }
+
+  /**
+   * Issue #6918 (R9): queue a stamp with no parent link by TAG (a watermark
+   * successor sends a parent with no relationship), applied when the child
+   * first registers, under the same 30-minute sweep as the parent queue.
+   */
+  queuePendingManagerStampByTag(tag: string, stamp: ManagerStampWrite): void {
+    this.queuePendingByTag(tag, { stamp });
+  }
+
+  /**
+   * Issue #6918 (R9): the post-success half of a stamp with no parent link.
+   * Resolves the id through the cache; queues it when the child has not
+   * registered yet. Set once (the store writer never changes a decision).
+   */
+  updateSessionManagerStamp(sessionId: string, stamp: ManagerStampWrite): void {
+    const session =
+      this.sessions.get(sessionId) ?? this.refreshSession(sessionId);
+    if (!session) {
+      this.queuePendingParentInfo(sessionId, { stamp });
+      return;
+    }
+    if (this.applyManagerStamp(session, stamp)) {
       this.publisher.emit({
         type: "session-updated",
         sessionId: session.id,

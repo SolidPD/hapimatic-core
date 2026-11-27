@@ -261,8 +261,15 @@ function useGateMode(): "on" | "closed" | "off" {
   return data?.billableSwitch ?? "off";
 }
 
-/** The list, retired categories included; read while the gate is on or closed. */
-export function useBillingCategoryList(api: ApiClient | null) {
+/**
+ * The list, retired categories included; read while the gate is on or closed.
+ * `enabled: false` holds the read (#6780: the Create page reads only while its
+ * Time Tracking group is on); the Settings page passes no options.
+ */
+export function useBillingCategoryList(
+  api: ApiClient | null,
+  opts?: { enabled?: boolean }
+) {
   const mode = useGateMode();
   const queryClient = useQueryClient();
   return useQuery({
@@ -279,7 +286,7 @@ export function useBillingCategoryList(api: ApiClient | null) {
         throw err;
       }
     },
-    enabled: Boolean(api) && mode !== "off",
+    enabled: Boolean(api) && mode !== "off" && (opts?.enabled ?? true),
     staleTime: 15_000,
     retry: false,
   });

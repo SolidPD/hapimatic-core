@@ -8,6 +8,7 @@ import type {
   CeilingGuardConfigPatch,
   ClaudeAccountInfo,
   LinkedIssue,
+  ManagerStampReason,
   RepoIdentity,
   Session,
   SessionView,
@@ -303,6 +304,10 @@ export type SessionSummary = {
   parentSessionId?: string | null;
   /** Relationship to parent (issue #2479): "branch" (forked) or "spawn" (PM-spawned managed peer). */
   parentRelationship?: "branch" | "spawn" | null;
+  /** Issue #6918: nearest project manager above, claimed at spawn (null: unstamped). */
+  managerSessionId?: string | null;
+  /** Issue #6918: decision marker; absent means undecided (the sweep uses its own rule). */
+  managerStampReason?: ManagerStampReason;
   /** Branching: user-provided label for this branch */
   branchLabel?: string | null;
   /** Branching: timestamp when this branch was created */
@@ -423,6 +428,12 @@ export function toSessionSummary(
     uiCollapseState: session.uiCollapseState ?? null,
     parentSessionId: session.parentSessionId ?? null,
     parentRelationship: session.parentRelationship ?? null,
+    // Issue #6918: the manager stamp. The reason is spread only when decided,
+    // so an undecided session carries no reason key at all.
+    managerSessionId: session.managerSessionId ?? null,
+    ...(session.managerStampReason
+      ? { managerStampReason: session.managerStampReason }
+      : {}),
     branchLabel: session.branchLabel ?? null,
     branchCreatedAt: session.branchCreatedAt ?? null,
     childBranchCount: childBranchCount ?? 0,

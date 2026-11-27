@@ -10,6 +10,7 @@ import { withBunRuntimeEnv } from "@/utils/bunRuntime";
 import { spawnWithAbort } from "@/utils/spawnWithAbort";
 import { getDefaultClaudeCodePath } from "./sdk/utils";
 import { buildSdkSpawnEnv } from "./launcherShared";
+import { sessionConfigDirOverride } from "./testInstanceConfigDir";
 
 export async function claudeLocal(opts: {
   abort: AbortSignal;
@@ -28,8 +29,10 @@ export async function claudeLocal(opts: {
   allowedTools?: string[];
   hookSettingsPath: string;
 }) {
+  // Issue #6980: where this child's transcripts are, on a test instance; else undefined.
+  const configDir = sessionConfigDirOverride(opts.claudeEnvVars);
   // Ensure project directory exists
-  const projectDir = getProjectPath(opts.path);
+  const projectDir = getProjectPath(opts.path, configDir);
   mkdirSync(projectDir, { recursive: true });
 
   // Check if user passed explicit session control flags.
@@ -41,7 +44,10 @@ export async function claudeLocal(opts: {
   // - If resuming an existing session: use --resume (unless user already supplied session control)
   // - If starting fresh: let Claude create a new session ID (reported via SessionStart hook)
   let startFrom = opts.sessionId;
-  if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
+  if (
+    opts.sessionId &&
+    !claudeCheckSession(opts.sessionId, opts.path, configDir)
+  ) {
     startFrom = null;
   }
 
@@ -75,6 +81,18 @@ export async function claudeLocal(opts: {
     );
   }
 
+  // Prepare environment variables
+  // Note: Local mode uses global Claude installation
+  // Issue #3731 (R1): the account binding comes ONLY from the explicit
+  // `claudeEnvVars` — ambient BINDING_ENV_VARS (a stray CLAUDE_CODE_OAUTH_TOKEN /
+  // CLAUDE_CONFIG_DIR / HAPI_ACCOUNT_UUID) never reach the child. Same precedence as
+  // before: DISABLE_AUTOUPDATER sits in the base, the explicit set layers last.
+  // Before the MCP config: its test-instance guard throws before a file is written (#6980).
+  const env = buildSdkSpawnEnv(
+    { ...process.env, DISABLE_AUTOUPDATER: "1" },
+    opts.claudeEnvVars
+  );
+
   const cleanupMcpConfig = safeMode
     ? null
     : appendMcpConfigArg(args, opts.mcpServers, {
@@ -101,17 +119,6 @@ export async function claudeLocal(opts: {
   if (opts.claudeTrailingArgs) {
     args.push(...opts.claudeTrailingArgs);
   }
-
-  // Prepare environment variables
-  // Note: Local mode uses global Claude installation
-  // Issue #3731 (R1): the account binding comes ONLY from the explicit
-  // `claudeEnvVars` — ambient BINDING_ENV_VARS (a stray CLAUDE_CODE_OAUTH_TOKEN /
-  // CLAUDE_CONFIG_DIR / HAPI_ACCOUNT_UUID) never reach the child. Same precedence as
-  // before: DISABLE_AUTOUPDATER sits in the base, the explicit set layers last.
-  const env = buildSdkSpawnEnv(
-    { ...process.env, DISABLE_AUTOUPDATER: "1" },
-    opts.claudeEnvVars
-  );
 
   // Issue #5348: the flags only; the prompt after the -- marker is not written to the log.
   const loggedArgs = opts.claudeTrailingArgs

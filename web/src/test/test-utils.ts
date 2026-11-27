@@ -96,6 +96,7 @@ export function createMockApiClient(): Record<string, Mock> {
     getPinById: vi.fn(),
     // #6455: dismiss a pin
     dismissSessionPin: vi.fn(),
+    reopenSessionPin: vi.fn(),
     // #6453: Save to session folder
     savePinFiles: vi.fn(),
     getMessages: vi.fn(),

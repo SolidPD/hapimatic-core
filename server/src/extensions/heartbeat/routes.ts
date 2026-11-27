@@ -16,6 +16,7 @@ import { Hono } from "hono";
 import { defineCapability } from "@hapi/protocol";
 import type { WebAppEnv } from "../../web/middleware/auth";
 import type { HeartbeatService } from "./heartbeatService";
+import type { HeartbeatConfig } from "../../heartbeat/types";
 // #1274: the scheduler moved into `builtin.scheduler`. This is a TYPE-only
 // import across the core→extension boundary, kept until #1275 relocates these
 // heartbeat routes into `builtin.heartbeat`, which will read the scheduler
@@ -23,6 +24,7 @@ import type { HeartbeatService } from "./heartbeatService";
 import type { SchedulerService } from "../scheduler/scheduler/schedulerService";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import { logAndJson } from "../../web/routes/routeErrorHelper";
+import { readJsonBody } from "../../web/routes/jsonBody";
 import { cataloged } from "../../capabilities/cataloged";
 import {
   saveHeartbeatConfig,
@@ -172,7 +174,7 @@ export function createHeartbeatRoutes(
       const service = requireService(c);
       if (service instanceof Response) return service;
 
-      const body = await c.req.json();
+      const body = await readJsonBody<Partial<HeartbeatConfig> | null>(c);
       if (!body || typeof body !== "object") {
         return c.json({ error: "Invalid request body" }, 400);
       }
@@ -358,7 +360,7 @@ export function createHeartbeatRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody<{ content?: unknown } | null>(c);
       if (
         !body ||
         typeof body !== "object" ||

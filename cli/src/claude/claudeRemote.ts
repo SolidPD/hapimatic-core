@@ -30,10 +30,12 @@ import {
 } from "./utils/generateHookSettings";
 import { readBoundApiKeyBinding } from "./accountTokenInjection";
 import { sdkStartPermissionMode } from "./spawnPermissionSeed";
+import { sessionConfigDirOverride } from "./testInstanceConfigDir";
 import type { ClaudePermissionMode } from "@hapi/protocol/modes";
 import type { EffortLevel } from "@hapi/protocol/effort";
 import type { McpServerUsage } from "@hapi/protocol";
 import { delay } from "@/utils/time";
+import type { QueueControl } from "@/utils/MessageQueue2";
 
 /**
  * Issue #6627: how long the end of claudeRemote() waits for a resolved fetch's
@@ -86,7 +88,12 @@ export async function claudeRemote(opts: {
   ) => Promise<PermissionResult>;
 
   // Dynamic parameters
-  nextMessage: () => Promise<{ message: string; mode: EnhancedMode } | null>;
+  nextMessage: () => Promise<{
+    message: string;
+    mode: EnhancedMode;
+    /** Issue #6559: on the initial item only; "reset" starts a fresh conversation. */
+    control?: QueueControl;
+  } | null>;
   /**
    * Issue #6627 (R3): hands back a message that a fetch took after this call
    * began to end its claude child, so it reaches the next child, never the
@@ -157,9 +164,15 @@ export async function claudeRemote(opts: {
 }) {
   const debugPrefix = "[claudeRemote][async-debug]";
 
+  // Issue #6980: where this child's transcripts are, on a test instance; else undefined.
+  const configDir = sessionConfigDirOverride(opts.claudeEnvVars);
+
   // Check if session is valid
   let startFrom = opts.sessionId;
-  if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
+  if (
+    opts.sessionId &&
+    !claudeCheckSession(opts.sessionId, opts.path, configDir)
+  ) {
     startFrom = null;
   }
 
@@ -214,7 +227,11 @@ export async function claudeRemote(opts: {
   const claudeEnvVarsPrior = new Map<string, string | undefined>();
   if (opts.claudeEnvVars) {
     const mirrored = Object.entries(opts.claudeEnvVars).filter(
-      ([key]) => key !== "ANTHROPIC_API_KEY" && key !== "HAPI_SESSION_ID"
+      ([key]) =>
+        key !== "ANTHROPIC_API_KEY" &&
+        key !== "HAPI_SESSION_ID" &&
+        // Issue #6918: the agent marker belongs to the agent child only.
+        key !== "HAPI_AGENT_CALLER"
     );
     for (const [key] of mirrored) {
       claudeEnvVarsPrior.set(key, process.env[key]);
@@ -242,6 +259,18 @@ export async function claudeRemote(opts: {
     return;
   }
   logger.debug(`${debugPrefix} initial message acquired`);
+
+  // Issue #6559 (Task 2, R3): a context reset arrives as ONE item that carries
+  // its text. The old conversation ends here and a fresh one starts with that
+  // text as its first prompt: no resume id, forced AFTER the --resume scan
+  // above (which reads claudeArgs whenever the id is null and would bring the
+  // old conversation back), and no fork.
+  const resetLaunch = initial.control === "reset";
+  if (resetLaunch) {
+    opts.onCompletionEvent?.("Context was reset");
+    opts.onSessionReset?.();
+    startFrom = null;
+  }
 
   // Handle special commands
   const specialCommand = parseSpecialCommand(initial.message);
@@ -287,7 +316,7 @@ export async function claudeRemote(opts: {
   // shares the parent's claudeSessionId/transcript. Mirror the spawnTimeSafeMode
   // extraction and feed it to the query builder via sdkOptions.forkSession.
   const spawnTimeForkSession =
-    opts.claudeArgs?.includes("--fork-session") ?? false;
+    !resetLaunch && (opts.claudeArgs?.includes("--fork-session") ?? false);
   const resolvedSystemPrompt = spawnTimeSafeMode
     ? undefined
     : buildSystemPrompt(opts.path, { pinsEnabled: opts.pinsEnabled });
@@ -661,7 +690,7 @@ export async function claudeRemote(opts: {
           logger.debug(
             `[claudeRemote] Waiting for session file to be written to disk: ${systemInit.session_id}`
           );
-          const projectDir = getProjectPath(opts.path);
+          const projectDir = getProjectPath(opts.path, configDir);
           const found = await awaitFileExist(
             join(projectDir, `${systemInit.session_id}.jsonl`)
           );
@@ -770,7 +799,7 @@ export async function claudeRemote(opts: {
             logger.debug(
               `[claudeRemote] Session ID found from result message (fallback): ${resultMsg.session_id}`
             );
-            const projectDir = getProjectPath(opts.path);
+            const projectDir = getProjectPath(opts.path, configDir);
             const found = await awaitFileExist(
               join(projectDir, `${resultMsg.session_id}.jsonl`)
             );

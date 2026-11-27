@@ -29,9 +29,11 @@ import {
   PinAnswerButtons,
   PinAnswerFields,
   useAnswerPanels,
+  WriteInField,
 } from "@/components/pins/PinAnswerControls";
 import { PinDeadlineLine } from "@/components/pins/PinDeadlineLine";
 import { PinIdControl } from "@/components/pins/PinIdControl";
+import { PinSentAnswers } from "@/components/pins/PinSentAnswers";
 import {
   isDismissablePin,
   PinDismissAction,
@@ -54,7 +56,13 @@ import {
   type PinViewModel,
 } from "@/lib/pins/ledger";
 import { ACTION_COLLAPSE_RANK } from "@/lib/pins/actionRowFit";
-import { stageChoice, useStagedPin, useStepTicks } from "@/lib/pins/staging";
+import {
+  chooseWriteIn,
+  hasChosenWriteIn,
+  stageChoice,
+  useStagedPin,
+  useStepTicks,
+} from "@/lib/pins/staging";
 
 /** SimpleMarkdown that skips re-parsing while its text is unchanged (#4110). */
 const PinMarkdown = memo(SimpleMarkdown);
@@ -93,7 +101,10 @@ function DecisionBody(props: PinBodyProps) {
   const { sessionId, via } = usePinsContext();
   const staged = useStagedPin(sessionId, pin.key);
   const name = useId();
+  const writeInHint = useId();
   const options = orderedOptions(model);
+  // #6803: no words yet on a chosen write-in, so the row says what sending needs.
+  const writeInEmpty = !staged?.writeIn?.trim();
   return (
     <>
       {isChoosablePin(model) && staged?.dismiss !== true ? (
@@ -105,6 +116,21 @@ function DecisionBody(props: PinBodyProps) {
           onSelect={id => {
             const option = options.find(o => o.id === id);
             if (option) stageChoice(sessionId, pin, option, via);
+          }}
+          writeIn={{
+            selected: staged?.writeInChosen === true,
+            onSelect: () => chooseWriteIn(sessionId, pin, via),
+            empty: writeInEmpty,
+            hintId: writeInHint,
+            field: (
+              <WriteInField
+                sessionId={sessionId}
+                pin={pin}
+                via={via}
+                staged={staged?.writeIn ?? ""}
+                describedBy={writeInEmpty ? writeInHint : undefined}
+              />
+            ),
           }}
         />
       ) : (
@@ -207,7 +233,11 @@ export function PinDetail(props: {
   const Body = pinBodyFor(pin);
   const answerable = summary === undefined && isAnswerablePin(pin);
   const staged = useStagedPin(sessionId, pin.key);
-  const moot = staged?.choice === undefined ? mootNotice(pin) : undefined;
+  // #6803: a chosen write-in with words answers the pin again, as a choice does.
+  const moot =
+    staged?.choice === undefined && !hasChosenWriteIn(staged)
+      ? mootNotice(pin)
+      : undefined;
   const markdown = usePinMarkdownProps();
   const dismissable = summary === undefined && isDismissablePin(pin);
   const dismissal = useDismissStaging(pin);
@@ -302,6 +332,8 @@ export function PinDetail(props: {
       </PinActionRow>
       {dismissable ? dismissal.dialog : null}
       {answerable ? <PinAnswerFields model={model} panels={panels} /> : null}
+      {/* #6803 (R1): what was sent on this pin that left it open. */}
+      {answerable ? <PinSentAnswers pin={pin} /> : null}
       {showText ? <PinTextView text={pin.plainText} /> : null}
     </div>
   );

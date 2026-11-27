@@ -19,8 +19,8 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { wrapperClaudeDir } from "@/claude/testInstanceConfigDir";
 import { logger } from "@/ui/logger";
 
 /**
@@ -33,7 +33,7 @@ const PROFILE_ROLE_SET: ReadonlySet<string> = new Set(PROFILE_ROLES);
 
 /** Absolute path of the directory holding the role profile settings files. */
 export function defaultProfilesDir(): string {
-  return join(homedir(), ".claude", "profiles");
+  return join(wrapperClaudeDir(), "profiles");
 }
 
 /**

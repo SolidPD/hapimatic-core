@@ -5,7 +5,12 @@ import { defineCapability } from "@hapi/protocol";
 import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import { cataloged } from "../../../capabilities/cataloged";
 import { checkFederationToken, type FederationDeps } from "./shared";
-import { isolatedChainFingerprint } from "../../../services/isolatedCredentialsSync";
+import {
+  isolatedChainFacts,
+  type ChainLayoutFacts,
+  type ChainMarkerFacts,
+  type IsolatedChainFacts,
+} from "../../../services/isolatedCredentialsSync";
 
 /**
  * Issue #3784 — cross-node refresh-token chain-fingerprint endpoints.
@@ -22,9 +27,19 @@ import { isolatedChainFingerprint } from "../../../services/isolatedCredentialsS
  *
  *   GET /api/federation/account-chain-fingerprints?accountUuid= (JWT; aggregator)
  *     → {fingerprints: [{nodeId, nodeLabel, self, fingerprint}], degraded}
- *     Fans out to every ONLINE node via the local registry + this node's own
- *     fingerprint. `degraded` ⇒ at least one online node could not be reached
- *     (the consumer must then fail SAFE and skip rotation).
+ *     Fans out to every node that is not offline via the local registry + this
+ *     node's own fingerprint. `degraded` ⇒ at least one node it asked could not
+ *     be reached (the consumer must then fail SAFE and skip rotation).
+ *
+ * Issue #6997 (Task 4), additive: each answer also carries
+ * `layoutFingerprints` (every folder layout's fingerprint and, when the node's
+ * `~/.claude` login is this account, that chain's), `deadlineAt` (the first
+ * layout's sign-in deadline), `layouts` (each layout's fingerprint with ITS OWN
+ * deadline) and `markers` (each sign-in marker's fingerprint and time). Hashes
+ * and times only. The receivers read every layout with this node's data dir
+ * (`chainFactsOptions`). A reply from an older peer lacks them and reads as no
+ * layouts, no deadline and no markers. The aggregator now asks DEGRADED nodes
+ * too (M6), so a holder on a degraded peer is compared rather than skipped.
  */
 export function createChainFingerprintRoutes(
   deps: FederationDeps
@@ -42,7 +57,7 @@ export function createChainFingerprintRoutes(
         domain: "accounts",
         surface: "rest",
         description:
-          "Return this node's sha256 refresh-token chain fingerprint for an account (never the raw token), so a peer can prove chain independence before rotating.",
+          "Return this node's sha256 refresh-token fingerprints for an account (each folder layout and its login), sign-in deadlines and marker hashes and times (never a token), so a peer can prove independence.",
         whenToUse:
           "When a peer's idle-refresh backstop needs to know whether this node shares an account's refresh-token chain.",
         invocation: {
@@ -70,14 +85,17 @@ export function createChainFingerprintRoutes(
         return c.json({ error: "Invalid body" }, 400);
       }
       const nodeId = deps.getNodeRegistry()?.getLocalNodeId() ?? "local";
-      const fingerprint = isolatedChainFingerprint(parsed.data.accountUuid);
+      const facts = isolatedChainFacts(
+        parsed.data.accountUuid,
+        deps.chainFactsOptions
+      );
       // `type: "success"` is REQUIRED: the hub wrapper (NodeRegistry
       // .getAccountChainFingerprintOnNode → proxyToNode) returns this raw body as
       // its result, and the aggregator classifies it via `res.type === "success"`
       // (the convention every other /api/federation receiver follows). Without it
       // a healthy peer response is misread as an error → the aggregator marks the
       // pass degraded and the chain-independence verdict can never be "independent".
-      return c.json({ type: "success" as const, nodeId, fingerprint });
+      return c.json({ type: "success" as const, nodeId, ...facts });
     }
   );
 
@@ -90,7 +108,7 @@ export function createChainFingerprintRoutes(
         domain: "accounts",
         surface: "rest",
         description:
-          "List, per federation node, the sha256 refresh-token chain fingerprint for an account (never raw tokens) plus a degraded flag — the cross-node chain-independence probe.",
+          "List, per federation node, an account's sha256 refresh-token fingerprints, sign-in deadlines and sign-in marker hashes and times (never a token), plus a degraded flag — the chain-independence probe.",
         whenToUse:
           "When comparing an account's refresh-token chains across the mesh to decide whether a node may safely rotate its own copy.",
         invocation: {
@@ -114,17 +132,18 @@ export function createChainFingerprintRoutes(
       }
       const registry = deps.getNodeRegistry();
       const localNodeId = registry?.getLocalNodeId() ?? "local";
-      const fingerprints: Array<{
-        nodeId: string;
-        nodeLabel: string;
-        self: boolean;
-        fingerprint: string | null;
-      }> = [
+      const fingerprints: Array<
+        {
+          nodeId: string;
+          nodeLabel: string;
+          self: boolean;
+        } & IsolatedChainFacts
+      > = [
         {
           nodeId: localNodeId,
           nodeLabel: localNodeId,
           self: true,
-          fingerprint: isolatedChainFingerprint(accountUuid),
+          ...isolatedChainFacts(accountUuid, deps.chainFactsOptions),
         },
       ];
       let degraded = false;
@@ -133,11 +152,13 @@ export function createChainFingerprintRoutes(
         // single-node mesh genuinely has no remote holder to collide with.
         return c.json({ fingerprints, degraded });
       }
-      const online = registry
+      // #6997 (M6): every node that is not offline is asked, a degraded one
+      // included, so a holder there is compared instead of silently skipped.
+      const asked = registry
         .getNodeStates()
-        .filter(s => s.status === "online" && s.config.id !== localNodeId);
+        .filter(s => s.status !== "offline" && s.config.id !== localNodeId);
       const results = await Promise.all(
-        online.map(async s => {
+        asked.map(async s => {
           const res = await registry
             .getAccountChainFingerprintOnNode(s.config.id, accountUuid)
             .catch(() => ({ type: "error" as const, message: "throw" }));
@@ -150,11 +171,11 @@ export function createChainFingerprintRoutes(
             nodeId: state.config.id,
             nodeLabel: state.config.label,
             self: false,
-            fingerprint: res.fingerprint,
+            ...peerChainFacts(res),
           });
         } else {
-          // An online node we could not reach — its chain is UNKNOWN this pass,
-          // so the whole probe is degraded (the consumer fails safe).
+          // A node we asked and could not reach — its chain is UNKNOWN this
+          // pass, so the whole probe is degraded (the consumer fails safe).
           degraded = true;
         }
       }
@@ -163,4 +184,59 @@ export function createChainFingerprintRoutes(
   );
 
   return app;
+}
+
+/** A peer's chain-fingerprint reply as the hub wrapper returns it. */
+type PeerChainReply = {
+  fingerprint: string | null;
+  layoutFingerprints?: unknown;
+  deadlineAt?: unknown;
+  layouts?: unknown;
+  markers?: unknown;
+};
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function objects(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter(
+        (v): v is Record<string, unknown> => typeof v === "object" && v !== null
+      )
+    : [];
+}
+
+/**
+ * Issue #6997: a peer's reply as chain facts. The reply crosses the federation
+ * boundary, so each field is normalized: anything that is not a hash or a
+ * finite time is dropped. A reply from an older peer (no layouts, deadline or
+ * markers) reads as just its fingerprint, which the consumer treats as unknown
+ * for the sign-in checks.
+ */
+function peerChainFacts(res: PeerChainReply): IsolatedChainFacts {
+  const layouts: ChainLayoutFacts[] = objects(res.layouts).map(l => ({
+    fingerprint: stringOrNull(l.fingerprint),
+    deadlineAt: finiteOrNull(l.deadlineAt),
+    source: l.source === "host" ? "host" : "isolated",
+  }));
+  const markers: ChainMarkerFacts[] = objects(res.markers).map(m => ({
+    fingerprint: stringOrNull(m.fingerprint),
+    writtenAt: finiteOrNull(m.writtenAt),
+  }));
+  return {
+    fingerprint: stringOrNull(res.fingerprint),
+    layoutFingerprints: Array.isArray(res.layoutFingerprints)
+      ? res.layoutFingerprints.filter(
+          (f): f is string => stringOrNull(f) !== null
+        )
+      : [],
+    deadlineAt: finiteOrNull(res.deadlineAt),
+    layouts,
+    markers,
+  };
 }

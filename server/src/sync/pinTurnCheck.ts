@@ -46,8 +46,10 @@
  */
 import { createHash } from "node:crypto";
 import {
+  answerKeyBlocks,
   classifyDecisionSignals,
   findPinIds,
+  isCoverableAnswerCode,
   PIN_NUDGE_HEAD,
   PinKeySchema,
   scanPinFences,
@@ -150,6 +152,7 @@ export type PinTurnCheckOptions = {
     | "upsert"
     | "withdraw"
     | "listKeysByPrefix"
+    | "get"
   >;
   getRecentMessages: (
     sessionId: string,
@@ -304,6 +307,34 @@ export function namesPinKey(text: string, key: string): boolean {
   return false;
 }
 
+/**
+ * #6456 (R4): the codes a Detected pin keeps for its message: every code of every
+ * answer key, only when every ask of the message is an answer key whose fence
+ * holds codes that can stand for options; else null, so no later pin's options
+ * can settle an ask they do not hold.
+ */
+function detectedCodesOf(
+  text: string,
+  signals: DecisionSignals
+): string[] | null {
+  if (signals.verdict !== "decision" || signals.askTextsCut) return null;
+  const blocks = answerKeyBlocks(text);
+  if (blocks.length === 0) return null;
+  const codes = new Set<string>();
+  for (const ask of signals.askTexts) {
+    const own = blocks.filter(block => block.askText === ask);
+    if (own.length === 0) return null;
+    for (const block of own) {
+      if (!block.codes || block.codes.length === 0) return null;
+      for (const code of block.codes) {
+        if (!isCoverableAnswerCode(code)) return null;
+        codes.add(code);
+      }
+    }
+  }
+  return codes.size > 0 ? [...codes] : null;
+}
+
 function detectedKey(messageId: string): string {
   const key = `${DETECTED_PIN_PREFIX}${messageId}`;
   if (PinKeySchema.safeParse(key).success) return key;
@@ -384,7 +415,34 @@ export class PinTurnCheck {
       findPinIds(ask).some(id =>
         this.options.resolveOpenPinNamespace(id, session.namespace)
       );
-    return asks.every(namesOpenPin);
+    // #6456 (R3): an answer key also counts as covered when every code of its
+    // own fence is an option ID of an open agent pin of the session. Read from
+    // the text, never from `excerpt` (the last block only, cut at 1,200).
+    const keyed = signals.verdict === "decision" ? answerKeyBlocks(text) : [];
+    let optionIds: Set<string> | null = null;
+    const openOptionIds = (): Set<string> => {
+      if (optionIds) return optionIds;
+      optionIds = new Set();
+      for (const candidate of candidates) {
+        const pin = this.options.pins.get(session.id, candidate.key)?.pin;
+        for (const option of pin?.options ?? []) optionIds.add(option.id);
+      }
+      return optionIds;
+    };
+    const coveredByCodes = (ask: string): boolean => {
+      // Two keys with one ask text are covered only when both blocks are.
+      const blocks = keyed.filter(block => block.askText === ask);
+      if (blocks.length === 0) return false;
+      return blocks.every(
+        block =>
+          block.codes !== null &&
+          block.codes.length > 0 &&
+          block.codes.every(
+            code => isCoverableAnswerCode(code) && openOptionIds().has(code)
+          )
+      );
+    };
+    return asks.every(ask => namesOpenPin(ask) || coveredByCodes(ask));
   }
 
   /** The Stop hook's question: block the turn end once, or let it end. */
@@ -534,7 +592,8 @@ export class PinTurnCheck {
       row.id,
       signals.excerpt,
       titleFrom(signals.excerpt, signals.titleSource),
-      cleanPinText(signals.titleSource ?? "")
+      cleanPinText(signals.titleSource ?? ""),
+      detectedCodesOf(row.text, signals)
     );
   }
 
@@ -554,7 +613,8 @@ export class PinTurnCheck {
     messageId: string,
     excerpt: string,
     title: string | null,
-    titleSource: string
+    titleSource: string,
+    codes: string[] | null = null
   ): DetectResult {
     const key = detectedKey(messageId);
     const cleanExcerpt = cleanPinText(excerpt);
@@ -605,6 +665,8 @@ export class PinTurnCheck {
     }
     const outcome = this.options.pins.upsert(session, content, {
       anchor: { messageId, blockId: null, offsetPx: 0, anchorHeightPx: null },
+      // #6456 (R4): the answer-key codes a later agent pin's options may cover.
+      detectedCodes: codes,
     });
     if ("closed" in outcome) return { action: "none", why: "already_closed" };
     if ("missing" in outcome) return { action: "none", why: "missing" };
@@ -635,12 +697,18 @@ export class PinTurnCheck {
     });
   }
 
-  /** At most `DETECTED_OPEN_MAX` open Detected pins: withdraw the oldest. */
+  /**
+   * At most `DETECTED_OPEN_MAX` open Detected pins: withdraw the oldest. A pin
+   * the operator reopened (#6456, R8) is neither closed by the cap nor counted
+   * toward it, and the cap records no closure: it is a plain withdrawal, not a
+   * settlement.
+   */
   private capOpenDetected(session: PinSessionRef): void {
     const open = this.options.pins.listKeysByPrefix(
       session.id,
       DETECTED_PIN_PREFIX,
-      "open"
+      "open",
+      { notReopened: true }
     );
     for (const key of open.slice(
       0,

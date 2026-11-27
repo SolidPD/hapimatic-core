@@ -26,6 +26,10 @@ import {
   importProviderAccounts,
   type GeminiVaultEntry,
 } from "./providerAccountImport";
+import {
+  getServerInstanceKind,
+  isInheritedTestStore,
+} from "./serverInstanceKind";
 
 /**
  * Server-side read/write access to the Hapimatic account store (issue #1451,
@@ -217,6 +221,11 @@ export class AccountService {
     this.accountsDir = join(dataDir, "accounts");
   }
 
+  /** `<dataDir>/accounts`, the folder this service reads (#6756: the inherited-store check). */
+  get storeDir(): string {
+    return this.accountsDir;
+  }
+
   /**
    * Import #3807's provider artifacts into #3808 store records — once per process
    * by default (`force` re-runs it after a new #3807 login; the import is
@@ -228,8 +237,10 @@ export class AccountService {
    */
   async importProviderAccountsOnce(
     deps: {
-      accountConfigsDir: string;
-      hostCodexHome: string;
+      /** `null` on a test instance: no shared-folder OpenAI import (#6756). */
+      accountConfigsDir: string | null;
+      /** `null` on a test instance: no host `~/.codex` import (#6756). */
+      hostCodexHome: string | null;
       /** Read the node's `gemini`/`google` vault entries (async — settings I/O). */
       readGeminiVaultEntries: () => Promise<GeminiVaultEntry[]>;
       /** Persist the minted `accountUuid` stamps back onto the vault entries. */
@@ -277,11 +288,25 @@ export class AccountService {
   }
 
   /**
+   * Issue #6756 (R13, ER-D1): on a test instance whose store predates this work, every
+   * reader here sees an empty store, so no consumer (the account list, the usage
+   * sampler, the model catalog, account health, the active account, a delete) reads or
+   * uses any of its records. A directory listing per call, on test instances only.
+   */
+  private hidesInheritedStore(): boolean {
+    return (
+      getServerInstanceKind() === "test" &&
+      isInheritedTestStore(this.accountsDir)
+    );
+  }
+
+  /**
    * Enumerate the per-account file UUIDs. Filters to canonical-UUID `*.json`
    * names, which excludes `index.json`, `active.json`, and any `.tmp`/`.lock`
    * siblings by construction. Returns `[]` for an absent/empty store.
    */
   private listAccountUuids(): string[] {
+    if (this.hidesInheritedStore()) return [];
     let entries: string[];
     try {
       entries = readdirSync(this.accountsDir);
@@ -308,6 +333,7 @@ export class AccountService {
    */
   getRaw(accountUuid: string): StoredAccount | null {
     if (!UUID_REGEX.test(accountUuid)) return null;
+    if (this.hidesInheritedStore()) return null;
     let raw: string;
     try {
       raw = readFileSync(this.accountPath(accountUuid), "utf-8");
@@ -333,6 +359,7 @@ export class AccountService {
    */
   getRawAny(accountUuid: string): AnyStoredAccount | null {
     if (!UUID_REGEX.test(accountUuid)) return null;
+    if (this.hidesInheritedStore()) return null;
     let raw: string;
     try {
       raw = readFileSync(this.accountPath(accountUuid), "utf-8");

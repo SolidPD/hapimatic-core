@@ -32,6 +32,10 @@ import {
   type ParityHistoryLogMeta,
 } from "./adminVmsParityLedger";
 import { readVmParitySummary } from "./adminVmsParityStatus";
+import {
+  registerFleetParityRoute,
+  type FleetParityRouteDeps,
+} from "./adminVmsFleetParity";
 import { defineCapability } from "@hapi/protocol";
 import { cataloged } from "../../capabilities/cataloged";
 import {
@@ -156,6 +160,8 @@ export interface AdminVmRoutesOptions {
    * `unreadable`. Tests inject a fixture.
    */
   readVmParityStatus?: (path: string) => Promise<string>;
+  /** `GET /admin-vms/fleet-parity`'s state folder and reader (#6300 PR-4; tests inject both). */
+  fleetParity?: Omit<FleetParityRouteDeps, "provisioner" | "now">;
   /** Per-job log reader for SSE follow (default `node:fs`, missing ⇒ ""). */
   readLog?: (logPath: string) => Promise<string>;
   /** SSE follow / dry-run poll interval, ms (default 500). */
@@ -709,6 +715,9 @@ export function createAdminVmRoutes(
       }
     }
   );
+
+  // #6300 PR-4: RP1's nightly fleet parity verdict, for the status page.
+  registerFleetParityRoute(app, { provisioner, now, ...opts.fleetParity });
 
   // ── #3593 (Sub G2): fleet parity history ───────────────────────────────────
   // A DISTINCT read-only route (ruling D2(a)) over Sub F's append-only ledger;

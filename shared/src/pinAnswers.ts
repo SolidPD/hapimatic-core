@@ -25,9 +25,15 @@ import { APPROVAL_TOKEN_PATTERN } from "./pins";
 //
 // A new optional field on an entry is the documented extension, not a version
 // bump, because readers are loose: `automaticPick` (#6452), `savedTo` (#6453),
-// `dismissed` with `title` (#6539), `pinId` (#6574, placed right after `kind`) and
-// `notSaved` (#6540, right after `savedTo`) each arrived this way. Renaming,
-// removing or re-ordering an existing field is a version bump.
+// `dismissed` with `title` (#6539), `pinId` (#6574, placed right after `kind`),
+// `notSaved` (#6540, right after `savedTo`) and `writeIn` (#6803, right after
+// `answer`) each arrived this way, and a later field is added the same way.
+// Renaming, removing or re-ordering an existing field is a version bump.
+//
+// The summary line lists a write-in as `<key> → write-in`, a fixed token, so the
+// operator's words never enter line 1. A choice of an option whose id is
+// `write-in` prints the same item; the block tells the two apart (`writeIn`
+// against `answer`).
 //
 // ## What `notSaved` says, and what its absence says (#6540)
 //
@@ -99,6 +105,12 @@ export type PinAnswersEntry = {
   /** The dismissed pin's title, so the agent need not look the key up. */
   title?: string;
   answer?: { choice: string; label: string };
+  /**
+   * #6803: the operator's own answer, in their own words, instead of one of
+   * the pin's options. It settles the pin like a choice. An entry carries
+   * `answer` or `writeIn`, never both.
+   */
+  writeIn?: string;
   note?: string;
   questions?: string[];
   automaticPick?: PinAutomaticPick;
@@ -134,6 +146,7 @@ const PinAnswersEntrySchema = z
       .object({ choice: z.string(), label: z.string() })
       .loose()
       .optional(),
+    writeIn: z.string().optional(),
     note: z.string().optional(),
     questions: z.array(z.string()).optional(),
     automaticPick: z
@@ -258,6 +271,11 @@ function cleanEntry(entry: PinAnswersEntry): PinAnswersEntry {
       label: neutralizeApprovalTokens(entry.answer.label),
     };
   }
+  // #6803: the operator typed it, so it is cleaned like a note. It is an
+  // answer, never an approval.
+  if (entry.writeIn !== undefined) {
+    out.writeIn = neutralizeApprovalTokens(entry.writeIn);
+  }
   if (entry.note !== undefined) out.note = neutralizeApprovalTokens(entry.note);
   if (entry.questions && entry.questions.length > 0) {
     out.questions = entry.questions.map(neutralizeApprovalTokens);
@@ -344,7 +362,8 @@ export type PinAnswersMessage =
 /**
  * The exact message: `Pins answers, <time>: <counts> (<item>, …)`, where an
  * item is `<key> (dismissed by you: <title>)` for a dismissal (#6539),
- * `<key> → <choice>` for an answer, `<key> (saved to <folder>)` for an
+ * `<key> → <choice>` for an answer, `<key> → write-in` for the operator's own
+ * answer (#6803), `<key> (saved to <folder>)` for an
  * entry that carries only a save (#6453), `<key> (saved to <folder>, <N> not
  * saved)` when that save was partial (#6540), or the bare `<key>` otherwise
  * (`Pins automatic pick, …` for an automatic pick, #6452),
@@ -361,8 +380,11 @@ export function formatPinAnswersMessage(
   // `savedTo` on every entry of a pin with a saved folder, and a dismissed pin
   // must read "dismissed by you", never "saved to".
   const dismissed = pins.filter(entry => entry.dismissed === true).length;
+  // #6803: a write-in answers its pin like a choice.
   const answered = pins.filter(
-    entry => entry.dismissed !== true && entry.answer
+    entry =>
+      entry.dismissed !== true &&
+      (entry.answer !== undefined || entry.writeIn !== undefined)
   ).length;
   const other = pins.length - answered - dismissed;
   const counts =
@@ -376,13 +398,17 @@ export function formatPinAnswersMessage(
       ? dismissedItem(entry)
       : entry.answer
         ? `${entry.pin} → ${summaryToken(entry.answer.choice)}`
-        : entry.savedTo !== undefined
-          ? `${entry.pin} (saved to ${summaryToken(entry.savedTo)}${
-              // #6540: the cleaned count, a positive safe integer, is all of
-              // `notSaved` this line prints, so line 1 stays one line.
-              entry.notSaved ? `, ${entry.notSaved.count} not saved` : ""
-            })`
-          : entry.pin
+        : // #6803: before `savedTo`, which the server puts on every entry of
+          // a pin with a saved folder; a fixed token, never the words.
+          entry.writeIn !== undefined
+          ? `${entry.pin} → write-in`
+          : entry.savedTo !== undefined
+            ? `${entry.pin} (saved to ${summaryToken(entry.savedTo)}${
+                // #6540: the cleaned count, a positive safe integer, is all of
+                // `notSaved` this line prints, so line 1 stays one line.
+                entry.notSaved ? `, ${entry.notSaved.count} not saved` : ""
+              })`
+            : entry.pin
   );
   const shown = items.slice(0, PIN_ANSWERS_SUMMARY_MAX_ITEMS);
   const more = items.length - shown.length;

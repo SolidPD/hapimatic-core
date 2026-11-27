@@ -21,7 +21,12 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useSetPinDeadline } from "@/hooks/queries/usePins";
 import { ACTION_COLLAPSE_RANK } from "@/lib/pins/actionRowFit";
 import { pinDeadlineOf } from "@/lib/pins/deadline";
-import { stageDismiss, unstageDismiss, useStagedPin } from "@/lib/pins/staging";
+import {
+  hasChosenWriteIn,
+  stageDismiss,
+  unstageDismiss,
+  useStagedPin,
+} from "@/lib/pins/staging";
 
 /**
  * #6539: Dismiss for a pin the operator will not answer (rulings X1, M1, Q1, Q4).
@@ -135,8 +140,11 @@ export function useDismissStaging(pin: Pin): DismissStaging {
   const [failed, setFailed] = useState<string | null>(null);
 
   const armedAt = pin.deadlineBy === "off" ? undefined : pinDeadlineOf(pin);
+  // #6803: a dismissal un-chooses a write-in and keeps its words, so the
+  // confirmation warns only while a chosen write-in with words is the answer.
   const discards =
     staged?.choice !== undefined ||
+    hasChosenWriteIn(staged) ||
     (staged?.questions?.length ?? 0) > 0 ||
     (staged?.ticks?.length ?? 0) > 0;
 

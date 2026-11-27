@@ -82,6 +82,8 @@ export const queryKeys = {
   vmInventory: ["vm-inventory"] as const,
   // #3996: RP1's own parity record (the hub row above the fleet).
   vmParityHub: ["vm-parity-hub"] as const,
+  // #6300 PR-4: RP1's nightly fleet parity verdict (the Fleet parity panel).
+  fleetParity: ["fleet-parity"] as const,
   vmPreflight: ["vm-preflight"] as const,
   // #2910: the operator-instance feedback-inbox gate (`GET /api/feedback/preflight`).
   feedbackPreflight: ["feedback-preflight"] as const,

@@ -25,6 +25,7 @@ import {
   type PinSubmissionResponse,
 } from "@hapi/protocol";
 import { ApiError, type ApiClient } from "@/api/client";
+import { resolveNoteMax } from "@/lib/pins/staging";
 import { queryKeys } from "@/lib/query-keys";
 import { patchOpenPinCount, subscribePinChanges } from "@/lib/pinEvents";
 
@@ -46,6 +47,12 @@ export type PinsData =
        * none is set (`resolvePinZone` then uses the browser's).
        */
       timeZone?: string | null;
+      /**
+       * #6969 (D2): the longest note the session's node takes, resolved where
+       * the response is parsed (`resolveNoteMax`: 2,048 from a node that states
+       * none). Required, so every cache write carries it.
+       */
+      noteMaxChars: number;
     };
 
 /**
@@ -54,7 +61,14 @@ export type PinsData =
  * gate is closed or the owning node has no pin routes.
  */
 export type PinRecordData =
-  | { kind: "ready"; pin: Pin; openPinCount: number; timeZone?: string | null }
+  | {
+      kind: "ready";
+      pin: Pin;
+      openPinCount: number;
+      timeZone?: string | null;
+      /** #6969 (D2): as on the list. */
+      noteMaxChars: number;
+    }
   | { kind: "missing" }
   | { kind: "unavailable" };
 
@@ -84,6 +98,7 @@ async function fetchPins(
       hasMore: res.hasMore,
       openPinCount: res.openPinCount,
       timeZone: res.timeZone ?? null,
+      noteMaxChars: resolveNoteMax(res.noteMaxChars),
     };
   } catch (error) {
     // Never through classifySessionLoadFailure: a closed gate's 404 is not a
@@ -109,6 +124,7 @@ async function fetchPinRecord(
       pin: res.pin,
       openPinCount: res.openPinCount,
       timeZone: res.timeZone ?? null,
+      noteMaxChars: resolveNoteMax(res.noteMaxChars),
     };
   } catch (error) {
     if (isMissingPin(error)) return { kind: "missing" };
@@ -305,6 +321,7 @@ function startSync(
             pin: r.res.pin,
             openPinCount: r.res.openPinCount,
             timeZone: r.res.timeZone ?? null,
+            noteMaxChars: resolveNoteMax(r.res.noteMaxChars),
           });
         } else if (isMissingPin(r.error)) {
           queryClient.setQueryData<PinRecordData>(queryKey, {
@@ -395,6 +412,7 @@ function startSync(
               pin,
               openPinCount: data.openPinCount,
               timeZone: data.timeZone ?? null,
+              noteMaxChars: data.noteMaxChars,
             });
           } else if (data.hasMore) {
             // The list stops at 500: absence there proves nothing.
@@ -500,6 +518,8 @@ export type PinByIdLookup =
       pin: Pin;
       openPinCount: number;
       timeZone: string | null;
+      /** #6969 (D2): the owning node's note limit, 2,048 when it states none. */
+      noteMaxChars: number;
       session: PinByIdSession;
     }
   | {
@@ -544,12 +564,13 @@ async function fetchPinById(
         "The pin lookup answered with a body this page cannot read"
       );
     }
-    const { pin, openPinCount, timeZone, session } = parsed.data;
+    const { pin, openPinCount, timeZone, noteMaxChars, session } = parsed.data;
     return {
       kind: "found",
       pin,
       openPinCount,
       timeZone: timeZone ?? null,
+      noteMaxChars: resolveNoteMax(noteMaxChars),
       session: {
         id: session?.id ?? pin.sessionId,
         name: session?.name ?? null,
@@ -623,6 +644,7 @@ function recordFromList(
         pin,
         openPinCount: list.openPinCount,
         timeZone: list.timeZone ?? null,
+        noteMaxChars: list.noteMaxChars,
       }
     : undefined;
 }
@@ -876,6 +898,47 @@ export function useSetPinDeadline(api: ApiClient | null, sessionId: string) {
   return { setDeadline, isPending };
 }
 
+/**
+ * #6456 (R8): the operator's Reopen on a superseded pin, which puts it back in
+ * Action Items. Not optimistic: the server refuses a pin that is not superseded
+ * and the open cap, so the caches take its pin only once it answers. The caller
+ * words a refusal with `pinReopenErrorMessage`.
+ */
+export function useReopenPin(api: ApiClient | null, sessionId: string) {
+  const queryClient = useQueryClient();
+  const { mutateAsync, isPending } = useMutation({
+    mutationFn: async (key: string) => {
+      if (!api) throw new Error("Session unavailable");
+      return PinMutationResponseSchema.parse(
+        await api.reopenSessionPin(sessionId, key)
+      );
+    },
+    onSuccess: res =>
+      writePinsToCaches(queryClient, sessionId, [res.pin], res.openPinCount),
+  });
+  const reopen = useCallback(
+    (key: string): Promise<PinMutationResponse> => mutateAsync(key),
+    [mutateAsync]
+  );
+  return { reopen, isPending };
+}
+
+/** A refused Reopen in the server's words, else a plain line with the status. */
+export function pinReopenErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    try {
+      const body = JSON.parse(error.body ?? "") as { error?: unknown };
+      if (typeof body.error === "string" && body.error) return body.error;
+    } catch {
+      // Not JSON: fall through to the status.
+    }
+    return `The pin could not be reopened (HTTP ${error.status})`;
+  }
+  return error instanceof Error && error.message
+    ? error.message
+    : "The pin could not be reopened";
+}
+
 /** A failed deadline change in the server's words ("This pin is no longer open"). */
 export function pinDeadlineErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
@@ -991,7 +1054,10 @@ export function useSubmitPinAnswers(api: ApiClient | null, sessionId: string) {
       const res = PinSubmissionResponseSchema.parse(
         await api.submitPinAnswers(sessionId, request)
       );
-      if (request.dryRun) return res;
+      // #6803: a dry run that replays a delivered Submit carries the recorded
+      // pins too, and three of the dialog's settle calls follow one, so the
+      // Sent record must be in the cache before staging clears.
+      if (request.dryRun && !res.delivered) return res;
       const pins = res.entries.flatMap(entry => (entry.pin ? [entry.pin] : []));
       if (pins.length > 0) {
         const cancelled = await cancelPinFetches(

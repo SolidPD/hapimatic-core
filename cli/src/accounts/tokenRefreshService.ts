@@ -16,6 +16,7 @@ import {
   withRefreshDeadline,
   withUnrefreshableFlag,
   withoutFailedTokenFingerprint,
+  type ExpectedRotation,
   type SiblingBindingScan,
 } from "@/accounts/machineRotator";
 import { runIsolatedCredentialsMirror } from "@/accounts/isolatedCredentialsMirror";
@@ -28,8 +29,13 @@ import {
   type HostChainQuarantineDeps,
 } from "@/accounts/hostChainQuarantine";
 import {
-  decideMixedBindingRotation,
+  assessmentFromVerdict,
+  decideRemoteBindingRotation,
+  readLocalChainFacts,
+  type ChainAssessContext,
+  type ChainAssessment,
   type ChainIndependence,
+  type LocalChainFacts,
 } from "@/accounts/remoteChainIndependence";
 import type {
   AccountIndexEntry,
@@ -351,7 +357,10 @@ export interface TokenRefreshServiceOptions {
    * {@link assessRemoteChainIndependence} proves this node's chain is a DISTINCT
    * grant from every remote holder's. Default **false** ⇒ byte-identical to the
    * pre-#3784 skip (ship gated; daemon reads `HAPI_IDLE_ROTATE_REMOTE_INDEPENDENT`).
-   * The REMOTE-ONLY case always skips regardless.
+   * Issue #6997 (PR 1, Matt's D1 = R1): the same switch also lets the
+   * REMOTE-ONLY case (a live session on another node, none here) rotate this
+   * node's own chain once its independence is proven (no session is restarted;
+   * there is none here). Off ⇒ both cases keep today's skip and log line.
    */
   rotateWhenRemoteIndependent?: boolean;
   /**
@@ -360,10 +369,40 @@ export interface TokenRefreshServiceOptions {
    * THIS node's chain fingerprint and compares it against the other federation
    * nodes' fingerprints. Default always "unknown" ⇒ fail-safe skip ⇒ an unwired
    * service is byte-identical to the pre-#3784 skip even with the flag on.
+   * Issue #6997: a verdict-only seam; {@link assessRemoteChainIndependenceDetailed}
+   * takes precedence when both are given.
    */
   assessRemoteChainIndependence?: (
     accountUuid: string
   ) => Promise<ChainIndependence>;
+  /**
+   * Issue #6997: the holder-aware verdict with its cause (see
+   * `assessChainIndependenceDetailed`). The backstop passes the binding mode,
+   * the holder node ids and THIS node's chain facts (fingerprint, sign-in
+   * deadline and marker, from one parse); the daemon wires it to the cross-node
+   * probe. Absent ⇒ the verdict-only seam above, read through
+   * `assessmentFromVerdict`.
+   */
+  assessRemoteChainIndependenceDetailed?: (
+    accountUuid: string,
+    context: ChainAssessContext
+  ) => Promise<ChainAssessment>;
+  /**
+   * Issue #6997: THIS node's chain facts for an account — its folder's refresh
+   * fingerprint and sign-in deadline from one parse, and its sign-in marker.
+   * Default `readLocalChainFacts`. The fingerprint is also what a proven
+   * rotation re-checks under the lock (R9).
+   */
+  readLocalChainFacts?: (accountUuid: string) => Promise<LocalChainFacts>;
+  /**
+   * Issue #6997 (R9): a local-only re-read of which accounts have a live LOCAL
+   * session RIGHT NOW (the daemon GETs `/cli/sessions`). Called just before a
+   * proven REMOTE-ONLY rotation, which restarts nothing, so a session that
+   * started on this node since the pass began is never rotated under. `null` on
+   * a failed read; absent ⇒ no re-read possible. Either way the rotation defers
+   * (fail safe).
+   */
+  getLocalBoundAccounts?: () => Promise<Set<string> | null>;
   /**
    * Issue #1806: returns an isolated account's current access-token expiry (ms
    * epoch) read from its isolated `.credentials.json` — the source of truth for
@@ -394,6 +433,17 @@ export interface TokenRefreshServiceOptions {
    * Production uses `productionQuarantineDeps`; tests pass fakes.
    */
   hostChainQuarantineDeps?: Partial<HostChainQuarantineDeps>;
+  /**
+   * Issue #6756 (TC1, R5): this daemon's instance kind (`ctx.instanceKind`). On a `test`
+   * instance the isolated-credentials mirror is off and the shared-chain pass flags
+   * only, never moving a folder file; while its store is `inheritedStore` (it predates
+   * this work, ER-D1 extended by row SR-TICK) the scheduler `tick` renews no record.
+   * Absent ⇒ a real instance (today's behaviour).
+   */
+  instanceKind?: {
+    kind: "real" | "test" | "dev";
+    inheritedStore?: { records: number };
+  };
   /**
    * Issue #3544: non-destructive validity probe for an isolated account's
    * access token — used by {@link TokenRefreshService.clearStaleUnrefreshableFlags}
@@ -594,6 +644,49 @@ export interface LiveAccountKeys {
     emails: Set<string>;
     reasons?: Map<string, string>;
   };
+  /**
+   * Issue #6997 (R4): accounts a live REMOTE session holds by its
+   * `metadata.accountUuid` — so a holder whose session carries no
+   * `claudeAccount.email`, or a different email, is still a holder. Kept apart
+   * from `uuids`, which stays LOCAL-only (the two key spaces are not
+   * interchangeable: a local binding can be restarted, a remote one cannot).
+   * Optional so the daemon closure, the constructor default and the test
+   * literals stay byte-compatible; absent ⇒ email matching only.
+   */
+  remoteUuids?: Set<string>;
+  /**
+   * Issue #6997 (R3(a)): the federation nodes holding each remote binding, keyed
+   * by email and by uuid; a live session with no node id is recorded as `?`,
+   * which no node can answer for. Optional for the same reason; absent ⇒ the
+   * holders are unknown, so holder coverage cannot pass.
+   */
+  remoteHolderNodes?: {
+    byEmail: Map<string, Set<string>>;
+    byUuid: Map<string, Set<string>>;
+  };
+}
+
+/**
+ * Issue #6997 (R3(a)): the federation nodes holding an account — the union of
+ * its entries in both holder maps. Unknown holders read as `?`, a node no probe
+ * can answer for, so a remote binding whose holders are not known can never
+ * pass holder coverage.
+ */
+function holderNodesFor(
+  live: LiveAccountKeys,
+  accountUuid: string,
+  emailAddress: string | undefined
+): Set<string> {
+  const holders = new Set<string>();
+  const byEmail = emailAddress
+    ? live.remoteHolderNodes?.byEmail.get(emailAddress)
+    : undefined;
+  for (const id of byEmail ?? []) holders.add(id);
+  for (const id of live.remoteHolderNodes?.byUuid.get(accountUuid) ?? []) {
+    holders.add(id);
+  }
+  if (holders.size === 0) holders.add("?");
+  return holders;
 }
 
 export class TokenRefreshService {
@@ -624,6 +717,10 @@ export class TokenRefreshService {
   ) => Promise<string | null>;
   /** #6800: the detector's machine-seam overrides (see the option). */
   private readonly hostChainQuarantineDeps: Partial<HostChainQuarantineDeps>;
+  /** #6756: a test instance (mirror off, shared-chain pass flag-only). */
+  private readonly testInstance: boolean;
+  /** #6756 (row SR-TICK): the store predates this work; `tick` renews none of it. */
+  private readonly inheritedStore: boolean;
   /**
    * Issue #3544: injected non-destructive token-validity probe (see the option
    * doc). Undefined ⇒ a legacy (fingerprint-less) flag never clears.
@@ -653,10 +750,26 @@ export class TokenRefreshService {
   private readonly getLocalBusyAccounts?: () => Promise<Set<string> | null>;
   /** #3784: mixed-case rotate-when-independent gate (default false ⇒ pre-#3784 skip). */
   private readonly rotateWhenRemoteIndependent: boolean;
-  /** #3784: composed cross-node independence verdict seam (default ⇒ "unknown"). */
+  /** #3784 + #6997: the holder-aware verdict seam (default ⇒ "unknown"). */
   private readonly assessChainIndependence: (
+    accountUuid: string,
+    context: ChainAssessContext
+  ) => Promise<ChainAssessment>;
+  /** #6997: this node's chain facts (one parse of its folder file + its marker). */
+  private readonly readLocalChainFacts: (
     accountUuid: string
-  ) => Promise<ChainIndependence>;
+  ) => Promise<LocalChainFacts>;
+  /** #6997 (R9): pre-rotation local binding re-read; undefined ⇒ defer. */
+  private readonly getLocalBoundAccounts?: () => Promise<Set<string> | null>;
+  /**
+   * #6997 (R6): when a gate-on "unknown" skip was last logged per account — its
+   * token's expiry and the UTC day — so it logs once per token lifetime plus once
+   * a day while it persists, not every 60 s pass.
+   */
+  private readonly unknownSkipLogged = new Map<
+    string,
+    { expiresAt: number; day: string }
+  >();
   /** #3023: per-tick utilization sampler for the un-pinned spawn veto (see option). */
   private readonly sampleUtilization?: (
     entries: readonly AccountIndexEntry[]
@@ -728,6 +841,17 @@ export class TokenRefreshService {
     this.readSignInMarker =
       options.readSignInMarkerFingerprint ?? readSignInMarkerFingerprint;
     this.hostChainQuarantineDeps = options.hostChainQuarantineDeps ?? {};
+    this.testInstance = options.instanceKind?.kind === "test";
+    this.inheritedStore =
+      this.testInstance && options.instanceKind?.inheritedStore !== undefined;
+    if (this.testInstance) {
+      logger.info("[ISOLATED_MIRROR] off on a test instance (#6756)");
+    }
+    if (this.inheritedStore) {
+      logger.info(
+        "[TOKEN_REFRESH] the store predates #6756: the scheduler renews none of its records"
+      );
+    }
     // #3544: injected token-validity probe for the stale-flag backstop.
     this.probeToken = options.probeToken;
     // #3541: default false ⇒ byte-equivalent to the pre-#3541 P-REVOKE skip.
@@ -736,9 +860,19 @@ export class TokenRefreshService {
     // pre-#3784 unconditional remote-bound skip (ship gated, fail-safe).
     this.rotateWhenRemoteIndependent =
       options.rotateWhenRemoteIndependent ?? false;
-    this.assessChainIndependence =
+    // #6997: the holder-aware seam wins; a verdict-only seam (or the default
+    // "unknown") is read through assessmentFromVerdict, which still enforces
+    // R3(d)'s provenance on the remote-only path.
+    const verdictOnly =
       options.assessRemoteChainIndependence ??
       (async () => "unknown" as ChainIndependence);
+    this.assessChainIndependence =
+      options.assessRemoteChainIndependenceDetailed ??
+      (async (uuid, context) =>
+        assessmentFromVerdict(await verdictOnly(uuid), context));
+    this.readLocalChainFacts =
+      options.readLocalChainFacts ?? readLocalChainFacts;
+    this.getLocalBoundAccounts = options.getLocalBoundAccounts;
     // #3023: optional utilization sampler for the un-pinned spawn veto. Absent by
     // default ⇒ no sampling (tests / no daemon are byte-equivalent to pre-#3023).
     this.sampleUtilization = options.sampleUtilization;
@@ -822,6 +956,8 @@ export class TokenRefreshService {
   async handleAuthFailure(
     accountUuid: string
   ): Promise<{ refreshed: boolean; accessToken?: string }> {
+    // #6756 (SR-TICK): an inherited test store renews none of its records.
+    if (this.inheritedStore) return { refreshed: false };
     const res = await this.store.get(accountUuid);
     if (!res || !res.ok) {
       logger.warn(
@@ -875,8 +1011,22 @@ export class TokenRefreshService {
    * awaited restart via the daemon's per-account in-flight guard). The shared
    * `inFlight` dedup still prevents a self-inflicted double-rotation race against
    * a concurrent scheduled refresh of the same account.
+   *
+   * Issue #6997 (R9): the idle backstop's proven cross-node paths pass the
+   * `expected` rotation, which the locked rotation of an isolated account
+   * re-checks (see `decideRotation`). Every other caller passes none.
    */
-  async forceRefresh(accountUuid: string): Promise<ForceRefreshOutcome> {
+  async forceRefresh(
+    accountUuid: string,
+    opts: { expected?: ExpectedRotation } = {}
+  ): Promise<ForceRefreshOutcome> {
+    // #6756 (SR-TICK): an inherited test store renews none of its records, so no
+    // OAuth call and no write; `transient` flags nothing (a `permanent` might).
+    if (this.inheritedStore) {
+      const detail = `this test instance's account store predates #6756; none of it is renewed (#6756)`;
+      logger.warn(`[TOKEN_REFRESH] forceRefresh: ${detail}`);
+      return { kind: "transient", detail };
+    }
     const res = await this.store.get(accountUuid);
     if (!res || !res.ok) {
       logger.warn(
@@ -906,7 +1056,15 @@ export class TokenRefreshService {
     // into the store so the harness's store-delta assertions pass + the UI badge
     // stays fresh.
     if (await this.isIsolatedAccount(accountUuid).catch(() => false)) {
-      return await this.forceRefreshIsolated(accountUuid);
+      return await this.forceRefreshIsolated(accountUuid, opts.expected);
+    }
+    // Issue #6997 (R9): a proven rotation was proven against the folder's
+    // token. If the account no longer reads as isolated (a read error, a moved
+    // folder), refuse rather than rotate the store's token, which no check saw.
+    if (opts.expected) {
+      const detail = `account ${accountUuid} no longer reads as isolated; a proven rotation is not re-routed to the store token (#6997)`;
+      logger.info(`[TOKEN_REFRESH] forceRefresh refused: ${detail}`);
+      return { kind: "transient", detail };
     }
     return toForceRefreshOutcome(await this.dedupedRefresh(account, false));
   }
@@ -928,7 +1086,8 @@ export class TokenRefreshService {
    * memory; restartBoundSessions re-points it at the dir (local instance only).
    */
   private async forceRefreshIsolated(
-    accountUuid: string
+    accountUuid: string,
+    expected?: ExpectedRotation
   ): Promise<ForceRefreshOutcome> {
     const oauth = await readIsolatedCredentials(accountUuid);
     if (!oauth) {
@@ -956,14 +1115,18 @@ export class TokenRefreshService {
     // second consumed a just-superseded token (the exact bug class #1635
     // fixes). Joining an in-flight entry is always an isolated rotation: the
     // scheduler defers isolated accounts, so it never registers one here.
+    // #6997: a caller with an `expected` rotation that joins one adds no OAuth
+    // call of its own; the joined rotation keeps its own rules.
     const existing = this.inFlight.get(accountUuid);
     let p: Promise<RefreshOutcome>;
     if (existing) {
       p = existing;
     } else {
-      p = this.rotateIsolatedOnceImpl(accountUuid, oauth).finally(() => {
-        this.inFlight.delete(accountUuid);
-      });
+      p = this.rotateIsolatedOnceImpl(accountUuid, oauth, expected).finally(
+        () => {
+          this.inFlight.delete(accountUuid);
+        }
+      );
       this.inFlight.set(accountUuid, p);
     }
     return toForceRefreshOutcome(await p);
@@ -978,7 +1141,8 @@ export class TokenRefreshService {
    */
   private rotateIsolatedOnceImpl(
     accountUuid: string,
-    oauth: NonNullable<Awaited<ReturnType<typeof readIsolatedCredentials>>>
+    oauth: NonNullable<Awaited<ReturnType<typeof readIsolatedCredentials>>>,
+    expected?: ExpectedRotation
   ): Promise<RefreshOutcome> {
     return rotateIsolatedCredentials({
       accountUuid,
@@ -988,6 +1152,7 @@ export class TokenRefreshService {
       mergeStore: mergeFn => this.persistMerge(accountUuid, mergeFn),
       now: this.now,
       expiryBufferMs: this.expiryBufferMs,
+      expected,
       sharesHostChain: token => this.sharesHostChain(token),
     });
   }
@@ -1019,10 +1184,13 @@ export class TokenRefreshService {
    * method acquires it first (R5).
    *
    * Issue #3541 SPLIT the former single "live-session-anywhere" P-REVOKE skip:
-   * a REMOTE (federation) binding still always skips (no cross-node restart), but
    * a near-expiry LOCALLY-bound, non-inferring session is now ROTATED and then
    * restarted (via `onSuccessfulRefresh` → the daemon's `restartBoundSessions`)
    * when `rotateBoundAtExpiry` is on — the fix for the live-but-idle deadlock.
+   * A REMOTE (federation) binding skips (no cross-node restart) unless the
+   * cross-node check proves this node's chain independent (#3784 for the mixed
+   * case, #6997 for the remote-only case, one switch): then this node's own
+   * chain rotates, re-checked under the lock against the proven fingerprint.
    */
   async refreshIdleIsolatedAccounts(): Promise<void> {
     try {
@@ -1033,23 +1201,25 @@ export class TokenRefreshService {
       // probed against api.anthropic.com. `store.get()` below is also Anthropic-only
       // (defence in depth), but the sampler reads the raw entries.
       const entries = await this.listAnthropicEntries();
-      const live = await this.getLiveAccountKeys().catch(() => ({
-        uuids: new Set<string>(),
-        emails: new Set<string>(),
-        // Issue #1834: KEEP this fallback (Fallback Preservation Rule) but flip
-        // it from fail-open to fail-safe. `getLiveAccountKeys` is non-throwing
-        // today, but if it ever throws, an empty `{uuids,emails}` would let the
-        // P-REVOKE guard skip NOTHING and rotate every idle account blind. A
-        // `federationDegraded: true` result makes the degrade guard below skip
-        // rotation instead (belt-and-suspenders, R5). Issue #3640: also set
-        // `localDegraded: true` so a throw fails safe on BOTH axes — an empty
-        // `uuids` from a throw must not be read as "no local session either".
-        federationDegraded: true,
-        localDegraded: true,
-        // Issue #3541: complete the shape; irrelevant on this path (the
-        // degrade skip below fires before the rotate-anyway gate).
-        inferring: { uuids: new Set<string>(), emails: new Set<string>() },
-      }));
+      const live: LiveAccountKeys = await this.getLiveAccountKeys().catch(
+        () => ({
+          uuids: new Set<string>(),
+          emails: new Set<string>(),
+          // Issue #1834: KEEP this fallback (Fallback Preservation Rule) but flip
+          // it from fail-open to fail-safe. `getLiveAccountKeys` is non-throwing
+          // today, but if it ever throws, an empty `{uuids,emails}` would let the
+          // P-REVOKE guard skip NOTHING and rotate every idle account blind. A
+          // `federationDegraded: true` result makes the degrade guard below skip
+          // rotation instead (belt-and-suspenders, R5). Issue #3640: also set
+          // `localDegraded: true` so a throw fails safe on BOTH axes — an empty
+          // `uuids` from a throw must not be read as "no local session either".
+          federationDegraded: true,
+          localDegraded: true,
+          // Issue #3541: complete the shape; irrelevant on this path (the
+          // degrade skip below fires before the rotate-anyway gate).
+          inferring: { uuids: new Set<string>(), emails: new Set<string>() },
+        })
+      );
       // Issue #4423 (R5): sibling-instance bindings — scanned lazily, at most
       // once per pass, only once an account passes the near-expiry gate. A
       // throwing scan fails safe (degraded), like getLiveAccountKeys above.
@@ -1100,55 +1270,79 @@ export class TokenRefreshService {
         // may rotate-anyway (rotate then restart), while a REMOTE binding must
         // always keep the skip.
         const boundLocally = live.uuids.has(uuid);
-        const boundRemotely = !!(
-          account.emailAddress && live.emails.has(account.emailAddress)
-        );
-        // Issue #3784: a REMOTE (federation) binding splits into two cases.
-        // REMOTE-ONLY (no local session here) ALWAYS keeps the skip — nothing on
-        // this node to keep alive, and rotating buys nothing (a future local
-        // spawn is covered by spawn-time recovery). The MIXED (local AND remote)
-        // case is delegated to {@link decideMixedBindingRotation}: when the
-        // #3784 gate is ON and this node's chain is PROVEN independent of every
-        // remote holder's (distinct refresh-token fingerprint), it rotates THIS
-        // node's own chain and restarts THIS node's own session (falling through
-        // to the #3541 path below) — the remote holder's independent chain is
-        // untouched. Any doubt (gate off, shared copy, degraded view) fails SAFE
-        // to the pre-#3784 skip.
-        // Issue #5021: set only when the mixed-binding check below proves this
-        // node's chain independent; the lease gate reads it.
+        // Issue #6997 (R4, ungated): a remote holder is recognised by its
+        // session's `claudeAccount.email` OR its `accountUuid`.
+        const boundRemotely =
+          !!(account.emailAddress && live.emails.has(account.emailAddress)) ||
+          !!live.remoteUuids?.has(uuid);
+        // Issue #3784 + #6997: a REMOTE (federation) binding has two cases, both
+        // decided by {@link decideRemoteBindingRotation} under the one switch
+        // (`rotateWhenRemoteIndependent`, HAPI_IDLE_ROTATE_REMOTE_INDEPENDENT):
+        //  - MIXED (local AND remote): when this node's chain is PROVEN
+        //    independent of every holder's, rotate THIS node's own chain and
+        //    restart THIS node's own session (falling through to the #3541 path
+        //    below); the holder's independent chain is untouched.
+        //  - REMOTE-ONLY (none local): when proven, rotate THIS node's own chain
+        //    and restart nothing (there is nothing here to restart), which keeps
+        //    this node's stored token live; the proof also needs this node's own
+        //    provenance (R3(d), Matt's U2).
+        // Any doubt (gate off, shared copy or sign-in, a holder that did not
+        // answer, a degraded view, no provenance) fails SAFE to the skip.
+        // Issue #5021: set only when this check proves this node's chain
+        // independent; the lease gate reads it.
         let provenIndependent = false;
+        // Issue #6997 (R9): the fingerprint the check proved, re-checked by the
+        // locked rotation, and whether the rotation restarts nothing.
+        let provenFingerprint: string | null = null;
+        let remoteOnlyRotation = false;
         if (boundRemotely) {
-          if (!boundLocally) {
-            logger.info(
-              `[IDLE_REFRESH] skip ${uuid} (${account.emailAddress}) — live session bound on a federation node, none local (P-REVOKE guard; no cross-node restart)`
-            );
-            continue;
-          }
-          const decision = await decideMixedBindingRotation({
+          const mode = boundLocally ? "mixed" : "remote-only";
+          let facts: LocalChainFacts | null = null;
+          const decision = await decideRemoteBindingRotation({
             accountUuid: uuid,
             emailAddress: account.emailAddress ?? "",
             enabled: this.rotateWhenRemoteIndependent,
-            assess: u => this.assessChainIndependence(u),
+            mode,
+            assess: async u => {
+              facts = await this.readLocalChainFacts(u).catch(
+                (): LocalChainFacts => ({
+                  fingerprint: null,
+                  deadlineAt: null,
+                  marker: null,
+                })
+              );
+              return this.assessChainIndependence(u, {
+                mode,
+                holderNodeIds: holderNodesFor(live, uuid, account.emailAddress),
+                localFingerprint: facts.fingerprint,
+                localDeadlineAt: facts.deadlineAt,
+                localMarker: facts.marker,
+                markerNamesCurrent:
+                  facts.fingerprint !== null &&
+                  facts.marker?.fingerprint === facts.fingerprint,
+              });
+            },
           });
           if (decision.action === "skip") {
-            // #4679: a lead-window skip repeats every pass for up to the whole
-            // lead; keep it out of the journal (the buffer pass logs it as before).
-            if (inLeadOnly) logger.debug(decision.message);
-            else if (decision.level === "warn") logger.warn(decision.message);
-            else logger.info(decision.message);
-            if (decision.jobError && !inLeadOnly) {
-              this.jobRegistry?.update(TOKEN_REFRESH_JOB_NAME, {
-                lastError: decision.jobError,
-              });
-            }
+            this.logRemoteBindingSkip(decision, uuid, expiresAt, inLeadOnly);
             continue;
           }
-          // decision.action === "rotate": independent chain proven — fall through
-          // to the sibling / rotate-anyway path, which rotates this node's chain
-          // and restarts this node's local session (#3541).
+          // decision.action === "rotate": independent chain proven. The rotation
+          // re-checks the fingerprint the check compared (R9), so a proof with
+          // no readable fingerprint is not acted on.
+          provenFingerprint =
+            (facts as LocalChainFacts | null)?.fingerprint ?? null;
+          if (provenFingerprint === null) {
+            logger.info(
+              `[IDLE_REFRESH] skip ${uuid} (${account.emailAddress}) — this node's chain fingerprint is unreadable; a proven rotation cannot be re-checked (fail-safe; #6997)`
+            );
+            continue;
+          }
           if (inLeadOnly) logger.debug(decision.message);
           else logger.info(decision.message);
           provenIndependent = true;
+          remoteOnlyRotation = !boundLocally;
+          // Fall through to the sibling and degraded checks either way (R5).
         }
         // Issue #4423 (R5): a live session of a SIBLING instance on this machine
         // ALWAYS skips — this daemon cannot restart another instance's session,
@@ -1296,17 +1490,50 @@ export class TokenRefreshService {
           // All four conditions hold (local ∧ ¬busy ∧ file-authoritative ∧
           // switch-on) → fall through to the lease + rotate + bound-session restart.
         }
+        // Issue #6997 (R9): a proven REMOTE-ONLY rotation restarts nothing, so a
+        // session that bound the account on this node since the pass began must
+        // not be rotated under. Re-read the local bindings right before the
+        // destructive step; a failed or unavailable read defers (fail safe).
+        if (remoteOnlyRotation) {
+          const boundNow = this.getLocalBoundAccounts
+            ? await this.getLocalBoundAccounts().catch(() => null)
+            : null;
+          if (boundNow === null || boundNow.has(uuid)) {
+            logger.info(
+              `[IDLE_REFRESH] defer ${uuid} (${account.emailAddress}) — ${boundNow === null ? "local session re-check unavailable (fail-safe; #6997)" : "a local session bound the account before rotation (#6997)"}`
+            );
+            continue;
+          }
+        }
+        // Issue #6997 (R9): a proven rotation carries what the check proved —
+        // the fingerprint it compared and the window the account was selected
+        // in (#4679's lead for a locally-bound account, else the buffer) — and
+        // the locked rotation refuses unless the token on disk still matches.
+        const expected: ExpectedRotation | undefined =
+          provenIndependent && provenFingerprint !== null
+            ? {
+                refreshFingerprint: provenFingerprint,
+                withinMs: boundLocally
+                  ? this.boundRotationLeadMs
+                  : this.expiryBufferMs,
+              }
+            : undefined;
+        const rotate = (): Promise<ForceRefreshOutcome> =>
+          expected
+            ? this.forceRefresh(uuid, { expected })
+            : this.forceRefresh(uuid);
         // R5: acquire the cross-machine family lease before the destructive
         // rotation (single owner). A non-holder defers — mirrors tick()'s gate.
         // Issue #5021: a chain the #3784 check proved independent skips the
         // lease (no other node can be rotating it), and a taken lease is
         // released once the rotation finishes, so it never outlives it.
+        // Issue #6997 (M9): a proven remote-only chain skips it the same way.
         let outcome: ForceRefreshOutcome;
         if (provenIndependent && this.bypassLeaseWhenIndependent) {
           logger.info(
             `[IDLE_REFRESH] ${uuid} (${account.emailAddress}) — independent chain proven; lease not required (#5021)`
           );
-          outcome = await this.forceRefresh(uuid);
+          outcome = await rotate();
         } else {
           if (!(await this.acquireRotationLease(uuid))) {
             logger.info(
@@ -1315,7 +1542,7 @@ export class TokenRefreshService {
             continue;
           }
           try {
-            outcome = await this.forceRefresh(uuid);
+            outcome = await rotate();
           } finally {
             await this.releaseLeaseQuietly(uuid);
           }
@@ -1324,11 +1551,12 @@ export class TokenRefreshService {
         // token we just revoked, via the SAME injected hook the tick() path uses
         // (run.ts wires `onSuccessfulRefresh` → `restartBoundSessions`). Fire it
         // ONLY for a locally-bound success — an UNBOUND rotation has nothing to
-        // restart, a REMOTE binding already `continue`d, and firing it inside
-        // `forceRefreshIsolated` is contractually forbidden (that path is
-        // callback-suppressed so the `hapi accounts force-refresh` harness can
-        // drive `restartBoundSessions` explicitly). `boundLocally` is the
-        // pre-rotation capture of `live.uuids.has(uuid)`.
+        // restart, an unproven REMOTE binding already `continue`d, a proven
+        // remote-only one (#6997) has no session here to restart, and firing
+        // it inside `forceRefreshIsolated` is contractually forbidden (that
+        // path is callback-suppressed so the `hapi accounts force-refresh`
+        // harness can drive `restartBoundSessions` explicitly). `boundLocally`
+        // is the pre-rotation capture of `live.uuids.has(uuid)`.
         if (boundLocally && outcome.kind === "success") {
           this.onSuccessfulRefresh?.(uuid);
         }
@@ -1345,15 +1573,58 @@ export class TokenRefreshService {
   }
 
   /**
+   * Issue #6997 (R6): log a remote-binding skip. A lead-window skip goes to
+   * debug, as #4679 set. Gate off: today's line on every pass (R7). `shared`:
+   * `warn` + the job's `lastError` on every pass. A gate-on `unknown`: once per
+   * token lifetime plus once a UTC day while it persists (debug in between),
+   * because an account that cannot be proven repeats it every 60 s pass.
+   */
+  private logRemoteBindingSkip(
+    decision: Extract<
+      Awaited<ReturnType<typeof decideRemoteBindingRotation>>,
+      { action: "skip" }
+    >,
+    uuid: string,
+    expiresAt: number,
+    inLeadOnly: boolean
+  ): void {
+    if (inLeadOnly) {
+      logger.debug(decision.message);
+      return;
+    }
+    if (decision.verdict === "unknown") {
+      const day = new Date(this.now()).toISOString().slice(0, 10);
+      const last = this.unknownSkipLogged.get(uuid);
+      if (last && last.expiresAt === expiresAt && last.day === day) {
+        logger.debug(decision.message);
+        return;
+      }
+      this.unknownSkipLogged.set(uuid, { expiresAt, day });
+    }
+    if (decision.level === "warn") logger.warn(decision.message);
+    else logger.info(decision.message);
+    if (decision.jobError) {
+      this.jobRegistry?.update(TOKEN_REFRESH_JOB_NAME, {
+        lastError: decision.jobError,
+      });
+    }
+  }
+
+  /**
    * Issue #4423 (Task 6, R3): clear a STALE `unrefreshable` flag on a non-host
    * isolated account. The flag is per-instance store state while the token it
    * describes is machine-global, so this instance's flag can outlive the token
    * that failed (a re-login, a sibling's successful rotation, a last-resort
    * seed). The server refuses spawns on a flagged record, so a daemon whose
-   * backstop is off (dev, every worktree) must still clear its own store: this
-   * runs on EVERY daemon, every maintenance tick, regardless of the
+   * backstop is off (dev) must still clear its own store: this runs on every
+   * real or dev daemon, every maintenance tick, regardless of the
    * machine-rotator role and of HAPI_IDLE_REFRESH. It takes no lease, makes no
    * session query and never rotates. Never throws.
+   *
+   * Issue #6756 (R5, SR-TICK): never on a test instance. A clear copies the
+   * machine-global folder's live token triple into the store, and the legacy arm
+   * probes the folder's real access token; a test instance copies no folder pair
+   * and uses no real login, so its flags stay as they are.
    *
    * The rule. A flag WITH a failed-token fingerprint clears only when the file's
    * CURRENT refresh token is a different token — no probe (a healthy ACCESS
@@ -1366,6 +1637,7 @@ export class TokenRefreshService {
    * token the store actually holds.
    */
   async clearStaleUnrefreshableFlags(): Promise<void> {
+    if (this.testInstance) return;
     try {
       const entries = await this.listAnthropicEntries();
       for (const entry of entries) {
@@ -1461,6 +1733,8 @@ export class TokenRefreshService {
           now: this.now,
           readHostRefreshFingerprint: this.readHostFp,
           ...this.hostChainQuarantineDeps,
+          // #6756 (R5): a test instance flags only; it never moves a folder file.
+          ...(this.testInstance ? { flagOnly: true } : {}),
         })
       );
     } catch (err) {
@@ -1479,6 +1753,8 @@ export class TokenRefreshService {
    * never throws. See `isolatedCredentialsMirror.ts`.
    */
   async mirrorIsolatedCredentials(): Promise<void> {
+    // #6756 (R5): a test instance keeps no copy current from the shared folders.
+    if (this.testInstance) return;
     await runIsolatedCredentialsMirror({
       listAccountUuids: async () =>
         (await this.listAnthropicEntries()).map(e => e.accountUuid),
@@ -1516,7 +1792,11 @@ export class TokenRefreshService {
       // (one per logged-in Anthropic account), so per-tick reads are cheap.
       // #3808 (R7): Anthropic-only — see refreshIdleIsolatedAccounts. Filter before
       // the sampler (which probes api.anthropic.com) and the refresh loop.
-      const entries = await this.listAnthropicEntries();
+      // #6756 (row SR-TICK): an inherited test store's records are neither renewed
+      // nor sampled, so none of their old logins is used.
+      const entries = this.inheritedStore
+        ? []
+        : await this.listAnthropicEntries();
       // #3023: refresh the un-pinned spawn veto's utilization cache for EVERY account
       // at the loop-top — BEFORE the isolated deferral `continue` below, so an
       // isolated account (which the refresh loop defers to native) is still sampled.

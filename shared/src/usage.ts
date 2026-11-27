@@ -185,6 +185,14 @@ export type Utilization = z.infer<typeof UtilizationSchema>;
  *                   the account is REFRESHABLE, so the upstream call was skipped
  *                   and the daemon backstop rotates it within ~60s. Transient,
  *                   self-healing, NOT user-actionable — distinct from `expired`.
+ *                   (#6997) It lasts longer while the backstop's skip stays in
+ *                   force: an account another node's session holds whose chain
+ *                   this node cannot prove independent (the switch off, a
+ *                   shared chain or sign-in, an unanswered holder, no provenance,
+ *                   or a marker-only pair after its one rotation), a sibling-
+ *                   instance binding, or a degraded view. The skip's cause is
+ *                   logged by the daemon only; #6162 owns the time limit on this
+ *                   status and any carrying of that cause to the display.
  *  - `rate_limited` — (#2608) the upstream returned HTTP 429 and a bounded,
  *                   Retry-After-aware retry did not clear within the sampler
  *                   budget. Transient and retriable (distinct from `error`); the

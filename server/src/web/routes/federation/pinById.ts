@@ -90,6 +90,8 @@ export function createFederationPinByIdRoutes(
           pin: neutralizePinText(hit.pin),
           openPinCount: hit.openPinCount,
           timeZone: hit.timeZone,
+          // #6969 (D2): this node's own note limit, which the hub passes on.
+          noteMaxChars: hit.noteMaxChars,
         });
       })
   );

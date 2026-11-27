@@ -27,6 +27,7 @@ export const KIND_PREFERENCE_KEY = {
   "loops-resuming": "loopsResuming",
   "model-reverted": "modelReverted",
   "sign-in-ending": "signInEnding",
+  "tracking-not-applied": "trackingNotApplied",
 } as const satisfies Record<NotificationKind, string>;
 
 export type KindPreferenceKey =
@@ -48,6 +49,7 @@ export const NEW_KIND_PREFERENCE_KEYS = [
   "loopsResuming",
   "modelReverted",
   "signInEnding",
+  "trackingNotApplied",
 ] as const;
 
 export type NewKindPreferenceKey = (typeof NEW_KIND_PREFERENCE_KEYS)[number];
@@ -61,4 +63,46 @@ export function preferenceKeyForKind(kind: string): KindPreferenceKey | null {
   return Object.prototype.hasOwnProperty.call(KIND_PREFERENCE_KEY, kind)
     ? KIND_PREFERENCE_KEY[kind as NotificationKind]
     : null;
+}
+
+/**
+ * This node's billable sessions gate as the version route reports it (`on`,
+ * `closed`, absent = off) or as `useBillableSwitchMode` reads it.
+ */
+export type BillableGateState = "on" | "closed" | "off" | undefined;
+
+/** #6778 PR-C (moved item 3): the kinds of billable tracking and their toggles. */
+const BILLABLE_TRACKING_KINDS: ReadonlySet<string> = new Set([
+  "tracking-not-applied",
+]);
+const BILLABLE_TRACKING_PREFERENCE_KEYS: ReadonlySet<string> = new Set([
+  "trackingNotApplied",
+]);
+
+/**
+ * Whether a kind's pop-up may show: a billable tracking kind stays out of
+ * sight while this node's gate is off (its inbox row is still stored); every
+ * other kind, and a kind this build does not know, always may.
+ */
+export function kindShownWithGate(
+  kind: string,
+  billableSwitch: BillableGateState
+): boolean {
+  return (
+    !BILLABLE_TRACKING_KINDS.has(kind) ||
+    billableSwitch === "on" ||
+    billableSwitch === "closed"
+  );
+}
+
+/** Whether a kind's settings row shows: the same rule, by its preference key. */
+export function preferenceKeyShownWithGate(
+  key: string,
+  billableSwitch: BillableGateState
+): boolean {
+  return (
+    !BILLABLE_TRACKING_PREFERENCE_KEYS.has(key) ||
+    billableSwitch === "on" ||
+    billableSwitch === "closed"
+  );
 }

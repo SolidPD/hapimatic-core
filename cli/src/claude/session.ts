@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: MIT AND AGPL-3.0-only
 import { ApiClient, ApiSessionClient } from "@/lib";
-import { MessageQueue2 } from "@/utils/MessageQueue2";
+import { MessageQueue2, type QueueControl } from "@/utils/MessageQueue2";
 import { logger } from "@/ui/logger";
 import { AgentSessionBase } from "@/agent/sessionBase";
 import type { TurnReporter } from "@/claude/utils/turnReporter";
+import {
+  tapNextMessage,
+  type ContextResetActuator,
+} from "@/claude/services/contextResetActuator";
 import type { SessionModelMode } from "@/api/types";
 import type { EnhancedMode } from "./loop";
 import type { PermissionMode } from "./loop";
@@ -74,6 +78,24 @@ export class Session extends AgentSessionBase<EnhancedMode> {
    * codex/gemini sessions (which don't drive Claude turn hooks) leave it unset.
    */
   turnReporter?: TurnReporter;
+
+  /**
+   * Issue #6559 (Task 4): acts on the server's reset flag and reports what
+   * happened. Attached once by `runClaude`'s `onSessionReady`; the SDK launcher
+   * reports its hand-overs and launch ends to it. Unset in a test session.
+   */
+  contextReset?: ContextResetActuator;
+
+  /**
+   * Issue #6559 (Task 4): wraps the SDK launcher's `nextMessage` so each item
+   * it hands to Claude is reported to {@link contextReset} (a plain delivery is
+   * confirmed there; a reset item is marked taken). Read at each launch.
+   */
+  tapNextMessage = <
+    R extends { message: string; control?: QueueControl } | null,
+  >(
+    fetch: () => Promise<R>
+  ): (() => Promise<R>) => tapNextMessage(this.contextReset, fetch);
 
   constructor(opts: {
     api: ApiClient;

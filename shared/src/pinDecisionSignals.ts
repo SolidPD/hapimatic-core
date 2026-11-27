@@ -942,6 +942,99 @@ function tailExcerpt(tail: string, firstLine: string): string {
 }
 
 /**
+ * #6456: one answer key of a message: its ask text, normalized as `askTexts`
+ * holds it, and the codes of its own fence, or null when it has none it can
+ * stand on (no fence, an unclosed one, or one the message's read window cut).
+ */
+export type AnswerKeyBlock = { askText: string; codes: string[] | null };
+
+/**
+ * #6456 (R3): whether an answer-key code can stand for an option of an open pin:
+ * two characters or longer, not a bare number, and not an approval token, so a
+ * reply such as "1", "A" or a token never reads as a pin's option ID.
+ */
+export function isCoverableAnswerCode(code: string): boolean {
+  return code.length >= 2 && !/^\d+$/.test(code) && !APPROVAL_TOKEN.test(code);
+}
+
+/** A code char: a letter, a digit, `_` or `-`. */
+function isCodeChar(ch: string): boolean {
+  return /^[\w-]$/.test(ch);
+}
+
+/** A code with its surrounding punctuation trimmed, by a scan (no backtracking). */
+function trimCodePunctuation(code: string): string {
+  let start = 0;
+  let end = code.length;
+  while (start < end && !isCodeChar(code[start]!)) start++;
+  while (end > start && !isCodeChar(code[end - 1]!)) end--;
+  return code.slice(start, end);
+}
+
+/**
+ * The codes of the first fence opened after line `from` and before the next
+ * heading, bold line or answer key, or null when there is none, it is unclosed,
+ * or it holds no code. Codes are the fence's words, split at spaces, commas and
+ * semicolons, with surrounding punctuation trimmed.
+ */
+function fenceCodesAfter(
+  lines: readonly string[],
+  from: number
+): string[] | null {
+  for (let i = from + 1; i < lines.length; i++) {
+    const raw = lines[i]!;
+    const run = FENCE.exec(raw)?.[1];
+    if (run) {
+      const body: string[] = [];
+      for (let j = i + 1; j < lines.length; j++) {
+        const line = lines[j]!;
+        const close = FENCE.exec(line)?.[1];
+        if (
+          close &&
+          close[0] === run[0] &&
+          close.length >= run.length &&
+          line.slice(line.indexOf(close) + close.length).trim() === ""
+        ) {
+          const codes = body
+            .join(" ")
+            .split(/[\s,;]+/)
+            .map(trimCodePunctuation)
+            .filter(code => code !== "");
+          return codes.length > 0 ? codes : null;
+        }
+        body.push(line);
+      }
+      return null;
+    }
+    if (HEADING_OR_BOLD.test(raw)) return null;
+  }
+  return null;
+}
+
+/**
+ * #6456 (R3): each answer key of a message with its ask text and its fence's
+ * codes, read from the same window and lines as {@link classifyDecisionSignals},
+ * so its ask texts are the ones `askTexts` holds. It changes no verdict. Never
+ * read codes from `excerpt`, which holds only the last block, cut at 1,200
+ * characters. Total: never throws.
+ */
+export function answerKeyBlocks(text: string): AnswerKeyBlock[] {
+  if (typeof text !== "string" || text.trim() === "") return [];
+  const window = readWindow(text);
+  const { lines } = window;
+  const kept = proseLines(window);
+  const blocks: AnswerKeyBlock[] = [];
+  for (const hit of findHits(kept)) {
+    if (hit.signal !== "answer_key") continue;
+    blocks.push({
+      askText: normalizeForMatch(ownText(hit, lines, kept)),
+      codes: fenceCodesAfter(lines, hit.line),
+    });
+  }
+  return blocks;
+}
+
+/**
  * Classify an assistant message. `decision` and `ambiguous` are both asks for the
  * nudge; `ambiguous` is what #6456's small-model step judges. Total: never throws.
  */

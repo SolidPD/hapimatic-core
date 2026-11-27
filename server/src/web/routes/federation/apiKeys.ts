@@ -3,6 +3,7 @@ import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { getConnInfo } from "hono/bun";
 import {
   defineCapability,
+  FederationApiKeyOutOfCreditRequestSchema,
   FederationApiKeyRequestSchema,
   FederationSharedApiKeysRequestSchema,
   isUsableNodeIdForSharing,
@@ -18,6 +19,10 @@ import type { WebAppEnv } from "../../middleware/auth";
 import { cataloged } from "../../../capabilities/cataloged";
 import { readSettings } from "../../../config/settings";
 import { homePeerAllowed } from "../../../federation/secretTransport";
+import {
+  stampOutOfCredit,
+  type ApiKeyCreditStampOutcome,
+} from "../../../services/apiKeyCreditStamp";
 import type { ApiKeySharePurpose } from "../../../store/apiKeyShareAuditStore";
 import { FixedWindowCounter } from "../../../utils/rateLimitCounter";
 import {
@@ -34,10 +39,23 @@ import { checkFederationToken, type FederationDeps } from "./shared";
  *   POST /api/federation/api-keys/shared  — this node's shared keys, redacted
  *   POST /api/federation/api-keys/resolve — one shared key's identity (no secret)
  *   POST /api/federation/api-keys/secret  — one shared key's secret
+ *   POST /api/federation/api-keys/out-of-credit — a peer's report that the
+ *        provider refused one of its sessions for lack of credit on a shared
+ *        key; this node stamps `outOfCreditAt` on it (issue #6978)
  *
  * A key stays in this node's vault. Another node of the same federation asks for
  * it each time one of its sessions needs it, and only a key the operator marked
  * "Make available to all nodes" (`shareAcrossNodes: true`) is ever served.
+ *
+ * The out-of-credit receiver passes the same checks in the same order, with
+ * `expectedMasked` required. It stamps with THIS node's clock (the body carries
+ * no time), re-checking existence, sharing and the mask inside the settings
+ * write chain, and writes ONE audit row with purpose `out-of-credit` and the
+ * request's true outcome (`ok`, the refusal code, or `internal`) before it
+ * answers; with no audit store it refuses as `api_key_audit_unavailable` before
+ * any stamp. A stamp's only effects are the key's card, the "use first" ranking
+ * and, once the low-credit notice ships, one notice; it clears itself at the
+ * next spend, budget edit or top-up.
  *
  * Every request is checked, in this order: the mesh token (401); the body
  * (refused as `invalid_request`, unaudited: it names no requester); a hosted
@@ -281,6 +299,10 @@ export function createFederationApiKeyRoutes(
     "This node cannot record API-key requests, so it serves none"
   );
 
+  /** The fixed answer to a request that failed inside this node: a receiver
+   *  body that threw (`guarded`), or an out-of-credit stamp that threw. */
+  const INTERNAL = refuse("internal", "The API key request failed");
+
   /** Run a receiver body; a throw becomes the fixed refusal `internal`, logged
    *  by error class only. The message never leaves this function. */
   async function guarded(
@@ -295,9 +317,27 @@ export function createFederationApiKeyRoutes(
         category: "api-keys",
         context: { purpose, error: errorClass(error) },
       });
-      return c.json(refuse("internal", "The API key request failed"));
+      return c.json(INTERNAL);
     }
   }
+
+  /** The three key refusals, shared by `checkKey` and the out-of-credit stamp
+   *  (which re-makes the same checks inside the settings write chain). */
+  const notFound = () =>
+    refuse(
+      "api_key_not_found",
+      `This API key is no longer stored on ${selfLabel()}`
+    );
+  const notShared = () =>
+    refuse(
+      "api_key_not_shared",
+      `This API key on ${selfLabel()} is not available to other nodes`
+    );
+  const replaced = (entry: StoredApiKey) =>
+    refuse(
+      "api_key_changed",
+      `The API key ${keyName(entry)} on ${selfLabel()} was replaced; pick it again`
+    );
 
   /** The checks a key must pass before its identity or secret is served. */
   function checkKey(
@@ -306,33 +346,16 @@ export function createFederationApiKeyRoutes(
   ): { entry: StoredApiKey } | { entry?: StoredApiKey; refusal: Refusal } {
     const entry = entries.find(e => e.id === req.id);
     if (!entry || entry.provider !== "anthropic") {
-      return {
-        refusal: refuse(
-          "api_key_not_found",
-          `This API key is no longer stored on ${selfLabel()}`
-        ),
-      };
+      return { refusal: notFound() };
     }
     if (entry.shareAcrossNodes !== true) {
-      return {
-        entry,
-        refusal: refuse(
-          "api_key_not_shared",
-          `This API key on ${selfLabel()} is not available to other nodes`
-        ),
-      };
+      return { entry, refusal: notShared() };
     }
     if (
       req.expectedMasked !== undefined &&
       req.expectedMasked !== maskApiKey(entry.key)
     ) {
-      return {
-        entry,
-        refusal: refuse(
-          "api_key_changed",
-          `The API key ${keyName(entry)} on ${selfLabel()} was replaced; pick it again`
-        ),
-      };
+      return { entry, refusal: replaced(entry) };
     }
     return { entry };
   }
@@ -545,6 +568,149 @@ export function createFederationApiKeyRoutes(
     ),
     requireToken,
     keyRoute("secret")
+  );
+
+  // Issue #6978: a peer reports that the provider refused one of its sessions
+  // for lack of credit on a key THIS node shares. The key is stamped here, with
+  // this node's clock, so its card, `/api/api-keys/available` and every peer's
+  // shared list read `outOfCredit: true`.
+  app.post(
+    "/federation/api-keys/out-of-credit",
+    cataloged(
+      defineCapability({
+        id: "accounts.federation-api-keys-out-of-credit",
+        domain: "accounts",
+        surface: "rest",
+        description:
+          "Record that a federation peer's session was refused by the provider for lack of credit on a key THIS node shares, so the key reads Out of credit here. Audited; never returns a key.",
+        whenToUse:
+          "Only node-to-node: a federation peer reporting that a key this node shares ran out of credit.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/federation/api-keys/out-of-credit",
+        },
+        auth: "federation-token",
+        riskTier: "mutating",
+        availability: { scope: "operator" },
+        telemetry: "off",
+        probe: "skip",
+      })
+    ),
+    requireToken,
+    c =>
+      guarded(
+        "out-of-credit",
+        async () => {
+          const body = FederationApiKeyOutOfCreditRequestSchema.safeParse(
+            await c.req.json().catch(() => null)
+          );
+          if (!body.success) {
+            return c.json(
+              refuse(
+                "invalid_request",
+                "id, homeNodeId, expectedMasked and requestingNodeId are required"
+              )
+            );
+          }
+          const req = body.data;
+          // Ruling D3: no stamp without a place to record it. That includes a
+          // store whose table still refuses this purpose (its one-time widen
+          // failed at boot): stamping first would leave the stamp unaudited.
+          // Checked before the gate, because every refusal below writes an
+          // `out-of-credit` row that such a table refuses too, which would
+          // answer `internal` with no row (#6978 F1).
+          const auditStore = deps.getApiKeyShareAudit?.();
+          if (!auditStore || !auditStore.acceptsPurpose("out-of-credit")) {
+            return c.json(NO_AUDIT);
+          }
+          const g = await gate(
+            c,
+            "out-of-credit",
+            req.requestingNodeId,
+            req.homeNodeId
+          );
+          const fields = {
+            keyId: req.id,
+            requestingNodeId: req.requestingNodeId,
+            sessionId: req.sessionId ?? null,
+            peer: g.peer,
+            purpose: "out-of-credit" as const,
+          };
+          const refuseAudited = (refusal: Refusal, entry?: StoredApiKey) =>
+            c.json(
+              audit({ ...fields, entry, outcome: refusal.code })
+                ? refusal
+                : NO_AUDIT
+            );
+          if (!g.ok) return refuseAudited(g.refusal);
+          const checked = checkKey(g.entries, req);
+          if ("refusal" in checked) {
+            return refuseAudited(checked.refusal, checked.entry);
+          }
+          const { entry } = checked;
+          if (
+            !allow(
+              keyLimiter,
+              `out-of-credit|${req.requestingNodeId}|${req.id}`
+            )
+          ) {
+            return refuseAudited(rateLimited(), entry);
+          }
+
+          // The checks are re-made on the settings read inside the write chain,
+          // so a key replaced or unshared since the gate's read is refused.
+          let stamped: ApiKeyCreditStampOutcome | null = null;
+          try {
+            const settingsFile = deps.getSettingsFile?.();
+            if (settingsFile) {
+              stamped = await stampOutOfCredit(
+                settingsFile,
+                req.id,
+                (deps.now ?? Date.now)(),
+                { requireShared: true, expectedMasked: req.expectedMasked }
+              );
+            }
+          } catch (error) {
+            deps.errorLogger?.error(
+              "Shared API key out-of-credit stamp failed",
+              {
+                category: "api-keys",
+                context: { purpose: "out-of-credit", error: errorClass(error) },
+              }
+            );
+          }
+          // ONE audit row with the request's true outcome (ruling D3). If the
+          // append itself throws after a stamp, `guarded` answers `internal`
+          // and that stamp is unaudited; the requester's retry answers
+          // `recent` and is audited.
+          if (
+            stamped === null ||
+            stamped.result === "not_found" ||
+            stamped.result === "not_shared" ||
+            stamped.result === "changed"
+          ) {
+            const refusal =
+              stamped === null
+                ? INTERNAL
+                : stamped.result === "not_found"
+                  ? notFound()
+                  : stamped.result === "not_shared"
+                    ? notShared()
+                    : replaced(entry);
+            return refuseAudited(refusal, entry);
+          }
+          if (!audit({ ...fields, entry, outcome: "ok" })) {
+            return c.json(NO_AUDIT);
+          }
+          return c.json({
+            ok: true,
+            ...(stamped.stampedAt ? { stampedAt: stamped.stampedAt } : {}),
+            changed: stamped.result === "stamped",
+          });
+        },
+        c
+      )
   );
 
   return app;

@@ -43,7 +43,16 @@ export interface SharedKeysResult {
   anyShared: boolean;
 }
 
-type ShareRow = { outcome: string; requesting_node_id: string; n: number };
+type ShareRow = {
+  outcome: string;
+  requesting_node_id: string;
+  purpose: string;
+  n: number;
+};
+
+/** #6978: a peer's report that a session there ran a shared key out of credit.
+ *  It is a write to the key's card, not a key served, so it has its own count. */
+const CREDIT_REPORT_PURPOSE = "out-of-credit";
 
 function malformed(path: string, what: string): Finding {
   return {
@@ -86,9 +95,9 @@ function readShareActivity(dbPath: string, sinceMs: number): ShareRow[] | null {
       .prepare(
         // A coalesced refusal row stands for itself plus the identical
         // refusals it summarises ("N identical refusal(s) …" in detail).
-        "SELECT outcome, requesting_node_id, SUM(1 + CASE WHEN detail LIKE '% identical refusal(s)%' " +
+        "SELECT outcome, requesting_node_id, purpose, SUM(1 + CASE WHEN detail LIKE '% identical refusal(s)%' " +
           "THEN CAST(detail AS INTEGER) ELSE 0 END) AS n FROM api_key_share_audit " +
-          "WHERE timestamp >= ? GROUP BY outcome, requesting_node_id"
+          "WHERE timestamp >= ? GROUP BY outcome, requesting_node_id, purpose"
       )
       .all(sinceMs) as ShareRow[];
   } finally {
@@ -235,8 +244,14 @@ export function checkSharedApiKeys(
       fixable: null,
     });
   } else {
+    // #6978: an accepted out-of-credit report is counted on its own, never as a
+    // key served. Its refusals stay in `refused`, so an unknown node or a
+    // non-Tailscale request on that route still raises the finding.
     const served = rows
-      .filter(r => r.outcome === "ok")
+      .filter(r => r.outcome === "ok" && r.purpose !== CREDIT_REPORT_PURPOSE)
+      .reduce((s, r) => s + r.n, 0);
+    const creditReports = rows
+      .filter(r => r.outcome === "ok" && r.purpose === CREDIT_REPORT_PURPOSE)
       .reduce((s, r) => s + r.n, 0);
     const refused = rows.filter(r => r.outcome !== "ok");
     const suspicious = refused.filter(r => SUSPICIOUS_REFUSALS.has(r.outcome));
@@ -258,6 +273,7 @@ export function checkSharedApiKeys(
       severity: suspiciousCount > 0 ? "medium" : "info",
       message:
         `shared-key requests from other nodes in the last 30 days: ${served} served, ${refusedCount} refused` +
+        (creditReports > 0 ? `, ${creditReports} credit reports` : "") +
         (requesters.length > 0
           ? ` (requesting nodes: ${requesters.slice(0, 10).join(", ")}${requesters.length > 10 ? ", …" : ""})`
           : "") +

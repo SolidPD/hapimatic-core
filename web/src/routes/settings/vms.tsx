@@ -20,10 +20,12 @@ import {
   useVmParityHub,
   useVmPreflight,
 } from "@/hooks/queries/useVmInventory";
+import { useFleetParity } from "@/hooks/queries/useFleetParity";
 import {
   InventoryTable,
   ParityHubTable,
 } from "@/components/vms/InventoryTable";
+import { FleetParityTable } from "@/components/vms/FleetParityTable";
 import { JobLogViewer } from "@/components/vms/JobLogViewer";
 import { NewVmForm } from "@/components/vms/NewVmForm";
 import { HealthCard } from "@/components/vms/HealthCard";
@@ -58,6 +60,8 @@ export default function AdminVmsPage() {
   const inventory = useVmInventory(api, { enabled });
   // #3996: RP1's own parity record, rendered above the fleet (never a fleet row).
   const parityHub = useVmParityHub(api, { enabled });
+  // #6300 PR-4: RP1's nightly fleet parity verdict (the panel at the top, and each VM's chip).
+  const fleetParity = useFleetParity(api, { enabled });
   const jobs = useVmJobs(api, { enabled, refetchInterval: 5000 });
 
   if (!enabled) {
@@ -105,6 +109,11 @@ export default function AdminVmsPage() {
         title="VMs"
       />
       <div className="mx-auto flex w-full max-w-content flex-col gap-4 px-4 pb-6">
+        <FleetParityTable
+          verdict={fleetParity.data}
+          isLoading={fleetParity.isLoading}
+          isError={fleetParity.isError}
+        />
         <NewVmForm api={api} onJobCreated={setActiveJobId} />
 
         {activeJobId && (
@@ -165,6 +174,7 @@ export default function AdminVmsPage() {
           api={api}
           entries={inventoryEntries}
           verdict={inventoryVerdict}
+          fleetParity={fleetParity.data}
           isLoading={inventory.isLoading}
           isError={inventory.isError}
           onDeprovisionApplied={setActiveJobId}

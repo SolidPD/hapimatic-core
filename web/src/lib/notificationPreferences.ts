@@ -46,6 +46,7 @@ export const STORAGE_KEYS = {
   loopsResuming: getStorageKey("hapi:notify:loopsResuming"),
   modelReverted: getStorageKey("hapi:notify:modelReverted"),
   signInEnding: getStorageKey("hapi:notify:signInEnding"),
+  trackingNotApplied: getStorageKey("hapi:notify:trackingNotApplied"),
 } as const satisfies Record<
   | "permissions"
   | "questions"

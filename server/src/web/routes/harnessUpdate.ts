@@ -50,6 +50,7 @@ const rollbackBodySchema = z
 
 /** Orchestrator error code → HTTP status. */
 const STATUS_BY_CODE: Record<UpdateErrorCode, ContentfulStatusCode> = {
+  test_instance: 409,
   update_in_flight: 409,
   version_mismatch: 409,
   no_prior_version: 409,
@@ -61,6 +62,8 @@ const STATUS_BY_CODE: Record<UpdateErrorCode, ContentfulStatusCode> = {
 
 /** Generic, command-free client messages (R11 — never echo the command/stderr). */
 const MESSAGE_BY_CODE: Record<UpdateErrorCode, string> = {
+  test_instance:
+    "Harness updates are off on a test instance: they would change the node's own installed harness.",
   update_in_flight:
     "An update or rollback is already in progress for this harness.",
   version_mismatch:

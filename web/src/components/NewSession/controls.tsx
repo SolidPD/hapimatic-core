@@ -75,32 +75,50 @@ export function UiInput({
   );
 }
 
-/** Standard on/off switch. */
+/**
+ * Standard on/off switch. The optional pass-through props (#6780, item 20) land
+ * on the checkbox; `hideText` omits the on/off word (the caller shows something
+ * else beside the switch). Every existing caller passes none of them and
+ * renders the same DOM.
+ */
 export function UiToggle(props: {
   checked: boolean;
   onChange: (value: boolean) => void;
   disabled?: boolean;
   onLabel?: string;
   offLabel?: string;
+  hideText?: boolean;
+  title?: string;
+  "aria-label"?: string;
+  "aria-invalid"?: boolean;
+  "aria-describedby"?: string;
 }) {
   return (
     <div className="flex items-center gap-3">
-      <label className="relative inline-flex h-5 w-9 items-center">
+      <label
+        className="relative inline-flex h-5 w-9 items-center"
+        title={props.title}
+      >
         <input
           type="checkbox"
           checked={props.checked}
           onChange={e => props.onChange(e.target.checked)}
           disabled={props.disabled}
           className="peer sr-only"
+          aria-label={props["aria-label"]}
+          aria-invalid={props["aria-invalid"]}
+          aria-describedby={props["aria-describedby"]}
         />
         <span className="absolute inset-0 rounded-full bg-[var(--app-border)] transition-colors peer-checked:bg-[var(--app-link)] peer-disabled:opacity-50" />
         <span className="absolute left-0.5 h-4 w-4 rounded-full bg-[var(--app-bg)] transition-transform peer-checked:translate-x-4 peer-disabled:opacity-50" />
       </label>
-      <span className="whitespace-nowrap text-xs text-[var(--app-fg)]">
-        {props.checked
-          ? (props.onLabel ?? "Enabled")
-          : (props.offLabel ?? "Disabled")}
-      </span>
+      {props.hideText ? null : (
+        <span className="whitespace-nowrap text-xs text-[var(--app-fg)]">
+          {props.checked
+            ? (props.onLabel ?? "Enabled")
+            : (props.offLabel ?? "Disabled")}
+        </span>
+      )}
     </div>
   );
 }

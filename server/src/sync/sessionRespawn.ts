@@ -25,7 +25,11 @@
 
 import { access as fsAccess } from "node:fs/promises";
 import type { Session } from "@hapi/protocol/types";
-import { inheritSpawnPosture, respawnYoloFromPosture } from "@hapi/protocol";
+import {
+  inheritSpawnPosture,
+  respawnYoloFromPosture,
+  type BillableSwitchBranchClaim,
+} from "@hapi/protocol";
 import type { SpawnSessionOptions } from "./syncEngine";
 import { inheritedSessionPins } from "./respawnBase";
 import type { SessionCache } from "./sessionCache";
@@ -644,7 +648,10 @@ export class SessionRespawn {
    */
   async branchSession(
     sessionId: string,
-    branchLabel?: string
+    branchLabel?: string,
+    // #6778 PR-C (Task 15b): who asked, from the route or the hop. None: the
+    // copy waits under "To confirm" (ruling PRC-R5).
+    claim?: BillableSwitchBranchClaim
   ): Promise<
     | { type: "success"; newSessionId: string }
     | { type: "error"; message: string; code?: string }
@@ -758,8 +765,14 @@ export class SessionRespawn {
       name: branchLabel ?? undefined,
       forkSession: true,
       parentSessionId: sessionId,
-      // Issue #6646 (A4): a branch takes its parent's switch and confirm state.
-      billableSwitchStart: { kind: "inherit", fromSessionId: sessionId },
+      // Issue #6646 (A4): a branch takes its parent's switch. #6778 PR-C (Task
+      // 15b, ruling 5): its claim decides whether the copy waits (row 6a or 6b)
+      // and is the start row's actor.
+      billableSwitchStart: {
+        ...claim,
+        kind: "inherit",
+        fromSessionId: sessionId,
+      },
       // #2479: stamp the discriminator so a branched child reads as "branch".
       // (The branch persistence itself is updateSessionBranchInfo below, which
       // also writes parent_relationship='branch'; this makes intent explicit and

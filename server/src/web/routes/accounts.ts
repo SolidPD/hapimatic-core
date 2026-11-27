@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
+import type { InstanceKind } from "@hapi/protocol/instanceKind";
+import {
+  ANTHROPIC_LOGIN_INHERITED_STORE_CODE,
+  ANTHROPIC_LOGIN_INHERITED_STORE_MESSAGE,
+  OPENAI_LOGIN_TEST_INSTANCE_CODE,
+  OPENAI_LOGIN_TEST_INSTANCE_MESSAGE,
+  getServerInstanceKind,
+  isInheritedStoreOn,
+  providerImportSources,
+} from "../../services/serverInstanceKind";
 import { z } from "zod";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import {
   AccountUsageHistorySchema,
   AccountUsageSchema,
@@ -70,17 +78,11 @@ import { listOlderLiveSiblingDaemons } from "../../services/siblingDaemonVersion
  */
 export async function triggerProviderImport(
   service: AccountService,
-  opts?: { force?: boolean }
+  opts?: { force?: boolean; instanceKind?: InstanceKind }
 ): Promise<void> {
-  const accountConfigsDir = join(
-    process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
-    "hapimatic",
-    "account-configs"
-  );
   await service.importProviderAccountsOnce(
     {
-      accountConfigsDir,
-      hostCodexHome: process.env.CODEX_HOME ?? join(homedir(), ".codex"),
+      ...providerImportSources(opts?.instanceKind ?? getServerInstanceKind()),
       readGeminiVaultEntries: async () => {
         const settings = await readSettings(configuration.settingsFile);
         return (settings?.apiKeys ?? [])
@@ -106,7 +108,7 @@ export async function triggerProviderImport(
         });
       },
     },
-    opts
+    { force: opts?.force }
   );
 }
 
@@ -248,9 +250,30 @@ export function createAccountsRoutes(opts: {
   // build (their CredentialsWatcher would overwrite a fresh sign-in). Defaults to
   // the daemon.state.json reader; tests inject.
   listOlderSiblingDaemons?: () => Promise<string[]>;
+  // Issue #6756 (TC1): this instance's kind (defaults to the boot reading, `real` until
+  // the boot sets it, so a test that never sets it keeps today's behaviour).
+  getInstanceKind?: () => InstanceKind;
 }): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
   const errorLogger = opts.errorLogger ?? null;
+  const instanceKind = (): InstanceKind =>
+    (opts.getInstanceKind ?? getServerInstanceKind)();
+  // R13 (ER-D1): a test instance whose store predates this work lists none of it.
+  const inheritedStore = (service: AccountService): boolean =>
+    isInheritedStoreOn(instanceKind(), service.storeDir);
+  // #6756 (round 3, E1): an Anthropic sign-in there would be saved, then hidden by every
+  // reader above, so a login start refuses it before any login work.
+  const refuseSignInOnInheritedStore = (c: Context<WebAppEnv>) => {
+    const service = opts.getAccountService();
+    if (!service || !inheritedStore(service)) return null;
+    return c.json(
+      {
+        error: ANTHROPIC_LOGIN_INHERITED_STORE_MESSAGE,
+        code: ANTHROPIC_LOGIN_INHERITED_STORE_CODE,
+      },
+      409
+    );
+  };
   // Instantiated inside the factory so each createAccountsRoutes() call (incl.
   // tests) gets a fresh rate-limit bucket map (#1099).
   const deleteLimiter = createRateLimiter({ name: "accounts-delete" });
@@ -345,7 +368,7 @@ export function createAccountsRoutes(opts: {
         // #3808: import #3807's provider artifacts into store records (once per
         // process, idempotent, best-effort) so OpenAI/Google accounts surface in
         // the roster alongside Anthropic.
-        await triggerProviderImport(service);
+        await triggerProviderImport(service, { instanceKind: instanceKind() });
         // #2095 (cloud onboarding): a cloud VM's Claude credential is delivered as a
         // process-level env var (wizard env-file → systemd drop-in), NOT an account-store
         // record — so the store can be empty while spawning works via the env-token
@@ -369,7 +392,8 @@ export function createAccountsRoutes(opts: {
         // and un-overridden accounts see the exact pre-change shape).
         const nicknames = opts.getNicknameStore?.();
         const monograms = opts.getMonogramStore?.();
-        const accounts = service.list().map(account => {
+        const listed = inheritedStore(service) ? [] : service.list();
+        const accounts = listed.map(account => {
           const nickname = nicknames?.get(account.accountUuid);
           const monogram = monograms?.get(account.accountUuid);
           // Spread both overrides at read time. The object literal is in the
@@ -440,6 +464,12 @@ export function createAccountsRoutes(opts: {
         return c.json({ error: "Usage service unavailable" }, 503);
       }
       try {
+        // #6756 (R13): an inherited test store's accounts are not listed, and its
+        // tokens are not read for a usage refresh either.
+        const accountService = opts.getAccountService();
+        if (accountService && inheritedStore(accountService)) {
+          return c.json({ usage: [], providerUsage: [] });
+        }
         // Push-to-cache read (#1909/#1962): serve the sampler's latest snapshot;
         // refresh only when never populated OR stale (Fallback Preservation Rule —
         // staleness guard self-heals a frozen cache; see usageService.getCachedOrRefresh).
@@ -655,6 +685,18 @@ export function createAccountsRoutes(opts: {
       }
       try {
         if (isLocalOpenAiRequest(nodeId)) {
+          // #6756 (R17, ER-D3): every OpenAI login creates a NEW machine-global
+          // folder that the node's real instance then imports, so a test instance
+          // refuses it before any login work.
+          if (instanceKind() === "test") {
+            return c.json(
+              {
+                error: OPENAI_LOGIN_TEST_INSTANCE_MESSAGE,
+                code: OPENAI_LOGIN_TEST_INSTANCE_CODE,
+              },
+              409
+            );
+          }
           const svc = opts.getCodexLoginService?.();
           if (!svc) {
             return c.json({ error: "Codex login service unavailable" }, 503);
@@ -1130,6 +1172,8 @@ export function createAccountsRoutes(opts: {
       if (!anthropicLoginRouting.isLocalTarget(nodeId)) {
         return await anthropicLoginRouting.startRemote(c, nodeId!);
       }
+      const refused = refuseSignInOnInheritedStore(c);
+      if (refused) return refused;
       const login = opts.getLoginService?.();
       if (!login) {
         return c.json({ error: "Account login service unavailable" }, 503);
@@ -1316,6 +1360,8 @@ export function createAccountsRoutes(opts: {
       if (!login) {
         return c.json({ error: "Account login service unavailable" }, 503);
       }
+      const refused = refuseSignInOnInheritedStore(c);
+      if (refused) return refused;
       if (!login.inVmSignInRequired()) {
         return c.json(
           {

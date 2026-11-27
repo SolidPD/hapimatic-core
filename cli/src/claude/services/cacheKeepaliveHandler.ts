@@ -113,6 +113,22 @@ export class CacheKeepaliveTracker {
     this.supportedThisProcess = false;
   }
 
+  /**
+   * Issue #6559 (Task 3, R12): a context reset ended the conversation. Its cache
+   * clock, TTL and idle time describe a prefix the new conversation does not
+   * share, so they go, and no keep-alive is sent until the new conversation
+   * completes a turn. The turn in flight (the reset's own first prompt, pushed
+   * just before) is left alone.
+   */
+  onConversationReset(): void {
+    this.touchedAt = null;
+    this.ttl = null;
+    this.idleSince = null;
+    this.turnsCompleted = 0;
+    this.configAtLastTurn = null;
+    this.toolsEpochAtLastTurn = this.toolsEpoch;
+  }
+
   /** A user message was handed to Claude: a turn starts with a new request. */
   onPromptPushed(): void {
     this.startTurn(this.now());

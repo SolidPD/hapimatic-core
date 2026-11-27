@@ -82,7 +82,7 @@ type ArchiveSessionFn = (
  */
 export type ApiKeyRefResolver = (
   ref: string,
-  opts: { sessionId: string }
+  opts: { sessionId: string; requireShared?: boolean }
 ) => Promise<ResolvedApiKey | ApiKeyRefusal>;
 
 /**
@@ -149,11 +149,13 @@ export interface AccountRestartDeps {
  * Issue #4823: what a session is switched ONTO — a subscription account or an
  * Anthropic API key by reference, never key material (#5127, #6542): a bare
  * vault id for a key on this node, or `<uuid>@<home>` for a key another node
- * shares.
+ * shares. `placedBy` (#6740): the node putting the key on this session, when
+ * another node does. Set means two things at once: the key must be shared, and
+ * a key on THIS node records the #5819 marker.
  */
 export type PaymentMethodTarget =
   | { kind: "account"; accountUuid: string }
-  | { kind: "api-key"; apiKeyId: string };
+  | { kind: "api-key"; apiKeyId: string; placedBy?: string };
 
 /** `httpStatus`: a shared-key refusal's own status (#6542), when it has one. */
 type SwitchError = {
@@ -206,6 +208,7 @@ type ResolvedTarget =
       apiKeyId: string;
       apiKeyMasked: string;
       displayIdentity: string;
+      apiKeyPlacedBy?: string;
     };
 
 /**
@@ -403,7 +406,7 @@ export class AccountRestart {
     // Issue #2299 (Task 4): the route's abort signal (`c.req.raw.signal`), threaded
     // through SessionService → SyncEngine so a client disconnect cancels the
     // bounded pre-kill wait. Optional + only the LOCAL path threads it (a proxied
-    // federated switch re-derives its own signal on the owning node).
+    // federated switch passes none: the owner's receiver runs it to the end).
     signal?: AbortSignal
   ): Promise<AccountSwitchSuccess | SwitchError> {
     // Issue #4823: the account-only entry point, kept for every existing caller.
@@ -503,8 +506,12 @@ export class AccountRestart {
     }
     // #6542 (ruling D1): split by reference form, as the daemon and the
     // placement re-check do. A bare id keeps this node's vault read, unchanged.
-    if (parseApiKeyRef(target.apiKeyId)?.homeNodeId !== null) {
-      return this.resolveSharedKeyTarget(target.apiKeyId, opts.sessionId);
+    // #6740: a key another node places here goes there in every form.
+    if (
+      target.placedBy !== undefined ||
+      parseApiKeyRef(target.apiKeyId)?.homeNodeId !== null
+    ) {
+      return this.resolveSharedKeyTarget(target, opts.sessionId);
     }
     const key = await this.getApiKeyById(target.apiKeyId);
     if (!key || key.provider !== "anthropic") {
@@ -531,9 +538,10 @@ export class AccountRestart {
    * messages. Fails closed: no resolver, a refusal or a throw changes nothing.
    * The binding is the CANONICAL ref (a ref homed on this node comes back bare),
    * the exact string the secret route later compares (`cliApiKeys.ts`).
+   * #6740: with `placedBy` the key must be shared, its own node's keys included.
    */
   private async resolveSharedKeyTarget(
-    ref: string,
+    { apiKeyId: ref, placedBy }: { apiKeyId: string; placedBy?: string },
     sessionId: string
   ): Promise<ResolvedTarget | SwitchError> {
     const resolver = this.getApiKeyRefResolver();
@@ -547,7 +555,10 @@ export class AccountRestart {
     }
     let outcome: ResolvedApiKey | ApiKeyRefusal;
     try {
-      outcome = await resolver(ref, { sessionId });
+      outcome = await resolver(ref, {
+        sessionId,
+        ...(placedBy !== undefined ? { requireShared: true } : {}),
+      });
     } catch (error) {
       // The class only: a thrown error's message can carry what it was handling.
       this.errorLogger?.error(
@@ -579,6 +590,11 @@ export class AccountRestart {
       displayIdentity: isQualifiedApiKeyRef(outcome.canonicalRef)
         ? `${name} (${outcome.homeNodeLabel})`
         : name,
+      // #5819: only a key on this node needs the marker; a foreign key's home
+      // re-checks sharing on every call.
+      ...(placedBy !== undefined && !isQualifiedApiKeyRef(outcome.canonicalRef)
+        ? { apiKeyPlacedBy: placedBy || "peer" }
+        : {}),
     };
   }
 
@@ -840,10 +856,11 @@ export class AccountRestart {
           apiKeyId: resolved.kind === "api-key" ? resolved.apiKeyId : undefined,
           apiKeyMasked:
             resolved.kind === "api-key" ? resolved.apiKeyMasked : undefined,
-          // Issue #5819: a switch target is chosen on the session's own node, so
-          // it is a local binding (persistBinding already dropped the record's
-          // marker). A foreign ref (#6542) needs none: its home re-checks sharing.
-          apiKeyPlacedBy: undefined,
+          // Issue #5819/#6740: the marker the record now holds — set when another
+          // node put one of this node's keys here, else none (a key chosen on the
+          // session's own node, or a foreign ref, whose home re-checks sharing).
+          apiKeyPlacedBy:
+            resolved.kind === "api-key" ? resolved.apiKeyPlacedBy : undefined,
         }),
       {
         capacityMode: "tail",
@@ -943,7 +960,11 @@ export class AccountRestart {
   ): boolean {
     return resolved.kind === "account"
       ? session.metadata?.accountUuid === resolved.accountUuid
-      : session.metadata?.apiKeyId === resolved.apiKeyId;
+      : session.metadata?.apiKeyId === resolved.apiKeyId &&
+          // #6740: the owner's own choice of a key a peer placed is a change (it
+          // drops the marker); a peer's choice of a key already held is not.
+          (resolved.apiKeyPlacedBy !== undefined ||
+            !session.metadata.apiKeyPlacedBy);
   }
 
   /**
@@ -965,6 +986,7 @@ export class AccountRestart {
           apiKeyId: resolved.apiKeyId,
           apiKeyMasked: resolved.apiKeyMasked,
           displayIdentity: resolved.displayIdentity,
+          apiKeyPlacedBy: resolved.apiKeyPlacedBy,
         });
   }
 

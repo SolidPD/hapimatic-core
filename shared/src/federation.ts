@@ -20,6 +20,7 @@ import {
   ModelRoutingSchema,
   NativeModelSelectionSchema,
   RedactedApiKeySchema,
+  ManagerStampReasonSchema,
   SessionRoleSchema,
   type RedactedApiKey,
 } from "./schemas";
@@ -74,6 +75,23 @@ export const INTERVAL_FEED_CAPABILITY = "billable:interval-feed";
 export const SHARED_API_KEYS_CAPABILITY = "api-keys:shared";
 
 /**
+ * Issue #6740: advertised by every node whose session-account receiver
+ * (`POST /api/federation/sessions/:id/account`) accepts an Anthropic API key by
+ * qualified reference. A hub sends a key target only to an owner that advertises
+ * it. `api-keys:shared` cannot stand for it: owners that advertise that tag
+ * without this one reject a key on that route.
+ */
+export const SESSION_API_KEY_SWITCH_CAPABILITY = "sessions:api-key-switch";
+
+/**
+ * Issue #6978: advertised by every binary that serves
+ * `POST /api/federation/api-keys/out-of-credit`. A node reports a peer's key as
+ * out of credit only to a home that advertises it; an older home is skipped
+ * before any call, and the key stays unstamped there.
+ */
+export const API_KEY_CREDIT_REPORT_CAPABILITY = "api-keys:credit-report";
+
+/**
  * Issue #6646: the billable switch's three capability tags, appended per call
  * by `detectCapabilities` (never cached with the base set). `billable:switch`:
  * the node's gate is `on`. `billable:switch-closed`: its gate is `closed` (the
@@ -89,6 +107,13 @@ export const BILLABLE_SWITCH_STORE_CAPABILITY = "billable:switch-store";
  * (`billable:tracking-carry`, PR-C) says the node keeps a carried start.
  */
 export const BILLABLE_TRACKING_CAPABILITY = "billable:tracking";
+/**
+ * Issue #6778 (4.1, PR-C): the node keeps and re-checks a carried start, serves
+ * the tracking receivers and answers whether a carried start was applied. A hub
+ * proxies a tracking read or write only to a node that advertises it; any other
+ * node's session is read from its summary, and a write to it is refused.
+ */
+export const BILLABLE_TRACKING_CARRY_CAPABILITY = "billable:tracking-carry";
 
 /**
  * Issue #6779: advertised by the node that keeps the billing-category list
@@ -329,6 +354,19 @@ export const FederationSpawnBodySchema = z.object({
   /** Issue #2822: "branch" | "spawn". The hub forward defaults it to "spawn" when
    *  a parent resolves, and omits both fields when it does not. */
   parentRelationship: z.enum(["branch", "spawn"]).optional(),
+  /** Issue #6918 (R7, R8): the manager stamp the SENDING node derived from the
+   *  local parent and the caller header. The receiver keeps it only beside a
+   *  spawn parent, with its own switch on, when the pair is consistent; it
+   *  never derives one itself. A malformed pair reads as absent (undecided);
+   *  an older receiver strips the field. The hub's client route deletes any
+   *  client-sent copy before parsing. */
+  managerStamp: z
+    .object({
+      managerSessionId: z.string().uuid().nullable(),
+      reason: ManagerStampReasonSchema,
+    })
+    .optional()
+    .catch(undefined),
   /** Issue #1633: launch the claude child with --safe-mode (scaffolding
    *  disabled) on the receiving node. Mirrors the local spawnBodySchema. */
   safeMode: z.boolean().optional(),
@@ -560,6 +598,36 @@ export type FederationApiKeySecret = z.infer<
   typeof FederationApiKeySecretSchema
 >;
 
+/**
+ * #6978: body of `POST /federation/api-keys/out-of-credit`, a requester's report
+ * that a session there was refused by the provider for lack of credit on this
+ * home's key. `expectedMasked` is required: a key rewritten under the same id
+ * since the session picked it is refused (a consistency check, not a defence).
+ * The body carries no time: the home stamps with its own clock.
+ */
+export const FederationApiKeyOutOfCreditRequestSchema =
+  FederationApiKeyRequestSchema.extend({
+    expectedMasked: z.string().min(1).max(64),
+  });
+export type FederationApiKeyOutOfCreditRequest = z.infer<
+  typeof FederationApiKeyOutOfCreditRequestSchema
+>;
+
+/**
+ * #6978: the home's answer to an out-of-credit report. `stampedAt` is the
+ * vault's stamp after the call (the home's clock); `changed` is true when this
+ * report wrote it and false when a recent stamp already stood. Both are
+ * optional on the wire, as every new federation field is.
+ */
+export const FederationApiKeyOutOfCreditSchema = z.object({
+  ok: z.literal(true),
+  stampedAt: z.string().optional(),
+  changed: z.boolean().optional(),
+});
+export type FederationApiKeyOutOfCredit = z.infer<
+  typeof FederationApiKeyOutOfCreditSchema
+>;
+
 /** Body of `POST /federation/spawn-api-key`: a spawn bound to a key homed on
  *  another node. `apiKeyId` must be a qualified `<uuid>@<homeNodeId>` ref; a
  *  bare id is refused (a local key spawns locally, never through this path). */
@@ -598,6 +666,11 @@ export const FederationSpawnStatusSchema = z.object({
   code: z.string().optional(),
   /** The sessionId of the spawned session (on success) */
   sessionId: z.string().optional(),
+  /** #6778 PRC-R9: the owning node's answer for a start that carried settings
+   *  or a copy, read by the hub with `SpawnTrackingAnswerSchema` itself, so a
+   *  value it cannot read is left out and the status still lands. Absent means
+   *  unknown (an older peer, or such a value), never applied. */
+  trackingStart: z.unknown().optional(),
 });
 
 export type FederationSpawnStatus = z.infer<typeof FederationSpawnStatusSchema>;

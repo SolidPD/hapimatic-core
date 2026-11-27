@@ -9,6 +9,9 @@ import {
   settleLaunchPermissionMode,
 } from "./spawnPermissionSeed";
 import { Future } from "@/utils/future";
+import type { QueuedMessage } from "@/utils/MessageQueue2";
+import { isIntentionalFastReturn } from "./services/contextResetActuator";
+import { reportMissingAttachments } from "./utils/missingAttachmentsReport";
 import {
   ChildExitError,
   SDKAssistantMessage,
@@ -72,8 +75,12 @@ import {
   verifyApiKeyForSession,
   readBoundApiKeyId,
   withAccountToken,
-  withAccountConfigDir,
 } from "./accountTokenInjection";
+import {
+  dropForeignResume,
+  resolveSessionChildEnv,
+  transcriptConfigDir,
+} from "./testInstanceConfigDir";
 import type { ClaudePermissionMode } from "@hapi/protocol/types";
 import { CACHE_KEEPALIVE_RPC_METHOD } from "@hapi/protocol";
 import {
@@ -569,6 +576,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
       // relays only system/result and drops task_started / task_notification
       // before that callback runs [ER 4383-2].
       session.backgroundAgentTracker.onSdkMessage(message);
+      session.contextReset?.onSdkMessage(message);
 
       if (message.type === "assistant") {
         let umessage = message as SDKAssistantMessage;
@@ -765,14 +773,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
       }
     }
 
+    let pending: QueuedMessage<EnhancedMode> | null = null;
+    session.contextReset?.setParkedProbe(() => pending !== null);
     try {
-      let pending: {
-        message: string;
-        mode: EnhancedMode;
-        isolate: boolean;
-        hash: string;
-      } | null = null;
-
       // Spawn-time --yolo sets session.permissionMode to "bypassPermissions",
       // but the web client's first message arrives with "default" because it
       // doesn't know about the spawn flag.  We apply the override on the first
@@ -850,6 +853,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
         this.abortFuture = new Future<void>();
         let modeHash: string | null = null;
         let mode: EnhancedMode | null = null;
+        let launchInitial: QueuedMessage<EnhancedMode> | null = null;
         const launchStartTime = Date.now();
         // Multi-account (epic #1446, Sub-Issue D): resolve the bound account's
         // token at each (re)launch (R7). Throws on unknown/unrefreshable (R3) —
@@ -886,13 +890,22 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
         // The cc session id arrives later via onSessionFound (SessionBase
         // recomputes the subagents/ path then).
         session.setBackgroundAgentContext({
-          configDir: accountConfigDir ?? undefined,
+          configDir: transcriptConfigDir(accountConfigDir),
           workingDirectory: session.path,
         });
         const accountToken =
           apiKeyBound || accountConfigDir
             ? null
             : await resolveAccountTokenForSession(session);
+        // Issue #6980: here, not in the try below, which would retry a refusal.
+        const childEnv = resolveSessionChildEnv({
+          session,
+          base: withAccountToken(session.claudeEnvVars, accountToken),
+          accountConfigDir,
+          hasCredential: apiKeyBound || accountToken !== null,
+          postRefusal: true,
+        });
+        dropForeignResume(session, accountConfigDir);
         // Issue #6617 round 4: the mode this iteration's query starts in, noted
         // on the session when the query is created (onQueryCreated, below).
         let startedPermissionMode: ClaudePermissionMode | null = null;
@@ -921,10 +934,11 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             isAborted: (toolCallId: string) => {
               return permissionHandler.isAborted(toolCallId);
             },
-            nextMessage: async () => {
+            nextMessage: session.tapNextMessage(async () => {
               if (pending) {
                 let p = pending;
                 pending = null;
+                launchInitial = p;
                 // Issue #6166 (ports tiann/hapi 9727f7e4a): seed the mode gate
                 // from the parked message. This query was launched with its mode
                 // (--effort among it); without the seed modeHash stays null, so
@@ -1016,7 +1030,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
 
               this.keepalive.onInputEnded();
               return null;
-            },
+            }),
             // Issue #6627 (R3): a message a fetch took after the end began goes
             // to the front of the queue; one parked in `pending` for a new mode
             // arrived after every handed-back message, so it goes behind them.
@@ -1024,6 +1038,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
               if (pending) {
                 session.queue.unshift(pending.message, pending.mode, {
                   isolate: pending.isolate,
+                  control: pending.control,
                 });
                 pending = null;
               }
@@ -1041,41 +1056,14 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             onAppliedEffort: session.onAppliedEffort,
             onQueryStart: session.onQueryStart,
             onQueryEnd: session.onQueryEnd,
-            onMissingAttachments: (missingPaths: string[]) => {
-              // Issue #1442: surface the silent multi-image data loss to the
-              // sender via the proven #1078 tool-error toast path. Use the SAME
-              // sessionId source ToolErrorDetector uses (`session.sessionId`,
-              // which the server's resolveSessionForNamespace resolves) — NOT
-              // the claudeRemote `sessionId` opt (the Claude resume id, null for
-              // fresh sessions). The toast renders as "Attached files: <msg>".
-              const names = missingPaths
-                .map(p => p.split("/").pop() ?? p)
-                .join(", ");
-              logger.reportError({
-                message: `${missingPaths.length} attached file(s) missing from disk at parse time`,
-                category: "tool-error",
-                severity: "warn",
-                sessionId: session.sessionId,
-                context: JSON.stringify({
-                  toolName: "Attached files",
-                  errorContent:
-                    `${missingPaths.length} of the attached files were not found on disk and ` +
-                    `could not be sent as images: ${names}. They were uploaded but their bytes ` +
-                    `never reached disk — please re-attach and resend.`,
-                }),
-              });
-            },
+            onMissingAttachments: missingPaths =>
+              reportMissingAttachments(session.sessionId, missingPaths),
             // Issue #4568: a key session's explicit set carries NO credential —
             // the key comes from its `apiKeyHelper`, and `apiKeyHelperSession`
             // strips every env credential that outranks the helper. Every other
             // session keeps its account binding.
             apiKeyHelperSession: apiKeyBound,
-            claudeEnvVars: apiKeyBound
-              ? session.claudeEnvVars
-              : withAccountConfigDir(
-                  withAccountToken(session.claudeEnvVars, accountToken),
-                  accountConfigDir
-                ),
+            claudeEnvVars: childEnv,
             claudeArgs: session.claudeArgs,
             onMessage,
             onCompletionEvent: (message: string) => {
@@ -1084,7 +1072,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
             },
             onSessionReset: () => {
               logger.debug("[remote]: Session reset");
-              session.clearSessionId();
+              session.resetConversation();
+              sdkToLogConverter.resetParentChain();
+              this.keepalive.onConversationReset();
             },
             onReady: () => {
               // Ready is now emitted via the onWaitStarted callback in
@@ -1128,6 +1118,10 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
           if (launchDurationMs >= MIN_HEALTHY_DURATION_MS) {
             consecutiveLaunchFailures = 0;
             consecutiveSignalFailures = 0;
+          } else if (isIntentionalFastReturn(launchInitial, pending)) {
+            logger.debug(
+              `[remote]: fast return after a reset, a clear or a parked item (#6559) — not counted`
+            );
           } else if (stoppedBy !== null) {
             // Issue #6617 (Matt 81a, 2026-11-12): a fast return because a stop
             // was asked for (the user's, or the applier's mode-switch stop,
@@ -1218,6 +1212,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
           const launchDurationMs = Date.now() - launchStartTime;
 
           logger.warn("[remote]: launch error", e);
+          session.contextReset?.onLaunchFailed(errorDetail);
           logger.warn(
             `[remote]: Claude process exited unexpectedly — ` +
               `type=${isSignalExit ? "signal" : "crash"}, ` +
@@ -1362,6 +1357,9 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
           }
         } finally {
           logger.debug("[remote]: launch finally");
+          // Issue #6559 (Task 3): every agent and shell ends with the process.
+          session.backgroundAgentTracker.reset();
+          session.contextReset?.onLaunchEnded();
 
           // Clear the active Query reference so a late-arriving mcp-toggle RPC
           // returns no_active_query instead of dispatching to a dead pipe.
@@ -1426,6 +1424,7 @@ class ClaudeRemoteLauncher extends RemoteLauncherBase {
         }
       }
     } finally {
+      session.contextReset?.onLauncherExit(pending);
       // Issue #3235: the SDK launcher wires onCleared (falling-edge clear) but has
       // no per-turn onThinkingChange(false) teardown, so clear the chip here on
       // launch exit — a dead session must not show a stale rate-limited chip.

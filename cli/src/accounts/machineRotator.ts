@@ -619,7 +619,24 @@ function isFresh(expiresAt: number, now: number, bufferMs: number): boolean {
 export type RotationDecision =
   | { action: "not-found" }
   | { action: "rotate"; refreshToken: string }
-  | { action: "adopt" };
+  | { action: "adopt" }
+  | {
+      action: "refuse";
+      reason: "fingerprint-changed" | "token-fresh" | "expiry-unknown";
+    };
+
+/**
+ * Issue #6997 (R9): what the idle backstop proved before it asked for this
+ * rotation — the fingerprint of the token its cross-node check compared, and
+ * the window it selected the account in (the expiry buffer, or the #4679 lead
+ * for a locally-bound account).
+ */
+export interface ExpectedRotation {
+  /** sha256 hex of the refresh token the cross-node check proved independent. */
+  refreshFingerprint: string;
+  /** The on-disk access token must expire within this many ms of now. */
+  withinMs: number;
+}
 
 /**
  * What to do once the lock is held, given the refresh token the caller read
@@ -630,14 +647,38 @@ export type RotationDecision =
  *     adopt it, no OAuth call;
  *  4. a different token that is NOT fresh (e.g. a pre-fix binary seeded an
  *     expired head) → rotate the ON-DISK token.
+ *
+ * Issue #6997 (R9): with an `expected` rotation (the idle backstop's proven
+ * cross-node paths), the on-disk token must be the one the check proved AND
+ * still inside the window it was selected in, else `refuse` (no OAuth call, no
+ * write). Cases 2 and 4 would otherwise rotate a token with no freshness test,
+ * or a different token the check never compared. Callers that pass no
+ * expectation (spawn-time recovery, force-refresh) keep cases 1-4 exactly.
  */
 export function decideRotation(
   presented: string,
   onDisk: IsolatedClaudeAiOauth | null,
   now: number,
-  expiryBufferMs: number
+  expiryBufferMs: number,
+  expected?: ExpectedRotation
 ): RotationDecision {
   if (!onDisk) return { action: "not-found" };
+  if (expected) {
+    if (
+      refreshTokenFingerprint(onDisk.refreshToken) !==
+      expected.refreshFingerprint
+    ) {
+      return { action: "refuse", reason: "fingerprint-changed" };
+    }
+    // A missing or non-numeric expiry cannot show the token is near expiry.
+    if (!Number.isFinite(onDisk.expiresAt)) {
+      return { action: "refuse", reason: "expiry-unknown" };
+    }
+    if (onDisk.expiresAt - now > expected.withinMs) {
+      return { action: "refuse", reason: "token-fresh" };
+    }
+    return { action: "rotate", refreshToken: onDisk.refreshToken };
+  }
   if (onDisk.refreshToken === presented) {
     return { action: "rotate", refreshToken: presented };
   }
@@ -710,6 +751,11 @@ export interface IsolatedRotationDeps {
   ) => Promise<void>;
   now: () => number;
   expiryBufferMs: number;
+  /**
+   * Issue #6997 (R9): the idle backstop's proven expectation, re-checked under
+   * the lock ({@link decideRotation}). Absent ⇒ today's compare-and-swap rules.
+   */
+  expected?: ExpectedRotation;
   /**
    * Issue #6800 (invariant I1): "is this refresh token the current ~/.claude
    * token?" — `hostChainQuarantine.sharesHostChain` in production. Required, so
@@ -784,13 +830,28 @@ async function rotateLocked(
     deps.presentedRefreshToken,
     onDisk,
     deps.now(),
-    deps.expiryBufferMs
+    deps.expiryBufferMs,
+    deps.expected
   );
   if (decision.action === "not-found" || !onDisk) {
     logger.warn(
       `[TOKEN_REFRESH] forceRefreshIsolated: no readable isolated credentials for ${uuid}`
     );
     return { status: "not-found" };
+  }
+  // Issue #6997 (R9): the token on disk is not the one the cross-node check
+  // proved, or it is no longer near expiry. No OAuth call, no write.
+  if (decision.action === "refuse") {
+    const detail =
+      decision.reason === "fingerprint-changed"
+        ? "the token on disk is not the one the cross-node check proved"
+        : decision.reason === "expiry-unknown"
+          ? "the token on disk has no readable expiry"
+          : "the token on disk is no longer near expiry";
+    logger.info(
+      `[TOKEN_REFRESH] isolated rotation for ${uuid} refused under the lock: ${detail} (#6997); no OAuth call`
+    );
+    return { status: "transient", detail: `rotation refused: ${detail}` };
   }
   // Issue #6800 (Task 1b): checked after the locked read, so a shared chain an
   // older daemon wrote while this caller waited for the lock is still refused:

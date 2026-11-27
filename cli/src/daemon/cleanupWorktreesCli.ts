@@ -6,10 +6,13 @@ import { basename, join } from "node:path";
 import { promisify } from "node:util";
 
 import {
+  describeInstanceOwner,
   discoverWorktreeInstances,
   getListeningPorts,
+  readInstanceOwnerState,
   releaseWorktreePortClaim,
   type DiscoveredWorktreeInstance,
+  type InstanceUnitReader,
 } from "./worktreeMeta";
 import {
   isWorktreeLive,
@@ -397,6 +400,11 @@ export async function findTtlCandidates(
     tmuxSessionCounts?: Map<number, number>;
     daemonUptimeSeconds?: Map<number, number>;
     sidecarPathForPort?: (port: number) => string;
+    // #4588: the home whose `.hapimatic-wt-<port>/owner-worktree` Pass 1
+    // reads (default `process.env.HOME`, the home the teardown cleans), and
+    // the reader of the port's units (default `systemctl --user show`).
+    ownerHome?: string;
+    ownerUnits?: InstanceUnitReader;
   }
 ): Promise<FindCandidatesResult> {
   const candidates: CleanupCandidate[] = [];
@@ -406,6 +414,7 @@ export async function findTtlCandidates(
 
   // Pass 1 (age): iterate discovered instances, check created_at age.
   let expiredCount = 0;
+  let notOwnedCount = 0;
   for (const instance of instances) {
     if (!instance.createdAt) continue;
     const createdMs = Date.parse(instance.createdAt);
@@ -417,6 +426,27 @@ export async function findTtlCandidates(
       `TTL expired: ${basename(instance.worktreePath)} ` +
         `(age: ${ageHours}h, port: ${instance.port})`
     );
+    // #4588 (D-4588-2 A): the claimed port may be held by ANOTHER worktree's
+    // instance, so tear it down only when it is provably this worktree's (the
+    // rule `cleanupWorktreeAndBranch` Step 0.5 applies). Otherwise it is no
+    // candidate: neither cleaned nor failed, and its meta claim is left as is.
+    // Pass 2 still judges that port on its own idleness.
+    const owner = await readInstanceOwnerState({
+      port: instance.port,
+      worktreePath: instance.worktreePath,
+      home: seams?.ownerHome ?? process.env.HOME ?? "",
+      readUnit: seams?.ownerUnits,
+    });
+    if (owner.state !== "own" && owner.state !== "own-legacy") {
+      logCron(
+        `  Skipping teardown: port=${instance.port} ${owner.state} ` +
+          `(${describeInstanceOwner(owner)}) — not provably ` +
+          `${basename(instance.worktreePath)}'s instance; meta left as is ` +
+          `(issue #4588)`
+      );
+      notOwnedCount++;
+      continue;
+    }
     candidates.push({
       port: instance.port,
       reason: `ttl-age (${ageHours}h > ${ttlHours}h)`,
@@ -431,6 +461,12 @@ export async function findTtlCandidates(
     logCron(`Pass 1 (age): no expired instances found (TTL: ${ttlHours}h).`);
   } else {
     logCron(`Pass 1 (age): found ${expiredCount} expired instance(s).`);
+  }
+  if (notOwnedCount > 0) {
+    logCron(
+      `Pass 1 (age): skipped ${notOwnedCount} expired worktree(s) whose ` +
+        `instance is not provably theirs (issue #4588).`
+    );
   }
 
   // Pass 2 (idle): for any active daemon not already caught by Pass 1, check

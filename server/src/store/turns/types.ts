@@ -72,7 +72,11 @@ export type TurnEventKind =
   // surfaces a swallowed parse error; the finalize seam records it as this event
   // (open TEXT, no SQL CHECK → no migration, per K1) so a fleet-wide parse
   // regression is counted via `v_analytics_counts` instead of silently zeroing.
-  | "parse_failed";
+  | "parse_failed"
+  // #6559: one event per context-reset arm (armed or refused) and per terminal
+  // outcome, on the arming turn's row. A new arm replaces a terminal request
+  // row, so these events are the only history (`server/src/contextReset/report.ts`).
+  | "context_reset";
 
 /**
  * Append-only manual time-ledger adjustment type. Plain TEXT — no CHECK (K1).

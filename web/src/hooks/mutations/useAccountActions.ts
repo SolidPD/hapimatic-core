@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ApiError, type ApiClient } from "@/api/client";
+import { ApiError, RequestTimeoutError, type ApiClient } from "@/api/client";
 import type {
   AccountLoginStartResponse,
   AccountsResponse,
@@ -13,6 +13,7 @@ import type {
 } from "@/types/api";
 import type { AccountExhaustion, ProviderId } from "@hapi/protocol";
 import { exhaustedLimitText, readAccountExhausted } from "@/lib/accountLimit";
+import { apiErrorServerMessage } from "@/lib/apiErrorMessage";
 import { queryKeys } from "@/lib/query-keys";
 import { useToast } from "@/components/Toast";
 import { reloginToastFromError } from "@/lib/reloginLink";
@@ -97,7 +98,26 @@ function exhaustedToastText(exhaustion: AccountExhaustion | null): string {
   return `${exhaustedLimitText(exhaustion)} The session stays on its account; reopen Session Configuration to use it anyway.`;
 }
 
+const UNKNOWN_SWITCH_OUTCOME_TEXT =
+  "The switch is taking longer than expected and may still complete. Check the session before trying again.";
+
+/**
+ * Issue #6740 (ER-7): the text for a switch whose outcome nobody knows yet — this
+ * browser gave up waiting, or the hub lost the session's node after sending it the
+ * switch. Null for every other error. It may still complete, so it never reads as
+ * a failure: a second switch on top of the first is what "try again" would start.
+ */
+export function unknownSwitchOutcomeText(err: unknown): string | null {
+  if (err instanceof RequestTimeoutError) return UNKNOWN_SWITCH_OUTCOME_TEXT;
+  if (err instanceof ApiError && err.code === "switch_outcome_unknown") {
+    return apiErrorServerMessage(err) ?? UNKNOWN_SWITCH_OUTCOME_TEXT;
+  }
+  return null;
+}
+
 function mapSwitchErrorText(err: unknown, code: string | undefined): string {
+  const unknownOutcome = unknownSwitchOutcomeText(err);
+  if (unknownOutcome) return unknownOutcome;
   switch (code) {
     case "at_capacity":
       return "This node is full — free a session (disconnect or delete one) and retry the switch.";
@@ -119,9 +139,10 @@ function mapSwitchErrorText(err: unknown, code: string | undefined): string {
     case "account_exhausted":
       return exhaustedToastText(readAccountExhausted(err)?.exhaustion ?? null);
     // Issue #6542: a key that is not found (it names where keys live and how to
-    // reach one on another node) and a peer-owned session (it names the owner)
-    // show the server's message, so `api_key_not_found` and
-    // `api_key_remote_unsupported` fall through to the body read below.
+    // reach one on another node) and a peer-owned session whose owner cannot take
+    // a key (#6740: it names the owner) show the server's message, so
+    // `api_key_not_found` and `api_key_remote_unsupported` fall through to the
+    // body read below.
     default: {
       let text =
         err instanceof Error ? err.message : "Failed to switch account";
@@ -248,7 +269,12 @@ export function useAccountActions(
       ) {
         return;
       }
-      const { message, action } = mapSwitchError(err);
+      // #6740: the unknown-outcome text is about a session; a node default that
+      // timed out keeps its own.
+      const { message, action } =
+        !sessionId && err instanceof RequestTimeoutError
+          ? { message: err.message, action: undefined }
+          : mapSwitchError(err);
       showToast(message, { type: "error", action });
     },
     onSettled: () => {

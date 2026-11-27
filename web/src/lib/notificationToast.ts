@@ -26,6 +26,11 @@
 // here caps pop-ups. `Toast.tsx` keeps its own MAX_VISIBLE cap and 2 s dedup.
 import type { NotificationSeverity } from "@hapi/protocol";
 import {
+  claimTrackingPopup,
+  isTrackingPopupClaimed,
+  trackingPopupKeys,
+} from "@/lib/trackingPopups";
+import {
   buildReloginToast,
   requestRelogin,
   type ReloginRequest,
@@ -101,6 +106,27 @@ function parseContext(raw: string | null | undefined): Context {
 function str(ctx: Context, key: string): string | undefined {
   const v = ctx[key];
   return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/**
+ * #6780 (Task 8, B14): the keys of a `tracking-not-applied` row, for the one
+ * pop-up per start. A copy-not-sent row pairs by the spawn's correlation id
+ * (its `sessionId` is the parent's, so never a key); a lost-start row by its
+ * tag and the session it names. The kind is tested before the context is
+ * parsed, so no other row pays a parse.
+ */
+function trackingNoticeKeys(row: NotificationToastRow): string[] {
+  if (row.kind !== "tracking-not-applied") return [];
+  const ctx = parseContext(row.context);
+  if (str(ctx, "lostCause") !== undefined) {
+    return trackingPopupKeys({
+      tag: str(ctx, "tag"),
+      sessionId: row.sessionId,
+    });
+  }
+  return trackingPopupKeys({
+    spawnCorrelationId: str(ctx, "spawnCorrelationId"),
+  });
 }
 
 /**
@@ -311,6 +337,15 @@ export function createToastGate(
         }
       }
 
+      // #6780 (Task 8): another source in this tab already showed this
+      // start's tracking pop-up (the spawn hook's or the read-back's).
+      if (
+        row.kind === "tracking-not-applied" &&
+        isTrackingPopupClaimed(trackingNoticeKeys(row))
+      ) {
+        return "suppressed";
+      }
+
       if (phase === "retrying") {
         const last = lastRetryingBySession.get(sessionKey);
         if (last !== undefined && t - last < retryThrottleMs) {
@@ -327,6 +362,10 @@ export function createToastGate(
 
     noteShown(row) {
       const t = now();
+      // #6780 (Task 8): a shown notice claims its start; one not shown never does.
+      if (row.kind === "tracking-not-applied") {
+        claimTrackingPopup(trackingNoticeKeys(row));
+      }
       if (retryPhase(row) === "retrying") {
         lastRetryingBySession.set(row.sessionId ?? "", t);
       }

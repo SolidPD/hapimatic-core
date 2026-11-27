@@ -10,6 +10,12 @@ export type SocketData = {
   runnerKey?: string;
   /** Issue #6647 (PR2): the identity layer cut this socket off. */
   evicted?: boolean;
+  /**
+   * #6559 (binding 3): the session this CLI socket declared at its handshake,
+   * set only when that session resolved in the socket's namespace. The
+   * context-reset events are accepted only for it.
+   */
+  cliSessionId?: string;
 };
 
 export type SocketServer = Server<

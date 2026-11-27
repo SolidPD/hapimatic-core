@@ -16,6 +16,9 @@ import {
   createUnreadCountRefresher,
   type UnreadCountRefresher,
 } from "@/lib/notificationCache";
+import { kindShownWithGate } from "@/lib/notificationKindPrefs";
+import { queryKeys } from "@/lib/query-keys";
+import type { VersionInfo } from "@/hooks/useVersion";
 
 /** Enough of a row to act on; `useSSE` forwards the event unvalidated. */
 function isNotificationRow(value: unknown): value is StoredNotification {
@@ -91,6 +94,14 @@ export function NotificationListener(): null {
         }
         applyNotificationToCache(queryClient, row);
         refresherRef.current?.schedule();
+
+        // #6778 PR-C (moved item 3): a billable tracking kind never pops up
+        // while this node's gate is off (or not read yet); its row stays in
+        // the inbox.
+        const billableSwitch = queryClient.getQueryData<VersionInfo>(
+          queryKeys.version
+        )?.billableSwitch;
+        if (!kindShownWithGate(row.kind, billableSwitch)) return;
 
         if (gate.decide(row, readPreferencesFailOpen()) !== "show") return;
         const toast = formatNotificationToast(row);

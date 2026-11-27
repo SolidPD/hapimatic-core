@@ -4,6 +4,8 @@ import {
   BillableConfirmSchema,
   projectBaseKey,
   projectKeyKind,
+  TrackingRecordSchema,
+  trackingProjectOf,
   unloggedAmount,
   type BillableConfirm,
   type BillableSwitchActor,
@@ -24,8 +26,10 @@ import type {
   BillableSwitchMirrorEvent,
 } from "../store/billableSwitchStore";
 import type { BillableSwitchInitial } from "../store/sessions";
+import type { ProducerNotification } from "../notifications/producerNotifications";
 import {
   resolveTrackingStartForInsert,
+  setTrackingNoticeSink,
   type TrackingRegistration,
 } from "./trackingStart";
 import { retryTrackingReconcileFor } from "./trackingStartup";
@@ -42,6 +46,68 @@ import type {
 // other node's header list is kept (the start-up step deleted the peers' stored
 // header rows; their report rows stay, and a received report stores nothing):
 // no header decides a start.
+
+/**
+ * R8's untracked earlier time (#6778, 7.3; review S4): the session's timer now,
+ * less the timer covered by tracked stretches, read from the timer each history
+ * row stores. The rows are walked in id order with the timeline's rules (3.5):
+ * header rows and the rows a `reconciled` row replays are skipped; a row the
+ * writer wrote stands for its snapshot (one that does not parse: untracked), any
+ * other row for a partial record tracked from its own `at`, or for none. A
+ * turn-on whose `trackFrom` reaches back to the start of the untracked stretch
+ * before it covers that stretch ("include earlier time"). A row with no stored
+ * timer adds no time. Never below 0. It is also the amount the old switch dialog
+ * shows once a record exists (3.3; ruling PRC-R1).
+ */
+export function untrackedEarlierMs(
+  events: readonly BillableSwitchEvent[],
+  input: { timerNowMs: number; startedAt: number }
+): number {
+  const rows = [...events].sort((a, b) => a.id - b.id);
+  const replayed = new Set<number>();
+  for (const row of rows) {
+    const replayOf = row.label?.replayOf;
+    if (
+      row.kind === "tracking" &&
+      row.reason === "reconciled" &&
+      typeof replayOf === "number"
+    ) {
+      replayed.add(replayOf);
+    }
+  }
+  const trackedFrom = (row: BillableSwitchEvent): number | null => {
+    if (row.origin !== undefined && row.origin !== null) {
+      const parsed = TrackingRecordSchema.safeParse(row.settingsAfter);
+      return parsed.success ? parsed.data.trackFrom : null;
+    }
+    return row.billableAfter === true ? row.at : null;
+  };
+  let covered = 0;
+  let timer = 0;
+  let tracked = false;
+  let untracked = { at: input.startedAt, timer: 0 };
+  for (const row of rows) {
+    if (row.kind === "header-on" || row.kind === "header-off") continue;
+    if (
+      (row.origin === undefined || row.origin === null) &&
+      replayed.has(row.id)
+    )
+      continue;
+    const at =
+      typeof row.timerMs === "number" ? Math.max(timer, row.timerMs) : timer;
+    if (tracked) covered += at - timer;
+    const from = trackedFrom(row);
+    if (from !== null && !tracked && from <= untracked.at) {
+      covered += at - untracked.timer;
+    }
+    if (from === null && tracked) untracked = { at: row.at, timer: at };
+    tracked = from !== null;
+    timer = at;
+  }
+  const now = Math.max(timer, input.timerNowMs);
+  if (tracked) covered += now - timer;
+  return Math.max(0, now - covered);
+}
 
 /** One node in the cross-node view (the join of the stored reports and the registry). */
 export type BillableSwitchCrossNodeEntry = Omit<
@@ -199,6 +265,12 @@ export type BillableSwitchServiceDeps = {
   getRole?: () => "hub" | "peer" | "node";
   /** The 30-minute sweep of the spawn queues (sessionCache.sweepPendingByTag). */
   sweepPendingByTag?: () => void;
+  /**
+   * #6778 PR-C (moved item 3): raises a user notification
+   * (`SyncEngine.notifyUser`). The lost-start notice goes through it; absent,
+   * none is raised.
+   */
+  notify?: (input: ProducerNotification) => void;
   now?: () => number;
 };
 
@@ -218,6 +290,8 @@ export class BillableSwitchService {
 
   constructor(private readonly deps: BillableSwitchServiceDeps) {
     this.now = deps.now ?? Date.now;
+    // One service per process: the start rule's lost-start notice goes here.
+    setTrackingNoticeSink(deps.notify ?? null);
   }
 
   mode(): BillableSwitchMode {
@@ -254,6 +328,22 @@ export class BillableSwitchService {
       .thinkingStartedAt;
     if (!session.thinking || typeof started !== "number") return 0;
     return Math.max(0, now - started);
+  }
+
+  /**
+   * R8's untracked earlier time for a local session (`untrackedEarlierMs`), from
+   * its own history rows in its namespace. The tracking read carries it as the
+   * amount the old switch dialog shows once a record exists (ruling PRC-R1).
+   */
+  earlierMsFor(
+    sessionId: string,
+    namespace: string,
+    input: { timerNowMs: number; startedAt: number }
+  ): number {
+    return untrackedEarlierMs(
+      this.deps.store.billableSwitch.listEvents(sessionId, namespace),
+      input
+    );
   }
 
   /** The session timer plus the live segment. */
@@ -490,11 +580,7 @@ export class BillableSwitchService {
       namespace,
       {
         ...route,
-        project: {
-          kind: projectKeyKind(meta),
-          key: projectKey,
-          name: projectKey,
-        },
+        project: trackingProjectOf(meta),
         trackFrom: session?.createdAt ?? now,
         event: {
           actorKind: input.actor.kind,

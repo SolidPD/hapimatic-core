@@ -243,7 +243,7 @@ export function resolveApiKeyBinding(input: {
     return {
       ok: false,
       code: "api_key_not_shared",
-      message: `The Anthropic API key "${label}" is no longer shared with other nodes — this session was started from another node, so it cannot restart on that key. Switch it to an account, or start a new session on this node with the key.`,
+      message: `The Anthropic API key "${label}" is no longer shared with other nodes — this session was put on that key from another node, so it cannot restart on it. Switch it to an account, or start a new session on this node with the key.`,
     };
   }
   if (input.expectedMasked && input.expectedMasked !== masked) {

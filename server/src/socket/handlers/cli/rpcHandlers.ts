@@ -40,6 +40,7 @@ export function registerRpcHandlers(
   socket: SocketWithData,
   rpcRegistry: RpcRegistry
 ): void {
+  // #6974: exempt from the runner identity gate, see socketEventClasses.ts.
   socket.on("rpc-register", (data: unknown) => {
     const parsed = rpcRegisterSchema.safeParse(data);
     if (!parsed.success) {
@@ -48,6 +49,7 @@ export function registerRpcHandlers(
     rpcRegistry.register(socket, parsed.data.method, parsed.data.meta);
   });
 
+  // #6974: exempt (removes only its own registration), socketEventClasses.ts.
   socket.on("rpc-unregister", (data: unknown) => {
     const parsed = rpcUnregisterSchema.safeParse(data);
     if (!parsed.success) {

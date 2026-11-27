@@ -174,6 +174,9 @@ function LaneSessionPins(props: {
   const listZone =
     query.data?.kind === "ready" ? (query.data.timeZone ?? null) : null;
   const zone = useMemo(() => resolvePinZone(listZone), [listZone]);
+  // #6969 (D2): the lane session's note limit, from the same list.
+  const noteMaxChars =
+    query.data?.kind === "ready" ? query.data.noteMaxChars : undefined;
   const models = useMemo(
     () =>
       (pins ?? [])
@@ -190,8 +193,9 @@ function LaneSessionPins(props: {
       markSeen,
       via: "pins",
       timeZone: zone,
+      noteMaxChars,
     }),
-    [api, session.id, session.running, markSeen, zone]
+    [api, session.id, session.running, markSeen, zone, noteMaxChars]
   );
   const toggle = useCallback((key: string) => {
     setExpanded(prev => {

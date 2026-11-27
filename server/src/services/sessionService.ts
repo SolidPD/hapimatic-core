@@ -41,6 +41,7 @@ import {
   type AgentTranscriptPageResult,
 } from "../sync/transcript/agentTranscriptPage";
 import { getKnownSecretLiterals } from "./knownSecretLiterals";
+import { switchPeerSessionToApiKey } from "./peerSessionKeySwitch";
 import {
   localOrProxyMutation,
   EMOJI_MUTATION,
@@ -54,6 +55,7 @@ import {
   PROMPT_DRAFT_MUTATION,
   RENAME_MUTATION,
   CEILING_OVERRIDE_MUTATION,
+  trackingProxyDetail,
 } from "../web/routes/sessionMutationHandlers";
 import type {
   SessionMutationResult,
@@ -307,23 +309,19 @@ export class SessionService {
     pathSuffix: string,
     method: string,
     namespace: string,
-    body?: unknown
+    body?: unknown,
+    headers?: Record<string, string>
   ): Promise<ProxyResult> {
-    if (!this.registry) {
-      return { type: "not-found" };
-    }
-
-    const node = this.registry.findNodeForSession(sessionId);
-    if (!node) {
-      return { type: "not-found" };
-    }
+    const node = this.registry?.findNodeForSession(sessionId);
+    if (!node) return { type: "not-found" };
     return this.proxyToResolvedNode(
       node,
       sessionId,
       pathSuffix,
       method,
       namespace,
-      body
+      body,
+      headers
     );
   }
 
@@ -331,15 +329,17 @@ export class SessionService {
    * Issue #6447: forward a request to the node that owns the session, generic (the
    * pin routes and #6646's billable routes use it), because `localOrProxyMutation`
    * drops the peer's body these routes return, and this file is at `max-lines`.
+   * `headers` (#6456): what the hub resolved itself, e.g. the caller's session.
    */
   proxyPinRequest(
     sessionId: string,
-    pathSuffix: string,
+    path: string,
     method: string,
     namespace: string,
-    body?: unknown
+    body?: unknown,
+    headers?: Record<string, string>
   ): Promise<ProxyResult> {
-    return this.proxyToNode(sessionId, pathSuffix, method, namespace, body);
+    return this.proxyToNode(sessionId, path, method, namespace, body, headers);
   }
 
   /**
@@ -354,9 +354,11 @@ export class SessionService {
     pathSuffix: string,
     method: string,
     namespace: string,
-    body?: unknown
+    body?: unknown,
+    extraHeaders?: Record<string, string>
   ): Promise<ProxyResult> {
     const headers: Record<string, string> = {
+      ...extraHeaders,
       "Content-Type": "application/json",
       // Issue #1097: forward the caller's JWT namespace so the receiver can
       // re-assert namespace ownership (federation token authenticates the
@@ -420,6 +422,7 @@ export class SessionService {
         servers.every(name => typeof name === "string")
           ? { servers: servers as string[] }
           : {}),
+        ...trackingProxyDetail(errBody),
       };
     } catch (error) {
       // Both branches leave `code` undefined: switchPaymentMethod maps that to
@@ -667,8 +670,8 @@ export class SessionService {
     namespace: string,
     // Issue #2299 (Task 4): the client request's abort signal, threaded to the
     // engine so a client disconnect cancels the bounded pre-kill wait. Only the
-    // LOCAL path forwards it; a proxied federated switch re-derives its own signal
-    // from the owning node's incoming request.
+    // LOCAL path forwards it; a proxied federated switch passes none (the owner's
+    // receiver runs it to the end).
     signal?: AbortSignal
   ): Promise<SwitchAccountServiceResult> {
     // Issue #4823: the account-only entry point, kept for every existing caller.
@@ -693,8 +696,8 @@ export class SessionService {
   /**
    * Issue #4823: switch (or stage) a session's payment method — an account or an
    * API-key reference (#6542: a key another node shares, too). Local → the
-   * engine's body. Remote → an account is proxied; a key is refused before any
-   * proxy, naming the owner (switching it from a hub is #6740).
+   * engine's body. Remote → proxied to the owner, a key only by qualified ref and
+   * only to an owner that takes one (#6740, `peerSessionKeySwitch.ts`).
    */
   async switchPaymentMethod(
     sessionId: string,
@@ -733,17 +736,12 @@ export class SessionService {
     }
 
     if (target.kind === "api-key") {
-      // An unknown (or offline) owner stays a 404, as for an account target.
-      const owner = this.registry?.findNodeForSession(sessionId);
-      if (!owner) return { type: "not-found" };
-      const ownerLabel =
-        this.registry?.getNodeIdentity(owner.nodeId)?.nodeLabel ?? owner.nodeId;
-      return {
-        type: "error",
-        message: `Open this session on ${ownerLabel} to switch it to an API key.`,
-        status: switchAccountCodeToStatus("api_key_remote_unsupported"),
-        code: "api_key_remote_unsupported",
-      };
+      return switchPeerSessionToApiKey(
+        this.registry,
+        this.localNode().nodeId,
+        this.proxyToResolvedNode.bind(this),
+        { sessionId, apiKeyId: target.apiKeyId, namespace }
+      );
     }
 
     // Issue #4461 (R6): resolve the owning node once and keep it for the stamp.
@@ -866,7 +864,13 @@ export class SessionService {
       overrides
     );
     if (result.type === "success") {
-      this.registry?.evictSessionFromCache(sessionId, undefined, "relaunch");
+      // #6740: a saved set restarts nothing, and the modal's next call needs the
+      // cached entry, so it takes the new set in place (ruling A-D4).
+      if (!overrides.persistOnly) {
+        this.registry?.evictSessionFromCache(sessionId, undefined, "relaunch");
+      } else if (overrides.mcpSet) {
+        this.registry?.updateCachedSessionMcpSet(sessionId, overrides.mcpSet);
+      }
       return { type: "success" };
     }
     if (result.type === "not-found") return { type: "not-found" };

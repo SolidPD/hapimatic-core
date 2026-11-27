@@ -107,6 +107,29 @@ export function canonicalApiKeyRef(
   return ref;
 }
 
+/**
+ * True when two refs name the same key, as a session on `sessionNodeId` records
+ * or is offered them (#6740). The vault ids must match and the homes must not
+ * conflict. A bare id's home is the session's node, so `<id>` and `<id>@<that
+ * node>` are one key, while two nodes that hold the same vault id (a copied
+ * settings file) stay two keys. A home that is not known (no usable
+ * `sessionNodeId`) is not compared. A malformed ref equals only itself.
+ */
+export function sameApiKeyRef(
+  a: string,
+  b: string,
+  sessionNodeId: string | null | undefined
+): boolean {
+  const parsedA = parseApiKeyRef(a);
+  const parsedB = parseApiKeyRef(b);
+  if (!parsedA || !parsedB) return a === b;
+  if (parsedA.id !== parsedB.id) return false;
+  const own = isUsableNodeIdForSharing(sessionNodeId) ? sessionNodeId : null;
+  const homeA = parsedA.homeNodeId ?? own;
+  const homeB = parsedB.homeNodeId ?? own;
+  return homeA === null || homeB === null || homeA === homeB;
+}
+
 /** The vault id inside any ref: the bare id itself, or the qualified ref's id. */
 export function apiKeyRefVaultId(ref: string): string {
   return parseApiKeyRef(ref)?.id ?? ref;

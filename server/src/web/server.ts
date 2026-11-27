@@ -22,6 +22,7 @@ import type { FederationConfig } from "@hapi/protocol";
 import type { HeartbeatService } from "../extensions/heartbeat/heartbeatService";
 import type { SchedulerService } from "../extensions/scheduler/scheduler/schedulerService";
 import type { ContextWatermarkService } from "../watermark/contextWatermarkService";
+import type { ContextResetService } from "../contextReset/service";
 import type { SSEManager } from "../sse/sseManager";
 import type { Server as BunServer, ServerWebSocket } from "bun";
 import type { Server as SocketEngine } from "@socket.io/bun-engine";
@@ -81,6 +82,8 @@ export async function startWebServer(options: {
   getSchedulerService: () => SchedulerService | null;
   /** Issue #2158: context-watermark successor-handoff status/override service. */
   getContextWatermarkService: () => ContextWatermarkService | null;
+  /** #6559: the context-reset service behind the read and cancel routes. */
+  getContextResetService?: () => ContextResetService | null;
   getNodeRegistry: () => NodeRegistry | null;
   /** Issue #4913: the notify() service behind /api/notifications. */
   getNotificationService?: () => NotificationService | null;
@@ -149,6 +152,7 @@ export async function startWebServer(options: {
     getHeartbeatService: options.getHeartbeatService,
     getSchedulerService: options.getSchedulerService,
     getContextWatermarkService: options.getContextWatermarkService,
+    getContextResetService: options.getContextResetService,
     getNodeRegistry: options.getNodeRegistry,
     getNotificationService: options.getNotificationService,
     getHealthAggregator: options.getHealthAggregator,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { resolveLocalNodeIdentity } from "../../config/nodeLabel";
+import { isManagerStampEnabled } from "../../configuration";
 import { z } from "zod";
 import { McpSetSchema, optionalSessionNameSchema } from "@hapi/protocol";
 import {
@@ -20,7 +21,7 @@ import {
   ExistingBranchSchema,
   SourceBranchSchema,
 } from "@hapi/protocol/gitBranches";
-import type { SyncEngine } from "../../sync/syncEngine";
+import type { Session, SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
 import type { ErrorLogger } from "../../logging/errorLogger";
 import type { SharedApiKeyService } from "../../services/sharedApiKeyService";
@@ -39,11 +40,21 @@ import {
 import { requireMachine } from "./guards";
 import {
   buildBillableSwitchStart,
+  CALLER_SESSION_HEADER,
   floorAgentMcpEnable,
   floorAgentSpawnPosture,
   refuseRetiredBillableAnswer,
+  resolveAgentParent,
+  resolveCallerSession,
+  resolvePersonTrackedStart,
 } from "./agentEscalation";
-import { BillableSwitchStartChoiceSchema } from "@hapi/protocol";
+import { observedTrackingStart } from "../../billableSwitch/trackingStart";
+import {
+  BillableSwitchStartBodySchema,
+  type TrackingCategoryLookup,
+} from "@hapi/protocol";
+import type { Store } from "../../store";
+import { lookUpCategory } from "./billableTracking";
 import { resolveSpawnMcpSet } from "../../services/mcpSetResolver";
 import type { McpCatalogService } from "../../services/mcpCatalogService";
 import { logAndJson } from "./routeErrorHelper";
@@ -198,14 +209,12 @@ export const spawnBodySchema = z.object({
   /** Issue #2479: "branch" | "spawn". Defaulted to "spawn" by the route when a
    *  parent is present and this is omitted (a PM-originated managed peer). */
   parentRelationship: z.enum(["branch", "spawn"]).optional(),
-  /** Issue #6646: the start answer a client may send with a spawn, `{ choice }`
-   *  ONLY (strict: a client cannot send a kind, an actor or a node); the route
-   *  builds the start context from the request (buildBillableSwitchStart). A
-   *  retired choice is refused with 400 `billable_choice_retired` (#6778). */
-  billableSwitchStart: z
-    .object({ choice: BillableSwitchStartChoiceSchema })
-    .strict()
-    .optional(),
+  /** Issue #6646: the start answer a client may send with a spawn: `{ choice }`
+   *  or, from #6778, a person's `{ tracking }` settings, exactly one key (strict:
+   *  a client cannot send a kind, an actor or a node); the route builds the
+   *  start context from the request (buildBillableSwitchStart). A retired choice
+   *  is refused with 400 `billable_choice_retired` (#6778). */
+  billableSwitchStart: BillableSwitchStartBodySchema.optional(),
 });
 
 /** Issue #4568 (R8): the stable 400 codes for an invalid API-key spawn body. */
@@ -272,6 +281,23 @@ const addRecentPathSchema = z.object({
   path: z.string().min(1),
 });
 
+/** #6918 F1: the CLI's spawn claim; no #6218 floor reads it (PM ruling A1). */
+const SPAWN_CALLER_HEADER = "X-Hapi-Spawn-Caller";
+
+/** The spawn's caller: X-Hapi-Session-Id, else the claim while the switch is on. */
+function resolveSpawnCaller(
+  c: Context<WebAppEnv>,
+  engine: SyncEngine | null
+): Session | undefined {
+  const claim = isManagerStampEnabled() && c.req.header(SPAWN_CALLER_HEADER);
+  if (c.req.header(CALLER_SESSION_HEADER) || !claim || !engine) {
+    return resolveCallerSession(c, engine);
+  }
+  const byId = engine.getSession(claim);
+  if (byId) return byId.namespace === c.get("namespace") ? byId : undefined;
+  return engine.getSessionByTagAndNamespace(claim, c.get("namespace"));
+}
+
 export function createMachinesRoutes(
   getSyncEngine: () => SyncEngine | null,
   options?: {
@@ -292,6 +318,14 @@ export function createMachinesRoutes(
     // project-disabled refusal. Absent ⇒ no default and no project check; an
     // explicit set is still checked against the agent and safe mode.
     getMcpCatalog?: () => McpCatalogService | null;
+    // Issue #6778 (Task 15): this node's tracking records (whether an agent's
+    // parent has one) and #6779's category lookup for a person's settings
+    // (ruling P-8). Absent ⇒ no parent has a record, and a tracked start answers
+    // 409 categories_unavailable.
+    getStore?: () => Pick<Store, "billableTracking"> | null;
+    getTrackingCategoryLookup?: (
+      namespace: string
+    ) => TrackingCategoryLookup | null;
   }
 ): Hono<WebAppEnv> {
   const errorLogger = options?.errorLogger ?? null;
@@ -587,12 +621,17 @@ export function createMachinesRoutes(
       }
 
       // Issue #6646: the start context, built from the request by the signal
-      // order of Task 6 (never taken from the client body beyond its choice).
-      const billableSwitchStart = buildBillableSwitchStart(
+      // order of Task 6 (never taken from the client body beyond its answer).
+      const bodyStart = parsed.data.billableSwitchStart;
+      const bodyTracking =
+        bodyStart && "tracking" in bodyStart ? bodyStart.tracking : undefined;
+      const routeStart = buildBillableSwitchStart(
         c,
         engine,
         {
-          choice: parsed.data.billableSwitchStart?.choice,
+          choice:
+            bodyStart && "choice" in bodyStart ? bodyStart.choice : undefined,
+          tracking: bodyTracking,
           parentSessionId: resolvedParentSessionId,
           parentRelationship:
             parsed.data.parentRelationship ??
@@ -605,13 +644,38 @@ export function createMachinesRoutes(
       // `billable_choice_retired` in every gate state, as the hub's route to
       // another node and the peer's receiver refuse it, never dropped. No
       // answer, `follow-header` and `not-billable` pass in every gate state.
-      const billableRefusal = refuseRetiredBillableAnswer(
-        c,
-        billableSwitchStart
-      );
+      const billableRefusal = refuseRetiredBillableAnswer(c, routeStart);
       if (billableRefusal) {
         return billableRefusal;
       }
+      // Issue #6778 (Task 15): a person's settings are checked here, the entry
+      // node; an agent's start records the parent it copies (agentEscalation.ts).
+      const billableMode = engine.getBillableSwitchMode?.() ?? "off";
+      const personStart = await resolvePersonTrackedStart(
+        c,
+        routeStart,
+        bodyTracking,
+        {
+          mode: billableMode,
+          nodeLabel:
+            engine.getBillableSwitchService?.()?.localNodeLabel?.() ??
+            getLocalNode().nodeLabel,
+          lookUp: ref =>
+            lookUpCategory(options?.getTrackingCategoryLookup, namespace, ref),
+        }
+      );
+      if (personStart instanceof Response) return personStart;
+      const copy = resolveAgentParent(c, engine, personStart, {
+        mode: billableMode,
+        parentSessionId: resolvedParentSessionId,
+        hasRecord: id =>
+          (options?.getStore?.()?.billableTracking.get(id, namespace) ??
+            null) !== null,
+        nodeId: engine.getBillableSwitchService?.()?.localNodeId() ?? null,
+        lookup: { engine },
+      });
+      const billableSwitchStart = copy.start;
+      if (copy.warning) spawnWarnings.push(copy.warning);
 
       const spawnOptions = {
         machineId,
@@ -681,6 +745,16 @@ export function createMachinesRoutes(
         parentRelationship:
           parsed.data.parentRelationship ??
           (resolvedParentSessionId ? "spawn" : undefined),
+        // Issue #6918 (D3): did the parent itself make this spawn? Only the
+        // request's caller header can say so (never a body field: the body
+        // schema has no manager key). The browser never sends the header, so a
+        // FanOut or a stale PWA reads "not from its parent".
+        spawnRequestedByParent:
+          !!resolvedParentSessionId &&
+          resolveSpawnCaller(c, engine)?.id === resolvedParentSessionId,
+        spawnCallerHeaderPresent:
+          Boolean(c.req.header(CALLER_SESSION_HEADER)) ||
+          (isManagerStampEnabled() && !!c.req.header(SPAWN_CALLER_HEADER)),
       };
 
       // Issue #1565 (Option B): opt-in early-return path. Pre-generate the
@@ -846,7 +920,20 @@ export function createMachinesRoutes(
             account = undefined;
           }
         }
-        return c.json(withSpawnNotes(result, account));
+        // #6778 PRC-R9: whether a start that carried settings or a copy was
+        // applied (such a start reaches here only while the gate is `on`).
+        const trackingStart =
+          billableSwitchStart.tracking || billableSwitchStart.inheritedFrom
+            ? observedTrackingStart(
+                options?.getStore?.() ?? null,
+                result.sessionId,
+                namespace
+              )
+            : undefined;
+        return c.json({
+          ...withSpawnNotes(result, account),
+          ...(trackingStart ? { trackingStart } : {}),
+        });
       }
       // Issue #5879: a failed spawn carries no headroom notes — "proceeding
       // without a headroom check" would misreport a spawn that did not proceed.

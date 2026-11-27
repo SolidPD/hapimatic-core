@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { WebAppEnv } from "../../middleware/auth";
 import type { FederationDeps } from "./shared";
 import { checkCallerNamespace, checkFederationToken } from "./shared";
+import type { TrackingReceiverDeps } from "./billableTrackingReceivers";
 import { logAndJson } from "../routeErrorHelper";
 import { archiveResponseBody } from "../pinRouteHelpers";
 import { spawnForPeer } from "./peerSpawn";
@@ -14,7 +15,14 @@ import {
   markSpawnFailed,
 } from "../../../sync/pendingSpawns";
 import { spawnFailedNotification } from "../../../notifications/producerNotifications";
-import { defineCapability, FederationSpawnStatusSchema } from "@hapi/protocol";
+import {
+  BillableSwitchBranchClaimWireSchema,
+  defineCapability,
+  FederationSpawnStatusSchema,
+  SpawnTrackingAnswerSchema,
+  type BillableSwitchBranchClaim,
+  type SpawnTrackingAnswer,
+} from "@hapi/protocol";
 import { cataloged } from "../../../capabilities/cataloged";
 import {
   isFileTypeAllowed,
@@ -26,7 +34,7 @@ import {
 } from "../upload";
 
 export function createSessionLifecycleRoutes(
-  deps: FederationDeps
+  deps: FederationDeps & TrackingReceiverDeps
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
 
@@ -511,18 +519,26 @@ export function createSessionLifecycleRoutes(
 
       // Parse optional branch label
       let branchLabel: string | undefined;
+      // #6778 PR-C (Task 15b): the hub's claim, its actor recorded on the start
+      // row. It never carries `inheritClaim`, so a branch that arrives over the
+      // hop always waits (ruling 5); an older hub sends none, which waits too.
+      let claim: BillableSwitchBranchClaim = {};
       try {
         const body = await c.req.json();
         if (body && typeof body.branchLabel === "string") {
           branchLabel = body.branchLabel;
         }
+        const parsed = BillableSwitchBranchClaimWireSchema.safeParse(
+          body?.claim
+        );
+        if (parsed.success) claim = parsed.data;
       } catch {
         // Empty body is fine
       }
 
       // Branch is async and may take a while — await it since the hub
       // needs the new session ID to return to the client.
-      const result = await engine.branchSession(sessionId, branchLabel);
+      const result = await engine.branchSession(sessionId, branchLabel, claim);
       if (result.type === "success") {
         return c.json({ ok: true, newSessionId: result.newSessionId });
       }
@@ -1145,6 +1161,20 @@ export function createSessionLifecycleRoutes(
         error,
         code,
       } = parsed.data;
+      // #6778 PRC-R9: the owning node's answer, read with its strict schema
+      // here; a value this hub cannot read is left out, never forwarded raw.
+      let trackingStart: SpawnTrackingAnswer | undefined;
+      if (parsed.data.trackingStart !== undefined) {
+        const answer = SpawnTrackingAnswerSchema.safeParse(
+          parsed.data.trackingStart
+        );
+        if (answer.success) trackingStart = answer.data;
+        else {
+          console.warn(
+            `[Federation] spawn-status from ${nodeId}: a trackingStart answer this hub cannot read was left out (spawnCorrelationId: ${spawnCorrelationId ?? "none"})`
+          );
+        }
+      }
 
       // Issue #2150: the placeholder this hub registered when it proxied the
       // spawn (webClient.ts). It is the ONLY source of the caller's namespace —
@@ -1250,6 +1280,7 @@ export function createSessionLifecycleRoutes(
             sessionId,
             ...(nodeLabel ? { nodeLabel } : {}),
             namespace: pending.namespace,
+            ...(trackingStart ? { trackingStart } : {}),
           });
         };
         // The peer's self-reported id first (the pre-#2150 poll target), then

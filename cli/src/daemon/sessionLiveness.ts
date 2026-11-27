@@ -36,6 +36,7 @@
 import { LIVE_SESSION_FRESHNESS_WINDOW_MS } from "@hapi/protocol";
 export { LIVE_SESSION_FRESHNESS_WINDOW_MS };
 import {
+  isSessionBusyForRotation,
   sessionBusyReason,
   type SessionBusyReason,
   type SessionBusySignal,
@@ -114,9 +115,17 @@ export interface LivenessInput {
  * `refreshIdleIsolatedAccounts`, NOT here: #2281's premise that an idle account
  * "will auto-refresh within ~60s" NOW holds for a LOCALLY-bound, non-inferring,
  * near-expiry isolated account (the rotate-anyway path restarts it), where
- * previously it never held while any session was bound. It still does NOT hold
- * for a remote-only binding (no cross-node restart) or a mid-inference session
- * (deferred until post-expiry) — both keep decaying to expiry by design.
+ * previously it never held while any session was bound. It does NOT hold for a
+ * mid-inference session (deferred until post-expiry), which keeps decaying to
+ * expiry by design.
+ *
+ * Issue #6997 (Matt's X1-1, superseding #4888's "leave the remote-only case
+ * unchanged" and epic #6799's 2026-11-21 named limit): a REMOTE-ONLY binding (a
+ * live session on another node, none here) no longer decays by design where
+ * this node's chain is PROVEN independent of every holder's
+ * (`remoteChainIndependence.ts`, gated by HAPI_IDLE_ROTATE_REMOTE_INDEPENDENT):
+ * the backstop then rotates THIS node's own chain and restarts nothing. A pair
+ * the proof cannot cover (gate off, shared, unknown) still keeps the skip.
  */
 export function isSessionLiveForGuard(
   s: LivenessInput,
@@ -195,4 +204,83 @@ export function collectLocalBindings(
     }
   }
   return { uuids, busyUuids, busyReasons };
+}
+
+/**
+ * Issue #6997: one FEDERATION session as read from `/api/federation/all-sessions`
+ * for the rotation guards — the liveness fields, the shared busy signal, the
+ * node that holds it (stamped by the hub's poll) and the bound account.
+ */
+export type RemoteBindingInput = LivenessInput &
+  SessionBusySignal & {
+    nodeId?: string;
+    metadata?: {
+      claudeAccount?: { email?: string };
+      accountUuid?: string;
+    };
+  };
+
+/** The node id recorded for a live remote session that names no node. */
+export const UNKNOWN_HOLDER_NODE = "?";
+
+/** Issue #6997: which accounts a live REMOTE session holds, and on which nodes. */
+export interface RemoteBindings {
+  /** Emails of accounts with a live remote session (`claudeAccount.email`). */
+  emails: Set<string>;
+  /** Uuids of accounts with a live remote session (`metadata.accountUuid`). */
+  uuids: Set<string>;
+  /** The nodes holding each email; {@link UNKNOWN_HOLDER_NODE} for a session with no node id. */
+  holderNodesByEmail: Map<string, Set<string>>;
+  /** The nodes holding each uuid; {@link UNKNOWN_HOLDER_NODE} for a session with no node id. */
+  holderNodesByUuid: Map<string, Set<string>>;
+  /** The subset of `emails` with at least one BUSY live remote session. */
+  busyEmails: Set<string>;
+}
+
+/**
+ * Issue #6997: the federation-leg collector for the rotation guards, the remote
+ * mirror of {@link collectLocalBindings}. A session counts only when it is live
+ * for the guard ({@link isSessionLiveForGuard}); it is keyed by its
+ * `claudeAccount.email` AND by its `accountUuid` when present (R4: a holder
+ * visible only by uuid is still a holder). A live session with no `nodeId` is
+ * recorded under {@link UNKNOWN_HOLDER_NODE}, a node no fingerprint probe can
+ * answer for, so holder coverage can never pass for it. Busy is the shared
+ * `isSessionBusyForRotation` predicate, as the federation leg used inline.
+ */
+export function collectRemoteBindings(
+  sessions: readonly RemoteBindingInput[],
+  now: number,
+  windowMs: number = LIVE_SESSION_FRESHNESS_WINDOW_MS
+): RemoteBindings {
+  const emails = new Set<string>();
+  const uuids = new Set<string>();
+  const holderNodesByEmail = new Map<string, Set<string>>();
+  const holderNodesByUuid = new Map<string, Set<string>>();
+  const busyEmails = new Set<string>();
+  const addHolder = (
+    map: Map<string, Set<string>>,
+    key: string,
+    nodeId: string
+  ): void => {
+    const nodes = map.get(key) ?? new Set<string>();
+    nodes.add(nodeId);
+    map.set(key, nodes);
+  };
+  for (const s of sessions) {
+    if (!isSessionLiveForGuard(s, now, windowMs)) continue;
+    const email = s.metadata?.claudeAccount?.email;
+    const uuid = s.metadata?.accountUuid;
+    if (!email && !uuid) continue;
+    const nodeId = s.nodeId || UNKNOWN_HOLDER_NODE;
+    if (email) {
+      emails.add(email);
+      addHolder(holderNodesByEmail, email, nodeId);
+      if (isSessionBusyForRotation(s)) busyEmails.add(email);
+    }
+    if (uuid) {
+      uuids.add(uuid);
+      addHolder(holderNodesByUuid, uuid, nodeId);
+    }
+  }
+  return { emails, uuids, holderNodesByEmail, holderNodesByUuid, busyEmails };
 }

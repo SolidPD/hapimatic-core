@@ -62,12 +62,16 @@ import {
   readBoundApiKeyId,
   API_KEY_SDK_ONLY_MESSAGE,
   withAccountToken,
-  withAccountConfigDir,
   resolveSpawnClaudeArgs,
   resolveSpawnContextWindow,
   readBoundAccountUuid,
   applySpawnPermissionArgs,
 } from "./accountTokenInjection";
+import {
+  dropForeignResume,
+  resolveSessionChildEnv,
+  transcriptConfigDir,
+} from "./testInstanceConfigDir";
 import {
   permissionNarrowingHolds,
   settleLaunchPermissionMode,
@@ -476,6 +480,9 @@ export async function claudeTmuxRemoteLauncher(
   // projects tree the account-bound claude child writes to under isolation,
   // instead of host ~/.claude/projects. Reused for token/model resolution below.
   const accountConfigDir = await resolveAccountConfigDirForSession(session);
+  // Issue #6980: a test instance's own folder, when that is where the child runs.
+  dropForeignResume(session, accountConfigDir);
+  const transcriptDir = transcriptConfigDir(accountConfigDir);
 
   // Issue #1719: suppress the scanner's re-emit of a web-originated user
   // message — the web POST already persisted it (Message A, with localId).
@@ -499,7 +506,7 @@ export async function claudeTmuxRemoteLauncher(
     // detectors below.
     resumeSessionId: resumeSessionIdFromArgs(session.claudeArgs) ?? undefined,
     workingDirectory: session.path,
-    configDir: accountConfigDir ?? undefined,
+    configDir: transcriptDir,
     onMessage: message => {
       forwardToChat(message);
       // Issue #1653 clear-site (ii): transcript activity means Claude has moved
@@ -533,7 +540,7 @@ export async function claudeTmuxRemoteLauncher(
   // Issue #4383: hand the tracker this session's reconcile context (the same
   // account-config dir the scanner watches, #1573).
   session.setBackgroundAgentContext({
-    configDir: accountConfigDir ?? undefined,
+    configDir: transcriptDir,
     workingDirectory: session.path,
   });
 
@@ -701,6 +708,13 @@ export async function claudeTmuxRemoteLauncher(
     const accountToken = accountConfigDir
       ? null
       : await resolveAccountTokenForSession(session);
+    // Issue #6980: once, before the retry loop, so a refusal is not retried.
+    const childEnv = resolveSessionChildEnv({
+      session,
+      base: withAccountToken(session.claudeEnvVars, accountToken),
+      accountConfigDir,
+      hasCredential: accountToken !== null,
+    });
     // Issue #1488 (Gap 4): append the entitled `--model` pin to the (retries-
     // stripped) spawn args when account-bound with no explicit model selection,
     // so the child does not silently fall back to Sonnet 4.6 (#1506/#1509).
@@ -786,10 +800,7 @@ export async function claudeTmuxRemoteLauncher(
         sessionId: session.sessionId,
         abort: processAbortController.signal,
         hapiSessionId: session.client.sessionId,
-        claudeEnvVars: withAccountConfigDir(
-          withAccountToken(session.claudeEnvVars, accountToken),
-          accountConfigDir
-        ),
+        claudeEnvVars: childEnv,
         claudeArgs: attemptArgs,
         mcpServers: session.mcpServers,
         pinsEnabled: session.pinsEnabled,

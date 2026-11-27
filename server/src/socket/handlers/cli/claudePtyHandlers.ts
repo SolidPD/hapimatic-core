@@ -3,6 +3,11 @@ import { z } from "zod";
 import type { StoredSession } from "../../../store";
 import type { ClaudePtyRegistry } from "../../claudePtyRegistry";
 import type { SocketServer, SocketWithData } from "../../socketTypes";
+import {
+  createReportGate,
+  type AfterDroppedReportFn,
+  type GateReportFn,
+} from "./reportGate";
 
 type AccessErrorReason = "namespace-missing" | "access-denied" | "not-found";
 
@@ -30,6 +35,10 @@ export type ClaudePtyCliHandlersDeps = {
   claudePtyNamespace: SocketNamespace;
   resolveSessionAccess: ResolveSessionAccess;
   emitAccessError: EmitAccessError;
+  /** Issue #6974 (Task 5, O5 P1): the runner identity backstop. */
+  gateReport?: GateReportFn;
+  /** Issue #6974 (Task 5): after a drop, cut its socket off (R5). */
+  afterDroppedReport?: AfterDroppedReportFn;
 };
 
 export function registerClaudePtyCliHandlers(
@@ -42,6 +51,11 @@ export function registerClaudePtyCliHandlers(
     resolveSessionAccess,
     emitAccessError,
   } = deps;
+  const { gate, dropped } = createReportGate(
+    socket,
+    deps.gateReport,
+    deps.afterDroppedReport
+  );
 
   socket.on("claude:pty-output", (data: unknown) => {
     const parsed = claudePtyOutputSchema.safeParse(data);
@@ -51,6 +65,12 @@ export function registerClaudePtyCliHandlers(
     const sessionAccess = resolveSessionAccess(parsed.data.sessionId);
     if (!sessionAccess.ok) {
       emitAccessError("session", parsed.data.sessionId, sessionAccess.reason);
+      return;
+    }
+    // #6974 (O5 P1): the one ungated path that re-pointed the operator's
+    // keystrokes to its sender; the backstop runs before the re-point.
+    if (!gate(parsed.data.sessionId, "claude:pty-output")) {
+      dropped();
       return;
     }
     claudePtyRegistry.register(parsed.data.sessionId, socket.id);

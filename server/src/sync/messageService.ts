@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { randomUUID } from "node:crypto";
+import { CONTEXT_RESET_META_KEY } from "@hapi/protocol";
 import type { DecryptedMessage } from "@hapi/protocol/types";
 import type { SpendLimitVariant } from "@hapi/protocol/apiErrorClasses";
 import type {
@@ -199,6 +200,11 @@ export class MessageService {
       // at all, and nothing is emitted until the commit. Returning false (or
       // throwing) persists nothing; false throws `RecordVetoError`.
       record?: MessageRecordStep;
+      // #6559: the flag that asks the wrapper to reset the conversation before
+      // it delivers this text, written to `content.meta.contextReset` only when
+      // given. Only the context-reset service passes it (R9); the CLI socket's
+      // `message` path strips it from socket-written content.
+      contextReset?: { armId: string };
     }
   ): Promise<SendMessageResult> {
     const sentFrom = payload.sentFrom ?? "webapp";
@@ -324,6 +330,9 @@ export class MessageService {
         // when the sender supplied none (programmatic / drained sends).
         ...(origin ? { origin } : {}),
         ...(payload.queuedOrigin ? { queuedOrigin: payload.queuedOrigin } : {}),
+        ...(payload.contextReset
+          ? { [CONTEXT_RESET_META_KEY]: { armId: payload.contextReset.armId } }
+          : {}),
       },
     };
 

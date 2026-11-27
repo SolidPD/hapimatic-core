@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import {
   HAPI_MCP_SERVER_NAME,
@@ -9,6 +8,7 @@ import {
 } from "@hapi/protocol";
 import { isolatedConfigPath } from "@/accounts/accountConfigDir";
 import { logger } from "@/ui/logger";
+import { wrapperClaudeJson } from "../testInstanceConfigDir";
 import { findCanonicalGitRoot } from "./canonicalGitRoot";
 import { applyDisabledServerToggle } from "./projectMcpConfig";
 
@@ -51,7 +51,7 @@ function readJson(path: string): Record<string, unknown> | null {
 export function sessionClaudeConfigPaths(
   env: NodeJS.ProcessEnv = process.env
 ): string[] {
-  const paths = [join(homedir(), ".claude.json")];
+  const paths = [wrapperClaudeJson()];
   const accountUuid = env.HAPI_ACCOUNT_UUID;
   if (accountUuid) {
     try {

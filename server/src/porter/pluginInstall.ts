@@ -45,10 +45,12 @@
  *    records recorded-vs-installed drift — it never claims a pin it did not make.
  *
  * The child-process pattern mirrors `server/src/utils/mcpPoller.ts`
- * (`execFile`, `findClaudePath`), the repo's server-side convention. It targets
- * the HOST config root (no `HOME`/`CLAUDE_CONFIG_DIR` override — OR-4 settled:
- * `plugins`/`settings.json` are host-symlinked for isolated accounts, so a
- * host-root install propagates to bound accounts).
+ * (`execFile`, `findClaudePath`), the repo's server-side convention. On a real or
+ * dev instance it targets the HOST config root (no `HOME`/`CLAUDE_CONFIG_DIR`
+ * override — OR-4 settled: `plugins`/`settings.json` are host-symlinked for
+ * isolated accounts, so a host-root install propagates to bound accounts). On a
+ * TEST instance the host root is the node's own, so the phase starts no `claude`
+ * and records every item failed (#6977).
  */
 
 import { execFile } from "node:child_process";
@@ -59,6 +61,8 @@ import {
   isValidMarketplaceSource,
   type PluginDescriptor,
 } from "@hapi/protocol/porter";
+import type { InstanceKind } from "@hapi/protocol/instanceKind";
+import { getServerInstanceKind } from "../services/serverInstanceKind";
 import { isMarketplaceTrusted, stripMarketplaceRef } from "./pluginTrust";
 import type { PluginInstallResult } from "@hapi/protocol/porter";
 // #5601: the wire shapes live in @hapi/protocol/porter (importWire.ts).
@@ -112,6 +116,8 @@ export interface ExecutePluginInstallOptions {
   timeoutMs?: number;
   /** Explicit `claude` binary path; default resolves via {@link findClaudeBinary}. */
   claudePath?: string;
+  /** #6977: this server's instance kind; default the boot reading. */
+  getInstanceKind?: () => InstanceKind;
 }
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
@@ -360,12 +366,11 @@ export async function executePluginInstall(
   const env = opts.secretResolutionEnv ?? process.env;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
 
-  // Resolve the runner. If no binary is found, every item fails (non-fatal).
+  // Resolve the runner. Without one, every item fails (non-fatal). An injected
+  // runner is a test seam: it starts no `claude`, so the instance kind is not read.
   let runClaude = opts.runClaude;
   if (!runClaude) {
-    const claudePath = opts.claudePath ?? findClaudeBinary();
-    if (!claudePath) {
-      const reason = "`claude` binary not found on the server PATH";
+    const failEverything = (reason: string): PluginInstallResult => {
       for (const m of descriptor.marketplaces) {
         result.marketplaces.push({
           name: m.name,
@@ -384,6 +389,15 @@ export async function executePluginInstall(
         });
       }
       return result;
+    };
+    if ((opts.getInstanceKind ?? getServerInstanceKind)() === "test") {
+      return failEverything(
+        "plugin install is off on a test instance (#6977): it would run the node's own claude"
+      );
+    }
+    const claudePath = opts.claudePath ?? findClaudeBinary();
+    if (!claudePath) {
+      return failEverything("`claude` binary not found on the server PATH");
     }
     runClaude = defaultClaudeRunner(claudePath, timeoutMs);
   }

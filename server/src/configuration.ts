@@ -304,3 +304,28 @@ export const configuration = new Proxy({} as Configuration, {
     return getConfiguration()[prop as keyof Configuration];
   },
 });
+
+/**
+ * Issue #6918 (DA): the manager-stamp switch. On only when the server's env
+ * holds exactly "1"; off by default. Turn it on per node only once
+ * rp1-home#3398 (`hapi-spawn.sh` sends the caller header) and this issue's CLI
+ * header are live there. Read per call (a unit change restarts the server).
+ */
+export function isManagerStampEnabled(
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  return env.HAPI_MANAGER_STAMP === "1";
+}
+
+/**
+ * Issue #6918 (R9): a watermark successor carries its predecessor's stamp
+ * with reason `successor` only when this is exactly "1". Off by default: a
+ * successor is undecided (today's behavior). MD7 answered, option 1
+ * (2026-11-23): activation sets HAPI_MANAGER_STAMP_SUCCESSOR=1 with
+ * HAPI_MANAGER_STAMP=1.
+ */
+export function isManagerStampSuccessorEnabled(
+  env: NodeJS.ProcessEnv = process.env
+): boolean {
+  return env.HAPI_MANAGER_STAMP_SUCCESSOR === "1";
+}

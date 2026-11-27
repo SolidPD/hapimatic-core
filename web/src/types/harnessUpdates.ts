@@ -95,7 +95,8 @@ export type TriggerAnalysisResponse =
  * (#1774, Sub-Issue E) — the SUCCESS envelope. The privileged command is NEVER
  * echoed to the client (R11). On failure `ApiClient.request` throws `ApiError`
  * carrying the server's `{ code, error }` (`update_in_flight` / `version_mismatch`
- * / `no_prior_version` / `binary_not_found` / `exec_failed` / `not_supported_remote`).
+ * / `no_prior_version` / `binary_not_found` / `exec_failed` / `not_supported_remote`
+ * / `test_instance` on a test instance, #6977).
  * Mirror of the server success response in `server/src/web/routes/harnessUpdate.ts`.
  */
 export type HarnessApplyResponse = { ok: true; new_version: string | null };

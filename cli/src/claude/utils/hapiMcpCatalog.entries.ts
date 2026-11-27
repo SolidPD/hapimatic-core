@@ -214,6 +214,20 @@ export const mcpCatalogEntries = [
     riskTier: "mutating",
     availability: { scope: "user" },
   }),
+  // Issue #6559 (Task 5): arm a context reset for the calling session. A short
+  // `whenToUse` because a Tier-0 tool renders it twice (the #6570 budgets).
+  defineCapability({
+    id: "session-lifecycle.request-context-reset",
+    domain: "session-lifecycle",
+    surface: "mcp",
+    description:
+      "Arm a context reset: when this turn ends cleanly, the session continues in a fresh conversation that starts with the resume notes.",
+    whenToUse: "To reset context.",
+    invocation: { kind: "mcp", tool: "request_context_reset" },
+    auth: "cli-token",
+    riskTier: "mutating",
+    availability: { scope: "user" },
+  }),
   // Issue #4450: the one operator-scope tool. Destructive and operator-only, so
   // it is never Tier-0 and never on the stdio bridge; the server lists it only
   // to a caller that derives operator scope, and the Claude launchers register it

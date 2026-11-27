@@ -106,6 +106,11 @@ export function buildSessionRecord(input: {
     parentRelationship: stored.parentRelationship ?? undefined,
     branchLabel: stored.branchLabel ?? undefined,
     branchCreatedAt: stored.branchCreatedAt ?? undefined,
+    // Issue #6918: the manager stamp is store-owned and set once at spawn.
+    managerSessionId: stored.managerSessionId ?? null,
+    ...(stored.managerStampReason
+      ? { managerStampReason: stored.managerStampReason }
+      : {}),
     // Issue #6646: the billable switch, present whatever the gate when the
     // node's switch storage is ready (the store leaves both out otherwise, so
     // the record and the summary read "unknown", never "non-billable").

@@ -12,6 +12,12 @@ import {
 import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import { cataloged } from "../../../capabilities/cataloged";
 import { checkFederationToken, type FederationDeps } from "./shared";
+import type { InstanceKind } from "@hapi/protocol/instanceKind";
+import {
+  OPENAI_LOGIN_TEST_INSTANCE_CODE,
+  OPENAI_LOGIN_TEST_INSTANCE_MESSAGE,
+  getServerInstanceKind,
+} from "../../../services/serverInstanceKind";
 import { createDegradedLog, LOCAL_DEGRADED_LOG_KEY } from "./degradedLog";
 
 /**
@@ -33,9 +39,12 @@ import { createDegradedLog, LOCAL_DEGRADED_LOG_KEY } from "./degradedLog";
  * receivers — these do NOT call `checkCallerNamespace` (#1097 / KD-5).
  */
 export function createFederationAccountRoutes(
-  deps: FederationDeps
+  deps: FederationDeps,
+  // Issue #6756 (TC1): this instance's kind (defaults to the boot reading).
+  routeOpts: { getInstanceKind?: () => InstanceKind } = {}
 ): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
+  const instanceKind = routeOpts.getInstanceKind ?? getServerInstanceKind;
   const jwtAuth = createAuthMiddleware(deps.jwtSecret);
   // #5417: logs degraded provider-auth-state reads, throttled per node.
   const logOnce = createDegradedLog(deps);
@@ -505,6 +514,17 @@ export function createFederationAccountRoutes(
     async c => {
       if (!checkFederationToken(deps, c.req.header("authorization"))) {
         return c.json({ error: "Unauthorized" }, 401);
+      }
+      // #6756 (R17, ER-D3): a test instance refuses an OpenAI login start, because
+      // every OpenAI login creates a new machine-global folder the real instance imports.
+      if (instanceKind() === "test") {
+        return c.json(
+          {
+            error: OPENAI_LOGIN_TEST_INSTANCE_MESSAGE,
+            code: OPENAI_LOGIN_TEST_INSTANCE_CODE,
+          },
+          409
+        );
       }
       const svc = deps.getCodexLoginService?.();
       if (!svc) {

@@ -18,6 +18,10 @@ function describe(entry: PinAnswersEntry): string {
     parts.push(`${entry.answer.choice}. ${entry.answer.label}`);
     // #6452: an answer beside an automatic pick was made by the deadline.
     if (entry.automaticPick) parts.push("automatic");
+  } else if (entry.writeIn !== undefined) {
+    // #6803: the operator's own answer; a fixed token, as on the summary line,
+    // so the words show only in the message's Raw block.
+    parts.push("write-in");
   } else if (entry.automaticPick) {
     // #6452: the operator moved or stopped the pick (`PinAutomaticPick`).
     parts.push(

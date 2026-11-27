@@ -325,6 +325,24 @@ export class AgentSessionBase<Mode> {
   };
 
   /**
+   * Issue #6559 (Task 3, R12): a context reset ended the conversation. Clears the
+   * in-memory conversation id and the old conversation's context figures, so
+   * the keepAlive tick stops reporting them (the window size stays: it is the
+   * model's). Writes NO metadata: the stored id stays until onSessionFound
+   * overwrites it, because a null id fails the metadata schema, and a stored
+   * value that fails to parse blanks the whole metadata object on the server.
+   */
+  resetConversation = (): void => {
+    this.sessionId = null;
+    this.resolvedModel = undefined;
+    this.contextUsedTokens = undefined;
+    this.contextPercentage = undefined;
+    logger.debug(
+      `[${this.sessionLabel}] conversation reset: id and context figures cleared in memory`
+    );
+  };
+
+  /**
    * Issue #4383: hand the background-Agent tracker the reconcile context each
    * launcher resolves — `configDir` (the account-isolated CLAUDE_CONFIG_DIR, the
    * same root the scanner watches — NOT a hardcoded ~/.claude) and the session's

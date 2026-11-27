@@ -12,7 +12,9 @@ import { Hono } from "hono";
 import { defineCapability } from "@hapi/protocol";
 import type { WebAppEnv } from "../../web/middleware/auth";
 import type { StallWatchdogService } from "./stallWatchdogService";
+import type { StallWatchdogConfig } from "./types";
 import { cataloged } from "../../capabilities/cataloged";
+import { readJsonBody } from "../../web/routes/jsonBody";
 import { saveStallWatchdogConfig, loadStallWatchdogConfig } from "./config";
 import { configuration } from "../../configuration";
 
@@ -136,7 +138,7 @@ export function createWatchdogRoutes(
       const service = requireService(c);
       if (service instanceof Response) return service;
 
-      const body = await c.req.json();
+      const body = await readJsonBody<Partial<StallWatchdogConfig> | null>(c);
       if (!body || typeof body !== "object") {
         return c.json({ error: "Invalid request body" }, 400);
       }

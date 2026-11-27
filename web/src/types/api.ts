@@ -9,6 +9,7 @@ import type {
   ProviderAuthStateEnvelope,
   ProviderId,
   SessionMetadataTurn,
+  SpawnWarning,
 } from "@hapi/protocol";
 import type {
   DecryptedMessage as ProtocolDecryptedMessage,
@@ -426,14 +427,21 @@ export type ListDirectoryResponse = { entries: DirectoryEntry[] };
 export type CreateDirectoryResponse = { entry: DirectoryEntry };
 
 export type SpawnResponse =
-  | { type: "success"; sessionId: string; resolvedName?: string }
+  | {
+      type: "success";
+      sessionId: string;
+      resolvedName?: string;
+      /** Issue #6778 (review C14): the spawn's non-fatal notes, which the web
+       *  had no field for (`tracking_copy_not_sent` among them, ruling C3). */
+      warnings?: SpawnWarning[];
+    }
   // Issue #3515: early-ack (`earlyReturn:true`) optimistic-spawn variant. The
   // server mints the session id (= the future session TAG), registers a
   // `spawning` placeholder, and answers before the daemon spawn RPC resolves.
   // The web navigates to `/sessions/<sessionId>` immediately (finding 3515-1:
   // this id is the tag, not the row uuid) and swaps to the real uuid at
   // materialisation. Falls back to `error` if the caller did not opt in.
-  | { type: "accepted"; sessionId: string }
+  | { type: "accepted"; sessionId: string; warnings?: SpawnWarning[] }
   | { type: "error"; message: string };
 
 export type RepoIssue = {

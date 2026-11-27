@@ -96,6 +96,52 @@ export function parseRateInput(
   return { ok: true, minor: Number(minorText) };
 }
 
+/** The longest time entry, in minutes (R5: an entry over 24 hours is split). */
+export const TIME_ENTRY_MINUTES_MAX = 1440;
+
+/**
+ * Issue #6204 (R8, decision D-6): minutes × hourly rate ÷ 60, to the nearest
+ * minor unit, an exact half up (minutes ≥ 0 only).
+ *
+ * Integer arithmetic only: `floor((2 × minutes × rateMinor + 60) / 120)`. The
+ * rate's minor unit is the value's (`parseRateInput`), so no exponent enters
+ * the arithmetic; the currency is checked against the committed table, which
+ * decides what may be valued. The largest intermediate (1,440 minutes at
+ * `BILLING_RATE_MINOR_MAX`) is 2,880,000,000,060, a safe integer (P4).
+ *
+ * Throws on a non-integer, negative minutes (a void negates a stored value and
+ * never rounds again), more than `TIME_ENTRY_MINUTES_MAX`, a rate outside
+ * `0..BILLING_RATE_MINOR_MAX`, or a currency the table lacks. There is no
+ * helper that adds values of different currencies: every total is the sum of
+ * its entries' stored values, per currency.
+ */
+export function entryValueMinor(input: {
+  minutes: number;
+  rateMinor: number;
+  currency: string;
+}): number {
+  const { minutes, rateMinor, currency } = input;
+  if (
+    !Number.isSafeInteger(minutes) ||
+    minutes < 0 ||
+    minutes > TIME_ENTRY_MINUTES_MAX
+  ) {
+    throw new Error("minutes are an integer from 0 to 1440");
+  }
+  if (
+    !Number.isSafeInteger(rateMinor) ||
+    rateMinor < 0 ||
+    rateMinor > BILLING_RATE_MINOR_MAX
+  ) {
+    throw new Error("a rate is a safe integer of minor units within the cap");
+  }
+  if (!isBillingCurrency(currency)) {
+    throw new Error("not a billing currency code");
+  }
+  const numerator = 2 * minutes * rateMinor + 60;
+  return (numerator - (numerator % 120)) / 120;
+}
+
 /**
  * Formats minor units as "160.00 USD": no grouping, no locale. Throws on a
  * non-integer, a negative amount or an unknown code.

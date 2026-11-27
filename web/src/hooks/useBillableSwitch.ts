@@ -11,7 +11,7 @@
  * The amount every confirmation shows goes through `unloggedAmount` (one swap
  * point, plan section 5); `useLoggedMinutes` is the provider #6204 replaces.
  */
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   useMutation,
   useQuery,
@@ -30,7 +30,13 @@ import {
   type BillableKeepAllResult,
   type BillableSwitchHeadersNode,
   type BillableSwitchSetResult,
+  type SessionTrackingResponse,
 } from "@/api/client";
+import {
+  fetchSwitchTracking,
+  switchTrackingKey,
+  trackingSwitchAmount,
+} from "@/hooks/queries/useSessionTracking";
 import type {
   FederationAllSessionsResponse,
   SessionResponse,
@@ -183,9 +189,13 @@ export function resolveHeaderNode(
  * person switches it on in the timer menu, so where billable sessions are on
  * and the target takes the switch it sends the explicit answer `not-billable`
  * (the start rule takes a person's answer before any header row). Everywhere
- * else it sends nothing: a target without the switch refuses an answer, and
- * with the gate off a session starts off anyway. `targetNodeId` is a peer's
- * node id, or `LOCAL_NODE_ID` for this server's machines.
+ * else it sends nothing; with the gate off a session starts off anyway. Since
+ * #6778 PR-C `not-billable` means "no settings" and any node takes it. #6780:
+ * while the Create page's Time Tracking group is on, the page sends the group's
+ * `{ tracking }` instead (`NewSession/useCreateTimeTracking.ts`); the hub
+ * validates it, and it needs a target that advertises `billable:switch` and
+ * `billable:tracking-carry`. `targetNodeId` is a peer's node id, or
+ * `LOCAL_NODE_ID` for this server's machines.
  */
 export function billableStartForCreate(input: {
   mode: BillableSwitchMode;
@@ -349,6 +359,49 @@ export function useBillableAmount(
 ): { ms: number; loggedKnown: boolean } {
   const logged = useLoggedMinutes([session.id]);
   return billableAmount(session, nowMs, logged[session.id] ?? null);
+}
+
+/**
+ * #6778 (moved item 4; ruling PRC-R7): the old switch's figure, judged on the
+ * record's state, never on the request's name. `timer` is today's figure.
+ *  1. a record that waits (`confirm` pending): today's figure, because the old
+ *     switch-off of a waiting record is its Reverse, and Keep and Reverse act
+ *     on the whole held stretch (Matt Starfield's ruling 1);
+ *  2. a record that does not wait: 0, because the old switch only changes its
+ *     status from now on ("applies forward only"), so nothing earlier moves;
+ *  3. no record: the read's `earlierMs` (time never tracked) when it carries
+ *     one, else today's figure.
+ * No read, a failed one, or an owner before PR-C: today's figure.
+ */
+export function oldSwitchAmount(
+  answer: SessionTrackingResponse | null | undefined,
+  timer: { ms: number; loggedKnown: boolean }
+): { ms: number; loggedKnown: boolean } {
+  if (!answer) return timer;
+  if (answer.confirm === "pending") return timer;
+  if (answer.record) return { ms: 0, loggedKnown: false };
+  return trackingSwitchAmount(answer) ?? timer;
+}
+
+/**
+ * The figure the switch dialog shows (ruling PRC-R7): the session's own
+ * `billableConfirm` decides a waiting record without a read; otherwise the read
+ * the switch took before its choice, from the cache. A failed read leaves no
+ * answer there, so the timer shows, as before PR-C.
+ */
+export function useOldSwitchAmount(
+  session: BillableSwitchSession,
+  nowMs: number
+): { ms: number; loggedKnown: boolean } {
+  const queryClient = useQueryClient();
+  const timer = useBillableAmount(session, nowMs);
+  if (session.billableConfirm === "pending") return timer;
+  return oldSwitchAmount(
+    queryClient.getQueryData<SessionTrackingResponse | null>(
+      switchTrackingKey(session.id)
+    ),
+    timer
+  );
 }
 
 // ─── the optimistic patch (pattern: useSessionActions.ts, auto-recover) ────
@@ -730,6 +783,11 @@ export type BillableTimerBlock = {
  * is `off` and for a placeholder), and the confirmation the owner renders
  * beside it. A figure of zero switches at once; otherwise the switch only asks
  * for the dialog, which confirms with the figure frozen at that moment.
+ *
+ * #6778 RF-1: a request belongs to the session whose switch was tapped. The open
+ * session's header keeps this hook when the person goes to another loaded
+ * session, so a request whose session is no longer shown is dropped: no dialog
+ * opens on, and nothing is written to, a session whose switch was not tapped.
  */
 export function useBillableSessionSwitch(input: {
   api: ApiClient | null;
@@ -750,10 +808,26 @@ export function useBillableSessionSwitch(input: {
     mode !== "off" || session.billable === true
   );
   const { showToast } = useToast();
+  const queryClient = useQueryClient();
   const setBillable = useSetSessionBillable(api);
   const confirm = useBillableConfirm(api);
   const logged = useLoggedMinutes([session.id]);
-  const [request, setRequest] = useState<BillableSwitchRequest | null>(null);
+  const sessionId = session.id;
+  const [asked, setAsked] = useState<{
+    sessionId: string;
+    kind: BillableSwitchRequest;
+  } | null>(null);
+  if (asked !== null && asked.sessionId !== sessionId) setAsked(null);
+  const request = asked?.sessionId === sessionId ? asked.kind : null;
+  // The session shown now, for a read that answers after the person moved on.
+  const shown = useRef(sessionId);
+  useEffect(() => {
+    shown.current = sessionId;
+  }, [sessionId]);
+  // #6778: one read at a time for each session, so a second tap during it opens
+  // no second dialog and sends no second write, and another session's tap still
+  // reads.
+  const reading = useRef(new Set<string>());
 
   const act = useCallback(
     (
@@ -779,15 +853,47 @@ export function useBillableSessionSwitch(input: {
 
   const ask = useCallback(
     (kind: BillableSwitchRequest) => {
-      const amount = billableAmount(
-        session,
-        Date.now(),
-        logged[session.id] ?? null
+      const timer = () =>
+        billableAmount(session, Date.now(), logged[session.id] ?? null);
+      const now = timer();
+      // Every rule of PRC-R7 gives at most the timer, so a zero timer acts at
+      // once, as before; a waiting record keeps today's figure without a read.
+      if (now.ms === 0) {
+        act(kind, now);
+        return;
+      }
+      const openDialog = () => {
+        if (shown.current === session.id) {
+          setAsked({ sessionId: session.id, kind });
+        }
+      };
+      if (session.billableConfirm === "pending" || !api) {
+        openDialog();
+        return;
+      }
+      // #6778 (ruling PRC-R1, PRC-R7): read the record before the choice.
+      const reads = reading.current;
+      if (reads.has(session.id)) return;
+      reads.add(session.id);
+      fetchSwitchTracking(queryClient, api, session.id).then(
+        answer => {
+          reads.delete(session.id);
+          const amount = oldSwitchAmount(answer, timer());
+          if (amount.ms === 0) act(kind, amount);
+          else openDialog();
+        },
+        () => {
+          // The read itself never rejects (a failure answers null); this is
+          // the cache failing. Today's figure, as for a failed read.
+          reads.delete(session.id);
+          console.warn(
+            "[useBillableSwitch] the switch's tracking read did not run; the switch shows its timer"
+          );
+          openDialog();
+        }
       );
-      if (amount.ms === 0) act(kind, amount);
-      else setRequest(kind);
     },
-    [act, logged, session]
+    [act, api, logged, queryClient, session]
   );
 
   const mark = billableMark(session, nodes, mode);
@@ -818,10 +924,10 @@ export function useBillableSessionSwitch(input: {
     mark,
     block,
     request,
-    closeRequest: () => setRequest(null),
+    closeRequest: () => setAsked(null),
     confirmRequest: amount => {
       if (request) act(request, amount);
-      setRequest(null);
+      setAsked(null);
     },
   };
 }

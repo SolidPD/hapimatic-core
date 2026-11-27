@@ -4,7 +4,9 @@ import { join } from "node:path";
 import os from "node:os";
 import type { ClaudeAccountInfo } from "@hapi/protocol/schemas";
 import { computePlanLabel } from "@hapi/protocol/accounts";
+import { wrapperClaudeJson } from "@/claude/testInstanceConfigDir";
 import { logger } from "@/ui/logger";
+import { isTestInstanceProcess } from "@/utils/testInstanceProcess";
 
 /**
  * Structure of ~/.claude/.credentials.json
@@ -41,7 +43,7 @@ export { computePlanLabel };
  * This file contains oauthAccount info populated by Claude Code during OAuth
  */
 async function readEmailFromConfig(): Promise<string | undefined> {
-  const configPath = join(os.homedir(), ".claude.json");
+  const configPath = wrapperClaudeJson();
 
   try {
     const content = await readFile(configPath, "utf-8");
@@ -60,11 +62,15 @@ async function readEmailFromConfig(): Promise<string | undefined> {
  * - ~/.claude/.credentials.json: OAuth tokens, subscriptionType, rateLimitTier
  * - ~/.claude.json: User config including oauthAccount with email
  *
+ * On a test instance nothing is opened and the answer is `undefined` (#6980): no session
+ * there runs on this login.
+ *
  * @returns ClaudeAccountInfo if credentials exist and are readable, undefined otherwise
  */
 export async function readClaudeAccountInfo(): Promise<
   ClaudeAccountInfo | undefined
 > {
+  if (isTestInstanceProcess()) return undefined;
   const credentialsPath = join(os.homedir(), ".claude", ".credentials.json");
 
   try {

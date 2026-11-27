@@ -9,7 +9,12 @@
 
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { getSettingsFile, readSettings, writeSettings } from "./settings";
+import {
+  getSettingsFile,
+  readSettings,
+  updateSettings,
+  type Settings,
+} from "./settings";
 import type { HeartbeatConfig } from "../heartbeat/types";
 
 function getDefaults(dataDir: string): HeartbeatConfig {
@@ -113,29 +118,37 @@ export async function hasHeartbeatConfig(dataDir: string): Promise<boolean> {
   return raw != null && typeof raw === "object";
 }
 
-/** Remove the heartbeat key from settings.json entirely */
+/**
+ * Remove the heartbeat key from settings.json entirely.
+ * #4056: through `updateSettings`. An unreadable file is refused with
+ * `SettingsUnreadableError` and left byte-identical (before the fix it was
+ * replaced with a bare `{}`), and a file with no heartbeat key is not rewritten.
+ */
 export async function deleteHeartbeatConfig(dataDir: string): Promise<void> {
   const settingsFile = getSettingsFile(dataDir);
-  const settings = (await readSettings(settingsFile)) ?? {};
-  delete (settings as Record<string, unknown>).heartbeat;
-  await writeSettings(settingsFile, settings);
+  await updateSettings(settingsFile, current => {
+    if (!("heartbeat" in current)) return current;
+    const { heartbeat: _removed, ...rest } = current as Record<string, unknown>;
+    return rest as Settings;
+  });
 }
 
-/** Persist heartbeat config updates to settings.json */
+/**
+ * Persist heartbeat config updates to settings.json.
+ * #4056: through `updateSettings`, so an unreadable file is refused with
+ * `SettingsUnreadableError` and left byte-identical.
+ */
 export async function saveHeartbeatConfig(
   dataDir: string,
   updates: Partial<HeartbeatConfig>
 ): Promise<HeartbeatConfig> {
   const settingsFile = getSettingsFile(dataDir);
-  const settings = (await readSettings(settingsFile)) ?? {};
-  const raw = (settings as Record<string, unknown>).heartbeat;
-  const existing = raw && typeof raw === "object" ? raw : {};
-
-  // Merge updates into existing heartbeat config
-  const merged = { ...existing, ...updates };
-  (settings as Record<string, unknown>).heartbeat = merged;
-
-  await writeSettings(settingsFile, settings);
+  await updateSettings(settingsFile, current => {
+    const raw = (current as Record<string, unknown>).heartbeat;
+    const existing = raw && typeof raw === "object" ? raw : {};
+    // Merge updates into existing heartbeat config
+    return { ...current, heartbeat: { ...existing, ...updates } } as Settings;
+  });
 
   // Return the full resolved config
   return loadHeartbeatConfig(dataDir);

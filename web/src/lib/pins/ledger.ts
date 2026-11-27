@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
   answerOnRecord,
+  countedClosure,
   isReservedPinKey,
   PIN_KINDS,
   PinEvidenceSchema,
@@ -21,7 +22,7 @@ import {
 } from "@hapi/protocol/schemas";
 import { formatRelativeTimeCompact } from "@/lib/sessionHelpers";
 import { normalizeSearchText } from "@/lib/sessionSearchFilterSort";
-import type { StagedPin } from "@/lib/pins/staging";
+import { hasChosenWriteIn, type StagedPin } from "@/lib/pins/staging";
 
 /**
  * #6449: the Pins Ledger's pure helpers — the view model, the sections, the
@@ -412,14 +413,30 @@ export function settlingAnswerNote(pin: Pin): string | undefined {
   return note && note.trim() ? note : undefined;
 }
 
+/**
+ * #6803: the operator's own words on the answer on record, if they settled the
+ * pin in their own words: a write-in, or an answer the agent recorded from the
+ * chat. The row's answer cell cuts them to one line, so the expanded pin shows
+ * them whole.
+ */
+export function settlingAnswerWords(pin: Pin): string | undefined {
+  const answer = answerOnRecord(pin);
+  return answer && isOwnWordsAnswer(answer) && answer.text?.trim()
+    ? answer.text
+    : undefined;
+}
+
 /** A Completed row's answer cell: "A. Ship it", the free text, or "—". */
+/** What a Completed row's answer cell holds when the pin has no answer on record. */
+export const COMPLETED_NO_ANSWER = "—";
+
 export function completedAnswerText(pin: Pin): string {
   const answer = answerOnRecord(pin);
-  if (!answer) return "—";
+  if (!answer) return COMPLETED_NO_ANSWER;
   const text = [answer.option, answer.label ?? answer.text]
     .filter(Boolean)
     .join(". ");
-  return text || "—";
+  return text || COMPLETED_NO_ANSWER;
 }
 
 export type CompletedReceipt = {
@@ -477,8 +494,58 @@ function withdrawnByServer(pin: Pin): boolean {
   );
 }
 
+/**
+ * #6456 (R10): who superseded a pin and why, for the Completed row. `by` is the
+ * Project Manager when the closure names a session other than the pin's own (a
+ * retire by the session's PM), the agent for the session's own act (a retire
+ * with proof, a replace, a link settled by its own resolve or withdraw), and
+ * Hapimatic for a server-made close. `ref` is the settling pin's ID. Null for a
+ * pin whose closure does not count, so a pin reopened and then closed another
+ * way reads by that later close.
+ */
+export type SupersededView = {
+  by: "pm" | "agent" | "hapimatic";
+  name: string | null;
+  rule: string;
+  ref: string | null;
+  reason: string | null;
+};
+
+export function supersededView(pin: Pin): SupersededView | null {
+  const closure = countedClosure(pin);
+  if (!closure) return null;
+  const by =
+    closure.by === "agent"
+      ? closure.bySession && closure.bySession !== pin.sessionId
+        ? "pm"
+        : "agent"
+      : "hapimatic";
+  return {
+    by,
+    name: closure.byName ?? null,
+    rule: closure.rule,
+    ref: closure.ref ?? null,
+    reason: closure.reason ?? null,
+  };
+}
+
+/** #6456 (R7): a Project Manager's ruling on record, or undefined. */
+export function pmRuling(pin: Pin): PinAnswer | undefined {
+  const answer = answerOnRecord(pin);
+  return answer?.via === "pm" ? answer : undefined;
+}
+
 /** Who completed a pin, for the Completed row's receipt pill. */
 export function completedReceipt(pin: Pin): CompletedReceipt {
+  // #6456: read first, because the rules below would show a superseded pin as
+  // Withdrawn or Dismissed.
+  if (supersededView(pin)) {
+    return {
+      label: "Superseded",
+      tone: "neutral",
+      tooltip: "Settled elsewhere, not answered here",
+    };
+  }
   if (withdrawnByServer(pin)) {
     return { label: "Withdrawn", tone: "neutral", tooltip: "Withdrawn" };
   }
@@ -494,6 +561,13 @@ export function completedReceipt(pin: Pin): CompletedReceipt {
       label: "Dismissed",
       tone: "neutral",
       tooltip: "Dismissed without an answer",
+    };
+  }
+  if (pmRuling(pin)) {
+    return {
+      label: "PM",
+      tone: "neutral",
+      tooltip: "Ruled by the Project Manager, not by you",
     };
   }
   const by = pinDecidedBy(pin);
@@ -529,6 +603,8 @@ const CHANNELS: Record<string, string> = {
   prompt: "via chat",
   deadline: "deadline",
   inbox: "via inbox",
+  // #6456 (R7): a Project Manager's ruling.
+  pm: "via PM",
   terminal: "—",
 };
 
@@ -543,6 +619,20 @@ export function completedChannel(pin: Pin): string {
 export function completedSummary(pin: Pin, zone: string): string {
   const answer = answerOnRecord(pin);
   const at = formatPinTime(settledAt(pin), zone);
+  // #6456 (R10): a superseded pin never reads as answered, dismissed or
+  // withdrawn by the agent; its closing words are the closure's own.
+  const superseded = supersededView(pin);
+  if (superseded) return supersededSentence(superseded, at);
+  const ruling = pmRuling(pin);
+  if (ruling) {
+    const what = [ruling.option, ruling.label ?? ruling.text]
+      .filter(Boolean)
+      .join(". ");
+    const who = ruling.byName
+      ? `the Project Manager (${ruling.byName})`
+      : "the Project Manager";
+    return `Ruled by ${who}, ${at}${what ? `: ${withoutEndStop(what)}` : ""}.`;
+  }
   const receipt = completedReceipt(pin);
   if (receipt.tone === "auto") {
     return `Decided automatically when its deadline passed, ${at}.`;
@@ -564,6 +654,45 @@ export function completedSummary(pin: Pin, zone: string): string {
   return `Completed by ${who} ${where}, ${at}.`;
 }
 
+/** A clause's own closing stop, dropped so the sentence ends with one. */
+function withoutEndStop(text: string): string {
+  let out = text.trim();
+  while (out.endsWith(".") || out.endsWith("!") || out.endsWith("?")) {
+    out = out.slice(0, -1);
+  }
+  return out;
+}
+
+/**
+ * #6456 (R10): "Superseded by the Project Manager (<name>), <time>: <reason>.",
+ * "Superseded by the agent, <time>: <reason>.", "Superseded by Hapimatic,
+ * <time>: <pin ID> was answered." (the reason the server wrote), and for a
+ * replacement "Superseded by the agent, <time>: replaced by <pin ID>." A
+ * settling pin the reason does not name (a retire's proof or the pin a Project
+ * Manager named) is added, "…: <reason>; settled by <pin ID>.", so the row can
+ * link it (R10; PR-2, c1afdae8).
+ */
+export function supersededSentence(view: SupersededView, at: string): string {
+  const who =
+    view.by === "pm"
+      ? view.name
+        ? `the Project Manager (${view.name})`
+        : "the Project Manager"
+      : view.by === "agent"
+        ? "the agent"
+        : "Hapimatic";
+  if (view.rule === "replaced" && view.ref) {
+    return `Superseded by ${who}, ${at}: replaced by ${view.ref}.`;
+  }
+  const reason = view.reason ? withoutEndStop(view.reason) : null;
+  const settledBy =
+    view.ref && !(reason ?? "").includes(view.ref)
+      ? `settled by ${view.ref}`
+      : null;
+  const why = [reason, settledBy].filter(Boolean).join("; ");
+  return `Superseded by ${who}, ${at}${why ? `: ${why}` : ""}.`;
+}
+
 // ── Answering (#6450) ───────────────────────────────────────────────────────
 
 export type MootNotice = {
@@ -573,7 +702,23 @@ export type MootNotice = {
   current: number;
   option?: string;
   label?: string;
+  /** #6803: the operator's own words, when the answer was a write-in. */
+  text?: string;
 };
+
+/**
+ * #6803: a record of the operator's own words: text with no option, no steps,
+ * and not a dismissal. A write-in, and what `pin_resolve` records for an answer
+ * given in the chat. An all-steps report (`text` beside `steps`) is not one.
+ */
+export function isOwnWordsAnswer(answer: PinAnswer): boolean {
+  return (
+    answer.text !== undefined &&
+    answer.option === undefined &&
+    answer.steps === undefined &&
+    answer.dismissed !== true
+  );
+}
 
 /**
  * For an open pin whose newest operator answer changed nothing because the pin
@@ -591,6 +736,7 @@ export function mootNotice(pin: Pin): MootNotice | undefined {
       current: pin.revision,
       ...(answer.option !== undefined ? { option: answer.option } : {}),
       ...(answer.label !== undefined ? { label: answer.label } : {}),
+      ...(isOwnWordsAnswer(answer) ? { text: answer.text } : {}),
     };
   }
   return undefined;
@@ -598,6 +744,10 @@ export function mootNotice(pin: Pin): MootNotice | undefined {
 
 /** The Moot pill's tooltip and the detail's opening line. */
 export function mootSentence(notice: MootNotice): string {
+  // #6803: not "You answered your answer".
+  if (notice.text !== undefined) {
+    return `You wrote your own answer on revision ${notice.answered}; this pin is now revision ${notice.current}, so your answer changed nothing. Answer it again.`;
+  }
   const choice = notice.option
     ? `${notice.option}${notice.label ? `. ${notice.label}` : ""}`
     : "your answer";
@@ -608,15 +758,22 @@ export function mootSentence(notice: MootNotice): string {
  * True when a staged choice, tick or dismissal was made on an older revision
  * than the pin's now; a note or a question alone is never stale (KD4). A stale
  * dismissal (#6539) is dropped at Submit and the pin stays open, so the row
- * and the Submit dialog say so first.
+ * and the Submit dialog say so first. A chosen write-in counts only with words
+ * (#6803), because one with none sends nothing.
  */
 export function stagedIsStale(
-  staged: Pick<StagedPin, "rev" | "choice" | "ticks" | "dismiss"> | undefined,
+  staged:
+    | Pick<
+        StagedPin,
+        "rev" | "choice" | "ticks" | "dismiss" | "writeIn" | "writeInChosen"
+      >
+    | undefined,
   pin: Pick<Pin, "revision">
 ): boolean {
   if (!staged) return false;
   const answers =
     staged.choice !== undefined ||
+    hasChosenWriteIn(staged) ||
     (staged.ticks?.length ?? 0) > 0 ||
     staged.dismiss === true;
   return answers && staged.rev < pin.revision;
@@ -681,4 +838,96 @@ export function formatPinAge(createdAt: string, now: number): string {
   const ms = Date.parse(createdAt);
   if (!Number.isFinite(ms)) return "";
   return formatRelativeTimeCompact(ms, now) ?? "";
+}
+
+// ── The Sent record (#6803) ─────────────────────────────────────────────────
+
+/** What a Sent record is, in the order a record is classified. */
+export type SentRecordKind =
+  | "ownAnswer"
+  | "noteBesideMoot"
+  | "question"
+  | "note";
+
+/** One thing the operator sent on a pin that did not settle it (R1). */
+export type SentRecord = {
+  kind: SentRecordKind;
+  /** The words in full: the answer, the question, or the note. */
+  words: string;
+  /** An own answer's note, shown under it. */
+  note?: string;
+  at: string;
+  revision: number;
+  deliveredTo?: string;
+};
+
+/** The newest Submits a Sent record shows; the rest are counted. */
+export const SENT_RECORD_SUBMITS = 3;
+
+function sentRecordOf(answer: PinAnswer): SentRecord | null {
+  if (answer.by !== "operator" || answer.dismissed === true) return null;
+  if (answer.resolves && !answer.moot) return null;
+  const common = {
+    at: answer.at,
+    revision: answer.revision,
+    ...(answer.deliveredTo !== undefined
+      ? { deliveredTo: answer.deliveredTo }
+      : {}),
+  };
+  const note = answer.note?.trim() ? answer.note : undefined;
+  if (answer.resolves) {
+    if (isOwnWordsAnswer(answer) && answer.text?.trim()) {
+      return {
+        kind: "ownAnswer",
+        words: answer.text,
+        ...(note ? { note } : {}),
+        ...common,
+      };
+    }
+    return note ? { kind: "noteBesideMoot", words: note, ...common } : null;
+  }
+  if (answer.text?.trim() && answer.steps === undefined && !note) {
+    return { kind: "question", words: answer.text, ...common };
+  }
+  if (note && answer.option === undefined) {
+    return { kind: "note", words: note, ...common };
+  }
+  return null;
+}
+
+/**
+ * #6803 (R1): the operator's records on a pin that did not settle it: notes,
+ * questions, an own answer that changed nothing, and a note beside an answer
+ * that changed nothing. A dismissal and a partial steps report with no note
+ * are not shown. Read from the pin's own history, so every device shows the
+ * same, after a reload too. It counts Submits, not records: every record of
+ * the newest Submit is shown, and older Submits up to three in all, in the
+ * order of `pin.answers`; `older` counts the records of the Submits not shown
+ * (of what the server kept: it trims a pin's history, oldest first).
+ */
+export function sentNotesAndQuestions(pin: Pin): {
+  records: SentRecord[];
+  older: number;
+} {
+  const groups = new Map<string, number>();
+  const found: { group: string; record: SentRecord }[] = [];
+  pin.answers.forEach((answer, index) => {
+    const record = sentRecordOf(answer);
+    if (!record) return;
+    const submission =
+      typeof answer.submission === "string" ? answer.submission : `@${index}`;
+    groups.set(submission, index);
+    found.push({ group: submission, record });
+  });
+  const newest = new Set(
+    [...groups.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, SENT_RECORD_SUBMITS)
+      .map(([group]) => group)
+  );
+  const shown = found.filter(item => newest.has(item.group));
+  return {
+    records: shown.map(item => item.record),
+    older: found.length - shown.length,
+  };
 }

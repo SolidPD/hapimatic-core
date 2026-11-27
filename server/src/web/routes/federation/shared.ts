@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { BillingCategoryService } from "../../../billingCategories/billingCategoryService";
 import type { Context } from "hono";
-import type { FederationConfig } from "@hapi/protocol";
+import type { FederationConfig, SpawnTrackingAnswer } from "@hapi/protocol";
 import type { SyncEngine } from "../../../sync/syncEngine";
 import type { SSEManager } from "../../../sse/sseManager";
 import type { NodeRegistry } from "../../../federation/nodeRegistry";
@@ -9,6 +9,7 @@ import type { HealthAggregator } from "../../../federation/healthAggregator";
 import type { PeerAnnouncer } from "../../../federation/peerAnnouncer";
 import type { ErrorLogger } from "../../../logging/errorLogger";
 import type { AccountService } from "../../../services/accountService";
+import type { ChainFactsOptions } from "../../../services/isolatedCredentialsSync";
 import type { UsageService } from "../../../accounts/usageService";
 import type { McpCatalogService } from "../../../services/mcpCatalogService";
 import type { ProviderUsageService } from "../../../accounts/providerUsageService";
@@ -61,6 +62,11 @@ export type FederationDeps = {
   getHealthAggregator: () => HealthAggregator | null;
   getPeerAnnouncer: () => PeerAnnouncer | null;
   getAccountService: () => AccountService | null;
+  // Issue #6997 (M10): how the chain-fingerprint routes read this node's account
+  // folders — every layout, the per-instance one through `dataDir`, as
+  // account-health reads them. Optional because federation test stubs omit it;
+  // absent ⇒ the machine-global layout only (the pre-#6997 read).
+  chainFactsOptions?: ChainFactsOptions;
   // Issue #1644: the hub's authoritative rotation-lease ledger. Optional because
   // only the real server.ts construction wires it; federation test stubs omit it.
   getLeaseStore?: () => LeaseStore | null;
@@ -281,6 +287,8 @@ export async function notifyOriginatingHub(params: {
    *  returned one — forwarded so the hub can surface it to the caller. */
   code?: string;
   sessionId?: string;
+  /** #6778 PRC-R9: whether a start that carried settings or a copy was applied. */
+  trackingStart?: SpawnTrackingAnswer;
   deps: FederationDeps;
 }): Promise<void> {
   if (!params.originatingNodeId) return;
@@ -319,6 +327,7 @@ export async function notifyOriginatingHub(params: {
       error: params.error,
       code: params.code,
       sessionId: params.sessionId,
+      trackingStart: params.trackingStart,
     };
 
     const headers: Record<string, string> = {

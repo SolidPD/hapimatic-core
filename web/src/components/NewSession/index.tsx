@@ -33,7 +33,11 @@ import {
   useBillableSwitchHeaders,
   useBillableSwitchMode,
 } from "@/hooks/useBillableSwitch";
-import { addPendingSpawn, markSpawnFailed } from "@/lib/pending-spawns";
+import {
+  addPendingSpawn,
+  dismissPendingSpawn,
+  markSpawnFailed,
+} from "@/lib/pending-spawns";
 import { apiErrorMessage } from "@/lib/apiErrorMessage";
 import { exhaustedLimitText, readAccountExhausted } from "@/lib/accountLimit";
 import { beginSpawnHandover, takeRetryForm } from "@/lib/spawn-draft";
@@ -139,6 +143,14 @@ import {
 } from "./SessionTypeSelector";
 import { PermissionModeSelector } from "./PermissionModeSelector";
 import { SafeModeToggle } from "./SafeModeToggle";
+import { useCreateTimeTracking } from "./useCreateTimeTracking";
+import { TimeTrackingGroup } from "@/components/timeTracking/TimeTrackingGroup";
+import { projectShown } from "@/components/timeTracking/timeTracking";
+import {
+  dropTrackedStart,
+  noteTrackedStart,
+  type TrackedStart,
+} from "@/lib/trackedStarts";
 import { CollapsibleLayer } from "./CollapsibleLayer";
 import {
   MonitorIcon,
@@ -728,6 +740,37 @@ export const NewSession = forwardRef<
   // Create form is non-billable, with no question (billableStartForCreate).
   const billableMode = useBillableSwitchMode();
   const { data: billableHeaders } = useBillableSwitchHeaders(props.api);
+  // #6780: the Time Tracking group; off at every mount but the retry form of a
+  // failed tracked start (OC-1). Its state never reaches the saved defaults.
+  // #6780 (Task 7): the project the group shows, kept for the read-back.
+  const trackingProject = projectShown({
+    cloneRepo,
+    detectedRepo,
+    lookupPending: issuesLoading,
+    lookupFailed: issuesUnavailable,
+    directory,
+    homeDir: selectedNodeHomeDir ?? null,
+  });
+  const timeTracking = useCreateTimeTracking({
+    api: props.api,
+    mode: billableMode,
+    scheduled: sessionMode === "scheduled",
+    target: !spawnTarget
+      ? null
+      : spawnTarget.kind === "local"
+        ? { kind: "local" }
+        : {
+            kind: "remote",
+            label: selectedRemoteNode?.nodeLabel ?? spawnTarget.nodeId,
+            status: selectedRemoteNode?.status ?? "offline",
+            capabilities: selectedRemoteNode?.capabilities,
+          },
+    targetKey: selectedValue ?? "",
+    disabled: isFormDisabled,
+    project: trackingProject,
+    initial: retryForm?.timeTracking,
+    onNotice: setError,
+  });
 
   // #3558: auto-detection owns the Repo field. When the directory is already a
   // repo checkout — e.g. the `~/projects/<name>` destination of a clone pick
@@ -1172,8 +1215,17 @@ export const NewSession = forwardRef<
       apiKeyLabel: pickedApiKey
         ? apiKeyDisplayNameWithHome(pickedApiKey)
         : undefined,
+      // #6780 (OC-5): the status only; no rate, category or note.
+      trackingStatus: timeTracking.previewStatus,
     }),
-    [isRemoteTarget, meterTargetLabel, accounts, accountUuid, pickedApiKey]
+    [
+      isRemoteTarget,
+      meterTargetLabel,
+      accounts,
+      accountUuid,
+      pickedApiKey,
+      timeTracking.previewStatus,
+    ]
   );
 
   // Create-page saved defaults (bookmark feature) — see useCreateDefaultsEngine.
@@ -1407,17 +1459,39 @@ export const NewSession = forwardRef<
   }
 
   async function handleCreateSession() {
+    // #6780 (item 9): the disabled button is not the only guard.
+    if (timeTracking.blocked) return;
     if (!spawnTarget || !directory.trim()) return;
     if (pathExistence[directory.trim()] === false) return;
 
+    // #6780: what this submit sends, with its sequence number (once).
+    const sentTracking = timeTracking.capture();
+    // #6780 (Task 7): what the form showed, for the read-back after Create.
+    const trackedStart = (nodeLabel: string | null): TrackedStart | null =>
+      sentTracking
+        ? {
+            kind: nodeLabel === null ? "local" : "remote",
+            nodeLabel,
+            settings: sentTracking.settings,
+            shown: {
+              project: trackingProject,
+              categoryName: timeTracking.group?.derived.category?.name ?? null,
+              defaultRateMinor: sentTracking.shown.defaultRateMinor,
+              defaultCurrency: sentTracking.shown.defaultCurrency,
+            },
+          }
+        : null;
     // #6646 (ruling T-1): non-billable where the target takes the switch,
-    // nothing elsewhere; no question and no notice after Create.
-    const billableSwitchStart = billableStartForCreate({
-      mode: billableMode,
-      headers: billableHeaders?.nodes,
-      targetNodeId:
-        spawnTarget.kind === "remote" ? spawnTarget.nodeId : LOCAL_NODE_ID,
-    });
+    // nothing elsewhere; no question and no notice after Create. #6780: while
+    // Time Tracking is on, its settings instead (chosen by `active`).
+    const billableSwitchStart = timeTracking.active
+      ? timeTracking.start
+      : billableStartForCreate({
+          mode: billableMode,
+          headers: billableHeaders?.nodes,
+          targetNodeId:
+            spawnTarget.kind === "remote" ? spawnTarget.nodeId : LOCAL_NODE_ID,
+        });
 
     // For remote targets, add a pending spawn stub immediately for instant
     // visual feedback. The stub appears in the session list before the API
@@ -1440,6 +1514,10 @@ export const NewSession = forwardRef<
         agent,
         spawnCorrelationId,
       });
+      // #6780 (Task 7): noted BEFORE the request, because the success event
+      // can come before the answer; dropped on any failure below.
+      const remoteStart = trackedStart(nodeLabel);
+      if (remoteStart) noteTrackedStart(spawnCorrelationId, remoteStart);
     }
 
     try {
@@ -1480,6 +1558,9 @@ export const NewSession = forwardRef<
       // fields are snapshotted for a single-click retry on failure (R1/R3/R4).
       if (result.type === "accepted") {
         haptic.notification("success");
+        // #6780 (Task 7): a local start is noted once its placeholder id exists.
+        const localStart = trackedStart(null);
+        if (localStart) noteTrackedStart(result.sessionId, localStart);
         if (spawnTarget.kind === "local") {
           setLastUsedMachineId(spawnTarget.machineId);
         }
@@ -1499,6 +1580,8 @@ export const NewSession = forwardRef<
             existingBranch: branchSel.existingBranch,
             // #4825 (RV2-8): the same key the spawn payload carried.
             apiKeyId: apiKeysOffered ? apiKeyId : null,
+            // #6780 (item 14): only when tracking was sent.
+            timeTracking: sentTracking ? timeTracking.snapshot : undefined,
           },
         });
         addRecentPath(directory.trim());
@@ -1543,11 +1626,25 @@ export const NewSession = forwardRef<
 
       haptic.notification("error");
       setError(result.message);
+      if (spawnCorrelationId) dropTrackedStart(spawnCorrelationId);
       // Mark stub as failed if API returned a non-success response
       if (pendingSpawnId) {
         markSpawnFailed(pendingSpawnId, result.message);
       }
     } catch (e) {
+      if (spawnCorrelationId) dropTrackedStart(spawnCorrelationId);
+      // #6780 (item 8): a tracked start's designed refusal, in the web's own
+      // words at once; a remote stub is dropped, never marked failed. An older
+      // submit's refusal shows nothing.
+      const refusal = timeTracking.refuse(e, sentTracking);
+      if (refusal) {
+        if (pendingSpawnId) dismissPendingSpawn(pendingSpawnId);
+        if (refusal.kind === "shown") {
+          haptic.notification("error");
+          setError(refusal.words);
+        }
+        return;
+      }
       haptic.notification("error");
       // A pre-dispatch refusal (e.g. #5127: the node storing a shared key is
       // offline) is a non-2xx `{ error, code }`; show its message, not the
@@ -1709,10 +1806,14 @@ export const NewSession = forwardRef<
       return Boolean(scheduleState.prompt.trim() && directory.trim());
     }
 
+    // #6780 (B8): a tracked Standard start waits for every field it needs.
+    if (timeTracking.blocked) return false;
+
     // Standard session creation: need a target + directory
     return Boolean(spawnTarget && directory.trim());
   }, [
     isFormDisabled,
+    timeTracking.blocked,
     sessionMode,
     scheduleState,
     spawnTarget,
@@ -1767,6 +1868,7 @@ export const NewSession = forwardRef<
         permissionMode,
         safeMode,
         sessionMode,
+        tracking: timeTracking.summary,
       }),
     [
       spawnTarget,
@@ -1782,6 +1884,7 @@ export const NewSession = forwardRef<
       permissionMode,
       safeMode,
       sessionMode,
+      timeTracking.summary,
     ]
   );
 
@@ -2217,6 +2320,10 @@ export const NewSession = forwardRef<
                   />
                 </div>
               </div>
+              {/* #6780: Time Tracking (absent while the gate is off, R13). */}
+              {timeTracking.group && (
+                <TimeTrackingGroup model={timeTracking.group} />
+              )}
               {/* Session Mode — Standard vs Scheduled. ScheduleSection itself stays
               un-nested below this accordion so the scheduled-event form renders
               unchanged. */}

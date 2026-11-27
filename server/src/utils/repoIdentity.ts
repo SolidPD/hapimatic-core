@@ -2,7 +2,10 @@
 /**
  * Resolve git repo identity from a directory path.
  * Runs `git remote get-url origin` and parses the result.
- * Uses an in-memory cache to avoid repeated shell calls.
+ * Uses an in-memory cache to avoid repeated shell calls. A negative answer
+ * ("no origin", "not a repository") is kept at most
+ * `REPO_IDENTITY_NEGATIVE_TTL_MS`, so a folder that becomes a repository is
+ * seen as one within that time (#6780, ruling D-A).
  */
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -13,7 +16,27 @@ export type RepoIdentity = {
   url?: string;
 };
 
-const cache = new Map<string, RepoIdentity | null>();
+/**
+ * Issue #6780 (ruling D-A): how long a negative answer on an existing folder is
+ * kept, by both caches below. The Create page's project chip shows what this
+ * file answers, while a session's CLI asks git afresh
+ * (`cli/src/agent/sessionFactory.ts`), so a negative kept forever showed a folder
+ * path for a folder that had since become a repository. One git call per such
+ * folder per minute is the cost.
+ */
+export const REPO_IDENTITY_NEGATIVE_TTL_MS = 60_000;
+
+/** A kept negative answer: when it was taken (`Date.now()`). */
+type NegativeAnswer = { negativeAt: number };
+
+const negativeAnswer = (): NegativeAnswer => ({ negativeAt: Date.now() });
+
+/** True while a kept negative answer is younger than the time limit. */
+function isFreshNegative(entry: NegativeAnswer): boolean {
+  return Date.now() - entry.negativeAt < REPO_IDENTITY_NEGATIVE_TTL_MS;
+}
+
+const cache = new Map<string, RepoIdentity | NegativeAnswer>();
 
 // Issue #2270 (F25): TRUE git-ness cache, distinct from `cache` above.
 // `resolveRepoIdentity` answers "does this dir have a forge-parseable origin?"
@@ -21,7 +44,7 @@ const cache = new Map<string, RepoIdentity | null>();
 // question the Git-Type control actually needs. A `git init`/no-origin/
 // local-path/NAS-path-origin repo has NO forge identity but IS a git repo the
 // daemon can worktree-spawn in (`worktree.ts` fetch is non-fatal without origin).
-const gitRepoCache = new Map<string, boolean>();
+const gitRepoCache = new Map<string, true | NegativeAnswer>();
 
 /**
  * Issue #2270 (F25): true git-ness probe for a directory.
@@ -39,8 +62,11 @@ const gitRepoCache = new Map<string, boolean>();
  * transient false-negative only changes the DEFAULT, never blocks a worktree.
  */
 export function isGitRepo(directory: string): boolean {
-  if (gitRepoCache.has(directory)) {
-    return gitRepoCache.get(directory) ?? false;
+  const kept = gitRepoCache.get(directory);
+  if (kept === true) return true;
+  if (kept !== undefined) {
+    if (isFreshNegative(kept)) return false;
+    gitRepoCache.delete(directory);
   }
   // #3558 (R8): a directory that does not exist YET is not a stable negative —
   // the clone-on-spawn destination is probed before the daemon clones it (in a
@@ -62,9 +88,10 @@ export function isGitRepo(directory: string): boolean {
     return true;
   } catch (err) {
     // A timeout / process-kill is TRANSIENT (slow CIFS under load) — do NOT
-    // cache it, so a later call can still resolve `true`. Only cache a genuine
-    // git failure on an EXISTING directory (not a repo), which is a stable
-    // negative. A missing directory never reaches here (#3558, R8).
+    // cache it, so a later call can still resolve `true`. Only keep a genuine
+    // git failure on an EXISTING directory (not a repo), and only for
+    // REPO_IDENTITY_NEGATIVE_TTL_MS (#6780, ruling D-A). A missing directory
+    // never reaches here (#3558, R8).
     const e = err as NodeJS.ErrnoException & {
       killed?: boolean;
       signal?: string;
@@ -72,7 +99,7 @@ export function isGitRepo(directory: string): boolean {
     const isTransient =
       e?.killed === true || e?.signal === "SIGTERM" || e?.code === "ETIMEDOUT";
     if (!isTransient) {
-      gitRepoCache.set(directory, false);
+      gitRepoCache.set(directory, negativeAnswer());
     }
     return false;
   }
@@ -81,8 +108,11 @@ export function isGitRepo(directory: string): boolean {
 export function resolveRepoIdentity(
   directory: string
 ): RepoIdentity | undefined {
-  if (cache.has(directory)) {
-    return cache.get(directory) ?? undefined;
+  const kept = cache.get(directory);
+  if (kept !== undefined) {
+    if (!("negativeAt" in kept)) return kept;
+    if (isFreshNegative(kept)) return undefined;
+    cache.delete(directory);
   }
   // #3558 (R8): see isGitRepo — never cache a negative for a directory that
   // does not exist yet (the clone-on-spawn destination).
@@ -103,13 +133,13 @@ export function resolveRepoIdentity(
     }).trim();
 
     if (!remoteUrl) {
-      cache.set(directory, null);
+      cache.set(directory, negativeAnswer());
       return undefined;
     }
 
     const parsed = parseGitRemoteUrl(remoteUrl);
     if (!parsed) {
-      cache.set(directory, null);
+      cache.set(directory, negativeAnswer());
       return undefined;
     }
 
@@ -117,10 +147,10 @@ export function resolveRepoIdentity(
     return parsed;
   } catch (err) {
     // A timeout / process-kill is TRANSIENT (slow CIFS under load) — do NOT
-    // poison the cache with `null`, so a later call can still succeed. Only
-    // cache `null` for a genuine git failure on an EXISTING directory (no
-    // origin remote, or not a repo), which is a stable, correct negative
-    // result. A missing directory never reaches here (#3558, R8).
+    // poison the cache with a negative, so a later call can still succeed.
+    // Only keep a negative, for REPO_IDENTITY_NEGATIVE_TTL_MS, for a genuine
+    // git failure on an EXISTING directory (no origin remote, or not a repo).
+    // A missing directory never reaches here (#3558, R8).
     const e = err as NodeJS.ErrnoException & {
       killed?: boolean;
       signal?: string;
@@ -128,7 +158,7 @@ export function resolveRepoIdentity(
     const isTransient =
       e?.killed === true || e?.signal === "SIGTERM" || e?.code === "ETIMEDOUT";
     if (!isTransient) {
-      cache.set(directory, null);
+      cache.set(directory, negativeAnswer());
     }
     return undefined;
   }

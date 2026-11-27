@@ -25,7 +25,11 @@ import {
   isYoloEquivalentMode,
 } from "@hapi/protocol/modes";
 import { configuration } from "@/configuration";
-import { readSettings } from "@/persistence";
+import {
+  readSettings,
+  readSettingsStrict,
+  SettingsUnreadableError,
+} from "@/persistence";
 import { writeStdout } from "@/utils/stdout";
 import { handleErrorLogs } from "./apiErrorLogs";
 import { handleApiCall } from "./apiCall";
@@ -37,6 +41,24 @@ import {
   spawnTimeoutMessage,
 } from "./apiSpawnError";
 import type { CommandDefinition } from "./types";
+
+/**
+ * Issue #6918 (R4, V11): the headers of a `hapi api sessions spawn` request.
+ * The caller header goes out only from an agent child (HAPI_AGENT_CALLER is
+ * exactly "1") that has a session id, never on HAPI_SESSION_ID alone: a web
+ * terminal or an operator shell inherits the session id but not the marker.
+ */
+export function spawnRequestHeaders(
+  jwt: string,
+  env: NodeJS.ProcessEnv = process.env
+): Record<string, string> {
+  const headers = authHeaders(jwt);
+  const sessionId = env.HAPI_SESSION_ID;
+  if (env.HAPI_AGENT_CALLER === "1" && sessionId) {
+    headers["X-Hapi-Spawn-Caller"] = sessionId; // not X-Hapi-Session-Id: the spawn floors read it (F1)
+  }
+  return headers;
+}
 
 function authHeaders(jwt: string): Record<string, string> {
   return {
@@ -92,6 +114,20 @@ export type ResolvedSpawnArgs = {
 export type SpawnArgsError = { error: string };
 
 /**
+ * #6778 PR-C (Task 15b; ruling 5): the headers of `hapi api sessions branch`.
+ * Like `send`, it stamps the calling session (`X-Hapi-Session-Id` from
+ * `HAPI_SESSION_ID`), so the server reads the branch as an agent's and its copy
+ * waits under "To confirm". Outside any session it sends no header.
+ */
+export function branchRequestHeaders(
+  jwt: string,
+  callerTag: string | undefined = process.env.HAPI_SESSION_ID
+): Record<string, string> {
+  const headers = authHeaders(jwt);
+  return callerTag ? { ...headers, "X-Hapi-Session-Id": callerTag } : headers;
+}
+
+/**
  * Issue #5879: the stderr lines for the headroom notes a spawn accept carries
  * (`usage_unavailable`, `forced_exhausted_account`). Pure, so it is testable
  * without a server; malformed entries are skipped.
@@ -132,7 +168,7 @@ export function boundAccountLine(
  */
 export async function resolveSpawnArgs(
   args: string[],
-  readSettingsFn: typeof readSettings = readSettings,
+  readSettingsFn: typeof readSettings = readSettingsStrict,
   // #2479: injectable so the function stays pure/testable (like readSettingsFn).
   // Production callers get the caller's HAPI_SESSION_ID; tests pass an explicit
   // value (or undefined) to avoid depending on the runner's environment.
@@ -214,8 +250,19 @@ export async function resolveSpawnArgs(
   // An explicit --machine wins and avoids consulting settings.json (R2).
   let machineId = scan.values.get("--machine");
   if (!machineId) {
-    const settings = await readSettingsFn();
-    machineId = settings.machineId;
+    // #4056 R8: the default reader is strict, so a file that exists but cannot
+    // be read or parsed is named as such, not as "No machine id found".
+    try {
+      const settings = await readSettingsFn();
+      machineId = settings.machineId;
+    } catch (error) {
+      if (error instanceof SettingsUnreadableError) {
+        return {
+          error: `Cannot read ${settingsPath}: ${error.errorKind}. Fix or remove that file, or pass --machine <id> explicitly.`,
+        };
+      }
+      throw error;
+    }
   }
   if (!machineId) {
     return {
@@ -616,7 +663,7 @@ async function handleSessions(args: string[]): Promise<void> {
       resp = await axios.post(
         `${configuration.serverUrl}/api/machines/${encodeURIComponent(machineId)}/spawn`,
         buildSpawnBody(resolved),
-        { headers: authHeaders(jwt), timeout: SPAWN_CLIENT_TIMEOUT_MS }
+        { headers: spawnRequestHeaders(jwt), timeout: SPAWN_CLIENT_TIMEOUT_MS }
       );
     } catch (error) {
       if (isAxiosTimeout(error)) {
@@ -816,7 +863,7 @@ async function handleSessions(args: string[]): Promise<void> {
     const resp = await axios.post(
       `${configuration.serverUrl}/api/sessions/${encodeURIComponent(sessionId)}/branch`,
       {},
-      { headers: authHeaders(jwt), timeout: 30_000 }
+      { headers: branchRequestHeaders(jwt), timeout: 30_000 }
     );
     writeStdout(JSON.stringify(resp.data, null, 2));
     return;

@@ -20,7 +20,9 @@ import {
   decideAttach,
   decideHandshake,
   decideReport,
+  emptyReportKinds,
   hasRecord,
+  reportWarning,
   runnerKeyOf,
   runnerSupersededError,
   unidentifiedReason,
@@ -224,13 +226,6 @@ export type RunnerIdentityCounts = {
   recordWriteFailures: number;
 };
 
-const reportKinds = (): Record<GatedReportKind, number> => ({
-  "session-alive": 0,
-  "update-state": 0,
-  "update-metadata": 0,
-  "session-end": 0,
-});
-
 export function emptyRunnerIdentityCounts(): RunnerIdentityCounts {
   return {
     attach: {
@@ -243,7 +238,7 @@ export function emptyRunnerIdentityCounts(): RunnerIdentityCounts {
       takeoverUnrequested: 0,
     },
     handshake: { refused: 0, wouldRefuse: 0, unknownKeyAccepted: 0 },
-    report: { dropped: reportKinds(), wouldDrop: reportKinds() },
+    report: { dropped: emptyReportKinds(), wouldDrop: emptyReportKinds() },
     socketsCutOff: 0,
     wouldCutOff: 0,
     stopsSent: 0,
@@ -708,29 +703,32 @@ export class RunnerIdentity {
       if (!enforce && this.cuttableAfterDrop(socket, record)) {
         this.countWouldCut([socket]);
       }
-      this.warnOnce(socket, `report:${kind}`, () =>
-        this.logger.warn(
-          enforce
-            ? `runner identity: dropped a ${kind} report`
-            : `runner identity: would drop a ${kind} report (observe)`,
-          {
-            ...this.socketWarning(
-              socket,
-              REPORT_CATEGORY,
-              enforce ? "drop" : "would-drop",
-              record
-            ),
-            context: {
-              decision: enforce ? "drop" : "would-drop",
-              kind,
-              mode: this.mode,
-              socketKey: key,
-              recordedKey: record?.runnerKey ?? null,
-              sidMatches: sessionId === sid,
-            },
-          }
-        )
-      );
+      if (reportWarning(kind, sessionId === sid) === "persist") {
+        this.warnOnce(socket, `report:${kind}`, () =>
+          this.logger.warn(
+            enforce
+              ? `runner identity: dropped a ${kind} report`
+              : `runner identity: would drop a ${kind} report (observe)`,
+            {
+              ...this.socketWarning(
+                socket,
+                REPORT_CATEGORY,
+                enforce ? "drop" : "would-drop",
+                record
+              ),
+              context: {
+                decision: enforce ? "drop" : "would-drop",
+                kind,
+                mode: this.mode,
+                socketKey: key,
+                recordedKey: record?.runnerKey ?? null,
+                sidMatches: sessionId === sid,
+                namedSid: sessionId === sid ? undefined : sid,
+              },
+            }
+          )
+        );
+      }
       return !enforce;
     } catch (error) {
       this.failOpen(
@@ -746,7 +744,7 @@ export class RunnerIdentity {
 
   /**
    * R5's third moment: after a dropped report was answered, cut off the socket
-   * that sent it while it is still connected, unless its key is unknown (K3).
+   * that sent it when its own session refuses it (#6974 O6; K3 is never cut).
    * A socket with no session id is in no session's room and is never cut.
    * Nothing outside `enforce`. Never throws.
    */
@@ -1303,16 +1301,13 @@ export class RunnerIdentity {
     });
   }
 
-  /** R5 moment 3 and K3: a dropped report's socket is cut unless its key is unknown. */
+  /** #6974 O6: after a drop, cut the socket only when its own session refuses it. */
   private cuttableAfterDrop(
     socket: RunnerSocketLike,
     record: RunnerRecord | null
   ): boolean {
     if (!socket.data.sessionId) return false;
-    return (
-      decideHandshake(record, socket.data.runnerKey ?? null) !==
-      "accept-unknown"
-    );
+    return decideHandshake(record, socket.data.runnerKey ?? null) === "refuse";
   }
 
   /** R3: the liveness read that picks the refusal's wording, and nothing else. */

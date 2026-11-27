@@ -53,6 +53,26 @@ export type StagedPin = {
    * dismissal turned off, so Undo can turn it back on. Only beside `dismiss`.
    */
   pickAt?: number;
+  /**
+   * #6803: the operator's own answer, in their own words, typed into the
+   * decision's "Something else" row. Kept as a draft when not chosen, because
+   * typed words are never lost: choosing an option, Clear, a dismissal, or a
+   * Submit of anything else leaves them here.
+   */
+  writeIn?: string;
+  /**
+   * #6803: the write-in is the pin's answer. Never beside `choice`. Only a
+   * chosen write-in with words is sent (as `writeIn`); with no words it sends
+   * nothing and its row says so.
+   */
+  writeInChosen?: true;
+  /**
+   * #6969 (D7): a question typed but not added. Kept like a write-in draft,
+   * because typed words are never lost: it survives the pin collapsing, the
+   * panel closing, the page hiding, a dismissal and a Submit, and it is never
+   * sent until Add stages it as a question.
+   */
+  questionDraft?: string;
   updatedAt: number;
 };
 
@@ -69,7 +89,29 @@ export const PENDING_KEY_PREFIX = "hapi:pinsPending:v1:";
 export const STAGED_QUESTIONS_MAX = 5;
 /** `PIN_SUBMISSION_QUESTION_MAX_CHARS`, copied (Zod-free); staging.test.ts keeps them equal. */
 export const STAGED_QUESTION_MAX_CHARS = 1000;
-export const STAGED_NOTE_MAX_CHARS = 2048;
+/**
+ * #6969 (D2, D4): `PIN_LEGACY_NOTE_MAX_CHARS`, copied (Zod-free); staging.test.ts
+ * keeps them equal. The note limit of a session whose node states none (a node
+ * before #6969), or whose list could not be read. Every other session's limit
+ * is the one its node states (`noteMaxChars`), never a copy here. A limit Submit
+ * holds a longer note at, never a cut: staging keeps every word it is given.
+ */
+export const STAGED_LEGACY_NOTE_MAX_CHARS = 2048;
+/** #6969: the write-in's request cap, copied (Zod-free); staging.test.ts keeps them equal. */
+export const STAGED_WRITE_IN_MAX_CHARS = 2048;
+
+/** #6969 (D2): a node's stated note limit: a positive whole number, else 2,048. */
+export function resolveNoteMax(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : STAGED_LEGACY_NOTE_MAX_CHARS;
+}
+/**
+ * #6969 (E1): `PIN_ANSWERS_MESSAGE_MAX_CHARS`, the agent's message cap, copied
+ * (Zod-free); staging.test.ts keeps them equal. Submit holds a pin whose
+ * answer would pass it, so the rest still send.
+ */
+export const STAGED_MESSAGE_MAX_CHARS = 48_000;
 /** Kinds answered by a choice (KD12). */
 export const ANSWERABLE_KINDS: ReadonlySet<string> = new Set([
   "decision",
@@ -89,12 +131,42 @@ export function isReservedKey(key: string): boolean {
   return RESERVED_KEY_PREFIXES.some(prefix => key.startsWith(prefix));
 }
 
+/**
+ * #6803: a chosen write-in with words, the only write-in a Submit sends. The
+ * one test for it, so the pin's row, its moot notice and the Submit agree.
+ */
+export function hasChosenWriteIn(
+  entry: Pick<StagedPin, "writeIn" | "writeInChosen"> | undefined
+): boolean {
+  return entry?.writeInChosen === true && Boolean(entry.writeIn?.trim());
+}
+
+/**
+ * #6969 (R-2): the operator's own words on a staged pin: a note, write-in words
+ * (chosen or a draft), a question, or a question draft. The one test every path
+ * that keeps, shows, or forgets a pin's words uses, so none of them loses a
+ * draft the others keep.
+ */
+export function hasOwnWords(
+  entry:
+    | Pick<StagedPin, "note" | "writeIn" | "questions" | "questionDraft">
+    | undefined
+): boolean {
+  return (
+    Boolean(entry?.note?.trim()) ||
+    Boolean(entry?.writeIn?.trim()) ||
+    (entry?.questions?.length ?? 0) > 0 ||
+    Boolean(entry?.questionDraft?.trim())
+  );
+}
+
 /** True when a staged pin has something a Submit would send. */
 export function hasUpdates(entry: StagedPin | undefined): boolean {
   if (!entry) return false;
   const ticks = entry.ticks?.length ?? 0;
   return (
     entry.choice !== undefined ||
+    hasChosenWriteIn(entry) ||
     Boolean(entry.note?.trim()) ||
     (entry.questions?.length ?? 0) > 0 ||
     (ticks > 0 && ticks !== (entry.ticksSent ?? 0)) ||
@@ -146,6 +218,9 @@ function isStagedPin(value: unknown): value is StagedPin {
     (v.saved === undefined || v.saved === true) &&
     (v.dismiss === undefined || v.dismiss === true) &&
     (v.pickAt === undefined || typeof v.pickAt === "number") &&
+    (v.writeIn === undefined || typeof v.writeIn === "string") &&
+    (v.writeInChosen === undefined || v.writeInChosen === true) &&
+    (v.questionDraft === undefined || typeof v.questionDraft === "string") &&
     strings(v.questions) &&
     strings(v.ticks)
   );
@@ -342,13 +417,16 @@ function mutate(
 /**
  * `mutate` deletes an entry this calls empty. A dismissal is content on its own
  * (#6539), or one staged with no note would be deleted as it is written;
- * `pickAt` is not, because it only says what Undo restores.
+ * `pickAt` is not, because it only says what Undo restores. A write-in draft
+ * is content (#6803), or typed words would be deleted on the next change, and
+ * so is a question draft (#6969, R-2), or `setQuestionDraft` would delete one
+ * on a pin with nothing else staged as it writes it.
  */
 function isEmptyEntry(entry: StagedPin): boolean {
   return (
     entry.choice === undefined &&
-    !entry.note &&
-    !entry.questions?.length &&
+    !hasOwnWords(entry) &&
+    entry.writeInChosen !== true &&
     !entry.ticks?.length &&
     entry.saved !== true &&
     entry.dismiss !== true
@@ -367,7 +445,8 @@ function base(
 
 /**
  * Choose an option; the revision and the label are taken as they are now. A
- * choice replaces a staged dismissal (#6539): the last act wins.
+ * choice replaces a staged dismissal (#6539): the last act wins. It replaces a
+ * chosen write-in too (#6803), and keeps its words as a draft.
  */
 export function stageChoice(
   sessionId: string,
@@ -376,7 +455,7 @@ export function stageChoice(
   via: StagedVia
 ): void {
   mutate(sessionId, [pin.key], entry => ({
-    ...withoutDismiss(base(entry, pin, via)),
+    ...withoutWriteInChoice(withoutDismiss(base(entry, pin, via))),
     rev: pin.revision,
     kind: pin.kind,
     choice: option.id,
@@ -388,6 +467,63 @@ export function stageChoice(
 function withoutDismiss(entry: StagedPin): StagedPin {
   const { dismiss: _dismiss, pickAt: _pickAt, ...rest } = entry;
   return rest;
+}
+
+/** #6803: the write-in stops being the answer; its words stay as a draft. */
+function withoutWriteInChoice(entry: StagedPin): StagedPin {
+  const { writeInChosen: _chosen, ...rest } = entry;
+  return rest;
+}
+
+/**
+ * #6803: make the write-in the pin's answer. Like a choice it binds to the
+ * revision on screen, replaces a staged choice and a staged dismissal (the last
+ * act wins), and keeps any words already typed.
+ */
+export function chooseWriteIn(
+  sessionId: string,
+  pin: StagingPin,
+  via: StagedVia
+): void {
+  mutate(sessionId, [pin.key], entry => {
+    const {
+      choice: _choice,
+      label: _label,
+      ...rest
+    } = withoutDismiss(base(entry, pin, via));
+    return {
+      ...rest,
+      rev: pin.revision,
+      kind: pin.kind,
+      writeInChosen: true,
+      via,
+    };
+  });
+}
+
+/**
+ * #6803: set the write-in's words, whole: #6969 (R1) cuts nothing, and a
+ * Submit holds a chosen write-in over its cap instead. Blank words remove
+ * them. While the write-in is the answer the words answer the revision on
+ * screen, so `rev` follows the pin given, which is the pin at the last
+ * keystroke (unlike a note, KD4). Unchanged words write nothing.
+ */
+export function setWriteIn(
+  sessionId: string,
+  pin: StagingPin,
+  text: string,
+  via: StagedVia
+): void {
+  const words = text.trim() ? text : undefined;
+  mutate(sessionId, [pin.key], entry => {
+    if (entry?.writeIn === words) return entry;
+    const { writeIn: _old, ...rest } = base(entry, pin, via);
+    return {
+      ...rest,
+      ...(words !== undefined ? { writeIn: words } : {}),
+      ...(rest.writeInChosen === true ? { rev: pin.revision } : {}),
+    };
+  });
 }
 
 /**
@@ -408,6 +544,11 @@ export function stageDismiss(
     kind: pin.kind,
     via,
     ...(entry?.note ? { note: entry.note } : {}),
+    // #6803 (RV-2): typed words are never lost, so a dismissal keeps them as a
+    // draft and drops only the mark that they are the answer; Undo brings them back.
+    ...(entry?.writeIn ? { writeIn: entry.writeIn } : {}),
+    // #6969 (R-2): so is a question typed but not added.
+    ...(entry?.questionDraft ? { questionDraft: entry.questionDraft } : {}),
     ...(entry?.saved === true ? { saved: true as const } : {}),
     dismiss: true,
     ...(pickAt !== undefined ? { pickAt } : {}),
@@ -425,10 +566,16 @@ export function unstageDismiss(sessionId: string, key: string): void {
   });
 }
 
+/** Clear the answer: a choice, or a chosen write-in, whose words stay as a draft (#6803). */
 export function clearChoice(sessionId: string, key: string): void {
   mutate(sessionId, [key], entry => {
     if (!entry) return undefined;
-    const { choice: _choice, label: _label, ...rest } = entry;
+    const {
+      choice: _choice,
+      label: _label,
+      writeInChosen: _chosen,
+      ...rest
+    } = entry;
     return rest;
   });
 }
@@ -447,7 +594,10 @@ export function toggleTick(
     // #6539: a dismissed pin's steps are read-only; a tick beside a dismissal
     // would contradict it, like a question.
     if (entry?.dismiss === true) return entry;
-    const current = base(entry, pin, via);
+    // #6803: steps never go with a chosen write-in (the schema refuses the
+    // whole request), so a tick on a pin re-posted as steps keeps the words as
+    // a draft.
+    const current = withoutWriteInChoice(base(entry, pin, via));
     const ticks = new Set(current.ticks ?? []);
     if (ticks.has(stepId)) ticks.delete(stepId);
     else ticks.add(stepId);
@@ -461,26 +611,35 @@ export function toggleTick(
   });
 }
 
-/** Set the note; an existing entry keeps its revision (KD4). */
+/**
+ * Set the note, whole: #6969 (R1) cuts nothing, and a Submit holds a note over
+ * its limit instead. An existing entry keeps its revision (KD4). A blank note
+ * removes it, and an unchanged one writes nothing: comparing the normalized
+ * note means a whitespace-only edit no longer rewrites the entry, which bumped
+ * `updatedAt` and made an open Submit check its answers again.
+ */
 export function setNote(
   sessionId: string,
   pin: StagingPin,
   note: string,
   via: StagedVia
 ): void {
-  const text = note.slice(0, STAGED_NOTE_MAX_CHARS);
+  const text = note.trim() ? note : "";
   mutate(sessionId, [pin.key], entry => {
     const current = base(entry, pin, via);
     if ((current.note ?? "") === text) return entry;
     const { note: _old, ...rest } = current;
-    return text.trim() ? { ...rest, note: text } : rest;
+    return text ? { ...rest, note: text } : rest;
   });
 }
 
 /**
- * Add a question; false when it is empty, the pin already has five, or a
- * dismissal is staged (#6539): a question beside a dismissal would be dropped
- * unsent, so it is refused here, where the caller can say so.
+ * Add a question; false when it is empty, longer than
+ * {@link STAGED_QUESTION_MAX_CHARS} (#6969: refused whole, never cut, so the
+ * caller's box keeps it), the pin already has five, or a dismissal is staged
+ * (#6539): a question beside a dismissal would be dropped unsent, so it is
+ * refused here, where the caller can say so. An added question clears the
+ * pin's question draft, because the draft is now that question.
  */
 export function addQuestion(
   sessionId: string,
@@ -488,17 +647,43 @@ export function addQuestion(
   question: string,
   via: StagedVia
 ): boolean {
-  const text = question.trim().slice(0, STAGED_QUESTION_MAX_CHARS);
+  const text = question.trim();
   const staged = load(sessionId)[pin.key];
   const existing = staged?.questions?.length ?? 0;
-  if (!text || existing >= STAGED_QUESTIONS_MAX || staged?.dismiss === true) {
+  if (
+    !text ||
+    text.length > STAGED_QUESTION_MAX_CHARS ||
+    existing >= STAGED_QUESTIONS_MAX ||
+    staged?.dismiss === true
+  ) {
     return false;
   }
   mutate(sessionId, [pin.key], entry => {
-    const current = base(entry, pin, via);
+    const { questionDraft: _draft, ...current } = base(entry, pin, via);
     return { ...current, questions: [...(current.questions ?? []), text] };
   });
   return true;
+}
+
+/**
+ * #6969 (D7): keep a question typed but not added, so a collapse, a closed
+ * panel, or a hidden page never loses it. A draft is never sent and does not
+ * make the pin submittable (`hasUpdates` leaves it out). Blank text removes it;
+ * unchanged text writes nothing. An existing entry keeps its revision, like a
+ * note.
+ */
+export function setQuestionDraft(
+  sessionId: string,
+  pin: StagingPin,
+  text: string,
+  via: StagedVia
+): void {
+  const draft = text.trim() ? text : undefined;
+  mutate(sessionId, [pin.key], entry => {
+    if (entry?.questionDraft === draft) return entry;
+    const { questionDraft: _old, ...rest } = base(entry, pin, via);
+    return draft !== undefined ? { ...rest, questionDraft: draft } : rest;
+  });
 }
 
 export function removeQuestion(
@@ -538,6 +723,8 @@ export function canStageRecommendation(
     ANSWERABLE_KINDS.has(pin.kind) &&
     !isReservedKey(pin.key) &&
     entry?.choice === undefined &&
+    // #6803: the operator answered in their own words.
+    entry?.writeInChosen !== true &&
     // #6539: a pin the operator chose to dismiss takes no recommendation.
     entry?.dismiss !== true &&
     pin.recommended !== undefined &&
@@ -583,6 +770,9 @@ export function stageRecommendations(
  * Clear what a Submit sent. An entry changed since the dialog read it (another
  * tab, or a tick after opening) keeps its newer edit. Partial step ticks stay,
  * marked sent, so the list still shows them; all ticked resolves the pin.
+ * #6803: write-in words that were never chosen were not sent, so they stay as
+ * a draft; a chosen write-in that was sent lives on the pin's record instead.
+ * #6969 (D7): a question draft was never sent either, so it stays too.
  */
 export function clearSubmitted(
   sessionId: string,
@@ -591,17 +781,57 @@ export function clearSubmitted(
   mutate(sessionId, Object.keys(submitted), (entry, key) => {
     const sent = submitted[key];
     if (!entry || !sent || entry.updatedAt !== sent.updatedAt) return entry;
+    const draft = {
+      ...(entry.writeIn?.trim() && entry.writeInChosen !== true
+        ? { writeIn: entry.writeIn }
+        : {}),
+      ...(entry.questionDraft?.trim()
+        ? { questionDraft: entry.questionDraft }
+        : {}),
+    };
     const ticks = entry.ticks ?? [];
-    return ticks.length > 0
+    if (ticks.length > 0) {
+      return {
+        rev: entry.rev,
+        kind: entry.kind,
+        via: entry.via,
+        ticks,
+        ticksSent: ticks.length,
+        ...draft,
+        updatedAt: entry.updatedAt,
+      };
+    }
+    return Object.keys(draft).length > 0
       ? {
           rev: entry.rev,
           kind: entry.kind,
           via: entry.via,
-          ticks,
-          ticksSent: ticks.length,
+          ...draft,
           updatedAt: entry.updatedAt,
         }
       : undefined;
+  });
+}
+
+/**
+ * #6969 (ruling B2): forget only the operator's words on a pin: its note,
+ * write-in words, questions, and question draft. A pin Submit held is still
+ * open, so its choice, a chosen write-in's mark, ticks, a save, and a
+ * dismissal stay staged and go with the next Submit; a Clear that also dropped
+ * the choice under a label naming only the words would lose it unannounced.
+ * An entry left with nothing is removed.
+ */
+export function clearWords(sessionId: string, key: string): void {
+  mutate(sessionId, [key], entry => {
+    if (!entry || !hasOwnWords(entry)) return entry;
+    const {
+      note: _note,
+      writeIn: _writeIn,
+      questions: _questions,
+      questionDraft: _draft,
+      ...rest
+    } = entry;
+    return rest;
   });
 }
 

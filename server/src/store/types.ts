@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { SessionView, UiCollapseState } from "@hapi/protocol";
+import type { ManagerStampReason } from "@hapi/protocol/schemas";
 
 export type StoredSession = {
   id: string;
@@ -52,6 +53,10 @@ export type StoredSession = {
   branchLabel: string | null;
   /** Branching: timestamp when this branch was created */
   branchCreatedAt: number | null;
+  /** Issue #6918: nearest manager above, set once at spawn (null: none/undecided). */
+  managerSessionId: string | null;
+  /** Issue #6918: the decision marker (null: undecided). */
+  managerStampReason: ManagerStampReason | null;
 };
 
 export type StoredMachine = {

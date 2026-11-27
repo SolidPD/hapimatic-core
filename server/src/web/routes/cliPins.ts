@@ -13,6 +13,8 @@ import {
   PinListResponseSchema,
   PinMutationResponseSchema,
   PinResolveRequestSchema,
+  PinRetireRequestSchema,
+  PinRuleRequestSchema,
 } from "@hapi/protocol";
 import { z } from "zod";
 
@@ -28,10 +30,18 @@ import { parseAccessToken } from "../../utils/accessToken";
 import { constantTimeEquals } from "../../utils/crypto";
 import { pinsGate } from "../middleware/pinsGate";
 import { createRateLimiter } from "../middleware/rateLimit";
+import { CALLER_SESSION_HEADER } from "./agentEscalation";
 import { resolveSessionForNamespace, type CliEnv } from "./cli";
 import {
   invalidPinIdResponse,
   PIN_FILES_MISSING_ROUTE,
+  PIN_SUPERSEDE_MISSING_ROUTE,
+  openDetectedSummary,
+  pinActionResponse,
+  pinCallerHeaders,
+  resolvePinCaller,
+  retireDetectedPin,
+  rulePin,
   pinAnswerResponse,
   pinByIdLimiters,
   pinByIdResponse,
@@ -360,12 +370,22 @@ export function createCliPinRoutes(
         if (!parsed.ok) return c.json({ error: parsed.error }, 400);
         const mustExist = c.req.query("mustExist") === "1";
         if (target.kind === "local") {
+          const { pins, session } = target;
           return pinUpsertResponse(
             c,
-            target.pins.upsert(target.session, parsed.content, {
+            pins.upsert(session, parsed.content, {
               reopen: parsed.reopen,
               mustExist,
-            })
+            }),
+            // #6456: the session's open Detected pins, for `repeats`.
+            written => {
+              const open = openDetectedSummary(
+                pins,
+                session.id,
+                written.pin.key
+              );
+              return open.length > 0 ? { detectedOpen: open } : {};
+            }
           );
         }
         const result = await target.service.proxyPinRequest(
@@ -556,6 +576,191 @@ export function createCliPinRoutes(
           result,
           PinMutationResponseSchema,
           followCount(target.sessionId)
+        );
+      })
+  );
+
+  /**
+   * #6456: the caller of a retire or a ruling. `X-Hapi-Session-Id` is required
+   * here (the other floors bind only a caller that sends it), and it must name a
+   * session; the result is that session's id, never the header's tag.
+   */
+  const requirePinCaller = (c: Context) => {
+    if (!c.req.header(CALLER_SESSION_HEADER)) {
+      return {
+        ok: false as const,
+        response: c.json(
+          {
+            error:
+              "This request must say which session sends it (X-Hapi-Session-Id)",
+            code: "pin_caller_required",
+          },
+          403
+        ),
+      };
+    }
+    const caller = resolvePinCaller(
+      c,
+      getSyncEngine(),
+      options.getNodeRegistry()
+    );
+    if (!caller) {
+      return {
+        ok: false as const,
+        response: c.json(
+          {
+            error: "The sending session was not found",
+            code: "pin_caller_unknown",
+          },
+          403
+        ),
+      };
+    }
+    return { ok: true as const, caller };
+  };
+
+  app.post(
+    "/sessions/:id/pins/:key/retire",
+    cataloged(
+      defineCapability({
+        id: "session-introspection.cli-retire-pin",
+        domain: "session-introspection",
+        surface: "rest",
+        description:
+          "Retire an open Detected pin settled elsewhere, as superseded with a reason, never as the operator's answer. Its PM may; the session itself only with proof.",
+        whenToUse:
+          "When a Detected pin repeats an ask already decided elsewhere.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/cli/sessions/:id/pins/:key/retire",
+        },
+        auth: "cli-token",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    gate,
+    writeLimiter,
+    c =>
+      withPinErrors(c, errorLogger, "cli-pins-retire", async () => {
+        const who = requirePinCaller(c);
+        if (!who.ok) return who.response;
+        const read = await readPinBody(c);
+        if (!read.ok) return read.response;
+        const body = PinRetireRequestSchema.safeParse(read.body);
+        if (!body.success) {
+          return c.json({ error: describePinIssues(body.error) }, 400);
+        }
+        const target = resolveTarget(c);
+        if (target.kind === "response") return target.response;
+        const key = c.req.param("key");
+        const engine = getSyncEngine();
+        if (target.kind === "local" && engine) {
+          const record = engine.getSession(target.session.id);
+          if (!record) return c.json({ error: "Session not found" }, 404);
+          return pinActionResponse(
+            c,
+            await retireDetectedPin({
+              engine,
+              session: record,
+              key,
+              request: body.data,
+              caller: who.caller,
+            })
+          );
+        }
+        if (target.kind !== "remote") {
+          return c.json({ error: "Not ready" }, 503);
+        }
+        // The hub forwards only the caller it resolved; the owner checks its
+        // own stamp, the token and the namespace.
+        const result = await target.service.proxyPinRequest(
+          target.sessionId,
+          pinPath(key, "/retire"),
+          "POST",
+          c.get("namespace"),
+          body.data,
+          pinCallerHeaders(who.caller)
+        );
+        return proxiedPinResponse(
+          c,
+          result,
+          PinMutationResponseSchema,
+          followCount(target.sessionId),
+          PIN_SUPERSEDE_MISSING_ROUTE
+        );
+      })
+  );
+
+  app.post(
+    "/sessions/:id/pins/:key/rule",
+    cataloged(
+      defineCapability({
+        id: "session-introspection.cli-rule-pin",
+        domain: "session-introspection",
+        surface: "rest",
+        description:
+          "Record a Project Manager's ruling on an open pin of a lane it started, at the revision it read; recorded as the PM's, never as the operator's answer.",
+        whenToUse:
+          "When the Project Manager that started a session decides that session's own pin.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/cli/sessions/:id/pins/:key/rule",
+        },
+        auth: "cli-token",
+        riskTier: "mutating",
+        availability: { scope: "user" },
+      })
+    ),
+    gate,
+    writeLimiter,
+    c =>
+      withPinErrors(c, errorLogger, "cli-pins-rule", async () => {
+        const who = requirePinCaller(c);
+        if (!who.ok) return who.response;
+        const read = await readPinBody(c);
+        if (!read.ok) return read.response;
+        const body = PinRuleRequestSchema.safeParse(read.body);
+        if (!body.success) {
+          return c.json({ error: describePinIssues(body.error) }, 400);
+        }
+        const target = resolveTarget(c);
+        if (target.kind === "response") return target.response;
+        const key = c.req.param("key");
+        const engine = getSyncEngine();
+        if (target.kind === "local" && engine) {
+          const record = engine.getSession(target.session.id);
+          if (!record) return c.json({ error: "Session not found" }, 404);
+          return pinActionResponse(
+            c,
+            rulePin({
+              engine,
+              session: record,
+              key,
+              request: body.data,
+              caller: who.caller,
+            })
+          );
+        }
+        if (target.kind !== "remote") {
+          return c.json({ error: "Not ready" }, 503);
+        }
+        const result = await target.service.proxyPinRequest(
+          target.sessionId,
+          pinPath(key, "/rule"),
+          "POST",
+          c.get("namespace"),
+          body.data,
+          pinCallerHeaders(who.caller)
+        );
+        return proxiedPinResponse(
+          c,
+          result,
+          PinMutationResponseSchema,
+          followCount(target.sessionId),
+          PIN_SUPERSEDE_MISSING_ROUTE
         );
       })
   );

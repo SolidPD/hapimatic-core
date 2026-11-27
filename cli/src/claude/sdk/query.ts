@@ -1250,8 +1250,6 @@ export function query(config: {
   const spawnCommand = pathToClaudeCodeExecutable;
   const spawnArgs = args;
 
-  cleanupMcpConfig = appendMcpConfigArg(spawnArgs, mcpServers);
-
   // Spawn Claude Code process.
   // #1734 (OmniBox Phase 0a) — THE critical gap: the default `sdk` launcher
   // NEVER routes through buildLauncherEnv, so without this strip the Claude
@@ -1298,6 +1296,8 @@ export function query(config: {
       { apiKeyHelperSession }
     )
   );
+  // After the env: its test-instance guard throws before a file is written (#6980).
+  cleanupMcpConfig = appendMcpConfigArg(spawnArgs, mcpServers);
   logDebug(
     `Spawning Claude Code process: ${spawnCommand} ${spawnArgs.join(" ")}`
   );

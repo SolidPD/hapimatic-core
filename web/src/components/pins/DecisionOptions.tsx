@@ -5,12 +5,47 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
 } from "react";
-import { Star } from "lucide-react";
+import { PenLine, Star } from "lucide-react";
 import type { PinOption } from "@hapi/protocol";
 import { HoverTooltip } from "@/components/ui/tooltip";
 import { collapseCount } from "@/lib/pins/actionRowFit";
 import { OptionIdCell, optionIdCellStyle, optionIdColumnCh } from "./optionId";
+
+/**
+ * #6803: the decision's "Something else" row, the operator's own answer. Only
+ * beside `onSelect`, in the same radio group.
+ */
+export type WriteInRow = {
+  selected: boolean;
+  onSelect: () => void;
+  /** The write-in field, shown under the row while it is selected. */
+  field: ReactNode;
+  /** No words yet: the row says what sending needs. */
+  empty: boolean;
+  /** The hint's id, which the field names in `aria-describedby`. */
+  hintId?: string;
+};
+
+/**
+ * The write-in radio's value: longer than any option id can be (64 characters,
+ * `PinOptionSchema`), so it can never equal one.
+ */
+export const WRITE_IN_RADIO_VALUE =
+  "hapimatic-write-in:the-operators-own-answer-instead-of-any-of-the-options";
+
+export const WRITE_IN_LABEL = "Something else";
+export const WRITE_IN_TOOLTIP = "Answer in your own words instead of an option";
+export const WRITE_IN_EMPTY_HINT = "Write your answer to send it";
+
+/**
+ * The id cell's font. The id column's width is in `ch` and its sizer holds the
+ * pin's ids as text (`./optionId`), both measured in this font, so the write-in
+ * row's id cell carries it too: in the label's larger font a word id's column
+ * drew wider there and "Something else" started right of the option labels.
+ */
+const ID_CELL_FONT = "text-[length:var(--text-body-dense)] font-bold";
 
 type DecisionOptionsProps = {
   options: readonly PinOption[];
@@ -18,9 +53,11 @@ type DecisionOptionsProps = {
   selectedId?: string;
   disabled?: boolean;
 } & (
-  | { onSelect?: undefined; name?: undefined }
+  | { onSelect?: undefined; name?: undefined; writeIn?: undefined }
   | {
       onSelect: (optionId: string) => void;
+      /** #6803: the last row, "Something else", when the pin takes one. */
+      writeIn?: WriteInRow;
       /**
        * The radio group's name, unique per rendered copy (`useId`): the same pin
        * can render twice in one document (two chat cards, or a card beside the
@@ -38,6 +75,7 @@ const CHIP_STYLE: CSSProperties = {
   borderColor: "color-mix(in srgb, var(--app-accent) 50%, transparent)",
 };
 const MARK_ICON: CSSProperties = { width: "11px", height: "11px" };
+const WRITE_IN_ICON: CSSProperties = { width: "13px", height: "13px" };
 
 /** The line's `gap-1.5`, between the label and the chip. */
 const LINE_GAP_PX = 6;
@@ -138,7 +176,8 @@ function RecommendedLabel(props: { label: string }) {
  * `./optionId`).
  */
 export function DecisionOptions(props: DecisionOptionsProps) {
-  const { options, recommendedId, selectedId, onSelect, disabled } = props;
+  const { options, recommendedId, selectedId, onSelect, disabled, writeIn } =
+    props;
   const choosing = onSelect !== undefined;
   const ids = options.map(option => option.id);
   const idCh = optionIdColumnCh(ids);
@@ -164,7 +203,7 @@ export function DecisionOptions(props: DecisionOptionsProps) {
               />
             ) : null}
             <span
-              className={`pt-px text-[length:var(--text-body-dense)] font-bold ${
+              className={`pt-px ${ID_CELL_FONT} ${
                 selected ? "text-[var(--app-accent)]" : "text-[var(--app-hint)]"
               }${idCh === null ? "" : " truncate"}`}
               style={idCh === null ? undefined : optionIdCellStyle(idCh)}
@@ -214,6 +253,86 @@ export function DecisionOptions(props: DecisionOptionsProps) {
           </div>
         );
       })}
+      {choosing && writeIn ? (
+        <WriteInOption
+          row={writeIn}
+          name={props.name}
+          disabled={disabled}
+          ids={ids}
+          idCh={idCh}
+          idColumn={idColumn}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * #6803: "Something else", the last row of a choosable decision's radio group.
+ * Its icon sits in the id column, sized like the option ids, so the labels
+ * line up. The field and its hint follow the row's label, inside the group.
+ * The tooltip is on the icon, as the Recommended star's is, so a tap on the
+ * words chooses the row instead of opening a tooltip on a phone.
+ */
+function WriteInOption(props: {
+  row: WriteInRow;
+  name: string | undefined;
+  disabled?: boolean;
+  ids: readonly string[];
+  idCh: number | null;
+  idColumn: string;
+}) {
+  const { row, idCh } = props;
+  return (
+    <div className="border-b border-[var(--app-divider)]">
+      <label
+        className="grid items-start gap-x-1.5 py-1.5"
+        style={{ gridTemplateColumns: `18px ${props.idColumn} minmax(0, 1fr)` }}
+      >
+        <input
+          type="radio"
+          name={props.name}
+          value={WRITE_IN_RADIO_VALUE}
+          checked={row.selected}
+          disabled={props.disabled}
+          onChange={() => row.onSelect()}
+          className="mt-0.5 h-4 w-4 accent-[var(--app-accent)]"
+        />
+        <span
+          data-write-in-id-cell=""
+          className={`pt-px ${ID_CELL_FONT} ${
+            row.selected ? "text-[var(--app-accent)]" : "text-[var(--app-hint)]"
+          }`}
+          style={idCh === null ? undefined : optionIdCellStyle(idCh)}
+          onClick={event => event.preventDefault()}
+        >
+          <HoverTooltip content={WRITE_IN_TOOLTIP}>
+            <span className="inline-flex" aria-hidden>
+              <PenLine style={WRITE_IN_ICON} />
+            </span>
+          </HoverTooltip>
+          {/* The option rows' own sizer, so the icon's column is as wide as theirs. */}
+          {idCh === null ? null : (
+            <OptionIdCell id="" ids={props.ids} idCh={idCh} />
+          )}
+        </span>
+        <span className="min-w-0 text-[length:var(--text-body)] font-semibold text-[var(--app-fg)]">
+          {WRITE_IN_LABEL}
+        </span>
+      </label>
+      {row.selected ? (
+        <div className="pb-1.5">
+          {row.field}
+          {row.empty ? (
+            <span
+              id={row.hintId}
+              className="mt-1 block text-[length:var(--text-caption)] text-[var(--app-hint)]"
+            >
+              {WRITE_IN_EMPTY_HINT}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

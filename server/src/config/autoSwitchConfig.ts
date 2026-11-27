@@ -14,7 +14,12 @@
  * `autoRecoveryConfig.ts` toggle-free.
  */
 
-import { getSettingsFile, readSettings, writeSettings } from "./settings";
+import {
+  getSettingsFile,
+  readSettings,
+  updateSettings,
+  type Settings,
+} from "./settings";
 
 export interface AutoSwitchConfig {
   /**
@@ -98,20 +103,21 @@ export async function loadAutoSwitchConfig(
   };
 }
 
-/** Persist auto-switch storm-guard tunables (NOT the global toggle). */
+/**
+ * Persist auto-switch storm-guard tunables (NOT the global toggle).
+ * #4056: through `updateSettings`, so an unreadable file is refused with
+ * `SettingsUnreadableError` and left byte-identical.
+ */
 export async function saveAutoSwitchConfig(
   dataDir: string,
   updates: Partial<AutoSwitchConfig>
 ): Promise<AutoSwitchConfig> {
   const settingsFile = getSettingsFile(dataDir);
-  const settings = (await readSettings(settingsFile)) ?? {};
-  const raw = (settings as Record<string, unknown>).autoSwitch;
-  const existing = raw && typeof raw === "object" ? raw : {};
-
-  const merged = { ...existing, ...updates };
-  (settings as Record<string, unknown>).autoSwitch = merged;
-
-  await writeSettings(settingsFile, settings);
+  await updateSettings(settingsFile, current => {
+    const raw = (current as Record<string, unknown>).autoSwitch;
+    const existing = raw && typeof raw === "object" ? raw : {};
+    return { ...current, autoSwitch: { ...existing, ...updates } } as Settings;
+  });
 
   return loadAutoSwitchConfig(dataDir);
 }

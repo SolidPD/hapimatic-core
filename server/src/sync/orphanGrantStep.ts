@@ -32,9 +32,10 @@
  * record → no notice (documented). No verify/mint/consume/re-run of any grant
  * (R5) — this module only READS grant files and posts a non-user-role notice.
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { DenialCopyParams } from "@hapi/protocol";
-import type { ApprovalKey } from "../services/approvalTokens";
+import { grantFile, type ApprovalKey } from "../services/approvalTokens";
 import type { FinalizeStep, FinalizeStepContext } from "./turnLifecycle";
 
 /**
@@ -73,6 +74,72 @@ export function readGrantNonceFromDisk(grantPath: string): string | null {
   } catch {
     return null;
   }
+}
+
+const ISSUE_GRANT_FILE_RE = /^\.user-approval-granted-(\d+)\.json$/;
+
+/**
+ * #6559 (Task 10 item 9): the mint record of each issue grant still on disk in
+ * `<repoPath>/claudedocs/` (unconsumed: the gate deletes a grant it consumes).
+ * A context reset re-records these, because the arming turn's clean end dropped
+ * their records (`dropOpenedAtOrAfter`) while the grants stay live. A file with
+ * no string nonce or no `minted_at` is skipped. Reads only; never throws.
+ */
+export function readIssueGrantMintsFromDisk(
+  repoPath: string,
+  /**
+   * #6559 ROUND RV10 item 8: told of each grant file (or an unreadable
+   * `claudedocs/`) that is skipped, so a skip is never silent. A missing
+   * folder is not a skip.
+   */
+  onSkip?: (path: string, why: string) => void
+): MintRecord[] {
+  const docs = join(repoPath, "claudedocs");
+  let names: string[];
+  try {
+    names = readdirSync(docs);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") {
+      onSkip?.(docs, `the folder cannot be read (${code ?? String(error)})`);
+    }
+    return [];
+  }
+  const records: MintRecord[] = [];
+  for (const name of names) {
+    const match = ISSUE_GRANT_FILE_RE.exec(name);
+    if (!match) continue;
+    const issueNumber = Number(match[1]);
+    const grantPath = grantFile(repoPath, issueNumber);
+    try {
+      const parsed = JSON.parse(readFileSync(grantPath, "utf8")) as {
+        nonce?: unknown;
+        minted_at?: unknown;
+      };
+      if (
+        typeof parsed.nonce !== "string" ||
+        parsed.nonce === "" ||
+        typeof parsed.minted_at !== "string"
+      ) {
+        onSkip?.(grantPath, "no nonce or no minted_at");
+        continue;
+      }
+      records.push({
+        key: { kind: "issue", issueNumber },
+        nonce: parsed.nonce,
+        mintedAt: parsed.minted_at,
+        repoPath,
+        grantPath,
+      });
+    } catch (error) {
+      onSkip?.(
+        grantPath,
+        `unreadable (${error instanceof Error ? error.message : String(error)})`
+      );
+      continue;
+    }
+  }
+  return records;
 }
 
 /**

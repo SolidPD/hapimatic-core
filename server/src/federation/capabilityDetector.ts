@@ -15,7 +15,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import {
   ANTHROPIC_LOGIN_CAPABILITY,
+  API_KEY_CREDIT_REPORT_CAPABILITY,
   INTERVAL_FEED_CAPABILITY,
+  SESSION_API_KEY_SWITCH_CAPABILITY,
   SHARED_API_KEYS_CAPABILITY,
   MCP_SET_CAPABILITY,
   KNOWN_AGENT_IDS,
@@ -199,6 +201,12 @@ export function detectCapabilities(opts?: {
       "spawn-session",
       ANTHROPIC_LOGIN_CAPABILITY,
       SHARED_API_KEYS_CAPABILITY,
+      // Issue #6740: static too — this binary's session-account receiver takes a
+      // key by qualified reference. An older owner answers it with a 400.
+      SESSION_API_KEY_SWITCH_CAPABILITY,
+      // Issue #6978: static too — this binary serves the out-of-credit report
+      // receiver. A requester skips a home without it, so the key stays unstamped.
+      API_KEY_CREDIT_REPORT_CAPABILITY,
       // Issue #6171: static too — this binary honors `mcpSet` on a spawn and serves
       // the MCP catalog. An older peer would strip the field and start every server.
       MCP_SET_CAPABILITY,

@@ -115,6 +115,64 @@ export const FORMAT_RATE_THROWS: readonly {
   { minor: 100, currency: "ZZZ" },
 ];
 
+/**
+ * Issue #6204 (R8, D-6): an entry's value, minutes × hourly rate ÷ 60 to the
+ * nearest minor unit, an exact half up. The rate's minor unit is the value's.
+ */
+export type EntryValueVector = {
+  minutes: number;
+  rateMinor: number;
+  currency: string;
+  expected: number;
+};
+
+export const ENTRY_VALUE_VECTORS: readonly EntryValueVector[] = [
+  // One minute at 160.00 an hour is 2.6667, so 2.67.
+  { minutes: 1, rateMinor: 16000, currency: "USD", expected: 267 },
+  { minutes: 60, rateMinor: 16000, currency: "USD", expected: 16000 },
+  { minutes: 0, rateMinor: 16000, currency: "USD", expected: 0 },
+  { minutes: 30, rateMinor: 0, currency: "USD", expected: 0 },
+  // An exact half rounds up.
+  { minutes: 1, rateMinor: 30, currency: "USD", expected: 1 },
+  { minutes: 3, rateMinor: 10, currency: "USD", expected: 1 },
+  { minutes: 90, rateMinor: 1, currency: "USD", expected: 2 },
+  // Just below a half rounds down.
+  { minutes: 1, rateMinor: 29, currency: "USD", expected: 0 },
+  { minutes: 59, rateMinor: 1, currency: "USD", expected: 1 },
+  { minutes: 29, rateMinor: 1, currency: "USD", expected: 0 },
+  // A currency with exponent 0, and one with 3.
+  { minutes: 90, rateMinor: 1000, currency: "JPY", expected: 1500 },
+  { minutes: 7, rateMinor: 1000, currency: "JPY", expected: 117 },
+  { minutes: 1, rateMinor: 1500, currency: "BHD", expected: 25 },
+  { minutes: 7, rateMinor: 1000, currency: "BHD", expected: 117 },
+  // The largest entry at the largest rate stays a safe integer (P4).
+  {
+    minutes: 1440,
+    rateMinor: 1_000_000_000,
+    currency: "USD",
+    expected: 24_000_000_000,
+  },
+];
+
+/** Inputs `entryValueMinor` refuses by throwing. */
+export const ENTRY_VALUE_THROWS: readonly {
+  minutes: number;
+  rateMinor: number;
+  currency: string;
+}[] = [
+  // Negative minutes: no caller needs them (a void negates a stored value).
+  { minutes: -1, rateMinor: 16000, currency: "USD" },
+  { minutes: 1.5, rateMinor: 16000, currency: "USD" },
+  { minutes: 1441, rateMinor: 16000, currency: "USD" },
+  { minutes: Number.NaN, rateMinor: 16000, currency: "USD" },
+  { minutes: 1, rateMinor: -1, currency: "USD" },
+  { minutes: 1, rateMinor: 1.5, currency: "USD" },
+  { minutes: 1, rateMinor: 1_000_000_001, currency: "USD" },
+  { minutes: 1, rateMinor: 16000, currency: "XXX" },
+  { minutes: 1, rateMinor: 16000, currency: "ZZZ" },
+  { minutes: 1, rateMinor: 16000, currency: "usd" },
+];
+
 export const CURRENCY_MEMBERSHIP_VECTORS: readonly {
   code: string;
   expected: boolean;

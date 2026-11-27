@@ -32,14 +32,12 @@ import { buildDaemonBootRecord } from "./daemonBootRecord";
 import { TrackedSession } from "./types";
 import {
   collectLocalBindings,
-  isSessionLiveForGuard,
+  collectRemoteBindings,
   resolveLiveFreshnessWindowMs,
   type LocalBindingInput,
+  type LocalBindings,
+  type RemoteBindingInput,
 } from "./sessionLiveness";
-import {
-  isSessionBusyForRotation,
-  type SessionBusySignal,
-} from "@hapi/protocol/sessionBusy";
 import { createBoundSessionRestarter } from "./boundSessionRestart";
 import { DaemonState, type Machine, Metadata } from "@/api/types";
 import {
@@ -84,6 +82,7 @@ import {
 import { resolveEgressAllowlist } from "@/sandbox/egressPolicy";
 import { DAEMON_DELETE_AT_START_ENV_VARS } from "@/sandbox/secretEnvVars";
 import { runSystemdInvariantsCheck } from "./systemdInvariants";
+import { bootDaemonInstanceKind } from "./instanceKindBoot";
 import { createOwnStateWriter } from "./daemonStateOwnership";
 import {} from "./orphanCheckDecision";
 import {} from "./worktree";
@@ -101,19 +100,17 @@ import {
 } from "@/accounts/tokenRefreshService";
 import { rotationLeaseManager } from "@/accounts/rotationLeaseManager";
 import {
-  assessRemoteChainIndependence,
+  assessChainIndependenceDetailed,
   defaultLocalChainFingerprint,
   makeRemoteChainFingerprintsFetcher,
+  mintLocalServerJwt,
 } from "@/accounts/remoteChainIndependence";
 import { TmuxManager } from "@/tmux";
 import type { DaemonContext } from "./daemonContext";
 import { createSessionTracker, resolveMaxConcurrent } from "./sessionTracker";
 import { createSessionSpawner } from "./sessionSpawner";
 import { createHealthScheduler } from "./healthScheduler";
-import {
-  createWorktreeCollector,
-  runningInsideWorktreeInstanceDaemon,
-} from "./worktreeCollector";
+import { createWorktreeCollector } from "./worktreeCollector";
 import { startSlicePressureWatchdog } from "./slicePressureWatchdog";
 import {
   machineRotatorRoleLine,
@@ -510,6 +507,7 @@ export async function startDaemon(
     if (tenantVm)
       logger.info(tenantBootLine(scrubTenantProviderEnv(process.env)));
 
+    const instanceKind = await bootDaemonInstanceKind(ctx); // #6756: test-env scrub
     // #4153: what `hapi doctor` judges (socket path, accounts dir, token state),
     // for the boot write. It holds the instance credential (#3731 R0b) BEFORE the
     // control server can accept a spawn.
@@ -529,6 +527,7 @@ export async function startDaemon(
       await accountStore.adoptIndependentAccountFolders({
         readHostRefreshFingerprint,
         readHostNamedUuid,
+        skipAdoption: instanceKind.kind !== "real", // #6756: real instances only
       });
     }
 
@@ -953,6 +952,9 @@ export async function startDaemon(
       const inferringEmails = new Set<string>();
       // #4679: why each local busy account is busy, for the backstop's log line.
       const inferringReasons = new Map<string, string>();
+      // #6997: remote holders by uuid (R4) and the nodes holding each binding
+      // (R3(a)); empty unless the federation leg below succeeds.
+      let remote = collectRemoteBindings([], now);
       // Issue #1834: track whether the FEDERATION query failed this pass. The
       // per-block try/catch structure stays intact — this flag is set only in
       // the federation `catch` below, so the success path leaves it false. The
@@ -1020,18 +1022,12 @@ export async function startDaemon(
           `[IDLE_REFRESH] local session query error: ${err instanceof Error ? err.message : String(err)}`
         );
       }
-      // Federation sessions (by claudeAccount.email) — mint a JWT first.
+      // Federation sessions (by claudeAccount.email, #6997 also accountUuid).
       try {
-        const authResp = await fetch(`${configuration.serverUrl}/api/auth`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ accessToken: configuration.cliApiToken }),
-        });
-        if (!authResp.ok) {
-          throw new Error(`auth HTTP ${authResp.status}`);
-        }
-        const { token } = (await authResp.json()) as { token?: string };
-        if (!token) throw new Error("no JWT in /api/auth response");
+        const token = await mintLocalServerJwt(
+          configuration.serverUrl,
+          configuration.cliApiToken
+        );
         const fedResp = await fetch(
           `${configuration.serverUrl}/api/federation/all-sessions`,
           { headers: { Authorization: `Bearer ${token}` } }
@@ -1039,41 +1035,28 @@ export async function startDaemon(
         if (!fedResp.ok) {
           throw new Error(`all-sessions HTTP ${fedResp.status}`);
         }
+        // The summary fields the guards read: #1852 freshness (`activeAt`) and
+        // hub reachability (`nodeStatus`, R24: diagnostic only, never the sole
+        // not-live trigger); #3541 `thinking` and #4679 background-work counts
+        // (the busy signal); #6997 the holder node (`nodeId`, stamped by the
+        // hub's poll) and the bound account by email AND uuid (R4).
         const { sessions } = (await fedResp.json()) as {
-          sessions?: Array<{
-            active?: boolean;
-            // #1852: freshness signal + hub reachability — the previous cast
-            // stripped both, so the gate would have seen `undefined`.
-            activeAt?: number;
-            nodeStatus?: string; // R24: diagnostic only — never the sole not-live trigger.
-            // #3541: inference signal (the federation `SessionSummary` carries
-            // `thinking`, mapped from `session.thinking`). Populates
-            // `inferring.emails` for symmetry; the rotate-anyway path is
-            // local-only, so this key-space is not consumed by the gate today.
-            thinking?: boolean;
-            // #4679: background-work counts (the summary's counts-only
-            // projection carries `running` and `shells.running`).
-            backgroundAgents?: SessionBusySignal["backgroundAgents"];
-            metadata?: { claudeAccount?: { email?: string } };
-          }>;
+          sessions?: RemoteBindingInput[];
         };
-        for (const s of sessions ?? []) {
-          const email = s.metadata?.claudeAccount?.email;
-          // #1852: an OFFLINE node's frozen `active:true` cache must NOT count as
-          // a live binding — gate on a fresh `activeAt`, not the raw `active`
-          // flag (the deadlock this fix removes). The `catch` below (a FAILED
-          // federation query ⇒ unknown) stays #1834's conservative domain and is
-          // left untouched.
-          if (email && isSessionLiveForGuard(s, now, liveFreshnessWindowMs)) {
-            emails.add(email);
-            // #3541: a live REMOTE busy session (symmetry with the local leg;
-            // #4679: the same shared busy predicate). Unused by the local-only
-            // rotate-anyway gate today.
-            if (isSessionBusyForRotation(s)) {
-              inferringEmails.add(email);
-            }
-          }
-        }
+        // #1852: an OFFLINE node's frozen `active:true` cache must NOT count as
+        // a live binding — the collector gates on a fresh `activeAt`, not the raw
+        // `active` flag. The `catch` below (a FAILED federation query ⇒ unknown)
+        // stays #1834's conservative domain and is left untouched.
+        remote = collectRemoteBindings(
+          sessions ?? [],
+          now,
+          liveFreshnessWindowMs
+        );
+        for (const email of remote.emails) emails.add(email);
+        // #3541: a live REMOTE busy session (symmetry with the local leg; #4679:
+        // the same shared busy predicate). Unused by the local-only rotate-anyway
+        // gate today.
+        for (const email of remote.busyEmails) inferringEmails.add(email);
       } catch (err) {
         // Cross-machine visibility lost for this pass — degrade to local-only.
         // Do NOT silently rotate blind across machines; log the degradation.
@@ -1100,13 +1083,19 @@ export async function startDaemon(
           emails: inferringEmails,
           reasons: inferringReasons,
         },
+        remoteUuids: remote.uuids,
+        remoteHolderNodes: {
+          byEmail: remote.holderNodesByEmail,
+          byUuid: remote.holderNodesByUuid,
+        },
       };
     };
 
-    // Issue #4679 (R4): the cheap pre-rotation re-read — local `/cli/sessions`
-    // only (no federation JWT), same collector as the local leg above. `null`
-    // on any failure so the backstop defers (fail safe).
-    const getLocalBusyAccounts = async (): Promise<Set<string> | null> => {
+    // Issue #4679 (R4) + #6997 (R9): the cheap pre-rotation re-read — local
+    // `/cli/sessions` only (no federation JWT), same collector as the local leg
+    // above, read for the busy set (#4679) or the bound set (#6997's remote-only
+    // rotation). `null` on any failure so the backstop defers (fail safe).
+    const readLocalBindings = async (): Promise<LocalBindings | null> => {
       try {
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
@@ -1121,8 +1110,11 @@ export async function startDaemon(
         const { sessions } = (await resp.json()) as {
           sessions: LocalBindingInput[];
         };
-        return collectLocalBindings(sessions, Date.now(), liveFreshnessWindowMs)
-          .busyUuids;
+        return collectLocalBindings(
+          sessions,
+          Date.now(),
+          liveFreshnessWindowMs
+        );
       } catch {
         return null;
       }
@@ -1147,6 +1139,7 @@ export async function startDaemon(
 
     const tokenRefreshService = new TokenRefreshService({
       accountStore,
+      instanceKind, // #6756: mirror off, flag-only, tick skip on an inherited store
       onSuccessfulRefresh: refreshedAccountUuid => {
         void restartBoundSessions(refreshedAccountUuid);
       },
@@ -1181,17 +1174,21 @@ export async function startDaemon(
       // this lead (HAPI_BOUND_ROTATION_LEAD_MS; 0 ⇒ pre-#4679 buffer timing),
       // re-reading local busy state right before the rotation (R4).
       boundRotationLeadMs: configuration.boundRotationLeadMs,
-      getLocalBusyAccounts,
-      // Issue #3784: mixed (local+remote) rotate-when-independent gate (default
-      // OFF; HAPI_IDLE_ROTATE_REMOTE_INDEPENDENT=1 enables post-validation). The
-      // verdict composes this node's own fingerprint with the remote probe above.
+      getLocalBusyAccounts: async () =>
+        (await readLocalBindings())?.busyUuids ?? null,
+      getLocalBoundAccounts: async () =>
+        (await readLocalBindings())?.uuids ?? null,
+      // Issue #3784 + #6997: the rotate-when-independent gate for the mixed AND
+      // remote-only cases (default OFF; HAPI_IDLE_ROTATE_REMOTE_INDEPENDENT=1).
+      // The verdict composes this node's chain facts with the remote probe above.
       rotateWhenRemoteIndependent:
         configuration.idleRotateWhenRemoteIndependentEnabled,
-      assessRemoteChainIndependence: uuid =>
-        assessRemoteChainIndependence(
+      assessRemoteChainIndependenceDetailed: (uuid, context) =>
+        assessChainIndependenceDetailed(
           uuid,
           defaultLocalChainFingerprint,
-          getRemoteChainFingerprints
+          getRemoteChainFingerprints,
+          context
         ),
       // Issue #3023: per-tick utilization sampler for the un-pinned spawn veto. Reads
       // each account's access token from the store, fetches its utilization (read-only,
@@ -1279,9 +1276,12 @@ export async function startDaemon(
     logger.info(
       `[IDLE_REFRESH] backstop ${configuration.idleRefreshEnabled ? "enabled" : "disabled"}`
     );
+    logger.info(
+      `[IDLE_REFRESH] cross-node independent-chain rotation: ${configuration.idleRotateWhenRemoteIndependentEnabled ? "on" : "off"} (mixed + remote-only, #6997)`
+    );
     // Issue #4423: the machine-rotator role, evaluated once (soak S1 reads it).
     const role = resolveMachineRotatorRole({
-      selfIsWorktreeDaemonUnit: runningInsideWorktreeInstanceDaemon(),
+      selfIsWorktreeDaemonUnit: instanceKind.kind === "test", // #6756
       serverUrl: configuration.serverUrl,
       idleRefreshEnabled: configuration.idleRefreshEnabled,
     });

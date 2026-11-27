@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { readFile, rename, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { FileLockTimeoutError, withFileLock } from "@/utils/fileLock";
 import { isSafeMachinePath } from "@/modules/common/pathSecurity";
+import { wrapperClaudeJson } from "../testInstanceConfigDir";
 
 /**
  * Thrown when ~/.claude.json exists but cannot be parsed as JSON. Distinct
@@ -117,7 +117,7 @@ export async function applyDisabledServerToggle(
     throw new UnsafePathError(projectDir);
   }
 
-  const cfgPath = configPath ?? join(homedir(), ".claude.json");
+  const cfgPath = configPath ?? wrapperClaudeJson();
   const lockPath = `${cfgPath}.lock`;
 
   try {
@@ -270,7 +270,7 @@ export async function applyPreTrustShim(
     throw new UnsafePathError(projectDir);
   }
 
-  const cfgPath = configPath ?? join(homedir(), ".claude.json");
+  const cfgPath = configPath ?? wrapperClaudeJson();
   const lockPath = `${cfgPath}.lock`;
 
   // Fast path (R10): read-only check. If the three fields already match the

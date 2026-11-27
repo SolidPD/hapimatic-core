@@ -2,6 +2,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
   type CSSProperties,
@@ -16,6 +17,7 @@ import {
 } from "@/components/ui/tooltip";
 import { usePinsContext } from "@/components/pins/pinsShared";
 import { OptionIdText } from "@/components/pins/optionId";
+import { TextLimitCounter } from "@/components/pins/TextLimitCounter";
 import {
   ACTION_COLLAPSE_RANK,
   ACTION_ICON_ONLY_PADDING_PX,
@@ -28,6 +30,7 @@ import {
 } from "@/lib/pins/actionRowFit";
 import { recommendedOption, type PinViewModel } from "@/lib/pins/ledger";
 import { registerNoteDraft } from "@/lib/pins/noteDrafts";
+import { textLimitState, type TextLimitWhat } from "@/lib/pins/textLimit";
 import { cn } from "@/lib/utils";
 import {
   addQuestion,
@@ -36,10 +39,13 @@ import {
   isReservedKey,
   removeQuestion,
   setNote,
+  setQuestionDraft,
+  setWriteIn,
   stageChoice,
-  STAGED_NOTE_MAX_CHARS,
+  STAGED_LEGACY_NOTE_MAX_CHARS,
   STAGED_QUESTION_MAX_CHARS,
   STAGED_QUESTIONS_MAX,
+  STAGED_WRITE_IN_MAX_CHARS,
   useStagedPin,
   type StagedVia,
 } from "@/lib/pins/staging";
@@ -58,6 +64,8 @@ export const PIN_ACTION_STYLE: CSSProperties = {
 const GO_CLASS =
   "inline-flex items-center gap-1 rounded-md border border-transparent bg-[var(--app-accent)] px-2 font-semibold text-[var(--palette-accent-fg)] hover:opacity-90";
 const NOTE_COMMIT_MS = 300;
+/** #6969 (R2): a box past its limit takes the warn border. */
+const OVER_LIMIT_CLASS = "border-[var(--status-warn)]";
 const ICON_ONLY_STYLE: CSSProperties = {
   ...PIN_ACTION_STYLE,
   paddingLeft: `${ACTION_ICON_ONLY_PADDING_PX}px`,
@@ -190,10 +198,12 @@ export function PinAnswerButtons(props: {
   const staged = useStagedPin(sessionId, pin.key);
   const recommended = recommendedOption(model);
   const dismissed = staged?.dismiss === true;
+  const drafted = Boolean(staged?.questionDraft?.trim());
   const choosable = isChoosablePin(model) && !dismissed;
   return (
     <>
-      {choosable && staged?.choice !== undefined ? (
+      {choosable &&
+      (staged?.choice !== undefined || staged?.writeInChosen === true) ? (
         <PinActionButton
           rank={ACTION_COLLAPSE_RANK.clear}
           content="Clear your answer"
@@ -220,11 +230,19 @@ export function PinAnswerButtons(props: {
       {dismissed ? null : (
         <PinActionButton
           rank={ACTION_COLLAPSE_RANK.ask}
-          content="Ask the agent a question about this pin"
+          content={
+            drafted
+              ? "Finish your question; it is kept here until you add it"
+              : "Ask the agent a question about this pin"
+          }
+          // #6969 (ruling C1): a question typed but not added is marked like a
+          // staged note, so it is never kept out of sight.
+          aria-label={drafted ? "Ask •" : "Ask"}
           aria-expanded={panels.asking}
           onClick={panels.toggleAsk}
           icon={<MessageCircleQuestion style={ICON} aria-hidden />}
           label="Ask"
+          keep={drafted ? <span aria-hidden>•</span> : null}
         />
       )}
       <PinActionButton
@@ -249,42 +267,62 @@ export function PinAnswerButtons(props: {
 }
 
 /**
- * The note field. Its text lives in local state and is staged about 300 ms
- * after typing stops, on blur, and when an iOS input method finishes composing,
- * so a keystroke never re-renders every copy of the pin. #6768: it also stages
- * what it holds when it closes, when a Submit opens, and when the page is
- * hidden, because words typed inside a composition that has not ended are
- * staged by none of the three, and React runs no blur for a field it removes.
+ * A staged text field: the note (#6450) and the write-in (#6803) share it, so
+ * both keep every #6768 rule. Its text lives in local state and is staged about
+ * 300 ms after typing stops, on blur, and when an iOS input method finishes
+ * composing, so a keystroke never re-renders every copy of the pin. #6768: it
+ * also stages what it holds when it closes, when a Submit opens, and when the
+ * page is hidden, because words typed inside a composition that has not ended
+ * are staged by none of the three, and React runs no blur for a field it
+ * removes. #6803 (R4): it commits with the pin that was on screen at the last
+ * keystroke, so a flush after a revision with no further typing keeps the
+ * revision the words answered. #6969 (R1, R2): it never cuts the text: the
+ * box sets no maxlength, so dictation and paste keep every character, and the counter
+ * under it says how much room is left; past the limit the box is marked
+ * invalid and Submit holds the pin until the text fits.
  */
-function NoteField(props: {
-  sessionId: string;
+export function StagedTextField(props: {
   pin: Pin;
-  via: StagedVia;
-  /** The staged note now; it changes when a Submit clears it, or another copy edits it. */
+  /** The staged text now; it changes when a Submit clears it, or another copy edits it. */
   staged: string;
+  /** Stage `text` against `pin`, the pin at the last keystroke. */
+  save: (pin: Pin, text: string) => void;
+  label: string;
+  placeholder: string;
+  /** The length Submit takes; past it the counter warns and Submit holds the pin. */
+  limit: number;
+  what: TextLimitWhat;
+  className?: string;
+  /** An element that describes the field, such as a hint under it. */
+  describedBy?: string;
 }) {
-  const { sessionId, pin, via, staged } = props;
+  const { staged } = props;
   const [text, setText] = useState(staged);
+  const counterId = useId();
+  const limit = textLimitState(text.length, props.limit);
   const latest = useRef(text);
   const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
   const composing = useRef(false);
   // #6768: typed here since this field last staged or adopted staging. Only such
   // a field stages on close, so an idle second copy, or a field a Submit just
-  // emptied, never stages an old note again.
+  // emptied, never stages an old text again.
   const dirty = useRef(false);
-  const target = useRef({ sessionId, pin, via });
-  target.current = { sessionId, pin, via };
+  // The latest props, so `commit` stays stable however often the pin renders.
+  const target = useRef({ pin: props.pin, save: props.save });
+  target.current = { pin: props.pin, save: props.save };
+  /** #6803 (R4): the pin on screen at the last keystroke. */
+  const typedPin = useRef<Pin | null>(null);
 
   const commit = useCallback(() => {
     if (pending.current) clearTimeout(pending.current);
     pending.current = null;
     dirty.current = false;
     const t = target.current;
-    setNote(t.sessionId, t.pin, latest.current, t.via);
+    t.save(typedPin.current ?? t.pin, latest.current);
   }, []);
 
-  // Follow staging while the operator is not typing: a Submit that sent the note
-  // clears it, and a stale field would stage the old note again on its next blur.
+  // Follow staging while the operator is not typing: a Submit that sent the text
+  // clears it, and a stale field would stage the old text again on its next blur.
   useEffect(() => {
     if (pending.current || composing.current) return;
     if (latest.current.trim() === staged.trim()) return;
@@ -306,61 +344,209 @@ function NoteField(props: {
     };
   }, [commit]);
 
+  const describedBy =
+    [props.describedBy, limit.show ? counterId : undefined]
+      .filter(Boolean)
+      .join(" ") || undefined;
   return (
-    <Textarea
-      rows={3}
-      value={text}
-      maxLength={STAGED_NOTE_MAX_CHARS}
-      aria-label="Note with your answer"
+    <div className={props.className}>
+      <Textarea
+        rows={3}
+        value={text}
+        aria-label={props.label}
+        aria-describedby={describedBy}
+        aria-invalid={limit.over > 0 ? true : undefined}
+        placeholder={props.placeholder}
+        className={limit.over > 0 ? OVER_LIMIT_CLASS : undefined}
+        onChange={event => {
+          setText(event.target.value);
+          latest.current = event.target.value;
+          typedPin.current = target.current.pin;
+          dirty.current = true;
+          if (composing.current) return;
+          if (pending.current) clearTimeout(pending.current);
+          pending.current = setTimeout(commit, NOTE_COMMIT_MS);
+        }}
+        onCompositionStart={() => {
+          composing.current = true;
+        }}
+        onCompositionEnd={event => {
+          composing.current = false;
+          latest.current = event.currentTarget.value;
+          commit();
+        }}
+        onBlur={commit}
+      />
+      <TextLimitCounter
+        length={text.length}
+        limit={props.limit}
+        what={props.what}
+        id={counterId}
+      />
+    </div>
+  );
+}
+
+/** The note field: a {@link StagedTextField} that stages the note. */
+function NoteField(props: {
+  sessionId: string;
+  pin: Pin;
+  via: StagedVia;
+  /** The staged note now; it changes when a Submit clears it, or another copy edits it. */
+  staged: string;
+  /** #6969 (D2): the session's note limit, as its node states it. */
+  limit: number;
+}) {
+  const { sessionId, pin, via, staged } = props;
+  return (
+    <StagedTextField
+      pin={pin}
+      staged={staged}
+      save={(typed, text) => setNote(sessionId, typed, text, via)}
+      label="Note with your answer"
       placeholder="Note with your answer (paragraphs and lists are kept as you write them)"
+      limit={props.limit}
+      what="note"
       className="mt-1.5"
-      onChange={event => {
-        setText(event.target.value);
-        latest.current = event.target.value;
-        dirty.current = true;
-        if (composing.current) return;
-        if (pending.current) clearTimeout(pending.current);
-        pending.current = setTimeout(commit, NOTE_COMMIT_MS);
-      }}
-      onCompositionStart={() => {
-        composing.current = true;
-      }}
-      onCompositionEnd={event => {
-        composing.current = false;
-        latest.current = event.currentTarget.value;
-        commit();
-      }}
-      onBlur={commit}
     />
   );
 }
 
+/**
+ * #6803: the write-in field under a decision's "Something else" row: a
+ * {@link StagedTextField} that stages the operator's own answer.
+ */
+export function WriteInField(props: {
+  sessionId: string;
+  pin: Pin;
+  via: StagedVia;
+  /** The staged write-in now. */
+  staged: string;
+  describedBy?: string;
+}) {
+  const { sessionId, pin, via, staged } = props;
+  return (
+    <StagedTextField
+      pin={pin}
+      staged={staged}
+      save={(typed, text) => setWriteIn(sessionId, typed, text, via)}
+      label="Your own answer"
+      placeholder="Your own answer, sent as your answer to this pin"
+      limit={STAGED_WRITE_IN_MAX_CHARS}
+      what="answer"
+      describedBy={props.describedBy}
+    />
+  );
+}
+
+/**
+ * The question field. #6969 (D7): its draft is staged as the pin's
+ * `questionDraft`, about 300 ms after typing stops, on blur, when a
+ * composition ends, and through the same draft flush as the note (a closed
+ * panel, a collapsed pin, an opening Submit, a hidden page), so a typed
+ * question is never lost and never sent until Add. It never cuts the text: a
+ * question over its limit keeps every word, the counter says so, and Add stays
+ * off until it fits. The counter counts what Add takes, the trimmed question.
+ */
 function QuestionField(props: {
   sessionId: string;
   pin: Pin;
   via: StagedVia;
   count: number;
+  /** The staged question draft now. */
+  staged: string;
 }) {
-  const { sessionId, pin, via, count } = props;
-  const [draft, setDraft] = useState("");
+  const { sessionId, pin, via, count, staged } = props;
+  const [draft, setDraft] = useState(staged);
+  const latest = useRef(draft);
+  const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const composing = useRef(false);
+  // Typed here since the field last staged or adopted staging (#6768's rule).
+  const dirty = useRef(false);
+  const target = useRef({ sessionId, pin, via });
+  target.current = { sessionId, pin, via };
+  const counterId = useId();
+
+  const commit = useCallback(() => {
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null;
+    dirty.current = false;
+    const t = target.current;
+    setQuestionDraft(t.sessionId, t.pin, latest.current, t.via);
+  }, []);
+
+  // Follow staging while the operator is not typing: another copy of the pin
+  // edited the draft, or added it.
+  useEffect(() => {
+    if (pending.current || composing.current) return;
+    if (latest.current.trim() === staged.trim()) return;
+    latest.current = staged;
+    dirty.current = false;
+    setDraft(staged);
+  }, [staged]);
+
+  useEffect(() => {
+    const flush = () => {
+      if (dirty.current) commit();
+    };
+    const unregister = registerNoteDraft(flush);
+    return () => {
+      unregister();
+      flush();
+    };
+  }, [commit]);
+
   const full = count >= STAGED_QUESTIONS_MAX;
+  const length = draft.trim().length;
+  const limit = textLimitState(length, STAGED_QUESTION_MAX_CHARS);
+  const over = limit.over > 0;
   const add = () => {
-    if (addQuestion(sessionId, pin, draft, via)) setDraft("");
+    if (over) return;
+    if (pending.current) clearTimeout(pending.current);
+    pending.current = null;
+    if (addQuestion(sessionId, pin, latest.current, via)) {
+      latest.current = "";
+      dirty.current = false;
+      setDraft("");
+    } else {
+      // Refused (five already, or a dismissal): the words stay, staged.
+      commit();
+    }
   };
   return (
     <div className="mt-1.5">
       <Textarea
         rows={2}
         value={draft}
-        maxLength={STAGED_QUESTION_MAX_CHARS}
         disabled={full}
         aria-label="Your question about this pin"
+        aria-describedby={limit.show ? counterId : undefined}
+        aria-invalid={over ? true : undefined}
+        className={over ? OVER_LIMIT_CLASS : undefined}
         placeholder={
           full
             ? `${STAGED_QUESTIONS_MAX} questions at most per Submit`
             : "Your question about this pin"
         }
-        onChange={event => setDraft(event.target.value)}
+        onChange={event => {
+          setDraft(event.target.value);
+          latest.current = event.target.value;
+          dirty.current = true;
+          if (composing.current) return;
+          if (pending.current) clearTimeout(pending.current);
+          pending.current = setTimeout(commit, NOTE_COMMIT_MS);
+        }}
+        onCompositionStart={() => {
+          composing.current = true;
+        }}
+        onCompositionEnd={event => {
+          composing.current = false;
+          latest.current = event.currentTarget.value;
+          commit();
+        }}
+        onBlur={() => {
+          if (dirty.current) commit();
+        }}
         onKeyDown={event => {
           if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
             event.preventDefault();
@@ -368,11 +554,21 @@ function QuestionField(props: {
           }
         }}
       />
+      <TextLimitCounter
+        length={length}
+        limit={STAGED_QUESTION_MAX_CHARS}
+        what="question"
+        id={counterId}
+      />
       <div className="mt-1 flex">
         <HoverTooltipButton
           type="button"
-          content="Stage this question; it goes with your next Submit"
-          disabled={full || !draft.trim()}
+          content={
+            over
+              ? "Shorten the question to add it"
+              : "Stage this question; it goes with your next Submit"
+          }
+          disabled={full || !draft.trim() || over}
           onClick={add}
           className={`${GO_CLASS} disabled:opacity-50`}
           style={PIN_ACTION_STYLE}
@@ -391,7 +587,7 @@ export function PinAnswerFields(props: {
 }) {
   const { model, panels } = props;
   const { pin } = model;
-  const { sessionId, via } = usePinsContext();
+  const { sessionId, via, noteMaxChars } = usePinsContext();
   const staged = useStagedPin(sessionId, pin.key);
   const questions = staged?.questions ?? [];
   // #6539: no question beside a dismissal, so its field is closed while one is
@@ -405,6 +601,7 @@ export function PinAnswerFields(props: {
           pin={pin}
           via={via}
           staged={staged?.note ?? ""}
+          limit={noteMaxChars ?? STAGED_LEGACY_NOTE_MAX_CHARS}
         />
       ) : null}
       {asking ? (
@@ -413,6 +610,7 @@ export function PinAnswerFields(props: {
           pin={pin}
           via={via}
           count={questions.length}
+          staged={staged?.questionDraft ?? ""}
         />
       ) : null}
       {questions.length > 0 ? (

@@ -2,7 +2,7 @@
 import { z } from "zod";
 import { isUnsafePathSegment } from "./capabilityCatalog/pathSegment";
 import { addLaneIssues, PinLanesSchema } from "./pinDashboard";
-import { isPinIdShaped } from "./pinId";
+import { isPinIdShaped, PinIdSchema } from "./pinId";
 import { canonicalJson, utf8ByteLength } from "./throughput";
 
 // Pins: every decision a session needs from the operator, as a typed record
@@ -97,8 +97,17 @@ export const PIN_MAX_ANSWERS = 20;
 /** A pin's whole history, which the content cap does not cover. */
 export const PIN_ANSWERS_MAX_BYTES = 8 * 1024;
 /**
- * An answer's note. The store clamps to it after cleaning (#6450), because
- * neutralizing an approval token lengthens the text and every read checks it.
+ * #6969 (D4): the longest note every node before #6969 takes in a Submit and
+ * parses in a stored answer. Frozen, because it describes shipped binaries.
+ */
+export const PIN_LEGACY_NOTE_MAX_CHARS = 2048;
+/**
+ * An answer's note as the pin's record keeps it. The store cuts to it after
+ * cleaning (#6450), because neutralizing an approval token lengthens the text
+ * and every read checks it. #6969: at most {@link PIN_LEGACY_NOTE_MAX_CHARS},
+ * because an older node refuses a whole pin list holding a longer stored note;
+ * a longer note reaches the agent whole in its message and is stored shortened
+ * and marked ({@link shortenStoredNote}), so #6487 may lower this cap.
  */
 export const PIN_ANSWER_NOTE_MAX_CHARS = 2048;
 /** An agent's pin title, at most (`pin_post`, a `hapi_pin` fence, a federation write). */
@@ -116,6 +125,13 @@ export const PIN_LIST_DEFAULT_LIMIT = 200;
 export const PIN_LIST_MAX_LIMIT = 500;
 /** Server-created pins only (#6455), so an agent cannot overwrite or withdraw one. */
 export const PIN_RESERVED_KEY_PREFIXES = ["prompt:", "detected:"] as const;
+
+/**
+ * #6456: the most pin IDs one pin may name in `repeats`, and the longest reason a
+ * closure keeps.
+ */
+export const PIN_REPEATS_MAX = 8;
+export const PIN_CLOSURE_REASON_MAX_CHARS = 500;
 
 const PIN_TEXT_MAX_CHARS = 16 * 1024;
 
@@ -320,6 +336,20 @@ export const PinContentObjectSchema = z.strictObject({
     .positive()
     .optional()
     .describe("Set by the server on a mirrored prompt; leave it out."),
+  /**
+   * #6456: the pins this one repeats, by pin ID. What each does depends on the pin
+   * it names: an open pin of this session is replaced by this one when this one is
+   * created; an open Detected pin of this session is linked, and closes when every
+   * pin linked to it is settled; another session's pin is followed, so this one
+   * closes when that one does. Optional with no default (above).
+   */
+  repeats: z
+    .array(PinIdSchema)
+    .max(PIN_REPEATS_MAX)
+    .optional()
+    .describe(
+      "Pin IDs this pin repeats: an open pin of your own session that this one replaces, an open Detected pin of your session that this one answers, or another session's pin whose ask this one copies."
+    ),
   /** Required on every pin, for any surface that cannot render it. */
   plainText: z
     .string()
@@ -433,6 +463,17 @@ function addPinContentIssues(pin: PinContent, ctx: z.RefinementCtx): void {
     });
   }
   addLaneIssues(pin.lanes, ctx);
+  const repeated = new Set<string>();
+  (pin.repeats ?? []).forEach((pinId, index) => {
+    if (repeated.has(pinId)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["repeats", index],
+        message: `names ${pinId} twice`,
+      });
+    }
+    repeated.add(pinId);
+  });
   if (pin.kind === "steps" && !pin.steps?.length) {
     ctx.addIssue({
       code: "custom",
@@ -506,6 +547,42 @@ export function parseAgentPin(
   input: unknown
 ): z.ZodSafeParseResult<z.infer<typeof AgentPinContentSchema>> {
   return AgentPinContentSchema.safeParse(input);
+}
+
+/**
+ * `text` cut to at most `max` characters, never splitting a surrogate pair
+ * (#6450's rule for a stored note; #6969 D-Q1 cuts a by-ID read the same way).
+ */
+export function cutPairSafe(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = Math.max(0, max);
+  const last = text.charCodeAt(end - 1);
+  if (end > 0 && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
+/**
+ * #6969 (D1, E2): a note as a pin's record keeps it, at most `max` characters.
+ * A note within `max` comes back as it is. A longer one keeps its start and ends
+ * with a marker naming the whole note's length and `where` it is whole (the
+ * Pins answers message, by its heading time), so every reader of every version
+ * shows that the stored copy was shortened; without `where` (an agent's
+ * resolve, which has no message) the marker names only the length. Cut after
+ * cleaning, and the marker carries no token (R9). A marker that cannot fit
+ * leaves a plain cut.
+ */
+export function shortenStoredNote(
+  note: string,
+  max: number,
+  where?: string
+): string {
+  if (note.length <= max) return note;
+  const total = note.length.toLocaleString("en-US");
+  const marker = where
+    ? `\n\n[Shortened here: the whole note, ${total} characters, is in ${where}]`
+    : `\n\n[Shortened here: the whole note had ${total} characters]`;
+  if (marker.length >= max) return cutPairSafe(note, max);
+  return cutPairSafe(note, max - marker.length) + marker;
 }
 
 /** One line naming each field, because a federation proxy keeps only the `error` string. */
@@ -592,6 +669,13 @@ export const PinAnswerSchema = z
      * `resolves: false`, so it is never read as the pin's answer.
      */
     dismissed: z.literal(true).optional(),
+    /**
+     * #6456 (R7): on a Project Manager's ruling (`by: "agent"`, `via: "pm"`), the
+     * PM's session and its name, so the ruling reads as the Project Manager's and
+     * never as the operator's.
+     */
+    bySession: z.string().max(200).optional(),
+    byName: z.string().max(200).optional(),
   })
   .loose();
 export type PinAnswer = z.infer<typeof PinAnswerSchema>;
@@ -631,6 +715,80 @@ export function answerOnRecord(
  * in `./pinFiles`, because that module imports a value from this one.
  */
 export type PinNotSavedFile = { path: string; reason: string };
+
+/**
+ * #6456: how a pin closed because its ask was settled elsewhere, by which rule:
+ * `repeats` (a copy followed the pin it repeats), `linked` (a Detected pin whose
+ * linked pins were all settled), `replaced` (a newer pin of the session named it in
+ * `repeats` at create) or `retired` (the session's Project Manager, or the session
+ * with proof, retired a Detected pin). A pin closed this way keeps status
+ * `withdrawn`, because a client drops a status it does not know; the closure is
+ * what tells it apart, and it is never an answer.
+ */
+export const PIN_CLOSURE_RULES = [
+  "repeats",
+  "linked",
+  "replaced",
+  "retired",
+] as const;
+export type PinClosureRule = (typeof PIN_CLOSURE_RULES)[number];
+
+export type PinClosure = {
+  how: "superseded";
+  /** `server` for a server-made close; `agent` when the act was an agent's. */
+  by: "server" | "agent";
+  rule: PinClosureRule;
+  /** ISO-8601 UTC. */
+  at: string;
+  /** The session whose act closed it (a retire or the agent's own settle). */
+  bySession?: string;
+  /** That session's name, as it read when the pin closed. */
+  byName?: string;
+  /** The pin ID of the pin that settled it. */
+  ref?: string;
+  reason?: string;
+  /**
+   * How the settling pin was settled (`operator`, `pm`, `auto`, `agent`,
+   * `dismissed` or `server`), so a pin that follows this one can tell the
+   * operator's or a Project Manager's act from an agent's (the Pins PM's
+   * correction of R1, #6456).
+   */
+  settledBy?: string;
+};
+
+/**
+ * Loose, with plain strings: a closure from a newer peer with a rule this build
+ * does not know still reads, and still counts as superseded.
+ */
+export const PinClosureSchema = z
+  .object({
+    how: z.string(),
+    by: z.string(),
+    rule: z.string(),
+    at: z.string(),
+    bySession: z.string().optional(),
+    byName: z.string().optional(),
+    ref: z.string().optional(),
+    reason: z.string().min(1).max(PIN_CLOSURE_REASON_MAX_CHARS).optional(),
+    settledBy: z.string().optional(),
+  })
+  .loose();
+
+/**
+ * #6456: a pin's closure, but only while it counts: the pin is still `withdrawn`,
+ * the closure says `superseded`, and the operator has not reopened the pin since.
+ * The store's sticky rule and the web's Completed list both read this, so they
+ * cannot disagree on whether a pin was superseded.
+ */
+export function countedClosure(
+  pin: Pick<Pin, "status" | "closure" | "reopenedAt">
+): PinClosure | null {
+  const closure = pin.closure;
+  if (!closure || closure.how !== "superseded") return null;
+  if (pin.status !== "withdrawn") return null;
+  if (pin.reopenedAt) return null;
+  return closure;
+}
 
 /** A pin as the server returns it: the content plus everything the server owns. */
 export type Pin = PinContent & {
@@ -686,6 +844,17 @@ export type Pin = PinContent & {
    * peer older than P omits it; read a missing value as null.
    */
   pinId?: string | null;
+  /**
+   * #6456: why the pin closed when its ask was settled elsewhere; read it through
+   * {@link countedClosure}. Server-owned; optional, because an older peer omits it.
+   */
+  closure?: PinClosure | null;
+  /**
+   * #6456: when the operator reopened the pin after a supersede, ISO-8601 UTC. Once
+   * set it is never cleared: no supersede, retire, ruling or cap closes the pin
+   * again. Optional for the same reason.
+   */
+  reopenedAt?: string | null;
   /** ISO-8601 UTC. */
   createdAt: string;
   /** ISO-8601 UTC. Moves on a content or status change, not on a star or a mark-seen. */
@@ -740,6 +909,10 @@ export const PinSchema = z
     requestLive: z.boolean().optional(),
     // #6574: optional, because a peer older than P omits it.
     pinId: z.string().nullable().optional(),
+    // #6456: optional, because an older peer omits them; a wrong-shaped value
+    // from another node reads as none, so it never fails a pin list.
+    closure: PinClosureSchema.nullable().optional().catch(null),
+    reopenedAt: z.string().nullable().optional().catch(null),
     createdAt: z.string(),
     updatedAt: z.string(),
     deadlineAt: z.string().nullable().optional(),
@@ -764,6 +937,37 @@ export type PinResolveRequest = z.infer<typeof PinResolveRequestSchema>;
 export const PinStarRequestSchema = z.strictObject({ starred: z.boolean() });
 
 /**
+ * #6456 (R6): `POST .../pins/:key/retire`, on an open Detected pin: why it is
+ * settled elsewhere, and, for the session's own retire, the closed pin that is
+ * its proof.
+ */
+export const PinRetireRequestSchema = z.strictObject({
+  reason: z
+    .string()
+    .max(PIN_CLOSURE_REASON_MAX_CHARS)
+    .refine(text => text.trim().length > 0, "must not be blank"),
+  ref: PinIdSchema.optional(),
+});
+export type PinRetireRequest = z.infer<typeof PinRetireRequestSchema>;
+
+/**
+ * #6456 (R7): `POST .../pins/:key/rule`, a Project Manager's ruling on its
+ * lane's pin: the resolve body, with the revision the PM read required.
+ */
+export const PinRuleRequestSchema = z
+  .strictObject({
+    revision: z.number().int().positive(),
+    option: z.string().min(1).max(64).optional(),
+    text: z.string().min(1).max(4000).optional(),
+    note: z.string().max(PIN_ANSWER_NOTE_MAX_CHARS).optional(),
+  })
+  .refine(
+    body => body.option !== undefined || body.text !== undefined,
+    "must carry option or text"
+  );
+export type PinRuleRequest = z.infer<typeof PinRuleRequestSchema>;
+
+/**
  * `PUT .../pins/:key/deadline` (#6452): move the automatic pick to an instant
  * (with an offset, so no zone is assumed) or turn it off. Turning a stopped
  * pick back on is a move. Only the operator sends this.
@@ -786,6 +990,19 @@ export const PinListQuerySchema = z.object({
 });
 export type PinListQuery = z.infer<typeof PinListQuerySchema>;
 
+/**
+ * #6969 (D2): a node's stated note limit on a pin response, the longest note it
+ * takes in a Submit. Absent from a node before #6969, which takes 2,048
+ * ({@link PIN_LEGACY_NOTE_MAX_CHARS}). Read leniently, so a bad value reads as
+ * absent and never fails the response.
+ */
+export const NoteMaxCharsSchema = z
+  .number()
+  .int()
+  .positive()
+  .optional()
+  .catch(undefined);
+
 /** `GET .../pins`. `peerUnsupported`: the owning node has no pin routes. */
 export const PinListResponseSchema = z
   .object({
@@ -799,6 +1016,11 @@ export const PinListResponseSchema = z
      * Submit summary does. Absent from a node that predates #6452.
      */
     timeZone: z.string().nullable().optional(),
+    /**
+     * #6969 (D2): the session's node's note limit ({@link NoteMaxCharsSchema});
+     * a hub states a peer's capped at its own (review F1).
+     */
+    noteMaxChars: NoteMaxCharsSchema,
   })
   .loose();
 export type PinListResponse = z.infer<typeof PinListResponseSchema>;
@@ -810,6 +1032,8 @@ export const PinGetResponseSchema = z
     openPinCount: z.number().int().nonnegative(),
     /** As on the list (#6452): a chat card reads one pin, not the list. */
     timeZone: z.string().nullable().optional(),
+    /** As on the list (#6969). */
+    noteMaxChars: NoteMaxCharsSchema,
   })
   .loose();
 export type PinGetResponse = z.infer<typeof PinGetResponseSchema>;
@@ -829,6 +1053,8 @@ export const PinByIdResponseSchema = z
     pin: PinSchema,
     openPinCount: z.number().int(),
     timeZone: z.string().nullable().optional(),
+    /** As on the list (#6969): the owning node's, capped at the hub's (F1). */
+    noteMaxChars: NoteMaxCharsSchema,
     session: z
       .object({
         id: z.string(),

@@ -41,6 +41,7 @@
  */
 import {
   answerOnRecord,
+  countedClosure,
   parsePinUpsert,
   PIN_FENCE_LANGUAGE,
   PIN_REQUEST_MAX_BYTES,
@@ -50,6 +51,10 @@ import type { ErrorLogger } from "../logging/errorLogger";
 import { isSqliteBusy } from "../socket/handlers/cli/messageWriteRetryQueue";
 import { extractUserFacingAssistantTexts } from "./needsReviewContent";
 import type { PinService } from "./pinService";
+import { capPinText } from "./pinText";
+
+/** #6803: how much of a settling answer a closed pin's notice quotes. */
+const CLOSED_PIN_QUOTE_MAX_CHARS = 200;
 
 /** Blocks read from one message; more are dropped and reported. */
 export const PIN_FENCE_MAX_BLOCKS_PER_MESSAGE = 10;
@@ -417,9 +422,28 @@ export class PinFenceIngest {
     }
 
     if ("closed" in outcome) {
+      // #6456 (R2): a superseded pin names the pin that settled it and never
+      // offers "reopen": only changed content raises it again.
+      const closure = countedClosure(outcome.closed);
+      if (closure) {
+        const by = closure.ref ?? "a pin settled elsewhere";
+        this.fail(
+          item,
+          "pin_closed",
+          `pin "${key}" was closed as superseded by ${by}, which settled its ask elsewhere. Read ${by} for the decision; post changed content only to ask something new.`
+        );
+        return;
+      }
+      // #6803: a write-in can be 2,048 characters, so the quote is cut, as
+      // the 409 text in pinRouteHelpers.ts cuts its own.
       const answer = answerOnRecord(outcome.closed);
+      // #6456 (R7): a Project Manager's ruling is quoted as the PM's.
+      const label =
+        answer?.via === "pm"
+          ? "The Project Manager's ruling on record"
+          : "The answer on record";
       const quoted = answer
-        ? ` The answer on record: ${[answer.option, answer.label ?? answer.text].filter(Boolean).join(". ")}.`
+        ? ` ${label}: ${capPinText([answer.option, answer.label ?? answer.text].filter(Boolean).join(". "), CLOSED_PIN_QUOTE_MAX_CHARS)}.`
         : "";
       this.fail(
         item,

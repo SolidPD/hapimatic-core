@@ -13,6 +13,7 @@ import type { ClaudePtyRegistry } from "../../claudePtyRegistry";
 import type { SocketServer, SocketWithData } from "../../socketTypes";
 import type { ErrorLogger } from "../../../logging/errorLogger";
 import type { MessageWriteRetryQueue } from "./messageWriteRetryQueue";
+import type { ContextResetSocketPort } from "./sessionHandlers";
 import { recordFirstCliConnect } from "./cliConnectFloors";
 import { registerMachineHandlers } from "./machineHandlers";
 import { registerRpcHandlers } from "./rpcHandlers";
@@ -29,6 +30,7 @@ import {
   registerClaudePtyCliHandlers,
 } from "./claudePtyHandlers";
 import type { RunnerIdentity } from "../../../sync/runnerIdentity";
+import type { AfterDroppedReportFn, GateReportFn } from "./reportGate";
 
 type SessionAlivePayload = {
   sid: string;
@@ -84,6 +86,8 @@ export type CliHandlersDeps = {
   messageWriteRetryQueue?: MessageWriteRetryQueue | null;
   /** Issue #6647: the runner identity registry (absent: no identity step). */
   runnerIdentity?: RunnerIdentity | null;
+  /** #6559: the context-reset service (late-bound; null until constructed). */
+  getContextReset?: () => ContextResetSocketPort | null;
 };
 
 /**
@@ -156,6 +160,9 @@ export function registerCliHandlers(
   const sessionId = typeof auth?.sessionId === "string" ? auth.sessionId : null;
   if (sessionId && resolveSessionAccess(sessionId).ok) {
     socket.join(`session:${sessionId}`);
+    // #6559 (binding 3): the handshake session, the only one this socket may
+    // arm, disarm or report a context reset for.
+    socket.data.cliSessionId = sessionId;
     // #4682 (R15): the floor an old wrapper's from-zero backfill is served
     // from. This listener runs before any packet from the client is
     // processed, so the floor never includes the client's flushed buffered
@@ -197,6 +204,16 @@ export function registerCliHandlers(
     socket.emit("error", { message, code: reason, scope, id });
   };
 
+  // Issue #6647 / #6974 (Task 5): one pair of backstop closures for every
+  // handler file that asks the gate.
+  const gateReport: GateReportFn | undefined = deps.runnerIdentity
+    ? (s, sid, kind) => deps.runnerIdentity?.gateReport(s, sid, kind) ?? true
+    : undefined;
+  const afterDroppedReport: AfterDroppedReportFn | undefined =
+    deps.runnerIdentity
+      ? s => deps.runnerIdentity?.afterDroppedReport(s)
+      : undefined;
+
   registerRpcHandlers(socket, rpcRegistry);
   registerSessionHandlers(socket, {
     store,
@@ -210,12 +227,9 @@ export function registerCliHandlers(
     onProviderUsageSnapshot: deps.onProviderUsageSnapshot,
     errorLogger: deps.errorLogger,
     messageWriteRetryQueue: deps.messageWriteRetryQueue,
-    gateReport: deps.runnerIdentity
-      ? (s, sid, kind) => deps.runnerIdentity?.gateReport(s, sid, kind) ?? true
-      : undefined,
-    afterDroppedReport: deps.runnerIdentity
-      ? s => deps.runnerIdentity?.afterDroppedReport(s)
-      : undefined,
+    gateReport,
+    afterDroppedReport,
+    getContextReset: deps.getContextReset,
   });
   registerMachineHandlers(socket, {
     store,
@@ -235,6 +249,8 @@ export function registerCliHandlers(
     claudePtyNamespace,
     resolveSessionAccess,
     emitAccessError,
+    gateReport,
+    afterDroppedReport,
   });
 
   socket.on("ping", (callback: () => void) => {

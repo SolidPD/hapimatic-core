@@ -64,6 +64,8 @@ const SENSITIVE_ENV_KEYS = new Set<string>([
   ...SECRET_ENV_VARS,
   ...AGENT_FORBIDDEN_ENV_VARS,
   "ANTHROPIC_API_KEY",
+  // Issue #6918 (belt): the agent marker never reaches a web terminal shell.
+  "HAPI_AGENT_CALLER",
 ]);
 
 function resolveEnvNumber(name: string, fallback: number): number {

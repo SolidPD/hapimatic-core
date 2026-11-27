@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
   SIGN_IN_MARKER_FILE,
+  parseSignInMarker,
   parseSignInMarkerWrittenAt,
   type SignInMarker,
 } from "@hapi/protocol";
@@ -136,32 +137,207 @@ export function isolatedChainFingerprint(
   accountUuid: string,
   opts: IsolatedCredentialsSyncOptions = {}
 ): string | null {
+  return firstFingerprint(readIsolatedLayouts(accountUuid, opts));
+}
+
+/** Issue #6997: one credentials file's chain facts — a hash and a time, never a token. */
+export interface ChainLayoutFacts {
+  /** sha256 hex of the file's refresh token, or null when it holds none. */
+  fingerprint: string | null;
+  /** The file's `claudeAiOauth.refreshTokenExpiresAt` (epoch ms), or null. */
+  deadlineAt: number | null;
+  /** An account folder layout, or the node's own `~/.claude` login. */
+  source: "isolated" | "host";
+}
+
+/** Issue #6997: a sign-in marker's comparable facts. */
+export interface ChainMarkerFacts {
+  /** The refresh fingerprint the marker names, or null. */
+  fingerprint: string | null;
+  /** The marker's `writtenAt` (epoch ms), or null. */
+  writtenAt: number | null;
+}
+
+/** Issue #6997: what this node reports for an account's chain (hashes and times only). */
+export interface IsolatedChainFacts {
+  /** Exactly {@link isolatedChainFingerprint}'s answer (the first folder layout with a token). */
+  fingerprint: string | null;
+  /** Every non-null fingerprint, across every folder layout and the host login. */
+  layoutFingerprints: string[];
+  /** The first existing folder layout's deadline, as {@link readFolderDeadline}. */
+  deadlineAt: number | null;
+  /** Each folder layout that exists (in order), then the host login when it is this account. */
+  layouts: ChainLayoutFacts[];
+  /** Every sign-in marker found beside a folder layout. */
+  markers: ChainMarkerFacts[];
+}
+
+/** Issue #6997: the chain-facts reader's options. */
+export interface ChainFactsOptions extends IsolatedCredentialsSyncOptions {
+  /** The home whose `~/.claude` login is checked (default `homedir()`). */
+  homeDir?: string;
+}
+
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** One parse of a credentials file: its fingerprint and deadline, or null when unreadable. */
+function readCredentialFacts(
+  path: string,
+  source: ChainLayoutFacts["source"]
+): ChainLayoutFacts | null {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(path, "utf-8")
+    ) as ClaudeAiOauthFile | null;
+    const oauth =
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      typeof parsed.claudeAiOauth === "object" &&
+      parsed.claudeAiOauth !== null
+        ? (parsed.claudeAiOauth as {
+            refreshToken?: unknown;
+            refreshTokenExpiresAt?: unknown;
+          })
+        : null;
+    const refreshToken = oauth?.refreshToken;
+    return {
+      fingerprint:
+        typeof refreshToken === "string" && refreshToken.length > 0
+          ? createHash("sha256").update(refreshToken).digest("hex")
+          : null,
+      deadlineAt: finiteOrNull(oauth?.refreshTokenExpiresAt),
+      source,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every existing folder layout's facts, in {@link resolveIsolatedCredentialPaths}
+ * order. An unreadable or corrupt file reads as no fingerprint and no deadline,
+ * so it is skipped by the fingerprint's fall-through and stops the deadline's.
+ */
+function readIsolatedLayouts(
+  accountUuid: string,
+  opts: IsolatedCredentialsSyncOptions
+): ChainLayoutFacts[] {
+  const layouts: ChainLayoutFacts[] = [];
   for (const path of resolveIsolatedCredentialPaths(accountUuid, opts)) {
     if (!existsSync(path)) continue;
-    try {
-      const parsed = JSON.parse(
-        readFileSync(path, "utf-8")
-      ) as ClaudeAiOauthFile | null;
-      const oauth =
-        parsed &&
-        typeof parsed === "object" &&
-        !Array.isArray(parsed) &&
-        typeof parsed.claudeAiOauth === "object" &&
-        parsed.claudeAiOauth !== null
-          ? (parsed.claudeAiOauth as { refreshToken?: unknown })
-          : null;
-      const refreshToken = oauth?.refreshToken;
-      if (typeof refreshToken !== "string" || refreshToken.length === 0) {
-        continue;
+    layouts.push(
+      readCredentialFacts(path, "isolated") ?? {
+        fingerprint: null,
+        deadlineAt: null,
+        source: "isolated",
       }
-      return createHash("sha256").update(refreshToken).digest("hex");
+    );
+  }
+  return layouts;
+}
+
+/** The first layout with a fingerprint — the fall-through #3784 always used. */
+function firstFingerprint(layouts: ChainLayoutFacts[]): string | null {
+  return layouts.find(l => l.fingerprint !== null)?.fingerprint ?? null;
+}
+
+/**
+ * Issue #6997 (M5): the node's own `~/.claude` login chain when `~/.claude.json`
+ * names this account (`oauthAccount.accountUuid`), else null. A holder running
+ * on its host login is then covered and compared like a folder. Reads the
+ * identity file for the uuid only, and the credentials file for a hash and a
+ * time. Never throws.
+ */
+function readHostLoginFacts(
+  accountUuid: string,
+  homeDir: string
+): ChainLayoutFacts | null {
+  try {
+    const identity = JSON.parse(
+      readFileSync(join(homeDir, ".claude.json"), "utf-8")
+    ) as { oauthAccount?: { accountUuid?: unknown } } | null;
+    const named = identity?.oauthAccount?.accountUuid;
+    if (
+      typeof named !== "string" ||
+      named.toLowerCase() !== accountUuid.toLowerCase()
+    ) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  const path = join(homeDir, ".claude", ".credentials.json");
+  return existsSync(path) ? readCredentialFacts(path, "host") : null;
+}
+
+/** Every sign-in marker beside a folder layout, in path order. */
+function readSignInMarkers(
+  accountUuid: string,
+  opts: IsolatedCredentialsSyncOptions
+): ChainMarkerFacts[] {
+  const markers: ChainMarkerFacts[] = [];
+  for (const credentialsPath of resolveIsolatedCredentialPaths(
+    accountUuid,
+    opts
+  )) {
+    const path = join(dirname(credentialsPath), SIGN_IN_MARKER_FILE);
+    if (!existsSync(path)) continue;
+    try {
+      const raw = readFileSync(path, "utf-8");
+      const facts = {
+        fingerprint: parseSignInMarker(raw),
+        writtenAt: parseSignInMarkerWrittenAt(raw),
+      };
+      if (facts.fingerprint !== null || facts.writtenAt !== null) {
+        markers.push(facts);
+      }
     } catch {
-      // Unreadable/corrupt at this layout — try the next, else null (fail-safe:
-      // a null here yields the caller's "unknown" ⇒ no rotation).
       continue;
     }
   }
-  return null;
+  return markers;
+}
+
+/**
+ * Issue #6997 (R3, Task 4): this node's chain facts for `accountUuid`, for the
+ * cross-node independence check. Each folder layout's fingerprint and deadline
+ * come from ONE parse of that layout's file, so a deadline always belongs to the
+ * fingerprint beside it (M10). The node's own `~/.claude` login joins as one
+ * more layout when it is this account (M5), and every sign-in marker is
+ * reported (M2). The top-level `fingerprint` and `deadlineAt` keep
+ * {@link isolatedChainFingerprint}'s and {@link readFolderDeadline}'s answers
+ * for older callers. Hashes and times only; never returns or logs a token.
+ */
+export function isolatedChainFacts(
+  accountUuid: string,
+  opts: ChainFactsOptions = {}
+): IsolatedChainFacts {
+  if (!UUID_REGEX.test(accountUuid)) {
+    return {
+      fingerprint: null,
+      layoutFingerprints: [],
+      deadlineAt: null,
+      layouts: [],
+      markers: [],
+    };
+  }
+  const isolated = readIsolatedLayouts(accountUuid, opts);
+  const host = readHostLoginFacts(accountUuid, opts.homeDir ?? homedir());
+  const layouts = host ? [...isolated, host] : isolated;
+  return {
+    fingerprint: firstFingerprint(isolated),
+    layoutFingerprints: [
+      ...new Set(
+        layouts.flatMap(l => (l.fingerprint === null ? [] : [l.fingerprint]))
+      ),
+    ],
+    deadlineAt: isolated[0]?.deadlineAt ?? null,
+    layouts,
+    markers: readSignInMarkers(accountUuid, opts),
+  };
 }
 
 /**

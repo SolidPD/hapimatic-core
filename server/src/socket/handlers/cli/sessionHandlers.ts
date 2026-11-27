@@ -19,6 +19,17 @@ import { extractTodoWriteTodosFromMessageContent } from "../../../sync/todos";
 import type { SocketWithData } from "../../socketTypes";
 import type { GatedReportKind } from "../../../sync/runnerIdentity";
 import type { MessageWriteRetryQueue } from "./messageWriteRetryQueue";
+import { createReportGate } from "./reportGate";
+import {
+  CONTEXT_RESET_EVENTS,
+  CONTEXT_RESET_META_KEY,
+  ContextResetArmRequestSchema,
+  ContextResetDisarmSchema,
+  ContextResetResultSchema,
+  type ContextResetArmRequest,
+  type ContextResetArmResult,
+  type ContextResetResult,
+} from "@hapi/protocol";
 import {
   MESSAGE_WRITE_CATEGORY,
   errorMessage,
@@ -168,6 +179,51 @@ const turnFinalizeSchema = z
   })
   .passthrough();
 
+/**
+ * #6559: what the CLI socket's context-reset handlers call on the service
+ * (`ContextResetService`). A narrow port so the handlers stay testable.
+ */
+export interface ContextResetSocketPort {
+  arm(
+    sessionId: string,
+    request: ContextResetArmRequest
+  ): Promise<ContextResetArmResult>;
+  disarm(sessionId: string, armId: string): boolean;
+  recordResult(sessionId: string, result: ContextResetResult): boolean;
+}
+
+/** #6559: every context-reset socket payload names its session as `sid`. */
+const contextResetSidSchema = z
+  .object({ sid: z.string().min(1) })
+  .passthrough();
+
+/**
+ * #6559 (binding 2): the reset flag is the server's alone (R9). The socket's
+ * `message` path stores caller-written content with any `meta`, so strip
+ * `meta.contextReset` before it is stored or rebroadcast. Returns the content
+ * unchanged when it carries no such key; never mutates the caller's object.
+ */
+export function stripContextResetMeta(content: unknown): unknown {
+  if (!content || typeof content !== "object" || Array.isArray(content)) {
+    return content;
+  }
+  const record = content as Record<string, unknown>;
+  const meta = record.meta;
+  if (
+    !meta ||
+    typeof meta !== "object" ||
+    Array.isArray(meta) ||
+    !Object.prototype.hasOwnProperty.call(meta, CONTEXT_RESET_META_KEY)
+  ) {
+    return content;
+  }
+  const { [CONTEXT_RESET_META_KEY]: _dropped, ...restMeta } = meta as Record<
+    string,
+    unknown
+  >;
+  return { ...record, meta: restMeta };
+}
+
 export type SessionHandlersDeps = {
   store: Store;
   resolveSessionAccess: ResolveSessionAccess;
@@ -194,6 +250,8 @@ export type SessionHandlersDeps = {
   ) => boolean;
   /** Issue #6647 (Task 12, R5): after a drop was answered, cut its socket off. */
   afterDroppedReport?: (socket: SocketWithData) => void;
+  /** #6559: the context-reset service (late-bound; null until constructed). */
+  getContextReset?: () => ContextResetSocketPort | null;
 };
 
 /**
@@ -278,37 +336,190 @@ export function registerSessionHandlers(
     onProviderUsageSnapshot,
     errorLogger,
     messageWriteRetryQueue,
+    getContextReset,
   } = deps;
 
   // Issue #6647 (Tasks 6 and 12, R7, R11): the runner identity backstop, after
-  // a handler's access check. True when the report goes ahead; a drop answers
-  // the report first and then calls `dropped`, which cuts the socket off (R5).
-  // A throw here must never reach a listener (an uncaught throw on a listener
-  // exits the server), so both fail open.
-  const gate = (sid: string, kind: GatedReportKind): boolean => {
+  // a handler's access check; fail-open (`reportGate.ts`, #6974 Task 3).
+  const { gate, dropped } = createReportGate(
+    socket,
+    deps.gateReport,
+    deps.afterDroppedReport
+  );
+
+  // #6559 (binding 3): the context-reset events. Each is accepted only for the
+  // session this socket declared at its handshake (`socket.data.cliSessionId`),
+  // whatever `sid` the payload names; a result is further accepted by the
+  // service only for a `firing` row with that arm id. FAIL-OPEN like the turn
+  // handlers: a throw or a rejection is caught here, and the arm handler always
+  // answers its ack, because the wrapper's tool is waiting on it.
+  const contextResetSessionOf = (data: unknown): string | null => {
+    const parsed = contextResetSidSchema.safeParse(data);
+    if (!parsed.success) return null;
+    const declared = socket.data.cliSessionId;
+    return declared && declared === parsed.data.sid ? declared : null;
+  };
+  const warnContextReset = (
+    message: string,
+    sid: string | null,
+    extra?: Record<string, unknown>
+  ): void => {
     try {
-      return deps.gateReport?.(socket, sid, kind) ?? true;
+      errorLogger?.warn(`context-reset socket: ${message}`, {
+        category: "context-reset",
+        sessionId: sid,
+        context: extra ?? null,
+      });
     } catch {
-      return true;
+      // never let a logging failure reach the socket
     }
   };
-  const dropped = (): void => {
-    try {
-      deps.afterDroppedReport?.(socket);
-    } catch {
-      // Fail open: the socket stays connected; its next report is dropped too.
+
+  socket.on(
+    CONTEXT_RESET_EVENTS.arm,
+    (data: unknown, cb?: (answer: ContextResetArmResult) => void) => {
+      const answer = (result: ContextResetArmResult): void => {
+        try {
+          if (typeof cb === "function") cb(result);
+        } catch {
+          // fail-open
+        }
+      };
+      try {
+        const sid = contextResetSessionOf(data);
+        if (!sid) {
+          warnContextReset("arm refused: not the socket's own session", null);
+          answer({ armed: false });
+          return;
+        }
+        const request = ContextResetArmRequestSchema.safeParse(data);
+        const service = getContextReset?.() ?? null;
+        if (!request.success || !service) {
+          answer({ armed: false });
+          return;
+        }
+        // #6974 (O3, C1): the backstop; a dropped arm reads as not armed.
+        if (!gate(sid, "context-reset:arm")) {
+          answer({ armed: false });
+          dropped();
+          return;
+        }
+        service
+          .arm(sid, request.data)
+          .then(answer)
+          .catch(error => {
+            warnContextReset("arm failed", sid, { error: errorMessage(error) });
+            answer({ armed: false });
+          });
+      } catch (error) {
+        warnContextReset("arm handler failed", null, {
+          error: errorMessage(error),
+        });
+        answer({ armed: false });
+      }
     }
-  };
+  );
+
+  socket.on(CONTEXT_RESET_EVENTS.disarm, (data: unknown) => {
+    try {
+      const sid = contextResetSessionOf(data);
+      if (!sid) {
+        warnContextReset("disarm refused: not the socket's own session", null);
+        return;
+      }
+      const parsed = ContextResetDisarmSchema.safeParse(data);
+      if (!parsed.success) return;
+      if (!gate(sid, "context-reset:disarm")) {
+        dropped();
+        return;
+      }
+      getContextReset?.()?.disarm(sid, parsed.data.armId);
+    } catch (error) {
+      warnContextReset("disarm handler failed", null, {
+        error: errorMessage(error),
+      });
+    }
+  });
+
+  socket.on(CONTEXT_RESET_EVENTS.result, (data: unknown) => {
+    try {
+      const sid = contextResetSessionOf(data);
+      if (!sid) {
+        warnContextReset("result refused: not the socket's own session", null);
+        return;
+      }
+      const parsed = ContextResetResultSchema.safeParse(data);
+      if (!parsed.success) {
+        // ROUND RV10 item 8: a firing row would wait out its deadline for a
+        // result that came and was dropped, so the drop is one line. The keys
+        // and the parse issues, not the values.
+        warnContextReset("result refused: malformed payload", sid, {
+          keys:
+            data && typeof data === "object"
+              ? Object.keys(data as Record<string, unknown>)
+              : typeof data,
+          issues: parsed.error.issues.map(
+            issue => `${issue.path.join(".") || "(root)"}: ${issue.message}`
+          ),
+        });
+        return;
+      }
+      if (!gate(sid, "context-reset:result")) {
+        dropped();
+        return;
+      }
+      getContextReset?.()?.recordResult(sid, parsed.data);
+    } catch (error) {
+      warnContextReset("result handler failed", null, {
+        error: errorMessage(error),
+      });
+    }
+  });
 
   // Issue #1664 (epic #1662, Sub B): per-turn telemetry boundaries. Both
   // handlers are FAIL-OPEN (R8) — a malformed/unknown payload is dropped
   // silently (tolerant Zod parse, no access-error noise) and any handler throw
-  // is swallowed. Turn telemetry is a rebuildable index and must never disturb
-  // the socket or the session. The server (turnLifecycle) allocates `seq`.
+  // is swallowed. Turn telemetry is a rebuildable index and, since #6559, also
+  // decides a pending context reset, so both events pass the runner identity
+  // backstop (#6974 O2). The server (turnLifecycle) allocates `seq`.
+  // #6974 O7 (Task 4a; Matt Starfield's answer T1, 2026-11-26): a turn event
+  // must name the sending socket's own session, its handshake session (set
+  // only after the access check passed at the connection, as for the reset
+  // events), and pass the access check. A refused event is dropped silently
+  // for the socket, with one warning in its own category; never
+  // `runner-identity-report`, whose bucket K3 keeps for the gate. In every mode.
+  const turnEventRefused = (event: string, sid: string): boolean => {
+    const declared = socket.data.cliSessionId ?? null;
+    const own = declared !== null && declared === sid;
+    if (own && resolveSessionAccess(sid).ok) return false;
+    const why =
+      declared === null
+        ? "the socket declared no session"
+        : own
+          ? "no access"
+          : "not the socket's own session";
+    try {
+      // The payload's sid is unbounded: log a bounded prefix and its length.
+      errorLogger?.warn(`turn socket: ${event} refused: ${why}`, {
+        category: "turn-socket",
+        sessionId: declared,
+        context: { event, sid: sid.slice(0, 64), sidLength: sid.length },
+      });
+    } catch {
+      // never let a logging failure reach the socket
+    }
+    return true;
+  };
+
   socket.on("turn:open", (data: unknown) => {
     try {
       const parsed = turnOpenSchema.safeParse(data);
       if (!parsed.success) return;
+      if (turnEventRefused("turn:open", parsed.data.sid)) return;
+      if (!gate(parsed.data.sid, "turn:open")) {
+        dropped();
+        return;
+      }
       onTurnOpen?.({
         sid: parsed.data.sid,
         turnLocalId: parsed.data.turnLocalId,
@@ -330,6 +541,11 @@ export function registerSessionHandlers(
     try {
       const parsed = turnFinalizeSchema.safeParse(data);
       if (!parsed.success) return;
+      if (turnEventRefused("turn:finalize", parsed.data.sid)) return;
+      if (!gate(parsed.data.sid, "turn:finalize")) {
+        dropped();
+        return;
+      }
       onTurnFinalize?.({
         sid: parsed.data.sid,
         turnLocalId: parsed.data.turnLocalId,
@@ -370,6 +586,10 @@ export function registerSessionHandlers(
         access.value.metadata as { accountUuid?: string } | null | undefined
       )?.accountUuid;
       if (!accountUuid) return; // host-credential codex session — nothing to attribute
+      if (!gate(parsed.data.sid, "provider-usage-snapshot")) {
+        dropped();
+        return;
+      }
       onProviderUsageSnapshot?.({
         accountUuid,
         windows: parsed.data.windows,
@@ -489,7 +709,8 @@ export function registerSessionHandlers(
     const { sid, localId } = parsed.data;
     const raw = parsed.data.message;
 
-    const content =
+    // #6559 (binding 2): strip the reset flag from socket-written content.
+    const content = stripContextResetMeta(
       typeof raw === "string"
         ? (() => {
             try {
@@ -498,7 +719,8 @@ export function registerSessionHandlers(
               return raw;
             }
           })()
-        : raw;
+        : raw
+    );
 
     // Extract generatedAt from message meta for chronological ordering (Issue #952)
     let generatedAt: number | undefined;
@@ -515,6 +737,11 @@ export function registerSessionHandlers(
     const sessionAccess = resolveSessionAccess(sid);
     if (!sessionAccess.ok) {
       emitAccessError("session", sid, sessionAccess.reason);
+      return;
+    }
+    // #6974 (O1, M1): the backstop, before the write and its broadcast.
+    if (!gate(sid, "message")) {
+      dropped();
       return;
     }
     const session = sessionAccess.value;

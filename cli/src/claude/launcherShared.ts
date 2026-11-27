@@ -28,6 +28,7 @@ import { createSessionStore } from "@/sessionPersistence/sessionStore";
 import { TMUX_REMOTE_WINDOW_PREFIX } from "@/tmux/types";
 import type { OrphanedSession, TmuxWindow } from "@/tmux/types";
 import { shellEscape } from "@/utils/shellEscape";
+import { assertTestInstanceChildEnv } from "./testInstanceConfigDir";
 
 /**
  * Environment variables that signal "Agent SDK invocation" to Anthropic's
@@ -44,6 +45,16 @@ export const SDK_SIGNAL_ENV_VARS = new Set([
   "CLAUDE_CODE_CONTAINER_ID",
   "ANTHROPIC_API_KEY",
 ]);
+
+/**
+ * Issue #6918 (R4, R10): the positive agent marker. Set to exactly "1" ONLY in
+ * the agent (Claude) child's environment, on every launcher; never in the
+ * wrapper's own `process.env` (so a web terminal or an operator shell never
+ * carries it). `hapi api sessions spawn` sends its caller header only when it
+ * is present, so a spawn Matt types in a PM's terminal is never stamped
+ * managed. A binding var: an ambient copy is stripped before the explicit set.
+ */
+export const AGENT_CALLER_ENV = "HAPI_AGENT_CALLER";
 
 /**
  * Per-session ACCOUNT-BINDING env vars (issue #1645, #1651). Each of these
@@ -81,6 +92,7 @@ export const SDK_SIGNAL_ENV_VARS = new Set([
 export const BINDING_ENV_VARS = new Set([
   "CLAUDE_CODE_OAUTH_TOKEN",
   "CLAUDE_CONFIG_DIR",
+  AGENT_CALLER_ENV,
   "HAPI_ACCOUNT_UUID",
   "HAPI_API_KEY_ID",
   "HAPI_API_KEY_MASKED",
@@ -201,6 +213,8 @@ export function buildLauncherEnv(
       env[key] = value;
     }
   }
+  // Issue #6918: the pty/tmux agent child carries the agent marker.
+  env[AGENT_CALLER_ENV] = "1";
   // R21 (#1429): defense-in-depth re-strip. Without this, a caller passing
   // `claudeEnvVars` containing any SDK_SIGNAL_ENV_VARS key would silently
   // re-introduce it after the initial strip — directly contradicting the
@@ -217,6 +231,8 @@ export function buildLauncherEnv(
   for (const key of AGENT_FORBIDDEN_ENV_VARS) {
     delete env[key];
   }
+  // Issue #6980 (R4): on a test instance, never a Claude child on the node's own login.
+  assertTestInstanceChildEnv(env);
   return env;
 }
 
@@ -292,6 +308,10 @@ export function buildSdkSpawnEnv<V>(
       result[key] = value;
     }
   }
+  // Issue #6918: the sdk and local agent child carries the agent marker; the
+  // wrapper's own env (the daemon building it) never does.
+  if (options.wrapperEnv) delete result[AGENT_CALLER_ENV];
+  else result[AGENT_CALLER_ENV] = "1";
   // Issue #4568 (F1): an API-key session's ONLY credential is its `apiKeyHelper`.
   // Drop, after the explicit layer too, every env credential Claude Code ranks
   // above the helper — measured on 2.1.280, an inherited `ANTHROPIC_API_KEY`
@@ -301,6 +321,9 @@ export function buildSdkSpawnEnv<V>(
   if (options.apiKeyHelperSession) {
     for (const key of API_KEY_HELPER_OUTRANKING_ENV_VARS) delete result[key];
   }
+  // Issue #6980 (R4): on a test instance, never a Claude child on the node's own login.
+  // The daemon's arm builds the WRAPPER's env, which is no Claude child.
+  if (!options.wrapperEnv) assertTestInstanceChildEnv(result);
   return result;
 }
 

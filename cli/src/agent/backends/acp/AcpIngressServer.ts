@@ -40,6 +40,7 @@ import {
   type HookSettingsOptions,
 } from "@/claude/utils/generateHookSettings";
 import { resolveSessionCompactionEnv } from "@/claude/utils/sessionCompaction";
+import { refuseWithoutCredential } from "@/claude/testInstanceConfigDir";
 import { HAPI_MCP_SERVER_NAME } from "@/claude/utils/scrubHapiOnSpawn";
 import { PushableAsyncIterable } from "@/utils/PushableAsyncIterable";
 import { asString, isObject } from "@/agent/utils";
@@ -213,6 +214,10 @@ export class AcpIngressServer {
   private async handleSessionNew(params: unknown): Promise<unknown> {
     const cwd =
       (isObject(params) ? asString(params.cwd) : null) ?? process.cwd();
+
+    // Issue #6980 (R2): an editor session has no credential of its own, so on a test
+    // instance its child would run on the node's login. Before a session exists.
+    refuseWithoutCredential();
 
     // DECISION-2: a first-class, PWA-visible, governed Hapimatic session.
     // Issue #6647 (Task 8, R13): each session/new gets its own tag, so a second

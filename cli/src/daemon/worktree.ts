@@ -34,12 +34,14 @@ import { probeLinkedWorktree } from "@/utils/worktreeEnv";
 import {
   buildScrubbedGitEnv,
   collectOwnedWorktreePorts,
+  describeInstanceOwner,
   detectSourceBranch,
   getGitFetchTimeoutMs,
   getGitTimeoutMs,
   getListeningPorts,
   getWorktreeAddTimeoutMs,
   readClaimedPort,
+  readInstanceOwnerState,
   writeWorktreeMeta,
 } from "./worktreeMeta";
 import { resolveWorktreeHostBase } from "./worktreeHostBase";
@@ -3234,8 +3236,9 @@ export async function cleanupWorktreeAndBranch(options: {
   const { basePath, worktreePath, branch, sessionId } = options;
 
   // Issue #1382: defense-in-depth path validation. Mirrors the explicit
-  // RPC-handler check in cli/src/api/apiMachine.ts so future direct callers
-  // (cli/src/daemon/run.ts:826, 1085, 1327) are also protected. Skipping when
+  // RPC-handler check in cli/src/api/apiMachine.ts (the `cleanup-worktree`
+  // RPC, today the only caller) so any future direct caller is also
+  // protected. Skipping when
   // worktreePath is undefined preserves the existing contract — see
   // worktree.test.ts "returns ok without teardown when worktreePath is absent".
   if (worktreePath !== undefined) {
@@ -3318,26 +3321,60 @@ export async function cleanupWorktreeAndBranch(options: {
   //
   // Failures here log but do NOT abort — soft-delete still runs (R2 graceful
   // degradation, preserved from #1337).
+  //
+  // #4588: a claimed port is not proof of ownership — another worktree can
+  // claim the same port and run the live instance on it (#4577, #4309 E3),
+  // and `clean: true` deletes that instance's data dir and binary. So the
+  // teardown runs only when `readInstanceOwnerState` reads `own` or
+  // `own-legacy`: every running unit's `HAPI_WT_OWNER_WORKTREE` (#4309) names
+  // this worktree; or no unit runs and the owner record names it; or nothing
+  // proves an owner (units from before #4309, or no record that counts) and no
+  // other worktree claims the port (D-4588-1 A). A record naming another
+  // worktree counts only while that worktree still claims the port (G1). Any
+  // other state makes no tmux or systemctl call and deletes nothing; this
+  // worktree's meta is left as it is (it moves to `.trash/`, which every
+  // claim scan skips).
   if (worktreePath) {
     const claimedPort = await readClaimedPort(worktreePath);
     if (claimedPort !== null) {
-      const teardown = await tearDownWorktreeInstance({
+      const owner = await readInstanceOwnerState({
         port: claimedPort,
-        sessionId,
-        clean: true,
+        worktreePath,
+        home: process.env.HOME ?? "",
       });
-      if (teardown.ok) {
-        logger.debug(
-          `[CLEANUP] Stopped worktree instance on port ${claimedPort}`
-        );
+      if (owner.state === "own" || owner.state === "own-legacy") {
+        const teardown = await tearDownWorktreeInstance({
+          port: claimedPort,
+          sessionId,
+          clean: true,
+        });
+        if (teardown.ok) {
+          logger.debug(
+            `[CLEANUP] Stopped worktree instance on port ${claimedPort}`
+          );
+        } else {
+          const detail = teardown.details?.stillBoundPids
+            ? ` (still-bound PIDs: ${teardown.details.stillBoundPids.join(", ")})`
+            : "";
+          logger.error(
+            `[CLEANUP] Teardown failed for port ${claimedPort}: ${teardown.error}${detail}`
+          );
+          // Continue to soft-delete — do not return early.
+        }
       } else {
-        const detail = teardown.details?.stillBoundPids
-          ? ` (still-bound PIDs: ${teardown.details.stillBoundPids.join(", ")})`
-          : "";
-        logger.error(
-          `[CLEANUP] Teardown failed for port ${claimedPort}: ${teardown.error}${detail}`
+        logger.warn(
+          `[CLEANUP] Not stopping port ${claimedPort}: ${owner.state} ` +
+            `(${describeInstanceOwner(owner)}) — instance is not provably ` +
+            `this worktree's (issue #4588)`
         );
-        // Continue to soft-delete — do not return early.
+        logProcessHygieneEvent({
+          source: "cli-worktree",
+          action: "skip",
+          path: worktreePath,
+          sessionId,
+          port: claimedPort,
+          reason: `teardown-not-owner:${owner.state}`,
+        });
       }
     }
   }

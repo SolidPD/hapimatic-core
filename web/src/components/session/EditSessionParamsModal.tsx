@@ -47,6 +47,8 @@ import {
   formatModelName,
   isYoloEquivalentMode,
   LOCAL_NODE_ID,
+  sameApiKeyRef,
+  SESSION_API_KEY_SWITCH_CAPABILITY,
   MODEL_MODE_LABELS,
   resolveModelFamily,
   stripModelTierSuffix,
@@ -104,7 +106,10 @@ import {
 import { useAccounts } from "@/hooks/queries/useAccounts";
 import { useAccountUsage } from "@/hooks/queries/useAccountUsage";
 import { useAccountsUsageView } from "@/hooks/useAccountsUsageView";
-import { useAccountActions } from "@/hooks/mutations/useAccountActions";
+import {
+  unknownSwitchOutcomeText,
+  useAccountActions,
+} from "@/hooks/mutations/useAccountActions";
 import { useAvailableApiKeys } from "@/hooks/queries/useAvailableApiKeys";
 import { useFederationLocalNode } from "@/hooks/queries/useFederatedSessions";
 import {
@@ -122,16 +127,19 @@ type PaymentMethod =
   | { kind: "account"; accountUuid: string }
   | { kind: "api-key"; apiKeyId: string };
 
+/** #6740: two key refs are compared as the session's node records them, so
+ *  `<id>` and `<id>@<that node>` are one key. */
 function samePaymentMethod(
   a: PaymentMethod | null,
-  b: PaymentMethod | null
+  b: PaymentMethod | null,
+  sessionNodeId: string | null
 ): boolean {
   if (a === null || b === null) return a === b;
   if (a.kind === "account" && b.kind === "account") {
     return a.accountUuid === b.accountUuid;
   }
   if (a.kind === "api-key" && b.kind === "api-key") {
-    return a.apiKeyId === b.apiKeyId;
+    return sameApiKeyRef(a.apiKeyId, b.apiKeyId, sessionNodeId);
   }
   return false;
 }
@@ -321,6 +329,20 @@ function EditSessionParamsForm({
     localNode != null &&
     effectiveNodeId !== localNode.nodeId;
 
+  // #6740: the owner of a peer-owned session, as this node tracks it. A key homed
+  // on the owner is recorded there by its bare id, so refs are compared with the
+  // owner's OWN node id (`info.nodeId`), never this node's name for it; null (not
+  // answered yet) compares vault ids alone. Peer info is cast, not parsed.
+  const ownerNode = isRemoteSession
+    ? nodes.find(n => n.config.id === effectiveNodeId)
+    : undefined;
+  const sessionNodeIdentity =
+    (isRemoteSession ? ownerNode?.info?.nodeId : localNode?.nodeId) ?? null;
+  const ownerTakesKeys =
+    ownerNode?.info?.capabilities?.includes(
+      SESSION_API_KEY_SWITCH_CAPABILITY
+    ) ?? false;
+
   // Issue #6171: the MCP servers known for the session's project on its node.
   const mcpCatalog = useMcpCatalog({
     api,
@@ -467,7 +489,11 @@ function EditSessionParamsForm({
   // a key → account move. Staging is selection-only; Apply performs the switch.
   const accountStaged =
     draft.paymentMethod != null &&
-    !samePaymentMethod(draft.paymentMethod, current.paymentMethod);
+    !samePaymentMethod(
+      draft.paymentMethod,
+      current.paymentMethod,
+      sessionNodeIdentity
+    );
   const stagedKind = accountStaged ? draft.paymentMethod?.kind : undefined;
   // The pick, else the session's LIVE binding (#5660 — not the binding at open).
   const shownAccountUuid =
@@ -489,25 +515,31 @@ function EditSessionParamsForm({
 
   // Issue #4823 / #6542: the Anthropic keys a session this node owns can bill —
   // this node's own and the keys other nodes share (`GET /api/api-keys/available`,
-  // no target), each with the `bindingRef` the switch sends. A peer-owned session
-  // lists none (switching it from here is #6740), nor does any session before the
-  // nodes read has said which node owns it. A successful read always names this
-  // node (#2332), so a settled read with no `localNode` FAILED: a session that
-  // names a node then has an unknown owner, not this one.
+  // no target), each with the `bindingRef` the switch sends. A session before the
+  // nodes read has said which node owns it lists none. A successful read always
+  // names this node (#2332), so a settled read with no `localNode` FAILED: a
+  // session that names a node then has an unknown owner, not this one.
+  // #6740: a session another node owns lists the keys THAT node can be given, by
+  // the qualified ref it resolves, once the owner advertises that it takes one.
   const ownsSession =
     localNodeSettled &&
     !isRemoteSession &&
     (localNode != null ||
       effectiveNodeId == null ||
       effectiveNodeId === LOCAL_NODE_ID);
-  const { data: keysData } = useAvailableApiKeys(api, null, {
-    enabled:
-      claudeSession &&
-      ownsSession &&
-      (accountModalOpen || stagedKind === "api-key"),
-  });
+  const listsKeys = ownsSession || (isRemoteSession && ownerTakesKeys);
+  const { data: keysData } = useAvailableApiKeys(
+    api,
+    isRemoteSession ? effectiveNodeId : null,
+    {
+      enabled:
+        claudeSession &&
+        listsKeys &&
+        (accountModalOpen || stagedKind === "api-key"),
+    }
+  );
   // A disabled query still returns cached rows, so the LOOKUP is gated too.
-  const availableKeys = ownsSession ? keysData : undefined;
+  const availableKeys = listsKeys ? keysData : undefined;
   const anthropicKeys = useMemo(
     () => (availableKeys?.keys ?? []).filter(k => k.provider === "anthropic"),
     [availableKeys]
@@ -523,6 +555,17 @@ function EditSessionParamsForm({
     stagedKind === "api-key"
       ? anthropicKeys.find(k => (k.bindingRef ?? k.id) === shownApiKeyId)
       : undefined;
+  // #6740: the picker marks the row that IS the shown key, in whatever form the
+  // session's record holds it: the exact ref first, then the same key.
+  const keyRefs = anthropicKeys.map(k => k.bindingRef ?? k.id);
+  const selectedKeyRef =
+    shownApiKeyId === undefined
+      ? null
+      : (keyRefs.find(ref => ref === shownApiKeyId) ??
+        keyRefs.find(ref =>
+          sameApiKeyRef(ref, shownApiKeyId, sessionNodeIdentity)
+        ) ??
+        shownApiKeyId);
   // The row names the STAGED binding while one is pending: a staged key shows
   // no email (an account switch's email must not linger beside it).
   const shownEmail =
@@ -568,22 +611,24 @@ function EditSessionParamsForm({
   // Issue #4823 (R6): the keys group is disabled — with the reason — when the
   // server would refuse a key target. Launcher: the RAW recorded kind (a missing
   // kind is refused: the respawn would use the node's default launcher; NOT
-  // `current.launcher`, which defaults it to "sdk"). Remote: a peer-owned session
-  // is switched to a key on its owner (#6542 names the owner; #6740 is the hub
-  // switch). Local mode: a live session the terminal controls (a stopped session
-  // stages).
-  const ownerLabel = isRemoteSession
-    ? nodes.find(n => n.config.id === effectiveNodeId)?.config.label
-    : undefined;
+  // `current.launcher`, which defaults it to "sdk"). Remote (#6740): an owner this
+  // node does not track, one that has not answered yet, and one that does not
+  // advertise the switch. Local mode: a live session the terminal controls (a
+  // stopped session stages).
+  const ownerLabel = ownerNode?.config.label;
   const keysDisabledReason =
     session.metadata?.launcherKind !== "sdk"
       ? "API-key billing requires the SDK launcher — start a new session on an API key."
-      : isRemoteSession
-        ? `Open this session on ${ownerLabel ?? "the node that owns it"} to switch it to an API key.`
-        : session.active !== false &&
-            session.agentState?.controlledByUser === true
-          ? "Return to remote mode to switch to an API key."
-          : undefined;
+      : isRemoteSession && !ownerNode
+        ? "Open this session on the node that owns it to switch it to an API key."
+        : ownerNode && !ownerNode.info
+          ? `${ownerLabel} has not answered yet. Try again in a moment.`
+          : isRemoteSession && !ownerTakesKeys
+            ? `${ownerLabel} needs updating before its sessions can switch to an API key from another node.`
+            : session.active !== false &&
+                session.agentState?.controlledByUser === true
+              ? "Return to remote mode to switch to an API key."
+              : undefined;
 
   // Field gating reuses the Create-page engine in edit mode (R10) — no fork.
   const fields = deriveFormState({
@@ -794,6 +839,10 @@ function EditSessionParamsForm({
       else if (changedFields.has("account") && shownApiKeyId)
         await accountActions.selectApiKey(shownApiKeyId);
     } catch (e) {
+      // #6740 (ER-7): nobody knows yet whether this switch happened, and the
+      // session may be respawning on the set saved above, so the set stays.
+      const unknownOutcome = unknownSwitchOutcomeText(e);
+      if (unknownOutcome) throw new Error(unknownOutcome);
       // #6171 review SS-2: a switch refused before the server stopped the
       // session leaves it running its old set, so the set saved above must not
       // stay on the record. Not after the stop (delta review DW-1): a rollback
@@ -1329,7 +1378,7 @@ function EditSessionParamsForm({
         apiKeysUnavailableHints={
           claudeSession ? apiKeysUnavailableHints : undefined
         }
-        selectedApiKeyId={shownApiKeyId ?? null}
+        selectedApiKeyId={selectedKeyRef}
         onSelectApiKey={
           claudeSession
             ? apiKeyId =>

@@ -33,6 +33,7 @@
 
 import type { ErrorLogger } from "../logging/errorLogger";
 import type { TurnStore } from "../store/turns/turnStore";
+import type { TurnIdBySeqReader } from "../store/turns/turnIdBySeq";
 import { clampOrphanWatermark } from "../store/turns/orphanWatermark";
 import type { TurnWriteService } from "../store/turns/turnWriteService";
 import type {
@@ -196,6 +197,19 @@ export interface TurnLifecycleOptions {
    *  (persist packet → spawn successor → deliver + confirm → roster handover →
    *  reap). Contributes no enrichment; runs last (default: no-op). */
   successorHandoffStep?: FinalizeStep;
+  /** Issue #6559 — the context-reset step. A SYNCHRONOUS FinalizeStep that hands
+   *  the RAW `event.outcome` and the turn's parsed label events to the
+   *  context-reset service and returns `{}`. Runs after parseStep and
+   *  backgroundAgentSeedStep and before successorHandoffStep, so the handoff sees
+   *  a pending reset. */
+  contextResetStep?: FinalizeStep;
+  /** Issue #6559 (binding 4) — a NEW turn opened (never a replay), with the seq
+   *  this process allocated. Fail-open. */
+  onTurnOpened?: (hapiSessionId: string, seq: number) => void;
+  /** Issue #6559 — a `turn:finalize` this process could resolve to no turn (the
+   *  hub restarted and its boot sweep closed the turn), handed over RAW, because
+   *  an operator's stop of that turn must still drop a pending reset. Fail-open. */
+  onUnresolvedFinalize?: (event: TurnFinalizeEvent) => void;
   /** Issue #1905 — runaway-session ceiling guard. A SYNCHRONOUS FinalizeStep that
    *  invokes `SyncEngine.checkSessionCeilings(sid)` at the turn boundary; the
    *  engine meters `v_session_totals`, and on a token/iteration breach it
@@ -297,6 +311,9 @@ export class TurnLifecycle {
   private readonly enrichStep: FinalizeStep;
   private readonly costStep: FinalizeStep;
   private readonly successorHandoffStep: FinalizeStep;
+  private readonly contextResetStep: FinalizeStep;
+  private readonly onTurnOpened?: (hapiSessionId: string, seq: number) => void;
+  private readonly onUnresolvedFinalize?: (event: TurnFinalizeEvent) => void;
   private readonly ceilingGuardStep: FinalizeStep;
   private readonly orphanGrantStep: FinalizeStep;
   private readonly onSessionOrphaned?: (hapiSessionId: string) => void;
@@ -310,6 +327,7 @@ export class TurnLifecycle {
     private readonly writeService: TurnWriteService,
     private readonly nodeId: string,
     private readonly errorLogger: ErrorLogger,
+    private readonly turnIds: TurnIdBySeqReader,
     options?: TurnLifecycleOptions
   ) {
     this.parseStep = options?.parseStep ?? NOOP_STEP;
@@ -320,6 +338,9 @@ export class TurnLifecycle {
     this.enrichStep = options?.enrichStep ?? NOOP_STEP;
     this.costStep = options?.costStep ?? NOOP_STEP;
     this.successorHandoffStep = options?.successorHandoffStep ?? NOOP_STEP;
+    this.contextResetStep = options?.contextResetStep ?? NOOP_STEP;
+    this.onTurnOpened = options?.onTurnOpened;
+    this.onUnresolvedFinalize = options?.onUnresolvedFinalize;
     this.ceilingGuardStep = options?.ceilingGuardStep ?? NOOP_STEP;
     this.orphanGrantStep = options?.orphanGrantStep ?? NOOP_STEP;
     this.onSessionOrphaned = options?.onSessionOrphaned;
@@ -466,8 +487,58 @@ export class TurnLifecycle {
         transcriptPath: event.transcriptPath ?? null,
         captureSource: "hooks",
       });
+      this.notifyTurnOpened(event.sid, seq);
     } catch (error) {
       this.safeLog("turn openTurn failed", event.sid, error);
+    }
+  }
+
+  /** #6559: hand a new turn's seq to the context-reset service. Fail-open. */
+  private notifyTurnOpened(hapiSessionId: string, seq: number): void {
+    if (!this.onTurnOpened) return;
+    try {
+      this.onTurnOpened(hapiSessionId, seq);
+    } catch (error) {
+      this.safeLog("turn onTurnOpened failed (degraded)", hapiSessionId, error);
+    }
+  }
+
+  /**
+   * #6559 (Task 10 item 6): the seq of the session's open turn as this process
+   * tracked it (the newest, when more than one is tracked), or null. The
+   * context-reset service binds an arm to it.
+   */
+  getOpenTurnSeq(hapiSessionId: string): number | null {
+    let open: number | null = null;
+    for (const tracked of this.openByLocalId.values()) {
+      if (tracked.hapiSessionId !== hapiSessionId) continue;
+      if (open === null || tracked.seq > open) open = tracked.seq;
+    }
+    return open;
+  }
+
+  /**
+   * #6559 (Task 10 item 6, Task 12): append events to the turn row of
+   * `(hapiSessionId, seq)`, through the fail-open write queue. False when no row
+   * with that seq is stored yet (nothing is queued); never throws.
+   */
+  appendTurnEvents(
+    hapiSessionId: string,
+    seq: number,
+    events: TurnEventInput[]
+  ): boolean {
+    try {
+      const turnId = this.turnIds.getTurnIdBySeq(hapiSessionId, seq);
+      if (!turnId) return false;
+      this.writeService.enqueueAppendEvents({
+        turnId,
+        nodeId: this.nodeId,
+        events,
+      });
+      return true;
+    } catch (error) {
+      this.safeLog("turn appendTurnEvents failed", hapiSessionId, error);
+      return false;
     }
   }
 
@@ -499,6 +570,17 @@ export class TurnLifecycle {
       let seq: number;
       let spansRestart = false;
       const tracked = this.openByLocalId.get(event.turnLocalId);
+      if (tracked && tracked.hapiSessionId !== event.sid) {
+        // #6974 O7 (Task 4b; Matt Starfield's answer T1): a finalize naming a
+        // turn tracked under another session is refused before any write, step
+        // or deletion, so the real entry and its finalize stay intact.
+        this.safeLog(
+          "turn finalizeTurn refused: turnLocalId tracked under another session",
+          event.sid,
+          `tracked under ${tracked.hapiSessionId}`
+        );
+        return;
+      }
       if (tracked) {
         seq = tracked.seq;
       } else {
@@ -508,7 +590,12 @@ export class TurnLifecycle {
           .getOpenTurns()
           .filter(t => t.hapiSessionId === event.sid);
         const latest = open[open.length - 1];
-        if (!latest) return; // nothing open to finalize — no-op
+        if (!latest) {
+          // nothing open to finalize — no-op for the ledger, but #6559 still
+          // needs the RAW outcome (an operator's stop of an orphaned turn).
+          this.notifyUnresolvedFinalize(event);
+          return;
+        }
         seq = latest.seq;
         spansRestart = true;
       }
@@ -721,6 +808,20 @@ export class TurnLifecycle {
     return orphaned;
   }
 
+  /** #6559: the RAW finalize of a turn this process resolved to no seq. Fail-open. */
+  private notifyUnresolvedFinalize(event: TurnFinalizeEvent): void {
+    if (!this.onUnresolvedFinalize) return;
+    try {
+      this.onUnresolvedFinalize(event);
+    } catch (error) {
+      this.safeLog(
+        "turn onUnresolvedFinalize failed (degraded)",
+        event.sid,
+        error
+      );
+    }
+  }
+
   private runFinalizeSteps(ctx: FinalizeStepContext): {
     enrichment: Partial<FinalizeTurnInput>;
     errored: boolean;
@@ -751,6 +852,11 @@ export class TurnLifecycle {
       this.backgroundAgentSeedStep,
       this.enrichStep,
       this.costStep,
+      // Issue #6559: the context-reset step, after parseStep (it reads the
+      // accumulated label `events`) and backgroundAgentSeedStep, and before the
+      // successor handoff, so the handoff sees a pending reset. Pure
+      // side-effecting (returns {}); reads the RAW `event.outcome`.
+      this.contextResetStep,
       // Issue #2158: context-watermark successor handoff runs LAST. Pure
       // side-effecting (returns {}); on fire it detaches its own async pipeline,
       // so it never blocks finalize.

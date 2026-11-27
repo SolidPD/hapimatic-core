@@ -16,6 +16,7 @@ import {
 import {
   useMarkPinSeen,
   usePinRecord,
+  useReopenPin,
   useStarPin,
 } from "@/hooks/queries/usePins";
 import { formatPinAge, formatPinTime, toPinViewModel } from "@/lib/pins/ledger";
@@ -90,6 +91,8 @@ export default function InlinePinCard(props: {
   const { api, sessionId, pinKey, sessionActive, fallback } = props;
   const record = usePinRecord(api, sessionId, pinKey, true);
   const starPin = useStarPin(api, sessionId);
+  // #6456 (R8): a superseded pin's Reopen, in the chat card too.
+  const { reopen: reopenPin } = useReopenPin(api, sessionId);
   const markSeen = useMarkPinSeen(api, sessionId);
   const [expanded, setExpanded] = useState(false);
   const { armed, observe } = useInlineArming();
@@ -100,9 +103,20 @@ export default function InlinePinCard(props: {
   const recordZone =
     record.data?.kind === "ready" ? (record.data.timeZone ?? null) : null;
   const timeZone = useMemo(() => resolvePinZone(recordZone), [recordZone]);
+  // #6969 (D2): the session's note limit, from the same record.
+  const noteMaxChars =
+    record.data?.kind === "ready" ? record.data.noteMaxChars : undefined;
   const context = useMemo<PinsContextValue>(
-    () => ({ api, sessionId, sessionActive, markSeen, via: "chat", timeZone }),
-    [api, sessionId, sessionActive, markSeen, timeZone]
+    () => ({
+      api,
+      sessionId,
+      sessionActive,
+      markSeen,
+      via: "chat",
+      timeZone,
+      noteMaxChars,
+    }),
+    [api, sessionId, sessionActive, markSeen, timeZone, noteMaxChars]
   );
 
   if (!model) {
@@ -130,6 +144,7 @@ export default function InlinePinCard(props: {
             onToggle={toggle}
             observe={observe}
             mode="chat"
+            onReopen={reopenPin}
           />
         ) : (
           <PinRow

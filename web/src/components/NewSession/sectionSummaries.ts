@@ -65,6 +65,8 @@ export function buildSectionSummaries(args: {
   permissionMode: PermissionMode;
   safeMode: boolean;
   sessionMode: SessionMode;
+  /** #6780: "Tracked: Billable" while Time Tracking is on; first in the parts. */
+  tracking?: string | null;
 }): { machine: string; model: string; session: string } {
   // The actual machine/node NAME — local targets resolve to the machine's
   // display title (displayName → host → id), NOT the generic slot-meter label.
@@ -94,6 +96,7 @@ export function buildSectionSummaries(args: {
   ].join(" · ");
 
   const parts: string[] = [];
+  if (args.tracking) parts.push(args.tracking);
   if (args.linkedIssue) parts.push(`#${args.linkedIssue.number}`);
   const name =
     `${args.sessionEmoji ? `${args.sessionEmoji} ` : ""}${args.sessionName.trim()}`.trim();

@@ -4,6 +4,8 @@ import type { HarnessRegistry, InstallFlavor } from "@hapi/protocol";
 import type { SyncEngine } from "../sync/syncEngine";
 import type { Store } from "../store";
 import type { AuditOutcome } from "../store/auditStore";
+import type { InstanceKind } from "@hapi/protocol/instanceKind";
+import { getServerInstanceKind } from "../services/serverInstanceKind";
 import {
   buildExecEnv,
   detectInstallFlavor,
@@ -45,6 +47,7 @@ export type ExecFileFn = (
 
 /** Error codes the route maps to HTTP status. */
 export type UpdateErrorCode =
+  | "test_instance" // 409 — a test instance changes no node-wide harness (#6977)
   | "update_in_flight" // 409 — a concurrent update/rollback holds the lock
   | "unknown_harness" // 404 — harnessId not in the registry
   | "version_mismatch" // 409 — requested version != detected latest (anti-downgrade)
@@ -180,6 +183,8 @@ export interface UpdateOrchestratorDeps {
   now?: () => number;
   /** Update/rollback timeout (ms). Default 5 min. */
   timeoutMs?: number;
+  /** #6977: this server's instance kind; default the boot reading. */
+  getInstanceKind?: () => InstanceKind;
   /** Optional spawn-quiesce (Task 10). Default no-ops — the flow is correct
    *  without them; they only narrow the symlink-flip spawn race (R9/KD-2). */
   pauseSpawning?: () => Promise<void>;
@@ -210,6 +215,7 @@ export class UpdateOrchestrator {
   private readonly buildEnv: () => NodeJS.ProcessEnv;
   private readonly now: () => number;
   private readonly timeoutMs: number;
+  private readonly getInstanceKind: () => InstanceKind;
   private readonly pauseSpawning?: () => Promise<void>;
   private readonly resumeSpawning?: () => Promise<void>;
 
@@ -225,6 +231,7 @@ export class UpdateOrchestrator {
     this.buildEnv = deps.buildEnv ?? buildExecEnv;
     this.now = deps.now ?? (() => Date.now());
     this.timeoutMs = deps.timeoutMs ?? DEFAULT_UPDATE_TIMEOUT_MS;
+    this.getInstanceKind = deps.getInstanceKind ?? getServerInstanceKind;
     this.pauseSpawning = deps.pauseSpawning;
     this.resumeSpawning = deps.resumeSpawning;
   }
@@ -260,6 +267,17 @@ export class UpdateOrchestrator {
     action: "update" | "rollback";
     targetVersion: string | null;
   }): Promise<UpdateResult> {
+    // 0. A test instance changes no harness (#6977): the binaries are node-wide and run
+    //    the node's real sessions, and `claude install` also takes the host login's
+    //    refresh lock. Refused before the in-flight lock; no audit row, as for every
+    //    refusal before the exec.
+    if (this.getInstanceKind() === "test") {
+      console.log(
+        `[harness-update] ${params.action} of ${JSON.stringify(params.harnessId)} refused on a test instance (#6977)`
+      );
+      return { ok: false, code: "test_instance" };
+    }
+
     const { nodeId, harnessId, actor, action } = params;
 
     // 1. Acquire the in-flight lock (the 409 producer). A held lock means a

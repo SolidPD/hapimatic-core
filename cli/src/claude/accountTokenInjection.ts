@@ -18,6 +18,7 @@ import { computePlanLabel } from "@/utils/claudeCredentials";
 import {
   accountConfigDirFor,
   hasIsolatedConfigDir,
+  isolatedConfigPath,
   provisionUserScopeConfigDir,
   type ProvisionResult,
   readIsolatedCredentials,
@@ -37,6 +38,7 @@ import {
 } from "@/accounts/legacyConfigDirMigration";
 import { logger } from "@/ui/logger";
 import { isTenantVm, tenantSignInRequiredMessage } from "@/accounts/tenantMode";
+import { isTestInstanceProcess } from "@/utils/testInstanceProcess";
 import { sharesHostChain as defaultSharesHostChain } from "@/accounts/hostChainQuarantine";
 import {
   permissionNarrowingHolds,
@@ -66,6 +68,9 @@ import {
  * session with no daemon scheduler) — KD-6.
  */
 const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+
+// #6977: the reading moved to its own leaf; #6756's pins import it from here.
+export { isTestInstanceProcess };
 
 /**
  * The account UUID this CLI process is bound to, or `null` for the
@@ -149,22 +154,8 @@ export function withAccountToken(
   return { ...(base ?? {}), CLAUDE_CODE_OAUTH_TOKEN: token };
 }
 
-/**
- * Issue #1551: merge `CLAUDE_CONFIG_DIR` into a launcher's `claudeEnvVars`. Pure
- * — returns a new object (or the original `base` when `configDir` is null), never
- * mutating `base`. Mirrors {@link withAccountToken}; `CLAUDE_CONFIG_DIR` is the
- * Path-A binding for non-host accounts (native Claude Code reads + rotates the
- * isolated `.credentials.json`). `CLAUDE_CONFIG_DIR` is NOT in
- * `SDK_SIGNAL_ENV_VARS`, so it passes the launcher billing scrub and preserves
- * subscription billing.
- */
-export function withAccountConfigDir(
-  base: Record<string, string> | undefined,
-  configDir: string | null
-): Record<string, string> | undefined {
-  if (!configDir) return base;
-  return { ...(base ?? {}), CLAUDE_CONFIG_DIR: configDir };
-}
+// #6980: moved to the leaf that composes every launcher's child env with it.
+export { withAccountConfigDir } from "./testInstanceConfigDir";
 
 /**
  * Issue #4568: the node-vault id of the Anthropic API key this CLI process bills
@@ -393,6 +384,18 @@ export async function resolveAccountConfigDirForSession(
     // which injects the stored `CLAUDE_CODE_OAUTH_TOKEN` directly.
     if (isEnvTokenAccount(account)) return null;
 
+    // Issue #6756 (R6, M4): a test instance never creates or migrates a machine-global
+    // account folder. With no folder file for this account, take the token path with the
+    // store's own token BEFORE the user-scope provisioning (which would mkdir the folder),
+    // the legacy migration and the bootstrap seed. An existing folder is used as today.
+    const testInstance = (deps.testInstance ?? isTestInstanceProcess)();
+    if (testInstance && !(await hasIsolatedConfigDir(accountUuid))) {
+      logger.info(
+        "[ACCOUNT_CONFIG_DIR] test instance (#6756): the bound account has no shared folder; using the store token on the instance's own config folder (#6980), creating no account folder"
+      );
+      return null;
+    }
+
     const dir = accountConfigDirFor(accountUuid);
 
     // Issue #1562: provision the host's user-scope config (skills, commands,
@@ -490,6 +493,21 @@ export async function resolveAccountConfigDirForSession(
             // process, so the lease lands in the wrapper's own manager singleton
             // and is NOT heartbeated by the daemon — it lapses at the hub TTL.
             acquireRotationLease: uuid => rotationLeaseManager.acquire(uuid),
+            // Issue #6980 (D3-19): a test instance's re-seed builds from the folder's
+            // OWN `.claude.json`, never the host's. The folder is shared with the
+            // node's real sessions, so never a minimal one over a good file: without
+            // its MCP servers and project trust they crash (#1551).
+            ...(testInstance
+              ? {
+                  seedFn: (seeded, opts) =>
+                    seedAccountConfigDir(seeded, {
+                      ...opts,
+                      hostClaudeConfigPath: isolatedConfigPath(
+                        seeded.accountUuid
+                      ),
+                    }),
+                }
+              : {}),
           }));
       const verdict = await validate(account);
       if (verdict === "ok") {
@@ -573,6 +591,11 @@ export interface ResolveAccountTokenDeps {
   tenantVm?: () => boolean;
   /** Issue #4349: whether an account's own dir holds the binary's credential (test seam). */
   hasConfigDir?: (accountUuid: string) => Promise<boolean>;
+  /**
+   * Issue #6756: "is this process a test instance?" (test seam). Defaults to
+   * {@link isTestInstanceProcess}, the instance-kind reading made once per process.
+   */
+  testInstance?: () => boolean;
   /**
    * Issue #6800: "is this refresh token the current ~/.claude token?" (test
    * seam). Defaults to `hostChainQuarantine.sharesHostChain`, which compares

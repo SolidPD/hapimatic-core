@@ -73,6 +73,9 @@ export function buildSuccessorHandoffDeps(args: {
    */
   const hasOpenTransaction = (sessionId: string): boolean => {
     try {
+      // #6559 (R13, one hold): a pending or firing context reset is an open
+      // transaction, so the handoff never fires while a reset is in flight.
+      if (syncEngine.isContextResetPending(sessionId)) return true;
       const session = syncEngine.getSession(sessionId);
       const tag = session?.tag ?? null;
       return store.pmRoster
@@ -119,8 +122,21 @@ export function buildSuccessorHandoffDeps(args: {
         ...inheritSpawnPosture(predecessor.metadata?.permissionMode, "claude"),
         name: `${baseName}-successor`,
         parentSessionId: predecessor.id,
-        // Issue #6646 (A4): the successor takes its predecessor's switch.
-        billableSwitchStart: { kind: "inherit", fromSessionId: predecessor.id },
+        // Issue #6918 (R9): the predecessor, so the choke point can carry its
+        // manager stamp with reason `successor` — only behind
+        // HAPI_MANAGER_STAMP_SUCCESSOR (off by default; MD7 answered, option 1
+        // (2026-11-23): activation sets HAPI_MANAGER_STAMP_SUCCESSOR=1 with
+        // HAPI_MANAGER_STAMP=1). No relationship is sent, so no parent link is
+        // persisted.
+        successorOf: predecessor,
+        // Issue #6646 (A4): the successor takes its predecessor's switch. #6778
+        // PR-C (ruling PRC-R5): it says it is the successor, so its copy keeps
+        // the predecessor's confirm state (row 6a); with no claim it would wait.
+        billableSwitchStart: {
+          kind: "inherit",
+          fromSessionId: predecessor.id,
+          inheritClaim: "successor",
+        },
         accountUuid: predecessor.metadata?.accountUuid,
         // Issue #4568 (R6): a successor of an API-key session bills the same key.
         apiKeyId: predecessor.metadata?.apiKeyId,

@@ -385,6 +385,10 @@ export class FederationTerminalNodeHandler {
     const cliSocket = cliNs.sockets.get(cliSocketId);
     if (!cliSocket) return;
 
+    // #6974 O11 (Task 5a; Matt Starfield's answer F1, 2026-11-26): each
+    // terminal:* listener below acts only on a federated terminal bound to
+    // THIS socket, as `disconnect` already tests, before any send, flag change
+    // or deletion; their classification is `socketEventClasses.ts`.
     // These listeners run IN ADDITION to the existing CLI terminal handlers.
     // The existing handlers will harmlessly fail for federation terminals
     // (they try to find a /terminal socket by the synthetic socketId, get null).
@@ -395,6 +399,7 @@ export class FederationTerminalNodeHandler {
       if (!parsed.success) return;
       const fed = this.fedTerminals.get(parsed.data.terminalId);
       if (!fed) return;
+      if (fed.cliSocketId !== cliSocketId) return; // #6974 O11: not this socket's
       // #4517: a CLI that did not confirm persistence (an older one) runs an
       // ephemeral shell. Treat the terminal as legacy, so a hub WebSocket
       // close kills the shell instead of orphaning it, and tell the hub.
@@ -414,6 +419,7 @@ export class FederationTerminalNodeHandler {
       if (!parsed.success) return;
       const fed = this.fedTerminals.get(parsed.data.terminalId);
       if (!fed) return;
+      if (fed.cliSocketId !== cliSocketId) return; // #6974 O11: not this socket's
       this.sendToHub(fed.ws, {
         type: "output",
         terminalId: parsed.data.terminalId,
@@ -426,6 +432,7 @@ export class FederationTerminalNodeHandler {
       if (!parsed.success) return;
       const fed = this.fedTerminals.get(parsed.data.terminalId);
       if (!fed) return;
+      if (fed.cliSocketId !== cliSocketId) return; // #6974 O11: not this socket's
       this.sendToHub(fed.ws, {
         type: "exit",
         terminalId: parsed.data.terminalId,
@@ -444,6 +451,7 @@ export class FederationTerminalNodeHandler {
       if (!parsed.success) return;
       const fed = this.fedTerminals.get(parsed.data.terminalId);
       if (!fed) return;
+      if (fed.cliSocketId !== cliSocketId) return; // #6974 O11: not this socket's
       this.sendToHub(fed.ws, {
         type: "error",
         terminalId: parsed.data.terminalId,

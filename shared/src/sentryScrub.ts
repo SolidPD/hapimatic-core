@@ -58,6 +58,8 @@ export const SENSITIVE_FIELD_NAMES = new Set([
   "rateminor",
   "defaultrateminor",
   "ratenote",
+  // Issue #6204 (section 6): a time entry's value, `valueMinor` / `value_minor`.
+  "valueminor",
 ]);
 
 /**

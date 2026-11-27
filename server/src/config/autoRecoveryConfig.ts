@@ -14,7 +14,12 @@
  * kill-switch disconnect — see directive finding 1234-1.
  */
 
-import { getSettingsFile, readSettings, writeSettings } from "./settings";
+import {
+  getSettingsFile,
+  readSettings,
+  updateSettings,
+  type Settings,
+} from "./settings";
 
 export interface AutoRecoveryConfig {
   /**
@@ -147,20 +152,24 @@ export async function loadAutoRecoveryConfig(
   };
 }
 
-/** Persist auto-recovery tunables (NOT the global toggle) to settings.json. */
+/**
+ * Persist auto-recovery tunables (NOT the global toggle) to settings.json.
+ * #4056: through `updateSettings`, so an unreadable file is refused with
+ * `SettingsUnreadableError` and left byte-identical.
+ */
 export async function saveAutoRecoveryConfig(
   dataDir: string,
   updates: Partial<AutoRecoveryConfig>
 ): Promise<AutoRecoveryConfig> {
   const settingsFile = getSettingsFile(dataDir);
-  const settings = (await readSettings(settingsFile)) ?? {};
-  const raw = (settings as Record<string, unknown>).autoRecovery;
-  const existing = raw && typeof raw === "object" ? raw : {};
-
-  const merged = { ...existing, ...updates };
-  (settings as Record<string, unknown>).autoRecovery = merged;
-
-  await writeSettings(settingsFile, settings);
+  await updateSettings(settingsFile, current => {
+    const raw = (current as Record<string, unknown>).autoRecovery;
+    const existing = raw && typeof raw === "object" ? raw : {};
+    return {
+      ...current,
+      autoRecovery: { ...existing, ...updates },
+    } as Settings;
+  });
 
   return loadAutoRecoveryConfig(dataDir);
 }

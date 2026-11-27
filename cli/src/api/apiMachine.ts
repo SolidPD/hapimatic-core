@@ -45,6 +45,7 @@ import {
   isSafeMachinePath,
   validateCreateDirectoryTarget,
 } from "../modules/common/pathSecurity";
+import { testInstanceConfigDir } from "@/claude/testInstanceConfigDir";
 import { getProjectPath } from "@/claude/utils/path";
 import {
   PATH_EXISTS_META,
@@ -220,6 +221,18 @@ interface CleanupWorktreeParams {
   worktreePath?: string;
   branch?: string;
   sessionId?: string;
+}
+
+/**
+ * Whether a transcript of `claudeSessionId` is there to resume at `cwd`: the host's, and
+ * on a test instance first the instance's own folder (#6980; the host's then serves a
+ * session bound to an account folder, whose `projects` links there). A `stat` each.
+ */
+function hasClaudeConversation(cwd: string, claudeSessionId: string): boolean {
+  const own = testInstanceConfigDir();
+  return (own === null ? [undefined] : [own, undefined]).some(configDir =>
+    existsSync(join(getProjectPath(cwd, configDir), `${claudeSessionId}.jsonl`))
+  );
 }
 
 export class ApiMachineClient {
@@ -884,6 +897,7 @@ export class ApiMachineClient {
     // If absent, the server's reconnectSession clears claudeSessionId so the
     // existing spawn-fresh fall-through fires (see syncEngine.ts CRITICAL block).
     //
+    // Issue #6980: `hasClaudeConversation` names the folders it looks in.
     // Path encoding is delegated to `getProjectPath` (canonical implementation
     // at `@/claude/utils/path`) which uses Claude Code's actual encoding rule:
     // `resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-")`. This replaces ALL
@@ -901,10 +915,7 @@ export class ApiMachineClient {
           throw new Error("claudeSessionId is required");
         }
 
-        const projectDir = getProjectPath(cwd);
-        const conversationPath = join(projectDir, `${claudeSessionId}.jsonl`);
-
-        return { exists: existsSync(conversationPath) };
+        return { exists: hasClaudeConversation(cwd, claudeSessionId) };
       },
       HAS_CLAUDE_CONVERSATION_META
     );

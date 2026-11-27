@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { execFile } from "node:child_process";
+import { constants as fsConstants } from "node:fs";
 import {
+  access,
   lstat,
   readdir,
   readFile,
+  realpath,
   rename,
+  stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import {
@@ -741,4 +745,432 @@ export async function collectOwnedWorktreePorts(
   }
 
   return owned;
+}
+
+/** The states `readInstanceOwnerState` reads (the bash lib's names). */
+export type InstanceOwnerState =
+  | { state: "own" }
+  | { state: "own-legacy" }
+  | { state: "foreign"; owner: string }
+  | { state: "ambiguous"; claimants: string[] }
+  | { state: "unknown"; reason: string };
+
+/**
+ * One `systemctl --user show -p <property> --value <unit>` read; `null` when
+ * it cannot be read. Injectable so tests never query a real unit.
+ */
+export type InstanceUnitReader = (
+  unit: string,
+  property: "ActiveState" | "Environment"
+) => Promise<string | null>;
+
+const UNIT_SHOW_TIMEOUT_MS = 15_000;
+const RUNNING_UNIT_STATES = new Set(["active", "activating", "reloading"]);
+
+async function readUnitProperty(
+  unit: string,
+  property: "ActiveState" | "Environment"
+): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "systemctl",
+      ["--user", "show", "-p", property, "--value", unit],
+      { timeout: UNIT_SHOW_TIMEOUT_MS }
+    );
+    // Strip trailing newlines, as the bash `$(...)` reading does.
+    let end = stdout.length;
+    while (end > 0 && stdout[end - 1] === "\n") end--;
+    return stdout.slice(0, end);
+  } catch {
+    return null;
+  }
+}
+
+// `[[:space:]]` in the C locale, which `owner_from_unit_env` matches under.
+const OWNER_VAR_RE =
+  /[ \t\n\v\f\r]HAPI_WT_OWNER_WORKTREE=(\/[^ \t\n\v\f\r"'\\]*)[ \t\n\v\f\r]/;
+
+/**
+ * Port of `owner_from_unit_env` (scripts/release-worktree-port.sh; the lib's
+ * verbatim copy is `instance_owner_from_unit_env`): the
+ * `HAPI_WT_OWNER_WORKTREE` value from one `systemctl show -p Environment
+ * --value` line. `rc` as the bash returns: 0 = the owner, 1 = no variable
+ * (launched before #4309), 2 = not one plain absolute path, 3 = the line holds
+ * a double quote (systemd quotes an item with a space or a shell-special
+ * character, so the variable's text could sit inside another item's value).
+ * Only ASCII whitespace separates items, as the bash matches byte by byte
+ * (LC_ALL=C).
+ */
+export function ownerFromUnitEnv(
+  line: string
+): { rc: 0; owner: string } | { rc: 1 | 2 | 3 } {
+  const env = ` ${line} `;
+  if (!env.includes("HAPI_WT_OWNER_WORKTREE=")) return { rc: 1 };
+  if (env.includes('"')) return { rc: 3 };
+  const found = env.match(OWNER_VAR_RE);
+  return found ? { rc: 0, owner: found[1] } : { rc: 2 };
+}
+
+/** The bash state line for `state`, as `instance_owner_state` prints it. */
+export function instanceOwnerStateLine(state: InstanceOwnerState): string {
+  switch (state.state) {
+    case "foreign":
+      return `foreign:${state.owner}`;
+    case "ambiguous":
+      return `ambiguous:${state.claimants.join(",")}`;
+    case "unknown":
+      return `unknown:${state.reason}`;
+    default:
+      return state.state;
+  }
+}
+
+/** `realpath -m`: symlinks resolved as far as the path exists, the rest kept. */
+async function realpathMissingOk(path: string): Promise<string> {
+  const absolute = resolve(path);
+  try {
+    return await realpath(absolute);
+  } catch {
+    const parent = dirname(absolute);
+    if (parent === absolute) return absolute;
+    return join(await realpathMissingOk(parent), basename(absolute));
+  }
+}
+
+/** `[[ -e ]] || [[ -L ]]`: anything at `path`, a dangling symlink included. */
+async function pathPresent(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `[[ -e ]]`, following symlinks. */
+async function pathPresentFollowing(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** `[[ -d ]]`, following symlinks. */
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** `[[ -f ]]`, following symlinks. */
+async function isRegularFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function hasAccess(path: string, mode: number): Promise<boolean> {
+  try {
+    await access(path, mode);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const READ_SEARCH = fsConstants.R_OK | fsConstants.X_OK;
+
+/** `[[ "$a" -ef "$b" ]]`: both exist and are the same device and inode. */
+async function sameFile(a: string, b: string): Promise<boolean> {
+  try {
+    const [sa, sb] = await Promise.all([stat(a), stat(b)]);
+    return sa.dev === sb.dev && sa.ino === sb.ino;
+  } catch {
+    return false;
+  }
+}
+
+/** `instance_owner_same_worktree CANON WORKTREE`. */
+async function sameWorktree(canon: string, worktree: string): Promise<boolean> {
+  return (
+    canon === (await realpathMissingOk(worktree)) ||
+    (await sameFile(canon, worktree))
+  );
+}
+
+/**
+ * The meta's claim as `grep -o '"claimed_port":[[:space:]]*[0-9]\+' | grep -o
+ * '[0-9]\+$'` reads it: every match, one per line, so a meta claims PORT only
+ * when it holds exactly one claim and that claim is PORT.
+ */
+function grepClaimedPort(content: string): string {
+  const claims: string[] = [];
+  for (const line of content.split("\n")) {
+    for (const found of line.matchAll(/"claimed_port":[ \t\v\f\r]*([0-9]+)/g)) {
+      claims.push(found[1]);
+    }
+  }
+  return claims.join("\n");
+}
+
+async function metaClaims(meta: string, port: number): Promise<boolean> {
+  try {
+    return grepClaimedPort(await readFile(meta, "utf-8")) === String(port);
+  } catch {
+    return false;
+  }
+}
+
+/** Strip leading and trailing ASCII whitespace (`[[:space:]]`). */
+function trimAscii(text: string): string {
+  const space = " \t\n\v\f\r";
+  let start = 0;
+  let end = text.length;
+  while (start < end && space.includes(text[start])) start++;
+  while (end > start && space.includes(text[end - 1])) end--;
+  return text.slice(start, end);
+}
+
+/**
+ * `instance_owner_record_check`: no unit runs. The state when the record
+ * decides it; `null` when no record counts and the claims decide.
+ */
+async function recordCheck(
+  port: number,
+  worktree: string,
+  dataDir: string
+): Promise<InstanceOwnerState | null> {
+  if (
+    (await pathPresentFollowing(dataDir)) &&
+    !(await hasAccess(dataDir, READ_SEARCH))
+  ) {
+    return { state: "unknown", reason: `unreadable-data-dir:${dataDir}` };
+  }
+  const record = join(dataDir, "owner-worktree");
+  if (!(await pathPresent(record))) return null;
+  let line: string;
+  try {
+    if (
+      !(await isRegularFile(record)) ||
+      !(await hasAccess(record, fsConstants.R_OK))
+    ) {
+      return { state: "unknown", reason: "unreadable-marker" };
+    }
+    line = (await readFile(record, "utf-8")).split("\n")[0] ?? "";
+  } catch {
+    return { state: "unknown", reason: "unreadable-marker" };
+  }
+  line = trimAscii(line);
+  if (!line) return { state: "unknown", reason: "empty-marker" };
+  if (!line.startsWith("/")) {
+    return { state: "unknown", reason: "malformed-marker" };
+  }
+  const canon = await realpathMissingOk(line);
+  if (await sameWorktree(canon, worktree)) return { state: "own" };
+  // Only a folder above the named worktree that can be read says it is gone.
+  const parent = dirname(canon);
+  if (!(await isDirectory(parent)) || !(await hasAccess(parent, READ_SEARCH))) {
+    return { state: "unknown", reason: `unreadable-owner-folder:${parent}` };
+  }
+  if (!(await pathPresent(canon))) return null;
+  if ((await isDirectory(canon)) && !(await hasAccess(canon, READ_SEARCH))) {
+    return { state: "unknown", reason: `unreadable-owner-meta:${canon}` };
+  }
+  const meta = join(canon, ".worktree-meta.json");
+  if (!(await pathPresent(meta))) return null;
+  if (
+    !(await isRegularFile(meta)) ||
+    !(await hasAccess(meta, fsConstants.R_OK))
+  ) {
+    return { state: "unknown", reason: `unreadable-owner-meta:${meta}` };
+  }
+  return (await metaClaims(meta, port))
+    ? { state: "foreign", owner: canon }
+    : null;
+}
+
+/**
+ * `instance_owner_claims_state` with `instance_owner_sibling_claimants`: the
+ * other worktrees in the folder holding `worktree` whose meta claims `port`. A
+ * claim that can be read decides first; else anything unreadable is unknown.
+ */
+async function claimsState(
+  port: number,
+  worktree: string
+): Promise<InstanceOwnerState> {
+  const wtDir = dirname(worktree);
+  const cannotList = {
+    state: "unknown" as const,
+    reason: `cannot list ${wtDir}, where another worktree may claim port ${port}`,
+  };
+  if (!(await isDirectory(wtDir)) || !(await hasAccess(wtDir, READ_SEARCH))) {
+    return cannotList;
+  }
+  let entries: string[];
+  try {
+    entries = await readdir(wtDir);
+  } catch {
+    return cannotList;
+  }
+  // The bash globs `*/` then `.*/`, each sorted.
+  const ordered = [
+    ...entries.filter(name => !name.startsWith(".")).sort(),
+    ...entries.filter(name => name.startsWith(".")).sort(),
+  ];
+  const names: string[] = [];
+  const unreadable: string[] = [];
+  for (const name of ordered) {
+    if (name === ".trash") continue;
+    const dir = join(wtDir, name);
+    if (!(await isDirectory(dir))) continue;
+    if (await sameFile(dir, worktree)) continue;
+    if (!(await hasAccess(dir, READ_SEARCH))) {
+      unreadable.push(dir);
+      continue;
+    }
+    const meta = join(dir, ".worktree-meta.json");
+    if (!(await pathPresent(meta))) continue;
+    if (
+      !(await isRegularFile(meta)) ||
+      !(await hasAccess(meta, fsConstants.R_OK))
+    ) {
+      unreadable.push(meta);
+      continue;
+    }
+    if (await metaClaims(meta, port)) names.push(name);
+  }
+  if (names.length > 0) return { state: "ambiguous", claimants: names };
+  if (unreadable.length > 0) {
+    return {
+      state: "unknown",
+      reason: `cannot read ${unreadable[0]}, which may claim port ${port}`,
+    };
+  }
+  return { state: "own-legacy" };
+}
+
+function errorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return typeof code === "string" ? code : "unreadable";
+}
+
+/**
+ * Whether the worktree instance on `port` is provably `worktreePath`'s
+ * (issue #4588). Read before any claim-based teardown, because a claimed port
+ * can be held by ANOTHER worktree's live instance: two worktrees can claim one
+ * port (the bash reclaim, and the per-root TS scan across roots, #4309 E3).
+ *
+ * The TS port of `instance_owner_state` in `scripts/lib/instance-owner-v1.sh`
+ * (#4577's file; the A1, D1 = A and G1 rulings). It gives the same
+ * state, and the same reason tokens, for the same inputs; a parity test in
+ * worktreeMeta.test.ts runs both on one set of fixtures. Keep them in step.
+ *   1. The port's units, `hapimatic-wt-<port>-server` and `-daemon`. A unit
+ *      runs when its ActiveState is active, activating or reloading, or cannot
+ *      be read. Each running unit's environment must be readable and non-empty;
+ *      its `HAPI_WT_OWNER_WORKTREE` (#4309) is canonicalised. Every running unit
+ *      naming this worktree is `own`, naming the same other worktree `foreign`;
+ *      any other mix is `unknown:mixed-units`. Units naming no launcher (before
+ *      #4309) fall to the claims below; the owner record is not read then,
+ *      because a record outlives a stop, a reboot or a crash.
+ *   2. When no unit runs, `<home>/.hapimatic-wt-<port>/owner-worktree` (one
+ *      line, an absolute path) naming this worktree is `own`; naming worktree W
+ *      is `foreign` only while W still exists and its meta still claims the
+ *      port. A record naming a gone W, or one whose claim was released (the
+ *      closer keeps the folder and nulls the claim), counts as no record (G1).
+ *   3. With no record that counts, the claims: the other worktrees in the
+ *      folder holding this one (dot folders read, `.trash` never) whose meta
+ *      claims the port give `ambiguous`, else `own-legacy` (D-4588-1 A).
+ * Anything that cannot be read is `unknown`. An empty `home` is a bad call (no
+ * data dir to read). Never throws.
+ */
+export async function readInstanceOwnerState(options: {
+  port: number;
+  worktreePath: string;
+  home: string;
+  readUnit?: InstanceUnitReader;
+}): Promise<InstanceOwnerState> {
+  const { port, worktreePath, home } = options;
+  const readUnit = options.readUnit ?? readUnitProperty;
+  try {
+    if (
+      !Number.isInteger(port) ||
+      port < 0 ||
+      !worktreePath.startsWith("/") ||
+      !home
+    ) {
+      return { state: "unknown", reason: "bad-call" };
+    }
+    const dataDir = join(home, `.hapimatic-wt-${port}`);
+
+    const running: string[] = [];
+    for (const unit of [
+      `hapimatic-wt-${port}-server`,
+      `hapimatic-wt-${port}-daemon`,
+    ]) {
+      const activeState = await readUnit(unit, "ActiveState");
+      if (!activeState || RUNNING_UNIT_STATES.has(activeState)) {
+        running.push(unit);
+      }
+    }
+
+    if (running.length === 0) {
+      return (
+        (await recordCheck(port, worktreePath, dataDir)) ??
+        (await claimsState(port, worktreePath))
+      );
+    }
+
+    const kinds: string[] = [];
+    for (const unit of running) {
+      const environment = await readUnit(unit, "Environment");
+      if (!environment) {
+        return { state: "unknown", reason: `unreadable-unit-env:${unit}` };
+      }
+      const parsed = ownerFromUnitEnv(environment);
+      if (parsed.rc !== 0) {
+        if (parsed.rc === 1) {
+          kinds.push("none");
+          continue;
+        }
+        return parsed.rc === 3
+          ? { state: "unknown", reason: `quoted-unit-env:${unit}` }
+          : { state: "unknown", reason: `malformed-unit-owner:${unit}` };
+      }
+      const canon = await realpathMissingOk(parsed.owner);
+      kinds.push(
+        (await sameWorktree(canon, worktreePath)) ? "own" : `foreign:${canon}`
+      );
+    }
+    // Every live unit must name the same launcher (#4577 mixed-set ruling).
+    if (kinds.some(kind => kind !== kinds[0])) {
+      return { state: "unknown", reason: "mixed-units" };
+    }
+    if (kinds[0] === "own") return { state: "own" };
+    if (kinds[0].startsWith("foreign:")) {
+      return { state: "foreign", owner: kinds[0].slice("foreign:".length) };
+    }
+    return await claimsState(port, worktreePath);
+  } catch (error) {
+    return { state: "unknown", reason: `error:${errorCode(error)}` };
+  }
+}
+
+/** One-line description of a non-own state, for logs (issue #4588). */
+export function describeInstanceOwner(owner: InstanceOwnerState): string {
+  switch (owner.state) {
+    case "foreign":
+      return `owner ${owner.owner}`;
+    case "ambiguous":
+      return `also claimed by ${owner.claimants.join(", ")}`;
+    case "unknown":
+      return owner.reason;
+    default:
+      return owner.state;
+  }
 }

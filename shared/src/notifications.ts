@@ -31,6 +31,7 @@ export const NOTIFICATION_KINDS = [
   "loops-resuming",
   "model-reverted",
   "sign-in-ending",
+  "tracking-not-applied",
 ] as const;
 
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
@@ -97,6 +98,12 @@ export const NOTIFICATION_KIND_DEFAULTS: Record<
   // the producer sends its own push, gated by the kind's `signInEnding` toggle,
   // that opens the re-login link.
   "sign-in-ending": { severity: "warn", dedupe: "none", pushType: null },
+  // #6778 PR-C (moved item 3; plan 4.2 rows 6 and 10): a new session that
+  // started without the tracking settings it was given — a lost start (row 12,
+  // raised as `error`), an agent's copy that was not sent, or a carried start
+  // the target did not apply. One row per occurrence, never pushed; the web
+  // keeps its settings row and its pop-up out of sight while the gate is off.
+  "tracking-not-applied": { severity: "warn", dedupe: "none", pushType: null },
 };
 
 /** A repeat within this window of an open row's `last_at` coalesces into it. */

@@ -8,15 +8,17 @@
  * through the component, `pinsSubmitRecovery.test.ts` directly.
  */
 import type {
+  PinSubmissionEntry,
   PinSubmissionRequest,
   PinSubmissionResponse,
   PinSubmissionResult,
 } from "@hapi/protocol";
 import { ApiError } from "@/api/client";
-import type { BuiltSubmission } from "@/lib/pins/submission";
+import { makeSubmissionId, type BuiltSubmission } from "@/lib/pins/submission";
 import {
   clearSubmitted,
   hasUpdates,
+  resolveNoteMax,
   type PendingSubmission,
   type StagedPin,
   type StagedPins,
@@ -27,7 +29,123 @@ export type Refusal = {
   code?: string;
   error: string;
   entries?: PinSubmissionResult[];
+  /**
+   * #6803: the request fields an older node refused (`dismiss`, `writeIn`).
+   * Read through `refusedFieldsOf`, which trusts only an array of strings.
+   * #6969: `longNote`, a note over the node's `maxNoteChars`.
+   */
+  unsupported?: unknown;
+  /** #6969 (D2): the longest note the node takes; read through `resolveNoteMax`. */
+  maxNoteChars?: unknown;
 };
+
+/**
+ * #6803: the request fields an older node may refuse, each its own extension.
+ * #6969 (D2): `longNote`, a note longer than an older node takes.
+ */
+export const REFUSABLE_FIELDS = ["dismiss", "writeIn", "longNote"] as const;
+export type RefusableField = (typeof REFUSABLE_FIELDS)[number];
+
+/** Each refusal code, and what it means when its 501 lists nothing. */
+const REFUSAL_CODES: Record<string, RefusableField> = {
+  pin_dismiss_unsupported: "dismiss",
+  pin_writein_unsupported: "writeIn",
+  pin_long_note_unsupported: "longNote",
+};
+
+/**
+ * #6539, #6803, #6969: the fields an older node refused, from its 501. A hub
+ * from before #6803 sends `pin_dismiss_unsupported` with no list, which means
+ * the dismissals alone. Null for any other refusal.
+ */
+export function refusedFieldsOf(
+  refusal: Refusal | null
+): RefusableField[] | null {
+  const alone = refusal?.code ? REFUSAL_CODES[refusal.code] : undefined;
+  if (!refusal || !alone) return null;
+  const listed = refusal.unsupported;
+  if (Array.isArray(listed) && listed.every(item => typeof item === "string")) {
+    const fields = REFUSABLE_FIELDS.filter(field => listed.includes(field));
+    if (fields.length > 0) return fields;
+  }
+  return [alone];
+}
+
+/** #6969 (D2): the longest note a refusing node takes, else 2,048. */
+export function refusedNoteMaxOf(refusal: Refusal | null): number {
+  return resolveNoteMax(refusal?.maxNoteChars);
+}
+
+/**
+ * #6803, #6969: whether an entry carries a refused field: a dismissal or a
+ * write-in by its presence, a long note by its length against `maxNoteChars`.
+ */
+export function carriesRefused(
+  entry: PinSubmissionEntry,
+  field: RefusableField,
+  maxNoteChars: number
+): boolean {
+  return field === "longNote"
+    ? (entry.note?.length ?? 0) > maxNoteChars
+    : entry[field] !== undefined;
+}
+
+/**
+ * #6539, #6803: the same Submit without every entry that carries one of
+ * `fields`, each left out whole with its note, under a new id, because the
+ * entry set changed and the old id may be on record somewhere. Its `submitted`
+ * holds only the pins it still sends, so the left-out entries stay staged.
+ */
+export function withoutFields(
+  built: BuiltSubmission,
+  fields: readonly RefusableField[],
+  maxNoteChars: number
+): BuiltSubmission {
+  const entries = (built.request?.entries ?? []).filter(
+    entry => !carriesAny(entry, fields, maxNoteChars)
+  );
+  const kept = new Set(entries.map(entry => entry.key));
+  return {
+    ...built,
+    request:
+      built.request && entries.length > 0
+        ? { ...built.request, submissionId: makeSubmissionId(), entries }
+        : null,
+    submitted: Object.fromEntries(
+      Object.entries(built.submitted).filter(([key]) => kept.has(key))
+    ),
+    stale: built.stale.filter(row => kept.has(row.key)),
+  };
+}
+
+/** #6539: the same Submit without its dismissals (a plain message records none). */
+export function withoutDismissals(built: BuiltSubmission): BuiltSubmission {
+  return withoutFields(built, ["dismiss"], Number.POSITIVE_INFINITY);
+}
+
+/** #6803, #6969: whether an entry carries any of `fields`. */
+export function carriesAny(
+  entry: PinSubmissionEntry,
+  fields: readonly RefusableField[],
+  maxNoteChars: number
+): boolean {
+  return fields.some(field => carriesRefused(entry, field, maxNoteChars));
+}
+
+/**
+ * #6803, #6969: the entries the older-node phase lists with their words when
+ * nothing else can go: each carrying a refused write-in or long note.
+ */
+export function refusedWordKeys(
+  entries: readonly PinSubmissionEntry[],
+  fields: readonly RefusableField[],
+  maxNoteChars: number
+): string[] {
+  const withWords = fields.filter(field => field !== "dismiss");
+  return entries
+    .filter(entry => carriesAny(entry, withWords, maxNoteChars))
+    .map(entry => entry.key);
+}
 
 export function refusalOf(error: unknown): Refusal | null {
   if (!(error instanceof ApiError)) return null;
@@ -153,6 +271,8 @@ export function withoutDelivered(
     };
     const saysSomething =
       stripped.choice !== undefined ||
+      // #6803: a write-in staged after a delivered Submit is new, so it goes.
+      stripped.writeIn !== undefined ||
       stripped.note !== undefined ||
       (stripped.questions?.length ?? 0) > 0 ||
       stripped.steps !== undefined ||

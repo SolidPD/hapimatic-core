@@ -253,6 +253,12 @@ export type PinsContextValue = {
    * `resolvePinZone`: the owning node's Time Log zone, else the browser's.
    */
   timeZone: string;
+  /**
+   * #6969 (D2): the longest note the session's node takes, from the data the
+   * zone comes from; the note counter counts against it. Absent reads as
+   * 2,048, what every node before #6969 takes.
+   */
+  noteMaxChars?: number;
 };
 
 export const PinsContext = createContext<PinsContextValue | null>(null);

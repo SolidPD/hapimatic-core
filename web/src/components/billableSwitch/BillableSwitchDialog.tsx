@@ -11,12 +11,17 @@
  * (#6204) knows what was logged, the figure names the timer, through the one
  * wording point `billableAmountWords`. The figure ticks while the session
  * thinks and is frozen at the moment the person confirms.
+ *
+ * #6778 (moved item 4; ruling PRC-R7): the figure is judged on the record's
+ * state through `useOldSwitchAmount`: a waiting record keeps the timer, a
+ * session with no record shows its untracked time from the read the switch
+ * took before its choice, and without that read the timer shows, as before.
  */
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useLiveNow } from "@/components/SessionTimer";
 import {
   billableAmountWords,
-  useBillableAmount,
+  useOldSwitchAmount,
   type BillableSwitchRequest,
   type BillableSwitchSession,
 } from "@/hooks/useBillableSwitch";
@@ -53,7 +58,7 @@ function OpenBillableSwitchDialog(
   // Mounted when the dialog opens, so its clock starts at the open; it ticks
   // only while the session has a live segment.
   const nowMs = useLiveNow(hasLiveSegment(session), session.thinkingStartedAt);
-  const amount = useBillableAmount(session, nowMs);
+  const amount = useOldSwitchAmount(session, nowMs);
   const on = request === "on";
 
   const description = on

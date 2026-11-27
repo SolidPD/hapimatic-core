@@ -37,6 +37,7 @@ import { useSyncExternalStore } from "react";
 import type { LinkedIssue } from "@hapi/protocol/types";
 import type { ExistingBranch } from "@hapi/protocol/gitBranches";
 import type { AgentType, SessionType } from "@/components/NewSession/types";
+import type { TimeTrackingState } from "@/components/timeTracking/timeTracking";
 
 /**
  * The primary user-entered Create-form values captured at optimistic-spawn time
@@ -67,6 +68,15 @@ export type SpawnFormSnapshot = {
    * (`<uuid>@<home>` for a key another node shares).
    */
   apiKeyId?: string | null;
+  /**
+   * #6780 (ruling OC-1 = a): Time Tracking as the person set it, kept for the
+   * same reason as `apiKeyId`: it is a billing choice, so a retry of the same
+   * attempt brings it back. Stored only when a tracked start was sent, and
+   * dropped from the handover once the real session appears
+   * (`dropHandoverTracking`), so a rate stays in this tab's memory no longer
+   * than the attempt needs.
+   */
+  timeTracking?: TimeTrackingState;
 };
 
 /** One optimistic-spawn handover, keyed by the placeholder id (= the tag). */
@@ -86,6 +96,22 @@ const listeners = new Set<() => void>();
 
 /** The last-failed Create form, consumed once by a fresh NewSession mount (R4). */
 let pendingRetryForm: SpawnFormSnapshot | null = null;
+let pendingRetryAt = 0;
+
+/**
+ * #6780 (item 13): the handover map's bound. A placeholder view that never
+ * mounts (a split-pane Create) never ends its handover, so above this many the
+ * oldest is dropped.
+ */
+export const SPAWN_HANDOVER_MAX = 20;
+
+/**
+ * #6780 (ruling L7): how long a stashed retry form waits for the retry form's
+ * mount. A real retry, the late-row one included, takes it within the same
+ * navigation; an older stash was left by a second navigation in between and
+ * would otherwise open the next Create with the failed form.
+ */
+export const RETRY_FORM_MAX_AGE_MS = 10_000;
 
 function notify(): void {
   for (const fn of listeners) fn();
@@ -106,6 +132,10 @@ export function beginSpawnHandover(
     form: SpawnFormSnapshot;
   }
 ): void {
+  if (!handovers.has(placeholderId) && handovers.size >= SPAWN_HANDOVER_MAX) {
+    const oldest = handovers.keys().next().value;
+    if (oldest !== undefined) handovers.delete(oldest);
+  }
   handovers.set(placeholderId, {
     emoji: init.emoji,
     linkedIssue: init.linkedIssue,
@@ -143,12 +173,24 @@ export function endSpawnHandover(placeholderId: string): void {
 /** Stash the failed spawn's form snapshot for the return-to-Create retry (R4). */
 export function stashRetryForm(form: SpawnFormSnapshot): void {
   pendingRetryForm = form;
+  pendingRetryAt = Date.now();
+}
+
+/**
+ * #6780 (item 13): drop only the form's Time Tracking from a handover once the
+ * real session appears, so the swap still gets its emoji and draft.
+ */
+export function dropHandoverTracking(placeholderId: string): void {
+  const entry = handovers.get(placeholderId);
+  if (!entry || entry.form.timeTracking === undefined) return;
+  entry.form = { ...entry.form, timeTracking: undefined };
 }
 
 /** Read + clear the pending retry snapshot (consumed once by NewSession mount). */
 export function takeRetryForm(): SpawnFormSnapshot | null {
   const form = pendingRetryForm;
   pendingRetryForm = null;
+  if (form && Date.now() - pendingRetryAt > RETRY_FORM_MAX_AGE_MS) return null;
   return form;
 }
 

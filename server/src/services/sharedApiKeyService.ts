@@ -253,6 +253,48 @@ export class SharedApiKeyService {
     return { ok: true, apiKey: outcome.value.apiKey };
   }
 
+  /**
+   * #6978: report to a FOREIGN key's home that the provider refused a session
+   * here for lack of credit, so the home stamps the key out of credit with its
+   * own clock. Refuses a local ref: the observer stamps those in this node's
+   * vault itself. `stampedAt` and `changed` are the home's answer, each absent
+   * when the home did not send it.
+   */
+  async reportOutOfCredit(
+    ref: string,
+    expectedMasked: string,
+    sessionId: string
+  ): Promise<
+    { ok: true; stampedAt?: string; changed?: boolean } | ApiKeyRefusal
+  > {
+    const parsed = parseApiKeyRef(ref);
+    if (!parsed) {
+      return refusal(
+        "api_key_ref_invalid",
+        "The API key reference is malformed",
+        400
+      );
+    }
+    if (parsed.homeNodeId === null || parsed.homeNodeId === this.selfNodeId()) {
+      return refusal(
+        "api_key_local_ref",
+        "This key is stored on this node; stamp it in the vault",
+        400
+      );
+    }
+    const home = parsed.homeNodeId;
+    const pre = this.foreignPrecheck(home);
+    if (pre) return pre;
+    const registry = this.opts.getNodeRegistry() as NodeRegistry;
+    const outcome = await registry.reportApiKeyOutOfCreditOnNode(home, {
+      id: parsed.id,
+      expectedMasked,
+      sessionId,
+    });
+    if (outcome.kind !== "ok") return this.mapOutcome(home, outcome);
+    return { ok: true, ...outcome.value };
+  }
+
   /** Refusals a foreign ref gets before any request: a hosted VM, no
    *  federation, an unknown home. */
   private foreignPrecheck(home: string): ApiKeyRefusal | null {

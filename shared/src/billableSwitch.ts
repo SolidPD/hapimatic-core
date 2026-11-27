@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { z } from "zod";
-import type { TrackingStartValues } from "./billableTracking";
+import type {
+  TrackingCarriedCopy,
+  TrackingStartValues,
+} from "./billableTracking";
 
 // The billable switch (issue #6646, epic #6585): whether a session's time is
 // billed. (#6586 says how much time there is; this module never measures time.)
@@ -358,10 +361,39 @@ export const BillableSwitchStartWireSchema = z.object({
     })
     .optional()
     .catch(undefined),
+  // #6778 PR-C (Task 15; PR-B's moved item 2): an agent's copy of a parent on
+  // the entry node, parsed strictly by the receiver like `tracking`.
+  inheritedCopy: z.unknown().optional(),
 });
 export type BillableSwitchStartWire = z.infer<
   typeof BillableSwitchStartWireSchema
 >;
+
+/**
+ * #6778 PR-C (Task 15b; section 4.3, ruling 5, rulings PRC-R5 and PRC-R6): what
+ * a branch, a successor or a transcript resume says about its `inherit` start.
+ * `person` (a branch or a resume a person starts in the app) and `successor` (the
+ * hand-off the server fires between turns, with no request) take the parent's
+ * confirm state (row 6a). Every other `inherit` copies and waits under "To
+ * confirm" (row 6b): the CLI's verb, a tool, another node's hop, and a start that
+ * names no claim at all. Server-only: never on the federation wire, so a hub
+ * cannot claim it for the owning node.
+ */
+export type BillableSwitchInheritClaim = "person" | "successor";
+
+/**
+ * #6778 PR-C (Task 15b): the hub's claim as it crosses the branch hop (`claim`
+ * beside `branchLabel` in `POST /api/federation/sessions/:id/branch`). Every
+ * field caught, like the start wire, so a later change never makes an older
+ * receiver refuse. It has no `inheritClaim`, so a branch that arrives over the
+ * hop always waits (ruling 5: the owning node cannot check the hub's claim). A
+ * receiver before PR-C reads only `branchLabel` and ignores it.
+ */
+export const BillableSwitchBranchClaimWireSchema = z.object({
+  actor: BillableSwitchActorSchema.optional().catch(undefined),
+  via: BillableSwitchViaSchema.optional().catch(undefined),
+  entryNodeId: z.string().max(200).optional().catch(undefined),
+});
 
 /**
  * The start context on the server (the required `billableSwitchStart` spawn
@@ -389,7 +421,17 @@ export type BillableSwitchStartContext = {
     claimed: true;
     headerBound: boolean;
   };
+  /** #6778 PR-C: that parent's record, carried when the parent is on another node (4.2, the one rule). */
+  inheritedCopy?: TrackingCarriedCopy;
+  /** #6778 PR-C (Task 15b): who asked for an `inherit` start; none waits (PRC-R5). */
+  inheritClaim?: BillableSwitchInheritClaim;
 };
+
+/** #6778 PR-C (Task 15b): what a branch's route or hop adds to its `inherit` start. */
+export type BillableSwitchBranchClaim = Pick<
+  BillableSwitchStartContext,
+  "actor" | "via" | "entryNodeId" | "inheritClaim"
+>;
 
 // ---------------------------------------------------------------------------
 // The project key
@@ -407,17 +449,24 @@ export type ProjectKeyMetadata =
   | null
   | undefined;
 
+/** A value that is not blank (#6778 PR-B review, finding 8988bf65). */
+function present(value: string | null | undefined): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
 /**
  * The node-blind key of a session's project: `repoIdentity.name` (owner/repo)
  * for a git-backed session, else `worktree.basePath`, else the raw path, else
- * "Other". The web groups the session list by it (`grouping.ts`) and the server
- * keys a project's header by it.
+ * "Other". A blank value counts as absent, so the key is never empty: the
+ * tracking writer refuses an empty key, and a session with one would never get
+ * its record (review finding 8988bf65). The web groups the session list by it
+ * (`grouping.ts`) and the server keys a session's tracking project by it.
  */
 export function projectBaseKey(metadata: ProjectKeyMetadata): string {
   return (
-    metadata?.repoIdentity?.name ??
-    metadata?.worktree?.basePath ??
-    metadata?.path ??
+    present(metadata?.repoIdentity?.name) ??
+    present(metadata?.worktree?.basePath) ??
+    present(metadata?.path) ??
     "Other"
   );
 }
@@ -426,7 +475,7 @@ export function projectBaseKey(metadata: ProjectKeyMetadata): string {
 export function projectKeyKind(
   metadata: ProjectKeyMetadata
 ): BillableSwitchKeyKind {
-  return metadata?.repoIdentity?.name ? "repo" : "path";
+  return present(metadata?.repoIdentity?.name) ? "repo" : "path";
 }
 
 // ---------------------------------------------------------------------------

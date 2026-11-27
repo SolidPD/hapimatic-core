@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+import type { InstanceKind } from "@hapi/protocol/instanceKind";
+import { getServerInstanceKind } from "./serverInstanceKind";
 import { existsSync } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -55,6 +57,12 @@ export interface ProviderAuthStateDeps {
    * injects the real `getMachines(db)`-derived list). [ER 2026-09-19: D11]
    */
   getDaemonProviderEnv?: () => string[] | null;
+  /**
+   * Issue #6756 (R4, M7): this instance's kind. Default: the boot reading
+   * (`getServerInstanceKind`, `real` until the boot sets it). On a `test` instance no
+   * OpenAI row is built from the host `~/.codex` or the shared folders' `codex/` dirs.
+   */
+  instanceKind?: () => InstanceKind;
 }
 
 /**
@@ -297,8 +305,10 @@ export async function readProviderAuthState(
   deps: ProviderAuthStateDeps = {}
 ): Promise<ProviderAuthFacts> {
   const homeDir = deps.homeDir ?? homedir();
+  const testInstance =
+    (deps.instanceKind ?? getServerInstanceKind)() === "test";
   const [openai, google] = await Promise.all([
-    readOpenAiState(deps, homeDir),
+    testInstance ? Promise.resolve([]) : readOpenAiState(deps, homeDir),
     readGoogleState(deps, homeDir),
   ]);
   return { openai, google };

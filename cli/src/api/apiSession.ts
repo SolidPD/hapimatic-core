@@ -51,10 +51,18 @@ import type {
   ProviderUsageSnapshotWindow,
 } from "@hapi/protocol/schemas";
 import {
+  CONTEXT_RESET_ABANDONED_METADATA_KEY,
+  CONTEXT_RESET_EVENTS,
   RUNNER_SUPERSEDED,
   RUNNER_SUPERSEDED_EVENT,
+  ContextResetArmResultSchema,
+  abandonedArmIds,
+  type ContextResetArmRequest,
+  type ContextResetArmResult,
+  type ContextResetResult,
   type PromptCacheState,
 } from "@hapi/protocol";
+import type { IncomingFrame } from "@/claude/services/contextResetActuator";
 import { applyVersionedAck } from "./versionedUpdate";
 
 /**
@@ -165,7 +173,13 @@ export class RecentIdSet {
   }
 }
 
-type IncomingMessage = { id?: string; seq?: number; content: unknown };
+type IncomingMessage = {
+  id?: string;
+  seq?: number;
+  /** Issue #6559: the server's store time, present on a live frame. */
+  createdAt?: number;
+  content: unknown;
+};
 
 export class ApiSessionClient extends EventEmitter {
   private readonly token: string;
@@ -196,9 +210,12 @@ export class ApiSessionClient extends EventEmitter {
   private agentState: AgentState | null;
   private agentStateVersion: number;
   private readonly socket: Socket<ServerToClientEvents, ClientToServerEvents>;
-  private pendingMessages: UserMessage[] = [];
-  private pendingMessageCallback: ((message: UserMessage) => void) | null =
-    null;
+  private pendingMessages: { message: UserMessage; frame: IncomingFrame }[] =
+    [];
+  /** Issue #6559 (Task 4): the frame says how the message came (live or backfilled). */
+  private pendingMessageCallback:
+    | ((message: UserMessage, frame: IncomingFrame) => void)
+    | null = null;
   /** Highest message seq handled; the live path drops anything at or below. */
   private lastSeenMessageSeq: number | null = null;
   /**
@@ -518,18 +535,21 @@ export class ApiSessionClient extends EventEmitter {
     };
   }
 
-  onUserMessage(callback: (data: UserMessage) => void): void {
+  onUserMessage(
+    callback: (data: UserMessage, frame: IncomingFrame) => void
+  ): void {
     this.pendingMessageCallback = callback;
     while (this.pendingMessages.length > 0) {
-      callback(this.pendingMessages.shift()!);
+      const next = this.pendingMessages.shift()!;
+      callback(next.message, next.frame);
     }
   }
 
-  private enqueueUserMessage(message: UserMessage): void {
+  private enqueueUserMessage(message: UserMessage, frame: IncomingFrame): void {
     if (this.pendingMessageCallback) {
-      this.pendingMessageCallback(message);
+      this.pendingMessageCallback(message, frame);
     } else {
-      this.pendingMessages.push(message);
+      this.pendingMessages.push({ message, frame });
     }
   }
 
@@ -593,7 +613,12 @@ export class ApiSessionClient extends EventEmitter {
       }
       this.deliveredUserMessageIds.add(message.id);
     }
-    this.enqueueUserMessage(userResult.data);
+    this.enqueueUserMessage(userResult.data, {
+      live: source === "live",
+      ...(typeof message.createdAt === "number"
+        ? { createdAt: message.createdAt }
+        : {}),
+    });
   }
 
   /**
@@ -979,6 +1004,59 @@ export class ApiSessionClient extends EventEmitter {
    * critical path. Any error is logged and swallowed — turn rows are a
    * rebuildable index, never worth disturbing a live session for.
    */
+  /**
+   * Issue #6559 (Task 4): what happened to a flagged message, on the wrapper's
+   * own socket. A result emitted while disconnected is buffered by Socket.IO
+   * and flushed in order on reconnect.
+   */
+  sendContextResetResult(result: ContextResetResult): void {
+    this.socket.emit(CONTEXT_RESET_EVENTS.result, {
+      sid: this.sessionId,
+      ...result,
+    });
+  }
+
+  /**
+   * Issue #6559 (Task 5): the arm tool's request, answered by the server's ack.
+   * Rejects when no answer comes within `timeoutMs` (the tool then withdraws
+   * the arm); an answer that is not an arm result reads as not armed.
+   */
+  async armContextReset(
+    request: ContextResetArmRequest,
+    timeoutMs: number
+  ): Promise<ContextResetArmResult> {
+    const answer: unknown = await this.socket
+      .timeout(timeoutMs)
+      .emitWithAck(CONTEXT_RESET_EVENTS.arm, {
+        sid: this.sessionId,
+        ...request,
+      });
+    const parsed = ContextResetArmResultSchema.safeParse(answer);
+    return parsed.success ? parsed.data : { armed: false };
+  }
+
+  /** Issue #6559 (Task 5): withdraws an arm that got no answer in time. */
+  disarmContextReset(armId: string): void {
+    this.socket.emit(CONTEXT_RESET_EVENTS.disarm, {
+      sid: this.sessionId,
+      armId,
+    });
+  }
+
+  /**
+   * Issue #6559 (Task 5): records an abandoned arm id in the session metadata,
+   * so the server ends that request `dropped:abandoned` and never fires it.
+   */
+  recordAbandonedContextResetArm(armId: string): void {
+    this.updateMetadata(metadata => ({
+      ...metadata,
+      [CONTEXT_RESET_ABANDONED_METADATA_KEY]: [
+        ...abandonedArmIds(metadata).slice(-19),
+        armId,
+      ],
+    }));
+  }
+
   sendTurnEvent(payload: TurnEventPayload): void {
     try {
       if (!this.socket.connected) {

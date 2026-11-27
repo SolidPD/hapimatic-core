@@ -119,21 +119,7 @@ export class QueueDrainObserver {
       // A drain for this session is already in flight (its synchronous pop-echo
       // re-enters here mid-drainOnce) — ignore.
       if (this.inFlight.has(event.sessionId)) return;
-      // A head was already dispatched this idle cycle and the CLI has not yet
-      // gone thinking:true→false — suppress a second level dispatch (R4).
-      if (this.dispatchedSinceIdle.has(event.sessionId)) return;
-      const current = this.engine.getSession(event.sessionId);
-      if (!current) return;
-      // Only drain when the session is CURRENTLY idle AND active (same gate as
-      // the edge branch below). An offline session waits for its active-rose
-      // edge; a thinking session waits for its thinking-fall edge.
-      if (!current.thinking && current.active) {
-        // Issue #2158: honor the dispatch hold (successor handoff in flight).
-        if (this.isDispatchHeld?.(event.sessionId)) return;
-        void this.drainOnce(event.sessionId).catch(err =>
-          this.logDrainError(event.sessionId, err)
-        );
-      }
+      this.drainIfIdle(event.sessionId);
       // Issue #3235: a queue-changed carries no session-state edge — do NOT
       // touch prevState (that map tracks session-state transitions only).
       return;
@@ -185,6 +171,36 @@ export class QueueDrainObserver {
         this.logDrainError(event.sessionId, err)
       );
     }
+  }
+
+  /**
+   * #6559 ROUND RV10 item 2: a dispatch hold ended with no new turn (a context
+   * reset that was dropped, expired or unconfirmed), so no idle edge will come
+   * to drain what was queued under it. Drain once now, under the same gate as an
+   * enqueue. Never throws.
+   */
+  wake(sessionId: string): void {
+    if (this.inFlight.has(sessionId)) return;
+    this.drainIfIdle(sessionId);
+  }
+
+  /**
+   * The level-triggered drain (#3235): one head, only when no head went out this
+   * idle cycle and the session is CURRENTLY idle AND active (same gate as the
+   * edge branch). An offline session waits for its active-rose edge; a thinking
+   * session waits for its thinking-fall edge.
+   */
+  private drainIfIdle(sessionId: string): void {
+    // A head was already dispatched this idle cycle and the CLI has not yet
+    // gone thinking:true→false — suppress a second level dispatch (R4).
+    if (this.dispatchedSinceIdle.has(sessionId)) return;
+    const current = this.engine.getSession(sessionId);
+    if (!current || current.thinking || !current.active) return;
+    // Issue #2158: honor the dispatch hold (successor handoff in flight).
+    if (this.isDispatchHeld?.(sessionId)) return;
+    void this.drainOnce(sessionId).catch(err =>
+      this.logDrainError(sessionId, err)
+    );
   }
 
   private async drainOnce(sessionId: string): Promise<void> {

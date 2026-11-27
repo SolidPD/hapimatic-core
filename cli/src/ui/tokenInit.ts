@@ -12,7 +12,7 @@ import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import chalk from "chalk";
 import { configuration } from "@/configuration";
-import { readSettings, updateSettings } from "@/persistence";
+import { readSettingsStrict, updateSettings } from "@/persistence";
 
 /** Where to find the server's token: its settings.json, named for this machine. */
 export function serverSettingsHint(): string {
@@ -29,8 +29,14 @@ export async function initializeToken(): Promise<void> {
     return;
   }
 
-  // 2. Read from settings file
-  const settings = await readSettings();
+  // 2. Read from settings file. #4056 R8: a file that exists but cannot be read
+  // or parsed is reported as such (path + error kind), not as "no token" and
+  // never as a prompt whose answer would be written over it. The
+  // SettingsUnreadableError surfaces as is ("Fix or remove that file."): the
+  // CLI_API_TOKEN advice `hapi api` gives does not fit here, because every
+  // caller next runs authAndSetupMachineIfNeeded, whose updateSettings refuses
+  // the same file.
+  const settings = await readSettingsStrict();
   if (settings.cliApiToken) {
     configuration._setCliApiToken(settings.cliApiToken);
     return;

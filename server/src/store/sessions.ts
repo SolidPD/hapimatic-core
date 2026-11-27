@@ -6,6 +6,11 @@ import { MAX_RUNNER_KEYS_PER_LIST } from "@hapi/protocol";
 
 import type { StoredSession, VersionedUpdateResult } from "./types";
 import { safeJsonParse } from "./json";
+import { attachedMetadata, erasedArchiveLine } from "./sessionLifecycle";
+import {
+  parseManagerStampReason,
+  type ManagerStampReason,
+} from "@hapi/protocol/schemas";
 import { updateVersionedField } from "./versionedUpdates";
 import type { TrackingOrigin, TrackingRecordDraft } from "@hapi/protocol";
 import { isBillableSwitchStorageReady } from "./billableSwitchStore";
@@ -49,6 +54,9 @@ type DbSessionRow = {
   parent_relationship: string | null;
   branch_label: string | null;
   branch_created_at: number | null;
+  // Issue #6918: absent on a database whose manager-stamp migration failed.
+  manager_session_id?: string | null;
+  manager_stamp_reason?: string | null;
   // Issue #6646: absent on a database whose billable migration failed.
   billable?: number | null;
   billable_confirm?: string | null;
@@ -125,6 +133,10 @@ function toStoredSession(
       (row.parent_relationship as "branch" | "spawn" | null) ?? null,
     branchLabel: row.branch_label,
     branchCreatedAt: row.branch_created_at,
+    // Issue #6918: read defensively (a failed migration leaves the keys absent),
+    // and an unknown reason string reads as undecided, never as a decision.
+    managerSessionId: row.manager_session_id ?? null,
+    managerStampReason: parseManagerStampReason(row.manager_stamp_reason),
   };
 }
 
@@ -152,6 +164,12 @@ export type BillableSwitchInitial = {
  * same file), and a busy writer waits for `busy_timeout` instead of failing on
  * a lock upgrade (#3631). `initial` is called only when a row is inserted;
  * anything it or the event write throws rolls the whole insert back.
+ *
+ * Issue #6324: an existing row is returned as stored, except that a
+ * daemon-started attach sets a row that does not read `running` back to it
+ * (`attachedMetadata`), in the same transaction. The reset fails open: an error
+ * of its write, or one that takes the transaction or the commit with it (a full
+ * disk), leaves the row and the attach as they would be without it.
  */
 export function getOrCreateSessionWithFlag(
   db: Database,
@@ -161,8 +179,11 @@ export function getOrCreateSessionWithFlag(
   namespace: string,
   initial?: () => BillableSwitchInitial | null
 ): { session: StoredSession; created: boolean } {
+  let resetOf: string | null = null;
+  let resetDone = false;
+  let erasedArchive: string | null = null;
   const run = db.transaction(
-    (): { session: StoredSession; created: boolean } => {
+    (withReset: boolean): { session: StoredSession; created: boolean } => {
       const existing = db
         .prepare(
           "SELECT * FROM sessions WHERE tag = ? AND namespace = ? ORDER BY created_at DESC LIMIT 1"
@@ -170,8 +191,31 @@ export function getOrCreateSessionWithFlag(
         .get(tag, namespace) as DbSessionRow | undefined | null;
 
       if (existing != null) {
+        const stored = safeJsonParse(existing.metadata);
+        const attached = withReset
+          ? attachedMetadata(stored, metadata, Date.now())
+          : null;
+        let reset: StoredSession | null = null;
+        if (attached !== null) {
+          resetOf = existing.id;
+          const written = updateSessionMetadata(
+            db,
+            existing.id,
+            attached,
+            existing.metadata_version,
+            namespace,
+            { touchUpdatedAt: false }
+          );
+          if (written.result === "success") {
+            reset = getSession(db, existing.id);
+            resetDone = true;
+            erasedArchive = erasedArchiveLine(existing.id, stored);
+          }
+        }
         return {
-          session: toStoredSession(existing, isBillableSwitchStorageReady(db)),
+          session:
+            reset ??
+            toStoredSession(existing, isBillableSwitchStorageReady(db)),
           created: false,
         };
       }
@@ -232,7 +276,22 @@ export function getOrCreateSessionWithFlag(
       return { session: row, created: true };
     }
   );
-  return run.immediate();
+  let result: { session: StoredSession; created: boolean };
+  try {
+    result = run.immediate(true);
+  } catch (error) {
+    // Only the reset's own failure is retried, without it. An insert's error
+    // goes on as before: the session cache records it as a lost start.
+    if (resetOf === null) throw error;
+    resetDone = false;
+    erasedArchive = null;
+    result = run.immediate(false);
+  }
+  if (resetOf !== null && !resetDone) {
+    console.warn(`[Store] session attach could not reset: session=${resetOf}`);
+  }
+  if (erasedArchive !== null) console.log(erasedArchive);
+  return result;
 }
 
 export function getOrCreateSession(
@@ -833,6 +892,61 @@ function sessionsColumnExists(db: Database, column: string): boolean {
     name: string;
   }>;
   return cols.some(c => c.name === column);
+}
+
+/** Issue #6918: a manager-stamp decision as the spawn path writes it. */
+export type ManagerStampWrite = {
+  managerSessionId: string | null;
+  reason: ManagerStampReason;
+};
+
+/**
+ * Issue #6918: write a session's manager stamp, set once. Its own statement,
+ * never part of the parent-link UPDATE: an UPDATE naming a missing column
+ * throws before it writes, so on a node whose migration failed the parent link
+ * and the registration must not depend on it (R11). Returns true only when
+ * this call wrote the decision; a decided row is never changed (R3).
+ */
+export function setManagerStamp(
+  db: Database,
+  id: string,
+  stamp: ManagerStampWrite,
+  namespace: string
+): boolean {
+  try {
+    if (
+      !sessionsColumnExists(db, "manager_stamp_reason") ||
+      !sessionsColumnExists(db, "manager_session_id")
+    ) {
+      return false;
+    }
+    const result = db
+      .prepare(
+        `
+          UPDATE sessions
+          SET manager_session_id = CASE WHEN manager_stamp_reason IS NULL
+                THEN @manager_session_id ELSE manager_session_id END,
+              manager_stamp_reason = COALESCE(manager_stamp_reason, @reason),
+              seq = seq + 1
+          WHERE id = @id AND namespace = @namespace
+            AND manager_stamp_reason IS NULL
+      `
+      )
+      .run({
+        id,
+        namespace,
+        manager_session_id: stamp.managerSessionId,
+        reason: stamp.reason,
+      });
+    return result.changes === 1;
+  } catch (error) {
+    console.warn(
+      `[manager-stamp] could not write the stamp of session ${id}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    return false;
+  }
 }
 
 /**

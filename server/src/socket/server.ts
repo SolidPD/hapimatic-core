@@ -24,6 +24,7 @@ import {
   type RunnerIdentity,
   runnerHandshakeStep,
 } from "../sync/runnerIdentity";
+import type { ContextResetSocketPort } from "./handlers/cli/sessionHandlers";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_MAX_TERMINALS = 4;
@@ -75,6 +76,9 @@ export type SocketServerDeps = {
   onTurnFinalize?: (event: TurnFinalizeEvent) => void;
   /** Issue #3809: an OpenAI/codex pacing snapshot → ProviderUsageService. */
   onProviderUsageSnapshot?: (event: ProviderUsageSnapshotEvent) => void;
+  /** #6559: the context-reset service for the CLI socket's arm, disarm and
+   *  result events (late-bound; null until constructed). */
+  getContextReset?: () => ContextResetSocketPort | null;
   /** Federation: proxy for remote terminal I/O (hub only, late-bound). */
   getRemoteTerminalProxy?: () => RemoteTerminalProxy | null;
   /** Federation: resolve sessionId → remote node URL (hub only, late-bound). */
@@ -202,6 +206,7 @@ export function createSocketServer(deps: SocketServerDeps): {
       errorLogger: deps.errorLogger,
       messageWriteRetryQueue: deps.messageWriteRetryQueue,
       runnerIdentity: deps.runnerIdentity,
+      getContextReset: deps.getContextReset,
     })
   );
 

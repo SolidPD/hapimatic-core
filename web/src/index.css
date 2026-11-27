@@ -410,6 +410,14 @@ textarea[placeholder*="notes"] {
 .pins-completed-row:hover {
   opacity: 0.85;
 }
+/* #6456 (Pins PM O1, Matt's mobile rule): a row with no answer on record
+ * (superseded, retired, or any other closure without one) renders no answer
+ * cell, and its title takes that column as well, so the title is not cut
+ * beside empty space. The cells after it keep their columns. Before the
+ * media block, so #6739's wrapped title (columns 2 to 7) still wins there. */
+.pins-completed-row[data-no-answer] .pins-c-title {
+  grid-column: 2 / 4;
+}
 @media (max-width: 600px) {
   .pins-completed-row {
     --c-ans: clamp(84px, 30%, 140px);

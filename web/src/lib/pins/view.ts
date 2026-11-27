@@ -22,7 +22,7 @@ import {
   type DeadlineOf,
   type PinViewModel,
 } from "./ledger";
-import type { StagedPins } from "./staging";
+import { hasChosenWriteIn, type StagedPins } from "./staging";
 
 /**
  * #6451: the Pins toolbar's view model — the 13 facets, the search, the held
@@ -218,13 +218,17 @@ export function isSortActive(
   );
 }
 
-/** A note or a question alone is not "an answer chosen"; a choice or unsent ticks are. */
+/**
+ * A note or a question alone is not "an answer chosen"; a choice, a chosen
+ * write-in with words (#6803) or unsent ticks are.
+ */
 function hasStagedAnswer(staged: StagedPins | null, key: string): boolean {
   const entry = staged?.[key];
   if (!entry) return false;
   const ticks = entry.ticks?.length ?? 0;
   return (
     entry.choice !== undefined ||
+    hasChosenWriteIn(entry) ||
     (ticks > 0 && ticks !== (entry.ticksSent ?? 0))
   );
 }

@@ -32,10 +32,14 @@ import {
   readBoundApiKeyId,
   API_KEY_SDK_ONLY_MESSAGE,
   withAccountToken,
-  withAccountConfigDir,
   resolveSpawnClaudeArgs,
   resolveSpawnContextWindow,
 } from "./accountTokenInjection";
+import {
+  dropForeignResume,
+  resolveSessionChildEnv,
+  transcriptConfigDir,
+} from "./testInstanceConfigDir";
 import {
   permissionNarrowingHolds,
   settleLaunchPermissionMode,
@@ -230,6 +234,9 @@ export async function claudePtyLauncher(
   // projects tree the account-bound claude child writes to under isolation,
   // instead of host ~/.claude/projects. Reused for token/model resolution below.
   const accountConfigDir = await resolveAccountConfigDirForSession(session);
+  // Issue #6980: a test instance's own folder, when that is where the child runs.
+  dropForeignResume(session, accountConfigDir);
+  const transcriptDir = transcriptConfigDir(accountConfigDir);
 
   // Issue #1719: suppress the scanner's re-emit of a web-originated user
   // message — the web POST already persisted it (Message A, with localId).
@@ -253,7 +260,7 @@ export async function claudePtyLauncher(
     // detectors below.
     resumeSessionId: resumeSessionIdFromArgs(session.claudeArgs) ?? undefined,
     workingDirectory: session.path,
-    configDir: accountConfigDir ?? undefined,
+    configDir: transcriptDir,
     onMessage: message => {
       forwardToChat(message);
       // Issue #6586 (as tmux does, #1653 clear-site (ii)): transcript activity
@@ -285,7 +292,7 @@ export async function claudePtyLauncher(
   // Issue #4383: hand the tracker this session's reconcile context (the same
   // account-config dir the scanner watches, #1573).
   session.setBackgroundAgentContext({
-    configDir: accountConfigDir ?? undefined,
+    configDir: transcriptDir,
     workingDirectory: session.path,
   });
 
@@ -500,10 +507,12 @@ export async function claudePtyLauncher(
       path: session.path,
       sessionId: session.sessionId,
       abort: processAbortController.signal,
-      claudeEnvVars: withAccountConfigDir(
-        withAccountToken(session.claudeEnvVars, accountToken),
-        accountConfigDir
-      ),
+      claudeEnvVars: resolveSessionChildEnv({
+        session,
+        base: withAccountToken(session.claudeEnvVars, accountToken),
+        accountConfigDir,
+        hasCredential: accountToken !== null,
+      }),
       claudeArgs,
       mcpServers: session.mcpServers,
       pinsEnabled: session.pinsEnabled,

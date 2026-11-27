@@ -33,6 +33,7 @@ import { writeBootSelfKnowledge } from "./capabilities/selfKnowledgeBootWriter";
 import { writeBootNodeDocs } from "./support/nodeDocs";
 import { ScorecardStore } from "./store/scorecardStore";
 import { TurnWriteService } from "./store/turns/turnWriteService";
+import { TurnIdBySeqReader } from "./store/turns/turnIdBySeq";
 import { TurnErrorMirrorService } from "./store/turns/turnErrorMirror";
 import {
   TurnLifecycle,
@@ -69,6 +70,7 @@ import { QueueDrainObserver } from "./sync/queueDrainObserver";
 import { OrphanGrantObserver } from "./sync/orphanGrantObserver";
 import { SpendLimitNoticeObserver } from "./sync/spendLimitNoticeObserver";
 import { ApiKeyCreditObserver } from "./sync/apiKeyCreditObserver";
+import { SharedApiKeyService } from "./services/sharedApiKeyService";
 import { createOrphanGrantStep } from "./sync/orphanGrantStep";
 import { createCostStep } from "./sync/costStep";
 import { NotificationHub } from "./notifications/notificationHub";
@@ -114,6 +116,13 @@ import {
 import { loadWorkflowReconcileConfig } from "./config/workflowReconcileConfig";
 import { InitiativeEventObserver } from "./sync/initiativeEventObserver";
 import { createPinDeadlineLoop } from "./sync/pinDeadlines";
+import { createPinFollowLoop } from "./sync/pinFollow";
+import { resolvePinsEnabled } from "./config/pinsConfig";
+import {
+  enginePinByIdDeps,
+  isPinLookupLocalOnly,
+  lookupPinById,
+} from "./sync/pinById";
 import { resolvePinAnswersTimeZone } from "./sync/pinSubmission";
 import { WebhookGapDetector } from "./workflow/webhookGapDetector";
 import { loadGitHubWebhookConfig } from "./config/githubWebhookConfig";
@@ -139,6 +148,16 @@ import {
   resolveLauncherConfig,
 } from "./web/routes/update";
 import { createSuccessorHandoffStep } from "./sync/successorHandoffStep";
+import { ContextResetService, challengePendingOnDisk } from "./contextReset";
+import { loadContextResetConfig } from "./config/contextResetConfig";
+import { loadApprovalTokensConfig } from "./config/approvalTokensConfig";
+import {
+  activeClaimsOf,
+  adaptEngineSend,
+  contextResetTurnEvent,
+  createContextResetStep,
+  listUserRoleMessages,
+} from "./sync/contextResetStep";
 import { createCeilingGuardStep } from "./sync/ceilingGuardStep";
 import { loadCeilingGuardConfig } from "./config/ceilingGuardConfig";
 import { buildSuccessorHandoffDeps } from "./watermark/successorHandoffWiring";
@@ -221,6 +240,7 @@ import {
   resolveBillingCategoriesOwner,
 } from "./config/billingCategoriesConfig";
 import { BillableSwitchService } from "./billableSwitch/billableSwitchService";
+import { initServerInstanceKind } from "./services/serverInstanceKind";
 import {
   describeBillableTrackingStartup,
   runBillableTrackingStartup,
@@ -269,6 +289,10 @@ let queueDrainObserver: QueueDrainObserver | null = null;
 let orphanGrantObserver: OrphanGrantObserver | null = null;
 let spendNoticeObserver: SpendLimitNoticeObserver | null = null;
 let apiKeyCreditObserver: ApiKeyCreditObserver | null = null;
+// Issue #6978: the requesting side the observer reports a foreign key's
+// out-of-credit refusal through. Set once federation has loaded; the observer,
+// built earlier, reads it late.
+let apiKeyCreditReporter: SharedApiKeyService | null = null;
 let initiativeEventObserver: InitiativeEventObserver | null = null;
 let webhookGapDetector: WebhookGapDetector | null = null;
 let turnWriteService: TurnWriteService | null = null;
@@ -282,6 +306,9 @@ let workflowReconcileService: WorkflowReconcileService | null = null;
 let autoRecoveryService: AutoRecoveryService | null = null;
 let autoSwitchService: AutoSwitchOnRateLimitService | null = null;
 let contextWatermarkService: ContextWatermarkService | null = null;
+// #6559: the context-reset service. Constructed after the turn lifecycle (below)
+// and referenced earlier by late-bound closures (socket, queue drain, finalize).
+let contextResetService: ContextResetService | null = null;
 let deferredApplyWatcher: DeferredApplyWatcher | null = null;
 let usageSampler: UsageSampler | null = null;
 // Issue #3809: constructed alongside usageService (below), but referenced earlier
@@ -311,6 +338,7 @@ let cleanupLoop: SupervisedLoop | null = null;
 let walCheckpointLoop: SupervisedLoop | null = null;
 let cpuSamplerLoop: SupervisedLoop | null = null; // #6156
 let pinDeadlineLoop: SupervisedLoop | null = null; // #6452
+let pinFollowLoop: SupervisedLoop | null = null; // #6456
 let notificationPurgeLoop: SupervisedLoop | null = null; // #4913
 let signInDeadlineAlertLoop: SupervisedLoop | null = null; // #6161
 let feedbackSinkLoop: SupervisedLoop | null = null; // #2911
@@ -334,6 +362,13 @@ async function main() {
 
   // Load configuration (async - loads from env/file with persistence)
   const config = await createConfiguration();
+  // Issue #6756 (R13): the instance kind is read before any account consumer starts (the
+  // usage sampler below runs long before buildWebApp), so a test instance's inherited
+  // store is hidden from the very first read. buildWebApp re-reads it and logs it.
+  initServerInstanceKind({
+    dataDir: config.dataDir,
+    serverPort: config.webappPort,
+  });
 
   // Display CLI API token information
   if (config.cliApiTokenIsNew) {
@@ -598,6 +633,8 @@ async function main() {
     getRemoteTerminalProxy: () => remoteTerminalProxy,
     findNodeForSession: sessionId =>
       nodeRegistry?.findNodeForSession(sessionId) ?? null,
+    // #6559: the CLI socket's context-reset arm/disarm/result (late-bound).
+    getContextReset: () => contextResetService,
   });
   // Issue #6647 (Task 4): the registry reads a session's sockets from the /cli
   // room each time; it keeps no socket map of its own.
@@ -777,7 +814,10 @@ async function main() {
     // in flight (`handoffState === "handing_off"`) so drainOnce cannot pop-and-lose
     // a message to a soon-to-be-reaped predecessor. Late-bound — the watermark
     // service is constructed further down; the predicate reads it at drain time.
-    sid => contextWatermarkService?.isHeld(sid) ?? false
+    // #6559 (R13, one hold): also hold while a context reset is pending or firing.
+    sid =>
+      (contextWatermarkService?.isHeld(sid) ?? false) ||
+      (contextResetService?.isPending(sid) ?? false)
   );
   queueDrainObserver.start();
 
@@ -795,11 +835,15 @@ async function main() {
   spendNoticeObserver = new SpendLimitNoticeObserver(syncEngine, errorLogger);
   spendNoticeObserver.start();
   // API key budgets: a session's "credit balance is too low" stamps its vault
-  // key, so the key's card says "Out of credit" for certain.
+  // key, so the key's card says "Out of credit" for certain. Issue #6978: a key
+  // stored on another node is reported to that node. The observer is built
+  // before federation loads, so it reads the reporter late.
   apiKeyCreditObserver = new ApiKeyCreditObserver(
     syncEngine,
     config.settingsFile,
-    errorLogger
+    errorLogger,
+    Date.now,
+    () => apiKeyCreditReporter
   );
   apiKeyCreditObserver.start();
 
@@ -1140,6 +1184,7 @@ async function main() {
       turnWriteService,
       federationConfig?.nodeId ?? "standalone",
       errorLogger,
+      new TurnIdBySeqReader(store.getRawDb()),
       {
         // Sub C (#1665): real transcript parse at finalize.
         parseStep: createParseStep(),
@@ -1173,6 +1218,15 @@ async function main() {
               })
             )
           : undefined,
+        // Issue #6559 (Task 10 item 1): the context-reset step — the RAW outcome
+        // and the turn's parsed label events to the service; returns {}.
+        contextResetStep: createContextResetStep(() => contextResetService),
+        // Issue #6559 (binding 4): the turns this process tracked as opened.
+        onTurnOpened: (sid, seq) => contextResetService?.onTurnOpen(sid, seq),
+        // Issue #6559: a finalize the boot sweep orphaned still reaches the
+        // service RAW, so an operator's stop of that turn drops the request.
+        onUnresolvedFinalize: event =>
+          contextResetService?.onUnresolvedFinalize(event.sid, event.outcome),
         // Sub D (#1666): OPEN-time identity/account/repo enrichment from
         // session.metadata, plus finalize git passthrough (CLI-wire).
         openEnrichStep: createOpenEnrichStep(sid => engine.getSession(sid)),
@@ -1262,6 +1316,83 @@ async function main() {
     // out-of-band page uses the shared #1883 Notifier (setNotifier, above).
     engine.setCeilingGuardConfig(await loadCeilingGuardConfig(settingsFile));
     engine.setCeilingGuardDeps({ pushService });
+  }
+
+  // Issue #6559 (Task 10): the context-reset service — a lane's same-session
+  // fresh conversation at a stage boundary. Every port is wired here; the
+  // switch (`HAPI_CONTEXT_RESET`, then `contextReset.enabled` in settings.json)
+  // is read fresh at every arm and evaluation, so it ships dark. The backstop
+  // loop runs with the switch off, because a request armed before the switch
+  // went off still owes its lane a delivery.
+  if (syncEngine) {
+    const engine = syncEngine;
+    const approvalStateDir = loadApprovalTokensConfig().globalStateDir ?? null;
+    contextResetService = new ContextResetService({
+      requests: store.contextReset,
+      engine: {
+        getSession: id => engine.getSession(id),
+        subscribe: listener => engine.subscribe(listener),
+        // syncEngine.sendMessage → messageService.sendMessage: never the queue.
+        sendMessage: adaptEngineSend((sid, payload) =>
+          engine.sendMessage(sid, payload)
+        ),
+      },
+      loadConfig: () => loadContextResetConfig(config.dataDir),
+      getOpenTurnSeq: sid => turnLifecycle?.getOpenTurnSeq(sid) ?? null,
+      isHandoffHeld: sid => contextWatermarkService?.isHeld(sid) ?? false,
+      challengePending: session =>
+        challengePendingOnDisk(session, approvalStateDir),
+      listSessionMessages: sid =>
+        listUserRoleMessages(
+          (s, afterSeq, limit) =>
+            store.messages.getMessagesAfter(s, afterSeq, limit),
+          sid
+        ),
+      listActiveClaims: sid =>
+        activeClaimsOf(
+          store.fileClaims.getClaimsBySession(sid, { includeReleased: false })
+        ),
+      zeroContextUsage: sid => engine.zeroContextUsage(sid),
+      // ROUND RV10 item 2: a hold that ends with no new turn wakes the drain.
+      wakeQueueDrain: sid => queueDrainObserver?.wake(sid),
+      rerecordGrantMint: sid => {
+        engine.rerecordGrantMintsFromDisk(sid);
+      },
+      // Task 12's sink: each arm and terminal outcome becomes a
+      // `context_reset` event on the arming turn's row.
+      recordEvent: event => {
+        const written =
+          event.turnSeq !== null &&
+          (turnLifecycle?.appendTurnEvents(event.sessionId, event.turnSeq, [
+            contextResetTurnEvent(event, Date.now()),
+          ]) ??
+            false);
+        if (!written) {
+          errorLogger.warn(
+            `context-reset event ${event.outcome} for ${event.armId} found no turn row`,
+            {
+              category: "context-reset",
+              sessionId: event.sessionId,
+              context: {
+                turnSeq: event.turnSeq,
+                outcome: event.outcome,
+                reason: event.reason,
+              },
+            }
+          );
+        }
+      },
+      nodeId: jobNodeId,
+      jobRegistry,
+      errorLogger,
+    });
+    engine.setContextResetHooks({
+      isPending: sid => contextResetService?.isPending(sid) ?? false,
+      abort: sid => contextResetService?.abort(sid) ?? false,
+      onSessionRespawn: sid => contextResetService?.onSessionRespawn(sid),
+      onSessionEnd: sid => contextResetService?.onSessionEnd(sid),
+    });
+    contextResetService.start();
   }
 
   // Epic #1662, Sub J (#1672): workflow-state reconcile poller. Node-local
@@ -1422,6 +1553,18 @@ async function main() {
     }
   }
 
+  // Issue #6978: the out-of-credit observer's requesting side. Its getters are
+  // late-bound, and `config.settingsFile` is the same memoized file the web
+  // app's own SharedApiKeyService reads, so a second instance is safe. With no
+  // registry (a `node` role or federation off) a foreign key's report is
+  // refused as `api_key_home_unknown` and logged once a minute.
+  apiKeyCreditReporter = new SharedApiKeyService({
+    getSettingsFile: () => config.settingsFile,
+    getFederationConfig: () => federationConfig,
+    getNodeRegistry: () => nodeRegistry,
+    errorLogger,
+  });
+
   // #6217: every node shows its own health. A standalone install (federation
   // off — every customer VM) and a spoke (role "node") build no aggregator
   // above, so run a local-only one: it samples this node in-process, keeps its
@@ -1455,6 +1598,21 @@ async function main() {
         }
       : null;
   });
+  // Issue #6456: the follow service reads an original on another node by its
+  // ID, through the same lookup as the by-ID routes, in the copy's namespace.
+  // Set here for the same reason as the line above.
+  const followEngine = syncEngine;
+  syncEngine.setPinFollowLookup((pinId, namespace) =>
+    lookupPinById(
+      enginePinByIdDeps(followEngine, {
+        registry: nodeRegistry,
+        localNode: resolveLocalNodeIdentity(federationConfig),
+        localOnly: isPinLookupLocalOnly(federationConfig),
+      }),
+      namespace,
+      pinId
+    )
+  );
 
   // Issue #6646 (Task 5): the billable switch's service, constructed after the
   // engine exists (never inside the `new SyncEngine(` call) and after the
@@ -1471,6 +1629,8 @@ async function main() {
     refreshSession: id => syncEngine?.refreshBillableSwitchSession(id),
     getRole: () => (federationConfig ? federationConfig.role : "node"),
     sweepPendingByTag: () => syncEngine?.sweepPendingSpawnQueues(),
+    // #6778 PR-C (moved item 3): a lost start's inbox notice.
+    notify: input => syncEngine?.notifyUser(input),
   });
   syncEngine.setBillableSwitchService(billableSwitchService);
 
@@ -1726,6 +1886,8 @@ async function main() {
     getSchedulerService: () =>
       loadedExtensions?.getService<SchedulerService>("scheduler") ?? null,
     getContextWatermarkService: () => contextWatermarkService,
+    // #6559 (Task 11): the context-reset read and cancel routes.
+    getContextResetService: () => contextResetService,
     getNodeRegistry: () => nodeRegistry,
     getNotificationService: () => notificationService,
     getHealthAggregator: () => healthAggregator,
@@ -1913,6 +2075,16 @@ async function main() {
     log: (message, context) => console.log(message, context ?? ""),
   });
   pinDeadlineLoop.start();
+  // #6456: close a pin settled elsewhere that no event delivered (a crash between
+  // a commit and its drain, an original on another node). Once at boot, then
+  // every five minutes; inert while Pins is off.
+  pinFollowLoop = createPinFollowLoop({
+    follow: syncEngine.pinFollow,
+    node: jobNodeId,
+    registry: jobRegistry,
+    enabled: resolvePinsEnabled(),
+  });
+  pinFollowLoop.start();
   transcriptIndexer.start({ config, jobNodeId, jobRegistry, syncEngine });
   // Issue #6164 (A1): throughput telemetry loops + the routes' summary service.
   throughput.start({
@@ -1936,7 +2108,10 @@ async function main() {
     syncEngine,
     store,
     errorLogger,
-    isHandoffHeld: sid => contextWatermarkService?.isHeld(sid) ?? false,
+    // #6559 (R13, one hold): the keep-alive also holds while a reset is pending.
+    isHandoffHeld: sid =>
+      (contextWatermarkService?.isHeld(sid) ?? false) ||
+      (contextResetService?.isPending(sid) ?? false),
   });
 
   turnMirrorWiring.startTurnMirrorPull({
@@ -2050,6 +2225,7 @@ async function main() {
     walCheckpointLoop?.stop();
     cpuSamplerLoop?.stop();
     pinDeadlineLoop?.stop();
+    pinFollowLoop?.stop();
     transcriptIndexer.stop();
     throughput.stop(); // issue #6164
     telemetryExecutor.stop(); // issue #6516: never waits for the worker's close
@@ -2068,6 +2244,7 @@ async function main() {
     autoRecoveryService?.stop();
     autoSwitchService?.stop();
     contextWatermarkService?.stop();
+    contextResetService?.stop();
     deferredApplyWatcher?.stop();
     // #1274: the scheduler's stop() moved into `builtin.scheduler`'s
     // `host.lifecycle.onShutdown` hook, drained further down this handler —

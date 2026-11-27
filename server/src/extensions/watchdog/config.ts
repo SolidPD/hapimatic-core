@@ -10,7 +10,8 @@
 import {
   getSettingsFile,
   readSettings,
-  writeSettings,
+  updateSettings,
+  type Settings,
 } from "../../config/settings";
 import type { StallWatchdogConfig } from "./types";
 
@@ -72,20 +73,24 @@ export async function loadStallWatchdogConfig(
   };
 }
 
-/** Persist stall watchdog config updates to settings.json */
+/**
+ * Persist stall watchdog config updates to settings.json.
+ * #4056: through `updateSettings`, so an unreadable file is refused with
+ * `SettingsUnreadableError` and left byte-identical.
+ */
 export async function saveStallWatchdogConfig(
   dataDir: string,
   updates: Partial<StallWatchdogConfig>
 ): Promise<StallWatchdogConfig> {
   const settingsFile = getSettingsFile(dataDir);
-  const settings = (await readSettings(settingsFile)) ?? {};
-  const raw = (settings as Record<string, unknown>).stallWatchdog;
-  const existing = raw && typeof raw === "object" ? raw : {};
-
-  const merged = { ...existing, ...updates };
-  (settings as Record<string, unknown>).stallWatchdog = merged;
-
-  await writeSettings(settingsFile, settings);
+  await updateSettings(settingsFile, current => {
+    const raw = (current as Record<string, unknown>).stallWatchdog;
+    const existing = raw && typeof raw === "object" ? raw : {};
+    return {
+      ...current,
+      stallWatchdog: { ...existing, ...updates },
+    } as Settings;
+  });
 
   return loadStallWatchdogConfig(dataDir);
 }

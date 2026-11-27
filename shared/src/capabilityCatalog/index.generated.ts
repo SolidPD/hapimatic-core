@@ -50,7 +50,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
-    "description": "Switch the Anthropic account bound to a session on the node that owns it, restarting the session process. Peer-incoming receiver for a remote-owned session.",
+    "description": "Switch a session's payment method on the node that owns it, restarting or staging it: an account, or an API key by reference. Peer-incoming receiver for a remote-owned session.",
     "domain": "accounts",
     "id": "accounts.api-federation-sessions-account",
     "invocation": {
@@ -63,7 +63,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "surface": "rest",
     "telemetry": "sampled",
     "trusted": true,
-    "whenToUse": "When switching the account for a session whose process lives on a remote federation node."
+    "whenToUse": "When switching the account or API key for a session whose process lives on a remote federation node."
   },
   {
     "auth": "none",
@@ -528,6 +528,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Record that a federation peer's session was refused by the provider for lack of credit on a key THIS node shares, so the key reads Out of credit here. Audited; never returns a key.",
+    "domain": "accounts",
+    "id": "accounts.federation-api-keys-out-of-credit",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/api-keys/out-of-credit"
+    },
+    "probe": "skip",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "off",
+    "trusted": true,
+    "whenToUse": "Only node-to-node: a federation peer reporting that a key this node shares ran out of credit."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Confirm one key THIS node shares and return its label, masked form and status, never the key.",
     "domain": "accounts",
     "id": "accounts.federation-api-keys-resolve",
@@ -588,7 +608,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
-    "description": "Return this node's sha256 refresh-token chain fingerprint for an account (never the raw token), so a peer can prove chain independence before rotating.",
+    "description": "Return this node's sha256 refresh-token fingerprints for an account (each folder layout and its login), sign-in deadlines and marker hashes and times (never a token), so a peer can prove independence.",
     "domain": "accounts",
     "id": "accounts.federation-chain-fingerprint",
     "invocation": {
@@ -608,7 +628,7 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
-    "description": "List, per federation node, the sha256 refresh-token chain fingerprint for an account (never raw tokens) plus a degraded flag — the cross-node chain-independence probe.",
+    "description": "List, per federation node, an account's sha256 refresh-token fingerprints, sign-in deadlines and sign-in marker hashes and times (never a token), plus a degraded flag — the chain-independence probe.",
     "domain": "accounts",
     "id": "accounts.federation-chain-fingerprints",
     "invocation": {
@@ -3309,6 +3329,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the operator wants to see what a VM teardown would do before applying it."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Return RP1's nightly fleet parity verdict for the status page: per node its state, commit, last check, engine, failing items and actions with remedies; secret and account names as counts.",
+    "domain": "harness-admin",
+    "id": "harness-admin.api-admin-vms-fleet-parity",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/admin-vms/fleet-parity"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the operator wants to see which nodes are at parity, which are being repaired, and which need a person."
   },
   {
     "auth": "jwt",
@@ -9073,6 +9113,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "operator"
     },
+    "description": "Reopen a pin closed as superseded, on the node that owns the session. Peer-incoming; the hub proxies the operator's Reopen here.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-reopen",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pins/:key/reopen"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the operator reopens a superseded pin of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
     "description": "Record a decision an agent reports on a pin, on the node that owns the session. Peer-incoming; a hub's CLI route proxies here for a remote-owned session.",
     "domain": "session-introspection",
     "id": "session-introspection.api-federation-sessions-pins-resolve",
@@ -9087,6 +9147,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When resolving a pin of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Retire an open Detected pin as superseded, on the node that owns the session, for the caller the hub resolved. Peer-incoming; a hub's CLI route proxies here.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-retire",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pins/:key/retire"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When retiring a Detected pin of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Record a Project Manager's ruling on a lane's pin, on the node that owns the session, for the caller the hub resolved. Peer-incoming; a hub's CLI route proxies here.",
+    "domain": "session-introspection",
+    "id": "session-introspection.api-federation-sessions-pins-rule",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/federation/sessions/:id/pins/:key/rule"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a Project Manager rules on a pin of a lane whose process lives on a remote federation node."
   },
   {
     "auth": "federation-token",
@@ -9548,6 +9648,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Retire an open Detected pin settled elsewhere, as superseded with a reason, never as the operator's answer. Its PM may; the session itself only with proof.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-retire-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/sessions/:id/pins/:key/retire"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a Detected pin repeats an ask already decided elsewhere."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Record a Project Manager's ruling on an open pin of a lane it started, at the revision it read; recorded as the PM's, never as the operator's answer.",
+    "domain": "session-introspection",
+    "id": "session-introspection.cli-rule-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/cli/sessions/:id/pins/:key/rule"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the Project Manager that started a session decides that session's own pin."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Read one session's message history over the CLI-token surface. Send exactCursor=1 to read from seq 0; without it, afterSeq=0 is served from the session's first-attach floor, if one exists (#4682).",
     "domain": "session-introspection",
     "id": "session-introspection.cli-session-messages",
@@ -9622,6 +9762,46 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When an agent no longer needs the operator's answer."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Return the effective context-reset config and which source set the switch.",
+    "domain": "session-introspection",
+    "id": "session-introspection.context-reset-config-get",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/context-reset/config"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When checking whether context reset is switched on."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Return a session's context-reset request: pending, or its last outcome.",
+    "domain": "session-introspection",
+    "id": "session-introspection.context-reset-get",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/sessions/:id/context-reset"
+    },
+    "probe": "safe",
+    "riskTier": "readonly",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When checking a lane's pending context reset."
   },
   {
     "auth": "jwt",
@@ -10239,6 +10419,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "To take back a question the operator no longer needs to answer."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Put a pin closed as superseded back in Action Items, so it is open again and no agent or Project Manager can close it as superseded again. Only the operator reopens; a session cannot.",
+    "domain": "session-introspection",
+    "id": "session-introspection.reopen-pin",
+    "invocation": {
+      "kind": "rest",
+      "method": "POST",
+      "path": "/api/sessions/:id/pins/:key/reopen"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the user taps Reopen on a superseded pin in the Completed list."
   },
   {
     "auth": "jwt",
@@ -11018,6 +11218,66 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When a rename must be applied to a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Read a session's time-tracking record on the node that owns it. Peer-incoming; the hub proxies here and leaves out the money fields for an agent.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-sessions-tracking",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/federation/sessions/:id/tracking"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub reads the tracking record of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Read every change to a session's time-tracking record on the node that owns it, with both snapshots of each. Peer-incoming; the hub redacts for an agent.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-sessions-tracking-history",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/federation/sessions/:id/tracking/history"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub reads the tracking history of a session whose process lives on a remote federation node."
+  },
+  {
+    "auth": "federation-token",
+    "availability": {
+      "scope": "operator"
+    },
+    "description": "Change a session's time-tracking record on the node that owns it, with the actor and the category answer the hub recorded. Peer-incoming.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.api-federation-sessions-tracking-set",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/federation/sessions/:id/tracking"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the hub forwards a tracking change for a session whose process lives on a remote federation node."
   },
   {
     "auth": "federation-token",
@@ -11892,6 +12152,26 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Cancel a session's armed context reset; nothing is delivered. A reset already firing is refused (already_delivering).",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.context-reset-cancel",
+    "invocation": {
+      "kind": "rest",
+      "method": "DELETE",
+      "path": "/api/sessions/:id/context-reset"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When the operator stops a pending context reset."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Read the saved per-field default values that pre-fill the Create-Session form for new sessions.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.create-defaults-preference",
@@ -12411,6 +12691,25 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "availability": {
       "scope": "user"
     },
+    "description": "Arm a context reset: when this turn ends cleanly, the session continues in a fresh conversation that starts with the resume notes.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.request-context-reset",
+    "invocation": {
+      "kind": "mcp",
+      "tool": "request_context_reset"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "mcp",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "To reset context."
+  },
+  {
+    "auth": "cli-token",
+    "availability": {
+      "scope": "user"
+    },
     "description": "Read the runner identity layer's mode, counts since the server start, and the namespace's live processes the hub cannot name as a session's current runner.",
     "domain": "session-lifecycle",
     "id": "session-lifecycle.runner-identity-status",
@@ -12583,6 +12882,66 @@ export const capabilityCatalogIndex: readonly CatalogEntry[] = [
     "telemetry": "sampled",
     "trusted": true,
     "whenToUse": "When the user takes over a local terminal session from the web UI."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read a session's time-tracking record: whether it is tracked, its billing status, category and rate, and whether it waits for a person's confirmation.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.tracking",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/sessions/:id/tracking"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When showing or editing how a session's time is billed, on whichever node owns it, including after the session was deleted."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Read every change to a session's time-tracking record, oldest first, each with the record before and after and who made it.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.tracking-history",
+    "invocation": {
+      "kind": "rest",
+      "method": "GET",
+      "path": "/api/sessions/:id/tracking/history"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When showing or checking how a session's billing changed over time, for a bill or an audit, including after the session was deleted."
+  },
+  {
+    "auth": "jwt",
+    "availability": {
+      "scope": "user"
+    },
+    "description": "Turn a session's time tracking on or off, or change its billing status, category, rate and note, on whichever node owns it; the change is recorded with who made it.",
+    "domain": "session-lifecycle",
+    "id": "session-lifecycle.tracking-set",
+    "invocation": {
+      "kind": "rest",
+      "method": "PUT",
+      "path": "/api/sessions/:id/tracking"
+    },
+    "probe": "safe",
+    "riskTier": "mutating",
+    "surface": "rest",
+    "telemetry": "sampled",
+    "trusted": true,
+    "whenToUse": "When a person sets or changes how a session's time is billed. An agent may only set a tracked session to Non-billable."
   },
   {
     "auth": "jwt",

@@ -74,7 +74,14 @@ import type {
   FeedbackConvertResponse,
   McpCatalogRouteResponse,
 } from "@/types/api";
-import type { BillableSwitchStartChoice, McpSet } from "@hapi/protocol";
+import type {
+  BillableConfirm,
+  BillableSwitchStartBody,
+  McpSet,
+  TrackingBillingStatus,
+  TrackingRecord,
+  TrackingSettingsInput,
+} from "@hapi/protocol";
 import type { QueuedMessage, SessionView } from "@hapi/protocol/types";
 import type { ClaudeRemoteLauncherKind } from "@hapi/protocol/launcherResolver";
 import type {
@@ -354,6 +361,30 @@ const BILLING_CATEGORY_REPORT_OPTS: RequestReportOptions = {
 };
 
 /**
+ * Issue #6778 (7.1-7.3): every tracking answer below 500 is designed (the gate
+ * off, a refused field, an agent, a stale token, a waiting copy, an owner that
+ * cannot serve the record), so none is reported; the caller reads its `code`.
+ */
+const TRACKING_REPORT_OPTS: RequestReportOptions = {
+  expectedStatuses: [400, 403, 404, 409, 503],
+};
+
+/**
+ * Issue #6780: a tracked start's designed answers (a missing note, a target
+ * that cannot take it, a category that left the list) are the page's to show,
+ * so they are not error reports; an untracked spawn reports as before. The
+ * option works by status, so a tracked spawn's unrelated faults of those
+ * statuses are not reported either (Key Decision 8, accepted: an untracked
+ * retry reports them).
+ */
+function trackedStartReportOpts(
+  parent: SpawnParentOptions | undefined
+): RequestReportOptions | undefined {
+  const start = parent?.billableSwitchStart;
+  return start && "tracking" in start ? TRACKING_REPORT_OPTS : undefined;
+}
+
+/**
  * Parse a billing category answer with its shared (stripping) schema. A body
  * that fails it throws an error whose text names no value from the body.
  */
@@ -547,9 +578,10 @@ export type SpawnParentOptions = {
   /** Issue #6171: the MCP servers the session starts with. Absent → the
    *  target project's default, else every server (the body has no field). */
   mcpSet?: McpSet;
-  /** Issue #6646 (ruling T-1): the Create form's billable start; a client
-   *  sends only `{ choice }`. Absent → the body has no field. */
-  billableSwitchStart?: { choice: BillableSwitchStartChoice };
+  /** Issue #6646 (ruling T-1): the Create form's billable start. #6778 (4.1):
+   *  `{ choice }` or a person's `{ tracking }` settings, exactly one key.
+   *  Absent → the body has no field. */
+  billableSwitchStart?: BillableSwitchStartBody;
 };
 
 /**
@@ -711,6 +743,65 @@ export type BillableSwitchHistory = {
   originNodeId: string | null;
   mirrorSyncedAt: number | null;
   events: BillableSwitchHistoryEvent[];
+};
+
+/**
+ * Issue #6778 (7.1): `GET /api/sessions/:id/tracking`. `record` leaves out the
+ * rate, the default rate and the note for an agent's request (the keys are
+ * absent: the server deletes them, it does not set them to null).
+ * `tracked` is null only for an older node's summary that cannot say.
+ * `earlierMs` (rulings PRC-R1, PRC-R7) is the session's untracked earlier time,
+ * present for a live session of a PR-C node, with a record or without one; the
+ * old switch dialog shows it for a session with no record (`oldSwitchAmount`),
+ * and without it the timer, as before PR-C.
+ */
+export type SessionTrackingResponse = {
+  sessionId: string;
+  tracked: boolean | null;
+  record: TrackingRecord | null;
+  confirm: BillableConfirm;
+  timeStatus: TrackingBillingStatus | null;
+  /** The write token: the session's highest history id (0 when none). */
+  token: number;
+  source: "local" | "deleted" | "origin" | "mirror" | "summary";
+  nodeId: string | null;
+  reconcilePending: boolean;
+  earlierMs?: number;
+};
+
+/** Issue #6778 (7.1): the three forms of `PUT /api/sessions/:id/tracking`. */
+export type SessionTrackingPutBody =
+  | { token: number; tracked: false }
+  | { token: number; tracked: true; billingStatus: TrackingBillingStatus }
+  | {
+      token: number;
+      tracked: true;
+      settings: TrackingSettingsInput;
+      includeEarlier?: boolean;
+      origin?: "session-controls";
+    };
+
+export type SessionTrackingPutResponse = {
+  ok: true;
+  changed: boolean;
+  record: TrackingRecord | null;
+  token: number;
+};
+
+/** Issue #6778 (7.1): one row of every kind, with both snapshots (3.2). */
+export type SessionTrackingHistoryEvent = BillableSwitchHistoryEvent & {
+  settingsBefore: Record<string, unknown> | null;
+  settingsAfter: Record<string, unknown> | null;
+  origin: string | null;
+  trackFrom: number | null;
+};
+
+export type SessionTrackingHistory = {
+  sessionId: string;
+  source: "local" | "deleted" | "origin" | "mirror";
+  originNodeId: string | null;
+  mirrorSyncedAt: number | null;
+  events: SessionTrackingHistoryEvent[];
 };
 
 export class ApiClient {
@@ -2270,7 +2361,8 @@ export class ApiClient {
       },
       0,
       undefined,
-      ApiClient.SPAWN_TIMEOUT_MS
+      ApiClient.SPAWN_TIMEOUT_MS,
+      trackedStartReportOpts(parent)
     );
   }
 
@@ -2366,7 +2458,8 @@ export class ApiClient {
       },
       0,
       undefined,
-      ApiClient.SPAWN_TIMEOUT_MS
+      ApiClient.SPAWN_TIMEOUT_MS,
+      trackedStartReportOpts(parent)
     );
   }
 
@@ -2559,6 +2652,25 @@ export class ApiClient {
       undefined,
       ApiClient.DEFAULT_TIMEOUT_MS,
       { expectedStatuses: [409] }
+    );
+  }
+
+  /**
+   * #6456 (R8): put a pin closed as superseded back in Action Items. The server
+   * refuses a pin that is not superseded and the open cap with 409, and a node
+   * built before #6456 with 501; the caller shows the refusal.
+   */
+  async reopenSessionPin(
+    sessionId: string,
+    key: string
+  ): Promise<PinMutationResponse> {
+    return await this.request<PinMutationResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/pins/${encodeURIComponent(key)}/reopen`,
+      { method: "POST" },
+      0,
+      undefined,
+      ApiClient.DEFAULT_TIMEOUT_MS,
+      { expectedStatuses: [409, 501] }
     );
   }
 
@@ -2939,6 +3051,52 @@ export class ApiClient {
       undefined,
       undefined,
       BILLABLE_REPORT_OPTS
+    );
+  }
+
+  // ─── Issue #6778: a session's tracking record (7.1) ───────────────────────
+  // Behind the same gate as the switch: a bare 404 while it is off.
+
+  /** The session's tracking record (`GET /api/sessions/:id/tracking`). */
+  async getSessionTracking(
+    sessionId: string
+  ): Promise<SessionTrackingResponse> {
+    return await this.request<SessionTrackingResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/tracking`,
+      undefined,
+      0,
+      undefined,
+      undefined,
+      TRACKING_REPORT_OPTS
+    );
+  }
+
+  /** Change it (`PUT /api/sessions/:id/tracking`); 409 `stale_token` carries only the new token. */
+  async setSessionTracking(
+    sessionId: string,
+    body: SessionTrackingPutBody
+  ): Promise<SessionTrackingPutResponse> {
+    return await this.request<SessionTrackingPutResponse>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/tracking`,
+      { method: "PUT", body: JSON.stringify(body) },
+      0,
+      undefined,
+      undefined,
+      TRACKING_REPORT_OPTS
+    );
+  }
+
+  /** Every history row of the session, every kind, with both snapshots. */
+  async getSessionTrackingHistory(
+    sessionId: string
+  ): Promise<SessionTrackingHistory> {
+    return await this.request<SessionTrackingHistory>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/tracking/history`,
+      undefined,
+      0,
+      undefined,
+      undefined,
+      TRACKING_REPORT_OPTS
     );
   }
 

@@ -2,6 +2,7 @@
 import { useEffect } from "react";
 import { useAppContext } from "@/lib/app-context";
 import { NotificationSettingsBody } from "@/components/NotificationSettings";
+import { useBillableSwitchMode } from "@/hooks/useBillableSwitch";
 
 /**
  * NotificationsSection — the notification settings on Settings → Notifications
@@ -23,6 +24,8 @@ import { NotificationSettingsBody } from "@/components/NotificationSettings";
  */
 export function NotificationsSection() {
   const { api, refreshPushSubscription } = useAppContext();
+  // #6778 PR-C (moved item 3): a billable tracking kind's row follows the gate.
+  const billableSwitch = useBillableSwitchMode();
 
   useEffect(() => {
     return () => {
@@ -30,5 +33,5 @@ export function NotificationsSection() {
     };
   }, [refreshPushSubscription]);
 
-  return <NotificationSettingsBody api={api} />;
+  return <NotificationSettingsBody api={api} billableSwitch={billableSwitch} />;
 }

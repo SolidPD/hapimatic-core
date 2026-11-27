@@ -27,6 +27,7 @@ import { StoredNotificationSchema } from "./notifications";
 import { ProviderIdSchema } from "./providerAuthState";
 import { PromptCacheStateSchema } from "./cacheKeepalive";
 import { BillableConfirmSchema } from "./billableSwitch";
+import { SpawnTrackingAnswerSchema } from "./billableTracking";
 import {
   PIN_CHANGES,
   PIN_KINDS,
@@ -444,6 +445,12 @@ export const MetadataSchema = z
      * legacy/in-flight sessions and non-Claude flavors won't have it.
      */
     launcherKind: ClaudeRemoteLauncherKindSchema.optional(),
+    /**
+     * Issue #6918 (R10): the wrapper sets HAPI_AGENT_CALLER=1 in its agent
+     * child, so the agent's spawns send the caller header. Absent on a wrapper
+     * from before #6918: its header-less spawns stay undecided.
+     */
+    agentCallerMarker: z.boolean().optional(),
     /** Issue #1633: session launched with --safe-mode (CLAUDE.md, skills,
      *  hooks, MCP customizations disabled). Read by server-side respawn paths
      *  (model switch, account switch) so the flag survives a restart. */
@@ -758,6 +765,35 @@ export type BackgroundAgentsSnapshot = z.infer<
   typeof BackgroundAgentsSnapshotSchema
 >;
 
+/**
+ * Issue #6918: why a session's manager stamp reads as it does. Written once at
+ * spawn by the node that holds the parent; absent (null) means undecided.
+ * - "manager": the parent is a project manager and made the spawn.
+ * - "inherited": the parent was itself stamped and has no operator message.
+ * - "none": the parent made the spawn, and no manager is above it (or the
+ *   parent had an operator message).
+ * - "not-from-parent": the spawn was not made by its parent session.
+ * - "successor": a watermark successor carrying its predecessor's stamp
+ *   (only behind HAPI_MANAGER_STAMP_SUCCESSOR=1).
+ */
+export const MANAGER_STAMP_REASONS = [
+  "manager",
+  "inherited",
+  "none",
+  "not-from-parent",
+  "successor",
+] as const;
+export const ManagerStampReasonSchema = z.enum(MANAGER_STAMP_REASONS);
+export type ManagerStampReason = z.infer<typeof ManagerStampReasonSchema>;
+
+/** Issue #6918: a stored reason string, or null (undecided) for anything else. */
+export function parseManagerStampReason(
+  value: unknown
+): ManagerStampReason | null {
+  const parsed = ManagerStampReasonSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
 export const SessionSchema = z
   .object({
     id: z.string(),
@@ -907,6 +943,14 @@ export const SessionSchema = z
     branchLabel: z.string().nullable().optional(),
     /** Branching: timestamp when this branch was created */
     branchCreatedAt: z.number().nullable().optional(),
+    /**
+     * Issue #6918: the nearest project-manager session above this one, claimed
+     * at spawn (store uuid, the id space of parentSessionId). Set once, never
+     * cleared; null when unstamped or decided not managed.
+     */
+    managerSessionId: z.string().nullable().optional(),
+    /** Issue #6918: the decision marker; absent or null means undecided. */
+    managerStampReason: ManagerStampReasonSchema.nullable().optional(),
   })
   .passthrough();
 
@@ -1216,6 +1260,11 @@ export const SyncEventSchema = z.discriminatedUnion("type", [
     sessionId: z.string(),
     nodeLabel: z.string().optional(),
     namespace: z.string().optional(),
+    // #6778 PRC-R9: the owning node's answer for a start that carried
+    // settings or a copy, as the hub parsed it; absent means unknown. A value
+    // this client cannot read (a newer hub's cause) leaves the field out and
+    // the event still lands (FND-7, B3's rule).
+    trackingStart: SpawnTrackingAnswerSchema.optional().catch(undefined),
   }),
   // Issue #1449: manual-login account auto-capture (live dropdown update).
   // Plain non-session SyncEvent (mirrors federation-spawn-failed shape) — the

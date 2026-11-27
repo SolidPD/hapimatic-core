@@ -12,7 +12,11 @@ import {
   writeGlobalOptOut,
   writeMutedSessions,
 } from "@/lib/notificationPreferences";
-import { NEW_KIND_PREFERENCE_KEYS } from "@/lib/notificationKindPrefs";
+import {
+  NEW_KIND_PREFERENCE_KEYS,
+  preferenceKeyShownWithGate,
+  type BillableGateState,
+} from "@/lib/notificationKindPrefs";
 
 // Storage keys, the per-type helpers, and the SW cache-sync (which now also
 // carries the per-session mute set, issue #87) live in @/lib/notificationPreferences
@@ -171,10 +175,20 @@ const EVENT_KIND_ROWS: Record<
     label: "Sign-in Ending",
     description: "When an account's sign-in on a node is about to end",
   },
+  trackingNotApplied: {
+    label: "Tracking Not Applied",
+    description:
+      "When a new session starts untracked instead of with its tracking settings",
+  },
 };
 
 export type NotificationSettingsBodyProps = {
   api: ApiClient | null;
+  /**
+   * #6778 PR-C (moved item 3): this node's billable sessions gate. A billable
+   * tracking kind's row shows only while it is on or closed; absent = off.
+   */
+  billableSwitch?: BillableGateState;
 };
 
 export function NotificationSettingsBody(props: NotificationSettingsBodyProps) {
@@ -446,7 +460,9 @@ export function NotificationSettingsBody(props: NotificationSettingsBodyProps) {
             description={row.description}
           />
         ))}
-        {NEW_KIND_PREFERENCE_KEYS.map(key => (
+        {NEW_KIND_PREFERENCE_KEYS.filter(key =>
+          preferenceKeyShownWithGate(key, props.billableSwitch)
+        ).map(key => (
           <Toggle
             key={key}
             checked={prefs[key]}

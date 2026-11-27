@@ -208,6 +208,18 @@ export class BackgroundAgentTracker {
     this.now = opts?.now ?? (() => Date.now());
   }
 
+  /**
+   * Issue #6559 (Task 3, R12): the query ended, so its Claude process and every
+   * agent and shell it ran are gone. Clears everything, the `subagents/` dir
+   * included (the next launch sets it again), so an agent that died with the
+   * process is never shown as running for ever.
+   */
+  reset(): void {
+    this.clearAll();
+    this.agentToolUseCache.clear();
+    this.subagentsDir = undefined;
+  }
+
   /** Set the session's resolved `subagents/` directory (account-isolated config
    *  dir root, NOT a hardcoded ~/.claude). Omit/undefined → no disk checks. */
   setSubagentsDir(dir: string | undefined): void {

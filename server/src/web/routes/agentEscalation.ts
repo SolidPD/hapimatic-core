@@ -90,7 +90,14 @@ import {
   isRetiredBillableSwitchChoice,
   isYoloEquivalentMode,
   KNOWN_AGENT_IDS,
+  validateTrackingSettings,
+  type BillableSwitchBranchClaim,
+  type BillableSwitchMode,
   type McpSet,
+  type SpawnWarning,
+  type TrackingCarriedCopy,
+  type TrackingSettingsInput,
+  type TrackingStartValues,
 } from "@hapi/protocol";
 import {
   clampSpawnPermissionMode,
@@ -101,6 +108,7 @@ import type { PermissionMode } from "@hapi/protocol/types";
 import type { NodeRegistry } from "../../federation/nodeRegistry";
 import type { Session, SyncEngine } from "../../sync/syncEngine";
 import type { WebAppEnv } from "../middleware/auth";
+import type { CategoryAnswer } from "./billableTracking";
 
 /** The caller-provenance header the floors read. */
 export const CALLER_SESSION_HEADER = "X-Hapi-Session-Id";
@@ -155,13 +163,13 @@ export function refuseSelfPermission(
 }
 
 /** What the caller-mode floors read of the caller, local or (#5640) remote. */
-type CallerView = { id: string; permissionMode?: PermissionMode };
+export type CallerView = { id: string; permissionMode?: PermissionMode };
 
 /**
  * The federation-cache lookups the #5616 floors read. `locateSessionByTag`
  * (#5640) is optional, like the engine's tag lookup, so a fake may omit it.
  */
-type FederationLookup = Pick<NodeRegistry, "locateSession"> &
+export type FederationLookup = Pick<NodeRegistry, "locateSession"> &
   Partial<Pick<NodeRegistry, "locateSessionByTag">>;
 
 /**
@@ -173,7 +181,7 @@ type FederationLookup = Pick<NodeRegistry, "locateSession"> &
  * nothing (`locateSessionByTag`). The id is the summary's, never the header,
  * which may be a tag: the archive floor's spawn walk compares ids.
  */
-function resolveRemoteCaller(
+export function resolveRemoteCaller(
   callerId: string,
   registry: FederationLookup | null
 ): CallerView | undefined {
@@ -650,6 +658,17 @@ export type RouteBillableSwitchStart = {
   via: "tool" | "direct";
   entryNodeId?: string;
   namespace?: string;
+  /** #6778: a person's settings, validated at the entry node (row 2; 7.3). */
+  tracking?: TrackingStartValues;
+  /** #6778: the parent an agent's start copies, always a claim (4.1; review A1). */
+  inheritedFrom?: {
+    sessionId: string;
+    nodeId: string | null;
+    claimed: true;
+    headerBound: boolean;
+  };
+  /** #6778: that parent's record, carried by the hub to another node (4.2, the one rule). */
+  inheritedCopy?: TrackingCarriedCopy;
 };
 
 /**
@@ -659,8 +678,9 @@ export type RouteBillableSwitchStart = {
  *     tool channel) → `agent`; a body choice is ignored. A person's spawn sent
  *     through `hapi api call` comes through the tool channel and is `agent` on
  *     purpose: that channel is the agents' own, and no screen uses it;
- *  2. a body choice → `person` with that choice (with or without a parent link:
- *     the web's Fan-out sends one and is a person's start);
+ *  2. a body choice, or a person's tracking settings (#6778; validated after,
+ *     by `resolvePersonTrackedStart`) → `person` (with or without a parent
+ *     link: the web's Fan-out sends one and is a person's start);
  *  3. a parent link with relationship `spawn` (what `hapi api sessions spawn`
  *     sends from inside a session) → `agent`, with the parent as the actor;
  *  4. anything else → `unattended` (a script, a Create from a cached old app).
@@ -670,6 +690,7 @@ export function buildBillableSwitchStart(
   engine: CallerSessionLookup | null,
   body: {
     choice?: RouteBillableSwitchStart["choice"];
+    tracking?: TrackingSettingsInput;
     parentSessionId?: string;
     parentRelationship?: "branch" | "spawn";
   },
@@ -685,10 +706,10 @@ export function buildBillableSwitchStart(
   if (isAgentRequest(c)) {
     return { kind: "agent", actor: billableSwitchActor(c, engine), ...common };
   }
-  if (body.choice) {
+  if (body.choice || body.tracking) {
     return {
       kind: "person",
-      choice: body.choice,
+      ...(body.choice ? { choice: body.choice } : {}),
       actor: billableSwitchActor(c, engine),
       ...common,
     };
@@ -704,6 +725,27 @@ export function buildBillableSwitchStart(
     kind: "unattended",
     actor: billableSwitchActor(c, engine),
     ...common,
+  };
+}
+
+/**
+ * #6778 PR-C (Task 15b; section 4.3, ruling 5): what a branch or a transcript
+ * resume asks for on its `inherit` start, built by the entry hub from the
+ * request and never from a body. A request that names no session and did not
+ * come through the tool channel is a person's in the app (row 6a, no wait); the
+ * CLI's verb (it stamps the caller session) and a tool are an agent's, and wait
+ * (row 6b). A header-less script reads as a person's: the residual of 7.2.
+ */
+export function inheritStartClaim(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null,
+  entryNodeId?: string
+): BillableSwitchBranchClaim {
+  return {
+    actor: billableSwitchActor(c, engine),
+    via: billableSwitchVia(c),
+    ...(entryNodeId ? { entryNodeId } : {}),
+    ...(isAgentRequest(c) ? {} : { inheritClaim: "person" as const }),
   };
 }
 
@@ -736,4 +778,163 @@ export function refuseRetiredBillableAnswer(
     },
     400
   );
+}
+
+/** A spawn refusal in the spawn routes' envelope (`type`, `error`, `message`, `code`). */
+function spawnRefusal(
+  c: Context<WebAppEnv>,
+  status: 400 | 409,
+  code: string,
+  message: string,
+  detail: Record<string, unknown> = {}
+): Response {
+  return c.json(
+    { type: "error", error: message, message, code, ...detail },
+    status
+  );
+}
+
+/** 409 `sync_unavailable` (7.3) until #6783 gives its lookup: the PUT's words and the spawn's. */
+export const SYNC_UNAVAILABLE_MESSAGE =
+  "Syncing a session's time to another service is not available yet.";
+
+/**
+ * Issue #6778 (4.1, 7.2, 7.3; Task 15): a person's spawn that carries tracking
+ * settings, checked at the entry node before anything is spawned. This node's
+ * gate must be `on`, whatever the target: off → 409
+ * `billable_feature_unsupported`, closed → 409 `billable_feature_closed` (an
+ * answer a node cannot honour is refused, never dropped). The category goes
+ * through #6779's lookup: no list, or one that cannot be read → 409
+ * `categories_unavailable` (with the lookup's reason when it gave one); a
+ * category the list does not know → 400 `invalid_field`. Then the one validator
+ * (`validateTrackingSettings`, no prior record); a sync selection → 409
+ * `sync_unavailable`, as the PUT answers. A refusal names the field and
+ * the rule, never a value. Any other start (an agent's tracking body included,
+ * which is ignored) passes unchanged.
+ */
+export async function resolvePersonTrackedStart(
+  c: Context<WebAppEnv>,
+  start: RouteBillableSwitchStart,
+  input: TrackingSettingsInput | undefined,
+  deps: {
+    mode: BillableSwitchMode;
+    nodeLabel: string;
+    lookUp: (ref: TrackingSettingsInput["category"]) => Promise<CategoryAnswer>;
+  }
+): Promise<RouteBillableSwitchStart | Response> {
+  if (start.kind !== "person" || input === undefined) return start;
+  const nodeLabel = deps.nodeLabel;
+  if (deps.mode === "off") {
+    return spawnRefusal(
+      c,
+      409,
+      "billable_feature_unsupported",
+      `${nodeLabel} does not run billable sessions, so a session cannot start with time tracking from it.`,
+      { nodeLabel }
+    );
+  }
+  if (deps.mode === "closed") {
+    return spawnRefusal(
+      c,
+      409,
+      "billable_feature_closed",
+      `Billable sessions are closed on ${nodeLabel}: a session cannot start with time tracking from it.`,
+      { nodeLabel }
+    );
+  }
+  const looked = await deps.lookUp(input.category);
+  if (!looked.ok) {
+    return spawnRefusal(
+      c,
+      409,
+      "categories_unavailable",
+      "The billing categories cannot be read right now, so a session cannot start with a category. Try again later.",
+      looked.reason ? { reason: looked.reason } : {}
+    );
+  }
+  if (looked.category === null) {
+    return spawnRefusal(
+      c,
+      400,
+      "invalid_field",
+      "The tracking settings were refused: the category is not on the list.",
+      { field: "category", reason: "unknown_category" }
+    );
+  }
+  const checked = validateTrackingSettings(input, looked.category, null);
+  if (!checked.ok) {
+    // RF-3: the PUT's own answer (7.3), never a 400 for a sync selection.
+    if (checked.reason === "sync_unavailable") {
+      return spawnRefusal(c, 409, "sync_unavailable", SYNC_UNAVAILABLE_MESSAGE);
+    }
+    return spawnRefusal(
+      c,
+      400,
+      "invalid_field",
+      `The tracking settings were refused: ${checked.field} (${checked.reason}).`,
+      { field: checked.field, reason: checked.reason }
+    );
+  }
+  return { ...start, tracking: checked.values };
+}
+
+/** C9's warning: the start went ahead without its parent's settings. */
+export const TRACKING_COPY_NOT_SENT_CALLER: SpawnWarning = {
+  code: "tracking_copy_not_sent",
+  message:
+    "The new session started untracked: the parent it names is neither the session that asked for it nor a session that one spawned, so its tracking settings were not copied.",
+};
+
+/**
+ * Issue #6778 (4.2 row 5; C9 as ruled, reviews A1 and C3; Task 15): the parent
+ * an agent's spawn copies. The parent is the body's (resolved in the caller's
+ * namespace), else the session `X-Hapi-Session-Id` resolves to; with neither,
+ * the start is untracked. Only when a copy would be made (this node's gate `on`
+ * and the parent has a record) is anything recorded, so with the gate off or an
+ * untracked parent the start is what it was before PR-C. Then, only where the
+ * header resolves, the parent must be the caller or one of its spawned sessions
+ * (`isSpawnDescendantOrSelf`); on a failure the start goes ahead without the
+ * copy, with the warning `tracking_copy_not_sent`, and nothing is written on
+ * the named parent's history. Every parent is a claim: `headerBound` records
+ * only whether the check ran. The record itself is read at registration on the
+ * owning node (the one rule of 4.2), not here.
+ */
+export function resolveAgentParent(
+  c: Context<WebAppEnv>,
+  engine: CallerSessionLookup | null,
+  start: RouteBillableSwitchStart,
+  deps: {
+    mode: BillableSwitchMode;
+    parentSessionId?: string;
+    hasRecord: (sessionId: string) => boolean;
+    nodeId: string | null;
+    lookup: TargetSessionLookup | null;
+  }
+): { start: RouteBillableSwitchStart; warning?: SpawnWarning } {
+  if (start.kind !== "agent" || deps.mode !== "on") return { start };
+  const caller = resolveCallerSession(c, engine);
+  const parentId = deps.parentSessionId ?? caller?.id;
+  if (!parentId || !deps.hasRecord(parentId)) return { start };
+  if (
+    caller &&
+    !isSpawnDescendantOrSelf(
+      parentId,
+      caller.id,
+      c.get("namespace"),
+      deps.lookup
+    )
+  ) {
+    return { start, warning: TRACKING_COPY_NOT_SENT_CALLER };
+  }
+  return {
+    start: {
+      ...start,
+      inheritedFrom: {
+        sessionId: parentId,
+        nodeId: deps.nodeId,
+        claimed: true,
+        headerBound: caller !== undefined,
+      },
+    },
+  };
 }

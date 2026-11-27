@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import type { HarnessRegistry, InstallFlavor } from "@hapi/protocol";
+import type { InstanceKind } from "@hapi/protocol/instanceKind";
 import type { SyncEngine } from "../sync/syncEngine";
 import type { Store } from "../store";
 import {
@@ -39,6 +40,8 @@ export interface UpdateServiceDeps {
   buildEnv?: () => NodeJS.ProcessEnv;
   now?: () => number;
   timeoutMs?: number;
+  /** #6977: this server's instance kind; default the boot reading. */
+  getInstanceKind?: () => InstanceKind;
 }
 
 export class UpdateService {
@@ -61,6 +64,7 @@ export class UpdateService {
       buildEnv: deps.buildEnv,
       now: deps.now,
       timeoutMs: deps.timeoutMs,
+      getInstanceKind: deps.getInstanceKind,
     });
   }
 

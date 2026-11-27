@@ -49,6 +49,10 @@ const UNKNOWN_SENT_FROM: ReadonlySet<string> = new Set([
   "auto-recovery",
   "system-notice",
   "self-update",
+  // #6559: a lane's own stage-boundary resume message, sent by the context-reset
+  // service right after the arming turn ends. Like `handoff`, a server-delivered
+  // continuation: neither a person nor a scheduled tick.
+  "stage-reset",
 ]);
 const PERSON_SENT_FROM: ReadonlySet<string> = new Set([
   "webapp",

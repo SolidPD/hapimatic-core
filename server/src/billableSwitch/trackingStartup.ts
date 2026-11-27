@@ -2,8 +2,7 @@
 import {
   applyOldRoute,
   partialBillableRecord,
-  projectBaseKey,
-  projectKeyKind,
+  trackingProjectOf,
   type OldRouteAction,
   type ProjectKeyMetadata,
   type TrackingProject,
@@ -100,8 +99,9 @@ export function runBillableTrackingStartup(
         stack: err instanceof Error ? (err.stack ?? null) : null,
         context: JSON.stringify({ step: "header-retirement" }),
       });
-    } catch {
-      // The error log cannot be written either; the boot line still says so.
+    } catch (logError) {
+      // The boot line still says so (review finding 78c033d3: never silent).
+      errorLogFailed("the header retirement's failure", logError);
     }
     // The reconcile runs in its own `try` even when the retirement failed
     // (review finding H2): skipping it left every unreplayed session open to
@@ -197,11 +197,7 @@ function sessionBasis(
   } | null;
   if (row == null) return null;
   const meta = safeJsonParse(row.metadata) as ProjectKeyMetadata;
-  const key = projectBaseKey(meta);
-  return {
-    project: { kind: projectKeyKind(meta), key, name: key },
-    createdAt: row.created_at,
-  };
+  return { project: trackingProjectOf(meta), createdAt: row.created_at };
 }
 
 /** The record a replayed row leaves (the old-route mapping, 3.3). */
@@ -308,11 +304,20 @@ function safeReconcile(store: StartupStore): BillableTrackingReconcileSummary {
         stack: err instanceof Error ? (err.stack ?? null) : null,
         context: JSON.stringify({ step: "reconcile" }),
       });
-    } catch {
-      // The boot line still says so.
+    } catch (logError) {
+      // The boot line still says so (review finding 78c033d3: never silent).
+      errorLogFailed("the reconcile's failure", logError);
     }
     return { ok: false, reconciled: 0, failedSessionIds: held, mismatches: -1 };
   }
+}
+
+/** A failed error-log write, on the console (review finding 78c033d3). */
+function errorLogFailed(what: string, error: unknown): void {
+  console.error(
+    `[BillableTracking] The error log could not record ${what}:`,
+    error instanceof Error ? error.message : String(error)
+  );
 }
 
 /** The rows a previous binary wrote that the reconcile has not replayed yet. */
@@ -327,15 +332,34 @@ const UNREPLAYED_ROWS_SQL = `FROM billable_switch_events e
                AND r.reason = 'reconciled'
                AND json_extract(r.label_json, '$.replayOf') = e.id)`;
 
-/** H2: hold every session that still has rows to replay; never throws. */
+/**
+ * The first-start to-do list (H1): a session whose switch is on and which has
+ * no record. The pass and the hold both read it.
+ */
+const SWITCHED_ON_WITHOUT_RECORD_SQL = `SELECT s.id, s.namespace FROM sessions s
+        WHERE s.billable = 1 AND NOT EXISTS (
+          SELECT 1 FROM billable_tracking_settings t
+           WHERE t.session_id = s.id AND t.namespace = s.namespace)`;
+
+/**
+ * H2: after a pass that throws as a whole, hold every session the pass would
+ * have worked on, from both of its sources: the sessions whose switch is on
+ * with no record, and (once a watermark exists) the sessions with rows to
+ * replay. Before review finding A1 (69a68652) only the second was held, and
+ * nothing at all while no watermark was written. Never throws.
+ */
 function holdUnreplayedSessions(store: StartupStore): string[] {
   try {
+    const db = store.getRawDb();
+    const switchedOn = db
+      .prepare(SWITCHED_ON_WITHOUT_RECORD_SQL)
+      .all() as Array<{ id: string }>;
+    for (const r of switchedOn) reconcilePending.add(r.id);
     const watermark = store.billableTracking.getMeta(
       BILLABLE_TRACKING_WATERMARK_KEY
     );
     if (watermark === null) return [...reconcilePending];
-    const rows = store
-      .getRawDb()
+    const rows = db
       .prepare(`SELECT DISTINCT e.session_id AS id ${UNREPLAYED_ROWS_SQL}`)
       .all(watermark) as Array<{ id: string }>;
     for (const r of rows) reconcilePending.add(r.id);
@@ -372,14 +396,10 @@ export function reconcileBillableTracking(
   // failed is settled by a retry or by the next start-up, never left without
   // its record. A session that also has rows to replay is rebuilt by the
   // replay instead (below).
-  const initialIds = db
-    .prepare(
-      `SELECT s.id, s.namespace FROM sessions s
-        WHERE s.billable = 1 AND NOT EXISTS (
-          SELECT 1 FROM billable_tracking_settings t
-           WHERE t.session_id = s.id AND t.namespace = s.namespace)`
-    )
-    .all() as Array<{ id: string; namespace: string }>;
+  const initialIds = db.prepare(SWITCHED_ON_WITHOUT_RECORD_SQL).all() as Array<{
+    id: string;
+    namespace: string;
+  }>;
   const watermark =
     store.billableTracking.getMeta(BILLABLE_TRACKING_WATERMARK_KEY) ?? 0;
   const rows = db
@@ -450,8 +470,9 @@ export function reconcileBillableTracking(
         stack: lastError instanceof Error ? (lastError.stack ?? null) : null,
         context: JSON.stringify({ step: "reconcile", sessionId }),
       });
-    } catch {
-      // The error log cannot be written either; the boot line still counts it.
+    } catch (logError) {
+      // The boot line still counts it (review finding 78c033d3: never silent).
+      errorLogFailed(`the unsettled session ${sessionId}`, logError);
     }
   }
   const failedSessionIds = [...reconcilePending];

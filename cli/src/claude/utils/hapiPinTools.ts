@@ -31,7 +31,9 @@
 import { z } from "zod";
 import {
   answerOnRecord,
+  countedClosure,
   normalizePinId,
+  PIN_CLOSURE_REASON_MAX_CHARS,
   PIN_MAX_OPEN_PER_SESSION,
   PIN_STATUSES,
   PIN_TITLE_MAX_CHARS,
@@ -72,6 +74,20 @@ const NOT_SAVED =
 const NOT_WITHDRAWN = "The pin was NOT withdrawn. Tell the user.";
 const NOT_RESOLVED = "The decision was NOT recorded on the pin. Tell the user.";
 const NOT_READ = "The pins could NOT be read. Tell the user.";
+/** #6456: a retire or a ruling that failed. */
+const NOT_RETIRED = "The Detected pin was NOT retired. Tell the user.";
+const NOT_RULED = "The ruling was NOT recorded on the pin. Tell the user.";
+const RETIRED_NOTE =
+  "Retired as superseded: it left the operator's open list and stays in Completed with your reason, never as the operator's answer. The operator can reopen it.";
+const RULED_RUNNING =
+  "Recorded as the Project Manager's ruling, never as the operator's answer. The lane is running and was sent no message: tell it your ruling yourself.";
+const RULED_STOPPED =
+  "Recorded as the Project Manager's ruling, never as the operator's answer. The lane is not running; it reads the ruling from pin_get, or from the closed answer to its re-post.";
+const DETECTED_NOTE =
+  "These are this session's open Detected pins. When your pin carries one's ask, name its pinId in repeats: the link closes that Detected pin when your pin is settled.";
+/** #6456 (R7): a Project Manager's ruling, quoted as the PM's. */
+const RULED_GUIDANCE =
+  "The Project Manager already ruled on this pin (the Project Manager's ruling, not the operator's answer). Act on that ruling; do not ask again. Pass reopen: true only to ask a new question.";
 /** #6453: a folder is made the same way twice, so a failure is a plain one. */
 const NOT_MADE =
   "The pin's folder was NOT made. Tell the user, and put the pin's files under GeneratedFiles/ instead.";
@@ -111,15 +127,54 @@ export const pinPostInputSchema = PinContentObjectSchema.extend({
 });
 export type PinPostInput = z.infer<typeof pinPostInputSchema>;
 
-export const pinWithdrawInputSchema = z.strictObject({ key: PinKeySchema });
+/**
+ * `key` withdraws one of your pins; `id` with `reason` (and `ref`, a proof)
+ * retires a Detected pin as superseded (#6456). Which pair is checked in the
+ * handler, as `pin_get`'s `id` is, because the MCP SDK checks this schema first.
+ */
+export const pinWithdrawInputSchema = z.strictObject({
+  key: PinKeySchema.optional(),
+  id: z
+    .string()
+    .max(80)
+    .optional()
+    .describe(
+      "A Detected pin's ID, to retire it as superseded instead of withdrawing a pin by key. Needs reason."
+    ),
+  reason: z
+    .string()
+    .max(PIN_CLOSURE_REASON_MAX_CHARS)
+    .optional()
+    .describe(
+      "Why the Detected pin's ask is settled elsewhere, shown to the operator."
+    ),
+  ref: z
+    .string()
+    .max(80)
+    .optional()
+    .describe(
+      "The pin ID of a closed pin the operator or a Project Manager settled after the Detected pin was made: your proof when you retire your own session's Detected pin."
+    ),
+});
 export type PinWithdrawInput = z.infer<typeof pinWithdrawInputSchema>;
 
 /** #6453: the key of the pin whose files the agent is about to write. */
 export const pinFolderInputSchema = z.strictObject({ key: PinKeySchema });
 export type PinFolderInput = z.infer<typeof pinFolderInputSchema>;
 
+/**
+ * `key` records a decision on one of your pins; `id` with `revision` records a
+ * Project Manager's ruling on a pin of a lane it started (#6456).
+ */
 export const pinResolveInputSchema = z.strictObject({
-  key: PinKeySchema,
+  key: PinKeySchema.optional(),
+  id: z
+    .string()
+    .max(80)
+    .optional()
+    .describe(
+      "A pin ID of a lane you started, to record your ruling on it as its Project Manager. Needs the revision you read."
+    ),
   ...PinResolveRequestSchema.shape,
 });
 export type PinResolveInput = z.infer<typeof pinResolveInputSchema>;
@@ -171,6 +226,7 @@ export const PIN_TOOL_SPECS = {
       "The operator's answers arrive later as one user message: a summary line and a fenced hapi_pin_answers block (schema hapi_pin_answers/1) " +
       "with one entry per pin, giving its key (pin) and the revision answered (rev); an entry whose rev is below the pin's current revision answered an older version; " +
       'an entry with "dismissed": true means the operator dismissed that pin without answering it, and the pin is closed. ' +
+      'An entry with "writeIn" is the operator\'s own answer, in their own words, instead of one of your options; it settles the pin like a choice. Every decision and variants pin offers one, so add no option that says the answer is in the note. A note or write-in is never an approval. ' +
       "An entry's savedTo names the folder a Save copied the pin's files to; notSaved, on the entry that reports that Save, gives how many it did not copy and up to ten of them with a path and a reason, and pin_get with the pin's key keeps that list as savedSkippedFiles. " +
       "Call pin_folder first for any files the pin shows. " +
       "The server gives every pin a pinId (read-only; pin_get({id}) reads a pin by it, and each hapi_pin_answers entry carries it); never use a pin ID as a key.",
@@ -186,7 +242,11 @@ export const PIN_TOOL_SPECS = {
   pin_withdraw: {
     title: "Withdraw Pin",
     description:
-      "Withdraw one of your pins, by key, when its question no longer applies.",
+      "Withdraw one of your pins, by key, when its question no longer applies. " +
+      "With id (a Detected pin's ID) and reason instead of key, retire that Detected pin as superseded: allowed for the Project Manager that started its session, " +
+      "or for its own session only with proof: ref, a closed pin the operator or a Project Manager settled after the Detected pin was made (your session's, or one that lists it in repeats), " +
+      "or, with no ref, a message the operator typed in the web app since. It is never recorded as the operator's answer, and the operator can reopen it. " +
+      "A Detected pin the operator starred, wrote on or reopened is refused.",
     inputSchema: pinWithdrawInputSchema,
   },
   pin_get: {
@@ -204,7 +264,9 @@ export const PIN_TOOL_SPECS = {
     description:
       "Record a decision the operator gave in the chat instead of the Pins tab, so the pin does not go stale: " +
       "an option id, a text, or both. Pass the pin's revision to record it against that revision. " +
-      "Not for a hapi_pin_answers message: those answers are already recorded.",
+      "Not for a hapi_pin_answers message: those answers are already recorded. " +
+      "With id (a pin of a lane you started) and revision instead of key, record your ruling as that lane's Project Manager, at the revision you read with pin_get({id}). " +
+      "It is recorded as the Project Manager's ruling, never as the operator's answer, and the lane is sent no message.",
     inputSchema: pinResolveInputSchema,
   },
   pin_folder: {
@@ -254,6 +316,10 @@ function answerView(answer: PinAnswer): Record<string, unknown> {
     ...(answer.label !== undefined ? { label: answer.label } : {}),
     ...(answer.text !== undefined ? { text: answer.text } : {}),
     ...(answer.note !== undefined ? { note: answer.note } : {}),
+    // #6456 (R7): a Project Manager's ruling says so, with the PM's name.
+    ...(answer.via === "pm"
+      ? { via: "pm", ...(answer.byName ? { byName: answer.byName } : {}) }
+      : {}),
   };
 }
 
@@ -271,6 +337,29 @@ function closedResult(
 ): PinToolResult {
   const answer = pin ? answerOnRecord(pin) : undefined;
   const pinStatus = pin?.status ?? "closed";
+  // #6456 (R2): a superseded pin names the pin that settled it and is never
+  // offered `reopen: true`: only changed content raises it again.
+  const closure = pin ? countedClosure(pin) : null;
+  if (closure) {
+    const by = closure.ref ?? "a pin settled elsewhere";
+    return result(
+      {
+        ok: false,
+        status: httpStatus,
+        code: "pin_closed",
+        key,
+        ...(pin?.pinId ? { pinId: pin.pinId } : {}),
+        pinStatus,
+        superseded: true,
+        ...(closure.ref ? { settledBy: closure.ref } : {}),
+        error:
+          serverError ??
+          `Pin "${key}" was closed as superseded by ${by}, so it was not changed.`,
+      },
+      true,
+      `Its ask was settled elsewhere: read ${by} with pin_get({id}) for the decision. Post changed content only to ask something new.`
+    );
+  }
   return result(
     {
       ok: false,
@@ -287,7 +376,9 @@ function closedResult(
     },
     true,
     answer
-      ? ANSWERED_GUIDANCE
+      ? answer.via === "pm"
+        ? RULED_GUIDANCE
+        : ANSWERED_GUIDANCE
       : `The pin was not changed: it is already ${pinStatus}. Pass reopen: true to ask again.`
   );
 }
@@ -459,6 +550,24 @@ function compactPin(pin: Pin): Record<string, unknown> {
   };
 }
 
+/** #6456: the server's `detectedOpen` list on a write's answer, read loosely. */
+function detectedOpenOf(
+  data: Record<string, unknown>
+): Array<{ pinId: string; title: string }> {
+  const list = data.detectedOpen;
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter(
+      (row): row is { pinId: string; title: string } =>
+        !!row &&
+        typeof row === "object" &&
+        typeof (row as { pinId?: unknown }).pinId === "string" &&
+        typeof (row as { title?: unknown }).title === "string"
+    )
+    .slice(0, 3)
+    .map(row => ({ pinId: row.pinId, title: listRowTitle(row.title).title }));
+}
+
 /** Factory for the six pin tools. Tests inject `fetchFn`; nothing is mocked. */
 export function createPinTools(deps: CapabilityToolDeps) {
   const doFetch: FetchLike = deps.fetchFn ?? ((url, init) => fetch(url, init));
@@ -575,12 +684,17 @@ export function createPinTools(deps: CapabilityToolDeps) {
     if (CLOSED_STATUSES.has(pin.status)) {
       return closedResult(key, sent.status, pin);
     }
+    // #6456: up to 3 open Detected pins of this session, which the server adds
+    // to its answer, so the agent can name one in `repeats`.
+    const detected = mustExist ? [] : detectedOpenOf(sent.data);
     return result(
       {
         ...writeView(pin, openPinCount, changed),
         ...(changed ? {} : { note: "unchanged (same content)" }),
+        ...(detected.length > 0 ? { detectedOpen: detected } : {}),
       },
-      false
+      false,
+      detected.length > 0 ? DETECTED_NOTE : undefined
     );
   }
 
@@ -592,10 +706,142 @@ export function createPinTools(deps: CapabilityToolDeps) {
     return upsert(args, true);
   }
 
+  /** An input error in one field, with the line that ends it. */
+  function usage(field: string, error: string, line: string): PinToolResult {
+    return result(
+      { ok: false, code: "invalid_input", field, error },
+      true,
+      line
+    );
+  }
+
+  /**
+   * #6456: read the pin an `id` names, to address its own session's route: the
+   * owner and the key come from the by-ID lookup, never from the agent.
+   */
+  async function targetOf(
+    id: string,
+    failLine: string
+  ): Promise<
+    | { ok: true; pin: Pin; url: (suffix: string) => string }
+    | { ok: false; failure: PinToolResult }
+  > {
+    const pinId = normalizePinId(id);
+    if (!pinId) {
+      return {
+        ok: false,
+        failure: usage(
+          "id",
+          "is not a pin ID: pin- and ten characters from 23456789abcdefghjkmnpqrstuvwxyz",
+          failLine
+        ),
+      };
+    }
+    const found = await lookupById(pinId, failLine);
+    if (!found.ok) return found;
+    const owner = found.session?.id ?? found.pin.sessionId;
+    const root = `${trimTrailingChars(deps.serverUrl, "/")}/cli/sessions/${encodeURIComponent(owner)}/pins/${encodeURIComponent(found.pin.key)}`;
+    return { ok: true, pin: found.pin, url: suffix => `${root}${suffix}` };
+  }
+
+  /** #6456 (R6): retire a Detected pin by its ID as superseded, with a reason. */
+  async function retire(
+    id: string,
+    reason: string,
+    ref: string | undefined
+  ): Promise<PinToolResult> {
+    const target = await targetOf(id, NOT_RETIRED);
+    if (!target.ok) return target.failure;
+    let refId: string | undefined;
+    if (ref !== undefined) {
+      const normalized = normalizePinId(ref);
+      if (!normalized) {
+        return usage("ref", "is not a pin ID", NOT_RETIRED);
+      }
+      refId = normalized;
+    }
+    const sent = await sendWrite(
+      "POST",
+      target.url("/retire"),
+      target.pin.key,
+      NOT_RETIRED,
+      { reason, ...(refId ? { ref: refId } : {}) }
+    );
+    if (!sent.ok) return sent.failure;
+    const { pin, openPinCount, changed } = sent.data;
+    return result(
+      {
+        ...writeView(pin, openPinCount, changed),
+        ...(changed
+          ? {}
+          : { note: `the pin was already ${pin.status}; nothing changed` }),
+      },
+      false,
+      changed ? RETIRED_NOTE : undefined
+    );
+  }
+
+  /** #6456 (R7): a Project Manager's ruling on a lane's pin, at a revision. */
+  async function rule(
+    id: string,
+    decision: Omit<z.infer<typeof pinResolveInputSchema>, "key" | "id">
+  ): Promise<PinToolResult> {
+    if (decision.revision === undefined) {
+      return usage(
+        "revision",
+        "A ruling needs the revision you read (pin_get({id}) gives it); it is never filled in for you.",
+        NOT_RULED
+      );
+    }
+    const target = await targetOf(id, NOT_RULED);
+    if (!target.ok) return target.failure;
+    const outcome = await send("POST", target.url("/rule"), decision);
+    if (outcome.kind === "transport") {
+      return transportFailure(outcome, NOT_RULED, WRITE_UNKNOWN);
+    }
+    if (!outcome.ok) return httpFailure(outcome, target.pin.key, NOT_RULED);
+    const parsed = PinMutationResponseSchema.safeParse(outcome.body);
+    if (!parsed.success) return badResponse(outcome, WRITE_UNKNOWN);
+    const running = (asRecord(outcome.body)?.laneRunning ?? false) === true;
+    const { pin, openPinCount, changed } = parsed.data;
+    return result(
+      writeView(pin, openPinCount, changed),
+      false,
+      running ? RULED_RUNNING : RULED_STOPPED
+    );
+  }
+
   async function withdraw(args: unknown): Promise<PinToolResult> {
     const parsed = pinWithdrawInputSchema.safeParse(args ?? {});
     if (!parsed.success) return inputRefusal(parsed.error, NOT_WITHDRAWN);
-    const { key } = parsed.data;
+    const { key, id, reason, ref } = parsed.data;
+    if (id !== undefined) {
+      if (key !== undefined) {
+        return usage("id", "Pass id or key, not both.", NOT_RETIRED);
+      }
+      if (!reason || reason.trim() === "") {
+        return usage(
+          "reason",
+          "Retiring a Detected pin needs a reason: why its ask is settled elsewhere.",
+          NOT_RETIRED
+        );
+      }
+      return retire(id, reason, ref);
+    }
+    if (key === undefined) {
+      return usage(
+        "key",
+        "Pass the key of one of your pins, or id and reason to retire a Detected pin.",
+        NOT_WITHDRAWN
+      );
+    }
+    if (reason !== undefined || ref !== undefined) {
+      return usage(
+        "reason",
+        "reason and ref go with id, to retire a Detected pin; withdrawing by key takes neither.",
+        NOT_WITHDRAWN
+      );
+    }
     const sent = await sendWrite(
       "POST",
       pinUrl(key, "/withdraw"),
@@ -628,7 +874,20 @@ export function createPinTools(deps: CapabilityToolDeps) {
   async function resolve(args: unknown): Promise<PinToolResult> {
     const parsed = pinResolveInputSchema.safeParse(args ?? {});
     if (!parsed.success) return inputRefusal(parsed.error, NOT_RESOLVED);
-    const { key, ...decision } = parsed.data;
+    const { key, id, ...decision } = parsed.data;
+    if (id !== undefined) {
+      if (key !== undefined) {
+        return usage("id", "Pass id or key, not both.", NOT_RULED);
+      }
+      return rule(id, decision);
+    }
+    if (key === undefined) {
+      return usage(
+        "key",
+        "Pass the key of one of your pins, or id and revision to rule as a lane's Project Manager.",
+        NOT_RESOLVED
+      );
+    }
     const sent = await sendWrite(
       "POST",
       pinUrl(key, "/resolve"),
@@ -694,12 +953,35 @@ export function createPinTools(deps: CapabilityToolDeps) {
     };
   }
 
-  /** #6574: read any pin in the namespace by its ID, read-only. */
-  async function getById(pinId: string): Promise<PinToolResult> {
+  /**
+   * #6574: read a pin by its ID, read-only: the pin and its owner, or the
+   * result to return. `failLine` ends a failure (#6456: a retire or a ruling
+   * reads its target through here first).
+   */
+  async function lookupById(
+    pinId: string,
+    failLine: string
+  ): Promise<
+    | {
+        ok: true;
+        pin: Pin;
+        openPinCount: number;
+        session:
+          | {
+              id: string;
+              name?: string | null;
+              nodeId?: string | null;
+              nodeLabel?: string | null;
+            }
+          | undefined;
+      }
+    | { ok: false; failure: PinToolResult }
+  > {
+    const fail = (failure: PinToolResult) => ({ ok: false as const, failure });
     const url = `${trimTrailingChars(deps.serverUrl, "/")}/cli/pins/by-id/${encodeURIComponent(pinId)}`;
     const outcome = await send("GET", url);
     if (outcome.kind === "transport")
-      return transportFailure(outcome, NOT_READ);
+      return fail(transportFailure(outcome, failLine));
     if (!outcome.ok) {
       const body = asRecord(outcome.body);
       const code = typeof body?.code === "string" ? body.code : null;
@@ -711,18 +993,20 @@ export function createPinTools(deps: CapabilityToolDeps) {
         // #6458 Task 11i: this session's node is a federation spoke, which
         // cannot ask the other nodes, so the miss is not "no such pin" and a
         // retry here cannot help.
-        return result(
-          {
-            ok: false,
-            status: 404,
-            code,
-            id: pinId,
-            localOnly: true,
-            error:
-              "No pin has that ID on this node, and this node cannot search the other nodes.",
-          },
-          true,
-          "If the pin is on another node, ask the operator to look it up from the hub's Pins search; the ID may also be mistyped."
+        return fail(
+          result(
+            {
+              ok: false,
+              status: 404,
+              code,
+              id: pinId,
+              localOnly: true,
+              error:
+                "No pin has that ID on this node, and this node cannot search the other nodes.",
+            },
+            true,
+            "If the pin is on another node, ask the operator to look it up from the hub's Pins search; the ID may also be mistyped."
+          )
         );
       }
       if (outcome.status === 404 && code === "pin_not_found") {
@@ -734,61 +1018,75 @@ export function createPinTools(deps: CapabilityToolDeps) {
           offline.length === 1
             ? `${offline[0]} is offline`
             : `${offline.join(", ")} are offline`;
-        return result(
-          {
-            ok: false,
-            status: 404,
-            code,
-            id: pinId,
-            error:
-              offline.length === 0
-                ? "No pin has that ID in your namespace."
-                : `No pin has that ID on the nodes that answered; ${offlineText}, so it was not searched.`,
-            ...(offline.length > 0 ? { notAsked: notAsked.data } : {}),
-          },
-          true,
-          offline.length === 0
-            ? "Check the ID; it may have been mistyped."
-            : `Try again once ${offline.join(", ")} is back online.`
+        return fail(
+          result(
+            {
+              ok: false,
+              status: 404,
+              code,
+              id: pinId,
+              error:
+                offline.length === 0
+                  ? "No pin has that ID in your namespace."
+                  : `No pin has that ID on the nodes that answered; ${offlineText}, so it was not searched.`,
+              ...(offline.length > 0 ? { notAsked: notAsked.data } : {}),
+            },
+            true,
+            offline.length === 0
+              ? "Check the ID; it may have been mistyped."
+              : `Try again once ${offline.join(", ")} is back online.`
+          )
         );
       }
       if (outcome.status === 409 && code === "pin_id_ambiguous") {
-        return result(
-          {
-            ok: false,
-            status: 409,
-            code,
-            id: pinId,
-            error: "More than one node holds a pin with this ID.",
-            matches: Array.isArray(body?.matches) ? body.matches : [],
-          },
-          true,
-          "Read it by key in its own session, or ask the operator which one is meant."
+        return fail(
+          result(
+            {
+              ok: false,
+              status: 409,
+              code,
+              id: pinId,
+              error: "More than one node holds a pin with this ID.",
+              matches: Array.isArray(body?.matches) ? body.matches : [],
+            },
+            true,
+            "Read it by key in its own session, or ask the operator which one is meant."
+          )
         );
       }
       if (outcome.status === 503 && code === "pin_lookup_incomplete") {
         const nodes = NodeLabelsSchema.safeParse(body?.nodes);
-        return result(
-          {
-            ok: false,
-            status: 503,
-            code,
-            id: pinId,
-            error: "Some nodes could not be asked.",
-            ...(nodes.success && nodes.data.length > 0
-              ? { nodes: nodes.data }
-              : {}),
-            ...(outcome.retryAfter ? { retryAfter: outcome.retryAfter } : {}),
-          },
-          true,
-          BY_ID_RETRY
+        return fail(
+          result(
+            {
+              ok: false,
+              status: 503,
+              code,
+              id: pinId,
+              error: "Some nodes could not be asked.",
+              ...(nodes.success && nodes.data.length > 0
+                ? { nodes: nodes.data }
+                : {}),
+              ...(outcome.retryAfter ? { retryAfter: outcome.retryAfter } : {}),
+            },
+            true,
+            BY_ID_RETRY
+          )
         );
       }
-      return httpFailure(outcome, undefined, NOT_READ);
+      return fail(httpFailure(outcome, undefined, failLine));
     }
     const body = PinByIdResponseSchema.safeParse(outcome.body);
-    if (!body.success) return badResponse(outcome, NOT_READ);
+    if (!body.success) return fail(badResponse(outcome, failLine));
     const { pin, openPinCount, session } = body.data;
+    return { ok: true, pin, openPinCount, session };
+  }
+
+  /** #6574: read any pin in the namespace by its ID, read-only. */
+  async function getById(pinId: string): Promise<PinToolResult> {
+    const found = await lookupById(pinId, NOT_READ);
+    if (!found.ok) return found.failure;
+    const { pin, openPinCount, session } = found;
     const yours = pin.sessionId === deps.selfSessionId;
     return result(
       {

@@ -4,7 +4,8 @@
  *
  * Captures structured diagnostic data when the child process exits
  * unexpectedly (signal kill, crash, rapid exit). Writes JSONL entries
- * to ~/.claude/logs/session-exits.jsonl for post-mortem analysis.
+ * to ~/.claude/logs/session-exits.jsonl for post-mortem analysis (on a test
+ * instance, to the instance's own Claude config folder, #6980).
  *
  * Issue #795 — all functions are best-effort and never throw.
  */
@@ -13,6 +14,10 @@ import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { getAllDescendantPids } from "@/utils/processTree";
 import { CLI_VERSION } from "@/version";
+import {
+  testInstanceConfigDir,
+  wrapperClaudeDir,
+} from "../testInstanceConfigDir";
 
 export interface ExitDiagnosticEntry {
   timestamp: string;
@@ -115,7 +120,12 @@ export function captureProcessTree(
  */
 export function logExitDiagnostics(entry: ExitDiagnosticEntry): void {
   try {
-    const logDir = join(process.env.HOME ?? "/tmp", ".claude", "logs");
+    const logDir = join(
+      testInstanceConfigDir() === null
+        ? join(process.env.HOME ?? "/tmp", ".claude")
+        : wrapperClaudeDir(),
+      "logs"
+    );
     const logPath = join(logDir, "session-exits.jsonl");
     mkdirSync(logDir, { recursive: true });
     appendFileSync(logPath, JSON.stringify(entry) + "\n");

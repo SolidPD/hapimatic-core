@@ -111,6 +111,9 @@ type Checked =
 /** The shared pin-text scrub (#6530), so the record and the message agree. */
 const clean = cleanPinText;
 
+/** #6803: the kinds whose pins offer the operator a write-in. */
+const WRITE_IN_KINDS: ReadonlySet<string> = new Set(["decision", "variants"]);
+
 function check(
   entry: PinSubmissionEntry,
   pin: Pin | undefined,
@@ -137,7 +140,13 @@ function check(
   if (pin.kind === "dashboard") {
     return drop("a dashboard takes no answers", "pin_dashboard");
   }
+  // #6803 (D2): a write-in on a closed pin keeps this drop, so ruling 1A's
+  // follow-up (#6889) relaxes this one branch.
   if (pin.status !== "open") return drop(`already ${pin.status}`, "pin_closed");
+  // #6803: only a pin answered by a choice takes the operator's own answer.
+  if (entry.writeIn !== undefined && !WRITE_IN_KINDS.has(pin.kind)) {
+    return drop("this pin takes no written answer", "pin_writein_kind");
+  }
   if (entry.rev > pin.revision) {
     return drop("unknown revision", "pin_unknown_revision");
   }
@@ -188,6 +197,14 @@ function cleanNote(entry: PinSubmissionEntry): string | undefined {
 }
 
 /**
+ * #6803: the operator's own answer, trimmed and cleaned once, so the record's
+ * `text` and the message's `writeIn` carry the same words.
+ */
+function cleanWriteIn(entry: PinSubmissionEntry): string | undefined {
+  return entry.writeIn?.trim() ? clean(entry.writeIn.trim()) : undefined;
+}
+
+/**
  * The label the message shows: the current option's label for a live answer,
  * else the operator's snapshot, because a later revision may have dropped it.
  */
@@ -217,6 +234,7 @@ function notSavedOf(
 function messageEntry(kept: Kept, save?: PendingSave): PinAnswersEntry {
   const { entry, pin } = kept;
   const label = labelOf(kept);
+  const writeIn = cleanWriteIn(entry);
   const note = cleanNote(entry);
   const questions = (entry.questions ?? []).map(clean);
   // #6453: the pin's saved folder rides every answer to it, Save's or the agent's own.
@@ -236,6 +254,8 @@ function messageEntry(kept: Kept, save?: PendingSave): PinAnswersEntry {
     ...(entry.dismiss !== true && entry.choice !== undefined
       ? { answer: { choice: entry.choice, label: label ?? entry.choice } }
       : {}),
+    // #6803: the operator's own answer, in place of `answer`.
+    ...(entry.dismiss !== true && writeIn !== undefined ? { writeIn } : {}),
     ...(note ? { note } : {}),
     ...(questions.length > 0 ? { questions } : {}),
     ...(kept.report ? { automaticPick: kept.report } : {}),
@@ -260,7 +280,8 @@ function saveEntry(save: PendingSave): PinAnswersEntry {
 }
 
 type ComposedAnswers =
-  | { ok: true; text: string; notSavedCut: boolean }
+  /** `submittedLocal`: the heading's time, which a shortened stored note names (#6969 E2). */
+  | { ok: true; text: string; notSavedCut: boolean; submittedLocal: string }
   | { ok: false; reason: "empty" }
   | { ok: false; reason: "too_large"; length: number };
 
@@ -297,7 +318,12 @@ function composeAnswers(
     const text =
       relay === undefined ? message.text : `${relay}\n\n${message.text}`;
     if (text.length <= PIN_ANSWERS_MESSAGE_MAX_CHARS) {
-      return { ok: true, text, notSavedCut: form === 2 };
+      return {
+        ok: true,
+        text,
+        notSavedCut: form === 2,
+        submittedLocal: message.block.submittedLocal,
+      };
     }
     refusal = { ok: false, reason: "too_large", length: text.length };
   }
@@ -326,6 +352,8 @@ function resolves(entry: PinSubmissionEntry): boolean {
   return (
     entry.dismiss === true ||
     entry.choice !== undefined ||
+    // #6803: a write-in settles its pin like a choice.
+    entry.writeIn !== undefined ||
     (entry.steps !== undefined && entry.steps.done === entry.steps.total)
   );
 }
@@ -340,9 +368,14 @@ function hasRunningPick(pin: Pin): boolean {
  * when nothing else carries it, then the partial steps or the resolving answer.
  * The settling entry is last, so it is also the newest, which `trimAnswers` keeps.
  * A dismissal (#6539) is one entry, with its note, and nothing else: the schema
- * refuses a choice, steps or questions beside it.
+ * refuses a choice, steps or questions beside it. #6969 (D1): `noteWhere` names
+ * the message that carries a note whole, for the pin's shortened stored copy.
  */
-function batchItems(kept: Kept, deliveredTo?: string): PinBatchAnswer[] {
+function batchItems(
+  kept: Kept,
+  deliveredTo?: string,
+  noteWhere?: string
+): PinBatchAnswer[] {
   const { entry, pin } = kept;
   const base = {
     key: pin.key,
@@ -350,8 +383,10 @@ function batchItems(kept: Kept, deliveredTo?: string): PinBatchAnswer[] {
     by: "operator" as const,
     via: entry.via,
     ...(deliveredTo !== undefined ? { deliveredTo } : {}),
+    ...(noteWhere !== undefined ? { noteWhere } : {}),
   };
   const note = cleanNote(entry);
+  const writeIn = cleanWriteIn(entry);
   if (entry.dismiss === true) {
     return [
       {
@@ -374,6 +409,15 @@ function batchItems(kept: Kept, deliveredTo?: string): PinBatchAnswer[] {
       ...base,
       option: entry.choice,
       ...(label !== undefined ? { label } : {}),
+      ...(note ? { note } : {}),
+      resolves: true,
+    });
+  } else if (writeIn !== undefined) {
+    // #6803: the shape `pin_resolve` records, so Completed and `pin_get`
+    // already read it. A stale one is recorded moot, like a stale choice.
+    items.push({
+      ...base,
+      text: writeIn,
       ...(note ? { note } : {}),
       resolves: true,
     });
@@ -769,6 +813,11 @@ export async function submitPinAnswers(
       : refuse(400, "pin_submission_empty", "Nothing left to send");
   }
   const { text } = message;
+  // #6969 (D1, E2): a note longer than the record keeps is stored shortened,
+  // naming this message by the time its heading shows.
+  const noteWhere = `the Pins answers message of ${message.submittedLocal}${
+    deliveredTo !== undefined ? ", sent to its Project Manager" : ""
+  }`;
   // Every save the message reports: the appended ones and those riding an
   // entry. #6540 (D2.1): a partial Save whose notice was cut for size stays
   // pending, so the next Submit carries it again with `notSaved`.
@@ -838,7 +887,7 @@ export async function submitPinAnswers(
         batch = engine.pins.recordBatch(
           session,
           submissionId,
-          kept.flatMap(item => batchItems(item, deliveredTo))
+          kept.flatMap(item => batchItems(item, deliveredTo, noteWhere))
         );
         const reports: Array<{ key: string; changedAt: number }> = [];
         for (const item of kept) {
@@ -962,6 +1011,7 @@ function messageCarries(item: Kept): boolean {
   return (
     entry.dismiss === true ||
     entry.choice !== undefined ||
+    (entry.writeIn?.trim() ?? "") !== "" ||
     (entry.note?.trim() ?? "") !== "" ||
     (entry.questions?.length ?? 0) > 0 ||
     entry.steps !== undefined ||

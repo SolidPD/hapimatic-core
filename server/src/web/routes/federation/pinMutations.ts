@@ -8,7 +8,10 @@ import {
   PinKeySchema,
   PinListQuerySchema,
   PinResolveRequestSchema,
+  PinRetireRequestSchema,
+  PinRuleRequestSchema,
   PinStarRequestSchema,
+  PIN_SUBMISSION_NOTE_MAX_CHARS,
   PIN_SUBMISSION_REQUEST_MAX_BYTES,
   PinSubmissionRequestSchema,
 } from "@hapi/protocol";
@@ -27,7 +30,12 @@ import type { WebAppEnv } from "../../middleware/auth";
 import { pinsGate } from "../../middleware/pinsGate";
 import {
   forwardedOrigin,
+  forwardedPinCaller,
+  pinActionResponse,
   pinAnswerResponse,
+  reopenPin,
+  retireDetectedPin,
+  rulePin,
   pinDeadlineInput,
   pinDeadlineRangeError,
   pinDeadlineResponse,
@@ -128,6 +136,8 @@ export function createPinMutationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
             local.engine.pins.list(local.session.id, query.data)
           ),
           timeZone: await preferenceZone(),
+          // #6969 (D2): this node owns the session, so its limit is the one.
+          noteMaxChars: PIN_SUBMISSION_NOTE_MAX_CHARS,
         });
       })
   );
@@ -166,6 +176,7 @@ export function createPinMutationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
           ? c.json({
               ...withRequestLive(local.session, found),
               timeZone: await preferenceZone(),
+              noteMaxChars: PIN_SUBMISSION_NOTE_MAX_CHARS,
             })
           : c.json({ error: "Pin not found" }, 404);
       })
@@ -287,6 +298,155 @@ export function createPinMutationRoutes(deps: FederationDeps): Hono<WebAppEnv> {
             by: "agent",
             via: "chat",
           })
+        );
+      })
+  );
+
+  // #6456: the owning node's half of a retire, a ruling and a reopen. The hub
+  // resolved the caller and sent only that, in `X-Hapi-Caller-Session`; this node
+  // checks its OWN session's stamp against it, after the token and the namespace.
+  const requireForwardedCaller = (c: Context<WebAppEnv>) => {
+    const caller = forwardedPinCaller(c);
+    if (caller) return { ok: true as const, caller };
+    return {
+      ok: false as const,
+      response: c.json(
+        {
+          error: "The forwarding node sent no caller session",
+          code: "pin_caller_required",
+        },
+        403
+      ),
+    };
+  };
+
+  app.post(
+    "/federation/sessions/:id/pins/:key/retire",
+    cataloged(
+      defineCapability({
+        id: "session-introspection.api-federation-sessions-pins-retire",
+        domain: "session-introspection",
+        surface: "rest",
+        description:
+          "Retire an open Detected pin as superseded, on the node that owns the session, for the caller the hub resolved. Peer-incoming; a hub's CLI route proxies here.",
+        whenToUse:
+          "When retiring a Detected pin of a session whose process lives on a remote federation node.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/federation/sessions/:id/pins/:key/retire",
+        },
+        auth: "federation-token",
+        riskTier: "mutating",
+        availability: { scope: "operator" },
+      })
+    ),
+    gate,
+    c =>
+      withPinErrors(c, errors, "federation-pins-retire", async () => {
+        const local = requireLocalSession(c);
+        if (!local.ok) return local.response;
+        const who = requireForwardedCaller(c);
+        if (!who.ok) return who.response;
+        const read = await readPinBody(c);
+        if (!read.ok) return read.response;
+        const body = PinRetireRequestSchema.safeParse(read.body);
+        if (!body.success) {
+          return c.json({ error: describePinIssues(body.error) }, 400);
+        }
+        return pinActionResponse(
+          c,
+          await retireDetectedPin({
+            engine: local.engine,
+            session: local.session,
+            key: c.req.param("key"),
+            request: body.data,
+            caller: who.caller,
+          })
+        );
+      })
+  );
+
+  app.post(
+    "/federation/sessions/:id/pins/:key/rule",
+    cataloged(
+      defineCapability({
+        id: "session-introspection.api-federation-sessions-pins-rule",
+        domain: "session-introspection",
+        surface: "rest",
+        description:
+          "Record a Project Manager's ruling on a lane's pin, on the node that owns the session, for the caller the hub resolved. Peer-incoming; a hub's CLI route proxies here.",
+        whenToUse:
+          "When a Project Manager rules on a pin of a lane whose process lives on a remote federation node.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/federation/sessions/:id/pins/:key/rule",
+        },
+        auth: "federation-token",
+        riskTier: "mutating",
+        availability: { scope: "operator" },
+      })
+    ),
+    gate,
+    c =>
+      withPinErrors(c, errors, "federation-pins-rule", async () => {
+        const local = requireLocalSession(c);
+        if (!local.ok) return local.response;
+        const who = requireForwardedCaller(c);
+        if (!who.ok) return who.response;
+        const read = await readPinBody(c);
+        if (!read.ok) return read.response;
+        const body = PinRuleRequestSchema.safeParse(read.body);
+        if (!body.success) {
+          return c.json({ error: describePinIssues(body.error) }, 400);
+        }
+        return pinActionResponse(
+          c,
+          rulePin({
+            engine: local.engine,
+            session: local.session,
+            key: c.req.param("key"),
+            request: body.data,
+            caller: who.caller,
+          })
+        );
+      })
+  );
+
+  app.post(
+    "/federation/sessions/:id/pins/:key/reopen",
+    cataloged(
+      defineCapability({
+        id: "session-introspection.api-federation-sessions-pins-reopen",
+        domain: "session-introspection",
+        surface: "rest",
+        description:
+          "Reopen a pin closed as superseded, on the node that owns the session. Peer-incoming; the hub proxies the operator's Reopen here.",
+        whenToUse:
+          "When the operator reopens a superseded pin of a session whose process lives on a remote federation node.",
+        invocation: {
+          kind: "rest",
+          method: "POST",
+          path: "/api/federation/sessions/:id/pins/:key/reopen",
+        },
+        auth: "federation-token",
+        riskTier: "mutating",
+        availability: { scope: "operator" },
+      })
+    ),
+    gate,
+    c =>
+      withPinErrors(c, errors, "federation-pins-reopen", () => {
+        const local = requireLocalSession(c);
+        if (!local.ok) return local.response;
+        return pinActionResponse(
+          c,
+          reopenPin(
+            local.engine.pins,
+            { id: local.session.id, namespace: local.session.namespace },
+            c.req.param("key")
+          )
         );
       })
   );

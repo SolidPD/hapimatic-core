@@ -79,6 +79,7 @@ export function createHealthScheduler(
     fileState,
     isShutdownRequested,
     ownStateWriter,
+    instanceKind,
   } = ctx;
 
   const heartbeatIntervalMs = parseInt(
@@ -675,7 +676,9 @@ export function createHealthScheduler(
             try {
               // Phase A — Global poll (always runs)
               try {
-                const status = await pollMcpStatus();
+                const status = await pollMcpStatus(undefined, {
+                  instanceKind,
+                });
                 if (status) {
                   // Issue #6171: the RAM sampler names processes from this list.
                   lastGlobalMcpServers = status.servers;
@@ -695,7 +698,9 @@ export function createHealthScheduler(
                 dirsNeedingProjectPoll(uniqueProjectDirs);
               for (const projectDir of projectScopedDirs) {
                 try {
-                  const status = await pollMcpStatus(projectDir);
+                  const status = await pollMcpStatus(projectDir, {
+                    instanceKind,
+                  });
                   if (status) {
                     await api.updateMcpStatus(status);
                   }

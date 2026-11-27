@@ -6,6 +6,20 @@ import {
   type LegacySweepResult,
 } from "@/accounts/legacyConfigDirMigration";
 import { configuration } from "@/configuration";
+import { accountStore } from "@/accounts/accountStore";
+import {
+  assessChainIndependenceDetailed,
+  readLocalChainFacts,
+  remoteChainFromAggregatorBody,
+  type ChainAssessment,
+  type RemoteBindingMode,
+} from "@/accounts/remoteChainIndependence";
+import {
+  collectRemoteBindings,
+  resolveLiveFreshnessWindowMs,
+  UNKNOWN_HOLDER_NODE,
+  type RemoteBindingInput,
+} from "@/daemon/sessionLiveness";
 import { parseSignInAgesFlags, runSignInAges } from "./accountsSignInAges";
 import { authenticateCli } from "./cliAuth";
 import type { CommandDefinition } from "./types";
@@ -239,11 +253,54 @@ async function runMigrateConfigDirs(args: string[]): Promise<number> {
 }
 
 /**
+ * Issue #6997 (M12): the federation nodes holding an account, read as the idle
+ * backstop reads them — the hub's `/api/federation/all-sessions` through the
+ * same collector, matched by the account's uuid and its stored email. `null`
+ * when the list cannot be read. Read-only.
+ */
+async function readHolderNodes(
+  token: string,
+  uuid: string
+): Promise<Set<string> | null> {
+  try {
+    const resp = await fetch(
+      `${configuration.serverUrl}/api/federation/all-sessions`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!resp.ok) return null;
+    const { sessions } = (await resp.json()) as {
+      sessions?: RemoteBindingInput[];
+    };
+    const remote = collectRemoteBindings(
+      sessions ?? [],
+      Date.now(),
+      resolveLiveFreshnessWindowMs()
+    );
+    // A store read that throws makes the holders unknown (the catch below),
+    // never "matched by uuid only". An account the store does not hold has no
+    // email to match, which is a real answer.
+    const res = await accountStore.get(uuid);
+    const email = res && res.ok ? res.account.emailAddress : undefined;
+    return new Set([
+      ...((email && remote.holderNodesByEmail.get(email)) || []),
+      ...(remote.holderNodesByUuid.get(uuid) ?? []),
+    ]);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Issue #3784: READ-ONLY cross-node chain-probe. Reports, per federation node,
  * the sha256 refresh-token chain fingerprint for an account (a hash, never the
  * raw token) + the independence verdict for THIS node (independent / shared /
  * unknown). Never rotates or writes anything — the operator's tool to confirm
  * chains are independent and to detect a copy-collision.
+ *
+ * Issue #6997 (M12): the verdict is the idle backstop's own
+ * (`assessChainIndependenceDetailed`, with its holder coverage, same-sign-in and
+ * provenance checks) and names its cause, once for an account held here too and
+ * once for one held only on another node, so the probe cannot disagree with it.
  */
 async function runChainProbe(
   uuid: string | undefined,
@@ -272,19 +329,46 @@ async function runChainProbe(
       }>;
       degraded: boolean;
     };
-    const selfEntry = body.fingerprints.find(e => e.self);
-    const others = body.fingerprints.filter(e => !e.self);
-    const localFp = selfEntry?.fingerprint ?? null;
-    const verdict: "independent" | "shared" | "unknown" = !localFp
-      ? "unknown"
-      : body.degraded
-        ? "unknown"
-        : others.some(e => e.fingerprint && e.fingerprint === localFp)
-          ? "shared"
-          : "independent";
+    // #6997 (M12): the backstop's own verdict and cause, from the backstop's
+    // own inputs: this node's chain facts (the folder it would rotate), the
+    // aggregator's answers, and the holder nodes from the hub's session list.
+    const holders = await readHolderNodes(token, uuid);
+    const facts = await readLocalChainFacts(uuid);
+    const remote = remoteChainFromAggregatorBody(body);
+    const assess = (mode: RemoteBindingMode) =>
+      assessChainIndependenceDetailed(
+        uuid,
+        async () => facts.fingerprint,
+        async () => remote,
+        {
+          mode,
+          holderNodeIds: holders ?? new Set([UNKNOWN_HOLDER_NODE]),
+          localFingerprint: facts.fingerprint,
+          localDeadlineAt: facts.deadlineAt,
+          localMarker: facts.marker,
+          markerNamesCurrent:
+            facts.fingerprint !== null &&
+            facts.marker?.fingerprint === facts.fingerprint,
+        }
+      );
+    const mixed = await assess("mixed");
+    const remoteOnly = await assess("remote-only");
+    const verdict = mixed.verdict;
+    const holderList = holders === null ? null : [...holders].sort();
     if (flags.json) {
       console.log(
-        JSON.stringify({ accountUuid: uuid, verdict, ...body }, null, 2)
+        JSON.stringify(
+          {
+            accountUuid: uuid,
+            verdict,
+            cause: mixed.cause,
+            remoteOnly,
+            holders: holderList,
+            ...body,
+          },
+          null,
+          2
+        )
       );
       return 0;
     }
@@ -296,9 +380,15 @@ async function runChainProbe(
         `  ${e.self ? "→ self " : "  peer "} ${e.nodeLabel.padEnd(16)} ${fp}`
       );
     }
+    const why = (a: ChainAssessment): string =>
+      a.cause ? `${a.verdict} (${a.cause})` : a.verdict;
     console.log(
-      `  verdict: ${verdict}${body.degraded ? " (a peer was unreachable)" : ""}`
+      `  holders: ${holderList === null ? "unknown (the session list could not be read)" : holderList.length > 0 ? holderList.join(", ") : "none"}`
     );
+    console.log(
+      `  verdict, held here too:       ${why(mixed)}${body.degraded ? " (a peer was unreachable)" : ""}`
+    );
+    console.log(`  verdict, held only elsewhere: ${why(remoteOnly)}`);
     console.log("");
     return 0;
   } catch (err) {

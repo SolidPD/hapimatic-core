@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import {
+  cutPairSafe,
   neutralizeApprovalTokens,
+  NoteMaxCharsSchema,
+  PIN_ANSWER_NOTE_MAX_CHARS,
+  PIN_SUBMISSION_NOTE_MAX_CHARS,
   PinSchema,
   type FederationConfig,
   type Pin,
@@ -51,6 +55,8 @@ export type PinByIdOutcome =
       openPinCount: number;
       /** The owning node's pin time zone (its loop fires the automatic pick). */
       timeZone: string | null;
+      /** #6969 (D2): the owning node's note limit; absent from a node before #6969. */
+      noteMaxChars?: number;
       session: PinByIdSession;
     }
   | {
@@ -134,6 +140,7 @@ export async function findLocalPinById(
   pin: Pin;
   openPinCount: number;
   timeZone: string | null;
+  noteMaxChars: number;
   session: Session;
 } | null> {
   const hit = deps.getByPinId(pinId);
@@ -144,8 +151,21 @@ export async function findLocalPinById(
     pin: hit.pin,
     openPinCount: hit.openPinCount,
     timeZone: await deps.getTimeZone(),
+    noteMaxChars: PIN_SUBMISSION_NOTE_MAX_CHARS,
     session,
   };
+}
+
+/**
+ * #6969 (review F1): a peer's stated note limit as this hub states it, the
+ * smaller of the peer's and this hub's own, because the hub parses every Submit
+ * it proxies against its own limit first. Absent stays absent (a node before
+ * #6969, which the web reads as 2,048).
+ */
+export function hubNoteMax(peer: number | undefined): number | undefined {
+  return peer === undefined
+    ? undefined
+    : Math.min(peer, PIN_SUBMISSION_NOTE_MAX_CHARS);
 }
 
 /** A peer's answer, as the federation receiver sends it. */
@@ -155,12 +175,21 @@ const PeerHitSchema = z
     pin: PinSchema,
     openPinCount: z.number().int(),
     timeZone: z.string().nullable().optional(),
+    noteMaxChars: NoteMaxCharsSchema,
   })
   .loose();
 const PeerMissSchema = z.object({ found: z.literal(false) }).loose();
 
+type PeerHit = {
+  pin: Pin;
+  openPinCount: number;
+  timeZone: string | null;
+  /** #6969: the peer's own note limit, never the hub's; absent when it sent none. */
+  noteMaxChars?: number;
+};
+
 type PeerAnswer =
-  | { kind: "hit"; pin: Pin; openPinCount: number; timeZone: string | null }
+  | ({ kind: "hit" } & PeerHit)
   | { kind: "miss" }
   | { kind: "not_asked" }
   | { kind: "failed" };
@@ -181,6 +210,9 @@ export function classifyPeerRead(
       pin: hit.data.pin,
       openPinCount: hit.data.openPinCount,
       timeZone: hit.data.timeZone ?? null,
+      ...(hit.data.noteMaxChars !== undefined
+        ? { noteMaxChars: hit.data.noteMaxChars }
+        : {}),
     };
   }
   return PeerMissSchema.safeParse(read.body).success
@@ -200,6 +232,7 @@ export async function lookupPinById(
       pin: local.pin,
       openPinCount: local.openPinCount,
       timeZone: local.timeZone,
+      noteMaxChars: local.noteMaxChars,
       session: {
         id: local.session.id,
         name: local.session.metadata?.name ?? null,
@@ -232,9 +265,7 @@ export async function lookupPinById(
         )
       )
     : [];
-  const hits: Array<
-    PinByIdNode & { pin: Pin; openPinCount: number; timeZone: string | null }
-  > = [];
+  const hits: Array<PinByIdNode & PeerHit> = [];
   settled.forEach((outcome, index) => {
     const node = asked[index];
     if (!node) return;
@@ -244,12 +275,8 @@ export async function lookupPinById(
     }
     const answer = classifyPeerRead(outcome.value, pinId);
     if (answer.kind === "hit") {
-      hits.push({
-        ...node,
-        pin: answer.pin,
-        openPinCount: answer.openPinCount,
-        timeZone: answer.timeZone,
-      });
+      const { kind: _kind, ...hit } = answer;
+      hits.push({ ...node, ...hit });
     } else if (answer.kind === "not_asked") {
       notAsked.push(node);
     } else if (answer.kind === "failed") {
@@ -278,6 +305,9 @@ export async function lookupPinById(
       pin: hit.pin,
       openPinCount: hit.openPinCount,
       timeZone: hit.timeZone,
+      ...(hit.noteMaxChars !== undefined
+        ? { noteMaxChars: hubNoteMax(hit.noteMaxChars) }
+        : {}),
       session: {
         id: hit.pin.sessionId,
         name: remote?.metadata?.name ?? null,
@@ -296,16 +326,44 @@ export async function lookupPinById(
 }
 
 /**
+ * #6969 (D-Q1, amended 2026-11-26): the one character a by-ID read's note cut
+ * ends with, so the view shows that the note goes on.
+ */
+export const BY_ID_CUT_MARK = "…";
+
+/**
  * A copy of the pin with every string passed through `neutralizeApprovalTokens`.
  * A walk, not a field list, because a list drifts: it reaches every agent-written
  * string by construction (titles and text, option ids and labels, step ids, links
  * and evidence paths, `recommended`, `ifUnanswered.option`, answer options and
  * `deliveredTo`, every `lanes` string) and any field a newer peer adds through the
  * loose `PinSchema`. It never throws: a value that is not a string, an array or a
- * plain object passes through unchanged.
+ * plain object passes through unchanged. #6969 (D-Q1): an agent's stored note is
+ * kept uncleaned, so each token's longer placeholder can take a note at the cap
+ * one character past it, which `PinByIdResponseSchema` refuses; each note is
+ * cut back to the cap after the walk, pair-safe, and ends with
+ * {@link BY_ID_CUT_MARK} so the view shows that it goes on (D-Q1 as amended by
+ * the Pins PM, 2026-11-26: text is never dropped without saying so).
  */
 export function neutralizePinText(pin: Pin): Pin {
-  return walk(pin) as Pin;
+  const out = walk(pin) as Pin;
+  if (!Array.isArray(out.answers)) return out;
+  return {
+    ...out,
+    answers: out.answers.map(answer =>
+      typeof answer?.note === "string" &&
+      answer.note.length > PIN_ANSWER_NOTE_MAX_CHARS
+        ? {
+            ...answer,
+            note:
+              cutPairSafe(
+                answer.note,
+                PIN_ANSWER_NOTE_MAX_CHARS - BY_ID_CUT_MARK.length
+              ) + BY_ID_CUT_MARK,
+          }
+        : answer
+    ),
+  };
 }
 
 function walk(value: unknown): unknown {

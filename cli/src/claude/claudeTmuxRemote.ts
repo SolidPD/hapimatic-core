@@ -72,6 +72,7 @@ import {
   buildTmuxEnvFileCommand,
   resolveRemoteSessionDisplayName,
 } from "./launcherShared";
+import { sessionConfigDirOverride } from "./testInstanceConfigDir";
 import { shellEscape, assertSpawnCommandLength } from "@/utils/shellEscape";
 import {
   TmuxManager,
@@ -624,7 +625,9 @@ export async function claudeTmuxRemote(
     }
   }
 
-  const projectDir = getProjectPath(opts.path);
+  // Issue #6980: where this child's transcripts are, on a test instance; else undefined.
+  const configDir = sessionConfigDirOverride(opts.claudeEnvVars);
+  const projectDir = getProjectPath(opts.path, configDir);
   mkdirSync(projectDir, { recursive: true });
 
   // R8/R9/R10 — pre-trust shim. Surgical alternative to
@@ -644,7 +647,10 @@ export async function claudeTmuxRemote(
   const hasResumeFlag = opts.claudeArgs?.includes("--resume");
   const hasUserSessionControl = Boolean(hasContinueFlag || hasResumeFlag);
   let startFrom = opts.sessionId;
-  if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
+  if (
+    opts.sessionId &&
+    !claudeCheckSession(opts.sessionId, opts.path, configDir)
+  ) {
     startFrom = null;
   }
   if (startFrom && !hasUserSessionControl) {
@@ -664,6 +670,11 @@ export async function claudeTmuxRemote(
       buildSystemPrompt(opts.path, { pinsEnabled: opts.pinsEnabled })
     );
   }
+  // R2 — env build via the scrubbed buildLauncherEnv. The shell-command
+  // prefix below is built from this env, so SDK_SIGNAL_ENV_VARS cannot
+  // leak through. Before the MCP config: its test-instance guard throws
+  // before a file is written (#6980).
+  const launcherEnv = buildLauncherEnv(opts.claudeEnvVars);
   const cleanupMcpConfig = safeMode
     ? null
     : appendMcpConfigArg(args, opts.mcpServers, {
@@ -678,11 +689,6 @@ export async function claudeTmuxRemote(
   if (!safeMode) {
     args.push("--settings", opts.hookSettingsPath);
   }
-
-  // R2 — env build via the scrubbed buildLauncherEnv. The shell-command
-  // prefix below is built from this env, so SDK_SIGNAL_ENV_VARS cannot
-  // leak through.
-  const launcherEnv = buildLauncherEnv(opts.claudeEnvVars);
 
   // R14 (#1429): per-attempt suffix varies the window name, FIFO path, AND the
   // env-file path so a retry after a burst-load exit doesn't collide with the

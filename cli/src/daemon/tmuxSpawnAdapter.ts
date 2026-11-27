@@ -61,6 +61,7 @@ import {
   resolveHostJailAxis,
   type AgentFlavor,
 } from "@hapi/protocol";
+import { HAPI_INSTANCE_KIND_ENV } from "@hapi/protocol/instanceKind";
 
 // K1 (#4218): `windowOwnedBy` is DEFINED in windowOwnership.ts (one definition)
 // and re-exported here so #4038 / #4080 keep the pinned import path.
@@ -1164,9 +1165,13 @@ export async function spawnSessionInTmux(
       };
     }
 
-    // Ensure project directory exists
+    // Ensure project directory exists. Issue #6980: it is the host's, so on a test
+    // instance (the daemon's own reading, forwarded) it is not made here; each launcher
+    // makes one in the config folder its child runs on.
     const projectDir = getProjectPath(directory);
-    await fs.mkdir(projectDir, { recursive: true });
+    if (extraEnv?.[HAPI_INSTANCE_KIND_ENV] !== "test") {
+      await fs.mkdir(projectDir, { recursive: true });
+    }
 
     // Ensure tmux session exists
     await tmux.ensureSession();

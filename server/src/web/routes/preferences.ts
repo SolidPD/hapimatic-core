@@ -5,6 +5,7 @@ import { cataloged } from "../../capabilities/cataloged";
 import type { WebAppEnv } from "../middleware/auth";
 import type { SyncEngine } from "../../sync/syncEngine";
 import type { SSEManager } from "../../sse/sseManager";
+import { readJsonBody } from "./jsonBody";
 import {
   SETTINGS_UNREADABLE_MESSAGE as UNREADABLE,
   readSettings,
@@ -144,7 +145,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = SearchFilterPreferencesSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -225,7 +226,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       // Patch schema: `enabled` has NO default here, so a `{classOverrides}`-only
       // body does not fabricate `enabled: true` and reset the master (R7 reverse).
       const parsed = AutoRecoverPreferencePatchSchema.safeParse(body);
@@ -334,7 +335,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = CeilingGuardPreferencePatchSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -410,7 +411,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = AutoSwitchOnRateLimitPreferencePatchSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -495,7 +496,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed =
         AutoSelectOptimalAccountPreferencePatchSchema.safeParse(body);
       if (!parsed.success) {
@@ -584,7 +585,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = CreateSessionPreferencesSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -659,7 +660,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = CreateSessionDefaultsSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -732,7 +733,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = OpenRouterFavoritesSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -806,7 +807,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = DefaultModelPreferenceSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -875,7 +876,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = ChatSectionsPreferenceSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -976,7 +977,7 @@ export function createPreferencesRoutes(
       })
     ),
     async c => {
-      const body = await c.req.json();
+      const body = await readJsonBody(c);
       const parsed = DefaultOutputStylePreferenceSchema.safeParse(body);
       if (!parsed.success) {
         return c.json(
@@ -1104,7 +1105,9 @@ export function createPreferencesRoutes(
         return c.json({ error: `Unknown federation setting: ${key}` }, 404);
       }
       const fedKey = key as FederationSettingKey;
-      const parsed = FederationSettingPatchSchema.safeParse(await c.req.json());
+      const parsed = FederationSettingPatchSchema.safeParse(
+        await readJsonBody(c)
+      );
       if (!parsed.success) {
         return c.json(
           { error: "Invalid patch", details: parsed.error.issues },

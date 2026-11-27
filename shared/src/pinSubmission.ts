@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 import { z } from "zod";
-import {
-  PIN_ANSWER_NOTE_MAX_CHARS,
-  PIN_MAX_OPEN_PER_SESSION,
-  PinKeySchema,
-  PinSchema,
-} from "./pins";
+import { PIN_MAX_OPEN_PER_SESSION, PinKeySchema, PinSchema } from "./pins";
 
 // Its own module, not pins.ts: the main web bundle already loads pins.ts (through
 // schemas.ts), and these schemas are needed only by the Submit path, which is
@@ -26,6 +21,18 @@ export const PIN_SUBMISSION_MAX_QUESTIONS = 5;
 export const PIN_SUBMISSION_QUESTION_MAX_CHARS = 1000;
 /** An IANA zone name; the longest real one is 32 characters. */
 export const PIN_SUBMISSION_TIME_ZONE_MAX_CHARS = 64;
+/**
+ * #6969 (D1): an entry's note, at most. The agent's message carries it whole;
+ * the pin's record keeps at most `PIN_ANSWER_NOTE_MAX_CHARS` of it, marked where
+ * it was shortened (`shortenStoredNote`). Each node states it on its pin
+ * responses (`noteMaxChars`), so the web counts against the session's own node.
+ */
+export const PIN_SUBMISSION_NOTE_MAX_CHARS = 10_000;
+/**
+ * #6969 (D4): a write-in's length, at most. Its own name, so #6487 may lower
+ * the record cap without moving it; at most `PIN_LEGACY_NOTE_MAX_CHARS`.
+ */
+export const PIN_SUBMISSION_WRITE_IN_MAX_CHARS = 2048;
 
 /**
  * The fields a dismissal refuses beside it (#6539): each one answers the pin, or
@@ -34,6 +41,7 @@ export const PIN_SUBMISSION_TIME_ZONE_MAX_CHARS = 64;
 const PIN_DISMISS_EXCLUDES = [
   "choice",
   "label",
+  "writeIn",
   "steps",
   "questions",
   "automaticPick",
@@ -49,6 +57,7 @@ const PIN_DISMISS_EXCLUDES = [
  * unreported save decides what the message reports. N added `dismiss` (#6539):
  * the operator dismissed the pin without answering it. A dismissal may carry a
  * note and `saved`, and nothing else: an answer beside it would contradict it.
+ * #6803 added `writeIn`: the operator's own answer instead of an option.
  */
 export const PinSubmissionEntrySchema = z
   .strictObject({
@@ -57,7 +66,18 @@ export const PinSubmissionEntrySchema = z
     choice: z.string().min(1).max(64).optional(),
     /** The option's label when it was chosen, for a choice on an older revision. */
     label: z.string().max(200).optional(),
-    note: z.string().max(PIN_ANSWER_NOTE_MAX_CHARS).optional(),
+    /**
+     * #6803: the operator's own answer, in their own words, instead of one of
+     * the pin's options; it settles the pin like a choice. An older node
+     * refuses the field (400), so a write-in is never sent through Submit to a
+     * node that could not record it.
+     */
+    writeIn: z
+      .string()
+      .max(PIN_SUBMISSION_WRITE_IN_MAX_CHARS)
+      .refine(text => text.trim() !== "", "must not be blank")
+      .optional(),
+    note: z.string().max(PIN_SUBMISSION_NOTE_MAX_CHARS).optional(),
     questions: z
       .array(z.string().min(1).max(PIN_SUBMISSION_QUESTION_MAX_CHARS))
       .max(PIN_SUBMISSION_MAX_QUESTIONS)
@@ -109,6 +129,24 @@ export const PinSubmissionEntrySchema = z
         }
       }
     }
+    // #6803: a write-in is the answer instead of an option, and steps answer
+    // a different kind of pin.
+    if (entry.writeIn !== undefined) {
+      if (entry.choice !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["writeIn"],
+          message: "does not go with a choice",
+        });
+      }
+      if (entry.steps !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["writeIn"],
+          message: "does not go with steps",
+        });
+      }
+    }
     if (entry.label !== undefined && entry.choice === undefined) {
       ctx.addIssue({
         code: "custom",
@@ -127,15 +165,20 @@ export const PinSubmissionEntrySchema = z
 export type PinSubmissionEntry = z.infer<typeof PinSubmissionEntrySchema>;
 
 /**
- * True when an entry answers anything: a choice, a non-blank note, a question,
- * or steps. An entry that only carries `saved` (#6453) does not, and neither
- * does a dismissal (#6539), which closes the question without answering it.
+ * True when an entry answers anything: a choice, a non-blank write-in (#6803),
+ * a non-blank note, a question, or steps. An entry that only carries `saved`
+ * (#6453) does not, and neither does a dismissal (#6539), which closes the
+ * question without answering it.
  */
 export function hasPinAnswer(
-  entry: Pick<PinSubmissionEntry, "choice" | "note" | "questions" | "steps">
+  entry: Pick<
+    PinSubmissionEntry,
+    "choice" | "writeIn" | "note" | "questions" | "steps"
+  >
 ): boolean {
   return (
     entry.choice !== undefined ||
+    (entry.writeIn !== undefined && entry.writeIn.trim() !== "") ||
     (entry.note !== undefined && entry.note.trim() !== "") ||
     (entry.questions?.length ?? 0) > 0 ||
     entry.steps !== undefined

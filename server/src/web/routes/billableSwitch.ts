@@ -5,11 +5,13 @@ import { z } from "zod";
 import {
   BILLABLE_SWITCH_EVENT_KINDS,
   BILLABLE_SWITCH_LEGACY_EVENT_KINDS,
+  BILLABLE_TRACKING_CARRY_CAPABILITY,
   BillableConfirmSchema,
   BillableSwitchActorSchema,
   BillableSwitchViaSchema,
   defineCapability,
   redactTrackingEventForAgent,
+  TrackingBillingStatusSchema,
   type BillableSwitchActor,
   type BillableSwitchEvent,
   type BillableSwitchMode,
@@ -210,7 +212,7 @@ function unsupportedRefusal(c: Context, nodeLabel: string): Response {
   );
 }
 
-function notReachableYet(c: Context, nodeLabel: string): Response {
+export function notReachableYet(c: Context, nodeLabel: string): Response {
   return c.json(
     {
       error: `${nodeLabel} has not answered this node yet. Try again in a moment.`,
@@ -259,7 +261,7 @@ export function remoteNodeRefusal(
  * 404, which the proxy words `Remote node returned 404` (the rule of
  * `pinRouteHelpers.isPeerWithoutPins`). A JSON `Session not found` is neither.
  */
-function isPeerWithoutBillableSwitch(
+export function isPeerWithoutBillableSwitch(
   result: Extract<ProxyResult, { type: "error" }>
 ): boolean {
   return (
@@ -372,6 +374,7 @@ type BillableRegistry = Pick<
   NodeRegistry,
   | "locateSession"
   | "getBillableSwitchNodeViews"
+  | "nodeSupports"
   | "updateCachedSessionBillable"
   | "callBillableSwitchPeerRoute"
   | "advanceBillableSwitchReportCounter"
@@ -464,6 +467,60 @@ function placeSession(
     nodeId: located.nodeId,
     view: registryView(registry, located.nodeId),
   };
+}
+
+/** The two fields of an owner's tracking answer that a Keep needs (newer fields ignored). */
+const OwnerRecordSchema = z.object({
+  record: z
+    .object({
+      confirm: BillableConfirmSchema,
+      billingStatus: TrackingBillingStatusSchema,
+    })
+    .nullable(),
+});
+
+/**
+ * #6778 PR-C (moved item 5): whether a Keep of a copy on another node would raise
+ * billing, from the owner's record, read through its tracking receiver
+ * (`GET /api/federation/sessions/:id/tracking`, Task 14). Only a waiting copy that
+ * is not Billable raises nothing. An owner that cannot be asked (no
+ * `billable:tracking-carry`, not reachable, gate off) or whose answer is an error
+ * or unreadable counts as raising, so the Keep is refused as before.
+ */
+async function remoteKeepRaisesBilling(
+  registry: Partial<BillableRegistry> | null,
+  place: Extract<SessionPlace, { kind: "remote" }>,
+  sessionService: Pick<SessionService, "proxyPinRequest"> | null,
+  sessionId: string,
+  namespace: string
+): Promise<boolean> {
+  const view = place.view;
+  if (!view || view.awaitingInitialPoll || view.status === "offline") {
+    return true;
+  }
+  if (!view.on && !view.closed) return true;
+  if (
+    !registry?.nodeSupports?.(place.nodeId, BILLABLE_TRACKING_CARRY_CAPABILITY)
+  ) {
+    return true;
+  }
+  if (!sessionService) return true;
+  const result = await proxyBillableSwitchRequest(
+    sessionService,
+    sessionId,
+    "/tracking",
+    "GET",
+    namespace
+  );
+  if (result.type !== "success") return true;
+  const parsed = OwnerRecordSchema.safeParse(result.data);
+  if (!parsed.success) return true;
+  const record = parsed.data.record;
+  return (
+    record === null ||
+    record.confirm !== "pending" ||
+    record.billingStatus === "billable"
+  );
 }
 
 export function createBillableSwitchRoutes(
@@ -631,11 +688,23 @@ export function createBillableSwitchRoutes(
       if (refused) return refused;
       // #6778 PR-B (3.3; review G5): a Keep only clears the wait, so `closed`
       // refuses it only when it would raise billing: a waiting Billable copy.
-      if (
-        closed &&
-        decision === "keep" &&
-        ready.service.keepRaisesBilling(sessionId, namespace)
-      ) {
+      // A copy on another node is judged by its owner's record (PR-C, moved
+      // item 5), read only when a closed gate needs it, here or there.
+      const keepRaises =
+        decision !== "keep"
+          ? false
+          : place.kind === "local"
+            ? ready.service.keepRaisesBilling(sessionId, namespace)
+            : closed || (place.view?.closed === true && !place.view.on)
+              ? await remoteKeepRaisesBilling(
+                  registry,
+                  place,
+                  options.getSessionService(),
+                  sessionId,
+                  namespace
+                )
+              : true;
+      if (closed && keepRaises) {
         return closedRefusal(c, ready.service.localNodeLabel());
       }
       const actor = billableSwitchActor(c, ready.engine);
@@ -671,10 +740,12 @@ export function createBillableSwitchRoutes(
         return c.json(setAnswer(outcome.result));
       }
 
+      // A Keep that raises nothing lowers no billing either: it goes to a
+      // closed owner, whose receiver applies the same rule.
       const nodeRefused = remoteNodeRefusal(
         c,
         place.view,
-        decision === "keep" ? "on" : "off"
+        keepRaises ? "on" : "off"
       );
       if (nodeRefused) return nodeRefused;
       const sessionService = options.getSessionService();

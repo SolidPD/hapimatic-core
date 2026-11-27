@@ -2,9 +2,12 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import {
+  apiKeyRefVaultId,
   defineCapability,
   isModelModeAllowedForFlavor,
   isPermissionModeAllowedForFlavor,
+  isQualifiedApiKeyRef,
+  isUsableNodeIdForSharing,
   mcpLiveToggleRefusal,
 } from "@hapi/protocol";
 import {
@@ -25,6 +28,7 @@ import {
   sessionModelFamily,
 } from "../../../accounts/accountHeadroom";
 import { cataloged } from "../../../capabilities/cataloged";
+import { errorClass } from "../apiKeys";
 import { logAndJson } from "../routeErrorHelper";
 import { runCapabilityInvoke } from "../capabilityPolicy";
 import {
@@ -67,11 +71,17 @@ export function createSessionMutationRoutes(
     desired: z.record(z.string(), z.boolean()),
   });
 
-  const federationAccountSchema = z.object({
-    accountUuid: z.string(),
-    // Issue #5879: the hub forwards the caller's override of the headroom check.
-    forceAccount: z.boolean().optional(),
-  });
+  // Issue #6740: exactly one of an account or an API key, the key by QUALIFIED
+  // ref only: a bare id means "the resolving node's vault", so a hub never sends one.
+  const federationAccountSchema = z
+    .object({
+      accountUuid: z.string().optional(),
+      apiKeyId: z.string().refine(isQualifiedApiKeyRef).optional(),
+      originatingNodeId: z.string().optional(),
+      // Issue #5879: the hub forwards the caller's override of the headroom check.
+      forceAccount: z.boolean().optional(),
+    })
+    .refine(b => (b.accountUuid === undefined) !== (b.apiKeyId === undefined));
 
   // ─── Node-to-node endpoint: PATCH /federation/sessions/:id (rename) ─
   app.patch(
@@ -682,7 +692,9 @@ export function createSessionMutationRoutes(
   // switch. SessionService.switchAccount on the HUB proxies here when this node
   // owns the session; validate caller namespace, then call engine.switchAccount
   // directly (federation receivers call engine.*, never SessionService — see
-  // server/CLAUDE.md "SessionService Audience Boundary").
+  // server/CLAUDE.md "SessionService Audience Boundary"). Issue #6740: an API key
+  // by qualified ref goes to engine.switchPaymentMethod. This route's acceptance of
+  // one is what SESSION_API_KEY_SWITCH_CAPABILITY advertises.
   app.post(
     "/federation/sessions/:id/account",
     cataloged(
@@ -691,9 +703,9 @@ export function createSessionMutationRoutes(
         domain: "accounts",
         surface: "rest",
         description:
-          "Switch the Anthropic account bound to a session on the node that owns it, restarting the session process. Peer-incoming receiver for a remote-owned session.",
+          "Switch a session's payment method on the node that owns it, restarting or staging it: an account, or an API key by reference. Peer-incoming receiver for a remote-owned session.",
         whenToUse:
-          "When switching the account for a session whose process lives on a remote federation node.",
+          "When switching the account or API key for a session whose process lives on a remote federation node.",
         invocation: {
           kind: "rest",
           method: "POST",
@@ -735,6 +747,77 @@ export function createSessionMutationRoutes(
         );
       }
 
+      // Issue #6740: a key target has no headroom check. The engine resolves the
+      // key once, requires it shared, and stamps the #5819 marker for a key on
+      // this node; a peer's `originatingNodeId` only names the placer.
+      if (parsed.data.apiKeyId !== undefined) {
+        const { apiKeyId, originatingNodeId } = parsed.data;
+        const placedBy = isUsableNodeIdForSharing(originatingNodeId)
+          ? originatingNodeId
+          : "peer";
+        try {
+          const result = await engine.switchPaymentMethod(sessionId, {
+            kind: "api-key",
+            apiKeyId,
+            placedBy,
+          });
+          if (result.type === "success" && result.paymentMethod === "api-key") {
+            deps.errorLogger?.info("[Federation] API-key switch", {
+              category: "federation-account-switch",
+              context: {
+                sessionId,
+                apiKeyId: apiKeyRefVaultId(result.apiKeyId),
+                placedBy,
+              },
+            });
+            const staged = "staged" in result && result.staged;
+            return c.json({
+              ok: true,
+              restartRequired: !staged,
+              ...(staged ? { staged: true } : {}),
+              apiKeyId: result.apiKeyId,
+              apiKeyLabel: result.apiKeyLabel,
+              authBinding: result.authBinding,
+            });
+          }
+          const refusal: {
+            message: string;
+            code?: string;
+            httpStatus?: number;
+          } =
+            result.type === "error"
+              ? result
+              : { message: "Unexpected switch result" };
+          const code = refusal.code ?? "unknown";
+          const status =
+            refusal.httpStatus ??
+            (code === "session_not_found" || code === "api_key_not_found"
+              ? 404
+              : code === "unknown"
+                ? 500
+                : 409);
+          return c.json(
+            { ok: false, error: refusal.message, code },
+            status as 400 | 403 | 404 | 409 | 500 | 502 | 503
+          );
+        } catch (err) {
+          // The class only: a thrown message can carry what it was handling.
+          deps.errorLogger?.warn(
+            `[Federation] API-key switch failed (${errorClass(err)})`,
+            { category: "federation-account-switch", context: { sessionId } }
+          );
+          return c.json(
+            {
+              ok: false,
+              error: "The switch failed on this session's node.",
+              code: "unknown",
+            },
+            500
+          );
+        }
+      }
+      const accountUuid = parsed.data.accountUuid!;
+
       // Issue #5879: THIS node owns the session and holds the account, so it
       // decides headroom — before the kill, so a refusal leaves the session as is.
       const verdict = await checkAccountHeadroom(
@@ -745,7 +828,7 @@ export function createSessionMutationRoutes(
           errorLogger: deps.errorLogger ?? null,
         },
         {
-          accountUuid: parsed.data.accountUuid,
+          accountUuid,
           modelFamily: sessionModelFamily(session),
           forceAccount: parsed.data.forceAccount === true,
         }
@@ -764,10 +847,7 @@ export function createSessionMutationRoutes(
       const rebindWarnings = headroomWarnings(verdict);
 
       try {
-        const result = await engine.switchAccount(
-          sessionId,
-          parsed.data.accountUuid
-        );
+        const result = await engine.switchAccount(sessionId, accountUuid);
         if (result.type === "success") {
           // Issue #1517: return the new accountUuid + claudeAccount so the HUB's
           // SessionService.switchAccount can update its NodeRegistry cache for

@@ -256,6 +256,149 @@ export type VmParityHistoryResponse = z.infer<
   typeof VmParityHistoryResponseSchema
 >;
 
+// ── Fleet parity verdict (#6300 PR-4, Tasks 19–20) ──────────────────────────
+/**
+ * The node states of RP1's nightly fleet parity verdict
+ * (`docs/internal/architecture/fleet-parity.md`, "The judge (P9)"): each node
+ * takes the worst disposition among its items.
+ */
+export const FLEET_PARITY_NODE_STATES = [
+  "at-parity",
+  "repairing",
+  "held",
+  "known",
+  "capped",
+  "failing",
+  "not-judged",
+  "not-contacted",
+  "needs-you",
+] as const;
+export const FleetParityNodeStateSchema = z.enum(FLEET_PARITY_NODE_STATES);
+export type FleetParityNodeState = z.infer<typeof FleetParityNodeStateSchema>;
+
+/** A verdict older than this is stale: one missed nightly sweep (row 13). */
+export const FLEET_PARITY_STALE_AFTER_MS = 26 * 60 * 60 * 1000;
+
+/** The most failing items served per node; the rest are counted in `itemsOmitted`. */
+export const FLEET_PARITY_ITEMS_MAX = 200;
+
+/**
+ * Items most in need of a person first. The server sorts by it before the
+ * {@link FLEET_PARITY_ITEMS_MAX} cap, so the cap drops the least urgent, and
+ * the panel lists by it (#6300 PR-4 round 4).
+ */
+export const FLEET_PARITY_ITEM_ORDER: Record<FleetParityNodeState, number> = {
+  "needs-you": 0,
+  failing: 1,
+  "not-judged": 2,
+  repairing: 3,
+  held: 4,
+  known: 5,
+  capped: 6,
+  "not-contacted": 7,
+  "at-parity": 8,
+};
+
+/**
+ * One failing item. `item` is null and `count` > 1 only for the collapsed
+ * `secret-names-missing` entry, whose items are secrets' names: those are
+ * never served, only counted.
+ */
+export const FleetParityItemSchema = z
+  .object({
+    probe: z.string().max(64),
+    item: z.string().max(128).nullable(),
+    count: z.number().int().positive(),
+    cause: z.string().max(128),
+    disposition: FleetParityNodeStateSchema,
+    firstFailingAt: z.string().max(32).nullable(),
+  })
+  .strict();
+export type FleetParityItem = z.infer<typeof FleetParityItemSchema>;
+
+/**
+ * One action (a needs-you item's alert). `message` is null for the classes
+ * whose message names secrets or accounts (`fleet-parity-secret-names`,
+ * `fleet-parity-login`); `count` then says how many it named. `whatToDo` is the
+ * monitor's own five-line remedy, which the sweep renders.
+ */
+export const FleetParityActionSchema = z
+  .object({
+    class: z.string().max(64),
+    message: z.string().max(600).nullable(),
+    count: z.number().int().nonnegative().nullable(),
+    whatToDo: z.string().max(4000),
+    judged: z.boolean(),
+  })
+  .strict();
+export type FleetParityAction = z.infer<typeof FleetParityActionSchema>;
+
+/** The config pull engine's summary, or null where no engine runs. */
+export const FleetParityEngineSchema = z
+  .object({
+    installed: z.boolean(),
+    healthy: z.boolean(),
+    lastTickAt: z.string().max(32).nullable(),
+    result: z.string().max(64).nullable(),
+    consecutiveFailures: z.number().int().nonnegative().nullable(),
+    hold: z.boolean(),
+    /** The newest standing rejection: the first rejected commit and when. */
+    rejection: z
+      .object({
+        firstCommit: z.string().max(40),
+        at: z.string().max(32),
+      })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+export type FleetParityEngine = z.infer<typeof FleetParityEngineSchema>;
+
+/** One node's row on the status page. Only what the page shows; no email, ever. */
+export const FleetParityNodeSchema = z
+  .object({
+    name: z.string().max(64),
+    state: FleetParityNodeStateSchema,
+    isVm: z.boolean(),
+    contacted: z.boolean(),
+    cause: z.string().max(128).nullable(),
+    lastContactedAt: z.string().max(32).nullable(),
+    commit: z.string().max(40).nullable(),
+    commitsBehind: z.number().int().nonnegative().nullable(),
+    sessionDays: z.number().int().nonnegative().nullable(),
+    engine: FleetParityEngineSchema.nullable(),
+    /** The most urgent items, by {@link FLEET_PARITY_ITEM_ORDER}. */
+    items: z.array(FleetParityItemSchema).max(FLEET_PARITY_ITEMS_MAX),
+    /** How many items the cap left out, all less urgent than every served one. */
+    itemsOmitted: z.number().int().nonnegative(),
+    actions: z.array(FleetParityActionSchema).max(50),
+  })
+  .strict();
+export type FleetParityNode = z.infer<typeof FleetParityNodeSchema>;
+
+/**
+ * `GET /api/admin-vms/fleet-parity`: RP1's verdict.json, projected. `absent`
+ * when there is no verdict file (not RP1, or before the first sweep);
+ * `unreadable` when the file fails the input schema. `stale` is computed by the
+ * server against {@link FLEET_PARITY_STALE_AFTER_MS}. `.strict()` is the OUTPUT
+ * allowlist: the server builds each object by name, so a stray field 500s
+ * instead of reaching the client.
+ */
+export const FleetParityVerdictSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("absent") }).strict(),
+  z.object({ state: z.literal("unreadable") }).strict(),
+  z
+    .object({
+      state: z.literal("ok"),
+      runId: z.string().max(64),
+      checkedAt: z.string().max(32),
+      stale: z.boolean(),
+      nodes: z.array(FleetParityNodeSchema).max(64),
+    })
+    .strict(),
+]);
+export type FleetParityVerdict = z.infer<typeof FleetParityVerdictSchema>;
+
 // ── Job create / status (R2) ─────────────────────────────────────────────────
 /**
  * A single flag value handed to `buildJob`: `true` = presence-only flag,
@@ -518,8 +661,9 @@ export type ReconcileRepairRequest = z.infer<
  * `infrastructure/cloud-vm/check-cloud-health.sh` emits via `add_check`, in the
  * order a healthy sweep emits them (not their order in the script's source, where
  * the helper functions come first). `HealthCard` renders only these names, so a check
- * missing here never reaches `/admin/vms` (#5525: `hostkey-pin`, `vm-parity`
- * and `account-mappings` had been emitted but never shown).
+ * missing here never reaches `/admin/vms` (#5525: `hostkey-pin`, check 11's
+ * `vm-parity`, since replaced by `fleet-parity` (#6300), and `account-mappings`
+ * had been emitted but never shown).
  * `scripts/test-check-cloud-health.sh` (32g) fails when the two lists diverge.
  * There is no "service state" check (expert review R11).
  */
@@ -547,7 +691,9 @@ export const HEALTH_CHECKS = [
   // said so in <vm>/base-check/<date>.json.
   "backup-base",
   "backup-markers",
-  "vm-parity",
+  // #6300 PR-3: check 17's row, the node's state in the nightly fleet parity
+  // verdict. It replaced check 11's `vm-parity` row (the file-manifest record).
+  "fleet-parity",
   "account-mappings",
 ] as const;
 export type HealthCheckName = (typeof HEALTH_CHECKS)[number];

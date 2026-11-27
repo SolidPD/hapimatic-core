@@ -126,24 +126,52 @@ function useIsCoarsePointer(): boolean {
 /**
  * Dismiss the tap-to-reveal bubble on scroll — a capture-phase `window` listener
  * held only while open (Popover lacks the scroll listener Tooltip has).
+ *
+ * `ignoreOpeningScroll` (#6780, opt-in): attach the listener two animation
+ * frames after opening, so a scroll the opening tap itself caused does not close
+ * the bubble it just opened (on the Create page the first tap on the project chip
+ * scrolls the page's scroll container by a pixel, dispatched in the next frame).
+ * Without it the listener attaches at once, as for every other caller.
  */
-function useDismissOnScroll(open: boolean, close: () => void): void {
+function useDismissOnScroll(
+  open: boolean,
+  close: () => void,
+  ignoreOpeningScroll: boolean
+): void {
   React.useEffect(() => {
     if (!open) return;
-    window.addEventListener("scroll", close, { capture: true, passive: true });
-    return () => window.removeEventListener("scroll", close, { capture: true });
-  }, [open, close]);
+    const attach = () =>
+      window.addEventListener("scroll", close, {
+        capture: true,
+        passive: true,
+      });
+    let frame = 0;
+    if (ignoreOpeningScroll) {
+      frame = requestAnimationFrame(() => {
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          attach();
+        });
+      });
+    } else {
+      attach();
+    }
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      window.removeEventListener("scroll", close, { capture: true });
+    };
+  }, [open, close, ignoreOpeningScroll]);
 }
 
 /**
  * Controlled open state shared by both tap-to-reveal branches: the bubble's
  * `open` flag, the `aria-describedby` target id, and the scroll dismissal.
  */
-function useTapTooltipState() {
+function useTapTooltipState(ignoreOpeningScroll = false) {
   const [open, setOpen] = React.useState(false);
   const descriptionId = React.useId();
   const close = React.useCallback(() => setOpen(false), []);
-  useDismissOnScroll(open, close);
+  useDismissOnScroll(open, close, ignoreOpeningScroll);
   return { open, setOpen, descriptionId };
 }
 
@@ -277,6 +305,11 @@ export interface HoverTooltipButtonProps
   delayDuration?: number;
   /** Extra classes merged onto the bubble surface (NOT the button). */
   tooltipClassName?: string;
+  /**
+   * Coarse-pointer branch only (#6780): keep the bubble open through a scroll
+   * the opening tap itself caused (see `useDismissOnScroll`). Default off.
+   */
+  ignoreOpeningScroll?: boolean;
 }
 
 /**
@@ -291,7 +324,14 @@ export const HoverTooltipButton = React.forwardRef<
   HoverTooltipButtonProps
 >(
   (
-    { content, side = "top", delayDuration = 300, tooltipClassName, ...button },
+    {
+      content,
+      side = "top",
+      delayDuration = 300,
+      tooltipClassName,
+      ignoreOpeningScroll,
+      ...button
+    },
     ref
   ) => {
     const isCoarsePointer = useIsCoarsePointer();
@@ -302,6 +342,7 @@ export const HoverTooltipButton = React.forwardRef<
           content={content}
           side={side}
           tooltipClassName={tooltipClassName}
+          ignoreOpeningScroll={ignoreOpeningScroll}
           {...button}
         />
       );
@@ -324,8 +365,10 @@ HoverTooltipButton.displayName = "HoverTooltipButton";
 const TapTooltipButton = React.forwardRef<
   HTMLButtonElement,
   Omit<HoverTooltipButtonProps, "delayDuration">
->(({ content, side = "top", tooltipClassName, ...button }, ref) => {
-  const { open, setOpen, descriptionId } = useTapTooltipState();
+>(({ content, side = "top", tooltipClassName, ...props }, ref) => {
+  const { ignoreOpeningScroll, ...button } = props;
+  const { open, setOpen, descriptionId } =
+    useTapTooltipState(ignoreOpeningScroll);
   return (
     <PopoverPrimitive.Root open={open} onOpenChange={setOpen}>
       <PopoverPrimitive.Trigger

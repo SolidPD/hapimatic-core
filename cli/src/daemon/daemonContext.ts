@@ -30,6 +30,7 @@
 import type { ApiClient } from "@/api/api";
 import type { TokenRefreshService } from "@/accounts/tokenRefreshService";
 import type { JobRegistry } from "@hapi/protocol";
+import type { InstanceKindReading } from "@hapi/protocol/instanceKindReader";
 import type { TrackedSession } from "./types";
 import type { DaemonLocallyPersistedState } from "@/persistence";
 import type { OwnStateWriter } from "./daemonStateOwnership";
@@ -60,6 +61,17 @@ export interface ClockSeams {
     ms: number
   ) => ReturnType<typeof setTimeout>;
   clearTimeoutFn?: (handle: ReturnType<typeof setTimeout>) => void;
+}
+
+/**
+ * Issue #6756: the daemon's instance-kind reading, plus what its test store holds.
+ * `inheritedStore` is set on a test instance whose `accounts/` holds any `*.json` and no
+ * test-store marker (a store that predates this work, inherited through the port's data
+ * dir, ER-D1): no Claude spawn binds from it and the refresh `tick` renews none of it.
+ * `records` is a count only, never an id.
+ */
+export interface DaemonInstanceKind extends InstanceKindReading {
+  inheritedStore?: { records: number };
 }
 
 /**
@@ -101,6 +113,14 @@ export interface DaemonContext {
    * without it (tests, pre-#4349 callers) reads as not-a-tenant.
    */
   tenantVm?: boolean;
+  /**
+   * Issue #6756 (TC1): this instance's kind (`readInstanceKind`, evaluated ONCE at boot,
+   * beside the tenant decision). On a `test` instance the boot adopts no account folder,
+   * seeds no env token and holds no instance token, the mirror is off and the host-chain
+   * moves are flag-only. Optional so a context built without it (tests, older callers)
+   * reads as a real instance.
+   */
+  instanceKind?: DaemonInstanceKind;
   /** The daemon control server's bearer token (spawned children call back with it). */
   controlToken: string;
   /** The daemon control server's bound port. */

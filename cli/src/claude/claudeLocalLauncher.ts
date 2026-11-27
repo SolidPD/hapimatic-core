@@ -25,8 +25,12 @@ import {
   resolveAccountConfigDirForSession,
   readBoundApiKeyId,
   withAccountToken,
-  withAccountConfigDir,
 } from "./accountTokenInjection";
+import {
+  dropForeignResume,
+  resolveSessionChildEnv,
+  transcriptConfigDir,
+} from "./testInstanceConfigDir";
 import {
   localLaunchPermissionArgs,
   permissionNarrowingHolds,
@@ -143,6 +147,9 @@ export async function claudeLocalLauncher(
   // sessions), so the scanner watches the projects tree the account-bound
   // claude child writes to under isolation. Reused for the launch below.
   const accountConfigDir = await resolveAccountConfigDirForSession(session);
+  // Issue #6980: a test instance's own folder, when that is where the child runs.
+  dropForeignResume(session, accountConfigDir);
+  const transcriptDir = transcriptConfigDir(accountConfigDir);
 
   // Issue #6088 (SINK-6): what reaches the chat — every record except Claude
   // Code's "No response requested." placeholder; the detectors below still
@@ -157,7 +164,7 @@ export async function claudeLocalLauncher(
     // detectors below.
     resumeSessionId: resumeSessionIdFromArgs(session.claudeArgs) ?? undefined,
     workingDirectory: session.path,
-    configDir: accountConfigDir ?? undefined,
+    configDir: transcriptDir,
     onMessage: message => {
       forwardToChat(message);
       // Detect and report tool errors to the error log system
@@ -182,7 +189,7 @@ export async function claudeLocalLauncher(
   // Issue #4383: hand the tracker this session's reconcile context (the same
   // account-config dir the scanner watches, #1573 / #6088).
   session.setBackgroundAgentContext({
-    configDir: accountConfigDir ?? undefined,
+    configDir: transcriptDir,
     workingDirectory: session.path,
   });
 
@@ -302,10 +309,12 @@ export async function claudeLocalLauncher(
           path: session.path,
           sessionId: session.sessionId,
           abort: processAbortController.signal,
-          claudeEnvVars: withAccountConfigDir(
-            withAccountToken(session.claudeEnvVars, accountToken),
-            accountConfigDir
-          ),
+          claudeEnvVars: resolveSessionChildEnv({
+            session,
+            base: withAccountToken(session.claudeEnvVars, accountToken),
+            accountConfigDir,
+            hasCredential: accountToken !== null,
+          }),
           // Issue #6166: a session taken over in a terminal keeps its effort —
           // before, only the pty/tmux launchers appended it, so a local launch
           // ran the binary default (medium on Opus 5.5). A user's own --effort

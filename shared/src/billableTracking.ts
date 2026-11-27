@@ -4,10 +4,13 @@ import {
   BILLABLE_SWITCH_KEY_KINDS,
   BillableConfirmSchema,
   BillableSwitchStartChoiceSchema,
+  projectBaseKey,
+  projectKeyKind,
   type BillableConfirm,
   type BillableSwitchMode,
   type BillableSwitchStartChoice,
   type BillableSwitchStartKind,
+  type ProjectKeyMetadata,
 } from "./billableSwitch";
 import type { TrackingCategory } from "./billingCategories";
 import { BILLING_RATE_MINOR_MAX, isBillingCurrency } from "./money";
@@ -58,6 +61,18 @@ export type TrackingProject = {
   key: string;
   name: string;
 };
+
+/**
+ * A session's own project, as its record names it (R1; ruling D-2: a folder
+ * that is not a repository is the project, shown as its path). The one place
+ * the server derives it: the start, the reconcile, the old switch and the PUT.
+ */
+export function trackingProjectOf(
+  metadata: ProjectKeyMetadata
+): TrackingProject {
+  const key = projectBaseKey(metadata);
+  return { kind: projectKeyKind(metadata), key, name: key };
+}
 
 /** The external sync selection: IDs and readable names only, never a token. */
 export const TrackingSyncSelectionSchema = z
@@ -393,7 +408,33 @@ function rateNoteRule(
   return { ok: true, note };
 }
 
-function sameCategory(
+/**
+ * The writer's three rules for a category's default (3.1), for both
+ * validators: the rate and the currency are both set or both null, the rate is
+ * in range, and the currency is in the list. Returns the refusal, or null.
+ */
+function defaultRateRule(
+  defaultRateMinor: number | null,
+  defaultCurrency: string | null
+): { field: string; reason: TrackingValidationReason } | null {
+  if ((defaultRateMinor === null) !== (defaultCurrency === null)) {
+    return { field: "defaultRateMinor", reason: "required" };
+  }
+  if (defaultRateMinor !== null && !isTrackingRateMinor(defaultRateMinor)) {
+    return { field: "defaultRateMinor", reason: "rate_out_of_range" };
+  }
+  if (defaultCurrency !== null && !isBillingCurrency(defaultCurrency)) {
+    return { field: "defaultCurrency", reason: "currency_not_allowed" };
+  }
+  return null;
+}
+
+/**
+ * Whether settings keep the record's category (ruling 12): then the route looks
+ * nothing up and the validator keeps the stored name and default. One rule, so
+ * the two never disagree on a write.
+ */
+export function keepsTrackingCategory(
   a: { source: string; id: string },
   prior: TrackingRecordDraft | null
 ): boolean {
@@ -418,7 +459,7 @@ export function validateTrackingSettings(
   category: TrackingCategory | null | undefined,
   prior: TrackingRecordDraft | null
 ): TrackingValidationResult {
-  const kept = sameCategory(input.category, prior);
+  const kept = keepsTrackingCategory(input.category, prior);
   let name: string;
   let defaultRateMinor: number | null;
   let defaultCurrency: string | null;
@@ -437,6 +478,10 @@ export function validateTrackingSettings(
     defaultRateMinor = category.defaultRateMinor;
     defaultCurrency = category.defaultCurrency;
   }
+  // A default the writer would refuse is named here (400), never passed on to
+  // fail inside the write (500; review finding f883b2e5).
+  const badDefault = defaultRateRule(defaultRateMinor, defaultCurrency);
+  if (badDefault) return { ok: false, ...badDefault };
   if (!isTrackingRateMinor(input.rateMinor)) {
     return { ok: false, field: "rateMinor", reason: "rate_out_of_range" };
   }
@@ -487,12 +532,11 @@ export function checkTrackingStartValues(
   if (!isBillingCurrency(v.currency)) {
     return { field: "currency", reason: "currency_not_allowed" };
   }
-  if ((v.defaultRateMinor === null) !== (v.defaultCurrency === null)) {
-    return { field: "defaultRateMinor", reason: "required" };
-  }
-  if (v.defaultRateMinor !== null && !isTrackingRateMinor(v.defaultRateMinor)) {
-    return { field: "defaultRateMinor", reason: "rate_out_of_range" };
-  }
+  // The writer's own default rules (review finding 65fc8fb5): a carried
+  // default it refuses would otherwise pass here and fail inside the
+  // registration, a lost start (`hook-failed`).
+  const badDefault = defaultRateRule(v.defaultRateMinor, v.defaultCurrency);
+  if (badDefault) return badDefault;
   const noted = rateNoteRule(v.rateNote, v);
   if (!noted.ok) return { field: "rateNote", reason: noted.reason };
   if (v.sync !== null) {
@@ -502,12 +546,140 @@ export function checkTrackingStartValues(
 }
 
 // ---------------------------------------------------------------------------
+// The carried copy (section 5 row 4 across nodes; PR-B's moved item 2)
+
+/**
+ * A parent's record carried to another node for an agent's copy: every field a
+ * copy keeps (`copyRecord`), the project and the `complete` flag among them
+ * (C8 = a), and none it sets itself (confirm, origin, start). Carried only to a
+ * node that advertises `billable:tracking-carry`, and read there strictly: a
+ * malformed value is refused with 400, never dropped (4.1).
+ */
+export const TrackingCarriedCopySchema = TrackingRecordShape.omit({
+  confirm: true,
+  createdVia: true,
+  trackFrom: true,
+  createdAt: true,
+  updatedAt: true,
+}).strict();
+export type TrackingCarriedCopy = z.infer<typeof TrackingCarriedCopySchema>;
+
+/** A record in its carried form, field by field. */
+export function carriedCopyOf(
+  record: TrackingRecordDraft
+): TrackingCarriedCopy {
+  return {
+    billingStatus: record.billingStatus,
+    projectKind: record.projectKind,
+    projectKey: record.projectKey,
+    projectName: record.projectName,
+    categorySource: record.categorySource,
+    categoryId: record.categoryId,
+    categoryName: record.categoryName,
+    defaultRateMinor: record.defaultRateMinor,
+    defaultCurrency: record.defaultCurrency,
+    rateMinor: record.rateMinor,
+    currency: record.currency,
+    rateNote: record.rateNote,
+    sync: record.sync,
+    complete: record.complete,
+  };
+}
+
+/** The source a copy is made from (`copyRecord` sets the confirm state, the origin and the start itself). */
+export function sourceFromCarriedCopy(
+  copy: TrackingCarriedCopy
+): TrackingRecordDraft {
+  return { ...copy, confirm: null, createdVia: "inheritance", trackFrom: 0 };
+}
+
+/**
+ * #6778 FND-3 (review T2): a partial record (the old switch-on's) under the
+ * writer's own rules (`checkTrackingDomains`): a rate in range and its currency
+ * together, on the list, the default paired, no sync. Otherwise such a copy
+ * would pass here and then be lost in the peer's start hook.
+ */
+function checkPartialCopy(
+  copy: TrackingCarriedCopy
+): { field: string; reason: TrackingValidationReason } | null {
+  if (copy.rateMinor !== null && !isTrackingRateMinor(copy.rateMinor)) {
+    return { field: "rateMinor", reason: "rate_out_of_range" };
+  }
+  if ((copy.rateMinor === null) !== (copy.currency === null)) {
+    return { field: "currency", reason: "required" };
+  }
+  if (copy.currency !== null && !isBillingCurrency(copy.currency)) {
+    return { field: "currency", reason: "currency_not_allowed" };
+  }
+  const badDefault = defaultRateRule(
+    copy.defaultRateMinor,
+    copy.defaultCurrency
+  );
+  if (badDefault) return badDefault;
+  if (copy.sync !== null) return { field: "sync", reason: "sync_unavailable" };
+  return null;
+}
+
+/**
+ * The structural rules on a carried copy at the owning node (4.2 row 8), so a
+ * value the writer would refuse is refused before the spawn, not lost in the
+ * start hook: a project key, the category and the note as a local write stores
+ * them, then for a complete record every setting with the rules of
+ * `checkTrackingStartValues`, for a partial one `checkPartialCopy`. Returns the
+ * refused field, or null.
+ */
+export function checkCarriedCopy(
+  copy: TrackingCarriedCopy
+): { field: string; reason: TrackingValidationReason } | null {
+  if (copy.projectKey.trim() === "") {
+    return { field: "projectKey", reason: "required" };
+  }
+  // #6778 FND-3 (T9): a carried name or note in the form a local write stores
+  // (trimmed, never blank), which a copy of a stored record always is.
+  for (const part of [
+    copy.categorySource,
+    copy.categoryId,
+    copy.categoryName,
+  ]) {
+    if (part !== null && part.trim() === "") {
+      return { field: "category", reason: "required" };
+    }
+  }
+  const note = copy.rateNote;
+  if (note !== null && (note.trim() === "" || note !== note.trim())) {
+    return { field: "rateNote", reason: "required" };
+  }
+  if (!copy.complete) return checkPartialCopy(copy);
+  const { categorySource, categoryId, categoryName, rateMinor, currency } =
+    copy;
+  if (categorySource === null || categoryId === null || categoryName === null) {
+    return { field: "category", reason: "required" };
+  }
+  if (rateMinor === null) return { field: "rateMinor", reason: "required" };
+  if (currency === null) return { field: "currency", reason: "required" };
+  return checkTrackingStartValues({
+    billingStatus: copy.billingStatus,
+    categorySource,
+    categoryId,
+    categoryName,
+    defaultRateMinor: copy.defaultRateMinor,
+    defaultCurrency: copy.defaultCurrency,
+    rateMinor,
+    currency,
+    rateNote: copy.rateNote,
+    sync: copy.sync,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // The agent rule (C7 = a, 7.1): no rate, default rate or note reaches an agent
 
 const AGENT_HIDDEN_FIELDS = [
   "rateMinor",
   "defaultRateMinor",
   "rateNote",
+  // Issue #6204 (section 6): a time entry's value.
+  "valueMinor",
 ] as const;
 
 /** A record without the money fields, for an agent's request. */
@@ -549,7 +721,37 @@ export const TRACKING_START_REASONS = [
 ] as const;
 export type TrackingStartReason = (typeof TRACKING_START_REASONS)[number];
 
-export type TrackingLostCause = "expired" | "namespace" | "hook-failed";
+/**
+ * Why a start's settings were lost (row 12); `unreadable` (#6778 PR-C, moved
+ * item 7): its queued context could not be read; `queue-failed` (moved item 6):
+ * the queue write itself failed, so nothing waited for the registration.
+ */
+export type TrackingLostCause =
+  | "expired"
+  | "namespace"
+  | "hook-failed"
+  | "unreadable"
+  | "queue-failed";
+
+/**
+ * #6778 PRC-R9 (FND-5): what the owning node observed of a start that carried
+ * settings or a copy, on the spawn-status callback and the local success
+ * answer: applied, or the cause it saw, never a value. `gate-off`: its gate
+ * was not on; `no-record`: the gate was on and the session had no record
+ * after its registration; `record-unreadable`: the record could not be read.
+ */
+export const SPAWN_TRACKING_CAUSES = [
+  "gate-off",
+  "no-record",
+  "record-unreadable",
+] as const;
+export const SpawnTrackingAnswerSchema = z.discriminatedUnion("applied", [
+  z.object({ applied: z.literal(true) }).strict(),
+  z
+    .object({ applied: z.literal(false), cause: z.enum(SPAWN_TRACKING_CAUSES) })
+    .strict(),
+]);
+export type SpawnTrackingAnswer = z.infer<typeof SpawnTrackingAnswerSchema>;
 
 export type TrackingStartInput = {
   mode: BillableSwitchMode;

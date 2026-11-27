@@ -5,6 +5,7 @@
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { AddressInfo } from "node:net";
@@ -33,6 +34,10 @@ import {
   type TypedCallRequest,
 } from "./hapiOrchestrationTools";
 import { createPinTools, PIN_TOOL_SPECS } from "./hapiPinTools";
+import {
+  createContextResetTool,
+  type ContextResetActuator,
+} from "@/claude/services/contextResetActuator";
 
 // Constants for image fetching
 const IMAGE_FETCH_TIMEOUT_MS = 10000; // 10 seconds
@@ -819,6 +824,9 @@ export const HAPY_MCP_TOOL_NAMES = [
   "create_schedule",
   "update_schedule",
   "respond_to_permission",
+  // Issue #6559 (Task 5): arm a context reset for this session (binding 5 and
+  // the ack live in `contextResetActuator.ts`).
+  "request_context_reset",
 ] as const;
 
 /**
@@ -876,6 +884,8 @@ export async function startHappyServer(
      * bridge forwards every registered tool to a harness with no such gate.
      */
     operatorTools?: boolean;
+    /** Issue #6559 (Task 5): the session's context-reset actuator, once ready. */
+    getContextReset?: () => ContextResetActuator | undefined;
     /** Test seam: overrides for the capability tools' server, token and fetch. */
     capabilityDeps?: Partial<
       Pick<CapabilityToolDeps, "serverUrl" | "getCliApiToken" | "fetchFn">
@@ -967,6 +977,20 @@ export async function startHappyServer(
         };
       }
     }
+  );
+
+  // Issue #6559 (Task 5): arm a context reset over this wrapper's own socket.
+  const contextResetTool = createContextResetTool({
+    getActuator: () => options.getContextReset?.(),
+    arm: (request, timeoutMs) => client.armContextReset(request, timeoutMs),
+    disarm: armId => client.disarmContextReset(armId),
+    recordAbandoned: armId => client.recordAbandonedContextResetArm(armId),
+    newArmId: () => randomUUID(),
+  });
+  registerHapyTool(
+    "request_context_reset",
+    contextResetTool.config,
+    contextResetTool.handler
   );
 
   //

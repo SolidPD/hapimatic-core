@@ -17,6 +17,7 @@ import { permissionNarrowingHolds } from "@/claude/spawnPermissionSeed";
 import { SdkRequestError } from "@/claude/sdk/types";
 import { readBackAppliedEffort } from "@/claude/claudeRemote";
 import { parseSpecialCommand } from "@/parsers/specialCommands";
+import { ContextResetActuator } from "@/claude/services/contextResetActuator";
 import { getEnvironmentInfo } from "@/ui/doctor";
 import {
   autoApprovedHapiToolNames,
@@ -55,6 +56,8 @@ import {
   resolveEntitledModelForBoundAccount,
 } from "@/claude/accountTokenInjection";
 import { resolveSpawnModelState } from "@/claude/spawnModelState";
+import { prepareTestInstanceConfigDir } from "@/claude/testInstanceConfigDir";
+import { isTestInstanceProcess } from "@/utils/testInstanceProcess";
 import {
   resolveInitialPermissionMode,
   spawnPermissionStamp,
@@ -187,6 +190,17 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
     // throw new Error('Daemon-spawned sessions cannot use local/interactive mode');
   }
 
+  // Issue #6980: on a test instance the scrub below writes in the instance's own Claude
+  // config folder, and its lock file needs the folder to exist. A folder that cannot be
+  // used is left for the launcher, which refuses the session with the reason.
+  if (isTestInstanceProcess()) {
+    try {
+      prepareTestInstanceConfigDir();
+    } catch (error) {
+      logger.debug("[START] test instance config folder not ready", error);
+    }
+  }
+
   // #1347: Remove HAPI_MCP_SERVER_NAME from this project's disabledMcpServers
   // in ~/.claude.json so Claude Code's project-config disable filter does NOT
   // silently drop the --mcp-config injection built below. Non-fatal: spawn
@@ -244,7 +258,12 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   // Start HAPI MCP server. This launcher owns an `allowedTools` list, so it may
   // be handed the operator tools (#4450 R7); the server lists them only on an
   // operator host.
-  const happyServer = await startHappyServer(session, { operatorTools: true });
+  const happyServer = await startHappyServer(session, {
+    operatorTools: true,
+    // Issue #6559 (Task 5): the arm tool reaches the session's actuator once
+    // onSessionReady has attached it.
+    getContextReset: () => currentSessionRef.current?.contextReset,
+  });
   logger.debug(`[START] HAPI MCP server started at ${happyServer.url}`);
 
   // Variable to track current session instance (updated via onSessionReady callback)
@@ -626,6 +645,9 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
   session.updateMetadata(currentMetadata => ({
     ...currentMetadata,
     launcherKind: activeLauncherKind,
+    // Issue #6918 (R10): this wrapper sets HAPI_AGENT_CALLER in its agent child,
+    // so a header-less spawn under it can be decided not-from-parent.
+    agentCallerMarker: true,
     // Issue #4877 item 1: a respawn reattaches to the stored record, whose
     // cached `hostPid` is the killed runner's; stamp this process's own.
     hostPid: process.pid,
@@ -737,7 +759,7 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       },
       launcherKind: activeLauncherKind,
     });
-  session.onUserMessage(message => {
+  session.onUserMessage((message, frame) => {
     const sessionPermissionMode =
       currentSessionRef.current?.getPermissionMode();
     if (
@@ -826,21 +848,37 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
       );
     }
 
+    // The mode every branch below pushes with (resolved once).
+    const enhancedMode: EnhancedMode = {
+      permissionMode: messagePermissionMode ?? "default",
+      model: messageModel,
+      fallbackModel: messageFallbackModel,
+      effort: messageEffort,
+      customSystemPrompt: messageCustomSystemPrompt,
+      appendSystemPrompt: messageAppendSystemPrompt,
+      allowedTools: messageAllowedTools,
+      disallowedTools: messageDisallowedTools,
+    };
+
+    // Issue #6559 (Task 4): the server's reset flag, read before the special-
+    // command parse. A reset pushes its ONE item and stops here; anything else
+    // (no flag, or a flag the wrapper does not reset for) takes the path below,
+    // so the text is delivered as an ordinary message.
+    if (
+      currentSessionRef.current?.contextReset?.onUserMessage(
+        message,
+        frame,
+        enhancedMode
+      )
+    ) {
+      return;
+    }
+
     // Check for special commands before processing
     const specialCommand = parseSpecialCommand(message.content.text);
 
     if (specialCommand.type === "compact") {
       logger.debug("[start] Detected /compact command");
-      const enhancedMode: EnhancedMode = {
-        permissionMode: messagePermissionMode ?? "default",
-        model: messageModel,
-        fallbackModel: messageFallbackModel,
-        effort: messageEffort,
-        customSystemPrompt: messageCustomSystemPrompt,
-        appendSystemPrompt: messageAppendSystemPrompt,
-        allowedTools: messageAllowedTools,
-        disallowedTools: messageDisallowedTools,
-      };
       messageQueue.pushIsolateAndClear(
         specialCommand.originalMessage || message.content.text,
         enhancedMode
@@ -854,38 +892,15 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
 
     if (specialCommand.type === "clear") {
       logger.debug("[start] Detected /clear command");
-      const enhancedMode: EnhancedMode = {
-        permissionMode: messagePermissionMode ?? "default",
-        model: messageModel,
-        fallbackModel: messageFallbackModel,
-        effort: messageEffort,
-        customSystemPrompt: messageCustomSystemPrompt,
-        appendSystemPrompt: messageAppendSystemPrompt,
-        allowedTools: messageAllowedTools,
-        disallowedTools: messageDisallowedTools,
-      };
       messageQueue.pushIsolateAndClear(
         specialCommand.originalMessage || message.content.text,
         enhancedMode
       );
-      logger.debugLargeJson(
-        "[start] /compact command pushed to queue:",
-        message
-      );
+      logger.debugLargeJson("[start] /clear command pushed to queue:", message);
       return;
     }
 
     // Push with resolved permission mode, model, system prompts, and tools
-    const enhancedMode: EnhancedMode = {
-      permissionMode: messagePermissionMode ?? "default",
-      model: messageModel,
-      fallbackModel: messageFallbackModel,
-      effort: messageEffort,
-      customSystemPrompt: messageCustomSystemPrompt,
-      appendSystemPrompt: messageAppendSystemPrompt,
-      allowedTools: messageAllowedTools,
-      disallowedTools: messageDisallowedTools,
-    };
     messageQueue.push(message.content.text, enhancedMode);
     logger.debugLargeJson("User message pushed to queue:", message);
   });
@@ -1312,6 +1327,30 @@ export async function runClaude(options: StartOptions = {}): Promise<void> {
           // fail-open and bounded; fires only at turn boundaries.
           gitProbe: makeGitProbe(),
         });
+        // Issue #6559 (Task 4): the context-reset actuator, one per session
+        // like the reporter above. It reads the session through these closures
+        // and reports results over the session's own socket.
+        const contextReset = new ContextResetActuator({
+          conversationId: () => sessionInstance.sessionId,
+          launcherKind: () => activeLauncherKind,
+          localMode: () => sessionInstance.mode === "local",
+          liveSdkQuery: () => sessionInstance.getLiveQuery() !== null,
+          thinking: () => sessionInstance.thinking,
+          queueSize: () => messageQueue.size(),
+          backgroundAgents: () =>
+            sessionInstance.backgroundAgentTracker.snapshot(),
+          pushReset: (text, mode) =>
+            messageQueue.pushIsolate(text, mode as EnhancedMode, {
+              control: "reset",
+            }),
+          emitResult: result =>
+            sessionInstance.client.sendContextResetResult(result),
+          now: () => Date.now(),
+        });
+        sessionInstance.contextReset = contextReset;
+        sessionInstance.addSessionFoundCallback(id =>
+          contextReset.onSessionFound(id)
+        );
         syncSessionModes();
       },
       mcpServers: {

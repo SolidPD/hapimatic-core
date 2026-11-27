@@ -7,6 +7,11 @@ import { randomUUID } from "node:crypto";
 import type { McpStatusUpdate, McpServerStatus } from "@hapi/protocol";
 import { parseMcpList, classifyHostedServers } from "@hapi/protocol";
 import { findCanonicalGitRoot } from "@hapi/protocol/gitRoot";
+import type { InstanceKind } from "@hapi/protocol/instanceKind";
+import {
+  describeServerInstanceKind,
+  getServerInstanceKind,
+} from "../services/serverInstanceKind";
 
 const MCP_REFRESH_TIMEOUT_MS = parseInt(
   process.env.HAPI_MCP_REFRESH_TIMEOUT || "60000",
@@ -178,9 +183,33 @@ function buildMcpStatus(
   return { servers, disabledServers };
 }
 
+let testInstanceLogged = false;
+
+/** One line per process (#6977). Its fixed text stays one literal: a per-node check greps for it. */
+function logOffOnTestInstance(): void {
+  if (testInstanceLogged) return;
+  testInstanceLogged = true;
+  console.log(
+    `[mcp-poll] claude mcp list is off on a test instance (#6977): ${describeServerInstanceKind() ?? "kind=test"}. If this is a real instance, write "real" in <data dir>/instance-kind.`
+  );
+}
+
+/**
+ * Run `claude mcp list` and parse it; `null` when there is nothing to report.
+ *
+ * Issue #6977: on a TEST instance it starts nothing and returns `null`, whatever `cwd` (or,
+ * later, account) it is given. The child would run on the node's own `~/.claude` login, and
+ * the poll itself reads and prunes host files, so the gate comes before any of them.
+ */
 export async function pollMcpStatusOnDemand(
-  cwd?: string
+  cwd?: string,
+  opts: { getInstanceKind?: () => InstanceKind } = {}
 ): Promise<McpStatusUpdate | null> {
+  if ((opts.getInstanceKind ?? getServerInstanceKind)() === "test") {
+    logOffOnTestInstance();
+    return null;
+  }
+
   if (pollInProgress) return null;
 
   const claudePath = findClaudePath();

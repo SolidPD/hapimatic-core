@@ -22,7 +22,7 @@ import {
   type CeilingGuardPreferencePatch,
 } from "@hapi/protocol/schemas";
 
-import { readSettings, writeSettings } from "./settings";
+import { readSettings, updateSettings, type Settings } from "./settings";
 
 /** The generous defaults (K2 — derived from prod P99/max, see the schema doc). */
 export function getCeilingGuardDefaults(): CeilingGuardConfig {
@@ -106,25 +106,26 @@ function parseStoredConfig(input: Record<string, unknown>): CeilingGuardConfig {
  * that ceiling dimension). Returns the freshly re-loaded config (env override
  * re-applied, validated). The merge is SHALLOW: a supplied `roleOverrides`
  * (#5254) replaces the stored map wholesale, so a PUT must carry every role
- * profile it wants to keep.
+ * profile it wants to keep. #4056: through `updateSettings`, so an unreadable
+ * file is refused with `SettingsUnreadableError` and left byte-identical (the
+ * `PUT /preferences/ceiling-guard` route has no try, so `app.onError` answers it).
  */
 export async function saveCeilingGuardConfig(
   settingsFile: string,
   updates: CeilingGuardPreferencePatch
 ): Promise<CeilingGuardConfig> {
-  const settings = (await readSettings(settingsFile)) ?? {};
-  const raw = (settings as Record<string, unknown>).ceilingGuard;
-  const existing = raw && typeof raw === "object" ? raw : {};
+  await updateSettings(settingsFile, current => {
+    const raw = (current as Record<string, unknown>).ceilingGuard;
+    const existing = raw && typeof raw === "object" ? raw : {};
 
-  const merged: Record<string, unknown> = { ...existing };
-  for (const [key, value] of Object.entries(updates)) {
-    // Drop `undefined` so an absent key never overwrites the stored value; a
-    // present `null` (clear-this-dimension) is preserved.
-    if (value !== undefined) merged[key] = value;
-  }
-  (settings as Record<string, unknown>).ceilingGuard = merged;
-
-  await writeSettings(settingsFile, settings);
+    const merged: Record<string, unknown> = { ...existing };
+    for (const [key, value] of Object.entries(updates)) {
+      // Drop `undefined` so an absent key never overwrites the stored value; a
+      // present `null` (clear-this-dimension) is preserved.
+      if (value !== undefined) merged[key] = value;
+    }
+    return { ...current, ceilingGuard: merged } as Settings;
+  });
 
   return loadCeilingGuardConfig(settingsFile);
 }

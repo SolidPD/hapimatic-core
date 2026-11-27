@@ -5,21 +5,37 @@ import { isQualifiedApiKeyRef } from "@hapi/protocol/apiKeyRef";
 import { createAuthMiddleware, type WebAppEnv } from "../../middleware/auth";
 import { resolveLocalNodeIdentity } from "../../../config/nodeLabel";
 import type { FederationDeps } from "./shared";
+import type { TrackingReceiverDeps } from "./billableTrackingReceivers";
 import {
   BILLABLE_SWITCH_CAPABILITY,
-  BillableSwitchStartChoiceSchema,
+  BILLABLE_TRACKING_CARRY_CAPABILITY,
+  BillableSwitchStartBodySchema,
   FederationSpawnBodySchema,
   LOCAL_NODE_ID,
   MCP_SET_CAPABILITY,
+  carriedCopyOf,
   defineCapability,
   type BillableSwitchStartChoice,
+  type SpawnWarning,
+  type TrackingSettingsInput,
 } from "@hapi/protocol";
 import {
   buildBillableSwitchStart,
+  CALLER_SESSION_HEADER,
   floorAgentMcpEnable,
   refuseRetiredBillableAnswer,
+  resolveAgentParent,
+  resolveCallerSession,
+  resolvePersonTrackedStart,
 } from "../agentEscalation";
-import { z } from "zod";
+import type { ManagerStampWrite } from "../../../store/sessions";
+import { lookUpCategory } from "../billableTracking";
+import { createTrackingCategoryLookupGetter } from "../../../billingCategories/billingCategoryService";
+import {
+  recordCopyNotSent,
+  TRACKING_START_ERROR_CATEGORY,
+} from "../../../billableSwitch/trackingStart";
+import { trackingCopyNotSentNotification } from "../../../notifications/producerNotifications";
 import { cataloged } from "../../../capabilities/cataloged";
 import { createRateLimiter } from "../../middleware/rateLimit";
 import {
@@ -31,13 +47,14 @@ import {
 /** #5127: the statuses a key-bound remote spawn's refusal keeps. */
 const PASSED_REFUSAL_STATUSES = new Set([400, 403, 404, 409, 503]);
 
-/** Issue #6646: what a client may send as `billableSwitchStart` (its answer only). */
-const ClientBillableSwitchStartSchema = z
-  .object({ choice: BillableSwitchStartChoiceSchema })
-  .strict();
-
-export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
+export function createWebClientRoutes(
+  deps: FederationDeps & TrackingReceiverDeps
+): Hono<WebAppEnv> {
   const app = new Hono<WebAppEnv>();
+  // #6779 P-8 point 1: the category lookup for a person's tracked start (#6778).
+  const getTrackingCategoryLookup = createTrackingCategoryLookupGetter(
+    () => deps.getBillingCategoryService?.() ?? null
+  );
 
   // ─── Web client endpoint: GET /federation/nodes (JWT auth) ─────
   const jwtAuth = createAuthMiddleware(deps.jwtSecret);
@@ -281,23 +298,31 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       // schema's wire form would read the client's shape differently); the hub
       // adds only the context it builds itself. A client value that carries a
       // kind, an actor or any other key is refused, and nothing it sent goes on.
+      // Issue #6918 (R7): a client never sets a manager stamp; only this hub's
+      // own derivation below is forwarded.
+      if (body && typeof body === "object") {
+        delete (body as Record<string, unknown>).managerStamp;
+      }
       let clientChoice: BillableSwitchStartChoice | undefined;
+      let clientTracking: TrackingSettingsInput | undefined;
       if (body && typeof body === "object" && "billableSwitchStart" in body) {
         const raw = (body as Record<string, unknown>).billableSwitchStart;
         delete (body as Record<string, unknown>).billableSwitchStart;
         if (raw !== undefined) {
-          const client = ClientBillableSwitchStartSchema.safeParse(raw);
+          // #6778: `{ choice }` or a person's `{ tracking }`, exactly one key.
+          const client = BillableSwitchStartBodySchema.safeParse(raw);
           if (!client.success) {
             return c.json(
               {
                 type: "error",
                 message:
-                  "billableSwitchStart accepts only { choice } from a client",
+                  "billableSwitchStart accepts only { choice } or { tracking } from a client",
               },
               400
             );
           }
-          clientChoice = client.data.choice;
+          if ("choice" in client.data) clientChoice = client.data.choice;
+          else clientTracking = client.data.tracking;
         }
       }
       // Issue #4568 (R8): a BARE API-key id names a key in THIS node's vault, so
@@ -377,11 +402,14 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
         parentRelationship: requestedRelationship,
         // Issue #6646: never forwarded as received; the hub's own context goes on.
         billableSwitchStart: _droppedBillableSwitchStart,
+        // Issue #6918: never forwarded as received (deleted above as well).
+        managerStamp: _droppedManagerStamp,
         ...forwardable
       } = parsed.data;
       let parentAttribution:
         | { parentSessionId: string; parentRelationship: "branch" | "spawn" }
         | undefined;
+      let managerStamp: ManagerStampWrite | undefined;
       if (requestedParentId) {
         const engine = deps.getSyncEngine();
         const namespace = c.get("namespace");
@@ -393,6 +421,24 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
             parentSessionId: parent.id,
             parentRelationship: requestedRelationship ?? "spawn",
           };
+          // Issue #6918 (R7): the parent lives here, so this hub derives the
+          // pair from it and the request's caller header, and forwards it.
+          // A failed derivation never fails the spawn: it goes undecided.
+          if (parentAttribution.parentRelationship === "spawn") {
+            try {
+              managerStamp = engine?.deriveManagerStampForSpawn({
+                parentSessionId: parent.id,
+                parentRelationship: "spawn",
+                spawnRequestedByParent:
+                  resolveCallerSession(c, engine ?? null)?.id === parent.id,
+                spawnCallerHeaderPresent: Boolean(
+                  c.req.header(CALLER_SESSION_HEADER)
+                ),
+              });
+            } catch {
+              managerStamp = undefined;
+            }
+          }
         } else {
           deps.errorLogger?.warn(
             engine
@@ -409,74 +455,221 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
 
       // Issue #6646: the start context, built HERE by the entry hub (Task 6's
       // signal order). A person's retired answer is refused first, whatever the
-      // target (#6778 PR-A, R12: 400 billable_choice_retired). A person's
-      // explicit `not-billable` would be dropped silently by an older or
-      // gate-off peer, so refuse it unless the target advertises billable:switch
-      // (the MCP-set precedent above); while the target has not been polled
-      // yet, say so instead of "unsupported".
+      // target (#6778 PR-A, R12: 400 billable_choice_retired). From #6778 PR-C
+      // (Task 15) `not-billable` and `follow-header` mean no settings and go to
+      // any node; a person's settings and an agent's copy follow 4.1's one
+      // predicate below.
+      const hubEngine = deps.getSyncEngine();
+      const hubNamespace = c.get("namespace");
+      const hubNodeId =
+        hubEngine?.getBillableSwitchService?.()?.localNodeId() ??
+        fedConfig?.nodeId;
       const routeStart = buildBillableSwitchStart(
         c,
-        deps.getSyncEngine(),
+        hubEngine,
         {
           choice: clientChoice,
+          tracking: clientTracking,
           parentSessionId: parentAttribution?.parentSessionId,
           parentRelationship: parentAttribution?.parentRelationship,
         },
-        deps.getSyncEngine()?.getBillableSwitchService?.()?.localNodeId() ??
-          fedConfig?.nodeId
+        hubNodeId
       );
       const retiredRefusal = refuseRetiredBillableAnswer(c, routeStart);
       if (retiredRefusal) {
         return retiredRefusal;
       }
-      if (
-        routeStart.kind === "person" &&
-        routeStart.choice !== undefined &&
-        routeStart.choice !== "follow-header"
-      ) {
+      // #6778 (7.2): this hub's own gate decides a person's tracked start,
+      // whatever the target's; the category goes through its lookup.
+      const hubMode = hubEngine?.getBillableSwitchMode?.() ?? "off";
+      const personStart = await resolvePersonTrackedStart(
+        c,
+        routeStart,
+        clientTracking,
+        {
+          mode: hubMode,
+          nodeLabel:
+            hubEngine?.getBillableSwitchService?.()?.localNodeLabel?.() ??
+            fedConfig?.nodeLabel ??
+            "This node",
+          lookUp: ref =>
+            lookUpCategory(getTrackingCategoryLookup, hubNamespace, ref),
+        }
+      );
+      if (personStart instanceof Response) return personStart;
+      // #6778 (4.1; reviews C10, A8): one predicate decides both a person's
+      // refusal and C3: the target's gate is `on` (billable:switch) and it
+      // keeps a carried start (billable:tracking-carry), by its last poll.
+      // Read only for a start that carries settings or may copy a parent, so
+      // a plain spawn reads nothing of the target's billable state.
+      const target = () => {
         const view = registry
           .getBillableSwitchNodeViews()
           .find(v => v.nodeId === nodeId);
-        const nodeLabel =
-          view?.nodeLabel ??
-          registry.getNodeIdentity(nodeId)?.nodeLabel ??
-          nodeId;
-        if (view?.awaitingInitialPoll || view?.status === "offline") {
+        const notPolled =
+          view?.awaitingInitialPoll === true || view?.status === "offline";
+        return {
+          nodeLabel:
+            view?.nodeLabel ??
+            registry.getNodeIdentity(nodeId)?.nodeLabel ??
+            nodeId,
+          notPolled,
+          canTakeTrackedStart:
+            !notPolled &&
+            registry.nodeSupports(nodeId, BILLABLE_SWITCH_CAPABILITY) &&
+            registry.nodeSupports(nodeId, BILLABLE_TRACKING_CARRY_CAPABILITY),
+        };
+      };
+      const personTarget = personStart.tracking ? target() : null;
+      if (personTarget && !personTarget.canTakeTrackedStart) {
+        const { nodeLabel, notPolled } = personTarget;
+        if (notPolled) {
           return c.json(
             {
               type: "error",
-              message: `${nodeLabel} has not answered yet, so its billable sessions cannot be checked. Try again in a moment.`,
+              message: `${nodeLabel} has not answered yet, so a session with tracking settings cannot be sent to it. Try again in a moment.`,
               code: "node_not_reachable_yet",
               nodeLabel,
             },
             503
           );
         }
-        if (!registry.nodeSupports(nodeId, BILLABLE_SWITCH_CAPABILITY)) {
-          return c.json(
-            {
-              type: "error",
-              message: `${nodeLabel} cannot take a billable answer: billable sessions are not on there, or it runs an older version.`,
-              code: "billable_feature_unsupported",
-              nodeLabel,
-            },
-            409
-          );
+        return c.json(
+          {
+            type: "error",
+            message: `${nodeLabel} cannot start a session with tracking settings: billable sessions are not on there, or it runs an older version.`,
+            code: "tracking_unsupported",
+            nodeLabel,
+          },
+          409
+        );
+      }
+      // An agent's copy (C9, then C3 = a): carried when the target can take
+      // it, else the start goes without it, with a warning and, once the peer
+      // has accepted, one `copy-not-sent` row on the parent's history.
+      const store = deps.getStore?.() ?? null;
+      const copy = resolveAgentParent(c, hubEngine, personStart, {
+        mode: hubMode,
+        parentSessionId: parentAttribution?.parentSessionId,
+        hasRecord: id =>
+          (store?.billableTracking.get(id, hubNamespace) ?? null) !== null,
+        nodeId: hubNodeId ?? null,
+        lookup: hubEngine ? { engine: hubEngine, registry } : null,
+      });
+      const hubWarnings: SpawnWarning[] = copy.warning ? [copy.warning] : [];
+      let start = copy.start;
+      let copyNotSentFor: string | null = null;
+      let carriedFrom: string | null = null;
+      if (start.inheritedFrom) {
+        const { nodeLabel, canTakeTrackedStart } = target();
+        const parentRecord =
+          store?.billableTracking.get(
+            start.inheritedFrom.sessionId,
+            hubNamespace
+          )?.record ?? null;
+        if (canTakeTrackedStart && parentRecord) {
+          start = { ...start, inheritedCopy: carriedCopyOf(parentRecord) };
+          carriedFrom = start.inheritedFrom?.sessionId ?? null;
+        } else {
+          copyNotSentFor = start.inheritedFrom.sessionId;
+          const { inheritedFrom: _notCarried, ...withoutParent } = start;
+          start = withoutParent;
+          hubWarnings.push({
+            code: "tracking_copy_not_sent",
+            message: `The new session on ${nodeLabel} started untracked: ${nodeLabel} cannot take its parent's tracking settings, so they were not copied.`,
+          });
         }
       }
       const spawnBody = {
         ...forwardable,
         ...parentAttribution,
+        ...(managerStamp ? { managerStamp } : {}),
         originatingNodeId: fedConfig?.nodeId,
         billableSwitchStart: {
-          kind: routeStart.kind,
-          ...(routeStart.choice ? { choice: routeStart.choice } : {}),
-          actor: routeStart.actor,
-          via: routeStart.via,
-          ...(routeStart.entryNodeId
-            ? { entryNodeId: routeStart.entryNodeId }
+          kind: start.kind,
+          ...(start.choice ? { choice: start.choice } : {}),
+          actor: start.actor,
+          via: start.via,
+          ...(start.entryNodeId ? { entryNodeId: start.entryNodeId } : {}),
+          ...(start.tracking ? { tracking: start.tracking } : {}),
+          ...(start.inheritedFrom
+            ? { inheritedFrom: start.inheritedFrom }
+            : {}),
+          ...(start.inheritedCopy
+            ? { inheritedCopy: start.inheritedCopy }
             : {}),
         },
+      };
+      // After the peer accepted (4.2 rows 6 and 10): the parent's row when
+      // the copy was not sent, or was sent and the peer did not apply it; the
+      // hub's own warnings beside the peer's. Never fails the accepted spawn.
+      const afterAccept = <T extends { type: "success" }>(
+        accepted: T & { warnings?: SpawnWarning[] }
+      ): T & { warnings?: SpawnWarning[] } => {
+        const notAppliedWarned = (accepted.warnings ?? []).some(
+          w => w.code === "tracking_not_applied"
+        );
+        const notApplied = carriedFrom !== null && notAppliedWarned;
+        const parentId = copyNotSentFor ?? (notApplied ? carriedFrom : null);
+        const reason = copyNotSentFor ? "tracking-unsupported" : "not-applied";
+        // Moved item 3: each such row raises a notice (4.2 rows 6 and 10), and
+        // so does a person's carried start the peer did not apply (6.3).
+        const notice = (parentSessionId: string | null) =>
+          hubEngine?.notifyUser?.(
+            trackingCopyNotSentNotification({
+              reason,
+              nodeId,
+              nodeLabel: registry.getNodeIdentity(nodeId)?.nodeLabel ?? nodeId,
+              parentSessionId,
+              namespace: hubNamespace,
+              // #6780 (Task 8): pairs this notice with the tab's other pop-ups.
+              spawnCorrelationId: forwardable.spawnCorrelationId,
+            })
+          );
+        if (parentId && store) {
+          try {
+            const written = recordCopyNotSent(store, {
+              namespace: hubNamespace,
+              parentSessionId: parentId,
+              targetNodeId: nodeId,
+              reason,
+              actor: start.actor,
+              via: start.via,
+              entryNodeId: hubNodeId ?? null,
+              now: Date.now(),
+            });
+            if (written) notice(parentId);
+          } catch (err) {
+            // FND-7 (B2): the person still hears of it; the logs carry the
+            // error's name only, never its text (it may hold a value).
+            const errorName = err instanceof Error ? err.name : "unknown error";
+            const message = `The copy-not-sent row on session ${parentId}'s history could not be written (${errorName}); its notice was raised.`;
+            console.error(`[BillableTracking] ${message}`);
+            notice(parentId);
+            try {
+              store.errorLogs.createEntry({
+                severity: "error",
+                category: TRACKING_START_ERROR_CATEGORY,
+                source: "server",
+                message,
+                context: JSON.stringify({
+                  parentSessionId: parentId,
+                  targetNodeId: nodeId,
+                  reason,
+                  error: errorName,
+                }),
+              });
+            } catch (logError) {
+              console.error(
+                `[BillableTracking] the error log could not record it either: ${logError instanceof Error ? logError.name : "unknown error"}`
+              );
+            }
+          }
+        } else if (start.tracking && notAppliedWarned) {
+          notice(null);
+        }
+        const warnings = [...hubWarnings, ...(accepted.warnings ?? [])];
+        return warnings.length > 0 ? { ...accepted, warnings } : accepted;
       };
 
       // Issue #2150 (R1, ruling D2-A): register the hub-side placeholder BEFORE
@@ -500,10 +693,14 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
       // confirms the key with its home before it accepts (or refuses with a
       // code). The plain path is byte-identical.
       if (sharedKeyRef !== undefined) {
-        const keyed = await registry.spawnApiKeyOnNode(nodeId, {
-          ...spawnBody,
-          apiKeyId: sharedKeyRef,
-        });
+        const keyed = await registry.spawnApiKeyOnNode(
+          nodeId,
+          {
+            ...spawnBody,
+            apiKeyId: sharedKeyRef,
+          },
+          hubNamespace
+        );
         if (keyed.type === "error") {
           if (spawnCorrelationId) dismissPendingSpawn(spawnCorrelationId);
           const { status, ...answer } = keyed;
@@ -515,10 +712,14 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
               : 502;
           return c.json(answer, passed as ContentfulStatusCode);
         }
-        return c.json(keyed);
+        return c.json(afterAccept(keyed));
       }
 
-      const result = await registry.spawnOnNode(nodeId, spawnBody);
+      const result = await registry.spawnOnNode(
+        nodeId,
+        spawnBody,
+        hubNamespace
+      );
 
       if (result.type === "error") {
         // The peer never accepted it — the error IS the caller's answer, so no
@@ -537,7 +738,7 @@ export function createWebClientRoutes(deps: FederationDeps): Hono<WebAppEnv> {
             : 502;
         return c.json(answer, passed as ContentfulStatusCode);
       }
-      return c.json(result);
+      return c.json(afterAccept(result));
     }
   );
 
